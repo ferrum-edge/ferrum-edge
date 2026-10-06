@@ -40,11 +40,21 @@ read fresh authority. Deployment evidence changed shape: top-level `api_specs`
 and `evidence.resources[5]` carry `spec_content: {"sha256", "len"}` instead of a
 byte array, SQL blob columns are `{"sha256", "len"}` instead of
 `{"bytes_hex"}`, and MongoDB raw rows carry `bson_sha256` (binary fields as
-`binary_sha256`/`len`/`subtype`) instead of `bson_hex`. Read spec bytes from a
-conditional backup (`spec_content_base64`) or `GET /api-specs/{id}`. A namespace
-whose canonical representation (excluding spec bytes) would exceed 64 MiB is
-refused with `507` on these conditional paths; use the unconditional profiles or
-split the namespace.
+`binary_sha256`/`len`/`subtype`) instead of `bson_hex`. Top-level `api_specs` is
+sorted by id and equals `evidence.resources[5]`. Read the stored bytes from the
+new `api_spec_contents` array in the same response. Each entry's
+`spec_content_base64` and `external_ref_snapshot_base64` decode to the bytes
+whose `sha256`/`len` the evidence fences, so recovery journals still need only
+this one read. Do not substitute `GET /api-specs/{id}`: it returns the
+decompressed document (format-converted unless requested in the stored
+`spec_format`), so it cannot match `spec_content.sha256`. In the stored format it
+matches only `content_hash`, and it never returns external-reference snapshot
+bytes. A namespace whose canonical representation (excluding spec bytes) would
+exceed 64 MiB is refused with `507` on these conditional paths, as is a
+deployment snapshot whose base64 spec content would exceed 256 MiB. Use the
+unconditional profiles or split the namespace. A `507` is deterministic for
+unchanged state, so do not retry it. Inside a deployment mutation transaction it
+reports `durable: "not_committed"`; otherwise it reports `durable: "not_started"`.
 
 **Backend egress `schema_version` 2 (#5994 / #5999).**
 `public_only_guaranteed` is now true only with

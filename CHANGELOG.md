@@ -19,12 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exhaust memory. Snapshot representations now carry the SHA-256 and length
   of stored spec documents, external-reference snapshots and every raw blob or
   BSON binary; canonical JSON streams into a bounded SHA-256, and stores compare
-  that digest instead of a retained representation. `GET /deployment-snapshot`
-  no longer repeats spec bytes in top-level `api_specs` (entries equal
-  `evidence.resources[5]`); raw SQL blobs are `{"sha256","len"}` and MongoDB
-  rows carry `bson_sha256` instead of `bson_hex`. A namespace whose canonical
+  that digest instead of a retained representation. In `GET /deployment-snapshot`,
+  top-level `api_specs` now carries the same digests and is sorted by id to
+  equal `evidence.resources[5]` under any store collation. A new
+  `api_spec_contents` array carries exactly one base64 copy of each stored
+  gzip document and external-reference snapshot, outside the digested evidence
+  and bounded at 256 MiB in total, so one read still recovers the original
+  bytes. Raw SQL blobs are `{"sha256","len"}` and MongoDB rows carry
+  `bson_sha256` instead of `bson_hex`. A namespace whose canonical
   representation would exceed 64 MiB (spec bytes excluded) returns
   `507 Insufficient Storage` without issuing, comparing or applying anything.
+  Deployment paths count typed resources against that bound before reading raw
+  rows/documents, then count each raw row/document as it is converted, so the
+  `507` fires before the rest of the evidence is built. This includes inside
+  the mutation transaction, where the `507` reports `durable: "not_committed"`.
   Namespace (`namespace_snapshot.v2`) and deployment (`deployment_snapshot.v2`)
   MAC domains changed: every tag issued by v0.9.12 or earlier, including
   `deployment-v1-` tokens, now fails closed with `412`; re-read authority after

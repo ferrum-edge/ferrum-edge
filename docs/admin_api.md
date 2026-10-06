@@ -1460,7 +1460,9 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
 ## Dependency-fenced deployment recovery (#6010)
 
 Use admin-only `GET /deployment-snapshot` for complete original spec metadata,
-stored-document digests, plugin and raw dependency evidence. Send its original deployment token to
+stored-document digests, one base64 copy of the stored spec bytes
+(`api_spec_contents`), plugin and raw dependency evidence. Send its original
+deployment token to
 `DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
 `PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
 partially mutate inside one owner-fenced transaction on all four supported

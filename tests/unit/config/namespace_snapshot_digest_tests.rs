@@ -7,7 +7,7 @@ use ferrum_edge::config::db_backend::{
     ConditionalNamespaceSnapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES, SnapshotDigest,
     is_namespace_snapshot_too_large,
 };
-use ferrum_edge::config::deployment_mutation::DeploymentSnapshot;
+use ferrum_edge::config::deployment_mutation::{DeploymentSnapshot, StoredEvidence};
 use ferrum_edge::config::types::{ApiSpec, GatewayConfig, SpecFormat};
 use serde_json::json;
 
@@ -143,4 +143,90 @@ fn deployment_digest_streams_the_same_canonical_evidence() {
         deployment.digest().unwrap(),
         deployment.snapshot.digest().unwrap()
     );
+}
+
+fn evidence_rows() -> Vec<(&'static str, Vec<serde_json::Value>)> {
+    vec![
+        (
+            "proxies",
+            vec![
+                json!({"id": {"value": "b"}, "name": {"value": "second"}}),
+                json!({"id": {"value": "a"}, "name": {"value": "first"}}),
+            ],
+        ),
+        ("upstreams", Vec::new()),
+        (
+            "api_specs",
+            vec![json!({"spec_content": {"value": {"sha256": "00", "len": 2048}}})],
+        ),
+    ]
+}
+
+fn assemble(
+    snapshot: ConditionalNamespaceSnapshot,
+    limit: usize,
+) -> Result<DeploymentSnapshot, anyhow::Error> {
+    let mut evidence = StoredEvidence::for_snapshot_within(&snapshot, limit)?;
+    for (table, rows) in evidence_rows() {
+        for row in rows {
+            evidence.push(row)?;
+        }
+        evidence.end_table(table)?;
+    }
+    Ok(evidence.finish(snapshot))
+}
+
+#[test]
+fn stored_evidence_charges_exactly_the_canonical_deployment_representation() {
+    let typed = || snapshot(vec![spec("a", vec![9; 2048])]);
+    let max = MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES;
+    let deployment = assemble(typed(), max).unwrap();
+    let representation = deployment.representation().unwrap();
+    // Rows are ordered by canonical rendering, independent of store order.
+    assert_eq!(representation["stored"]["proxies"][0]["id"]["value"], "a");
+    assert_eq!(representation["stored"]["upstreams"], json!([]));
+    let exact = canonical_len(&representation);
+    assert_eq!(
+        deployment.digest().unwrap(),
+        SnapshotDigest::of_representation(&representation).unwrap()
+    );
+    // The running budget refuses exactly what the bounded digest refuses.
+    let at_bound = assemble(typed(), exact).unwrap();
+    assert_eq!(
+        at_bound.digest_within(exact).unwrap(),
+        deployment.digest().unwrap()
+    );
+    let error = assemble(typed(), exact - 1).err().unwrap();
+    assert!(is_namespace_snapshot_too_large(&error), "{error}");
+    assert!(is_namespace_snapshot_too_large(
+        &deployment.digest_within(exact - 1).unwrap_err()
+    ));
+}
+
+#[test]
+fn stored_evidence_refuses_an_over_bound_typed_snapshot_before_raw_rows() {
+    let typed = snapshot(vec![spec("a", vec![9; 2048])]);
+    let resources = canonical_len(&typed.representation().unwrap());
+    let error = StoredEvidence::for_snapshot_within(&typed, resources)
+        .err()
+        .unwrap();
+    assert!(is_namespace_snapshot_too_large(&error), "{error}");
+
+    // A row past the remaining budget is refused when it is pushed.
+    let n = resources + 64;
+    let mut evidence = StoredEvidence::for_snapshot_within(&typed, n).unwrap();
+    let row = json!({"value": "x".repeat(128)});
+    let error = evidence.push(row).unwrap_err();
+    assert!(is_namespace_snapshot_too_large(&error), "{error}");
+}
+
+#[test]
+fn deployment_representation_by_value_matches_by_reference() {
+    let typed = snapshot(vec![spec("a", vec![9; 2048])]);
+    let max = MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES;
+    let deployment = assemble(typed, max).unwrap();
+    let by_reference = deployment.representation().unwrap();
+    let (by_value, typed) = deployment.into_representation().unwrap();
+    assert_eq!(by_value, by_reference);
+    assert_eq!(typed.api_specs[0].spec_content.len(), 2048);
 }

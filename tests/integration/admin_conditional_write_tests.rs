@@ -2609,8 +2609,23 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     );
     assert_eq!(spec_content["sha256"].as_str().unwrap().len(), 64);
     assert_eq!(
-        opened.body["api_specs"][0],
-        opened.body["evidence"]["resources"][5][0]
+        opened.body["api_specs"],
+        opened.body["evidence"]["resources"][5]
+    );
+    // One base64 copy of the stored bytes travels outside the evidence.
+    let content = &opened.body["api_spec_contents"][0];
+    assert_eq!(content["id"], spec_id);
+    let encoded = content["spec_content_base64"].as_str().unwrap();
+    let decoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    };
+    assert_eq!(decoded, stored.snapshot.api_specs[0].spec_content);
+    assert!(
+        !opened.body["evidence"].to_string().contains(encoded),
+        "stored bytes must not enter the digested evidence"
     );
     for header in [
         None,

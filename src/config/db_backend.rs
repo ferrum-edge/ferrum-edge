@@ -141,6 +141,59 @@ impl std::io::Write for SnapshotDigestWriter {
     }
 }
 
+/// Running canonical-byte budget for evidence assembled piece by piece. Every
+/// charge is part of the final canonical representation, so an exhausted
+/// budget proves that [`SnapshotDigestWriter`] would refuse it too, and lets
+/// assembly stop before materializing the rest.
+pub(crate) struct SnapshotByteBudget {
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl SnapshotByteBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            remaining: limit,
+            exceeded: false,
+        }
+    }
+
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), NamespaceSnapshotTooLarge> {
+        match self.remaining.checked_sub(bytes) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => {
+                self.exceeded = true;
+                Err(NamespaceSnapshotTooLarge)
+            }
+        }
+    }
+
+    /// Settle a streamed write into this budget, reporting an exhausted budget
+    /// as [`NamespaceSnapshotTooLarge`] rather than as the I/O error it
+    /// surfaced as.
+    pub(crate) fn settle(&self, written: std::io::Result<()>) -> Result<(), anyhow::Error> {
+        if self.exceeded {
+            return Err(NamespaceSnapshotTooLarge.into());
+        }
+        written?;
+        Ok(())
+    }
+}
+
+impl std::io::Write for SnapshotByteBudget {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.charge(buf.len()).map_err(std::io::Error::other)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// SHA-256 and length of stored binary content. Snapshot representations
 /// carry this instead of the bytes, which `serde_json` would otherwise render
 /// as an array of numbers (tens of bytes of heap per stored byte).

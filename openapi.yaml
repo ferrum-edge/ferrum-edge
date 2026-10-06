@@ -4939,10 +4939,12 @@ paths:
         Admin-only, unfiltered primary snapshot for the deployment-v1 partial
         mutation profile. Contains complete proxy/plugin/association dependencies,
         spec metadata, raw store fields, historical credentials, trust, registry
-        metadata and the change watermark. Stored gzip spec documents,
-        external-reference snapshots and every other binary value appear only
-        as the SHA-256 and length of the stored bytes, never as the bytes.
-        Security audit admission is mandatory before disclosure. No queries or
+        metadata and the change watermark. Inside evidence and api_specs, stored
+        gzip spec documents, external-reference snapshots and every other binary
+        value appear only as the SHA-256 and length of the stored bytes.
+        api_spec_contents carries exactly one base64 copy of each stored spec
+        document and external-reference snapshot outside the evidence, bounded
+        at 256 MiB, so one read recovers them. Security audit admission is mandatory before disclosure. No queries or
         cached fallback are supported. Unknown/unrepresentable resource shapes
         refuse authority rather than being erased. MongoDB requires a replica set.
         Retain the original encrypted response and ETag; never refresh authority
@@ -8892,7 +8894,13 @@ components:
         conditional-authority bound, so no namespace token was issued or
         compared and nothing was applied. Stored API-spec documents and other
         binary content count only as a fixed-size SHA-256 digest and length.
-        Split the namespace or use the unconditional profile.
+        GET /deployment-snapshot also returns 507 when its base64 spec content
+        (api_spec_contents) would exceed 256 MiB. Deployment bodies report
+        durable "not_started" for a snapshot read or the pre-transaction check
+        of a mutation, and "not_committed" when the bound is hit inside the
+        rolled-back mutation transaction. The refusal is deterministic for
+        unchanged namespace state; do not retry it. Split the namespace or use
+        the unconditional profile.
       content:
         application/json:
           schema:
@@ -9108,7 +9116,7 @@ components:
         A local applied result does not prove all remote data planes applied.
     DeploymentSnapshot:
       type: object
-      required: [profile, namespace, namespace_etag, evidence, proxies, upstreams, plugin_configs, api_specs]
+      required: [profile, namespace, namespace_etag, evidence, proxies, upstreams, plugin_configs, api_specs, api_spec_contents]
       properties:
         profile:
           type: string
@@ -9159,10 +9167,38 @@ components:
                   - $ref: "#/components/schemas/StoredContentDigest"
                   - type: "null"
             description: |
-              Full spec metadata, identical to evidence.resources[5]. The stored
-              gzip document and external-reference snapshot are represented by
-              digest; read the bytes from a conditional backup
-              (spec_content_base64) or GET /api-specs/{id}.
+              Full spec metadata. The array is sorted by id in byte order and
+              equals evidence.resources[5]. The stored gzip document and
+              external-reference snapshot are represented by digest. Their
+              bytes are in api_spec_contents.
+        api_spec_contents:
+          type: array
+          description: |
+            One base64 copy of every stored API-spec document and
+            external-reference snapshot from the same primary snapshot, in the
+            same order as api_specs. It is outside evidence and not part of the
+            token's digest, but each value decodes to the exact stored bytes
+            whose StoredContentDigest the evidence fences, so this one read
+            recovers the original bytes. The base64 values together are bounded
+            at 256 MiB; past that the read returns 507 and discloses nothing.
+            GET /api-specs/{id} is no substitute: it returns the decompressed
+            (and possibly format-converted) document, which matches content_hash
+            only in the stored spec_format and never spec_content.sha256.
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, spec_content_base64, external_ref_snapshot_base64]
+            properties:
+              id:
+                type: string
+              spec_content_base64:
+                type: string
+                format: byte
+                description: Standard padded base64 of the stored gzip-compressed document
+              external_ref_snapshot_base64:
+                type: [string, "null"]
+                format: byte
+                description: Standard padded base64 of the stored external-reference snapshot, or null when none is stored
     StoredContentDigest:
       type: object
       additionalProperties: false

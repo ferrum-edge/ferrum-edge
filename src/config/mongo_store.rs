@@ -71,7 +71,7 @@ mod inner {
     };
     use crate::config::deployment_mutation::{
         DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-        ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
+        ExternalSpecUpstreamConflict, StoredEvidence, validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -5538,7 +5538,9 @@ mod inner {
             let snapshot = self
                 .conditional_namespace_snapshot_in_session(session, connection.as_ref(), namespace)
                 .await?;
-            let mut stored = serde_json::Map::new();
+            // Refuses an over-bound typed snapshot before any raw document is
+            // read; each document is charged as it is converted.
+            let mut stored = StoredEvidence::for_snapshot(&snapshot)?;
             // Credential representations and uniqueness hashes live on consumers;
             // their partial unique indexes do not own separate documents.
             for name in [
@@ -5558,7 +5560,6 @@ mod inner {
                     doc! { "namespace": namespace }
                 };
                 let mut cursor = collection.find(filter).session(&mut *session).await?;
-                let mut rows = Vec::new();
                 while cursor.advance(&mut *session).await? {
                     let document = cursor.deserialize_current()?;
                     if matches!(
@@ -5579,20 +5580,16 @@ mod inner {
                     let bson = mongodb::bson::to_vec(&document)?;
                     let bson_sha256 = hex::encode(crate::fips::approved::Sha256::digest(&bson));
                     drop(bson);
-                    rows.push(serde_json::json!({
+                    stored.push(serde_json::json!({
                         "document": serde_json::to_value(deployment_evidence_bson(
                             &Bson::Document(document),
                         ))?,
                         "bson_sha256": bson_sha256,
-                    }));
+                    }))?;
                 }
-                sort_stored_rows(&mut rows);
-                stored.insert(name.to_string(), serde_json::Value::Array(rows));
+                stored.end_table(name)?;
             }
-            Ok(DeploymentSnapshot {
-                snapshot,
-                stored: serde_json::Value::Object(stored),
-            })
+            Ok(stored.finish(snapshot))
         }
 
         async fn mutate_deployment_in_session(

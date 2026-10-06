@@ -2,12 +2,18 @@
 
 use crate::config::batch_atomicity::NamespaceConfigAdmissionLeaseRef;
 use crate::config::db_backend::{
-    ConditionalNamespaceSnapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES, SnapshotDigest,
-    SnapshotDigestWriter,
+    ConditionalNamespaceSnapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES, SnapshotByteBudget,
+    SnapshotDigest, SnapshotDigestWriter,
 };
 use crate::config::types::PluginScope;
 use serde_json::Value;
 use std::collections::HashSet;
+
+// Canonical framing of the deployment representation. Keys in canonical
+// (sorted) order: profile < resources < stored.
+const CANONICAL_HEAD: &[u8] = br#"{"profile":"deployment-v1","resources":"#;
+const CANONICAL_STORED: &[u8] = br#","stored":"#;
+const CANONICAL_TAIL: &[u8] = b"}";
 
 /// Typed evidence and raw store evidence read from the same primary transaction.
 /// Raw rows/documents retain unknown fields, credentials and association metadata;
@@ -30,6 +36,19 @@ impl DeploymentSnapshot {
         }))
     }
 
+    /// [`Self::representation`] by value: the raw evidence is moved, not
+    /// deep-cloned, and the typed snapshot is handed back to the caller.
+    pub fn into_representation(
+        self,
+    ) -> Result<(Value, ConditionalNamespaceSnapshot), serde_json::Error> {
+        let resources = self.snapshot.representation()?;
+        let mut representation = serde_json::Map::with_capacity(3);
+        representation.insert("profile".to_string(), Value::from("deployment-v1"));
+        representation.insert("resources".to_string(), resources);
+        representation.insert("stored".to_string(), self.stored);
+        Ok((Value::Object(representation), self.snapshot))
+    }
+
     /// Bounded digest of [`Self::representation`], streamed without
     /// materializing it.
     pub fn digest(&self) -> Result<SnapshotDigest, anyhow::Error> {
@@ -44,12 +63,11 @@ impl DeploymentSnapshot {
     }
 
     fn write_canonical<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
-        // Keys in canonical (sorted) order: profile < resources < stored.
-        out.write_all(br#"{"profile":"deployment-v1","resources":"#)?;
+        out.write_all(CANONICAL_HEAD)?;
         self.snapshot.write_canonical(out)?;
-        out.write_all(br#","stored":"#)?;
+        out.write_all(CANONICAL_STORED)?;
         crate::admin::preconditions::write_canonical_json_to(&self.stored, out)?;
-        out.write_all(b"}")
+        out.write_all(CANONICAL_TAIL)
     }
 
     pub(crate) fn replacement_is_noop(
@@ -437,11 +455,74 @@ pub(crate) async fn validate_deployment_candidate(
     .map_err(|_| anyhow::anyhow!("Deployment validation task did not complete"))?
 }
 
-/// Store order is immaterial; field values and embedded array order are not.
-pub(crate) fn sort_stored_rows(rows: &mut [Value]) {
-    rows.sort_by_cached_key(|row| {
+/// Raw store evidence assembled under one canonical-byte budget shared with
+/// the typed snapshot it accompanies. The typed snapshot and the framing are
+/// charged first, so a namespace that is over the bound on its typed resources
+/// alone is refused before any raw row or document is read. Every converted
+/// row is then charged as it is produced, so an over-bound namespace is
+/// refused before the rest of the raw evidence is materialized. The charges
+/// sum to exactly the canonical length of the finished
+/// [`DeploymentSnapshot`]'s representation, so this refuses precisely what
+/// [`DeploymentSnapshot::digest_within`] would refuse at the same bound.
+pub struct StoredEvidence {
+    budget: SnapshotByteBudget,
+    stored: serde_json::Map<String, Value>,
+    rows: Vec<(String, Value)>,
+}
+
+impl StoredEvidence {
+    /// Charge `snapshot` against [`MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES`].
+    pub fn for_snapshot(snapshot: &ConditionalNamespaceSnapshot) -> Result<Self, anyhow::Error> {
+        Self::for_snapshot_within(snapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES)
+    }
+
+    /// [`Self::for_snapshot`] with an explicit canonical-byte bound.
+    pub fn for_snapshot_within(
+        snapshot: &ConditionalNamespaceSnapshot,
+        limit: usize,
+    ) -> Result<Self, anyhow::Error> {
+        let mut budget = SnapshotByteBudget::new(limit);
+        // The framing, including the braces of the `stored` object.
+        let framing = CANONICAL_HEAD.len() + CANONICAL_STORED.len() + CANONICAL_TAIL.len() + 2;
+        budget.charge(framing)?;
+        let written = snapshot.write_canonical(&mut budget);
+        budget.settle(written)?;
+        Ok(Self {
+            budget,
+            stored: serde_json::Map::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Add one row or document of the table being collected, charging its
+    /// canonical rendering (and separator) before it is retained.
+    pub fn push(&mut self, row: Value) -> Result<(), anyhow::Error> {
         let mut canonical = String::new();
-        crate::admin::preconditions::write_canonical_json(row, &mut canonical);
-        canonical
-    });
+        crate::admin::preconditions::write_canonical_json(&row, &mut canonical);
+        let separator = usize::from(!self.rows.is_empty());
+        self.budget.charge(canonical.len().saturating_add(separator))?;
+        self.rows.push((canonical, row));
+        Ok(())
+    }
+
+    /// Close the table being collected under `name`. Store order is
+    /// immaterial; field values and embedded array order are not, so rows are
+    /// ordered by their canonical rendering.
+    pub fn end_table(&mut self, name: &str) -> Result<(), anyhow::Error> {
+        // `"name":[]` plus its separator. Table names are plain identifiers.
+        let separator = usize::from(!self.stored.is_empty());
+        self.budget.charge(name.len().saturating_add(5 + separator))?;
+        let mut rows = std::mem::take(&mut self.rows);
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let rows = rows.into_iter().map(|(_, row)| row).collect();
+        self.stored.insert(name.to_string(), Value::Array(rows));
+        Ok(())
+    }
+
+    pub fn finish(self, snapshot: ConditionalNamespaceSnapshot) -> DeploymentSnapshot {
+        DeploymentSnapshot {
+            snapshot,
+            stored: Value::Object(self.stored),
+        }
+    }
 }

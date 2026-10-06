@@ -29,7 +29,7 @@ use crate::config::db_backend::{
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-    ExternalSpecUpstreamConflict, deployment_known_columns, sort_stored_rows,
+    ExternalSpecUpstreamConflict, StoredEvidence, deployment_known_columns,
     validate_deployment_candidate,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
@@ -2956,6 +2956,9 @@ impl DatabaseStore {
             .iter()
             .map(row_to_api_spec)
             .collect::<Result<Vec<_>, _>>()?;
+        // Release the driver copy of every stored spec document now that each
+        // is decoded, rather than holding both until the snapshot returns.
+        drop(rows);
         let namespace_record = self.get_namespace_tx(tx, namespace).await?;
         let row = sqlx::query(&self.q(
             "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM config_changes WHERE namespace = ?",
@@ -3005,10 +3008,13 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        use futures_util::TryStreamExt;
+
         let snapshot = self
             .conditional_namespace_snapshot_tx(tx, namespace)
             .await?;
-        let mut stored = serde_json::Map::new();
+        // Refuses an over-bound typed snapshot before any raw row is read.
+        let mut stored = StoredEvidence::for_snapshot(&snapshot)?;
         for table in [
             "proxies",
             "consumers",
@@ -3026,21 +3032,17 @@ impl DatabaseStore {
             } else {
                 "namespace"
             };
-            let rows = sqlx::query(&self.q(&format!("SELECT * FROM {table} WHERE {column} = ?")))
-                .bind(namespace)
-                .fetch_all(&mut **tx)
-                .await?;
-            let mut rows = rows
-                .iter()
-                .map(deployment_raw_sql_row)
-                .collect::<Result<Vec<_>, _>>()?;
-            sort_stored_rows(&mut rows);
-            stored.insert(table.to_string(), serde_json::Value::Array(rows));
+            let query = self.q(&format!("SELECT * FROM {table} WHERE {column} = ?"));
+            // Stream rows so each is converted and charged against the
+            // representation bound before the next one is fetched.
+            let mut rows = sqlx::query(&query).bind(namespace).fetch(&mut **tx);
+            while let Some(row) = rows.try_next().await? {
+                stored.push(deployment_raw_sql_row(&row)?)?;
+            }
+            drop(rows);
+            stored.end_table(table)?;
         }
-        Ok(DeploymentSnapshot {
-            snapshot,
-            stored: serde_json::Value::Object(stored),
-        })
+        Ok(stored.finish(snapshot))
     }
 
     async fn load_deployment_snapshot_inner(
