@@ -31,7 +31,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 These changes affect only the sample `docker-compose.yml`, the SQL TLS test
 stack (`docker-compose.tls-test.yml`, `scripts/setup_db_tls.sh`) and local
 functional tests. Images, Helm charts and binaries are unchanged. Advisories:
-GHSA-wq9h-xxp4-7r2m and GHSA-x87v-w7p2-77f4.
+GHSA-wq9h-xxp4-7r2m and GHSA-x87v-w7p2-77f4; see issue #6002.
 
 **MongoDB sample profile.** `docker compose up` no longer starts MongoDB, and
 there is no default password. Start it explicitly:

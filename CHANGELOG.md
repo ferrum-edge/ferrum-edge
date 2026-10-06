@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING (developer fixtures) — sample Compose MongoDB and SQL TLS test
   fixtures no longer have working default credentials or wildcard ports**
-  (GHSA-wq9h-xxp4-7r2m, GHSA-x87v-w7p2-77f4; #6002). Affects only the
+  (issue #6002; GHSA-wq9h-xxp4-7r2m, GHSA-x87v-w7p2-77f4). Affects only the
   source-tree `docker-compose.yml`, `docker-compose.tls-test.yml` and SQL TLS
   helper shipped in v0.9.0–v0.9.12; no container image, Helm chart or binary
   contains them. See the
