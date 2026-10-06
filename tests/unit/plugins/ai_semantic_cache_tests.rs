@@ -6730,7 +6730,9 @@ async fn redis_quarantine_without_a_dial_permit_never_waits() {
     let cache_key = "permit-exhausted-key";
     let fingerprint = quarantine_fp("permit-exhausted");
     assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
-        &plugin, cache_key, fingerprint
+        &plugin,
+        cache_key,
+        fingerprint
     ));
 
     let held = ai_semantic_cache_redis_quarantine_hold_all_dials_for_test(&plugin);

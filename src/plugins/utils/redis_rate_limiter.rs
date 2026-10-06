@@ -4056,7 +4056,10 @@ impl RedisRateLimitClient {
                 // no-eviction memory policy) before the connection is published
                 // to the hot path: a Cluster endpoint or an evicting Redis must
                 // never serve a policy operation.
-                if !self.screen_and_arm(&mut conn, DedicatedDialPurpose::Policy).await {
+                if !self
+                    .screen_and_arm(&mut conn, DedicatedDialPurpose::Policy)
+                    .await
+                {
                     return None;
                 }
                 // Re-check at the publication boundary: another task may have
