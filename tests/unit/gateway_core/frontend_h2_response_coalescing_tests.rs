@@ -145,7 +145,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WindowTricklingClient<S> {
             self.io.read_exact(&mut head).await.expect("frame header");
             let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
             let mut payload = vec![0_u8; len];
-            self.io.read_exact(&mut payload).await.expect("frame payload");
+            self.io
+                .read_exact(&mut payload)
+                .await
+                .expect("frame payload");
             match (head[3], head[4]) {
                 (H2_DATA, flags) => {
                     self.received += len;
@@ -168,7 +171,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WindowTricklingClient<S> {
     /// Opens the connection window by `INCREMENT` bytes.
     async fn grant(&mut self) {
         let increment = INCREMENT.to_be_bytes();
-        self.write(&h2_frame(H2_WINDOW_UPDATE, 0, 0, &increment)).await;
+        self.write(&h2_frame(H2_WINDOW_UPDATE, 0, 0, &increment))
+            .await;
     }
 }
 
