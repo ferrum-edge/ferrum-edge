@@ -259,7 +259,7 @@ mod tests {
     fn open_with_wrong_key_returns_none() {
         let codec = SessionCookieCodec::new(SECRET, None, 4000).expect("codec");
         let other =
-            SessionCookieCodec::new("2d8b6f0a4c1e9375b8d2f6a0c4e19753", None, 4000).expect("codec");
+            SessionCookieCodec::new("a-different-key-for-wrong-key-tests", None, 4000).expect("codec");
         let sealed = codec.seal(b"payload").expect("seal");
         assert!(other.open(&sealed).is_none());
     }
