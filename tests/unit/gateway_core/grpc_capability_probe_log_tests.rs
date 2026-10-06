@@ -735,3 +735,49 @@ async fn request_waiter_after_probe_debug_publication_upgrades_once() {
         "request joining after probe DEBUG must upgrade once: {captured}"
     );
 }
+
+/// Issue #6032: a request that joined a probe-owned create re-dials instead of
+/// returning the probe's failure, and its own attempt logs at request
+/// severity. The probe's failure therefore keeps the probe's severity, so one
+/// outage is not logged twice and an expected h2c miss stays DEBUG.
+#[test]
+fn probe_owned_attempt_keeps_probe_severity_when_requests_joined() {
+    let (logs, _guard) = capture_debug_logs();
+    let attempt = CoalescedCreateAttempt::new_probe_owned();
+    note_grpc_establishment_join(&attempt, GrpcEstablishmentPurpose::Request);
+    log_grpc_coalesced_establishment_failure(
+        &attempt,
+        GrpcEstablishmentPurpose::CapabilityProbe,
+        "backend.example",
+        "127.0.0.1:80",
+        &h2c_handshake_miss(),
+    );
+    note_grpc_establishment_waiter_failure(&attempt, GrpcEstablishmentPurpose::Request);
+    upgrade_grpc_coalesced_establishment_log(&attempt);
+
+    let captured = logs.contents();
+    assert_eq!(count_substr(&captured, DEBUG_PROBE), 1, "{captured}");
+    assert_eq!(
+        count_substr(&captured, WARN_ESTABLISH),
+        0,
+        "a probe-owned failure is not a joined request's outcome: {captured}"
+    );
+}
+
+#[test]
+fn request_owned_attempt_still_logs_request_severity_for_a_probe_failure() {
+    let (logs, _guard) = capture_debug_logs();
+    let attempt = CoalescedCreateAttempt::new();
+    note_grpc_establishment_join(&attempt, GrpcEstablishmentPurpose::Request);
+    log_grpc_coalesced_establishment_failure(
+        &attempt,
+        GrpcEstablishmentPurpose::CapabilityProbe,
+        "backend.example",
+        "127.0.0.1:80",
+        &h2c_handshake_miss(),
+    );
+
+    let captured = logs.contents();
+    assert_eq!(count_substr(&captured, DEBUG_PROBE), 0, "{captured}");
+    assert_eq!(count_substr(&captured, WARN_ESTABLISH), 1, "{captured}");
+}

@@ -1,7 +1,8 @@
 //! Behavioral coverage for GenericPool create-failure fan-out (#2950).
 //!
 //! External (non-inline) tests for: one-create fan-out, creator cancel/drop,
-//! later independent retry, and pool-key isolation. Classification parity for
+//! later independent retry, pool-key isolation, and probe-owned failures that
+//! must not reach request waiters (#6032). Classification parity for
 //! H2/gRPC/H3 adapters lives in `pool_create_failure_classification_tests.rs`.
 
 use async_trait::async_trait;
@@ -10,7 +11,7 @@ use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
 };
-use ferrum_edge::pool::{GenericPool, PoolManager, SharedPoolCreateError};
+use ferrum_edge::pool::{GenericPool, PoolCreateCaller, PoolManager, SharedPoolCreateError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -319,4 +320,160 @@ async fn external_generic_pool_clears_pending_state_when_creator_is_cancelled() 
         .unwrap();
     assert_eq!(waiter_result, "recovered-after-cancel");
     assert_eq!(pool.cached(&key).as_deref(), Some("recovered-after-cancel"));
+}
+
+/// Issue #6032: a capability probe dials with a capped connect budget, and
+/// connect timeout is not part of the pool key, so a live request can join a
+/// probe-owned create. That create's failure must not reach the request: it
+/// re-elects and dials under its own budget. Probe waiters still share the
+/// probe's failure, and the request waiters re-coalesce onto one dial.
+#[tokio::test]
+async fn external_probe_owned_create_failure_is_not_broadcast_to_request_waiters() {
+    let manager = Arc::new(FanoutTestManager {
+        healthy: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let pool = GenericPool::new(manager, PoolConfig::default(), Duration::from_secs(60), 64);
+    let key = "backend.example.com|8080|0".to_string();
+    let probe_started = Arc::new(Notify::new());
+    let probe_release = Arc::new(Notify::new());
+    let probe_waiter_dials = Arc::new(AtomicUsize::new(0));
+    let request_dials = Arc::new(AtomicUsize::new(0));
+
+    let probe = {
+        let pool = pool.clone();
+        let key = key.clone();
+        let probe_started = probe_started.clone();
+        let probe_release = probe_release.clone();
+        tokio::spawn(async move {
+            pool.create_or_get_existing_owned_as(
+                key,
+                PoolCreateCaller::CapabilityProbe,
+                move |_key| async move {
+                    probe_started.notify_waiters();
+                    probe_release.notified().await;
+                    Err::<String, _>(anyhow::anyhow!("probe connect budget exhausted"))
+                },
+            )
+            .await
+        })
+    };
+    probe_started.notified().await;
+
+    let probe_waiter = {
+        let pool = pool.clone();
+        let key = key.clone();
+        let probe_waiter_dials = probe_waiter_dials.clone();
+        tokio::spawn(async move {
+            pool.create_or_get_existing_owned_as(
+                key,
+                PoolCreateCaller::CapabilityProbe,
+                move |_key| async move {
+                    probe_waiter_dials.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>("probe-waiter-dial".to_string())
+                },
+            )
+            .await
+        })
+    };
+
+    let mut requests = Vec::new();
+    for _ in 0..4 {
+        let pool = pool.clone();
+        let key = key.clone();
+        let request_dials = request_dials.clone();
+        requests.push(tokio::spawn(async move {
+            pool.create_or_get_existing_owned(key, move |_key| async move {
+                request_dials.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, anyhow::Error>("request-dial".to_string())
+            })
+            .await
+        }));
+    }
+
+    // Let every waiter register on the probe's pending entry before it fails.
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(request_dials.load(Ordering::SeqCst), 0);
+    probe_release.notify_waiters();
+
+    assert!(
+        probe.await.unwrap().is_err(),
+        "the probe creator keeps its own failure"
+    );
+    assert!(
+        probe_waiter.await.unwrap().is_err(),
+        "a probe waiter shares the probe-owned failure"
+    );
+    assert_eq!(probe_waiter_dials.load(Ordering::SeqCst), 0);
+    for request in requests {
+        let connection = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("request waiters must re-elect, not wait on a retired entry")
+            .unwrap()
+            .expect("a probe-owned failure must not fail a joined request");
+        assert_eq!(connection, "request-dial");
+    }
+    assert_eq!(
+        request_dials.load(Ordering::SeqCst),
+        1,
+        "re-elected request waiters coalesce onto one dial under their own budget"
+    );
+    assert_eq!(pool.cached(&key).as_deref(), Some("request-dial"));
+}
+
+/// The re-election is scoped to probe-owned creates: a request creator's
+/// failure still fans out to request waiters without a second dial (#2950).
+#[tokio::test]
+async fn external_request_owned_create_failure_still_fans_out_to_request_waiters() {
+    let manager = Arc::new(FanoutTestManager {
+        healthy: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let pool = GenericPool::new(manager, PoolConfig::default(), Duration::from_secs(60), 64);
+    let key = "backend.example.com|8080|0".to_string();
+    let creator_started = Arc::new(Notify::new());
+    let creator_release = Arc::new(Notify::new());
+    let waiter_dials = Arc::new(AtomicUsize::new(0));
+
+    let creator = {
+        let pool = pool.clone();
+        let key = key.clone();
+        let creator_started = creator_started.clone();
+        let creator_release = creator_release.clone();
+        tokio::spawn(async move {
+            pool.create_or_get_existing_owned(key, move |_key| async move {
+                creator_started.notify_waiters();
+                creator_release.notified().await;
+                Err::<String, _>(anyhow::anyhow!("request connect budget exhausted"))
+            })
+            .await
+        })
+    };
+    creator_started.notified().await;
+
+    let waiter = {
+        let pool = pool.clone();
+        let key = key.clone();
+        let waiter_dials = waiter_dials.clone();
+        tokio::spawn(async move {
+            pool.create_or_get_existing_owned(key, move |_key| async move {
+                waiter_dials.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, anyhow::Error>("waiter-dial".to_string())
+            })
+            .await
+        })
+    };
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+    }
+    creator_release.notify_waiters();
+
+    assert!(creator.await.unwrap().is_err());
+    assert!(
+        waiter.await.unwrap().is_err(),
+        "a request-owned failure is shared with request waiters"
+    );
+    assert_eq!(waiter_dials.load(Ordering::SeqCst), 0);
 }
