@@ -33,7 +33,7 @@ docker run -d --name ferrum-scale-test-pg \
   -e POSTGRES_USER=ferrum \
   -e POSTGRES_PASSWORD=ferrum-scale-test \
   -e POSTGRES_DB=ferrum_scale \
-  -p 25432:5432 postgres:16
+  -p 127.0.0.1:25432:5432 postgres:16
 ```
 
 The test automatically skips if the container isn't running.

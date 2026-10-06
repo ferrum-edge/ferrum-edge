@@ -302,15 +302,20 @@ docker-compose --profile postgres up ferrum-postgres
 ### 3. MongoDB Single-Node (NoSQL Alternative)
 
 ```bash
-# Start services
-docker compose --profile mongodb up -d
+# Required: there is no default MongoDB password. Use at least 32 characters from
+# A-Z a-z 0-9 . _ ~ - (the gateway embeds it in its mongodb:// URL unescaped).
+export MONGO_PASSWORD="$(openssl rand -hex 32)"
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
+
+# Start only the MongoDB services (they are not part of default startup)
+docker compose --profile mongodb up -d mongodb ferrum-mongodb
 
 # Verify (the container's built-in HEALTHCHECK runs `ferrum-edge health` on
 # loopback inside the pod; the admin port is not published to the host by default)
 docker compose ps   # STATUS column shows healthy/unhealthy
 ```
 
-Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
+Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. The Mongo container refuses to start with a missing, short, or non-URL-safe `MONGO_PASSWORD`, and port `27017` is not published to the host. `MONGO_PASSWORD` only seeds a new volume; to change the password of an existing volume (including one created with the old `dev-password-change-in-production` default), follow [the upgrade guide](upgrade_guide.md#development-compose-fixtures-unreleased). See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
 
 **Key differences from SQL**:
 - Indexes created automatically instead of SQL migrations

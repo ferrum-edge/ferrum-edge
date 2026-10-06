@@ -73,7 +73,7 @@ docker run -d --name ferrum-load-test-pg \
   -e POSTGRES_USER=ferrum \
   -e POSTGRES_PASSWORD=ferrum-load-test \
   -e POSTGRES_DB=ferrum_load \
-  -p 25433:5432 \
+  -p 127.0.0.1:25433:5432 \
   postgres:16
 ```
 

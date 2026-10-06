@@ -216,22 +216,33 @@ Use `FERRUM_DB_TLS_MODE=require` or stricter for PostgreSQL client-certificate a
 
 ### Docker Example
 
+The database joins a private Docker network with the gateway and publishes no
+host port. Passwords stay in private files and env files, never on a command
+line.
+
 ```bash
-# Generate test certificates
-openssl genrsa -out ca.key 4096
-openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/CN=Test CA"
-openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr -subj "/CN=postgres"
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -days 365 -out server.crt
+# Generate test certificates; the server certificate names the container host
+mkdir -p certs
+openssl genrsa -out certs/ca.key 4096
+openssl req -new -x509 -days 365 -key certs/ca.key -out certs/ca.crt -subj "/CN=Test CA"
+openssl genrsa -out certs/server.key 2048
+openssl req -new -key certs/server.key -out certs/server.csr -subj "/CN=pg-tls"
+printf 'subjectAltName=DNS:pg-tls\n' > certs/server.ext
+openssl x509 -req -in certs/server.csr -CA certs/ca.crt -CAkey certs/ca.key \
+  -CAcreateserial -days 365 -extfile certs/server.ext -out certs/server.crt
+
+# Generate a private password file
+(umask 077 && openssl rand -hex 32 > certs/pg-password)
+
+docker network create ferrum-db
 
 # Start PostgreSQL with TLS
 docker run -d \
   --name pg-tls \
-  -p 5432:5432 \
+  --network ferrum-db \
   -e POSTGRES_DB=ferrum \
   -e POSTGRES_USER=ferrum \
-  -e POSTGRES_PASSWORD=secret \
+  -e POSTGRES_PASSWORD_FILE=/certs-src/pg-password \
   -v $(pwd)/certs:/certs-src:ro \
   --entrypoint sh \
   postgres:16 \
@@ -246,11 +257,14 @@ docker run -d \
         -c ssl_key_file=/var/lib/postgresql/server.key \
         -c ssl_ca_file=/var/lib/postgresql/ca.crt'
 
-# Start gateway with TLS verification
+# Start gateway with TLS verification; the credential-bearing URL is in a private env file
+(umask 077 && printf 'FERRUM_DB_URL=postgres://ferrum:%s@pg-tls:5432/ferrum\n' \
+  "$(cat certs/pg-password)" > gateway.env)
 docker run -d \
+  --network ferrum-db \
+  --env-file gateway.env \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=postgres \
-  -e FERRUM_DB_URL="postgres://ferrum:secret@host.docker.internal:5432/ferrum" \
   -e FERRUM_DB_TLS_MODE=verify-full \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
   -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
@@ -316,14 +330,24 @@ export FERRUM_DB_TLS_CLIENT_KEY_PATH=/etc/ferrum/certs/client.key
 ### Docker Example
 
 ```bash
+# Same private-network pattern as PostgreSQL. server-cert.pem must carry
+# subjectAltName=DNS:mysql-tls, and the mounted key must be readable by the
+# container's mysql user.
+(umask 077 && openssl rand -hex 32 > certs/mysql-password \
+  && openssl rand -hex 32 > certs/mysql-root-password)
+
+docker network create ferrum-db   # skip if it already exists
+
 # Start MySQL with TLS
 docker run -d \
   --name mysql-tls \
-  -p 3306:3306 \
+  --network ferrum-db \
   -e MYSQL_DATABASE=ferrum \
   -e MYSQL_USER=ferrum \
-  -e MYSQL_PASSWORD=secret \
-  -e MYSQL_ROOT_PASSWORD=root-secret \
+  -e MYSQL_PASSWORD_FILE=/run/secrets/mysql-password \
+  -e MYSQL_ROOT_PASSWORD_FILE=/run/secrets/mysql-root-password \
+  -v $(pwd)/certs/mysql-password:/run/secrets/mysql-password:ro \
+  -v $(pwd)/certs/mysql-root-password:/run/secrets/mysql-root-password:ro \
   -v $(pwd)/certs/server-cert.pem:/etc/mysql/ssl/server-cert.pem:ro \
   -v $(pwd)/certs/server-key.pem:/etc/mysql/ssl/server-key.pem:ro \
   -v $(pwd)/certs/ca.pem:/etc/mysql/ssl/ca.pem:ro \
@@ -333,11 +357,14 @@ docker run -d \
   --ssl-key=/etc/mysql/ssl/server-key.pem \
   --ssl-ca=/etc/mysql/ssl/ca.pem
 
-# Start gateway
+# Start gateway; the credential-bearing URL is in a private env file
+(umask 077 && printf 'FERRUM_DB_URL=mysql://ferrum:%s@mysql-tls:3306/ferrum\n' \
+  "$(cat certs/mysql-password)" > gateway.env)
 docker run -d \
+  --network ferrum-db \
+  --env-file gateway.env \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=mysql \
-  -e FERRUM_DB_URL="mysql://ferrum:secret@host.docker.internal:3306/ferrum" \
   -e FERRUM_DB_TLS_MODE=verify-full \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
   -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
@@ -530,18 +557,12 @@ when the containers are not running.
 
 ### Setup
 
-The Compose/SQL setup changes on this candidate branch require owner approval
-before adoption for the released 0.9.10 profiles. See
-[the fixture security proposal](security/compose-fixture-security-proposal.md).
-The SQL helper generates fresh passwords, a separate MySQL root password, and
-seven-day certificates in a newly created directory. It refuses an existing
-directory or container instead of replacing it. Its default directory remains
-`/tmp/ferrum-db-tls-certs`; pass another absolute path with an existing parent
-to isolate the material. Do not use a shared directory or real database data.
-The implementation now lives in `scripts/setup_db_tls.sh`, inside the frozen
-checker's scanned automation roots. The released `tests/scripts/setup_db_tls.sh`
-path remains a manual forwarding entrypoint for the five existing SQL cells;
-the qualification workflow calls the `scripts/` implementation directly.
+`scripts/setup_db_tls.sh` (also reachable as `tests/scripts/setup_db_tls.sh`)
+creates a disposable PostgreSQL/MySQL TLS stack from `docker-compose.tls-test.yml`.
+It needs Docker Compose v2 and OpenSSL. Each run generates a fresh CA,
+seven-day certificates, and random PostgreSQL, MySQL and MySQL root passwords
+in a new private directory (default `/tmp/ferrum-db-tls-certs`; pass another
+path whose parent exists). Never point it at real database data.
 
 ```bash
 # Generate certificates and start TLS-enabled PostgreSQL/MySQL containers
@@ -554,55 +575,73 @@ the qualification workflow calls the `scripts/` implementation directly.
 cargo build
 ```
 
-Both SQL ports publish explicitly on `127.0.0.1` (`15432` and `13306`). The
-private directory is mode `0700`; keys, passwords, client option files, and
-`connections.env` are mode `0600`. Compose passes password file paths to the
-official image entrypoints, and the healthchecks run authenticated `SELECT 1`
-with CA and hostname verification. MySQL clients use an option file; PostgreSQL
-clients pass the password through `PGPASSWORD`. Passwords are absent from the
-client/Docker CLI argument lists and the healthcheck configuration. They can
-still be read by the operator, Docker administrators, or privileged processes
-through files, memory, and process environments. Compose file-backed secrets
-are bind mounts, not encrypted secret storage; host permissions matter.
+What the helper guarantees:
 
-`connections.env` contains `PG_TLS_URL` and `MYSQL_TLS_URL`, without printing
-them during setup. These generated passwords are hexadecimal, so their URI
-password components require no percent encoding. Read the file privately into
-a client environment; do not print it, pass a credential-bearing URI as a CLI
-argument, enable shell tracing, or commit it. TLS settings still need explicit
-CA/hostname verification when a client consumes these URLs. Operator-supplied
-material for direct Compose use must follow the file layout in the helper,
-including the client option files and PostgreSQL HBA file; arbitrary passwords
-also require correct MySQL option-file quoting and URI percent encoding.
-`CERTS_DIR` is required for direct Compose use and has no shared-directory
-fallback. The helper is the supported path for generating the complete layout.
+- **Loopback only.** PostgreSQL publishes `127.0.0.1:15432` and MySQL
+  `127.0.0.1:13306`; nothing listens on other host interfaces.
+- **TLS required.** PostgreSQL rejects every non-TLS TCP connection
+  (`hostnossl ... reject`) and MySQL runs with `require_secure_transport=ON`.
+  The healthchecks run an authenticated `SELECT 1` with CA and hostname
+  verification.
+- **No fixed credentials.** Passwords are generated per run and reach the
+  containers as Compose file secrets (`*_PASSWORD_FILE`) and MySQL option files.
+  They never appear on a command line, in the healthcheck configuration, or in
+  setup output, and setup failures do not dump container logs.
+- **Private files.** The directory is mode `0700`; keys, passwords, option files
+  and `connections.env` are `0600`. These are plain bind-mounted files, not
+  encrypted secret storage, so anyone with Docker or root access on the host can
+  still read them (including from the database processes' environment).
+- **Safe reruns.** Setup refuses an existing directory or an existing
+  `ferrum-test-pg-tls` / `ferrum-test-mysql-tls` container rather than replacing
+  it, and refuses a directory inside the repository checkout unless you pass
+  `--allow-repo-dir` (the default name and `connections.env` are gitignored).
+  Remove containers or directories left by older versions of the helper
+  manually: `docker rm -f ferrum-test-pg-tls ferrum-test-mysql-tls` and delete
+  the old directory.
 
-**Candidate compatibility dependency:** the SQL cells in
-`tests/functional/functional_db_tls_test.rs` currently construct URLs with
-`test-password`. They will not connect to these fresh credentials. Hosted
-data-plane CI continues to provision its own unchanged fixtures inline in
-`.github/workflows/ci.yml`. Before adopting this helper for the Rust suite,
-the test owner must replace the hard-coded SQL credentials with private input
-URLs and approve any matching change to the guarded hosted fixture contract.
-The new `Compose Fixture Qualification` workflow exercises this candidate
-separately; its result is not evidence that the existing Rust suite supports
-generated credentials. Do not restore the known password to make those cells
-work. The commands below describe the existing suite and require that consumer
-update when using this candidate's helper.
+`connections.env` holds two lines for clients on the host:
 
-For the ordinary Mongo Compose sample, set `MONGO_PASSWORD` to at least 32
-hexadecimal characters (for example, a fresh `openssl rand -hex 32` value).
-Start just its services with
-`docker compose --profile mongodb up -d mongodb ferrum-mongodb`. Both Mongo
-services now belong to that profile. Missing, empty, too-short, and
-non-hexadecimal passwords fail in the Mongo container entrypoint before the
-official initialization script runs, including when a database volume exists.
-Compose `config` still accepts an absent Mongo password: validation is at
-startup, allowing unrelated profiles to interpolate without that variable.
-The sample does not publish port `27017`; network peers on its Compose bridge
-can reach Mongo, and any added publication or route changes that exposure.
-Changing an initialization password does not rotate existing Mongo users;
-follow the proposal's volume rotation requirements before reuse.
+```text
+PG_TLS_URL=postgres://ferrum:<generated>@localhost:15432/ferrum?sslmode=verify-full&sslrootcert=<dir>/ca.crt
+MYSQL_TLS_URL=mysql://ferrum:<generated>@localhost:13306/ferrum?ssl-mode=VERIFY_IDENTITY&ssl-ca=<dir>/ca.crt
+```
+
+Generated passwords are hexadecimal and the directory path is limited to
+`A-Z a-z 0-9 . _ - /`, so the URLs need no escaping. Load them into a client's
+environment instead of printing them or passing them as command-line arguments.
+The functional tests read this file from `FERRUM_TEST_CERT_DIR` (default
+`/tmp/ferrum-db-tls-certs`); they strip the URL's TLS query and set
+`FERRUM_DB_TLS_MODE` per test instead. There is no fallback password: a running
+fixture without `connections.env` fails the SQL TLS tests.
+
+Hosted data-plane CI provisions its own SQL TLS containers inline in
+`.github/workflows/ci.yml` with the same contract: loopback-only ports,
+generated file-based credentials, and `connections.env` under
+`FERRUM_TEST_CERT_DIR`. It also sets `FERRUM_DB_TLS_REQUIRED=1`.
+
+The files are owned by your user with mode `0600` and are read inside the
+containers by root. Under Docker user-namespace remapping, container root
+cannot read them and the fixture fails to start; run it on a daemon without
+`userns-remap`.
+
+#### MongoDB sample profile
+
+The MongoDB services in `docker-compose.yml` are opt-in and have no default
+password:
+
+```bash
+export MONGO_PASSWORD="$(openssl rand -hex 32)"
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
+docker compose --profile mongodb up -d mongodb ferrum-mongodb
+```
+
+The Mongo container refuses to start when `MONGO_PASSWORD` is missing, shorter
+than 32 characters, or contains characters outside `A-Z a-z 0-9 . _ ~ -` (the
+gateway embeds it in its `mongodb://` URL without escaping). Port `27017` is not
+published to the host. Changing `MONGO_PASSWORD` does not change the password
+stored in an existing volume; see
+[the upgrade guide](upgrade_guide.md#development-compose-fixtures-unreleased) to
+rotate it.
 
 ### Run Tests
 
@@ -651,15 +690,13 @@ Each test performs a complete CRUD cycle:
 ./scripts/setup_db_tls.sh --cleanup
 ```
 
-Pass the same custom directory after `--cleanup` if one was used at setup.
-Cleanup verifies the ownership marker and container path labels, then removes
-the disposable containers, their volumes/network, and the private directory.
-Startup failure attempts the same cleanup without dumping database logs.
-Successful setup retains the material until explicit cleanup. Unlinking is
-not guaranteed secure erasure; interrupted cleanup or daemon failure can leave
-material and must be handled by the operator. An old helper directory lacks
-the ownership marker and is deliberately refused: retire the old containers
-and private material explicitly before adopting the candidate.
+Pass the same custom directory after `--cleanup` if you used one at setup.
+Cleanup checks the directory's ownership marker and the containers' path labels,
+then removes the containers, their volumes and network, and the private
+directory. A failed setup runs the same cleanup. Deleting files is not secure
+erasure. If cleanup is interrupted, remove the containers and directory by hand.
+Directories created by older versions of the helper have no ownership marker, so
+cleanup refuses them; delete them manually.
 
 ## Troubleshooting
 

@@ -1048,13 +1048,13 @@ async fn test_scale_perf_30k_proxies_postgres() {
     // Check for the PostgreSQL container
     // Start with: docker run -d --name ferrum-scale-test-pg \
     //   -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD=ferrum-scale-test \
-    //   -e POSTGRES_DB=ferrum_scale -p 25432:5432 postgres:16
+    //   -e POSTGRES_DB=ferrum_scale -p 127.0.0.1:25432:5432 postgres:16
     if !is_container_running("ferrum-scale-test-pg") {
         println!("SKIPPED: ferrum-scale-test-pg container not running.");
         println!("Start it with:");
         println!("  docker run -d --name ferrum-scale-test-pg \\");
         println!("    -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD=ferrum-scale-test \\");
-        println!("    -e POSTGRES_DB=ferrum_scale -p 25432:5432 postgres:16");
+        println!("    -e POSTGRES_DB=ferrum_scale -p 127.0.0.1:25432:5432 postgres:16");
         return;
     }
 
