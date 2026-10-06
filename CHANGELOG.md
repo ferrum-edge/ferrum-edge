@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A client reset of a pumped HTTP/2 upload reaches the backend as
+  `CANCEL`** (#6038). A direct HTTP/2 upload runs through a gateway-owned pump
+  when the route has a request size limit and a `backend_write_timeout_ms`,
+  or an authenticated stream lifetime. A client `RST_STREAM` makes hyper drop
+  the request handler, which cancels that pump, and the cancellation could win
+  the race against the pump reading the same reset from the client body. The
+  backend then got `RST_STREAM(INTERNAL_ERROR)`, hyper's code for the
+  gateway's own cancellation, instead of `CANCEL`. A cancelled pump for an
+  HTTP/2 upload now checks the client body once, without waiting, for a reset
+  that has already arrived, and passes it on as `CANCEL`.
 - **Backend HTTP/2 resets mid-response count as backend failures** (#6019).
   A backend `RST_STREAM` or `GOAWAY` with any reason other than `NO_ERROR`
   after response headers reached the body classifier as a hyper body error
@@ -37,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **HTTP/2 small-window coalescing follow-ups** (#6038). New tests drive the
+  production frontend accept loop over h2c and TLS with a raw client that
+  opens its window a few bytes at a time, proving that both frontend HTTP/2
+  builders give the response pipe a timer. The real-time gRPC pool test now
+  proves the bounded wait with a lower bound that holds on a loaded runner,
+  and allows small frames up to half the increments instead of 16 of 128.
+  Hyper patch 005's notes now explain the deliberate spurious wake after a
+  hold that ends early and reason about the unmeasured cost against a 64 KiB
+  window. They also list HTTP/2 CONNECT tunnels (WebSocket over HTTP/2,
+  inbound HBONE) as not covered: hyper's tunnel task applies no flow-control
+  backpressure, so a bounded hold there would change write and shutdown
+  behaviour as well as framing.
 - **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
   backend now answers before reading any request DATA, then drains the full
   2 MiB upload, alongside the existing variant that reads one DATA frame first.

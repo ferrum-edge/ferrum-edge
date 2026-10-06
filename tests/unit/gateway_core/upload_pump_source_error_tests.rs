@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use bytes::Bytes;
 use http_body::Frame;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{BoxError, PUMP_SOURCE_ERROR, PUMP_SOURCE_RESET};
+use super::{BoxError, PUMP_CANCELLED, PUMP_SOURCE_ERROR, PUMP_SOURCE_RESET};
 use super::{UploadPumpJoin, UploadPumpOutcome, UploadPumpSource};
 use super::{
     is_h2_source_cancel, spawn_upload_pump, spawn_upload_pump_with_deferred_write,
@@ -319,6 +319,93 @@ async fn masked_reset_is_still_nonclean_but_terminal_trailers_complete_normally(
     assert!(ended.is_none());
     assert_eq!(join.join().await, Some(UploadPumpOutcome::Completed));
     assert_eq!(state.releases.load(Ordering::Acquire), 1);
+}
+
+/// A client body whose reset has arrived but has not been polled yet: it is
+/// `Pending` until `reset` is set, then yields the reset.
+struct LateResetBody {
+    reset: Arc<AtomicBool>,
+    state: Arc<BodyState>,
+}
+
+impl Drop for LateResetBody {
+    fn drop(&mut self) {
+        self.state.releases.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl http_body::Body for LateResetBody {
+    type Data = Bytes;
+    type Error = h2::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, h2::Error>>> {
+        self.state.polls.fetch_add(1, Ordering::Relaxed);
+        if self.reset.load(Ordering::Acquire) {
+            Poll::Ready(Some(Err(h2::Error::from(h2::Reason::CANCEL))))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Issue #6038: hyper's frontend stream task drops the direct-H2 handler, and
+/// with it a `cancel_on_drop` join, as soon as it sees the client's
+/// RST_STREAM. That cancellation can reach the pump before the pump polls the
+/// body carrying the same reset. The reset must still reach the backend as
+/// CANCEL, not as the gateway's own cancellation, which hyper's writer sends
+/// as INTERNAL_ERROR. Without a reset, or without the HTTP/2 end-of-stream
+/// gate, the cancellation stays the gateway's own.
+#[tokio::test]
+async fn dispatcher_cancel_racing_a_client_reset_keeps_the_reset() {
+    for (client_reset, require_end_stream, expected) in [
+        (true, true, PUMP_SOURCE_RESET),
+        (false, true, PUMP_CANCELLED),
+        (true, false, PUMP_CANCELLED),
+    ] {
+        let reset = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(BodyState::default());
+        let body = LateResetBody {
+            reset: Arc::clone(&reset),
+            state: Arc::clone(&state),
+        };
+        // No plan and no write bound: the pump runs on its own task, as a
+        // direct-H2 pump does once the response head has arrived.
+        let (mut source, join) = spawn_upload_pump(body, None, 0, require_end_stream);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state.polls.load(Ordering::Relaxed) >= 1,
+            "the pump is parked on the client body"
+        );
+        // The reset arrives, then the handler drop cancels the pump before
+        // its task runs again.
+        reset.store(client_reset, Ordering::Release);
+        assert_eq!(
+            join.cancel_and_join().await,
+            Some(UploadPumpOutcome::Cancelled)
+        );
+        assert_eq!(state.releases.load(Ordering::Acquire), 1);
+        assert_eq!(source.terminal.load(Ordering::Acquire), expected);
+
+        let error = std::future::poll_fn(|cx| source.poll_frame(cx))
+            .await
+            .expect("one non-clean terminal")
+            .expect_err("a cancelled upload cannot end cleanly");
+        if expected == PUMP_SOURCE_RESET {
+            let typed = error.downcast_ref::<h2::Error>().expect("a typed reset");
+            assert_eq!(typed.reason(), Some(h2::Reason::CANCEL));
+        } else {
+            assert!(error.downcast_ref::<h2::Error>().is_none());
+            assert_eq!(
+                error.to_string(),
+                upload_pump_error_message(UploadPumpOutcome::Cancelled)
+            );
+        }
+    }
 }
 
 #[test]

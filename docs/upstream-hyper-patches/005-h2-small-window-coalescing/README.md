@@ -107,6 +107,32 @@ deadlock:
   `Arc` increment.
 - **Worst-case latency.** One 2 ms wait per round trip, and only against a
   peer whose window never reaches 256 bytes.
+- **A hold that ends early.** Its sleep stays armed, so the task can be woken
+  once more at the old deadline and find nothing to do. This is deliberate
+  (#6038). The next hold moves the deadline later, which tokio does in place
+  without the timer driver. Disarming the sleep when a hold ends would make
+  every next hold move it earlier instead, a timer-wheel update per hold. Only
+  a pause between holds longer than the rest of the wait costs the spurious
+  wake.
+- **Chunks larger than the window (unmeasured).** Before this patch, a ready
+  chunk went to h2 whole and h2 framed the rest itself as WINDOW_UPDATEs
+  arrived. Now the pipe hands h2 only the assigned capacity, so each
+  WINDOW_UPDATE that reopens a window-limited stream wakes the pipe to hand
+  over the next piece: one extra hop from the connection task to the pipe
+  and back per update. This is the cost #6038 asked to measure with a 64 KiB
+  stream window, and it has not been measured. Reasoning only: an h2 peer
+  (hyper, tonic, the benchmark client and backend) sends a WINDOW_UPDATE once
+  its unclaimed capacity reaches half of its remaining window, so against a
+  64 KiB window each update opens about a third of it, roughly 21 KiB. That
+  is far above 256 bytes, so no hold happens: the pipe wakes, compares,
+  splits the `Bytes` without copying and returns. The count is about one
+  extra wake per 21 KiB sent, around 50,000 per second for each GB/s on a
+  window-limited stream, each paying a task wake and a `send_data` call.
+  With the benchmark's 8 MiB stream windows a chunk rarely exceeds its
+  capacity, so the default protocol matrix should show no change. The peer
+  windows are fixed in `proto_bench` and `proto_backend`
+  (`tests/performance/multi_protocol/`), so no hosted benchmark workflow can
+  run the 64 KiB case yet; measuring it needs a window option there first.
 
 ### Not covered
 
@@ -114,6 +140,25 @@ The patch merges window increments, not body chunks. If the source body yields
 tiny chunks, for example a client streaming small gRPC messages, each chunk
 still leaves as its own frame. Merging chunks would add latency to streamed
 messages.
+
+**HTTP/2 CONNECT tunnels** (#6038). WebSocket over HTTP/2 (RFC 8441) on the
+frontend and inbound HBONE write through hyper's upgraded send task
+(`src/proto/h2/upgrade.rs`), not through `PipeToSendStream`. That task hands
+each write to h2 as soon as it arrives, so h2 still cuts one DATA frame from
+each small window increment on a tunnel. The task also never waits for the
+peer's window before it takes the next write: hyper does not apply flow-control
+backpressure to a tunnel writer. A bounded hold therefore cannot be added
+without changing more than framing:
+
+- If the task stopped taking writes while it held bytes, every tunnel writer
+  would gain window backpressure, and `poll_shutdown` would wait for the peer
+  to open its window instead of returning once END_STREAM is queued. The H2
+  WebSocket and HBONE relays would need review for both.
+- Keeping today's write semantics needs the task to queue writes itself and
+  split them by capacity, a rewrite of that task rather than this patch's
+  hold.
+
+Either needs its own change and tunnel-specific regressions.
 
 ## Regression coverage
 
@@ -139,8 +184,19 @@ cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --featu
 
 `test_grpc_h2c_upload_coalesces_small_connection_window_increments` in
 `tests/integration/http2_pool_tests.rs` drives the same peer behaviour through
-Ferrum's gRPC connection pool over TCP, in real time. It checks both properties:
-increments coalesce, and a lockstep window completes after the bounded wait.
+Ferrum's gRPC connection pool over TCP, in real time. It checks that increments
+coalesce, and that a lockstep window completes after the bounded wait. On a
+real clock frame sizes depend on scheduling, so its load-independent proof is
+a lower bound: every lockstep round but the last takes at least the 2 ms wait,
+which only a client built with a timer does. The small-frame count only has to
+stay under half the increments, where the no-timer control lands (#6038).
+
+`tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs` covers the
+response direction through the production accept loop: a raw-frame client
+trickles and then locksteps its connection window against a large response,
+over h2c (`handle_connection`) and over TLS with ALPN `h2`
+(`handle_tls_connection`). The same lower bound proves that both frontend
+HTTP/2 builders set a timer.
 
 ## Retirement plan
 

@@ -178,6 +178,14 @@ impl Coalesce {
     }
 
     /// The held chunk was handed to h2: the hold, if any, is over.
+    ///
+    /// A hold that ends before its deadline leaves the sleep armed, so the
+    /// task can be woken once more at that deadline and find nothing to do.
+    /// That is deliberate. The next hold moves the deadline later, which
+    /// tokio does in place without the timer driver; disarming here would
+    /// make every next hold move it earlier, a timer-wheel update per hold.
+    /// Only a pause between holds longer than the rest of the wait costs the
+    /// spurious wake.
     fn release(&mut self) {
         self.deadline = None;
     }

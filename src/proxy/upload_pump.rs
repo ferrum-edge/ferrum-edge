@@ -1203,6 +1203,36 @@ fn is_h2_source_cancel(error: BoxError) -> bool {
     false
 }
 
+/// Most client frames a cancelled pump reads looking for a reset that already
+/// arrived. Only frames already buffered are read, so this bounds how much of
+/// a client still streaming is discarded before the cancellation completes.
+const SOURCE_RESET_PROBE_FRAMES: usize = 16;
+
+/// Whether the client already reset the HTTP/2 upload that the dispatcher is
+/// cancelling (issue #6038).
+///
+/// Polls the source without registering a waker, so it finds only a reset
+/// that has already been received; the pump drops the body right after.
+/// DATA that is still buffered ahead of the reset is discarded, because the
+/// upload is being torn down either way. A masked reset (EOF without
+/// END_STREAM) counts as a reset, as it does in the relay itself.
+fn source_already_reset<B>(body: &mut B) -> bool
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    for _ in 0..SOURCE_RESET_PROBE_FRAMES {
+        match http_body::Body::poll_frame(Pin::new(&mut *body), &mut cx) {
+            Poll::Ready(Some(Ok(_))) => {}
+            Poll::Ready(Some(Err(error))) => return is_h2_source_cancel(error.into()),
+            Poll::Ready(None) => return !http_body::Body::is_end_stream(&*body),
+            Poll::Pending => return false,
+        }
+    }
+    false
+}
+
 /// The relay itself. Its return value is the pump's terminal, published to the
 /// shared state — and the client body and bridge sender released — BEFORE it
 /// returns, so whichever task awaits this future (inline dispatcher or
@@ -1358,6 +1388,16 @@ where
             }
         }
     };
+    // A dispatcher cancellation can race the client's own reset (issue
+    // #6038). Hyper's frontend stream task drops the direct-H2 handler, and
+    // with it a `cancel_on_drop` join, as soon as it sees the client's
+    // RST_STREAM, which can be before this pump polls the body carrying the
+    // same reset. The biased cancel arm then wins, and the backend would get
+    // hyper's INTERNAL_ERROR for the gateway's own cancellation instead of
+    // the client's CANCEL.
+    if outcome == UploadPumpOutcome::Cancelled && require_end_stream {
+        source_reset = source_already_reset(&mut body);
+    }
     // Publish BEFORE the sender drops: the transport side reads this exactly
     // when `poll_recv` observes the closed channel, and the channel close is
     // the synchronisation edge for this release store.
