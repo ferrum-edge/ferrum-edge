@@ -538,7 +538,10 @@ where
 
         let send_stream = if !f.is_connect {
             if !f.eos {
-                let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
+                // FERRUM PATCH 005: coalesce DATA frames cut from small
+                // window increments, bounded by the connection's timer.
+                let mut pipe = PipeToSendStream::new(f.body, f.body_tx)
+                    .with_coalescing(self.timer.clone());
                 if let Some(signal) = f.write_timeout {
                     pipe = pipe.with_write_timeout(super::WriteTimeout::new(
                         signal,
