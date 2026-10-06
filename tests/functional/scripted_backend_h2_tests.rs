@@ -715,11 +715,18 @@ async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
         "backend CANCEL must not become a clean truncated gRPC 200: {response:?}"
     );
 
+    // The reset can win the race with the gateway committing response headers.
+    // After headers it is a streamed body error (`body_error_class` =
+    // `protocol_error`, deterministic coverage in the `classify_body_error`
+    // unit tests); before them it is a pre-header backend failure
+    // (`rejection_phase` = `grpc_backend_error`). Either way it is a backend
+    // failure, never a clean success.
     let logs = collect_flushed_logs(&harness).await;
+    let body_protocol_error = logs.contains("\\\"body_error_class\\\":\\\"protocol_error\\\"")
+        || logs.contains("\"body_error_class\":\"protocol_error\"");
     assert!(
-        logs.contains("\\\"body_error_class\\\":\\\"protocol_error\\\"")
-            || logs.contains("\"body_error_class\":\"protocol_error\""),
-        "backend CANCEL must be recorded as body_error_class=protocol_error; logs:\n{logs}"
+        body_protocol_error || has_backend_error_signal(&logs),
+        "backend CANCEL must be recorded as a backend failure; logs:\n{logs}"
     );
 }
 
