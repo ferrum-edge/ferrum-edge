@@ -1369,6 +1369,8 @@ A fresh gateway runs `both` + baseline-on. It still reaches **loopback and RFC19
 
 The allow/deny CIDR lists accept comma-separated CIDRs or bare IPs (`10.0.0.0/8, 192.168.1.1, fc00::/7, ::1`); an invalid entry fails startup rather than silently failing open. The same policy is enforced by config validation, the DNS resolver, the connection pool, service discovery, and plugin endpoint screening.
 
+The policy is per process. `GET /backend-egress-policy` reports the loaded policy's mode and override-presence flags (never the CIDRs). In CP/DP deployments each DP also reports that metadata to its CP on ConfigSync `Subscribe`, so the CP's `GET /backend-egress-policy` and `GET /cluster` can list what every connected DP enforces; see [admin_api.md](admin_api.md#backend-egress-policy) and [cp_dp_mode.md](cp_dp_mode.md#backend-egress-policy-attestation).
+
 ### `kafka_logging` requires a fully-open egress policy
 
 `kafka_logging` produces through librdkafka (`rdkafka 0.39`, `rdkafka-sys 4.10.0+2.12.1`), which owns its own resolution and connection path. It resolves bootstrap hostnames itself, and after the first Metadata response it **creates and dials brokers advertised by the cluster** — addresses Ferrum never sees. Enforcing them needs librdkafka's `connect_cb` / `resolve_cb`; the pinned Rust client exposes neither (`ThreadedProducer` builds its `NativeClientConfig` internally and `BaseProducer::from_client` is private), so there is no supported injection point.

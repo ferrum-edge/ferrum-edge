@@ -37,6 +37,7 @@ use tonic::transport::channel::ClientTlsConfig;
 use tonic::transport::{Certificate, Channel, Endpoint, Identity};
 use tracing::{debug, error, info, warn};
 
+use super::backend_egress_attestation::report_for_policy;
 use super::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS,
@@ -2319,6 +2320,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 .unwrap_or_default(),
         ),
         config_sync_build: config_sync_build_identity().to_string(),
+        // Presence-only egress metadata the CP records for this node (#6020).
+        backend_egress_policy: Some(report_for_policy(&proxy_state.env_config.backend_allow_ips)),
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();

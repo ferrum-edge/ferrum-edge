@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Control-plane attestation of data-plane backend egress policy** (issue
+  #6020, completing #5994). Data planes now report bounded metadata about their
+  loaded backend egress policy on ConfigSync `Subscribe`
+  (`SubscribeRequest.backend_egress_policy`): the mode and the
+  dangerous-range/allow-override/deny-override presence flags, never CIDRs,
+  addresses or counts. The control plane records the report per live Subscribe
+  stream, keyed by namespace, principal, node id and stream sequence, so
+  streams sharing a node id never replace or hide each other and
+  `connected_data_planes` counts streams. On a CP, `GET /backend-egress-policy`
+  gains an optional `data_plane_attestation` object for the selected
+  namespace: every live stream with its reported policy (without build
+  versions), a field-wise `weakest_policy`, and
+  `all_connected_public_only_guaranteed`. `GET /cluster` adds each data plane's
+  `backend_egress_policy_attestation` and `backend_egress_policy`, plus a
+  cluster-wide `data_plane_backend_egress_policy` aggregate. A data plane that
+  sends no recognised report is `unknown`, and an unknown data plane, like an
+  empty set, makes the weakest policy incomplete and the public-only guarantee
+  false. The CP's own top-level fields are unchanged: `public_only_guaranteed`
+  stays false on `admission-only`. The new object is optional and additive, so
+  `schema_version` stays `2`. Disconnected data planes that still serve cached
+  config are not listed, so consumers should compare `connected_data_planes`
+  with their expected inventory. The ConfigSync protocol revision is bumped to
+  `3`, so CP and DP must run the same build. ferrum-contracts and Nexus
+  GHSA-93rq Part B consume this contract.
+
 ## [0.9.13] - 2026-10-06
 
 Release prepared on **2026-10-06 UTC** from main
