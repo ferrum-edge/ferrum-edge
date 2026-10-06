@@ -2473,7 +2473,10 @@ jobs:
             -e POSTGRES_DB=ferrum \
             -e POSTGRES_USER=ferrum \
             -e POSTGRES_PASSWORD_FILE=/certs-src/pg-password \
-            -v "$DB_TLS_CERT_DIR:/certs-src:ro" \
+            -v "$DB_TLS_CERT_DIR/pg-server.crt:/certs-src/pg-server.crt:ro" \
+            -v "$DB_TLS_CERT_DIR/pg-server.key:/certs-src/pg-server.key:ro" \
+            -v "$DB_TLS_CERT_DIR/ca.crt:/certs-src/ca.crt:ro" \
+            -v "$DB_TLS_CERT_DIR/pg-password:/certs-src/pg-password:ro" \
             --entrypoint sh \
             postgres:16 \
             -c '

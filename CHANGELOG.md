@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     containing characters outside `A-Z a-z 0-9 . _ ~ -` (the gateway embeds it
     in its `mongodb://` URL without escaping). The Mongo image is pinned by
     digest. A volume initialized with the old default keeps accepting that
-    password until you rotate it.
+    password until you rotate it. Containers started by an earlier plain
+    `docker compose up` can remain running after this update; remove the old
+    Mongo container and volume or rotate the password as described in the
+    upgrade guide.
   - `scripts/setup_db_tls.sh` (also run by `tests/scripts/setup_db_tls.sh`)
     publishes PostgreSQL and MySQL on `127.0.0.1` only. It generates random
     PostgreSQL, MySQL and MySQL root passwords into a private `0700` directory,

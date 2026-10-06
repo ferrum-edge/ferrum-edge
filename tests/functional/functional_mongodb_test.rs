@@ -11,7 +11,7 @@
 //!
 //! Prerequisites:
 //!   1. MongoDB running on localhost:27017 (plaintext test)
-//!      - Docker: `docker run -d --name mongo-test -p 27017:27017 mongo:7`
+//!      - Docker: `docker run -d --name mongo-test -p 127.0.0.1:27017:27017 mongo:7`
 //!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs under
 //!      `FERRUM_TEST_MONGO_CERT_DIR` (defaults to `/tmp/ferrum-mongo-tls-certs`)
 //!      listening on 27018 (TLS) / 27019 (mTLS). Hosted data-plane CI

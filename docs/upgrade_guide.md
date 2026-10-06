@@ -47,14 +47,31 @@ The container refuses to start when `MONGO_PASSWORD` is missing, shorter than
 that use `+`, `/`, `=` or other URI-reserved characters; for example, generate
 one with `openssl rand -hex 32` instead of `openssl rand -base64`.
 
+**Remove MongoDB started by an earlier plain `docker compose up`.** In v0.9.0–v0.9.12,
+plain `docker compose up` started MongoDB with the default password
+`dev-password-change-in-production`, even if you never used the database. The
+new MongoDB profile leaves that old container running. If its data is
+disposable, remove the old container and its volume:
+
+```bash
+docker compose --profile mongodb rm -sf mongodb ferrum-mongodb
+docker volume rm <project>_mongodb_data
+```
+
+Find the volume name with `docker volume ls --filter name=mongodb_data`; it is
+normally `<project>_mongodb_data`. If you need the data, rotate the password
+using the steps below.
+
 **Rotate an existing MongoDB volume.** `MONGO_INITDB_ROOT_PASSWORD` is applied
 only when the volume is first initialized. A `mongodb_data` volume created by
 v0.9.0–v0.9.12 without `MONGO_PASSWORD` still accepts
 `dev-password-change-in-production`, and anything that can reach the container
 (for example, other services on the Compose network) can use it until you
 rotate it. The gateway authenticates with the new `MONGO_PASSWORD`, so it fails
-until the stored password matches. To rotate without putting either password on
-a command line:
+until the stored password matches. Run the steps in one shell with
+`FERRUM_ADMIN_JWT_SECRET` set and `POSTGRES_PASSWORD` set if required by your
+Compose environment; step 1 sets the new `MONGO_PASSWORD`. To rotate without
+putting either MongoDB password on a command line:
 
 ```bash
 # 1. Choose the new password and start only the database. The stored password

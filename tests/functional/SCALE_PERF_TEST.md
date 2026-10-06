@@ -48,9 +48,9 @@ Uses a MongoDB Docker container to measure how the document-store backend scales
 
 ```bash
 docker run -d --name ferrum-scale-test-mongo --network host \
-  mongo:7 --replSet rs0 --port 27117 --bind_ip_all
+  mongo:7 --replSet rs0 --port 27117 --bind_ip 127.0.0.1
 docker exec ferrum-scale-test-mongo mongosh --quiet --port 27117 --eval \
-  'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27117"}]})'
+  'rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27117"}]})'
 export FERRUM_MONGO_REPLICA_SET=rs0
 ```
 
