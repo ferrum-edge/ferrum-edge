@@ -43,6 +43,7 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -325,93 +326,120 @@ pub struct DpNodeInfo {
     pub backend_egress_policy: Option<ReportedEgressPolicy>,
 }
 
-/// Registry of connected DP nodes. Shared between the gRPC server and the
-/// admin API so that `GET /cluster` can report live connection state.
+/// Process-wide source of ConfigSync stream sequence numbers. Every admitted
+/// Subscribe stream gets a distinct value, so two live streams never share a
+/// registry key even when namespace, principal and node id all match.
+static NEXT_DP_STREAM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Identity of one live ConfigSync Subscribe stream in [`DpNodeRegistry`].
+///
+/// Admission allows several concurrent streams per node id (other namespaces,
+/// shared-principal replicas, reconnect overlap), so the registry is keyed per
+/// stream rather than per node id: one stream can never hide or replace
+/// another, and a stream's drop removes exactly its own entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DpStreamKey {
+    pub namespace: String,
+    pub principal: String,
+    pub node_id: String,
+    pub stream_seq: u64,
+}
+
+/// Registry of live DP ConfigSync streams. Shared between the gRPC server and
+/// the admin API so that `GET /cluster` can report live connection state.
 #[derive(Default)]
 pub struct DpNodeRegistry {
-    nodes: DashMap<String, DpNodeInfo>,
+    streams: DashMap<DpStreamKey, DpNodeInfo>,
 }
 
 impl DpNodeRegistry {
     pub fn new() -> Self {
         Self {
-            nodes: DashMap::new(),
+            streams: DashMap::new(),
         }
     }
 
-    pub fn insert(&self, info: DpNodeInfo) {
-        self.nodes.insert(info.node_id.clone(), info);
+    /// Register one admitted Subscribe stream authenticated as `principal`
+    /// under a fresh stream sequence number. Never replaces another stream's
+    /// entry; the returned key removes exactly this entry.
+    pub fn register_stream(&self, principal: &str, info: DpNodeInfo) -> DpStreamKey {
+        let key = DpStreamKey {
+            namespace: info.namespace.clone(),
+            principal: principal.to_string(),
+            node_id: info.node_id.clone(),
+            stream_seq: NEXT_DP_STREAM_SEQ.fetch_add(1, Ordering::Relaxed),
+        };
+        self.streams.insert(key.clone(), info);
+        key
     }
 
-    /// Remove a node only if its `connected_at` matches the expected timestamp.
-    /// This prevents a stale stream drop from removing a newer reconnection's entry.
-    pub fn remove_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
-        self.nodes.remove_if(node_id, |_, info| {
-            info.connected_at == expected_connected_at
-        });
+    /// Remove the entry of the stream identified by `key`. Other streams for
+    /// the same node id, in any namespace, are left untouched.
+    pub fn remove_stream(&self, key: &DpStreamKey) {
+        self.streams.remove(key);
     }
 
-    /// Update `last_update_at` for all connected nodes (called after broadcast).
+    /// Update `last_update_at` for all live streams (called after broadcast).
     pub fn touch_all(&self) {
         let now = Utc::now();
-        for mut entry in self.nodes.iter_mut() {
+        for mut entry in self.streams.iter_mut() {
             entry.last_update_at = now;
         }
     }
 
-    /// Update `last_update_at` for connected nodes in a specific namespace.
+    /// Update `last_update_at` for live streams in a specific namespace.
     /// Used by the per-namespace broadcast path so a delta for namespace A
     /// does not bump the `last_update_at` of namespace B's DPs.
     pub fn touch_namespace(&self, namespace: &str) {
         let now = Utc::now();
-        for mut entry in self.nodes.iter_mut() {
+        for mut entry in self.streams.iter_mut() {
             if entry.namespace == namespace {
                 entry.last_update_at = now;
             }
         }
     }
 
-    /// Return a snapshot of all connected nodes.
+    /// Return a snapshot with one entry per live stream.
     pub fn snapshot(&self) -> Vec<DpNodeInfo> {
-        self.nodes
+        self.streams
             .iter()
             .map(|entry| entry.value().clone())
             .collect()
     }
 
-    /// Number of connected node IDs.
+    /// Number of live DP streams.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.snapshot().len()
+        self.streams.len()
     }
 
-    /// Whether the registry has no connected node IDs.
+    /// Whether the registry has no live DP streams.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.streams.is_empty()
     }
 }
 
-/// A stream wrapper that removes the DP node from the registry when the
-/// gRPC stream is dropped (i.e. the DP disconnects). Uses `connected_at`
-/// to guard against stale drops: if the DP reconnects before the old stream
-/// is dropped, the old drop will not remove the newer entry.
+/// A stream wrapper that removes its own registry entry when the gRPC stream
+/// is dropped (i.e. the DP disconnects). Removal is by exact [`DpStreamKey`],
+/// so an older or newer stream for the same node id stays registered.
 struct TrackedStream<S> {
     inner: Pin<Box<S>>,
     _admission_permit: CpGrpcStreamPermit,
     registry: Arc<DpNodeRegistry>,
-    node_id: String,
-    connected_at: DateTime<Utc>,
+    stream_key: DpStreamKey,
 }
 
 impl<S> Drop for TrackedStream<S> {
     fn drop(&mut self) {
-        self.registry
-            .remove_if_stale(&self.node_id, self.connected_at);
+        self.registry.remove_stream(&self.stream_key);
         info!(
             "{}",
             crate::startup::sanitize_startup_cause(
-                format!("DP node {:?} disconnected (stream dropped)", self.node_id),
+                format!(
+                    "DP node {:?} disconnected (stream dropped)",
+                    self.stream_key.node_id
+                ),
                 &[]
             )
         );
@@ -2250,14 +2278,19 @@ impl ConfigSync for CpGrpcServer {
             )
         );
         let now = Utc::now();
-        self.registry.insert(DpNodeInfo {
-            node_id: node_id.clone(),
-            version: dp_version.clone(),
-            namespace: dp_namespace.clone(),
-            connected_at: now,
-            last_update_at: now,
-            backend_egress_policy,
-        });
+        // One entry per admitted stream, keyed by namespace, principal, node
+        // id and a fresh stream sequence number (#6020).
+        let stream_key = self.registry.register_stream(
+            &identity.subject,
+            DpNodeInfo {
+                node_id,
+                version: dp_version,
+                namespace: dp_namespace.clone(),
+                connected_at: now,
+                last_update_at: now,
+                backend_egress_policy,
+            },
+        );
 
         let config_for_recovery = self.config.clone();
         let recovery_namespace = dp_namespace.clone();
@@ -2353,8 +2386,7 @@ impl ConfigSync for CpGrpcServer {
             inner: Box::pin(combined),
             _admission_permit: admission_permit,
             registry: self.registry.clone(),
-            node_id,
-            connected_at: now,
+            stream_key,
         };
         let authorized = AuthorizedResponseStream::new(
             tracked,
@@ -2560,18 +2592,18 @@ mod tests {
     }
 
     #[test]
-    fn registry_insert_replaces_same_dp_node() {
+    fn registry_keeps_each_stream_of_the_same_dp_node() {
         let registry = DpNodeRegistry::new();
         let first_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
         let second_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
 
-        registry.insert(registry_info("node-a", "old-version", first_connected_at));
-        registry.insert(registry_info("node-a", "new-version", second_connected_at));
+        let first = registry_info("node-a", "old-version", first_connected_at);
+        let second = registry_info("node-a", "new-version", second_connected_at);
+        let first_key = registry.register_stream("node-a", first);
+        let second_key = registry.register_stream("node-a", second);
 
-        let snapshot = registry.snapshot();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].version, "new-version");
-        assert_eq!(snapshot[0].connected_at, second_connected_at);
+        assert_ne!(first_key, second_key);
+        assert_eq!(registry.snapshot().len(), 2);
     }
 
     #[test]
@@ -2660,9 +2692,11 @@ mod tests {
         let old_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
         let new_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
 
-        registry.insert(registry_info("node-a", "old-version", old_connected_at));
-        registry.insert(registry_info("node-a", "new-version", new_connected_at));
-        registry.remove_if_stale("node-a", old_connected_at);
+        let old = registry_info("node-a", "old-version", old_connected_at);
+        let new = registry_info("node-a", "new-version", new_connected_at);
+        let old_key = registry.register_stream("node-a", old);
+        registry.register_stream("node-a", new);
+        registry.remove_stream(&old_key);
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 1);

@@ -2605,7 +2605,6 @@ paths:
                       all_connected_public_only_guaranteed: true
                       data_planes:
                         - node_id: dp-a
-                          ferrum_version: "0.9.13"
                           connected_at: "2026-10-06T12:00:00+00:00"
                           attestation: reported
                           policy:
@@ -2617,7 +2616,6 @@ paths:
                             deny_cidr_overrides_present: true
                             public_only_guaranteed: true
                         - node_id: dp-b
-                          ferrum_version: "0.9.13"
                           connected_at: "2026-10-06T12:00:05+00:00"
                           attestation: reported
                           policy:
@@ -39266,13 +39264,19 @@ components:
           enum: [cp]
         connected_data_planes:
           type: integer
-          description: Number of currently connected Data Plane nodes
+          description: |
+            Number of live Data Plane ConfigSync Subscribe streams. Each stream
+            is counted, including several that share one node_id.
         data_planes:
           type: array
+          description: One entry per live Data Plane Subscribe stream
           items:
             $ref: "#/components/schemas/ConnectedDpNode"
         data_plane_backend_egress_policy:
-          $ref: "#/components/schemas/DataPlaneEgressSummary"
+          description: Aggregate over every live Data Plane stream, all namespaces
+          allOf:
+            - $ref: "#/components/schemas/DataPlaneEgressSummary"
+          unevaluatedProperties: false
         connected_mesh_nodes:
           type: integer
           description: Number of currently connected Mesh nodes
@@ -39674,9 +39678,11 @@ components:
     DataPlaneEgressAttestation:
       description: |
         CP-only (enforcement_scope=admission-only), additive within
-        schema_version 2 and absent on other responses. Lists the DPs connected
-        over ConfigSync for the selected namespace with the backend egress
-        policy metadata each one self-reported on Subscribe. Reports come from
+        schema_version 2 and absent on other responses. Lists every live
+        ConfigSync Subscribe stream for the selected namespace with the backend
+        egress policy metadata it self-reported. Streams are keyed per stream,
+        so several streams sharing a node_id are each listed and counted, and
+        another namespace's streams never affect this view. Reports come from
         JWT-authenticated DPs running the CP's exact build; they are not
         cryptographic host attestation. DPs that are disconnected but still
         serving cached config are not listed.
@@ -39691,7 +39697,9 @@ components:
               description: Reports arrive on ConfigSync Subscribe
             data_planes:
               type: array
-              description: Connected DPs for the selected namespace, sorted by node_id
+              description: |
+                Live streams for the selected namespace, sorted by node_id then
+                connected_at
               items:
                 $ref: "#/components/schemas/DataPlaneEgressEntry"
       unevaluatedProperties: false
@@ -39709,7 +39717,9 @@ components:
         connected_data_planes:
           type: integer
           minimum: 0
-          description: Connected ConfigSync subscribers in this set
+          description: |
+            Live ConfigSync Subscribe streams in this set, one per stream rather
+            than per distinct node_id
         reporting_data_planes:
           type: integer
           minimum: 0
@@ -39743,14 +39753,14 @@ components:
     DataPlaneEgressEntry:
       type: object
       additionalProperties: false
-      required: [node_id, ferrum_version, connected_at, attestation, policy]
+      description: |
+        One live Subscribe stream. No build version is included: the ConfigSync
+        build gate pins it to the CP's own build, and GET /cluster reports it.
+      required: [node_id, connected_at, attestation, policy]
       properties:
         node_id:
           type: string
           description: Authenticated ConfigSync node identity
-        ferrum_version:
-          type: string
-          description: Ferrum Edge version reported by the DP
         connected_at:
           type: string
           format: date-time

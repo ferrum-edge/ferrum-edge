@@ -2208,6 +2208,79 @@ async fn test_cp_records_dp_backend_egress_policy_attestation() {
     server_handle.abort();
 }
 
+/// Every live Subscribe stream is attested on its own, even when several share
+/// one node id: a newer stream never hides an older one, and dropping the
+/// newer stream first leaves the older one attested (issue #6020).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_attests_every_live_stream_of_one_node_id() {
+    use ferrum_edge::grpc::backend_egress_attestation::{
+        DataPlaneEgressSummary, EgressMode, ReportedEgressPolicy,
+    };
+    use ferrum_edge::grpc::cp_server::DpNodeRegistry;
+
+    let registry = Arc::new(DpNodeRegistry::new());
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_config(0))));
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+        .registry(registry.clone())
+        .build();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let policy = |mode: EgressMode| ReportedEgressPolicy {
+        mode,
+        dangerous_ranges_blocked: true,
+        allow_cidr_overrides_present: false,
+        deny_cidr_overrides_present: false,
+    };
+    let summary = || {
+        let snapshot = registry.snapshot();
+        let reports = snapshot.iter().map(|node| node.backend_egress_policy);
+        DataPlaneEgressSummary::from_reports(reports)
+    };
+
+    // The old stream still serves `both` while a replacement stream for the
+    // same node id reports `public`.
+    let both = Some(policy(EgressMode::Both).to_report());
+    let public = Some(policy(EgressMode::Public).to_report());
+    let older = subscribe_with_egress_report(bound_addr, "shared-dp", both).await;
+    let newer = subscribe_with_egress_report(bound_addr, "shared-dp", public).await;
+    let attested = summary();
+    assert_eq!(attested.connected_data_planes, 2);
+    assert_eq!(attested.reporting_data_planes, 2);
+    assert_eq!(attested.weakest_policy, Some(policy(EgressMode::Both)));
+    assert!(attested.weakest_policy_complete);
+    assert!(!attested.all_connected_public_only_guaranteed);
+
+    // The newer stream drops first: the older stream stays attested.
+    drop(newer);
+    let remaining = timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.len() == 1 {
+                return summary();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the newer stream should deregister within 5s");
+    assert_eq!(remaining.connected_data_planes, 1);
+    assert_eq!(remaining.weakest_policy, Some(policy(EgressMode::Both)));
+    assert!(!remaining.all_connected_public_only_guaranteed);
+
+    drop(older);
+    server_handle.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_handles_malformed_config() {
     // Start CP server with valid initial config
@@ -7737,14 +7810,17 @@ mod configsync_size_bounds {
         let mut rx = tx.subscribe();
         let registry = DpNodeRegistry::new();
         let before = Utc::now() - chrono::Duration::seconds(60);
-        registry.insert(DpNodeInfo {
-            node_id: "size-bound-dp".to_string(),
-            version: ferrum_edge::FERRUM_VERSION.to_string(),
-            namespace: "ferrum".to_string(),
-            connected_at: before,
-            last_update_at: before,
-            backend_egress_policy: None,
-        });
+        registry.register_stream(
+            "size-bound-dp",
+            DpNodeInfo {
+                node_id: "size-bound-dp".to_string(),
+                version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                connected_at: before,
+                last_update_at: before,
+                backend_egress_policy: None,
+            },
+        );
         let logs = CapturedLogs::default();
         tracing::subscriber::with_default(logs.subscriber(), || {
             CpGrpcServer::broadcast_namespace_update(

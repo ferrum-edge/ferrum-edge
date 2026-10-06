@@ -1212,7 +1212,7 @@ The `GET /cluster` admin endpoint (JWT-authenticated) provides live CP/DP connec
 curl -H "Authorization: Bearer $TOKEN" http://cp-host:9000/cluster
 ```
 
-Returns all connected DP nodes and Mesh nodes (each in its own array — `data_planes` and `mesh_nodes`) with metadata: `node_id`, `version`, `namespace`, `status`, `connected_at`, and `last_sync_at`. Mesh node entries also include `last_heartbeat_at`. DP entries also include the backend egress policy each DP reported (`backend_egress_policy_attestation`, `backend_egress_policy`), and `data_plane_backend_egress_policy` aggregates them across namespaces (see [Backend egress policy attestation](#backend-egress-policy-attestation)). Disconnected nodes are automatically removed from their respective registries — only currently connected nodes appear. The `last_sync_at` timestamp updates on every config broadcast (delta or full snapshot) to that registry. MeshSubscribe streams also emit lightweight heartbeat frames; the CP reaps mesh registry entries that stop producing stream activity for 5 minutes.
+Returns all connected DP nodes and Mesh nodes (each in its own array — `data_planes` and `mesh_nodes`) with metadata: `node_id`, `version`, `namespace`, `status`, `connected_at`, and `last_sync_at`. Mesh node entries also include `last_heartbeat_at`. `data_planes` has one entry per live ConfigSync Subscribe stream (several streams can share a `node_id`), and `connected_data_planes` counts those streams. DP entries also include the backend egress policy each DP reported (`backend_egress_policy_attestation`, `backend_egress_policy`), and `data_plane_backend_egress_policy` aggregates them across namespaces (see [Backend egress policy attestation](#backend-egress-policy-attestation)). Disconnected nodes are automatically removed from their respective registries — only currently connected nodes appear. The `last_sync_at` timestamp updates on every config broadcast (delta or full snapshot) to that registry. MeshSubscribe streams also emit lightweight heartbeat frames; the CP reaps mesh registry entries that stop producing stream activity for 5 minutes.
 
 ### From a DP
 
@@ -1234,11 +1234,14 @@ policy in `SubscribeRequest.backend_egress_policy`: the mode and the
 dangerous-range, allow-override and deny-override presence flags. CIDRs,
 addresses, list sizes and raw settings never leave the DP.
 
-The CP records the report against the connected node for the lifetime of its
-Subscribe stream and exposes it on:
+The CP records the report against the Subscribe stream that carried it, for
+that stream's lifetime. Registry entries are keyed per stream (namespace,
+authenticated principal, node id and a per-stream sequence number), so two
+live streams never overwrite each other even when they share a node id, and a
+stream's disconnect removes only its own entry. The CP exposes the reports on:
 
 - `GET /backend-egress-policy` on the CP: the optional `data_plane_attestation`
-  object lists the DPs connected for the selected namespace, a field-wise
+  object lists every live stream for the selected namespace, a field-wise
   `weakest_policy`, `weakest_policy_complete`, and
   `all_connected_public_only_guaranteed`.
 - `GET /cluster` on the CP: each DP's report plus a cluster-wide aggregate.
@@ -1255,7 +1258,9 @@ The report is the DP's self-description over its JWT-authenticated stream, not
 a cryptographic attestation of the host, and it covers only DPs connected to
 this CP right now. A DP that is partitioned from the CP and keeps serving its
 cached config is not listed, so consumers should compare
-`connected_data_planes` with the data-plane inventory they expect. See
+`connected_data_planes` with the data-plane inventory they expect.
+`connected_data_planes` counts live streams rather than distinct node ids, so
+replicas sharing one principal are each counted. See
 [admin_api.md](admin_api.md#data-plane-attestation-on-a-control-plane) for the
 field rules.
 

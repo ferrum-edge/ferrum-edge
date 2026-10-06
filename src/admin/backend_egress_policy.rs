@@ -43,7 +43,9 @@ struct BackendEgressPolicyResponse<'a> {
     data_plane_attestation: Option<DataPlaneAttestation>,
 }
 
-/// Connected data planes of one namespace and their reported policies.
+/// Live ConfigSync streams of one namespace and their reported policies. Each
+/// stream counts as one data plane, so streams sharing a node id are all
+/// listed and all weaken the aggregate.
 #[derive(Serialize)]
 struct DataPlaneAttestation {
     source: &'static str,
@@ -52,10 +54,11 @@ struct DataPlaneAttestation {
     data_planes: Vec<DataPlaneEgressEntry>,
 }
 
+/// One live stream. The build is omitted: the ConfigSync build gate already
+/// pins it to the CP's own, and namespace viewers need no fleet build detail.
 #[derive(Serialize)]
 struct DataPlaneEgressEntry {
     node_id: String,
-    ferrum_version: String,
     connected_at: String,
     attestation: &'static str,
     policy: Option<ReportedEgressPolicy>,
@@ -119,7 +122,9 @@ pub(super) fn handle_get(state: &AdminState, namespace: &str) -> Response<Full<B
 }
 
 /// Only data planes subscribed to the requested namespace serve it, and the
-/// caller is authorized for that namespace alone.
+/// caller is authorized for that namespace alone. The registry holds one entry
+/// per live stream, so every stream of this namespace is counted, including
+/// several sharing one node id; another namespace's streams never are.
 fn connected_data_planes(state: &AdminState, namespace: &str) -> DataPlaneAttestation {
     let mut nodes: Vec<DpNodeInfo> = state
         .dp_registry
@@ -127,7 +132,11 @@ fn connected_data_planes(state: &AdminState, namespace: &str) -> DataPlaneAttest
         .map(|registry| registry.snapshot())
         .unwrap_or_default();
     nodes.retain(|node| node.namespace == namespace);
-    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    nodes.sort_by(|a, b| {
+        a.node_id
+            .cmp(&b.node_id)
+            .then(a.connected_at.cmp(&b.connected_at))
+    });
     let reports = nodes.iter().map(|node| node.backend_egress_policy);
     let summary = DataPlaneEgressSummary::from_reports(reports);
     let data_planes = nodes
@@ -136,7 +145,6 @@ fn connected_data_planes(state: &AdminState, namespace: &str) -> DataPlaneAttest
             attestation: attestation_label(node.backend_egress_policy.as_ref()),
             policy: node.backend_egress_policy,
             node_id: node.node_id,
-            ferrum_version: node.version,
             connected_at: node.connected_at.to_rfc3339(),
         })
         .collect();

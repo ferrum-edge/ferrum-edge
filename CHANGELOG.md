@@ -14,10 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loaded backend egress policy on ConfigSync `Subscribe`
   (`SubscribeRequest.backend_egress_policy`): the mode and the
   dangerous-range/allow-override/deny-override presence flags, never CIDRs,
-  addresses or counts. The control plane records the report against each
-  connected data plane. On a CP, `GET /backend-egress-policy` gains an optional
-  `data_plane_attestation` object for the selected namespace: every connected
-  data plane with its reported policy, a field-wise `weakest_policy`, and
+  addresses or counts. The control plane records the report per live Subscribe
+  stream, keyed by namespace, principal, node id and stream sequence, so
+  streams sharing a node id never replace or hide each other and
+  `connected_data_planes` counts streams. On a CP, `GET /backend-egress-policy`
+  gains an optional `data_plane_attestation` object for the selected
+  namespace: every live stream with its reported policy (without build
+  versions), a field-wise `weakest_policy`, and
   `all_connected_public_only_guaranteed`. `GET /cluster` adds each data plane's
   `backend_egress_policy_attestation` and `backend_egress_policy`, plus a
   cluster-wide `data_plane_backend_egress_policy` aggregate. A data plane that

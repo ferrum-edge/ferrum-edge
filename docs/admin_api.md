@@ -2314,7 +2314,8 @@ DP token minting uses the node ID as `sub`; external issuers must do the same.
 - **`status`** is always `online` — disconnected DPs and mesh nodes are automatically removed from their registries when their gRPC stream drops. Mesh nodes also send lightweight `MeshSubscribe` heartbeats; the CP reaps entries that stop producing stream activity for 5 minutes.
 - **`last_sync_at`** updates whenever the CP broadcasts a config update (full snapshot or delta) to that registry. DP and mesh broadcasts share the same database polling cycle, so the timestamps converge on every successful poll.
 - **`last_heartbeat_at`** is mesh-only and updates whenever the CP produces a mesh stream item for that node: the initial snapshot, a config delta/full snapshot, or a heartbeat.
-- **`backend_egress_policy_attestation`** / **`backend_egress_policy`** are DP-only: the backend egress policy metadata the DP reported on `ConfigSync.Subscribe` (`reported`), or `unknown` with a `null` policy when it sent no recognised report. **`data_plane_backend_egress_policy`** aggregates every connected DP across namespaces with the same fields and rules as `data_plane_attestation` on [`GET /backend-egress-policy`](#backend-egress-policy), which is the namespace-scoped form.
+- **`data_planes`** has one entry per live `ConfigSync.Subscribe` stream, and **`connected_data_planes`** counts those streams. Several streams can share one `node_id` (another namespace, shared-principal replicas, or reconnect overlap), and each is listed.
+- **`backend_egress_policy_attestation`** / **`backend_egress_policy`** are DP-only: the backend egress policy metadata the DP reported on `ConfigSync.Subscribe` (`reported`), or `unknown` with a `null` policy when it sent no recognised report. **`data_plane_backend_egress_policy`** aggregates every live DP stream across namespaces with the same fields and rules as `data_plane_attestation` on [`GET /backend-egress-policy`](#backend-egress-policy), which is the namespace-scoped form.
 
 ### DP Mode Response
 
@@ -2771,8 +2772,14 @@ On a CP (`enforcement_scope=admission-only`) the response also carries
 `data_plane_attestation`. Each data plane reports bounded metadata about its own
 loaded policy on `ConfigSync.Subscribe` (mode and the three presence flags, never
 CIDRs, addresses or counts), and the CP keeps it for as long as that Subscribe
-stream is connected. The object lists only the DPs connected for the selected
-namespace, so a namespace-scoped reader never sees another namespace's nodes:
+stream is connected. The CP records one entry per live Subscribe stream, keyed
+by namespace, authenticated principal, node id and a per-stream sequence
+number, so streams that share a node id (the same id in another namespace,
+shared-principal replicas, or a reconnect that overlaps the old stream) never
+replace or hide each other, and a stream's disconnect removes only its own
+entry. The object lists only the streams connected for the selected namespace,
+so a namespace-scoped reader never sees another namespace's nodes, and another
+namespace's Subscribe never changes this namespace's view:
 
 ```json
 "data_plane_attestation": {
@@ -2794,7 +2801,6 @@ namespace, so a namespace-scoped reader never sees another namespace's nodes:
   "data_planes": [
     {
       "node_id": "dp-a",
-      "ferrum_version": "0.9.13",
       "connected_at": "2026-10-06T12:00:00+00:00",
       "attestation": "reported",
       "policy": { "mode": "public", "...": "same fields as weakest_policy" }
@@ -2803,9 +2809,16 @@ namespace, so a namespace-scoped reader never sees another namespace's nodes:
 }
 ```
 
-- `data_planes` is sorted by `node_id`. Each `policy` uses the top-level field
-  meanings for a local data plane: `public_only_guaranteed` is true exactly for
-  `mode=public` with no allow CIDR overrides.
+- `connected_data_planes` counts live Subscribe **streams**, not distinct node
+  ids: each stream is one entry in `data_planes` and weakens the aggregate on
+  its own. Two streams for one `node_id` (for example an old `both` pod and its
+  `public` replacement during a rollout that share a principal) are both listed,
+  and the weakest policy is `both` until the old stream disconnects.
+- `data_planes` is sorted by `node_id`, then `connected_at`. Entries carry no
+  build version: the ConfigSync build gate pins every DP to the CP's own build,
+  and `GET /cluster` (admin-only) still reports `version`. Each `policy` uses
+  the top-level field meanings for a local data plane: `public_only_guaranteed`
+  is true exactly for `mode=public` with no allow CIDR overrides.
 - `attestation` is `reported` for a recognised report, or `unknown` (with
   `policy: null`) when the DP sent none or an unrecognised mode.
 - `weakest_policy` combines the reporting DPs field by field, keeping the least
@@ -2831,9 +2844,16 @@ point-in-time view of connected Subscribe streams: a DP that is partitioned
 from the CP keeps serving its cached config but is not listed, and a DP using
 another control plane is never seen. Consumers should require
 `all_connected_public_only_guaranteed=true` **and** compare
-`connected_data_planes` (or the listed `node_id`s) against their expected
-data-plane inventory. `GET /cluster` shows the same per-DP reports for every
-namespace.
+`connected_data_planes` (live streams) against their expected data-plane
+inventory. When replicas share one node id, compare the stream count, not the
+distinct `node_id`s. A transient reconnect overlap can briefly count one DP
+twice; that only weakens or over-counts the set, never hides a stream.
+`GET /cluster` shows the same per-stream reports for every namespace.
+
+Authorization: this endpoint is open to `viewer` tokens and viewer-key
+ceilings for the authorized namespace, so on a CP it discloses that
+namespace's DP `node_id`s, connection times and reported policy metadata. It
+discloses nothing about other namespaces and no build versions.
 
 ### Consumer guidance
 

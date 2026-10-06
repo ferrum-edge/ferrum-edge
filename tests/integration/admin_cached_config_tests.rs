@@ -9734,22 +9734,28 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
     let registry = std::sync::Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
 
     // Simulate two connected DPs
-    registry.insert(ferrum_edge::grpc::cp_server::DpNodeInfo {
-        node_id: "dp-node-1".to_string(),
-        version: "0.9.0".to_string(),
-        namespace: "ferrum".to_string(),
-        connected_at: Utc::now(),
-        last_update_at: Utc::now(),
-        backend_egress_policy: None,
-    });
-    registry.insert(ferrum_edge::grpc::cp_server::DpNodeInfo {
-        node_id: "dp-node-2".to_string(),
-        version: "0.9.0".to_string(),
-        namespace: "staging".to_string(),
-        connected_at: Utc::now(),
-        last_update_at: Utc::now(),
-        backend_egress_policy: None,
-    });
+    registry.register_stream(
+        "dp-node-1",
+        ferrum_edge::grpc::cp_server::DpNodeInfo {
+            node_id: "dp-node-1".to_string(),
+            version: "0.9.0".to_string(),
+            namespace: "ferrum".to_string(),
+            connected_at: Utc::now(),
+            last_update_at: Utc::now(),
+            backend_egress_policy: None,
+        },
+    );
+    registry.register_stream(
+        "dp-node-2",
+        ferrum_edge::grpc::cp_server::DpNodeInfo {
+            node_id: "dp-node-2".to_string(),
+            version: "0.9.0".to_string(),
+            namespace: "staging".to_string(),
+            connected_at: Utc::now(),
+            last_update_at: Utc::now(),
+            backend_egress_policy: None,
+        },
+    );
 
     let state = AdminState {
         db: None,

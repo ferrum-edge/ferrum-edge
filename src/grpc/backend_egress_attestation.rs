@@ -3,7 +3,7 @@
 //! A DP reports bounded metadata about its loaded backend address policy on
 //! `SubscribeRequest.backend_egress_policy`: the mode plus three presence
 //! flags, never CIDRs, addresses, counts, or raw settings. The CP records the
-//! report against the connected node in
+//! report against the live Subscribe stream in
 //! [`DpNodeRegistry`](super::cp_server::DpNodeRegistry) and exposes it on
 //! `GET /backend-egress-policy` and `GET /cluster`.
 //!
@@ -206,7 +206,7 @@ pub fn attestation_label(policy: Option<&ReportedEgressPolicy>) -> &'static str 
     }
 }
 
-/// Aggregate over a set of connected data planes.
+/// Aggregate over a set of connected data planes, one per live stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DataPlaneEgressSummary {
     pub connected_data_planes: usize,

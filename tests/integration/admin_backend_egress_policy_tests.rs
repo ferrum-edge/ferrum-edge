@@ -11,7 +11,7 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::backend_egress_attestation::ReportedEgressPolicy;
-use ferrum_edge::grpc::cp_server::{DpNodeInfo, DpNodeRegistry};
+use ferrum_edge::grpc::cp_server::{DpNodeInfo, DpNodeRegistry, DpStreamKey};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -301,22 +301,24 @@ async fn public_only_is_never_guaranteed_without_local_enforcement() {
     assert_eq!(body["public_only_guaranteed"], true);
 }
 
-/// Register a connected DP whose Subscribe carried `policy` (None = unknown).
+/// Register one live Subscribe stream whose request carried `policy`
+/// (None = unknown), authenticated as `node_id`.
 fn connect_dp(
     registry: &DpNodeRegistry,
     node_id: &str,
     namespace: &str,
     policy: Option<BackendEgressPolicy>,
-) {
+) -> DpStreamKey {
     let connected_at = chrono::Utc::now();
-    registry.insert(DpNodeInfo {
+    let info = DpNodeInfo {
         node_id: node_id.to_string(),
         version: "0.9.13".to_string(),
         namespace: namespace.to_string(),
         connected_at,
         last_update_at: connected_at,
         backend_egress_policy: policy.as_ref().map(ReportedEgressPolicy::from_policy),
-    });
+    };
+    registry.register_stream(node_id, info)
 }
 
 fn public_policy_view() -> Value {
@@ -362,7 +364,8 @@ async fn control_plane_attests_connected_data_planes_of_the_selected_namespace()
     let node_ids: Vec<&Value> = data_planes.iter().map(|dp| &dp["node_id"]).collect();
     assert_eq!(node_ids, ["dp-a", "dp-b"]);
     assert_eq!(data_planes[0]["attestation"], "reported");
-    assert_eq!(data_planes[0]["ferrum_version"], "0.9.13");
+    // Build detail stays on the admin-only `/cluster`.
+    assert!(data_planes[0].get("ferrum_version").is_none());
     assert_eq!(data_planes[0]["policy"], public_policy_view());
     // Another namespace's DPs are neither listed nor counted.
     assert!(!body.to_string().contains("dp-staging"));
@@ -379,7 +382,7 @@ async fn control_plane_attests_connected_data_planes_of_the_selected_namespace()
     assert_eq!(empty["data_plane_attestation"], empty_attestation());
 
     // An unknown DP voids the guarantee but keeps the reporting DPs' policy.
-    connect_dp(&registry, "dp-old", "ferrum", None);
+    let old = connect_dp(&registry, "dp-old", "ferrum", None);
     let (_, body) = harness.get(Some(&reader), None).await;
     let attestation = &body["data_plane_attestation"];
     assert_eq!(attestation["connected_data_planes"], 3);
@@ -394,12 +397,7 @@ async fn control_plane_attests_connected_data_planes_of_the_selected_namespace()
     assert_eq!(unknown["policy"], Value::Null);
 
     // A reporting DP with an allow overlay is the weakest; its CIDR is withheld.
-    let old = registry
-        .snapshot()
-        .into_iter()
-        .find(|node| node.node_id == "dp-old")
-        .unwrap();
-    registry.remove_if_stale("dp-old", old.connected_at);
+    registry.remove_stream(&old);
     let allow = BackendEgressPolicy::from_env(BackendAllowIps::Public, "10.45.67.89/32", "", true);
     connect_dp(&registry, "dp-c", "ferrum", Some(allow.unwrap()));
     let (_, body) = harness.get(Some(&reader), None).await;
@@ -417,6 +415,76 @@ async fn control_plane_attests_connected_data_planes_of_the_selected_namespace()
     assert_eq!(attestation["weakest_policy_complete"], true);
     assert_eq!(attestation["all_connected_public_only_guaranteed"], false);
     assert!(!body.to_string().contains("10.45.67.89"));
+}
+
+#[tokio::test]
+async fn same_node_id_in_two_namespaces_is_attested_only_in_its_own_namespace() {
+    let registry = Arc::new(DpNodeRegistry::new());
+    let both = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both);
+    let public = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public);
+    connect_dp(&registry, "dp-1", "tenant-a", Some(both));
+    let tenant_b = connect_dp(&registry, "dp-1", "tenant-b", Some(public));
+    let mut state = admin_state("cp", BackendEgressPolicy::unrestricted());
+    state.dp_registry = Some(registry.clone());
+    let harness = AdminHarness::start(state).await;
+    let reader = token(PRIMARY_SECRET, json!({}));
+
+    // Namespace B's later Subscribe neither replaces nor hides A's stream.
+    let (_, body) = harness.get(Some(&reader), Some("tenant-a")).await;
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 1);
+    assert_eq!(attestation["weakest_policy"]["mode"], "both");
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], false);
+    assert_eq!(attestation["data_planes"][0]["node_id"], "dp-1");
+    let (_, body) = harness.get(Some(&reader), Some("tenant-b")).await;
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 1);
+    assert_eq!(attestation["weakest_policy"], public_policy_view());
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], true);
+
+    // Namespace B's disconnect removes only its own stream.
+    registry.remove_stream(&tenant_b);
+    let (_, body) = harness.get(Some(&reader), Some("tenant-a")).await;
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 1);
+    assert_eq!(attestation["weakest_policy"]["mode"], "both");
+    let (_, body) = harness.get(Some(&reader), Some("tenant-b")).await;
+    assert_eq!(body["data_plane_attestation"], empty_attestation());
+}
+
+#[tokio::test]
+async fn every_stream_of_one_node_id_is_counted_and_weakens_the_aggregate() {
+    let registry = Arc::new(DpNodeRegistry::new());
+    let both = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both);
+    let public = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public);
+    // A shared-principal rollout: the old stream still serves `both` while
+    // the replacement stream for the same node id reports `public`.
+    connect_dp(&registry, "dp-1", "ferrum", Some(both));
+    let newer = connect_dp(&registry, "dp-1", "ferrum", Some(public));
+    let mut state = admin_state("cp", BackendEgressPolicy::unrestricted());
+    state.dp_registry = Some(registry.clone());
+    let harness = AdminHarness::start(state).await;
+    let reader = token(PRIMARY_SECRET, json!({}));
+
+    let (_, body) = harness.get(Some(&reader), None).await;
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 2);
+    assert_eq!(attestation["reporting_data_planes"], 2);
+    assert_eq!(attestation["weakest_policy"]["mode"], "both");
+    assert_eq!(attestation["weakest_policy_complete"], true);
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], false);
+    let data_planes = attestation["data_planes"].as_array().unwrap();
+    assert_eq!(data_planes.len(), 2);
+    assert!(data_planes.iter().all(|dp| dp["node_id"] == "dp-1"));
+
+    // The newer stream drops first: the older one is still listed.
+    registry.remove_stream(&newer);
+    let (_, body) = harness.get(Some(&reader), None).await;
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 1);
+    assert_eq!(attestation["weakest_policy"]["mode"], "both");
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], false);
+    assert_eq!(attestation["data_planes"][0]["node_id"], "dp-1");
 }
 
 #[tokio::test]
@@ -765,6 +833,35 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
     let mut unknown = attesting.clone();
     unknown["data_plane_attestation"]["data_planes"][0]["attestation"] = json!("trusted");
     assert!(!validator.is_valid(&unknown));
+    // Build detail stays off the namespace-scoped entries.
+    let mut versioned = attesting.clone();
+    versioned["data_plane_attestation"]["data_planes"][0]["ferrum_version"] = json!("0.9.13");
+    assert!(!validator.is_valid(&versioned));
+    // The `/cluster` aggregate is closed too, so a leaked CIDR is rejected there.
+    let root = json!({
+        "$ref": "#/components/schemas/ClusterStatusCp",
+        "components": spec["components"].clone(),
+    });
+    let cluster = jsonschema::draft202012::options().build(&root).unwrap();
+    let mut cluster_status = json!({
+        "mode": "cp",
+        "connected_data_planes": 0,
+        "data_planes": [],
+        "data_plane_backend_egress_policy": {
+            "connected_data_planes": 0,
+            "reporting_data_planes": 0,
+            "unknown_data_planes": 0,
+            "weakest_policy": null,
+            "weakest_policy_complete": false,
+            "all_connected_public_only_guaranteed": false,
+        },
+        "connected_mesh_nodes": 0,
+        "mesh_nodes": [],
+    });
+    assert!(cluster.is_valid(&cluster_status));
+    cluster_status["data_plane_backend_egress_policy"]["allow_cidrs"] =
+        json!(["10.45.67.89/32"]);
+    assert!(!cluster.is_valid(&cluster_status));
     let docs = include_str!("../../docs/admin_api.md");
     assert!(docs.contains("### `GET /backend-egress-policy`"));
     assert!(docs.contains("ferrum-private-reserved-v1"));
