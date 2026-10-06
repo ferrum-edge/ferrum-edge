@@ -26,6 +26,104 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Development Compose fixtures (unreleased)
+
+These changes affect only the sample `docker-compose.yml`, the SQL TLS test
+stack (`docker-compose.tls-test.yml`, `scripts/setup_db_tls.sh`) and local
+functional tests. Images, Helm charts and binaries are unchanged. Advisories:
+GHSA-wq9h-xxp4-7r2m and GHSA-x87v-w7p2-77f4; see issue #6002.
+
+**MongoDB sample profile.** `docker compose up` no longer starts MongoDB, and
+there is no default password. Start it explicitly:
+
+```bash
+export MONGO_PASSWORD="$(openssl rand -hex 32)"   # >= 32 chars of A-Z a-z 0-9 . _ ~ -
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
+docker compose --profile mongodb up -d mongodb ferrum-mongodb
+```
+
+The container refuses to start when `MONGO_PASSWORD` is missing, shorter than
+32 characters, or contains other characters. This also rejects long passwords
+that use `+`, `/`, `=` or other URI-reserved characters; for example, generate
+one with `openssl rand -hex 32` instead of `openssl rand -base64`.
+
+**Remove MongoDB started by an earlier plain `docker compose up`.** In v0.9.0–v0.9.12,
+plain `docker compose up` started MongoDB with the default password
+`dev-password-change-in-production`, even if you never used the database. The
+new MongoDB profile leaves that old container running. If its data is
+disposable, remove the old container and its volume:
+
+```bash
+docker compose --profile mongodb rm -sf mongodb ferrum-mongodb
+docker volume rm <project>_mongodb_data
+```
+
+Find the volume name with `docker volume ls --filter name=mongodb_data`; it is
+normally `<project>_mongodb_data`. If you need the data, rotate the password
+using the steps below.
+
+**Rotate an existing MongoDB volume.** `MONGO_INITDB_ROOT_PASSWORD` is applied
+only when the volume is first initialized. A `mongodb_data` volume created by
+v0.9.0–v0.9.12 without `MONGO_PASSWORD` still accepts
+`dev-password-change-in-production`, and anything that can reach the container
+(for example, other services on the Compose network) can use it until you
+rotate it. The gateway authenticates with the new `MONGO_PASSWORD`, so it fails
+until the stored password matches. Run the steps in one shell with
+`FERRUM_ADMIN_JWT_SECRET` set and `POSTGRES_PASSWORD` set if required by your
+Compose environment; step 1 sets the new `MONGO_PASSWORD`. To rotate without
+putting either MongoDB password on a command line:
+
+```bash
+# 1. Choose the new password and start only the database. The stored password
+#    is still the old one.
+export MONGO_PASSWORD="$(openssl rand -hex 32)"
+docker compose --profile mongodb up -d mongodb
+
+# 2. Authenticate with the OLD password at the prompt. The new value is read
+#    from the container environment, which Compose set from MONGO_PASSWORD.
+docker compose --profile mongodb exec mongodb mongosh --quiet \
+  --authenticationDatabase admin -u ferrum \
+  --eval "db.getSiblingDB('admin').changeUserPassword('ferrum', process.env.MONGO_INITDB_ROOT_PASSWORD)"
+
+# 3. Check that the old password is refused ("Authentication failed") and the
+#    new one is accepted (prints 1). Enter each at the prompt.
+docker compose --profile mongodb exec mongodb mongosh --quiet \
+  --authenticationDatabase admin -u ferrum --eval "db.runCommand({ping: 1}).ok"
+
+# 4. Start the gateway with the new password.
+docker compose --profile mongodb up -d ferrum-mongodb
+```
+
+If the data is disposable, delete the volume instead. Find its name with
+`docker volume ls --filter name=mongodb_data` (normally `<project>_mongodb_data`),
+stop the Mongo services with `docker compose --profile mongodb rm -sf mongodb ferrum-mongodb`,
+then run `docker volume rm <project>_mongodb_data`. Do not use
+`docker compose down -v` unless you also mean to delete the PostgreSQL volume.
+
+**SQL TLS test stack.** `scripts/setup_db_tls.sh` (still reachable as
+`tests/scripts/setup_db_tls.sh`) now:
+
+- requires Docker Compose v2 (`docker compose ... --wait`);
+- publishes PostgreSQL and MySQL on `127.0.0.1:15432` and `127.0.0.1:13306` only;
+- generates fresh PostgreSQL, MySQL and MySQL root passwords on every run and
+  writes the client URLs to `<dir>/connections.env` (default directory
+  `/tmp/ferrum-db-tls-certs`), instead of using `test-password`;
+- refuses to reuse an existing directory or container, and refuses a directory
+  inside the repository checkout unless you pass `--allow-repo-dir`.
+
+Before the first run, remove what the old helper left behind:
+
+```bash
+docker rm -f ferrum-test-pg-tls ferrum-test-mysql-tls
+rm -rf /tmp/ferrum-db-tls-certs   # or the directory you passed to the old helper
+./scripts/setup_db_tls.sh
+```
+
+The SQL TLS functional tests now read `connections.env` from
+`FERRUM_TEST_CERT_DIR` (default `/tmp/ferrum-db-tls-certs`). Tooling that
+hard-coded `test-password` for ports 15432 or 13306 must read that file instead.
+Tear down with `./scripts/setup_db_tls.sh --cleanup [dir]`.
+
 ## Upgrading to 0.9.12 (candidate)
 
 Prepared on **2026-10-05 UTC** from merged #6012 main

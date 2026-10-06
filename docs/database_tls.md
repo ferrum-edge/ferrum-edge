@@ -216,22 +216,33 @@ Use `FERRUM_DB_TLS_MODE=require` or stricter for PostgreSQL client-certificate a
 
 ### Docker Example
 
+The database joins a private Docker network with the gateway and publishes no
+host port. Passwords stay in private files and env files, never on a command
+line.
+
 ```bash
-# Generate test certificates
-openssl genrsa -out ca.key 4096
-openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/CN=Test CA"
-openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr -subj "/CN=postgres"
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -days 365 -out server.crt
+# Generate test certificates; the server certificate names the container host
+mkdir -p certs
+openssl genrsa -out certs/ca.key 4096
+openssl req -new -x509 -days 365 -key certs/ca.key -out certs/ca.crt -subj "/CN=Test CA"
+openssl genrsa -out certs/server.key 2048
+openssl req -new -key certs/server.key -out certs/server.csr -subj "/CN=pg-tls"
+printf 'subjectAltName=DNS:pg-tls\n' > certs/server.ext
+openssl x509 -req -in certs/server.csr -CA certs/ca.crt -CAkey certs/ca.key \
+  -CAcreateserial -days 365 -extfile certs/server.ext -out certs/server.crt
+
+# Generate a private password file
+(umask 077 && openssl rand -hex 32 > certs/pg-password)
+
+docker network create ferrum-db
 
 # Start PostgreSQL with TLS
 docker run -d \
   --name pg-tls \
-  -p 5432:5432 \
+  --network ferrum-db \
   -e POSTGRES_DB=ferrum \
   -e POSTGRES_USER=ferrum \
-  -e POSTGRES_PASSWORD=secret \
+  -e POSTGRES_PASSWORD_FILE=/certs-src/pg-password \
   -v $(pwd)/certs:/certs-src:ro \
   --entrypoint sh \
   postgres:16 \
@@ -246,11 +257,14 @@ docker run -d \
         -c ssl_key_file=/var/lib/postgresql/server.key \
         -c ssl_ca_file=/var/lib/postgresql/ca.crt'
 
-# Start gateway with TLS verification
+# Start gateway with TLS verification; the credential-bearing URL is in a private env file
+(umask 077 && printf 'FERRUM_DB_URL=postgres://ferrum:%s@pg-tls:5432/ferrum\n' \
+  "$(cat certs/pg-password)" > gateway.env)
 docker run -d \
+  --network ferrum-db \
+  --env-file gateway.env \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=postgres \
-  -e FERRUM_DB_URL="postgres://ferrum:secret@host.docker.internal:5432/ferrum" \
   -e FERRUM_DB_TLS_MODE=verify-full \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
   -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
@@ -316,14 +330,24 @@ export FERRUM_DB_TLS_CLIENT_KEY_PATH=/etc/ferrum/certs/client.key
 ### Docker Example
 
 ```bash
+# Same private-network pattern as PostgreSQL. server-cert.pem must carry
+# subjectAltName=DNS:mysql-tls, and the mounted key must be readable by the
+# container's mysql user.
+(umask 077 && openssl rand -hex 32 > certs/mysql-password \
+  && openssl rand -hex 32 > certs/mysql-root-password)
+
+docker network create ferrum-db   # skip if it already exists
+
 # Start MySQL with TLS
 docker run -d \
   --name mysql-tls \
-  -p 3306:3306 \
+  --network ferrum-db \
   -e MYSQL_DATABASE=ferrum \
   -e MYSQL_USER=ferrum \
-  -e MYSQL_PASSWORD=secret \
-  -e MYSQL_ROOT_PASSWORD=root-secret \
+  -e MYSQL_PASSWORD_FILE=/run/secrets/mysql-password \
+  -e MYSQL_ROOT_PASSWORD_FILE=/run/secrets/mysql-root-password \
+  -v $(pwd)/certs/mysql-password:/run/secrets/mysql-password:ro \
+  -v $(pwd)/certs/mysql-root-password:/run/secrets/mysql-root-password:ro \
   -v $(pwd)/certs/server-cert.pem:/etc/mysql/ssl/server-cert.pem:ro \
   -v $(pwd)/certs/server-key.pem:/etc/mysql/ssl/server-key.pem:ro \
   -v $(pwd)/certs/ca.pem:/etc/mysql/ssl/ca.pem:ro \
@@ -333,11 +357,14 @@ docker run -d \
   --ssl-key=/etc/mysql/ssl/server-key.pem \
   --ssl-ca=/etc/mysql/ssl/ca.pem
 
-# Start gateway
+# Start gateway; the credential-bearing URL is in a private env file
+(umask 077 && printf 'FERRUM_DB_URL=mysql://ferrum:%s@mysql-tls:3306/ferrum\n' \
+  "$(cat certs/mysql-password)" > gateway.env)
 docker run -d \
+  --network ferrum-db \
+  --env-file gateway.env \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=mysql \
-  -e FERRUM_DB_URL="mysql://ferrum:secret@host.docker.internal:3306/ferrum" \
   -e FERRUM_DB_TLS_MODE=verify-full \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
   -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
@@ -530,9 +557,16 @@ when the containers are not running.
 
 ### Setup
 
+`scripts/setup_db_tls.sh` (also reachable as `tests/scripts/setup_db_tls.sh`)
+creates a disposable PostgreSQL/MySQL TLS stack from `docker-compose.tls-test.yml`.
+It needs Docker Compose v2 and OpenSSL. Each run generates a fresh CA,
+seven-day certificates, and random PostgreSQL, MySQL and MySQL root passwords
+in a new private directory (default `/tmp/ferrum-db-tls-certs`; pass another
+path whose parent exists). Never point it at real database data.
+
 ```bash
 # Generate certificates and start TLS-enabled PostgreSQL/MySQL containers
-./tests/scripts/setup_db_tls.sh
+./scripts/setup_db_tls.sh
 
 # MongoDB TLS/mTLS fixtures are owned by hosted data-plane CI. Local Mongo TLS
 # cells skip unless FERRUM_TEST_MONGO_CERT_DIR / 27018 / 27019 are already present.
@@ -540,6 +574,74 @@ when the containers are not running.
 # Build the gateway
 cargo build
 ```
+
+What the helper guarantees:
+
+- **Loopback only.** PostgreSQL publishes `127.0.0.1:15432` and MySQL
+  `127.0.0.1:13306`; nothing listens on other host interfaces.
+- **TLS required.** PostgreSQL rejects every non-TLS TCP connection
+  (`hostnossl ... reject`) and MySQL runs with `require_secure_transport=ON`.
+  The healthchecks run an authenticated `SELECT 1` with CA and hostname
+  verification.
+- **No fixed credentials.** Passwords are generated per run and reach the
+  containers as Compose file secrets (`*_PASSWORD_FILE`) and MySQL option files.
+  They never appear on a command line, in the healthcheck configuration, or in
+  setup output, and setup failures do not dump container logs.
+- **Private files.** The directory is mode `0700`; keys, passwords, option files
+  and `connections.env` are `0600`. These are plain bind-mounted files, not
+  encrypted secret storage, so anyone with Docker or root access on the host can
+  still read them (including from the database processes' environment).
+- **Safe reruns.** Setup refuses an existing directory or an existing
+  `ferrum-test-pg-tls` / `ferrum-test-mysql-tls` container rather than replacing
+  it, and refuses a directory inside the repository checkout unless you pass
+  `--allow-repo-dir` (the default name and `connections.env` are gitignored).
+  Remove containers or directories left by older versions of the helper
+  manually: `docker rm -f ferrum-test-pg-tls ferrum-test-mysql-tls` and delete
+  the old directory.
+
+`connections.env` holds two lines for clients on the host:
+
+```text
+PG_TLS_URL=postgres://ferrum:<generated>@localhost:15432/ferrum?sslmode=verify-full&sslrootcert=<dir>/ca.crt
+MYSQL_TLS_URL=mysql://ferrum:<generated>@localhost:13306/ferrum?ssl-mode=VERIFY_IDENTITY&ssl-ca=<dir>/ca.crt
+```
+
+Generated passwords are hexadecimal and the directory path is limited to
+`A-Z a-z 0-9 . _ - /`, so the URLs need no escaping. Load them into a client's
+environment instead of printing them or passing them as command-line arguments.
+The functional tests read this file from `FERRUM_TEST_CERT_DIR` (default
+`/tmp/ferrum-db-tls-certs`); they strip the URL's TLS query and set
+`FERRUM_DB_TLS_MODE` per test instead. There is no fallback password: a running
+fixture without `connections.env` fails the SQL TLS tests.
+
+Hosted data-plane CI provisions its own SQL TLS containers inline in
+`.github/workflows/ci.yml` with the same contract: loopback-only ports,
+generated file-based credentials, and `connections.env` under
+`FERRUM_TEST_CERT_DIR`. It also sets `FERRUM_DB_TLS_REQUIRED=1`.
+
+The files are owned by your user with mode `0600` and are read inside the
+containers by root. Under Docker user-namespace remapping, container root
+cannot read them and the fixture fails to start; run it on a daemon without
+`userns-remap`.
+
+#### MongoDB sample profile
+
+The MongoDB services in `docker-compose.yml` are opt-in and have no default
+password:
+
+```bash
+export MONGO_PASSWORD="$(openssl rand -hex 32)"
+export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
+docker compose --profile mongodb up -d mongodb ferrum-mongodb
+```
+
+The Mongo container refuses to start when `MONGO_PASSWORD` is missing, shorter
+than 32 characters, or contains characters outside `A-Z a-z 0-9 . _ ~ -` (the
+gateway embeds it in its `mongodb://` URL without escaping). Port `27017` is not
+published to the host. Changing `MONGO_PASSWORD` does not change the password
+stored in an existing volume; see
+[the upgrade guide](upgrade_guide.md#development-compose-fixtures-unreleased) to
+rotate it.
 
 ### Run Tests
 
@@ -585,8 +687,16 @@ Each test performs a complete CRUD cycle:
 
 ```bash
 # Stop and remove the PostgreSQL/MySQL TLS test containers
-./tests/scripts/setup_db_tls.sh --cleanup
+./scripts/setup_db_tls.sh --cleanup
 ```
+
+Pass the same custom directory after `--cleanup` if you used one at setup.
+Cleanup checks the directory's ownership marker and the containers' path labels,
+then removes the containers, their volumes and network, and the private
+directory. A failed setup runs the same cleanup. Deleting files is not secure
+erasure. If cleanup is interrupted, remove the containers and directory by hand.
+Directories created by older versions of the helper have no ownership marker, so
+cleanup refuses them; delete them manually.
 
 ## Troubleshooting
 
