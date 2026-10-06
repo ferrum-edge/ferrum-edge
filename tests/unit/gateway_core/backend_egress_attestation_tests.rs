@@ -130,7 +130,8 @@ fn summary_is_public_only_only_when_every_connected_dp_reports_public_only() {
     assert!(all_public.all_connected_public_only_guaranteed);
 
     // One weaker DP decides the weakest policy.
-    let mixed = DataPlaneEgressSummary::from_reports([Some(public), Some(policy(EgressMode::Both))]);
+    let mixed =
+        DataPlaneEgressSummary::from_reports([Some(public), Some(policy(EgressMode::Both))]);
     assert!(mixed.weakest_policy_complete);
     assert_eq!(mixed.weakest_policy.unwrap().mode, EgressMode::Both);
     assert!(!mixed.all_connected_public_only_guaranteed);
