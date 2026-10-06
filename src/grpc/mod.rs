@@ -10,6 +10,7 @@
 
 pub mod admission;
 pub mod auth;
+pub mod backend_egress_attestation;
 pub mod configsync_lifecycle;
 pub mod cp_server;
 pub mod cp_trust;

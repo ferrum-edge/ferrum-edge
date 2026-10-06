@@ -30,6 +30,7 @@ paths:
 - The `/health` response includes `database.pool` stats when connected, but only in the authenticated (detailed) tier.
 - `/metrics/runtime` remains JWT-authenticated and cached through `runtime_metrics_cache()`.
 - `GET /cluster` is JWT-authenticated. CP returns connected DPs from `DpNodeRegistry`; DP returns CP connection state including primary/fallback and `last_config_received_at`.
+- DP backend egress attestation (#6020): DPs report presence-only egress metadata on `SubscribeRequest.backend_egress_policy`; `DpNodeInfo.backend_egress_policy` holds it (`None` = unknown). `DpNodeRegistry` is keyed per stream (`DpStreamKey`: namespace, principal, node id, process-wide stream seq); never re-key by node id, which let one stream hide another. The CP's `GET /backend-egress-policy` adds the optional `data_plane_attestation` (namespace-filtered) and `GET /cluster` the per-DP fields plus aggregate, both via `grpc::backend_egress_attestation`. Unknown DPs and empty sets never count as public-only; never add CIDRs to the report; the CP's own `public_only_guaranteed` stays false on `admission-only`.
 - `GET /backend-capabilities` and `POST /backend-capabilities/refresh` are JWT-authenticated and expose only classifications plus probe timestamps.
 
 ## OpenAPI Parity
