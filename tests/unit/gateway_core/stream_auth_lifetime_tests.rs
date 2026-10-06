@@ -7501,9 +7501,8 @@ fn cross_protocol_mesh_force_buffer_uses_the_composed_authorization_bound() {
         .expect("the mesh force-buffer must collect under the authorization bound")
         .1;
     assert!(
-        mesh_drain_args.starts_with(
-            "drain_h3_body(stream,upload,&mutmesh_upload_charge),plain_local_bound,"
-        ),
+        mesh_drain_args
+            .starts_with("drain_h3_body(stream,upload,&mutmesh_upload_charge),plain_local_bound,"),
         "the mesh force-buffer must drain under the composed authorization bound"
     );
     assert!(

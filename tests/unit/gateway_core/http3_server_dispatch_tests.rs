@@ -191,9 +191,8 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .expect("mesh uploads must force-collect under the authorization bound")
         .1;
     assert!(
-        mesh_drain_args.starts_with(
-            "drain_h3_body(stream,upload,&mutmesh_upload_charge),plain_local_bound,"
-        ),
+        mesh_drain_args
+            .starts_with("drain_h3_body(stream,upload,&mutmesh_upload_charge),plain_local_bound,"),
         "mesh force-buffer must drain under the composed authorization bound"
     );
     assert!(

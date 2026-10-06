@@ -150,7 +150,8 @@ fn first_match_order_is_preserved() {
         path_rule("/soap", Some(1500)),
     ]))];
     assert_eq!(
-        preview(&plugins, &request("/soap/admin/x", &[])), None,
+        preview(&plugins, &request("/soap/admin/x", &[])),
+        None,
         "the first matching rule is untimed, so no later sibling's total applies"
     );
     assert_eq!(preview(&plugins, &request("/soap/x", &[])), Some(1500));
@@ -164,7 +165,8 @@ fn a_later_matched_untimed_instance_replaces_an_earlier_total() {
     ];
     assert_eq!(preview(&plugins, &request("/soap/bulk", &[])), None);
     assert_eq!(
-        preview(&plugins, &request("/soap/order", &[])), Some(1500),
+        preview(&plugins, &request("/soap/order", &[])),
+        Some(1500),
         "a non-matching later instance leaves the earlier total in force"
     );
 }
@@ -202,7 +204,10 @@ fn a_redirect_publishes_no_total() {
 
 #[test]
 fn an_unmatched_rejection_publishes_no_total() {
-    let plugins = [dispatch_rejecting_unmatched(json!([path_rule("/soap", Some(1500))]))];
+    let plugins = [dispatch_rejecting_unmatched(json!([path_rule(
+        "/soap",
+        Some(1500)
+    )]))];
     assert_eq!(preview(&plugins, &request("/other", &[])), None);
 }
 
@@ -262,7 +267,8 @@ fn an_untimed_candidate_keeps_the_read_and_rpc_bounds() {
         ])),
     ];
     assert_eq!(
-        preview(&plugins, &request("/soap", &[])), None,
+        preview(&plugins, &request("/soap", &[])),
+        None,
         "one candidate is untimed, so no early route bound may apply"
     );
 }
@@ -294,7 +300,8 @@ fn identity_headers_are_never_decided_before_authentication() {
     ]))];
     let spoofed = request("/soap", &[("x-consumer-username", "alice")]);
     assert_eq!(
-        preview(&plugins, &spoofed), Some(5000),
+        preview(&plugins, &spoofed),
+        Some(5000),
         "a gateway-owned identity header is published only after authentication"
     );
 }
@@ -306,7 +313,8 @@ fn a_destination_claim_ahead_of_dispatch_may_skip_the_instance() {
         dispatch(json!([path_rule("/", Some(5000))])),
     ];
     assert_eq!(
-        preview(&plugins, &request("/soap", &[])), None,
+        preview(&plugins, &request("/soap", &[])),
+        None,
         "a router may claim the request and leave it untimed"
     );
     let plugins = [
@@ -515,7 +523,8 @@ async fn h1_an_elapsed_route_budget_refuses_a_ready_body_without_polling_it() {
     let report_rx = serve_h1(server, bounds(30_000, Some(route_at)));
     let (outcome, _) = report(report_rx).await;
     assert_eq!(
-        outcome, Outcome::RouteDeadlineExceeded,
+        outcome,
+        Outcome::RouteDeadlineExceeded,
         "a complete body must not be accepted once the route budget is spent"
     );
     drop(client);
@@ -703,7 +712,9 @@ fn every_early_collector_takes_the_previewed_route_total() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let server = include_str!("../../../src/http3/server.rs");
     assert_eq!(
-        proxy.matches("plugin_cache_view.early_route_total_at(&ctx,").count(),
+        proxy
+            .matches("plugin_cache_view.early_route_total_at(&ctx,")
+            .count(),
         3,
         "the H1/H2 pre-authenticate, authorize and pre-before_proxy collectors"
     );
@@ -714,7 +725,9 @@ fn every_early_collector_takes_the_previewed_route_total() {
         3
     );
     assert_eq!(
-        server.matches("let upload_bound = h3_early_upload_bound(").count(),
+        server
+            .matches("let upload_bound = h3_early_upload_bound(")
+            .count(),
         3,
         "the native-H3 pre-authenticate, authorize and pre-before_proxy drains"
     );
