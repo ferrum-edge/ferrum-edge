@@ -60,12 +60,20 @@ An HTTP/2 frontend upload has the matching rule. hyper reports a client's `RST_S
 as a clean end of the request body, so every streaming upload adapter relaying an HTTP/2 client's
 `Incoming` requires the client's own `END_STREAM` before it ends the backend upload. This covers
 native gRPC, the direct HTTP/2 pool, the reqwest path, the direct HTTP/1.1 pool, sidecar mesh
-mTLS, HBONE, and Unix sockets. When the gateway-owned upload pump owns the client body, the pump
-applies the same check. A reset client instead yields a CANCEL error. An HTTP/2 backend sees
-`RST_STREAM(CANCEL)`. An HTTP/1.1 backend sees an aborted body and a closed connection, never the
-terminal chunk. The reset is gateway-initiated, so the error classifiers never count it as a backend
-failure (see [error classification](error_classification.md)). HTTP/1.1 frontends skip the check:
-a valid chunked EOF need not update `is_end_stream()`.
+mTLS, HBONE, Unix sockets, and the native HTTP/3 backend. When the gateway-owned upload pump owns
+the client body, the pump applies the same check. A reset client instead yields a CANCEL error. An
+HTTP/2 backend sees `RST_STREAM(CANCEL)`. An HTTP/1.1 backend sees an aborted body and a closed
+connection, never the terminal chunk. A native HTTP/3 backend sees its request stream reset with
+`H3_REQUEST_CANCELLED`, never a FIN, and the request ends as a `499` client disconnect. HTTP/1.1
+frontends skip the check: a valid chunked EOF need not update `is_end_stream()`.
+
+The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
+classifier never count this gateway-initiated reset as a backend failure (see
+[error classification](error_classification.md)). The sidecar mesh-mTLS, HBONE, and Unix-socket
+dispatchers do not inspect the cause of a `send_request` failure before response headers: apart
+from a canceled dispatch of a replayable body, it is `protocol_error`. If the gateway's reset
+surfaces there while the dispatch is still running, it is charged to that target's circuit breaker
+and passive health, as an explicit client `CANCEL` already is.
 
 Regression coverage checks zero backend requests on expiry during TLS checkout and before a cached
 send, and observes backend QUIC resets after complete DATA followed by a stalled frontend (without

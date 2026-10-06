@@ -4151,6 +4151,71 @@ fn test_remaining_h2_upload_dispatchers_require_h2_end_stream() {
 }
 
 #[test]
+fn test_native_h3_streaming_upload_requires_h2_end_stream() {
+    // Issue #6022: an HTTP/1.1 or HTTP/2 route whose target is native HTTP/3
+    // streams the client's `Incoming` straight into the backend QUIC stream.
+    // hyper reports an HTTP/2 client's RST_STREAM(NO_ERROR) as a clean end of
+    // body, so the native-H3 forwarder must check the client's END_STREAM
+    // before it FINs the backend stream. Otherwise the backend receives a
+    // truncated upload that looks complete.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("async fn proxy_to_backend_http3(")
+        .nth(1)
+        .expect("native-H3 dispatcher")
+        .split("\n}\n")
+        .next()
+        .expect("bounded native-H3 dispatcher");
+    assert!(
+        dispatch.contains(
+            "let require_end_stream = original_req.version() == hyper::Version::HTTP_2;"
+        ),
+        "the requirement must come from the frontend request version, never HTTP/1.1"
+    );
+    assert_eq!(
+        dispatch
+            .matches("_streaming_incoming_body_under_authorization(")
+            .count(),
+        2,
+        "unexpected number of native-H3 streaming Incoming dispatch calls"
+    );
+    assert_eq!(
+        dispatch
+            .matches("body,\n                            require_end_stream,\n")
+            .count(),
+        2,
+        "both native-H3 streaming Incoming calls must pass the END_STREAM requirement"
+    );
+
+    let client = include_str!("../../../src/http3/client.rs");
+    let forward = client
+        .split("async fn forward_incoming_body_and_read_response(")
+        .nth(1)
+        .expect("native-H3 Incoming forwarder")
+        .split("\n    }\n")
+        .next()
+        .expect("bounded native-H3 Incoming forwarder");
+    let gate = forward
+        .find("require_h2_end_stream && !hyper::body::Body::is_end_stream(&frontend_body)")
+        .expect("END_STREAM check after the frontend body ends");
+    let finish = forward
+        .find("upload.stream.finish()")
+        .expect("backend stream FIN");
+    assert!(
+        gate < finish,
+        "the END_STREAM check must run before the backend stream is finished"
+    );
+    // A post-wire error leaves the reset guard incomplete, so it cancels the
+    // backend stream; the message maps to the 499 client-disconnect arm.
+    let refusal = &forward[gate..finish];
+    assert!(
+        refusal.contains("H3PoolError::post_wire(")
+            && refusal.contains("Client disconnected while sending request body"),
+        "a masked client reset must be a post-wire client disconnect"
+    );
+}
+
+#[test]
 fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
     // Ordinary and SNI routes share the same body-compat gate; body-size
     // limits no longer fork the predicate.

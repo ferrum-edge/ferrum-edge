@@ -61198,6 +61198,10 @@ async fn proxy_to_backend_http3(
                     );
                 }
 
+                // An HTTP/2 client's upload EOF must be its own END_STREAM
+                // (issue #6022), so a masked client reset cancels the backend
+                // H3 stream instead of finishing it. Never for HTTP/1.1.
+                let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
                 let (_parts, body) = (*original_req).into_parts();
                 let http3_headers = build_http3_backend_headers(
                     state,
@@ -61239,6 +61243,7 @@ async fn proxy_to_backend_http3(
                             backend_url,
                             &http3_headers,
                             body,
+                            require_end_stream,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
@@ -61262,6 +61267,7 @@ async fn proxy_to_backend_http3(
                             backend_url,
                             &http3_headers,
                             body,
+                            require_end_stream,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
