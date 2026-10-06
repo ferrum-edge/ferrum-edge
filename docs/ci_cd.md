@@ -202,25 +202,27 @@ under `pull_request_target` and rejects any change to
   against its own base before being queued, which is what keeps the payload
   base usable as a trusted baseline.
 
-**Live admin / no-bypass posture (root-owned repository settings; re-applied
-and re-verified 2026-09-01, issue #4445):** classic branch protection and
-ruleset `20208307` both require all nine GitHub Actions checks above, including
-`FIPS Build & Test`. Classic protection enforces administrators
-(`enforce_admins=true`); it previously did not, and it previously required only
-seven contexts. The active ruleset has no bypass actors -- the standing
-`OrganizationAdmin` / `bypass_mode: always` actor is removed, not narrowed --
-and it blocks force pushes and deletion. As of 2026-09-26 the ruleset contains
-only `deletion`, `non_fast_forward`, and `required_status_checks` rules: it has
-no `pull_request` (approval) rule and no `merge_queue` rule (see
-[Merge-queue batching and coordinated cadence](#merge-queue-batching-and-coordinated-cadence-evaluation-not-a-decision) below). The owner intentionally disabled GitHub's
-"approval of the most recent reviewable push by someone other than the pusher"
-rule (`require_last_push_approval=false`), so do not document or re-enable that
-distinct restriction without an explicit settings decision.
+**Live main-branch settings (read-only API snapshot, 2026-10-04 10:01 UTC):**
+ruleset `20208307` is active and requires all nine GitHub Actions checks above,
+including `FIPS Build & Test`, with integration id `15368` for each check and
+`strict_required_status_checks_policy=false`. Its rules are `deletion`,
+`non_fast_forward`, and `required_status_checks`; it has no pull-request
+approval or merge-queue rule. The ruleset currently has two bypass actors:
+`OrganizationAdmin` and `RepositoryRole` id `5`, both with
+`bypass_mode: always`. It is therefore not a no-bypass ruleset.
 
-After any future settings edit, re-query both protection APIs and confirm the
-nine exact check names, GitHub Actions app id `15368`, admin enforcement, empty
-bypass list, pull-request parameters, and merge-queue parameters. Exercise a
-queued PR to prove every required owner reports on the synthesized SHA.
+The classic branch-protection API was available for this snapshot. It reports
+the same nine required checks, each bound to GitHub Actions app id `15368`,
+`strict=false`, and `enforce_admins=false`; it also disallows force pushes and
+deletion. Its response did not include a required pull-request reviews rule.
+These API observations describe only the settings returned at the read time.
+Re-query both APIs after any settings change and before claiming administrator
+enforcement, bypass behavior, approval requirements, or merge-queue enforcement.
+
+**Historical record:** the 2026-09-01 note for issue #4445 recorded that
+administrator enforcement was enabled and the ruleset bypass list was empty.
+That is a record of the earlier observation, not a statement of current
+settings. The 2026-09-26 ruleset observation likewise predates this snapshot.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
@@ -2000,6 +2002,77 @@ full-release ABI job are removed; fast test artifacts make no production ABI
 claim. Existing frozen parser, shell, action, and artifact-ownership checks
 continue to protect the production lane.
 
+`Cross.toml` image, the complete ordered `pre-build` list, and
+`env.passthrough` are allowlisted by identity in `verify_cross_build_policy.py`.
+The Cross 0.2.5 image is pinned to the GHCR-published OCI index
+`sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c`.
+The index contains the existing Linux/amd64 host image
+`sha256:9e5d86740280e021e5f372afcad2eda7367676f33ec40085b49ee88a2652cfe5`,
+which cross-compiles for aarch64. The tag is retained for inventory and drift
+monitoring; the digest determines the bytes used by the release.
+
+That image is Ubuntu 16.04 (xenial, glibc 2.23). Every apt package `pre-build`
+installs comes from its own configured Ubuntu archive, verified by the base
+image's existing Ubuntu archive keyring. This includes bindgen's `clang-6.0` /
+`libclang-6.0-dev`, pinned to the exact `xenial-updates` version
+`1:6.0-1ubuntu2~16.04.1`, installing libclang under `/usr/lib/llvm-6.0/lib`.
+The LLVM 6.0 major, `LIBCLANG_PATH`, ABI contract, fixed empty environment,
+wrapper overrides, and passthrough values are retained. The release build adds
+no third-party apt repository and fetches no apt key. Removing apt.llvm.org
+addresses its release-time availability and trust dependency (#4978, #5955).
+The Ubuntu package is LLVM 6.0.0 rather than the former LLVM 6.0.1 snapshot.
+
+The other download is the Linux/x86_64 **host** protoc 25.1 archive, pinned to
+`ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50`.
+This is the previously admitted `.github/linux-gnu-abi.toml` checksum, shared
+by the GNU sysroot and Cross verifier constants. Cross checks it with
+`sha256sum --check --strict` before `unzip`, executable permission changes, or
+use. A failed download or checksum stops the command chain. The trusted policy
+also binds the GNU manifest's version, archive architecture, and complete URL
+to that same identity. A newly downloaded archive never supplies its own
+expected checksum. GHCR registry metadata and GitHub's published release asset
+were independently read when selecting these pins; GitHub's older v25.1 asset
+metadata has a null `digest`, so its downloaded bytes were compared with the
+pre-existing admitted checksum rather than treated as a new trust source.
+
+`base-image-digest-refresh.yml` includes a separately frozen, read-only
+`cross-image-drift` inventory job. It compares the published tag's OCI index
+with the admitted pin and reports drift for review; it cannot rewrite or
+approve the Cross pin. Its job and scheduled trigger are checked by both
+production validation and trusted-base PR comparison. A rotation must retain
+the Linux/amd64 host image and aarch64 target, independently inspect the
+published index and artifact identities, and update the trusted policy and
+inventory coherently. The Dockerfile refresh continues its existing path.
+
+The hosted `Candidate policy self-test` checks the pinned positive
+configuration and rejects missing/floating/substituted image pins, missing or
+incorrect protoc checksums, extraction before verification, ignored checksum
+failure, self-derived checksums, and mismatched artifact versions/architectures.
+Its additional hosted shell test uses the published archive, the admitted
+checksum, and real `sha256sum`; extraction is a marker stub. The correct bytes
+reach the marker and corrupt bytes must stop before it. No Cross build or
+protoc execution occurs in that read-only candidate lane.
+
+**Admission prerequisite.** Candidate success never authorizes a merge. The
+trusted-base `cross-build-policy.yml` rejects a PR that edits the verifier;
+`CI Plan` also rejects those frozen-file edits, and `CI Policy` validates Cross
+against the base's exact image and pre-build identities. An independently
+reviewed trusted-base policy rotation must admit these exact inputs and the
+refresh contract on `main` before an ordinary PR can pass. Do not override-merge
+a failed required check, loosen the protected-file comparison, or add a manual
+build dispatch to bypass admission. If the owner has no authorized rotation
+mechanism, park the proposal for an explicit owner decision about that
+mechanism. Once the trusted base contains the reviewed verifier, update the PR
+with a normal merge and obtain fresh required checks for its exact head.
+Publication still requires successful canonical evidence for every required
+check on the selected commit; no candidate result substitutes for it.
+
+Remaining availability risk: Ubuntu could remove this exact LLVM package
+version or move xenial to `old-releases.ubuntu.com`. Either change fails apt
+installation and requires a reviewed policy rotation. The signed apt archive
+remains a build-time dependency; this fix does not claim a fully offline build.
+No release version or build-profile change is part of this rotation.
+
 ##### Trusted-base relevance for required live gates
 
 `mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
@@ -2616,8 +2689,9 @@ The identity now lives in the trusted base, in two places that must agree:
    the defect being closed. The build image, both baseline smoke images, and
    the protoc archive digest are compared for exact equality (an unqualified
    Docker Hub reference, so equality also refuses a registry-host prefix and a
-   renamed repository), and `protoc_url` must start with
-   `https://github.com/protocolbuffers/protobuf/releases/download/`.
+   renamed repository). The protoc version, archive name (Linux/x86_64 host
+   architecture), and full GitHub release URL must equal the shared Cross/GNU
+   identity; a matching checksum alone cannot admit a mismatched URL or version.
 
 A deliberate image or protoc bump is consequently a direct-to-`main`
 predecessor: the constants in `verify_cross_build_policy.py`, the two producer

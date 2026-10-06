@@ -49,3 +49,7 @@ jobs:
           set -euo pipefail
           policy=.github/scripts/verify_cross_build_policy.py
           python3 -I "$policy" --self-test
+
+      # Read-only hosted evidence, never an admission or publication authority.
+      - name: Verify protoc checksum before any extraction
+        run: python3 -I .github/scripts/tests/test_cross_build_inputs.py
