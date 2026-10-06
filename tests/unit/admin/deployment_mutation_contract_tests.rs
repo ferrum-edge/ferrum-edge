@@ -59,7 +59,8 @@ fn deployment_entry_pins_precede_dependency_reads_and_original_comparison() {
     ] {
         let mutation = section(SQL, start, end);
         assert!(mutation.contains("renew_pinned_restore_lease_tx("));
-        assert!(mutation.contains("tx.commit().await?"));
+        // Only the deployment commit itself may report an unknown outcome.
+        assert!(mutation.contains("tx.commit().await.map_err(deployment_commit_unknown)?"));
     }
     assert!(mongo.contains("renew_pinned_restore_lease_in_session("));
     assert!(mongo.contains("deleted.deleted_count != 1"));
@@ -132,6 +133,14 @@ fn deployment_ack_requires_audit_release_and_live_evidence() {
     );
     assert!(finish.contains("\"recovery_cleanup_authorized\": applicable"));
     assert!(finish.contains("unavailable(\"committed\")"));
+    // Pre-commit failures are known not to have committed; only a failed
+    // commit (or a lost settlement task) is uncertain.
+    let store_error = section(ADMIN, "pub(super) fn store_error(", "fn read_error(");
+    assert!(store_error.contains("is_deployment_commit_outcome_unknown(error)"));
+    assert!(store_error.contains("unavailable(\"not_committed\")"));
+    assert_eq!(store_error.matches("unavailable(\"unknown\")").count(), 1);
+    assert!(MONGO.contains("return deployment_commit_unknown(error);"));
+    assert!(!HANDLERS.contains("Persistence outcome unknown"));
     assert!(ADMIN.contains("get_all(hyper::header::IF_MATCH)"));
     assert!(ADMIN.contains("conditional != 1"));
     assert!(ADMIN.contains("cleanup != 1"));

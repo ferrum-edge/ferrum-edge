@@ -29,8 +29,8 @@ use crate::config::db_backend::{
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-    ExternalSpecUpstreamConflict, StoredEvidence, deployment_known_columns,
-    validate_deployment_candidate,
+    ExternalSpecUpstreamConflict, StoredEvidence, deployment_commit_unknown,
+    deployment_known_columns, validate_deployment_candidate,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
@@ -3014,7 +3014,7 @@ impl DatabaseStore {
             .conditional_namespace_snapshot_tx(tx, namespace)
             .await?;
         // Refuses an over-bound typed snapshot before any raw row is read.
-        let mut stored = StoredEvidence::for_snapshot(&snapshot)?;
+        let mut stored = StoredEvidence::for_snapshot(snapshot)?;
         for table in [
             "proxies",
             "consumers",
@@ -3042,7 +3042,7 @@ impl DatabaseStore {
             drop(rows);
             stored.end_table(table)?;
         }
-        Ok(stored.finish(snapshot))
+        Ok(stored.finish())
     }
 
     async fn load_deployment_snapshot_inner(
@@ -3114,7 +3114,7 @@ impl DatabaseStore {
             self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
                 .await?;
         }
-        let mut candidate = snapshot.snapshot.config.clone();
+        let mut candidate = snapshot.snapshot().config.clone();
         candidate.proxies.retain(|p| p.id != id);
         candidate
             .plugin_configs
@@ -3172,7 +3172,7 @@ impl DatabaseStore {
             .await?;
         let (fault, _) = crate::config::batch_atomicity::atomic_batch_test_overrides(namespace);
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
-        tx.commit().await?;
+        tx.commit().await.map_err(deployment_commit_unknown)?;
         Ok(())
     }
 
@@ -10346,11 +10346,12 @@ impl DatabaseStore {
             }
             Some(
                 snapshot
-                    .snapshot
+                    .snapshot()
                     .config
                     .proxies
-                    .into_iter()
+                    .iter()
                     .find(|p| p.id == spec.proxy_id)
+                    .cloned()
                     .ok_or(DeploymentGraphInvalid)?,
             )
         } else {
@@ -10478,8 +10479,10 @@ impl DatabaseStore {
                 let (fault, _) =
                     crate::config::batch_atomicity::atomic_batch_test_overrides(&spec.namespace);
                 Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
+                tx.commit().await.map_err(deployment_commit_unknown)?;
+            } else {
+                tx.commit().await?;
             }
-            tx.commit().await?;
             return Ok(());
         }
         // Resource graph mismatch — fall through to the full replace path. The
@@ -10934,8 +10937,10 @@ impl DatabaseStore {
             let (fault, _) =
                 crate::config::batch_atomicity::atomic_batch_test_overrides(&spec.namespace);
             Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
+            tx.commit().await.map_err(deployment_commit_unknown)?;
+        } else {
+            tx.commit().await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 

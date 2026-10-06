@@ -11,6 +11,7 @@ use crate::config::db_backend::{
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, ExternalSpecUpstreamConflict,
+    is_deployment_commit_outcome_unknown, is_deployment_mutation_not_started,
 };
 use crate::config::types::ApiSpec;
 use bytes::Bytes;
@@ -32,6 +33,10 @@ const DEPLOYMENT_SNAPSHOT_TAG_KIND: &str = "deployment_snapshot.v2";
 /// `GET /deployment-snapshot`: one base64 copy of every stored gzip spec
 /// document and external-reference snapshot, carried outside the digested
 /// evidence. A namespace past it returns `507` without disclosing evidence.
+///
+/// Peak memory for the member is about twice this bound: its base64 strings
+/// and the serialized response body coexist until the body is built, on top
+/// of the stored bytes (about three quarters of the bound) already loaded.
 pub(crate) const MAX_DEPLOYMENT_SNAPSHOT_CONTENT_BASE64_BYTES: usize = 256 * 1024 * 1024;
 
 const SNAPSHOT_CONTENT_TOO_LARGE: &str =
@@ -140,11 +145,23 @@ fn snapshot_too_large(error: &str, durable: &str) -> Response<Full<Bytes>> {
     )
 }
 
-/// Map a mutation outcome. Every store error reaching here was raised inside
-/// the mutation transaction, which rolled back.
+/// Map a failed mutation. Only a commit whose outcome the store could not
+/// confirm (`DeploymentCommitOutcomeUnknown`) reports `durable: unknown`.
+/// A failure tagged `DeploymentMutationNotStarted` was raised before the
+/// mutation transaction opened (a read or mTLS admission refusal ahead of it)
+/// and reports `not_started`. Every other error was raised inside a
+/// transaction that rolled back (lease loss, a statement or admission failure)
+/// and reports `not_committed`.
 pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if is_deployment_mutation_not_started(error) {
+        return unavailable("not_started");
+    }
     if is_namespace_snapshot_too_large(error) {
         return snapshot_too_large(&NamespaceSnapshotTooLarge.to_string(), "not_committed");
+    }
+    if is_deployment_commit_outcome_unknown(error) {
+        // The store may have committed despite a transport or acknowledgement error.
+        return unavailable("unknown");
     }
     let status = if error.chain().any(|e| e.is::<NamespacePreconditionFailed>()) {
         StatusCode::PRECONDITION_FAILED
@@ -156,9 +173,8 @@ pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
     } else if crate::config::db_backend::atomic_batch_unsupported(error).is_some() {
         StatusCode::NOT_IMPLEMENTED
     } else {
-        // Never expose driver messages, credentials, or tokens. The store may
-        // have committed despite a transport or auxiliary lease release error.
-        return unavailable("unknown");
+        // Never expose driver messages, credentials, or tokens.
+        return unavailable("not_committed");
     };
     json_response(
         status,
@@ -172,7 +188,7 @@ pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
     )
 }
 
-fn read_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+pub(super) fn read_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if is_namespace_snapshot_too_large(error) {
         snapshot_too_large(&NamespaceSnapshotTooLarge.to_string(), "not_started")
     } else if crate::config::db_backend::atomic_batch_unsupported(error).is_some() {
@@ -224,7 +240,7 @@ pub(super) async fn snapshot(
     };
     // Bound the one base64 copy of stored spec content before encoding any.
     let mut content_len = 0usize;
-    for spec in &snapshot.snapshot.api_specs {
+    for spec in &snapshot.snapshot().api_specs {
         let external = spec.external_ref_snapshot.as_ref().map_or(0, Vec::len);
         content_len = content_len
             .saturating_add(base64_len(spec.spec_content.len()))

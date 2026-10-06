@@ -446,8 +446,9 @@ allow-CIDR override exists, even if that override appears harmless. The
 production default remains `both`; adopting public-only backends still
 requires explicitly configuring each serving process and restarting it.
 This discovery endpoint does not expand the existing enforcement coverage.
-See [backend egress policy](admin_api.md#backend-egress-policy) and the
-[published baseline and next contracts handoff](admin_contracts_handoff_5992_5994.md).
+See [backend egress policy](admin_api.md#backend-egress-policy); its contract
+is published in
+[`contracts-edge-0.9.11`](https://github.com/ferrum-edge/ferrum-contracts/tree/390edbd5b2485af0988e02f7827fde778d76ae0a).
 
 **Dependencies**
 
