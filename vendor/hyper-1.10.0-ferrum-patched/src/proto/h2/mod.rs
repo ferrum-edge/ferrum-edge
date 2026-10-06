@@ -3,8 +3,9 @@ use std::future::Future;
 use std::io::{Cursor, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use futures_core::ready;
 use h2::SendStream;
 use http::header::{HeaderName, CONNECTION, TE, TRANSFER_ENCODING, UPGRADE};
@@ -12,6 +13,7 @@ use http::HeaderMap;
 use pin_project_lite::pin_project;
 
 use crate::body::Body;
+use crate::common::time::Time;
 
 pub(crate) mod ping;
 pub(crate) mod upgrade;
@@ -93,8 +95,91 @@ pin_project! {
         pending_data: Option<(S::Data, bool)>,
         // FERRUM PATCH 004: bound a ready chunk waiting for send capacity.
         write_timeout: Option<WriteTimeout>,
+        // FERRUM PATCH 005: hold capacity too small for a useful DATA frame,
+        // for a bounded time, while the peer opens more of its window.
+        coalesce: Option<Coalesce>,
         #[pin]
         stream: S,
+    }
+}
+
+/// FERRUM PATCH 005: the shortest non-final DATA frame worth cutting while the
+/// peer is still opening its window. It matches h2's
+/// `DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD`: an h2 0.4.16+ receiver charges
+/// every DATA frame below it against a connection-wide budget and answers an
+/// exhausted budget with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")`.
+const MIN_COALESCED_DATA_FRAME: usize = 256;
+
+/// FERRUM PATCH 005: how long a ready chunk may hold positive capacity below
+/// `MIN_COALESCED_DATA_FRAME` waiting for more. The bound is what keeps every
+/// legal window live: a peer whose window can never reach the minimum (a
+/// stream window under 256 bytes, or one that opens only after it receives
+/// the bytes held here) gets the smaller frame once the wait ends.
+const MAX_COALESCE_WAIT: Duration = Duration::from_millis(2);
+
+/// FERRUM PATCH 005: the running state of small-window coalescing.
+///
+/// h2 cuts each DATA frame from whatever capacity is assigned when it writes.
+/// Handing it a whole chunk while the peer opens its window a few bytes at a
+/// time turns every increment into its own DATA frame, and the pattern feeds
+/// itself: the peer releases each small frame as it reads it and grants
+/// another small increment. So while assigned capacity is below a useful
+/// frame, the pipe waits up to `MAX_COALESCE_WAIT` for more, then hands h2
+/// exactly the capacity it has. The last bytes of a chunk are never held:
+/// fewer than the minimum make a useful frame at their own length, and
+/// waiting for the next chunk would delay a streamed message.
+///
+/// Only a window-limited stream reaches this state. The one sleep is
+/// allocated on its first hold and reset for later ones; a sleep that fires
+/// before the deadline (a `Timer` whose `reset` did nothing) is replaced for
+/// the rest of the hold, so the hold ends by the deadline with any `Timer`.
+struct Coalesce {
+    timer: Time,
+    sleep: Option<Pin<Box<dyn crate::rt::Sleep>>>,
+    deadline: Option<std::time::Instant>,
+}
+
+impl Coalesce {
+    /// Reports whether a chunk with `remaining` bytes should keep waiting
+    /// while `capacity` bytes are assigned. Registers the waker while it
+    /// does.
+    fn should_hold(&mut self, capacity: usize, remaining: usize, cx: &mut Context<'_>) -> bool {
+        if capacity >= remaining.min(MIN_COALESCED_DATA_FRAME) {
+            return false;
+        }
+        let now = self.timer.now();
+        let deadline = match self.deadline {
+            Some(deadline) => deadline,
+            None => {
+                let deadline = now + MAX_COALESCE_WAIT;
+                self.deadline = Some(deadline);
+                if let Some(sleep) = self.sleep.as_mut() {
+                    self.timer.reset(sleep, deadline);
+                } else {
+                    self.sleep = Some(self.timer.sleep(MAX_COALESCE_WAIT));
+                }
+                deadline
+            }
+        };
+        if now >= deadline {
+            return false;
+        }
+        let Some(sleep) = self.sleep.as_mut() else {
+            return false;
+        };
+        if sleep.as_mut().poll(cx).is_ready() {
+            // Fired before the deadline: sleep for the rest of the hold. A
+            // timer that reports even that sleep ready cannot wake a hold, so
+            // stop holding rather than wait for the peer.
+            *sleep = self.timer.sleep(deadline - now);
+            return sleep.as_mut().poll(cx).is_pending();
+        }
+        true
+    }
+
+    /// The held chunk was handed to h2: the hold, if any, is over.
+    fn release(&mut self) {
+        self.deadline = None;
     }
 }
 
@@ -177,8 +262,23 @@ where
             data_done: false,
             pending_data: None,
             write_timeout: None,
+            coalesce: None,
             stream,
         }
+    }
+
+    /// FERRUM PATCH 005: coalesce DATA frames that small window increments
+    /// would otherwise cut. The wait needs the connection's timer to stay
+    /// bounded; without one the pipe sends at every positive capacity.
+    pub(crate) fn with_coalescing(mut self, timer: Time) -> Self {
+        if !matches!(timer, Time::Empty) {
+            self.coalesce = Some(Coalesce {
+                timer,
+                sleep: None,
+                deadline: None,
+            });
+        }
+        self
     }
 
     /// FERRUM PATCH 004: bound how long a polled chunk may wait to be written.
@@ -220,26 +320,39 @@ where
             // legal peer window. Waiting for a fixed minimum can deadlock when
             // the peer advertises a smaller stream window or only one byte of
             // connection capacity remains.
-            if let Some((chunk, is_eos)) = me.pending_data.take() {
-                while chunk.has_remaining() && me.body_tx.capacity() == 0 {
+            if let Some((mut chunk, is_eos)) = me.pending_data.take() {
+                let mut capacity = me.body_tx.capacity() as usize;
+                while chunk.has_remaining() {
+                    // FERRUM PATCH 005: positive capacity is enough unless it
+                    // is too small for a useful frame and the bounded wait
+                    // for more is still running.
+                    if capacity > 0
+                        && !me.coalesce.as_mut().map_or(false, |coalesce| {
+                            coalesce.should_hold(capacity, chunk.remaining(), cx)
+                        })
+                    {
+                        break;
+                    }
                     match me.body_tx.poll_capacity(cx) {
                         Poll::Pending => {
                             // FERRUM PATCH 004: a ready chunk that cannot be
                             // written is a write stall; bound it.
-                            if let Some(write_timeout) = me.write_timeout.as_mut() {
-                                if write_timeout.poll_stalled(cx) {
-                                    debug!("request body write timed out, resetting stream");
-                                    write_timeout.signal.mark_expired();
-                                    me.body_tx.send_reset(h2::Reason::CANCEL);
-                                    return Poll::Ready(Err(crate::Error::new_body_write(
-                                        "HTTP/2 request body write timed out",
-                                    )));
+                            if capacity == 0 {
+                                if let Some(write_timeout) = me.write_timeout.as_mut() {
+                                    if write_timeout.poll_stalled(cx) {
+                                        debug!("request body write timed out, resetting stream");
+                                        write_timeout.signal.mark_expired();
+                                        me.body_tx.send_reset(h2::Reason::CANCEL);
+                                        return Poll::Ready(Err(crate::Error::new_body_write(
+                                            "HTTP/2 request body write timed out",
+                                        )));
+                                    }
                                 }
                             }
                             *me.pending_data = Some((chunk, is_eos));
                             return Poll::Pending;
                         }
-                        Poll::Ready(Some(Ok(_))) => {}
+                        Poll::Ready(Some(Ok(_))) => capacity = me.body_tx.capacity() as usize,
                         Poll::Ready(Some(Err(e))) => {
                             return Poll::Ready(Err(crate::Error::new_body_write(e)))
                         }
@@ -248,6 +361,23 @@ where
                                 "send stream capacity unexpectedly closed",
                             )));
                         }
+                    }
+                }
+                // FERRUM PATCH 005: hand h2 only the capacity it can frame
+                // now. Given the whole chunk, h2 would buffer the rest and cut
+                // a DATA frame from each later window increment.
+                if let Some(coalesce) = me.coalesce.as_mut() {
+                    coalesce.release();
+                    if capacity > 0 && chunk.remaining() > capacity {
+                        let head = chunk.copy_to_bytes(capacity);
+                        me.body_tx
+                            .send_data(SendBuf::Bytes(head), false)
+                            .map_err(crate::Error::new_body_write)?;
+                        if let Some(write_timeout) = me.write_timeout.as_mut() {
+                            write_timeout.progressed();
+                        }
+                        *me.pending_data = Some((chunk, is_eos));
+                        continue;
                     }
                 }
                 me.body_tx
@@ -334,6 +464,9 @@ enum SendBuf<B> {
     Buf(B),
     Cursor(Cursor<Box<[u8]>>),
     None,
+    // FERRUM PATCH 005: the leading part of a chunk split at the assigned
+    // capacity.
+    Bytes(Bytes),
 }
 
 impl<B: Buf> Buf for SendBuf<B> {
@@ -343,6 +476,7 @@ impl<B: Buf> Buf for SendBuf<B> {
             Self::Buf(ref b) => b.remaining(),
             Self::Cursor(ref c) => Buf::remaining(c),
             Self::None => 0,
+            Self::Bytes(ref b) => b.remaining(),
         }
     }
 
@@ -352,6 +486,7 @@ impl<B: Buf> Buf for SendBuf<B> {
             Self::Buf(ref b) => b.chunk(),
             Self::Cursor(ref c) => c.chunk(),
             Self::None => &[],
+            Self::Bytes(ref b) => b.chunk(),
         }
     }
 
@@ -361,6 +496,7 @@ impl<B: Buf> Buf for SendBuf<B> {
             Self::Buf(ref mut b) => b.advance(cnt),
             Self::Cursor(ref mut c) => c.advance(cnt),
             Self::None => {}
+            Self::Bytes(ref mut b) => b.advance(cnt),
         }
     }
 
@@ -369,6 +505,7 @@ impl<B: Buf> Buf for SendBuf<B> {
             Self::Buf(ref b) => b.chunks_vectored(dst),
             Self::Cursor(ref c) => c.chunks_vectored(dst),
             Self::None => 0,
+            Self::Bytes(ref b) => b.chunks_vectored(dst),
         }
     }
 }
@@ -785,5 +922,287 @@ mod ferrum_body_write_timeout_tests {
         mut rx: tokio::sync::mpsc::Receiver<T>,
     ) -> impl futures_core::Stream<Item = T> {
         futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+    }
+}
+
+#[cfg(all(test, feature = "client"))]
+mod ferrum_h2_small_window_coalescing_tests {
+    //! FERRUM PATCH 005: capacity that a peer opens a few bytes at a time is
+    //! coalesced into useful DATA frames, the end of a body is never held,
+    //! and a window that never reaches a useful frame still progresses once
+    //! the bounded wait ends.
+    //!
+    //! The peer speaks raw frames so it controls every WINDOW_UPDATE, and the
+    //! runtime's clock is paused: the bounded wait elapses only while every
+    //! task is idle, so frame sizes do not depend on machine speed.
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{MAX_COALESCE_WAIT, MIN_COALESCED_DATA_FRAME};
+    use crate::common::io::Compat;
+    use crate::rt::{Sleep, Timer};
+
+    #[derive(Clone)]
+    struct TokioExecutor;
+
+    impl<F> crate::rt::Executor<F> for TokioExecutor
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        fn execute(&self, fut: F) {
+            tokio::spawn(fut);
+        }
+    }
+
+    struct TokioTimer;
+
+    struct TokioSleep(Pin<Box<tokio::time::Sleep>>);
+
+    impl Future for TokioSleep {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.0.as_mut().poll(cx)
+        }
+    }
+
+    impl Sleep for TokioSleep {}
+
+    impl Timer for TokioTimer {
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>> {
+            Box::pin(TokioSleep(Box::pin(tokio::time::sleep(duration))))
+        }
+        fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Sleep>> {
+            Box::pin(TokioSleep(Box::pin(tokio::time::sleep_until(deadline.into()))))
+        }
+        // The paused clock moves tokio's time, not the system's.
+        fn now(&self) -> Instant {
+            tokio::time::Instant::now().into_std()
+        }
+    }
+
+    /// Every connection starts with this much connection window; SETTINGS
+    /// cannot change it.
+    const INITIAL_CONNECTION_WINDOW: usize = 65_535;
+    /// How far the peer opens the connection window at a time.
+    const INCREMENT: u32 = 32;
+
+    const DATA: u8 = 0x0;
+    const SETTINGS: u8 = 0x4;
+    const PING: u8 = 0x6;
+    const WINDOW_UPDATE: u8 = 0x8;
+    const END_STREAM: u8 = 0x1;
+    const ACK: u8 = 0x1;
+
+    fn frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9 + payload.len());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        out.push(kind);
+        out.push(flags);
+        out.extend_from_slice(&stream_id.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A raw HTTP/2 server that records the length and END_STREAM flag of
+    /// every request DATA frame.
+    struct Peer {
+        io: tokio::io::DuplexStream,
+        frames: Vec<(usize, bool)>,
+        received: usize,
+    }
+
+    impl Peer {
+        async fn accept(mut io: tokio::io::DuplexStream) -> Peer {
+            let mut preface = [0u8; 24];
+            io.read_exact(&mut preface).await.expect("client preface");
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            // SETTINGS_INITIAL_WINDOW_SIZE = 1 MiB: only the connection
+            // window ever limits the client.
+            io.write_all(&frame(SETTINGS, 0, 0, &[0, 4, 0, 0x10, 0, 0]))
+                .await
+                .expect("server SETTINGS");
+            Peer {
+                io,
+                frames: Vec::new(),
+                received: 0,
+            }
+        }
+
+        /// Reads frames until `total` body bytes have arrived.
+        async fn read_body_until(&mut self, total: usize) {
+            while self.received < total {
+                let mut head = [0u8; 9];
+                self.io.read_exact(&mut head).await.expect("frame header");
+                let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+                let mut payload = vec![0u8; len];
+                self.io.read_exact(&mut payload).await.expect("frame payload");
+                match (head[3], head[4]) {
+                    (DATA, flags) => {
+                        self.received += len;
+                        self.frames.push((len, flags & END_STREAM != 0));
+                    }
+                    (SETTINGS, flags) if flags & ACK == 0 => {
+                        self.io
+                            .write_all(&frame(SETTINGS, ACK, 0, &[]))
+                            .await
+                            .expect("SETTINGS ACK");
+                    }
+                    (PING, flags) if flags & ACK == 0 => {
+                        self.io
+                            .write_all(&frame(PING, ACK, 0, &payload))
+                            .await
+                            .expect("PING ACK");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// Opens the connection window by `INCREMENT` bytes, then yields so
+        /// the client handles it before the next one arrives. Yielding never
+        /// advances the paused clock.
+        async fn grant(&mut self) {
+            self.io
+                .write_all(&frame(WINDOW_UPDATE, 0, 0, &INCREMENT.to_be_bytes()))
+                .await
+                .expect("WINDOW_UPDATE");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    async fn client(
+        io: tokio::io::DuplexStream,
+        timer: bool,
+    ) -> crate::client::conn::http2::SendRequest<Full<Bytes>> {
+        let mut builder = crate::client::conn::http2::Builder::new(TokioExecutor);
+        if timer {
+            builder.timer(TokioTimer);
+        }
+        let (sender, conn) = builder.handshake(Compat::new(io)).await.expect("handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    }
+
+    fn upload(len: usize) -> http::Request<Full<Bytes>> {
+        http::Request::post("http://t/")
+            .body(Full::new(Bytes::from(vec![b'x'; len])))
+            .unwrap()
+    }
+
+    fn small_non_final_frames(frames: &[(usize, bool)]) -> usize {
+        frames
+            .iter()
+            .filter(|(len, end_stream)| !end_stream && *len < MIN_COALESCED_DATA_FRAME)
+            .count()
+    }
+
+    /// Uploads a body against a peer that, once the initial connection window
+    /// is spent, opens it `INCREMENT` bytes at a time, `grants` times, without
+    /// waiting for the bytes it allows. Returns the DATA frames sent after the
+    /// initial window.
+    async fn frames_after_initial_window(timer: bool, grants: usize) -> Vec<(usize, bool)> {
+        let body_len = INITIAL_CONNECTION_WINDOW + grants * INCREMENT as usize;
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let peer = tokio::spawn(async move {
+            let mut peer = Peer::accept(server_io).await;
+            peer.read_body_until(INITIAL_CONNECTION_WINDOW).await;
+            let initial = peer.frames.len();
+            for _ in 0..grants {
+                peer.grant().await;
+            }
+            peer.read_body_until(body_len).await;
+            assert_eq!(peer.received, body_len);
+            peer.frames.split_off(initial)
+        });
+        let mut sender = client(client_io, timer).await;
+        let _response = sender.send_request(upload(body_len));
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("the upload completes")
+            .expect("peer")
+    }
+
+    /// Control: without a timer the pipe cannot bound a wait, so it sends at
+    /// every positive capacity and each increment leaves as its own DATA
+    /// frame. This is the run of small frames that an h2 0.4.16+ receiver
+    /// charges against its budget.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_timer_each_increment_is_its_own_frame() {
+        const GRANTS: usize = 128;
+        let frames = frames_after_initial_window(false, GRANTS).await;
+        assert!(
+            small_non_final_frames(&frames) >= GRANTS / 2,
+            "expected a run of small DATA frames: {frames:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn small_window_increments_coalesce_into_useful_frames() {
+        const GRANTS: usize = 128;
+        let frames = frames_after_initial_window(true, GRANTS).await;
+        let total: usize = frames.iter().map(|(len, _)| len).sum();
+        assert_eq!(total, GRANTS * INCREMENT as usize);
+        assert_eq!(
+            small_non_final_frames(&frames),
+            0,
+            "window increments must coalesce into frames of at least \
+             {MIN_COALESCED_DATA_FRAME} bytes: {frames:?}"
+        );
+    }
+
+    /// A peer that opens its window only after it has received the bytes it
+    /// allowed never lets capacity reach a useful frame. Each increment is
+    /// held for the bounded wait and then sent anyway. The last piece of the
+    /// body is useful at its own length, so it is not held at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_below_a_useful_frame_progresses_after_the_bounded_wait() {
+        const ROUNDS: usize = 8;
+        let body_len = INITIAL_CONNECTION_WINDOW + ROUNDS * INCREMENT as usize;
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let peer = tokio::spawn(async move {
+            let mut peer = Peer::accept(server_io).await;
+            peer.read_body_until(INITIAL_CONNECTION_WINDOW).await;
+            let initial = peer.frames.len();
+            let mut waits = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                let started = tokio::time::Instant::now();
+                let target = peer.received + INCREMENT as usize;
+                peer.grant().await;
+                peer.read_body_until(target).await;
+                waits.push(started.elapsed());
+            }
+            (peer.frames.split_off(initial), waits)
+        });
+        let mut sender = client(client_io, true).await;
+        let _response = sender.send_request(upload(body_len));
+        let (frames, waits) = tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("the upload completes")
+            .expect("peer");
+        assert_eq!(frames.len(), ROUNDS, "{frames:?}");
+        assert!(
+            frames.iter().all(|(len, _)| *len == INCREMENT as usize),
+            "{frames:?}"
+        );
+        assert!(frames[ROUNDS - 1].1, "the last frame ends the stream");
+        for wait in &waits[..ROUNDS - 1] {
+            assert!(*wait >= MAX_COALESCE_WAIT, "held for the bounded wait: {waits:?}");
+            assert!(*wait < MAX_COALESCE_WAIT * 4, "and no longer: {waits:?}");
+        }
+        assert!(
+            waits[ROUNDS - 1] < MAX_COALESCE_WAIT,
+            "the end of the body is not held: {waits:?}"
+        );
     }
 }

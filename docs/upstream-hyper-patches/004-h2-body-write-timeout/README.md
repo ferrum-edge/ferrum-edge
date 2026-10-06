@@ -208,7 +208,10 @@ Retire together with [patch 002](../002-min-data-frame-capacity/README.md#retire
 when Ferrum adopts an equivalent upstream per-request HTTP/2 body write-stall
 bound that preserves progress at every positive assigned capacity, or when
 Ferrum's HTTP/2 client moves off hyper. The shared pending-body implementation
-belongs to the `hyper-h2-body-progress-and-timeout` co-retirement group.
+belongs to the `hyper-h2-body-progress-and-timeout` co-retirement group, with
+[patch 005](../005-h2-small-window-coalescing/README.md). Patch 005's bounded
+coalescing wait is not a write stall: this timer is checked only while
+assigned capacity is zero.
 Hosted replacement tests must cover small legal windows, the final connection
 byte, empty end-of-stream handling and write-stall bounds. No compatible
 replacement release has been selected or tested.

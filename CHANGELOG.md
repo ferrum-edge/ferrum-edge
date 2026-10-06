@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP/2 bodies no longer leave as one DATA frame per small window
+  increment** (#6033). Since the old 1 KiB send-capacity gate was removed
+  (#6001), a backend or client that opened its HTTP/2 window a few bytes at a
+  time received one tiny DATA frame per increment. The pattern feeds itself,
+  and an unpatched h2 0.4.16+ peer (tonic, axum, hyper) answers it with
+  `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")`, failing every stream on
+  the connection. Hyper patch 005 makes Ferrum's HTTP/2 body pipes (uploads
+  through the gRPC and direct HTTP/2 pools, and responses to HTTP/2 clients)
+  hold capacity below `min(chunk remaining, 256)` bytes for at most 2 ms. The
+  pipe then sends exactly the assigned capacity. The bound means a window that
+  never reaches 256 bytes still progresses. The frontend HTTP/2 server now
+  configures a hyper timer for this wait. Ferrum's receive-side DATA-frame
+  budget fix (h2 patch 002) is unchanged.
 - **Direct-H2 uploads no longer relay a client reset as a complete body**
   (#6022). hyper reports an HTTP/2 client's `RST_STREAM(NO_ERROR)` as a clean
   end of the request body. A non-gRPC upload relayed through the direct HTTP/2

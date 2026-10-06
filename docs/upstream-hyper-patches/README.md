@@ -18,18 +18,20 @@ root. Each patch is based on the output of all preceding patches:
 | [002](002-min-data-frame-capacity/README.md) | Hyper 1.10.0 + 001 | Pending body chunk foundation, positive-capacity progress and regressions |
 | [003](003-greedy-h1-read/README.md) | Hyper 1.10.0 + 001 + 002 | HTTP/1 read-ahead and upgrade error handoff |
 | [004](004-h2-body-write-timeout/README.md) | Hyper 1.10.0 + 001 + 002 + 003 | HTTP/2 request-body write-stall bound |
+| [005](005-h2-small-window-coalescing/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 | Coalesce DATA frames cut from small HTTP/2 window increments |
 
-Patch 002 supplies `pending_data`; patch 004 builds on it. Patch 002 is a
-complete diff from its stated baseline, replacing the former incremental
+Patch 002 supplies `pending_data`; patches 004 and 005 build on it. Patch 002
+is a complete diff from its stated baseline, replacing the former incremental
 correction that required the old fixed-minimum patch and patch 004 first.
-No stage reinstates the unsafe 1 KiB send-capacity threshold.
+No stage reinstates the unsafe 1 KiB send-capacity threshold; patch 005's
+coalescing wait is bounded, so every positive window still makes progress.
 
 ## Hosted reconstruction gate
 
 The **Dependency Audit (cargo-deny)** job in
 [CI](../../.github/workflows/ci.yml) downloads and checks the pinned archive,
 then runs [the reconstruction verifier](../../.github/scripts/verify_hyper_patch_stack.py)
-before Cargo touches the vendor tree. It applies all four patches with
+before Cargo touches the vendor tree. It applies all five patches with
 `git apply` to a fresh extracted crate. It neither formats the result nor
 copies source from `vendor/` over it.
 
@@ -56,8 +58,8 @@ the optional security lockfile producer uses the new pins. See
 
 ## Lifecycle
 
-The current progress implementation is a deliberate fork paired with patch
-004. [Hyper #4212](https://github.com/hyperium/hyper/pull/4212) closed unmerged
+The current progress implementation is a deliberate fork paired with patches
+004 and 005. [Hyper #4212](https://github.com/hyperium/hyper/pull/4212) closed unmerged
 on 2026-10-04; it is historical evidence, not a release-adoption prerequisite.
 See [patch 002's retirement plan](002-min-data-frame-capacity/README.md#retirement-plan)
 and [the lifecycle inventory](../vendored-patch-lifecycle.json). The receiver's
