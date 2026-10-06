@@ -859,8 +859,7 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
         "mesh_nodes": [],
     });
     assert!(cluster.is_valid(&cluster_status));
-    cluster_status["data_plane_backend_egress_policy"]["allow_cidrs"] =
-        json!(["10.45.67.89/32"]);
+    cluster_status["data_plane_backend_egress_policy"]["allow_cidrs"] = json!(["10.45.67.89/32"]);
     assert!(!cluster.is_valid(&cluster_status));
     let docs = include_str!("../../docs/admin_api.md");
     assert!(docs.contains("### `GET /backend-egress-policy`"));
