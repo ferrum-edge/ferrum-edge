@@ -351,7 +351,10 @@ fn both_h3_bridge_drain_refusals_run_the_reject_hooks_and_the_log() {
         "crate::proxy::log_rejected_request(",
         "outcome.rejection_logged = true;",
     ] {
-        assert!(refusal.contains(call), "the bridge refusal must use `{call}`");
+        assert!(
+            refusal.contains(call),
+            "the bridge refusal must use `{call}`"
+        );
     }
 
     let drains: Vec<&str> = bridge.split("H3RetainedUpload::admit(").skip(1).collect();
@@ -362,7 +365,9 @@ fn both_h3_bridge_drain_refusals_run_the_reject_hooks_and_the_log() {
             .next()
             .unwrap_or_else(|| panic!("bridge drain {index} must be bounded"));
         assert_eq!(
-            refusals.matches("Box::pin(write_bridge_upload_refusal(").count(),
+            refusals
+                .matches("Box::pin(write_bridge_upload_refusal(")
+                .count(),
             2,
             "bridge drain {index}: the capacity and oversize refusals take the shared path"
         );
