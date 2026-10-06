@@ -3,6 +3,9 @@
 
 use std::sync::Arc;
 
+use ferrum_edge::_test_support::{
+    h3_pool_buffered_request_for_test, h3_pool_streaming_request_with_target_for_test,
+};
 use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
@@ -2535,22 +2538,23 @@ async fn h3_pool_request_reuses_an_admitted_shard_when_the_cap_refuses_creation(
     // served by multiplexing onto it.
     for attempt in 0..REQUESTS {
         let tls = client_tls.clone();
-        let response = pool
-            .request(
-                &proxy,
-                "GET",
-                &url,
-                &headers,
-                bytes::Bytes::new(),
-                move || std::future::ready(Ok(tls)),
+        let response = h3_pool_buffered_request_for_test(
+            &pool,
+            &proxy,
+            None,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(tls)),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "request {attempt} must be served on the already-admitted shard, \
+                 not fail because its own shard is over the cap: {e}"
             )
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "request {attempt} must be served on the already-admitted shard, \
-                     not fail because its own shard is over the cap: {e}"
-                )
-            });
+        });
         assert_eq!(response.status, 200);
         assert!(response.body.is_empty());
     }
@@ -2606,17 +2610,18 @@ async fn h3_pool_conn_slot_is_owned_by_the_driver_not_the_pooled_handle() {
     )];
 
     let tls = client_tls.clone();
-    let response = pool
-        .request(
-            &proxy,
-            "GET",
-            &url,
-            &headers,
-            bytes::Bytes::new(),
-            move || std::future::ready(Ok(tls)),
-        )
-        .await
-        .expect("first request establishes the one admitted QUIC connection");
+    let response = h3_pool_buffered_request_for_test(
+        &pool,
+        &proxy,
+        None,
+        "GET",
+        &url,
+        &headers,
+        bytes::Bytes::new(),
+        std::future::ready(Ok(tls)),
+    )
+    .await
+    .expect("first request establishes the one admitted QUIC connection");
     assert_eq!(response.status, 200);
     assert_eq!(
         limiter.current("127.0.0.1", port),
@@ -2660,17 +2665,18 @@ async fn h3_pool_conn_slot_is_owned_by_the_driver_not_the_pooled_handle() {
     }
 
     let tls = client_tls.clone();
-    let response = pool
-        .request(
-            &proxy,
-            "GET",
-            &url,
-            &headers,
-            bytes::Bytes::new(),
-            move || std::future::ready(Ok(tls)),
-        )
-        .await
-        .expect("a replacement must be admitted once the old driver terminated");
+    let response = h3_pool_buffered_request_for_test(
+        &pool,
+        &proxy,
+        None,
+        "GET",
+        &url,
+        &headers,
+        bytes::Bytes::new(),
+        std::future::ready(Ok(tls)),
+    )
+    .await
+    .expect("a replacement must be admitted once the old driver terminated");
     assert_eq!(response.status, 200);
     assert_eq!(
         backend.accepted_handshakes(),
@@ -2788,20 +2794,18 @@ async fn h3_pool_target_dispatch_caps_on_the_policy_port_under_a_target_port_rem
 
     for attempt in 0..REQUESTS {
         let tls = client_tls.clone();
-        let response = pool
-            .request_with_target(
-                &proxy,
-                "127.0.0.1",
-                port,
-                POLICY_PORT,
-                "GET",
-                &url,
-                &headers,
-                bytes::Bytes::new(),
-                move || std::future::ready(Ok(tls)),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("buffered targeted request {attempt} must be served: {e}"));
+        let response = h3_pool_buffered_request_for_test(
+            &pool,
+            &proxy,
+            Some(("127.0.0.1", port, POLICY_PORT)),
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(tls)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("buffered targeted request {attempt} must be served: {e}"));
         assert_eq!(response.status, 200);
     }
 
@@ -2847,20 +2851,18 @@ async fn h3_pool_streaming_target_dispatch_caps_on_the_policy_port_under_a_remap
 
     for attempt in 0..REQUESTS {
         let tls = client_tls.clone();
-        let response = pool
-            .request_with_target_streaming(
-                &proxy,
-                "127.0.0.1",
-                port,
-                POLICY_PORT,
-                "GET",
-                &url,
-                &headers,
-                bytes::Bytes::new(),
-                move || std::future::ready(Ok(tls)),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("streaming targeted request {attempt} must be served: {e}"));
+        let response = h3_pool_streaming_request_with_target_for_test(
+            &pool,
+            &proxy,
+            ("127.0.0.1", port, POLICY_PORT),
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(tls)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("streaming targeted request {attempt} must be served: {e}"));
         assert_eq!(response.status, 200);
     }
 
@@ -2958,24 +2960,20 @@ async fn h3_pool_request_with_target_reuses_an_admitted_shard_when_the_cap_refus
     // from `request()` — cover it independently.
     for attempt in 0..REQUESTS {
         let tls = client_tls.clone();
-        let response = pool
-            .request_with_target(
-                &proxy,
-                "127.0.0.1",
-                port,
-                port,
-                "GET",
-                &url,
-                &headers,
-                bytes::Bytes::new(),
-                move || std::future::ready(Ok(tls)),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "targeted request {attempt} must be served on the already-admitted shard: {e}"
-                )
-            });
+        let response = h3_pool_buffered_request_for_test(
+            &pool,
+            &proxy,
+            Some(("127.0.0.1", port, port)),
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(tls)),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("targeted request {attempt} must be served on the already-admitted shard: {e}")
+        });
         assert_eq!(response.status, 200);
         assert!(response.body.is_empty());
     }
@@ -3477,12 +3475,18 @@ async fn h3_pool_authorization_expiry_during_checkout_sends_zero_backend_request
         assert_eq!(backend.accepted_connections(), 0);
         assert!(backend.received_requests().await.is_empty());
         // Prove zero hits came from expiry rather than an unusable fixture.
-        let response = pool
-            .request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
-                std::future::ready(Ok(client_tls))
-            })
-            .await
-            .expect("healthy backend after refused acquisition");
+        let response = h3_pool_buffered_request_for_test(
+            &pool,
+            &proxy,
+            None,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(client_tls)),
+        )
+        .await
+        .expect("healthy backend after refused acquisition");
         assert_eq!(response.status, 200);
         assert_eq!(backend.received_requests().await.len(), 1);
     }
@@ -3508,9 +3512,16 @@ async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
                 .expect("backend authority"),
         )];
         let tls = client_tls.clone();
-        pool.request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
-            std::future::ready(Ok(tls))
-        })
+        h3_pool_buffered_request_for_test(
+            &pool,
+            &proxy,
+            None,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(tls)),
+        )
         .await
         .expect("warm live sender");
         let plan = (
@@ -3539,12 +3550,18 @@ async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
         assert!(!error.1);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(backend.received_requests().await.len(), 1);
-        let response = pool
-            .request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
-                std::future::ready(Ok(client_tls))
-            })
-            .await
-            .expect("refusal must preserve the healthy sender");
+        let response = h3_pool_buffered_request_for_test(
+            &pool,
+            &proxy,
+            None,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(client_tls)),
+        )
+        .await
+        .expect("refusal must preserve the healthy sender");
         assert_eq!(response.status, 200);
         assert_eq!(backend.accepted_connections(), 1);
         assert_eq!(backend.received_requests().await.len(), 2);
@@ -3576,9 +3593,16 @@ async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenanc
             .expect("backend authority"),
     )];
     let tls = client_tls.clone();
-    pool.request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
-        std::future::ready(Ok(tls))
-    })
+    h3_pool_buffered_request_for_test(
+        &pool,
+        &proxy,
+        None,
+        "GET",
+        &url,
+        &headers,
+        bytes::Bytes::new(),
+        std::future::ready(Ok(tls)),
+    )
     .await
     .expect("warm live sender");
     let plan = (
@@ -3706,17 +3730,18 @@ async fn h3_cold_connect_timeout_does_not_become_an_authorization_refusal() {
             http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
                 .expect("live backend authority"),
         )];
-        let response = pool
-            .request(
-                &proxy,
-                "GET",
-                &format!("https://127.0.0.1:{port}/"),
-                &headers,
-                bytes::Bytes::new(),
-                || std::future::ready(Ok(client_tls)),
-            )
-            .await
-            .expect("usable H3 fixture after timeout");
+        let response = h3_pool_buffered_request_for_test(
+            &pool,
+            &proxy,
+            None,
+            "GET",
+            &format!("https://127.0.0.1:{port}/"),
+            &headers,
+            bytes::Bytes::new(),
+            std::future::ready(Ok(client_tls)),
+        )
+        .await
+        .expect("usable H3 fixture after timeout");
         assert_eq!(response.status, 200);
         assert_eq!(backend.received_requests().await.len(), 1);
     }

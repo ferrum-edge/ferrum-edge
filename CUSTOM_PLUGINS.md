@@ -748,8 +748,11 @@ async fn transform_response_body(
   `name()` reports. A custom plugin that returns a built-in name (for example
   `"compression"`) still gets the custom default here, and its request-input
   and response-header declarations are not trusted as a built-in's either
-  (issue #6022). `Plugin` has `Any` as a supertrait for this, so a plugin type
-  must be `'static`, which `Arc<dyn Plugin>` already required.
+  (issue #6022). The plugin-cache composition checks treat it the same way: it
+  is not exempt from, and does not impose, the ordering rules of the built-in
+  it names (for example `request_deduplication` or `response_caching`).
+  `Plugin` has `Any` as a supertrait for this, so a plugin type must be
+  `'static`, which `Arc<dyn Plugin>` already required.
 - Declaring `Never` but returning `Some` from `normalize_response_body*` /
   `transform_response_body*` remains a contract violation: the replacement is
   refused rather than installed.

@@ -9,14 +9,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use ferrum_edge::_test_support::{early_route_total_ms_for_test, run_after_proxy_hooks_for_test};
+use ferrum_edge::_test_support::{
+    early_route_total_ms_for_test, run_after_proxy_hooks_for_test,
+    validate_plugin_security_composition_for_test,
+};
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginScope};
 use ferrum_edge::plugins::compression::CompressionPlugin;
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
+use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseBodyProduction, create_plugin,
-    is_builtin_plugin,
+    Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext, ResponseBodyProduction,
+    create_plugin, is_builtin_plugin, priority,
 };
 
 use crate::unit::plugins::plugin_utils::{make_plugin_config_with_json, make_proxy};
@@ -163,4 +168,136 @@ async fn a_late_header_hook_reporting_a_built_in_name_is_simulated_conservativel
         "a custom hook reporting a built-in name is not simulated as that built-in, \
          so compression must not commit an encoding ahead of it"
     );
+}
+
+/// A custom plugin that reports a built-in name and declares the request
+/// mutations the security-composition ordering checks look for.
+struct ComposingImpostor {
+    name: &'static str,
+    priority: u16,
+    headers: bool,
+    body: bool,
+}
+
+#[async_trait]
+impl Plugin for ComposingImpostor {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        self.headers
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        self.body
+    }
+}
+
+fn composing_impostor(
+    name: &'static str,
+    priority: u16,
+    headers: bool,
+    body: bool,
+) -> Arc<dyn Plugin> {
+    Arc::new(ComposingImpostor {
+        name,
+        priority,
+        headers,
+        body,
+    })
+}
+
+fn request_deduplication() -> Arc<dyn Plugin> {
+    let plugin =
+        RequestDeduplication::new(&json!({}), PluginHttpClient::default()).expect("valid config");
+    Arc::new(plugin)
+}
+
+fn response_caching() -> Arc<dyn Plugin> {
+    Arc::new(ResponseCaching::new(&json!({})).expect("valid config"))
+}
+
+#[test]
+fn a_custom_plugin_reporting_request_deduplication_is_not_exempt_from_its_ordering_checks() {
+    let late = priority::REQUEST_DEDUPLICATION + 1;
+    let cases = [
+        (
+            composing_impostor("request_deduplication", late, true, false),
+            "must run before every request_deduplication",
+        ),
+        (
+            composing_impostor("request_deduplication", late, false, true),
+            "deferred request-body transformer",
+        ),
+    ];
+    for (impostor, expected) in cases {
+        let plugins = [request_deduplication(), impostor];
+        let error = validate_plugin_security_composition_for_test(&plugins)
+            .expect_err("a custom mutator reporting the deduplication name must be checked");
+        assert!(error.contains(expected), "got: {error}");
+    }
+}
+
+#[test]
+fn a_custom_plugin_reporting_request_deduplication_does_not_select_its_ordering_checks() {
+    // Only a registered request_deduplication fingerprints during
+    // before_proxy, so a custom plugin reporting the name imposes no ordering
+    // on a later request mutator.
+    let plugins = [
+        composing_impostor(
+            "request_deduplication",
+            priority::REQUEST_DEDUPLICATION,
+            false,
+            false,
+        ),
+        composing_impostor("custom_header_mutator", priority::DEFAULT, true, false),
+    ];
+    validate_plugin_security_composition_for_test(&plugins)
+        .expect("a custom plugin reporting request_deduplication is not deduplication");
+}
+
+#[test]
+fn a_custom_plugin_reporting_an_exempt_name_is_not_exempt_from_response_caching_checks() {
+    let late = priority::RESPONSE_CACHING + 1;
+    let cases = [
+        (
+            composing_impostor("response_caching", late, true, false),
+            "must run before every response_caching",
+        ),
+        (
+            composing_impostor("compression", late, true, false),
+            "must run before every response_caching",
+        ),
+        (
+            composing_impostor("response_caching", late, false, true),
+            "deferred request-body transformer",
+        ),
+        (
+            composing_impostor("grpc_web", late, false, true),
+            "deferred request-body transformer",
+        ),
+    ];
+    for (impostor, expected) in cases {
+        let name = impostor.name().to_string();
+        let plugins = [response_caching(), impostor];
+        let error = validate_plugin_security_composition_for_test(&plugins)
+            .expect_err("a custom mutator reporting an exempt built-in name must be checked");
+        assert!(error.contains(expected), "{name}: got: {error}");
+    }
+}
+
+#[test]
+fn the_registered_compression_plugin_keeps_its_response_caching_exemption() {
+    let config = json!({"min_content_length": 10, "algorithms": ["gzip"]});
+    let compression: Arc<dyn Plugin> =
+        Arc::new(CompressionPlugin::new(&config).expect("valid config"));
+    assert!(compression.priority() >= priority::RESPONSE_CACHING);
+    let plugins = [response_caching(), compression];
+    validate_plugin_security_composition_for_test(&plugins)
+        .expect("response caching composes with the registered compression plugin");
 }

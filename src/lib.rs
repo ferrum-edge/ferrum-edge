@@ -11840,6 +11840,79 @@ pub mod _test_support {
         })
     }
 
+    /// The native-H3 pool's buffered dispatch, on the proxy's own backend or
+    /// an explicit `(host, port, policy_port)` target. No authorization
+    /// lifetime bounds it: the pool's shard and admission tests use it, while
+    /// production buffers through the authorized streaming entry points
+    /// (issue #6022).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn h3_pool_buffered_request_for_test<F>(
+        pool: &crate::http3::client::Http3ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        target: Option<(&str, u16, u16)>,
+        method: &str,
+        url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        tls_config: F,
+    ) -> crate::http3::client::H3PoolResult<crate::http3::client::H3BufferedResponse>
+    where
+        F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        match target {
+            Some((host, port, policy_port)) => {
+                pool.request_with_target(
+                    proxy,
+                    host,
+                    port,
+                    policy_port,
+                    method,
+                    url,
+                    headers,
+                    body,
+                    || tls_config,
+                )
+                .await
+            }
+            None => {
+                pool.request(proxy, method, url, headers, body, || tls_config)
+                    .await
+            }
+        }
+    }
+
+    /// The native-H3 pool's authorized streaming dispatch to an explicit
+    /// `(host, port, policy_port)` target with no lifetime bound, the
+    /// production entry point an unbounded request takes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn h3_pool_streaming_request_with_target_for_test<F>(
+        pool: &crate::http3::client::Http3ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        (host, port, policy_port): (&str, u16, u16),
+        method: &str,
+        url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        tls_config: F,
+    ) -> crate::http3::client::H3PoolResult<crate::http3::client::H3StreamingResponse>
+    where
+        F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        pool.request_with_target_streaming_under_authorization(
+            proxy,
+            host,
+            port,
+            policy_port,
+            method,
+            url,
+            headers,
+            body,
+            crate::http3::client::H3Authorization::new(None, None),
+            || tls_config,
+        )
+        .await
+    }
+
     /// The sidecar readiness terminal chosen from the captured connect winner.
     pub fn sidecar_readiness_connect_terminal_for_test() -> (u16, Option<String>, bool) {
         let response = crate::proxy::sidecar_readiness_connect_timeout_response(true, None);
