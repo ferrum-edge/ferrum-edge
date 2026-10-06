@@ -42,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2 MiB upload, alongside the existing variant that reads one DATA frame first.
 ### Fixed
 
+- **HTTP/2 bodies no longer leave as one DATA frame per small window
+  increment** (#6033). Since the old 1 KiB send-capacity gate was removed
+  (#6001), a backend or client that opened its HTTP/2 window a few bytes at a
+  time received one tiny DATA frame per increment. The pattern feeds itself,
+  and an unpatched h2 0.4.16+ peer (tonic, axum, hyper) answers it with
+  `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")`, failing every stream on
+  the connection. Hyper patch 005 makes Ferrum's HTTP/2 body pipes (uploads
+  through the gRPC and direct HTTP/2 pools, and responses to HTTP/2 clients)
+  hold capacity below `min(chunk remaining, 256)` bytes for at most 2 ms. The
+  pipe then sends exactly the assigned capacity. The bound means a window that
+  never reaches 256 bytes still progresses. The frontend HTTP/2 server now
+  configures a hyper timer for this wait. Ferrum's receive-side DATA-frame
+  budget fix (h2 patch 002) is unchanged.
 - **A request that joins the capability probe's backend setup keeps its own
   connect timeout** (#6032). Connect timeout is not part of a pool key, so a
   gRPC, direct HTTP/2, HTTP/3 or gateway-to-mesh HBONE request arriving while

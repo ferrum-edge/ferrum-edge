@@ -2,3 +2,4 @@
 002-min-data-frame-capacity/hyper-min-data-frame-capacity.patch
 003-greedy-h1-read/hyper-greedy-h1-read.patch
 004-h2-body-write-timeout/hyper-h2-body-write-timeout.patch
+005-h2-small-window-coalescing/hyper-h2-small-window-coalescing.patch

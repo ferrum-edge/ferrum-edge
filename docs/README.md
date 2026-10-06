@@ -202,6 +202,8 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   [patch](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/hyper-upgraded-h2-connect-error-reset.patch))
 - 004 — [bound HTTP/2 request body write stalls](upstream-hyper-patches/004-h2-body-write-timeout/README.md)
   ([patch](upstream-hyper-patches/004-h2-body-write-timeout/hyper-h2-body-write-timeout.patch))
+- 005 — [coalesce DATA frames cut from small HTTP/2 window increments](upstream-hyper-patches/005-h2-small-window-coalescing/README.md)
+  ([patch](upstream-hyper-patches/005-h2-small-window-coalescing/hyper-h2-small-window-coalescing.patch))
 
 ### h2
 
