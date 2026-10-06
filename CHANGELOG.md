@@ -249,6 +249,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the query, and no longer lets `lookup()` / `lookup_ip()` hide DNSSEC
   validation failures. Ferrum does not enable resolver DNSSEC validation, so
   resolution results are otherwise unchanged; no call sites changed.
+- **CI hardening: the dormant Claude PR review workflow is removed**
+  (GHSA-652c-qw6h-2hw6). `claude-review.yml`, a maintainer-triggered review
+  that ran a tool-capable model with comment-write permission over PR content,
+  had been disabled since August 2026 and is now deleted. No released
+  artifact was affected.
+- **CI hardening: native release binaries no longer restore a dependency
+  cache** (GHSA-w92m-frx7-pxjp). `build-release-binaries` drops its
+  `Swatinem/rust-cache` step, so release builds can no longer restore a cache
+  entry written by another workflow. The local-only sccache directory is still
+  created fresh each run and never saved. Recent releases logged no cache hit,
+  so published binaries were already built cold.
 
 ### Fixed
 

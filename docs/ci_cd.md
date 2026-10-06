@@ -76,7 +76,6 @@ adding, removing, or materially changing a workflow.
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `h1-tls-post-regression.yml` | H1 TLS POST Historical Baseline | Daily schedule on `main`, manual | Paired same-runner HTTP/1.1 TLS POST/echo throughput of the `main` tip against the historical reference pinned in `tests/performance/multi_protocol/h1_tls_post_reference.json`; gates the paired ratio per payload size, alerts on rolling-ratio drift, downgrades noisy-runner verdicts to provisional. Manual dispatch accepts a reference SHA override for matched-host bisects. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md#historical-baseline-h1-tls-post-check). |
 | `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-24.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
-| `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
 | `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
 | `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. |
@@ -2837,6 +2836,13 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 4. Generate SHA256 checksum
 5. x86_64 GNU only: re-verify the `.sha256` sidecars, then ABI-scan and smoke `release-assets/ferrum-edge-linux-x86_64` and `release-assets/ferrum-cni-linux-x86_64` — the exact staged bytes, before they are uploaded
 6. Upload artifact
+
+**No restored dependency cache.** `build-release-binaries` never restores a
+GitHub Actions cache: no `Swatinem/rust-cache`, no `actions/cache`, and no
+BoringCache. `setup-sccache` starts each run with an empty, local-only
+directory that is never saved, so every release binary is compiled cold from
+the tagged source and its pinned dependencies. A cache entry written by any
+other workflow cannot reach a published binary.
 
 **One producer, one artifact identity.** The sysroot bytes are copied by the
 job's own `Copy binary` step into `release-assets/`, checksummed there,
