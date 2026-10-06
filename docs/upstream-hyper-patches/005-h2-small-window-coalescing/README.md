@@ -85,9 +85,9 @@ deadlock:
 - **Small peer windows.** A peer stream window under 256 bytes, or a peer that
   opens its window only after it has received the bytes held here, gets the
   smaller frame once the 2 ms wait ends.
-- **End of a chunk.** The last bytes of a chunk are never held. Fewer than
-  256 bytes make a useful frame at their own length, and the pipe never waits
-  for the next chunk, which would delay a streamed gRPC message.
+- **End of a chunk.** A chunk that fits the assigned capacity is sent at
+  once; the pipe never waits for the next chunk. A tail smaller than the
+  coalescing threshold that does not fit is held for at most 2 ms.
 - **512-byte windows.** A 512-byte stream window grants at least 256 bytes per
   increment, so it is never held.
 - **Bounded hold.** Held capacity stays assigned to the stream for at most one

@@ -125,9 +125,9 @@ const MAX_COALESCE_WAIT: Duration = Duration::from_millis(2);
 /// itself: the peer releases each small frame as it reads it and grants
 /// another small increment. So while assigned capacity is below a useful
 /// frame, the pipe waits up to `MAX_COALESCE_WAIT` for more, then hands h2
-/// exactly the capacity it has. The last bytes of a chunk are never held:
-/// fewer than the minimum make a useful frame at their own length, and
-/// waiting for the next chunk would delay a streamed message.
+/// exactly the capacity it has. A chunk that fits the assigned capacity is
+/// sent at once; the pipe never waits for the next chunk; a tail smaller than
+/// the coalescing threshold that does not fit is held for at most 2 ms.
 ///
 /// Only a window-limited stream reaches this state. The one sleep is
 /// allocated on its first hold and reset for later ones; a sleep that fires
