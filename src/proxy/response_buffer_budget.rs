@@ -757,6 +757,17 @@ impl RequestBufferPermit {
             _permit: self.reservation.into_permit(),
         })
     }
+
+    /// Narrow the charge to the allocation that stays resident after a
+    /// finished collect, for a holder that keeps its own `Vec` rather than
+    /// publishing [`Bytes`] (native H3, issue #6009). The same narrowing
+    /// [`Self::into_charged_bytes`] applies at publication, so a small body
+    /// does not hold a ceiling-sized claim for the rest of the request.
+    pub(crate) fn narrow_to_retained(&mut self, retained_capacity: usize) {
+        // Narrowing only releases. `false` means the allocation outgrew the
+        // charge, which the capped collector excludes; keep the whole charge.
+        let _: bool = self.reservation.narrow_to_covered(retained_capacity);
+    }
 }
 
 /// Operator-facing pressure on the aggregate buffered-request budget.

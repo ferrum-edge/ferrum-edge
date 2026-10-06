@@ -578,6 +578,9 @@ pub struct ComposedAuthBound {
     authorization: Option<StreamAuthDeadline>,
     /// Whether `at` came from `authorization`.
     authorization_wins: bool,
+    /// Whether `at` came from a plain request's previewed route total
+    /// deadline (issue #6008); see [`Self::with_route_total`].
+    route_wins: bool,
 }
 
 impl ComposedAuthBound {
@@ -597,19 +600,47 @@ impl ComposedAuthBound {
                 at: Some(plan.at),
                 authorization: Some(plan),
                 authorization_wins: true,
+                route_wins: false,
             },
             (Some(protocol), authorization) => Self {
                 at: Some(protocol),
                 authorization,
                 authorization_wins: false,
+                route_wins: false,
             },
             (None, Some(plan)) => Self {
                 at: Some(plan.at),
                 authorization: Some(plan),
                 authorization_wins: true,
+                route_wins: false,
             },
             (None, None) => Self::default(),
         }
+    }
+
+    /// Fold in a plain request's previewed route total deadline (issue #6008)
+    /// as a third owner, for a body collected before `before_proxy` arms the
+    /// rule. It wins only when strictly earlier, so the RPC deadline and the
+    /// authorization deadline keep their tie precedence over it.
+    #[inline]
+    #[must_use]
+    pub fn with_route_total(mut self, route_at: Option<tokio::time::Instant>) -> Self {
+        if let Some(at) = route_at
+            && self.at.is_none_or(|current| at < current)
+        {
+            self.at = Some(at);
+            self.authorization_wins = false;
+            self.route_wins = true;
+        }
+        self
+    }
+
+    /// Whether the previewed route total owns [`Self::deadline`]. Read only
+    /// once the composed deadline has fired, to select the route timeout.
+    #[inline]
+    #[must_use]
+    pub fn route_wins(self) -> bool {
+        self.route_wins
     }
 
     /// The instant the bounded work runs under: the earliest of the two.

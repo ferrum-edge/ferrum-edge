@@ -139,6 +139,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Native HTTP/3 buffered uploads now honour the shared retained-request
+  budget** (#6009). Every native-H3 buffered drain — including the collectors
+  that run before `authenticate`, `authorize` and `before_proxy`, and the H3
+  cross-protocol bridge drains — reserves its ceiling from
+  `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` before allocating and folds a `0`
+  body limit to `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES`, as HTTP/1.1 and
+  HTTP/2 already did. Previously an unauthenticated H3 client on a
+  body-before-auth route had no aggregate bound, and no per-request bound when
+  the global body limit was `0`. An upload the budget cannot admit now gets
+  `503` / gRPC `RESOURCE_EXHAUSTED` (`gateway_buffer_capacity`,
+  health-neutral). At a dispatch-stage drain that refusal runs the rejection
+  hooks and is transaction-logged like the other terminal request-body
+  rejections. Cancellation, `413`, disconnect and timeouts release the charge
+  exactly once. A completed body is published for dispatch with its charge, as
+  on HTTP/1.1 and HTTP/2: the charge is released when the last dispatch or
+  retry copy drops, before the response is relayed, so a long streamed
+  response holds no request-buffer charge.
+- **Route total deadlines now bound body collection that runs before
+  `before_proxy`** (partially addresses #6008). A body a plugin needs before
+  authentication, authorization or `before_proxy` (SOAP WS-Security,
+  `hmac_auth`, `waf`) was bounded only by `backend_read_timeout_ms` and any
+  client RPC deadline, because the `mesh_route_dispatch` / HTTPRoute
+  `timeouts.request` total is armed after `before_proxy` selects the rule.
+  An unauthenticated client could trickle such a body past the route budget,
+  or indefinitely with `backend_read_timeout_ms: 0`. HTTP/1.1, HTTP/2 and
+  native HTTP/3 now preview the rule with the request's pinned compiled
+  matchers (no hook runs, nothing is armed) and bound the collect at the
+  receipt-anchored total. An elapsed budget refuses before a ready body is
+  polled, on gRPC too. Expiry is the existing health-neutral route timeout
+  (`504` `{"error":"Request timeout"}`, logged `before_dispatch` under the
+  `route_request_timeout_early_upload` rejection phase on every protocol);
+  gRPC folds it into `DEADLINE_EXCEEDED`. A rule is undetermined when any
+  plugin may still rewrite an input it matches on before it runs: plugins
+  that rewrite headers, query, path or destination in `authenticate`,
+  `authorize` or the request-decompression normalizer count whatever their
+  priority, and so does every custom plugin that has not declared its request
+  mutations (`declares_request_input_mutations`). `correlation_id`,
+  `otel_tracing`, `rate_limiting`, `grpc_deadline`, `sse` and `compression`
+  declare the headers they write, so a rule on any other header stays
+  decided. The bound for an undetermined rule is the largest total among the
+  rules that could still be selected. A request that would be answered
+  without dispatch adds no candidate: a redirect, a fault that always aborts
+  (unless `fault_injection` or an earlier instance's rule fault may inject
+  first), a decided waypoint veto, or the deferred unmatched `404` of a
+  `reject_unmatched` chain. If any candidate is untimed, the read/RPC bounds
+  apply as before; set a finite `backend_read_timeout_ms` on such routes. An
+  undeclared custom plugin that disables the early bound on a proxy is logged
+  at `info` once per proxy chain on startup and reload. A
+  completed early body and its buffer charge are released before
+  authentication or authorization rejection hooks run. **Known limitation:**
+  an instance with an execution trigger stays undetermined whenever any
+  request input may change, and a custom plugin that rewrites
+  `route_override_request_timeout_ms` directly is not modelled.
 - **BREAKING (developer fixtures) — sample Compose MongoDB and SQL TLS test
   fixtures no longer have working default credentials or wildcard ports**
   (issue #6002; GHSA-wq9h-xxp4-7r2m, GHSA-x87v-w7p2-77f4). Affects only the

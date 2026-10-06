@@ -1245,6 +1245,11 @@ impl Plugin for CorsFinalizer {
         super::ResponseBodyProduction::Never
     }
 
+    /// Cache-internal sentinel: rewrites no request input (issue #6008).
+    fn declares_request_input_mutations(&self) -> bool {
+        true
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         finalize_cors_request(ctx)
     }

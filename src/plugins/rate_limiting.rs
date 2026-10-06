@@ -1135,6 +1135,13 @@ impl Plugin for RateLimiting {
         true
     }
 
+    /// The exposed `x-ratelimit-*` set and the stripped identity header.
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        let mut names = EXPOSED_RATELIMIT_POLICY_NAMES.to_vec();
+        names.push(RATE_LIMIT_IDENTITY_HEADER.to_string());
+        Some(names)
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         self.limiter.warmup_hostname().into_iter().collect()
     }

@@ -1270,8 +1270,9 @@ fn native_http3_logs_an_upload_route_timeout_under_its_own_phase() {
         .next()
         .expect("bounded route timeout arm");
     assert!(
-        route_arm.contains("H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE,"),
-        "the route timeout arm must log its own phase"
+        route_arm.contains("H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE")
+            && route_arm.contains("crate::proxy::EARLY_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE"),
+        "the route timeout arm must log its own phase, shared with H1/H2 for an early drain"
     );
     assert!(
         !route_arm.contains("(rejection_phase,"),

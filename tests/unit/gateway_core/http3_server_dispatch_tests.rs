@@ -191,9 +191,8 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .expect("mesh uploads must force-collect under the authorization bound")
         .1;
     assert!(
-        mesh_drain_args.starts_with(
-            "drain_h3_body(stream,effective_max_request_body_size_bytes),plain_local_bound,"
-        ),
+        mesh_drain_args
+            .starts_with("drain_h3_body(stream,upload,&mutmesh_upload_charge),plain_local_bound,"),
         "mesh force-buffer must drain under the composed authorization bound"
     );
     assert!(
@@ -202,8 +201,9 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     );
     assert_eq!(
         mesh_collection.matches("cb_probe.release_neutral(").count(),
-        3,
-        "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
+        4,
+        "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch, \
+         including the shared request-buffer capacity refusal (#6009)"
     );
 
     let oversize = mesh_collection
@@ -5939,7 +5939,7 @@ fn h3_plain_bridge_counts_request_messages_in_the_upload_framing() {
         .next()
         .expect("bounded cross-protocol plain dispatcher");
     let mesh_drain = dispatch
-        .split("drain_h3_body(stream, effective_max_request_body_size_bytes),")
+        .split("drain_h3_body(stream, upload, &mut mesh_upload_charge),")
         .nth(1)
         .expect("mesh-egress upload drain")
         .split("(Some(body), len)")

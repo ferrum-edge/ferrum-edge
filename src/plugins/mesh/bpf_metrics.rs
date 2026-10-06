@@ -405,6 +405,11 @@ impl Plugin for MeshBpfMetrics {
         Some(self.exporter())
     }
 
+    /// Implements no request hook, so it rewrites no request input (#6008).
+    fn declares_request_input_mutations(&self) -> bool {
+        true
+    }
+
     /// Reusable (issue #5583): this plugin implements no request, response,
     /// stream, or WebSocket hook at all — it is a passive scrape-exporter
     /// carrier whose counters are updated by the event-consumer task — so an
