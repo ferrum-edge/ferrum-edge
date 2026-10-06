@@ -5268,7 +5268,10 @@ async fn direct_h2_early_response_upload(read_request_data_before_response: bool
     let streams = backend.received_streams().await;
     assert_eq!(streams.len(), 1, "the exchange must use one backend stream");
     if read_request_data_before_response {
-        assert!(!streams[0].body.is_empty(), "backend read initial request DATA");
+        assert!(
+            !streams[0].body.is_empty(),
+            "backend read initial request DATA"
+        );
     }
 }
 
