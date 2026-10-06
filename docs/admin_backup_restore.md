@@ -163,6 +163,12 @@ audit events, and missing-resource no-ops do not. Tokens use keyed HMACs under
 the admin JWT secret, so replicas need the same secret to share tokens; tags
 are not offline credential-guessing digests.
 
+The response `ETag` equals `conditional.namespace_etag`. It is a namespace
+state token, not a validator for the response bytes: two exports of unchanged
+state carry the same tag although their bodies differ (`exported_at`, for
+example). Use it only as the `If-Match` of a conditional restore on this
+namespace, never for HTTP caching or `If-None-Match`.
+
 Stored API-spec documents (and external-reference snapshots) enter the tag as
 the SHA-256 and length of the stored gzip bytes, not as the bytes themselves,
 and the canonical representation is streamed into the digest rather than
