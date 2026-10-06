@@ -40,15 +40,15 @@ const SHORT: u64 = 1;
 const LONG: u64 = 30;
 const WINDOW: Duration = Duration::from_secs(8);
 
-struct ProxyHarness {
-    addr: SocketAddr,
+pub(super) struct ProxyHarness {
+    pub(super) addr: SocketAddr,
     state: ProxyState,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     server: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
 }
 
 impl ProxyHarness {
-    async fn start(
+    pub(super) async fn start(
         header_read_timeout_seconds: u64,
         tls_config: Option<Arc<rustls::ServerConfig>>,
         backend_port: u16,
@@ -128,13 +128,13 @@ impl ProxyHarness {
         Self::start(header_read_timeout_seconds, None, backend_port).await
     }
 
-    async fn connect(&self) -> TcpStream {
+    pub(super) async fn connect(&self) -> TcpStream {
         TcpStream::connect(self.addr)
             .await
             .expect("connect proxy listener")
     }
 
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.server).await;
     }
@@ -172,7 +172,7 @@ async fn start_ok_backend() -> (u16, tokio::task::JoinHandle<()>) {
     (port, handle)
 }
 
-fn frontend_tls_pair() -> (Arc<rustls::ServerConfig>, String) {
+pub(super) fn frontend_tls_pair() -> (Arc<rustls::ServerConfig>, String) {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 
     let ecdsa = &rcgen::PKCS_ECDSA_P256_SHA256;
@@ -209,7 +209,7 @@ fn frontend_tls_pair() -> (Arc<rustls::ServerConfig>, String) {
     (Arc::new(server_config), ca_pem)
 }
 
-async fn tls_connect(
+pub(super) async fn tls_connect(
     addr: SocketAddr,
     ca_pem: &str,
     alpn: &[u8],
@@ -270,13 +270,13 @@ async fn drain_until_closed<S: AsyncRead + Unpin>(stream: &mut S) {
     }
 }
 
-const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub(super) const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const H2_SETTINGS: u8 = 0x4;
 const H2_HEADERS: u8 = 0x1;
 const H2_END_STREAM: u8 = 0x1;
 const HPACK_INDEXED_GET: &[u8] = &[0x82];
 
-fn h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+pub(super) fn h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let len = payload.len();
     let mut frame = Vec::with_capacity(9 + len);
     frame.push((len >> 16) as u8);
