@@ -700,7 +700,14 @@ async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
     .expect("response surfaced");
 
     assert_eq!(response.http_status, 200);
-    assert_eq!(response.messages, [Bytes::from_static(b"partial")]);
+    // The client's h2 stack may discard DATA it buffered when the RST_STREAM
+    // arrives, so the partial message is not guaranteed to surface; it must
+    // never be followed by anything else.
+    assert!(
+        response.messages.is_empty() || response.messages == [Bytes::from_static(b"partial")],
+        "unexpected messages after backend CANCEL: {:?}",
+        response.messages
+    );
     assert!(
         response.stream_error.is_some()
             || response.grpc_status().is_some_and(|status| status != 0)
