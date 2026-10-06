@@ -42,6 +42,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`scripts/check_compose_fixtures.sh`). It checks loopback-only ports,
     TLS-only SQL, that MongoDB is opt-in, and that generated passwords stay out
     of argv, `docker inspect`, healthcheck output and container logs.
+- **ARM64 Cross release inputs are pinned and verified** (#5955, #5989;
+  GHSA-2q8f-75vc-v8c7). Cross 0.2.5 now uses the published GHCR OCI index
+  digest, retaining its Linux/amd64 host image and aarch64 target. The protoc
+  25.1 host archive is checked against the already admitted GNU sysroot
+  SHA-256 before extraction or execution. Trusted policy binds the image,
+  ordered verification command, and matching protoc version/architecture;
+  hosted positive and corrupt-archive tests exercise the checksum boundary.
+  The base-image refresh inventory reports Cross tag drift for an independent
+  trusted-policy rotation. The existing admission guard remains enforced;
+  candidate CI cannot authorize a merge or release.
+
+### Fixed
+
+- The release ARM64 (aarch64) Cross build no longer adds the third-party
+  apt.llvm.org repository or fetches its signing key at release time (#5955).
+  bindgen's `clang-6.0` / `libclang-6.0-dev` now come from the Cross image's
+  own signed Ubuntu 16.04 `xenial-updates` archive, which pre-build already
+  uses for its other packages. They are pinned to the exact version
+  `1:6.0-1ubuntu2~16.04.1`. The LLVM major version and `LIBCLANG_PATH`
+  (`/usr/lib/llvm-6.0/lib`) are unchanged. The trusted Cross build policy's
+  frozen pre-build allowlist is updated to match.
 
 ## [0.9.12] - Unreleased
 
