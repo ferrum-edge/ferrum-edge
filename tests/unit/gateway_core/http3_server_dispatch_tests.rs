@@ -216,9 +216,11 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     let oversize_release = oversize
         .find("cb_probe.release_neutral()")
         .expect("Ok(None) must release HALF_OPEN probe");
+    // The oversize refusal commits through the shared reject path, so the
+    // reject hooks and the transaction log run (issue #6022).
     let oversize_write = oversize
-        .find("write_plain_gateway_error(")
-        .expect("Ok(None) must write plain gateway error");
+        .find("write_bridge_upload_refusal(")
+        .expect("Ok(None) must refuse through the shared bridge reject path");
     assert!(
         oversize_release < oversize_write,
         "Ok(None) must release probe before terminal write"

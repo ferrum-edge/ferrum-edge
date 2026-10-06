@@ -3399,15 +3399,16 @@ where
     {
         let Some(upload) = H3RetainedUpload::admit(effective_max_request_body_size_bytes) else {
             cb_probe.release_neutral();
-            return write_plain_gateway_error(
+            return Box::pin(write_bridge_upload_refusal(
                 stream,
+                HttpFlavor::Plain,
+                plugins,
                 ctx,
-                StatusCode::SERVICE_UNAVAILABLE,
-                crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY,
-                None,
+                BridgeUploadRefusal::BufferCapacity,
+                response_committed_plugins,
+                initial_response_header_policy_plugins,
                 backend_start,
-                0,
-            )
+            ))
             .await;
         };
         match super::server::collect_h3_request_body_under_authorization(
@@ -3426,15 +3427,16 @@ where
             }
             Ok(None) => {
                 cb_probe.release_neutral();
-                return write_plain_gateway_error(
+                return Box::pin(write_bridge_upload_refusal(
                     stream,
+                    HttpFlavor::Plain,
+                    plugins,
                     ctx,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    r#"{"error":"Request body too large"}"#,
-                    None,
+                    BridgeUploadRefusal::TooLarge,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
                     backend_start,
-                    0,
-                )
+                ))
                 .await;
             }
             // The winner was captured where BOTH instants were known, so a late
@@ -8110,15 +8112,16 @@ where
     } else {
         let Some(upload) = H3RetainedUpload::admit(effective_max_grpc_recv_size_bytes) else {
             cb_probe.release_neutral();
-            return write_grpc_error_for_request(
+            return Box::pin(write_bridge_upload_refusal(
                 stream,
+                HttpFlavor::Grpc,
+                plugins,
                 ctx,
-                crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
-                crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
-                backend_start,
-                0,
+                BridgeUploadRefusal::BufferCapacity,
+                response_committed_plugins,
                 initial_response_header_policy_plugins,
-            )
+                backend_start,
+            ))
             .await;
         };
         match super::server::collect_h3_request_body_under_authorization(
@@ -8130,18 +8133,19 @@ where
         {
             Ok(Some(b)) => b,
             Ok(None) => {
-                // Default writer emits HEADERS then STOP_SENDING; do not reverse
+                // The reject writer emits HEADERS then STOP_SENDING; do not reverse
                 // that order with a pre-write halt (would duplicate STOP_SENDING).
                 cb_probe.release_neutral();
-                return write_grpc_error_for_request(
+                return Box::pin(write_bridge_upload_refusal(
                     stream,
+                    HttpFlavor::Grpc,
+                    plugins,
                     ctx,
-                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                    "Request body exceeds maximum size",
-                    backend_start,
-                    0,
+                    BridgeUploadRefusal::TooLarge,
+                    response_committed_plugins,
                     initial_response_header_policy_plugins,
-                )
+                    backend_start,
+                ))
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::Read(e)) => {
@@ -12534,6 +12538,94 @@ where
     outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
     outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
     outcome
+}
+
+/// A refusal of the bridge's own request-body drain (issue #6022).
+#[derive(Clone, Copy)]
+enum BridgeUploadRefusal {
+    /// The shared request-buffer budget could not admit the upload (#6009).
+    BufferCapacity,
+    /// The upload exceeded the drain's retained ceiling.
+    TooLarge,
+}
+
+/// Refuse the bridge's own request-body drain through the shared reject path
+/// (issue #6022): the reject-path `after_proxy` hooks, the committed-response
+/// observers, and the transaction log run as for the bridge's other terminal
+/// request-body rejections and the native H3 drains. The gRPC status is
+/// explicit, so it never falls back to the HTTP-status mapping. Callers box
+/// it so the cold arms do not widen the dispatch frames.
+#[allow(clippy::too_many_arguments)]
+async fn write_bridge_upload_refusal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    flavor: HttpFlavor,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    refusal: BridgeUploadRefusal,
+    response_committed_plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    backend_start: Instant,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    use crate::proxy::response_buffer_budget as budget;
+    let (status, body, grpc_status, grpc_message) = match refusal {
+        BridgeUploadRefusal::BufferCapacity => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            budget::REQUEST_BUFFER_OVERLOAD_BODY,
+            budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        ),
+        BridgeUploadRefusal::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"error":"Request body too large"}"#,
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Request body exceeds maximum size",
+        ),
+    };
+    let mut headers = HashMap::new();
+    if matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
+        headers.insert("grpc-status".to_string(), grpc_status.to_string());
+        headers.insert("grpc-message".to_string(), grpc_message.to_string());
+    }
+    // No backend I/O happened, so committed observers release any request
+    // ownership rather than completing it, as the native drains do.
+    ctx.metadata.insert(
+        crate::plugins::RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let reject = PluginResult::Reject {
+        status_code: status.as_u16(),
+        body: body.to_string(),
+        headers,
+    };
+    let mut outcome = write_final_body_reject(
+        stream,
+        flavor,
+        plugins,
+        ctx,
+        reject,
+        response_committed_plugins,
+        initial_response_header_policy_plugins,
+        RejectWriteAccounting {
+            backend_start,
+            bytes_sent: 0,
+        },
+        FinalRejectHooks::Standard,
+    )
+    .await?;
+    crate::proxy::log_rejected_request(
+        plugins,
+        ctx,
+        outcome.response_status,
+        backend_start,
+        "on_final_request_body",
+        0,
+    )
+    .await;
+    outcome.rejection_logged = true;
+    Ok(outcome)
 }
 
 /// How [`write_final_body_reject`] runs the reject-path hooks over its terminal.

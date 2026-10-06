@@ -2700,6 +2700,20 @@ impl super::Plugin for OidcRelyingParty {
     fn modifies_request_headers(&self) -> bool {
         self.session.hide_session_cookie || !self.provider.claim_headers.is_empty()
     }
+    /// The owned claim destinations, plus `Cookie` when the session cookie is
+    /// hidden from the backend (issue #6022).
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        let mut names: Vec<String> = self
+            .provider
+            .claim_header_destinations
+            .names()
+            .map(str::to_string)
+            .collect();
+        if self.session.hide_session_cookie {
+            names.push("cookie".to_string());
+        }
+        Some(names)
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

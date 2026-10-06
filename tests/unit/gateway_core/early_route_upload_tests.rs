@@ -46,7 +46,7 @@ use ferrum_edge::proxy::auth_lifetime::{
 };
 
 use crate::unit::plugins::plugin_utils::{
-    make_plugin_config_with_json, make_proxy, minimal_plugin_config,
+    basic_auth_test_secret_guard, make_plugin_config_with_json, make_proxy, minimal_plugin_config,
 };
 
 // ---------------------------------------------------------------------------
@@ -496,6 +496,131 @@ async fn fixed_header_writers_undecide_only_the_headers_they_write() {
         Some(9000),
         "`correlation_id` may write `x-request-id`, so that rule is a candidate"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Auth plugins declare the headers they strip (issue #6022)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_hidden_key_header_undecides_only_that_header() {
+    let hidden = json!({"key_location": "header:X-API-Key", "hide_credentials": true});
+    let plugins = [
+        built_in("key_auth", hidden),
+        dispatch(json!([
+            header_rule("x-soap-tier", "gold", Some(800)),
+            header_rule("x-api-key", "batch", Some(9000)),
+            path_rule("/", Some(5000)),
+        ])),
+    ];
+    let gold = request("/soap", &[("x-soap-tier", "gold")]);
+    assert_eq!(
+        preview(&plugins, &gold),
+        Some(800),
+        "`key_auth` strips only its key header, so the tier rule is decided"
+    );
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(9000),
+        "the stripped key header keeps its own rule a candidate"
+    );
+}
+
+#[tokio::test]
+async fn basic_auth_hide_credentials_keeps_authority_rules_decided() {
+    let _secret = basic_auth_test_secret_guard();
+    let basic = built_in("basic_auth", json!({"hide_credentials": true}));
+    assert_eq!(
+        basic.modified_request_header_names(),
+        Some(vec!["authorization".to_string()])
+    );
+    let authority = json!({"authority": {"exact": "edge.example"}});
+    let rules = json!([rule(authority, Some(700)), path_rule("/", Some(5000))]);
+    let plugins = [Arc::clone(&basic), dispatch(rules)];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(700),
+        "`basic_auth` never rewrites Host, so the authority rule is decided"
+    );
+    let plugins = [
+        basic,
+        dispatch(json!([
+            header_rule("authorization", "Basic batch", Some(9000)),
+            path_rule("/", Some(5000)),
+        ])),
+    ];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(9000),
+        "the stripped `Authorization` field keeps its rule a candidate"
+    );
+}
+
+#[tokio::test]
+async fn token_auth_plugins_declare_the_headers_they_strip_and_own() {
+    let jwks = built_in(
+        "jwks_auth",
+        json!({"providers": [{
+            "jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json",
+            "forward_original_token": false,
+            "claim_headers": {"email": "X-User-Email"}
+        }]}),
+    );
+    let introspection = built_in(
+        "oauth2_introspection",
+        json!({"providers": [{
+            "introspection_endpoint": "http://127.0.0.1:9/introspect",
+            "client_auth": {"method": "none"},
+            "from_headers": [{"name": "X-Access-Token"}],
+            "forward_original_token": false
+        }]}),
+    );
+    let oidc = built_in(
+        "oidc_relying_party",
+        minimal_plugin_config("oidc_relying_party"),
+    );
+    for (plugin, expected) in [
+        (&jwks, &["authorization", "x-user-email"][..]),
+        (&introspection, &["authorization", "x-access-token"][..]),
+        (&oidc, &["cookie"][..]),
+    ] {
+        assert!(plugin.modifies_request_headers(), "{}", plugin.name());
+        let names = plugin
+            .modified_request_header_names()
+            .expect("a fixed header set");
+        for name in expected {
+            assert!(names.iter().any(|known| known == name), "{names:?}");
+        }
+        assert!(!names.iter().any(|known| known == "host"), "{names:?}");
+    }
+}
+
+/// Every built-in auth plugin that may change request headers names them, so
+/// a route matching on any other header (Host included) stays decidable.
+#[tokio::test]
+async fn every_header_writing_auth_plugin_names_its_headers() {
+    let _secret = basic_auth_test_secret_guard();
+    for name in [
+        "basic_auth",
+        "hmac_auth",
+        "jwks_auth",
+        "jwt_auth",
+        "key_auth",
+        "ldap_auth",
+        "mtls_auth",
+        "oauth2_introspection",
+        "oidc_relying_party",
+        "soap_ws_security",
+    ] {
+        let Ok(Some(plugin)) = create_plugin(name, &minimal_plugin_config(name)) else {
+            continue;
+        };
+        if !plugin.modifies_request_headers() {
+            continue;
+        }
+        let names = plugin.modified_request_header_names();
+        assert!(names.is_some(), "{name} must declare the headers it writes");
+    }
 }
 
 #[tokio::test]

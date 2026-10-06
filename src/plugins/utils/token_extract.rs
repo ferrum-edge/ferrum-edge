@@ -208,6 +208,22 @@ pub fn stage_original_token_stripping(
     }
 }
 
+/// Append the request headers credential stripping may remove for
+/// `token_locations`: `Authorization` and every configured header location.
+/// Feeds [`crate::plugins::Plugin::modified_request_header_names`] on the cold
+/// path (issue #6022).
+pub fn push_stripped_credential_header_names<'a>(
+    names: &mut Vec<String>,
+    token_locations: impl IntoIterator<Item = &'a TokenLocation>,
+) {
+    names.push("authorization".to_string());
+    for location in token_locations {
+        if let TokenLocation::Header(header) = location {
+            names.push(header.name.to_ascii_lowercase());
+        }
+    }
+}
+
 fn extract_location_value(value: &str, prefix: Option<&str>) -> TokenLocationExtract {
     let token = match prefix {
         Some(prefix) => match value.strip_prefix(prefix) {

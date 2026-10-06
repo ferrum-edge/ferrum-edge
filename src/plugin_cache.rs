@@ -333,6 +333,10 @@ impl Plugin for DeferredCorsPlugin {
         self.inner.cors_uses_strict_origin_policy()
     }
 
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        self.inner.response_body_production()
+    }
+
     async fn after_proxy(
         &self,
         _ctx: &mut RequestContext,
@@ -345,6 +349,29 @@ impl Plugin for DeferredCorsPlugin {
     fn applies_after_proxy_on_reject(&self) -> bool {
         false
     }
+}
+
+/// How [`crate::plugins::is_builtin_plugin`] sees a plugin type this cache owns
+/// (issue #6022).
+pub(crate) enum CacheOwnedPlugin<'a> {
+    /// A cache-internal built-in sentinel.
+    Sentinel,
+    /// A wrapper whose declarations are the wrapped instance's.
+    Wraps(&'a (dyn Plugin + 'static)),
+}
+
+/// Classify `plugin` when it is one of this cache's own wrapper or sentinel
+/// types. Keyed on the concrete type, so no other plugin can claim it.
+pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwnedPlugin<'_>> {
+    if let Some(wrapper) = plugin.downcast_ref::<PluginInstanceWrapper>() {
+        return Some(CacheOwnedPlugin::Wraps(wrapper.inner.as_ref()));
+    }
+    if let Some(wrapper) = plugin.downcast_ref::<DeferredCorsPlugin>() {
+        return Some(CacheOwnedPlugin::Wraps(wrapper.inner.as_ref()));
+    }
+    plugin
+        .is::<MeshRouteDispatchFinalizer>()
+        .then_some(CacheOwnedPlugin::Sentinel)
 }
 
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";

@@ -744,6 +744,12 @@ async fn transform_response_body(
   unknown plugin names default to `Undeclared`, and the gateway refuses the
   producer before invocation (buffered H1/H2 traffic surfaces this as a
   gateway-local refusal rather than running default response hooks).
+- Built-in treatment follows the plugin's registered type, never the name
+  `name()` reports. A custom plugin that returns a built-in name (for example
+  `"compression"`) still gets the custom default here, and its request-input
+  and response-header declarations are not trusted as a built-in's either
+  (issue #6022). `Plugin` has `Any` as a supertrait for this, so a plugin type
+  must be `'static`, which `Arc<dyn Plugin>` already required.
 - Declaring `Never` but returning `Some` from `normalize_response_body*` /
   `transform_response_body*` remains a contract violation: the replacement is
   refused rather than installed.

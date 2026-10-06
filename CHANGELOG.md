@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Built-in plugin trust follows the registered type, not the reported
+  name** (#6022). A custom plugin whose `name()` returned a built-in name was
+  trusted as that built-in: its request-input declarations, its later
+  response-header simulation, and its response-body producer declaration all
+  took the built-in's audited answer. Trust is now keyed on the concrete type
+  the built-in factory registers (`plugins::is_builtin_plugin`), looking
+  through the plugin cache's own wrappers. Such a plugin now gets the
+  custom-plugin treatment: it may rewrite any routing input before
+  `before_proxy`, no later response header is assumed absent behind it, and
+  its response-body production stays `Undeclared` unless it declares one.
+  `Plugin` now has `Any` as a supertrait.
+- **H3 dispatch-stage `413` refusals and both bridge drain refusals run the
+  reject hooks and the transaction log** (#6022). The native buffered,
+  cross-protocol, and native dispatch drains answered an oversized upload with
+  a bare `413`. The plain and gRPC bridges' own drains did the same for an
+  oversized upload and for a request-buffer capacity refusal. None of them ran
+  the reject-path `after_proxy` hooks or the committed-response hooks, and they
+  logged no rejection. They now commit through the same path as the other
+  terminal request-body rejections, logged as `on_final_request_body`. The
+  gRPC status stays `RESOURCE_EXHAUSTED`. A gRPC-Web client on the plain
+  bridge now gets `RESOURCE_EXHAUSTED` for a capacity refusal; it got
+  `UNAVAILABLE` before. The pre-authentication drains are unchanged.
 - **Make reqwest patch reconstruction and dependency security floors required
   CI** (#6019). The blocking dependency audit now reconstructs the published
   reqwest archive and checks security floors across committed lockfiles; the
@@ -18,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Auth plugins name the request headers they strip** (#6022). `basic_auth`,
+  `ldap_auth`, `key_auth`, `jwks_auth`, `oauth2_introspection`, and
+  `oidc_relying_party` declared that they change request headers but not
+  which ones. The early route-deadline preview therefore treated every
+  header, `Host` included, as undetermined, and a `mesh_route_dispatch`
+  header or authority rule on the same chain got no early bound. Each plugin
+  now names the credential headers it strips and the claim headers it owns, so
+  only rules on those headers stay undetermined.
 - **Backend HTTP/2 resets mid-response count as backend failures** (#6019).
   A backend `RST_STREAM` or `GOAWAY` with any reason other than `NO_ERROR`
   after response headers reached the body classifier as a hyper body error
