@@ -9264,8 +9264,11 @@ is the `before_dispatch` `504` above, and gRPC folds the total into
   `declares_request_input_mutations()` is treated as able to rewrite any input
   (see `CUSTOM_PLUGINS.md`). The gateway logs this at `info` once per proxy
   chain at startup and reload when that chain also runs `mesh_route_dispatch`
-  and collects a body before `before_proxy`. `key_auth` with
-  `hide_credentials` and a `query:` location counts as rewriting the query.
+  and collects a body before `before_proxy`. A plugin is built-in by the type
+  it was registered with, not by the name it reports: a custom plugin that
+  reports a built-in name is still a custom plugin (issue #6022). `key_auth`
+  with `hide_credentials` and a `query:` location counts as rewriting the
+  query.
 - Plugins that always write a fixed set of headers declare those names
   (`correlation_id` its `header_name`, `otel_tracing` `traceparent` /
   `tracestate`, `rate_limiting` its `x-ratelimit-*` set and
@@ -9273,7 +9276,14 @@ is the `before_dispatch` `504` above, and gRPC folds the total into
   `accept-encoding` / `last-event-id`, `compression` the `accept-encoding` /
   `cache-control` / `content-encoding` / `content-length` /
   `x-ferrum-original-content-encoding` set), so a rule on
-  any other header stays decided alongside them.
+  any other header stays decided alongside them. Auth plugins name the
+  headers they strip or own (issue #6022): `basic_auth` and `ldap_auth`
+  `authorization` when `hide_credentials` is set, `key_auth` its key header,
+  `jwks_auth` and `oauth2_introspection` `authorization` and their header
+  token locations when a provider does not forward the original token plus
+  their claim-header destinations, and `oidc_relying_party` `cookie` when the
+  session cookie is hidden plus its claim-header destinations. `Host` and every
+  other header stay decidable.
 - An instance whose trigger reads an identity that is not yet established, or
   any input that may still change, may or may not run. So may an instance a
   routing plugin may claim the request away from.

@@ -2011,6 +2011,11 @@ auth_flow::impl_auth_plugin!(
         self.hide_credentials
     }
 
+    /// `hide_credentials` removes only the Basic `Authorization` field.
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        Some(vec!["authorization".to_string()])
+    }
+
     async fn before_proxy(
         &self,
         _ctx: &mut crate::plugins::RequestContext,

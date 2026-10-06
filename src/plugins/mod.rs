@@ -147,12 +147,13 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -10122,9 +10123,12 @@ pub enum BackendAdmissionDecision {
 }
 
 /// Plugin lifecycle hooks.
+///
+/// `Any` is a supertrait so built-in trust can be keyed on the concrete type a
+/// plugin was registered with rather than the name it reports (issue #6022).
 #[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
-pub trait Plugin: Send + Sync {
+pub trait Plugin: Any + Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
 
@@ -10396,7 +10400,9 @@ pub trait Plugin: Send + Sync {
     /// phase before backend dispatch: `authenticate`, `authorize`, the
     /// pre-`before_proxy` body normalization, and `before_proxy`.
     ///
-    /// Built-in plugins are audited and always treated as declared. A custom
+    /// Built-in plugins are audited and always treated as declared; a plugin
+    /// is built-in by its registered type, never by the name it reports
+    /// ([`is_builtin_plugin`], issue #6022). A custom
     /// plugin that returns `false` (the default) is treated as able to change
     /// any request input in any of those phases, so a body collected before
     /// `before_proxy` gets no early route-total bound from a
@@ -11778,8 +11784,13 @@ pub trait Plugin: Send + Sync {
     /// potentially unbounded and is refused rather than invoked. Built-in
     /// declarations live in one table
     /// ([`builtin_parity::declared_response_body_production`]) so the set cannot
-    /// drift per plugin file, and are covered by a parity test.
+    /// drift per plugin file, and are covered by a parity test. The table is
+    /// consulted only for a built-in type, so a custom plugin reporting a
+    /// built-in name stays `Undeclared` (issue #6022).
     fn response_body_production(&self) -> ResponseBodyProduction {
+        if !is_builtin_plugin_type(Any::type_id(self)) {
+            return ResponseBodyProduction::Undeclared;
+        }
         builtin_parity::declared_response_body_production(self.name())
     }
 
@@ -13637,6 +13648,124 @@ pub fn plugin_failure_policy(name: &str) -> Option<PluginFailurePolicy> {
 /// Returns true when `name` is handled by the built-in plugin factory.
 pub fn is_builtin_plugin_name(name: &str) -> bool {
     builtin_plugin_registration(name).is_some()
+}
+
+/// The concrete types the built-in factory constructs, one per
+/// [`BUILTIN_PLUGIN_REGISTRATIONS`] entry, plus the built-in sentinels the
+/// plugin cache inserts. Built once; a lookup takes no lock and allocates
+/// nothing.
+static BUILTIN_PLUGIN_TYPES: LazyLock<HashSet<TypeId>> = LazyLock::new(|| {
+    HashSet::from([
+        TypeId::of::<stdout_logging::StdoutLogging>(),
+        TypeId::of::<transaction_log_schema::TransactionLogSchema>(),
+        TypeId::of::<statsd_logging::StatsdLogging>(),
+        TypeId::of::<http_logging::HttpLogging>(),
+        TypeId::of::<tcp_logging::TcpLogging>(),
+        TypeId::of::<ws_logging::WsLogging>(),
+        TypeId::of::<loki_logging::LokiLogging>(),
+        TypeId::of::<udp_logging::UdpLogging>(),
+        TypeId::of::<kafka_logging::KafkaLogging>(),
+        TypeId::of::<transaction_debugger::TransactionDebugger>(),
+        TypeId::of::<jwks_auth::JwksAuth>(),
+        TypeId::of::<oauth2_introspection::Oauth2Introspection>(),
+        TypeId::of::<oidc_relying_party::OidcRelyingParty>(),
+        TypeId::of::<jwt_auth::JwtAuth>(),
+        TypeId::of::<key_auth::KeyAuth>(),
+        TypeId::of::<basic_auth::BasicAuth>(),
+        TypeId::of::<ldap_auth::LdapAuth>(),
+        TypeId::of::<hmac_auth::HmacAuth>(),
+        TypeId::of::<mtls_auth::MtlsAuth>(),
+        TypeId::of::<mesh::spiffe_identity::SpiffeIdentity>(),
+        TypeId::of::<compression::CompressionPlugin>(),
+        TypeId::of::<cors::CorsPlugin>(),
+        TypeId::of::<security_headers::SecurityHeaders>(),
+        TypeId::of::<access_control::AccessControl>(),
+        TypeId::of::<tcp_connection_throttle::TcpConnectionThrottle>(),
+        TypeId::of::<adaptive_concurrency::AdaptiveConcurrency>(),
+        TypeId::of::<mesh::authz::MeshAuthz>(),
+        TypeId::of::<opa::Opa>(),
+        TypeId::of::<mesh::outbound_registry::OutboundRegistry>(),
+        TypeId::of::<ip_restriction::IpRestriction>(),
+        TypeId::of::<geo_restriction::GeoRestriction>(),
+        TypeId::of::<bot_detection::BotDetection>(),
+        TypeId::of::<correlation_id::CorrelationId>(),
+        TypeId::of::<request_transformer::RequestTransformer>(),
+        TypeId::of::<mesh_route_dispatch::MeshRouteDispatch>(),
+        TypeId::of::<response_transformer::ResponseTransformer>(),
+        TypeId::of::<sse::SsePlugin>(),
+        TypeId::of::<graphql::GraphqlPlugin>(),
+        TypeId::of::<grpc_method_router::GrpcMethodRouter>(),
+        TypeId::of::<grpc_deadline::GrpcDeadline>(),
+        TypeId::of::<grpc_web::GrpcWebPlugin>(),
+        TypeId::of::<rate_limiting::RateLimiting>(),
+        TypeId::of::<request_mirror::RequestMirror>(),
+        TypeId::of::<load_testing::LoadTesting>(),
+        TypeId::of::<request_deduplication::RequestDeduplication>(),
+        TypeId::of::<request_size_limiting::RequestSizeLimiting>(),
+        TypeId::of::<waf::Waf>(),
+        TypeId::of::<response_size_limiting::ResponseSizeLimiting>(),
+        TypeId::of::<body_validator::BodyValidator>(),
+        TypeId::of::<openapi_validator::OpenapiValidator>(),
+        TypeId::of::<soap_ws_security::SoapWsSecurity>(),
+        TypeId::of::<request_termination::RequestTermination>(),
+        TypeId::of::<response_caching::ResponseCaching>(),
+        TypeId::of::<fault_injection::FaultInjectionPlugin>(),
+        TypeId::of::<response_mock::ResponseMock>(),
+        TypeId::of::<serverless_function::ServerlessFunction>(),
+        TypeId::of::<prometheus_metrics::PrometheusMetrics>(),
+        TypeId::of::<proxy_alerts::ProxyAlerts>(),
+        TypeId::of::<api_chargeback::ApiChargeback>(),
+        TypeId::of::<api_chargeback_sink::ApiChargebackSink>(),
+        TypeId::of::<otel_tracing::OtelTracing>(),
+        TypeId::of::<ai_token_metrics::AiTokenMetrics>(),
+        TypeId::of::<ai_request_guard::AiRequestGuard>(),
+        TypeId::of::<ai_rate_limiter::AiRateLimiter>(),
+        TypeId::of::<ai_prompt_shield::AiPromptShield>(),
+        TypeId::of::<ai_prompt_compressor::AiPromptCompressor>(),
+        TypeId::of::<ai_semantic_firewall::AiSemanticFirewall>(),
+        TypeId::of::<ai_semantic_cache::AiSemanticCache>(),
+        TypeId::of::<ai_response_guard::AiResponseGuard>(),
+        TypeId::of::<ai_stream_router::AiStreamRouter>(),
+        TypeId::of::<ai_federation::AiFederation>(),
+        TypeId::of::<ai_tool_governor::AiToolGovernor>(),
+        TypeId::of::<ai_transcript_audit::AiTranscriptAudit>(),
+        TypeId::of::<mcp_gateway::McpGateway>(),
+        TypeId::of::<a2a_gateway::A2aGateway>(),
+        TypeId::of::<ws_message_size_limiting::WsMessageSizeLimiting>(),
+        TypeId::of::<ws_frame_logging::WsFrameLogging>(),
+        TypeId::of::<ws_rate_limiting::WsRateLimiting>(),
+        TypeId::of::<udp_rate_limiting::UdpRateLimiting>(),
+        TypeId::of::<spec_expose::SpecExpose>(),
+        TypeId::of::<mesh::workload_metrics::WorkloadMetrics>(),
+        TypeId::of::<mesh::bpf_metrics::MeshBpfMetrics>(),
+        TypeId::of::<cors::CorsFinalizer>(),
+    ])
+});
+
+/// Whether `type_id` is the concrete type of a built-in plugin.
+fn is_builtin_plugin_type(type_id: TypeId) -> bool {
+    BUILTIN_PLUGIN_TYPES.contains(&type_id)
+}
+
+/// Whether `plugin` runs audited built-in code (issue #6022).
+///
+/// Trust follows the concrete type the plugin was registered with, never the
+/// name it reports. A custom plugin whose `name()` returns a built-in name is
+/// still a custom plugin, so its request-input, response-header, and
+/// response-body declarations get the custom-plugin treatment. The plugin
+/// cache's own wrappers are looked through to the instance they wrap.
+pub fn is_builtin_plugin(plugin: &(dyn Plugin + 'static)) -> bool {
+    use crate::plugin_cache::{CacheOwnedPlugin, cache_owned_plugin};
+
+    let plugin: &dyn Any = plugin;
+    if is_builtin_plugin_type(Any::type_id(plugin)) {
+        return true;
+    }
+    match cache_owned_plugin(plugin) {
+        Some(CacheOwnedPlugin::Sentinel) => true,
+        Some(CacheOwnedPlugin::Wraps(inner)) => is_builtin_plugin(inner),
+        None => false,
+    }
 }
 
 pub fn available_plugins() -> Vec<&'static str> {

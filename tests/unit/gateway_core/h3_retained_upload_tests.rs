@@ -274,3 +274,107 @@ fn every_h3_dispatch_publishes_the_charge_with_the_body() {
         );
     }
 }
+
+#[test]
+fn every_dispatch_stage_h3_drain_refusal_runs_the_reject_hooks_and_the_log() {
+    // Issue #6022: a native-H3 drain after `before_proxy` refuses an oversized
+    // upload through the same finalizer as its capacity refusal, so the
+    // reject-path hooks, the committed-response hooks, and the transaction log
+    // run on the `413` too.
+    let server = include_str!("../../../src/http3/server.rs");
+    let terminal = server
+        .split("async fn finalize_h3_terminal_body_rejection_with_headers(")
+        .nth(1)
+        .expect("shared terminal-body rejection finalizer")
+        .split("/// Optional HTTP/3 listener settings")
+        .next()
+        .expect("bounded terminal-body rejection finalizer");
+    for call in [
+        "apply_reject_after_proxy_and_synthetic_body_hooks(",
+        "run_h3_reject_response_committed_hooks(",
+        "log_rejected_request_with_path(",
+    ] {
+        assert!(terminal.contains(call), "the finalizer must call `{call}`");
+    }
+    let refusal = server
+        .split("fn boxed_finalize_h3_dispatch_body_refusal<'a>(")
+        .nth(1)
+        .expect("shared dispatch-stage drain refusal")
+        .split("/// Promptly stop a cancelled or rejected H3 upload")
+        .next()
+        .expect("bounded dispatch-stage drain refusal");
+    assert!(refusal.contains("finalize_h3_terminal_body_rejection_with_headers("));
+    assert!(refusal.contains("send_h3_plugin_reject_flavor_aware("));
+
+    let sites: Vec<&str> = server
+        .split("return boxed_finalize_h3_request_buffer_capacity_rejection(")
+        .skip(1)
+        .collect();
+    assert_eq!(sites.len(), 4, "four dispatch-stage drains refuse capacity");
+    for (index, site) in sites.into_iter().enumerate() {
+        let oversize = site
+            .split("Ok(None) => {")
+            .nth(1)
+            .unwrap_or_else(|| panic!("drain {index} must have an oversize arm"))
+            .split("Err(H3RequestBodyReadError::Read(")
+            .next()
+            .unwrap_or_else(|| panic!("drain {index} oversize arm must be bounded"));
+        assert!(
+            oversize.contains("boxed_finalize_h3_request_body_too_large_rejection(")
+                || oversize.contains("finalize_h3_terminal_body_read_rejection("),
+            "drain {index}: the oversize refusal must commit through the shared finalizer"
+        );
+        assert!(
+            !oversize.contains("send_h3_error_flavor_aware_with_policy("),
+            "drain {index}: the oversize refusal must not write an unhooked, unlogged 413"
+        );
+    }
+}
+
+#[test]
+fn both_h3_bridge_drain_refusals_run_the_reject_hooks_and_the_log() {
+    // Issue #6022: the bridge's own drains refuse capacity and oversize
+    // through the shared bridge reject path, which runs the reject-path
+    // `after_proxy` hooks and committed observers and logs the rejection, so
+    // the frontend does not log a second, generic summary.
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let refusal = bridge
+        .split("async fn write_bridge_upload_refusal<S>(")
+        .nth(1)
+        .expect("shared bridge drain refusal")
+        .split("/// How [`write_final_body_reject`] runs")
+        .next()
+        .expect("bounded bridge drain refusal");
+    for call in [
+        "write_final_body_reject(",
+        "FinalRejectHooks::Standard,",
+        "crate::proxy::log_rejected_request(",
+        "outcome.rejection_logged = true;",
+    ] {
+        assert!(
+            refusal.contains(call),
+            "the bridge refusal must use `{call}`"
+        );
+    }
+
+    let drains: Vec<&str> = bridge.split("H3RetainedUpload::admit(").skip(1).collect();
+    assert_eq!(drains.len(), 2, "both H3 bridge drains take admission");
+    for (index, drain) in drains.into_iter().enumerate() {
+        let refusals = drain
+            .split("Err(super::server::H3RequestBodyReadError::")
+            .next()
+            .unwrap_or_else(|| panic!("bridge drain {index} must be bounded"));
+        assert_eq!(
+            refusals
+                .matches("Box::pin(write_bridge_upload_refusal(")
+                .count(),
+            2,
+            "bridge drain {index}: the capacity and oversize refusals take the shared path"
+        );
+        assert!(
+            !refusals.contains("write_plain_gateway_error(")
+                && !refusals.contains("write_grpc_error_for_request("),
+            "bridge drain {index}: no refusal may bypass the reject hooks and the log"
+        );
+    }
+}

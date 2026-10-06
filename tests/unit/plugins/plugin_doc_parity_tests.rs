@@ -623,3 +623,30 @@ async fn websocket_framing_declarations_match_the_built_in_frame_plugins() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Built-in trust follows the registered type, never the reported name (issue
+// #6022). Every registration must construct a type the trust table knows, or
+// the built-in would silently lose its audited declarations.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_built_in_registration_constructs_a_trusted_type() {
+    // Same guards (and lock order) as the protocol-matrix test, which proves
+    // every built-in constructs from `minimal_plugin_config` under them.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
+    let _registry = super::plugin_utils::log_schema_registry_guard();
+    use ferrum_edge::plugins::is_builtin_plugin;
+
+    for registration in BUILTIN_PLUGIN_REGISTRATIONS {
+        let config = minimal_plugin_config(registration.name);
+        let plugin = create_plugin(registration.name, &config)
+            .unwrap_or_else(|e| panic!("create_plugin({}) failed: {e}", registration.name))
+            .unwrap_or_else(|| panic!("create_plugin({}) returned None", registration.name));
+        assert!(
+            is_builtin_plugin(plugin.as_ref()),
+            "{} constructs a type missing from the built-in trust table",
+            registration.name
+        );
+    }
+}
