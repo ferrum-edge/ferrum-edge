@@ -72,7 +72,7 @@ mod inner {
     use crate::config::deployment_mutation::{
         DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
         ExternalSpecUpstreamConflict, StoredEvidence, deployment_commit_unknown,
-        validate_deployment_candidate,
+        deployment_not_started, validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -5541,7 +5541,7 @@ mod inner {
                 .await?;
             // Refuses an over-bound typed snapshot before any raw document is
             // read; each document is charged as it is converted.
-            let mut stored = StoredEvidence::for_snapshot(&snapshot)?;
+            let mut stored = StoredEvidence::for_snapshot(snapshot)?;
             // Credential representations and uniqueness hashes live on consumers;
             // their partial unique indexes do not own separate documents.
             for name in [
@@ -5590,7 +5590,7 @@ mod inner {
                 }
                 stored.end_table(name)?;
             }
-            Ok(stored.finish(snapshot))
+            Ok(stored.finish())
         }
 
         async fn mutate_deployment_in_session(
@@ -5630,7 +5630,7 @@ mod inner {
             }
             let plan = snapshot.removal_plan(id)?;
             crate::config::batch_atomicity::pause_conditional_restore_for_test(namespace).await;
-            let mut candidate = snapshot.snapshot.config.clone();
+            let mut candidate = snapshot.snapshot().config.clone();
             let prior_conflicts = candidate.mtls_dns_identity_conflicts();
             let mut changes: Vec<(&str, String, &str)> = Vec::new();
             match replacement {
@@ -5723,14 +5723,14 @@ mod inner {
                         return Err(DeploymentGraphInvalid.into());
                     }
                     let previous_spec = snapshot
-                        .snapshot
+                        .snapshot()
                         .api_specs
                         .iter()
                         .find(|s| s.id == spec.id)
                         .ok_or(DeploymentGraphInvalid)?;
                     if snapshot.replacement_is_noop(bundle, spec)? {
                         validate_deployment_candidate(
-                            &snapshot.snapshot.config,
+                            &snapshot.snapshot().config,
                             precondition.validation_http_client,
                         )
                         .await?;
@@ -6064,7 +6064,8 @@ mod inner {
             }
             let mut mtls_leases = self
                 .acquire_mtls_dns_admission_leases([precondition.namespace])
-                .await?;
+                .await
+                .map_err(deployment_not_started)?;
             // The mTLS admission guard owns the connection-generation pin.
             // Avoid acquiring that fair RwLock recursively around a reconnect.
             if !self.replica_set_configured() {
@@ -6075,7 +6076,11 @@ mod inner {
             }
             let connection = self.connection();
             Self::run_mtls_dns_mutations(&mut mtls_leases, async {
-                let mut session = connection.client.start_session().await?;
+                let mut session = connection
+                    .client
+                    .start_session()
+                    .await
+                    .map_err(|error| deployment_not_started(error.into()))?;
                 session
                     .start_transaction()
                     .read_concern(ReadConcern::snapshot())

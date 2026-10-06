@@ -1,6 +1,6 @@
 //! The mandatory conditional-restore live-store lane must stay in CI. Workflow
 //! review owns the lane's shell programs; this only catches the lane, its
-//! fixtures or its transactional tests being dropped.
+//! fixtures, its transactional tests or the ignored-test wiring being dropped.
 
 const CI: &str = include_str!("../../../.github/workflows/ci.yml");
 const LIVE_TESTS: &[&str] = &[
@@ -41,4 +41,24 @@ fn conditional_live_store_lane_runs_the_transactional_tests() {
             "missing CI step: {name}"
         );
     }
+    // The live tests are `#[ignore]`; only this flag runs them, and only this
+    // env mapping selects it for the live lane.
+    let run_step = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Run integration test shard"))
+        .expect("missing CI step: Run integration test shard");
+    let run = run_step["run"]
+        .as_str()
+        .expect("integration shard run is a string");
+    assert!(
+        run.contains("--run-ignored=all"),
+        "live lane must run ignored tests"
+    );
+    let live_env = run_step["env"]["CONDITIONAL_LIVE_STORES"]
+        .as_str()
+        .expect("CONDITIONAL_LIVE_STORES is set on the shard step");
+    assert!(
+        live_env.contains("matrix.conditional_live_stores"),
+        "CONDITIONAL_LIVE_STORES must be wired from the matrix"
+    );
 }

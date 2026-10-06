@@ -163,13 +163,15 @@ owners of a plugin the cascade would delete return `409` before selected writes.
 Proven external references to spec-owned upstreams use the same typed
 `409/not_committed/unconfirmed/recovery_cleanup_authorized=false` refusal on
 resource-changing PUT/DELETE. Metadata-only replacement keeps its shortcut before
-that guard. A store failure raised before commit is attempted reports `503` with
-`durable: "not_committed"`: a read, transaction start or MongoDB mTLS admission
-refusal ahead of the transaction, a lost namespace admission lease, or a
-statement, admission or validation failure inside the transaction, which rolls
-it back. Only a failed commit or commit acknowledgement (for example a dropped
-connection or MongoDB `UnknownTransactionCommitResult`/write-concern failure at
-commit), or a settlement task that never reports, leaves `durable: "unknown"`.
+that guard. A store failure raised before commit is attempted reports `503`
+with `durable: "not_started"` when it precedes the mutation transaction (a
+read, transaction start or MongoDB mTLS admission refusal ahead of it) and
+`durable: "not_committed"` when the transaction opened and rolled back (a lost
+namespace admission lease, or a statement, admission or validation failure
+inside the transaction). Only a failed commit or commit acknowledgement (for
+example a dropped connection or MongoDB
+`UnknownTransactionCommitResult`/write-concern failure at commit), or a
+settlement task that never reports, leaves `durable: "unknown"`.
 Driver messages are never returned. Ordinary invalid external-owner
 proxy admission still returns `400` without a durable row or covering change.
 Composition, named-schema, TCP-throttle and mTLS policy admission still apply
@@ -190,7 +192,8 @@ body echoes. A confirmed response has `profile: "deployment-v1"`, `id`,
 | Commit in CP mode, an unserved namespace, or a process without a serving coordinator | 200 | `not_applicable` | `false` |
 | Commit confirmed but local apply, final audit, cursor capture or namespace admission lease release cannot be confirmed | 503 | `unconfirmed` | `false` |
 | Commit or commit acknowledgement failed, or the settlement task was lost | 503 if a response is available | `unconfirmed` | `false`; durable state `unknown` |
-| Store, lease or admission failure before commit was attempted | 503 | `unconfirmed` | `false`; durable state `not_committed` |
+| Store, lease or admission failure before commit was attempted, ahead of the mutation transaction | 503 | `unconfirmed` | `false`; durable state `not_started` |
+| Lease loss or statement/admission failure inside the rolled-back mutation transaction | 503 | `unconfirmed` | `false`; durable state `not_committed` |
 | Precondition/graph refusal | 412/409 | `unconfirmed` | `false`; durable state `not_committed` |
 | Namespace too large inside the mutation transaction | 507 | `unconfirmed` | `false`; durable state `not_committed` |
 

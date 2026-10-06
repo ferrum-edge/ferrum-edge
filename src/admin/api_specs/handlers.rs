@@ -3055,7 +3055,7 @@ pub async fn handle_put_api_spec(
         }
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) if deployment_expected.is_some() => {
-            return Ok(crate::admin::deployment_mutations::store_error(&e));
+            return Ok(crate::admin::deployment_mutations::read_error(&e));
         }
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };

@@ -9,15 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Deployment mutations report `not_committed` for failures before commit**
+- **Deployment mutations separate `not_started` from `not_committed`**
   (issue #6021). A conditional `DELETE /proxies/{id}` or `PUT /api-specs/{id}`
-  whose store failed before commit was attempted (a lost namespace admission
-  lease, a refused MongoDB mTLS admission fence, a transaction start, or a
-  statement, admission or validation failure inside the rolled-back
-  transaction) returned `503` with `durable: "unknown"`. It now reports
-  `durable: "not_committed"`. Only a failed commit or commit acknowledgement,
-  or a settlement task that never reports, still reports `"unknown"`. Neither
-  outcome authorizes cleanup or replay.
+  whose store failed before commit was attempted returned `503` with
+  `durable: "unknown"`. A failure ahead of the mutation transaction (a read, a
+  transaction start, or a MongoDB mTLS admission refusal) now reports
+  `durable: "not_started"`, and a failure inside the rolled-back transaction (a
+  lost namespace admission lease, or a statement, admission or validation
+  failure) reports `durable: "not_committed"`. Only a failed commit or commit
+  acknowledgement, or a settlement task that never reports, still reports
+  `"unknown"`. No outcome authorizes cleanup or replay.
 
 ### Performance
 

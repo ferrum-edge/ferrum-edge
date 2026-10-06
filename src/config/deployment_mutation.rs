@@ -22,9 +22,11 @@ const CANONICAL_TAIL: &[u8] = b"}";
 ///
 /// A snapshot assembled by [`StoredEvidence`] keeps the SHA-256 state of its
 /// canonical head and typed snapshot, so [`Self::digest`] does not render the
-/// typed snapshot again. Treat both fields as read-only once assembled.
+/// typed snapshot again. The typed snapshot is private: it is owned here and
+/// exposed only by shared reference, so nothing can mutate the state the
+/// [`Self::digest`] prefix was computed over.
 pub struct DeploymentSnapshot {
-    pub snapshot: ConditionalNamespaceSnapshot,
+    snapshot: ConditionalNamespaceSnapshot,
     pub stored: Value,
     typed_prefix: Option<CanonicalPrefix>,
 }
@@ -72,6 +74,13 @@ impl DeploymentSnapshot {
             stored,
             typed_prefix: None,
         }
+    }
+
+    /// The typed resources this snapshot was assembled from. Shared only; the
+    /// canonical prefix [`Self::digest`] resumes from was hashed from exactly
+    /// this value at assembly time.
+    pub fn snapshot(&self) -> &ConditionalNamespaceSnapshot {
+        &self.snapshot
     }
 
     /// `{"profile": "deployment-v1", "resources": <namespace representation>,
@@ -478,6 +487,35 @@ pub fn is_deployment_commit_outcome_unknown(error: &anyhow::Error) -> bool {
         .is_some()
 }
 
+/// The deployment mutation was refused before its storage transaction opened:
+/// no mutation statement ran, so the durable outcome is `not_started`. Every
+/// other deployment store error without this tag was raised inside a
+/// transaction that rolled back.
+#[derive(Debug, Clone, Copy)]
+pub struct DeploymentMutationNotStarted;
+
+impl std::fmt::Display for DeploymentMutationNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Deployment mutation did not start")
+    }
+}
+
+impl std::error::Error for DeploymentMutationNotStarted {}
+
+/// Tag an existing error as raised before the deployment mutation transaction
+/// opened, retaining it as the source.
+pub fn deployment_not_started(error: anyhow::Error) -> anyhow::Error {
+    error.context(DeploymentMutationNotStarted)
+}
+
+/// Whether `error` reports a deployment mutation refused before its
+/// transaction opened.
+pub fn is_deployment_mutation_not_started(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DeploymentMutationNotStarted>()
+        .is_some()
+}
+
 /// A proven external reference that refuses removal of a spec-owned upstream.
 /// Driver, decoding and transaction failures must retain their own error types.
 #[derive(Debug, Clone)]
@@ -565,17 +603,20 @@ pub struct StoredEvidence {
     prefix: CanonicalPrefix,
     stored: serde_json::Map<String, Value>,
     rows: Vec<(String, Value)>,
+    snapshot: ConditionalNamespaceSnapshot,
 }
 
 impl StoredEvidence {
     /// Charge `snapshot` against [`MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES`].
-    pub fn for_snapshot(snapshot: &ConditionalNamespaceSnapshot) -> Result<Self, anyhow::Error> {
+    /// The snapshot is owned here and completed by [`Self::finish`], so the
+    /// value whose prefix is hashed cannot differ from the one in the result.
+    pub fn for_snapshot(snapshot: ConditionalNamespaceSnapshot) -> Result<Self, anyhow::Error> {
         Self::for_snapshot_within(snapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES)
     }
 
     /// [`Self::for_snapshot`] with an explicit canonical-byte bound.
     pub fn for_snapshot_within(
-        snapshot: &ConditionalNamespaceSnapshot,
+        snapshot: ConditionalNamespaceSnapshot,
         limit: usize,
     ) -> Result<Self, anyhow::Error> {
         let mut budget = SnapshotByteBudget::new(limit);
@@ -598,6 +639,7 @@ impl StoredEvidence {
             prefix,
             stored: serde_json::Map::new(),
             rows: Vec::new(),
+            snapshot,
         })
     }
 
@@ -628,11 +670,11 @@ impl StoredEvidence {
         Ok(())
     }
 
-    /// `snapshot` must be the one passed to [`Self::for_snapshot`]: its
-    /// canonical prefix was hashed there.
-    pub fn finish(self, snapshot: ConditionalNamespaceSnapshot) -> DeploymentSnapshot {
+    /// Completes the evidence with the typed snapshot supplied to
+    /// [`Self::for_snapshot`], whose canonical prefix was hashed there.
+    pub fn finish(self) -> DeploymentSnapshot {
         DeploymentSnapshot {
-            snapshot,
+            snapshot: self.snapshot,
             stored: Value::Object(self.stored),
             typed_prefix: Some(self.prefix),
         }

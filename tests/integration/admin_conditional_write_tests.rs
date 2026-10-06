@@ -2608,7 +2608,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     let spec_content = &opened.body["api_specs"][0]["spec_content"];
     assert_eq!(
         spec_content["len"],
-        stored.snapshot.api_specs[0].spec_content.len()
+        stored.snapshot().api_specs[0].spec_content.len()
     );
     assert_eq!(spec_content["sha256"].as_str().unwrap().len(), 64);
     assert_eq!(
@@ -2625,7 +2625,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             .decode(encoded)
             .unwrap()
     };
-    assert_eq!(decoded, stored.snapshot.api_specs[0].spec_content);
+    assert_eq!(decoded, stored.snapshot().api_specs[0].spec_content);
     assert!(
         !opened.body["evidence"].to_string().contains(encoded),
         "stored bytes must not enter the digested evidence"
@@ -2865,7 +2865,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             .unwrap_err();
         assert!(error.chain().any(|e| e.is::<NamespacePreconditionFailed>()));
         let snapshot = db.load_deployment_snapshot(&namespace).await.unwrap();
-        let spec = &snapshot.snapshot.api_specs[0];
+        let spec = &snapshot.snapshot().api_specs[0];
         let bundle = deployment_bundle(&snapshot, "deployment", &spec_id);
         let error = db
             .replace_deployment_conditionally(&bundle, spec, &precondition)
@@ -2893,7 +2893,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     // Entry loss with matching evidence cannot authorize either mutation.
     let snapshot = db.load_deployment_snapshot(&namespace).await.unwrap();
     let exact = snapshot.digest().unwrap();
-    let spec = &snapshot.snapshot.api_specs[0];
+    let spec = &snapshot.snapshot().api_specs[0];
     let bundle = deployment_bundle(&snapshot, "deployment", &spec_id);
     let precondition = DeploymentPrecondition {
         namespace: &namespace,
@@ -3341,7 +3341,7 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         assert!(metadata_authority.body["evidence"] == metadata_before.representation().unwrap());
         let sequence_before_metadata = db.latest_change_sequence(&namespace).await.unwrap();
         assert_eq!(
-            metadata_before.snapshot.change_sequence,
+            metadata_before.snapshot().change_sequence,
             sequence_before_metadata
         );
         let conditional_replace = format!("{ordinary_replace}?conditional=true");
@@ -3368,8 +3368,8 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         assert!(proxy_after.etag == proxy_before.etag);
         assert!(proxy_after.body == proxy_before.body);
         let stored_before = db.load_deployment_snapshot(&namespace).await.unwrap();
-        let resources_before = metadata_before.snapshot.representation().unwrap();
-        let resources_after = stored_before.snapshot.representation().unwrap();
+        let resources_before = metadata_before.snapshot().representation().unwrap();
+        let resources_after = stored_before.snapshot().representation().unwrap();
         // These members cover proxies, consumers, upstreams, plugins, trust and
         // namespace metadata; only the spec and covering sequence may change.
         for index in [0, 1, 2, 3, 4, 6] {
@@ -3392,10 +3392,10 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
                 );
             }
         }
-        assert_eq!(metadata_before.snapshot.api_specs.len(), 1);
-        assert_eq!(stored_before.snapshot.api_specs.len(), 1);
-        let spec_before = &metadata_before.snapshot.api_specs[0];
-        let spec_after = &stored_before.snapshot.api_specs[0];
+        assert_eq!(metadata_before.snapshot().api_specs.len(), 1);
+        assert_eq!(stored_before.snapshot().api_specs.len(), 1);
+        let spec_before = &metadata_before.snapshot().api_specs[0];
+        let spec_after = &stored_before.snapshot().api_specs[0];
         assert_eq!(spec_after.id, spec_before.id);
         assert_eq!(spec_after.proxy_id, spec_before.proxy_id);
         assert_eq!(spec_after.namespace, spec_before.namespace);
@@ -3410,7 +3410,7 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         let sequence_after_metadata = db.latest_change_sequence(&namespace).await.unwrap();
         assert!(sequence_after_metadata > sequence_before_metadata);
         assert_eq!(
-            stored_before.snapshot.change_sequence,
+            stored_before.snapshot().change_sequence,
             sequence_after_metadata
         );
         let covering = db
@@ -3428,9 +3428,9 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         assert!(covering.added_or_modified_upstreams.is_empty());
         assert!(covering.removed_upstream_ids.is_empty());
 
-        let config = &stored_before.snapshot.config;
-        assert_eq!(stored_before.snapshot.api_specs.len(), 1);
-        assert_eq!(stored_before.snapshot.api_specs[0].id, spec_id);
+        let config = &stored_before.snapshot().config;
+        assert_eq!(stored_before.snapshot().api_specs.len(), 1);
+        assert_eq!(stored_before.snapshot().api_specs[0].id, spec_id);
         assert_eq!(config.proxies.len(), 2);
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.upstreams[0].id, "owned-upstream");
@@ -3484,7 +3484,7 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         let mut bundle = deployment_bundle(&stored_before, "dependency", spec_id);
         bundle.upstream = Some(config.upstreams[0].clone());
         bundle.proxy.backend_host = "replacement.example.com".to_string();
-        let mut spec = stored_before.snapshot.api_specs[0].clone();
+        let mut spec = stored_before.snapshot().api_specs[0].clone();
         spec.resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle).unwrap();
         let error = db
             .replace_api_spec_bundle(&bundle, &spec)
@@ -3621,9 +3621,9 @@ fn deployment_bundle(
     proxy_id: &str,
     spec_id: &str,
 ) -> ferrum_edge::admin::api_specs::ExtractedBundle {
+    let typed = snapshot.snapshot();
     ferrum_edge::admin::api_specs::ExtractedBundle {
-        proxy: snapshot
-            .snapshot
+        proxy: typed
             .config
             .proxies
             .iter()
@@ -3631,8 +3631,7 @@ fn deployment_bundle(
             .unwrap()
             .clone(),
         upstream: None,
-        plugins: snapshot
-            .snapshot
+        plugins: typed
             .config
             .plugin_configs
             .iter()
@@ -4147,13 +4146,13 @@ async fn assert_mongo_orphaned_spec_refused(db: Arc<dyn DatabaseBackend>, raw: &
             .is_none()
     );
     let stored_before = db.load_deployment_snapshot(&namespace).await.unwrap();
-    assert_eq!(stored_before.snapshot.api_specs.len(), 1);
-    assert_eq!(stored_before.snapshot.api_specs[0].id, spec_id);
-    assert_eq!(stored_before.snapshot.api_specs[0].proxy_id, "orphan");
-    assert_eq!(stored_before.snapshot.config.proxies.len(), 1);
-    assert_eq!(stored_before.snapshot.config.proxies[0].id, "unrelated");
-    assert_eq!(stored_before.snapshot.config.plugin_configs.len(), 1);
-    assert_eq!(stored_before.snapshot.config.upstreams.len(), 1);
+    assert_eq!(stored_before.snapshot().api_specs.len(), 1);
+    assert_eq!(stored_before.snapshot().api_specs[0].id, spec_id);
+    assert_eq!(stored_before.snapshot().api_specs[0].proxy_id, "orphan");
+    assert_eq!(stored_before.snapshot().config.proxies.len(), 1);
+    assert_eq!(stored_before.snapshot().config.proxies[0].id, "unrelated");
+    assert_eq!(stored_before.snapshot().config.plugin_configs.len(), 1);
+    assert_eq!(stored_before.snapshot().config.upstreams.len(), 1);
     let evidence_before = stored_before.representation().unwrap();
 
     // Coherent, decodable original authority may describe an invalid graph.

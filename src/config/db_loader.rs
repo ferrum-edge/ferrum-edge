@@ -3014,7 +3014,7 @@ impl DatabaseStore {
             .conditional_namespace_snapshot_tx(tx, namespace)
             .await?;
         // Refuses an over-bound typed snapshot before any raw row is read.
-        let mut stored = StoredEvidence::for_snapshot(&snapshot)?;
+        let mut stored = StoredEvidence::for_snapshot(snapshot)?;
         for table in [
             "proxies",
             "consumers",
@@ -3042,7 +3042,7 @@ impl DatabaseStore {
             drop(rows);
             stored.end_table(table)?;
         }
-        Ok(stored.finish(snapshot))
+        Ok(stored.finish())
     }
 
     async fn load_deployment_snapshot_inner(
@@ -3114,7 +3114,7 @@ impl DatabaseStore {
             self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
                 .await?;
         }
-        let mut candidate = snapshot.snapshot.config.clone();
+        let mut candidate = snapshot.snapshot().config.clone();
         candidate.proxies.retain(|p| p.id != id);
         candidate
             .plugin_configs
@@ -10346,11 +10346,12 @@ impl DatabaseStore {
             }
             Some(
                 snapshot
-                    .snapshot
+                    .snapshot()
                     .config
                     .proxies
-                    .into_iter()
+                    .iter()
                     .find(|p| p.id == spec.proxy_id)
+                    .cloned()
                     .ok_or(DeploymentGraphInvalid)?,
             )
         } else {

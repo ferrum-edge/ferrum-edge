@@ -9036,16 +9036,17 @@ components:
         than comparing it with a replacement database's watermark.
 
         Conditional deployment mutations instead use
-        DeploymentMutationAcknowledgement. Admission/evidence failures report
-        `durable: not_started`; a store, lease or admission failure raised
-        before commit is attempted rolled back and reports
-        `durable: not_committed`; only a failed commit or commit
-        acknowledgement (or a lost settlement task) reports `durable: unknown`;
-        a confirmed commit whose live, audit or namespace-lease acknowledgement
-        fails reports `durable: committed`. All have `live: unconfirmed` and
-        `recovery_cleanup_authorized: false`. This family does not promise a
-        cursor or Retry-After. Retain the original encrypted journal; no 503
-        authorizes automatic replay or journal removal.
+        DeploymentMutationAcknowledgement. Admission/evidence failures, and
+        store or admission failures raised before the mutation transaction
+        opens, report `durable: not_started`; a failure raised inside the
+        rolled-back transaction reports `durable: not_committed`; only a failed
+        commit or commit acknowledgement (or a lost settlement task) reports
+        `durable: unknown`; a confirmed commit whose live, audit or
+        namespace-lease acknowledgement fails reports `durable: committed`. All
+        have `live: unconfirmed` and `recovery_cleanup_authorized: false`. This
+        family does not promise a cursor or Retry-After. Retain the original
+        encrypted journal; no 503 authorizes automatic replay or journal
+        removal.
       headers:
         Retry-After:
           required: false
