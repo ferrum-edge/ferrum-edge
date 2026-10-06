@@ -14688,6 +14688,41 @@ pub mod _test_support {
         }
     }
 
+    /// The PRODUCTION native-H3 retained-upload collector (issue #6009),
+    /// admitted against an isolated [`RequestBufferBudgetProbe`] so a test can
+    /// observe admission, capped growth, and release deterministically.
+    pub struct H3RetainedUploadProbe(crate::http3::server::H3RetainedUpload);
+
+    impl H3RetainedUploadProbe {
+        /// Admit one upload exactly as every native-H3 drain site does: fold
+        /// the effective limit to the retained ceiling, then charge that
+        /// ceiling before a byte is allocated. `None` is the `503` refusal.
+        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Option<Self> {
+            let ceiling = budget.0.buffered_request_body_ceiling(effective_limit);
+            crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling).map(Self)
+        }
+
+        /// Append one DATA chunk; `false` is the `413` (drop the probe).
+        pub fn push(&mut self, chunk: &[u8]) -> bool {
+            self.0.push(chunk)
+        }
+
+        pub fn collected_len(&self) -> usize {
+            self.0.collected_len()
+        }
+
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+
+        /// The collected body and its narrowed charge, as the drain hands them
+        /// to the request handler.
+        pub fn finish(self) -> (Vec<u8>, RequestBufferPermitProbe) {
+            let (body, permit) = self.0.finish();
+            (body, RequestBufferPermitProbe(permit))
+        }
+    }
+
     /// What the shared charged content-coding chain decoder — the one
     /// `compression`'s opt-in `decompress_request` normalizer now runs
     /// (`GHSA-q76p-952x-7c3v`) — decided for one coding list, projected so

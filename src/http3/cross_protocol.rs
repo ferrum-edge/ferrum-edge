@@ -147,6 +147,8 @@ use crate::proxy::{
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
+use super::server::H3RetainedUpload;
+
 /// Outcome reported back to the H3 listener so it can update request
 /// counters, build the `TransactionSummary` for log plugins, and record
 /// whether the client disconnected mid-stream.
@@ -3379,11 +3381,27 @@ where
     // selected target is mesh-tagged (issue #3620). Drain under the composed
     // authorization bound so an elapsed credential cannot complete a ready
     // upload (issue #3815); the client-RPC wrapper would ignore that owner.
+    // The shared request-buffer charge for a force-buffered mesh upload
+    // (#6009), held until this dispatch and every retry replay are done.
+    let mut mesh_upload_charge = None;
     let (prebuffered_body, raw_prebuffered_body_bytes) = if prebuffered_body.is_none()
         && upstream_target.is_some_and(crate::proxy::target_requires_http_mesh_egress)
     {
+        let Some(upload) = H3RetainedUpload::admit(effective_max_request_body_size_bytes) else {
+            cb_probe.release_neutral();
+            return write_plain_gateway_error(
+                stream,
+                ctx,
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY,
+                None,
+                backend_start,
+                0,
+            )
+            .await;
+        };
         match super::server::collect_h3_request_body_under_authorization(
-            drain_h3_body(stream, effective_max_request_body_size_bytes),
+            drain_h3_body(stream, upload, &mut mesh_upload_charge),
             plain_local_bound,
             proxy.backend_read_timeout_ms,
         )
@@ -8065,11 +8083,27 @@ where
     // `max_request_body_size_bytes`) so H3 gRPC matches the H1/H2 gRPC limit —
     // an `https` proxy serves any client HTTP version uniformly.
     let body_was_prebuffered = prebuffered_body.is_some();
+    // The shared request-buffer charge for a bridge-drained upload (#6009),
+    // held until this dispatch and every retry replay are done.
+    let mut bridge_upload_charge = None;
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
+        let Some(upload) = H3RetainedUpload::admit(effective_max_grpc_recv_size_bytes) else {
+            cb_probe.release_neutral();
+            return write_grpc_error_for_request(
+                stream,
+                ctx,
+                crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+                crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
+                backend_start,
+                0,
+                initial_response_header_policy_plugins,
+            )
+            .await;
+        };
         match super::server::collect_h3_request_body_under_authorization(
-            drain_h3_body(stream, effective_max_grpc_recv_size_bytes),
+            drain_h3_body(stream, upload, &mut bridge_upload_charge),
             upload_bound,
             proxy.backend_read_timeout_ms,
         )
@@ -11725,16 +11759,18 @@ pub(crate) fn collect_reqwest_response_headers(
 // H3 body drain + response writers
 // ---------------------------------------------------------------------------
 
-/// Drain the H3 stream body into a `Vec<u8>` with a size ceiling. Returns
-/// `Ok(None)` when the limit is exceeded (caller emits 413).
+/// Drain the H3 stream body into an admitted, capped `Vec<u8>` (#6009).
+/// Returns `Ok(None)` when the retained ceiling is exceeded (caller emits
+/// 413); on success the shared request-buffer charge moves into `charge`.
 async fn drain_h3_body<S>(
     stream: &mut RequestStream<S, Bytes>,
-    max_bytes: usize,
+    upload: H3RetainedUpload,
+    charge: &mut Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
 ) -> Result<Option<Vec<u8>>, h3::error::StreamError>
 where
     S: RecvStream,
 {
-    super::server::drain_h3_request_body(stream, max_bytes).await
+    super::server::drain_h3_request_body(stream, upload, charge).await
 }
 
 /// Streaming-framed response headers: the final body length is not known here,

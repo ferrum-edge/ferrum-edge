@@ -78,6 +78,7 @@ mod h1_send_release_tests;
 mod h3_cross_protocol_backend_header_tests;
 mod h3_cross_protocol_bytes_share_tests;
 mod h3_native_reject_bytes_share_tests;
+mod h3_retained_upload_tests;
 mod h3_retry_eligibility_tests;
 mod hbone_inner_reuse_classification_tests;
 mod health_check_tests;

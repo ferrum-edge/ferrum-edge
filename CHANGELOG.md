@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Native HTTP/3 buffered uploads now honour the shared retained-request
+  budget** (#6009). Every native-H3 buffered drain — including the collectors
+  that run before `authenticate`, `authorize` and `before_proxy`, and the H3
+  cross-protocol bridge drains — reserves its ceiling from
+  `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` before allocating and folds a `0`
+  body limit to `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES`, as HTTP/1.1 and
+  HTTP/2 already did. Previously an unauthenticated H3 client on a
+  body-before-auth route had no aggregate bound, and no per-request bound when
+  the global body limit was `0`. An upload the budget cannot admit now gets
+  `503` / gRPC `RESOURCE_EXHAUSTED` (`gateway_buffer_capacity`,
+  health-neutral). Cancellation, `413`, disconnect and timeouts release the
+  charge exactly once; a completed body stays charged until its owner and
+  every retry copy are done.
+
 ## [0.9.12] - Unreleased
 
 Candidate prepared on **2026-10-05 UTC** from post-#6012 main
