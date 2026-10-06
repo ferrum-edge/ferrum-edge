@@ -1341,9 +1341,8 @@ mod h2_reset_origin_classification {
     /// One upload DATA frame, then the bare CANCEL the gateway's upload
     /// adapters yield (`h2_upload_reset_error`) once `fail` fires.
     fn failing_upload(fail: oneshot::Receiver<()>) -> ByteStream {
-        let first = futures_util::stream::once(async {
-            Ok::<_, BoxError>(Bytes::from_static(b"partial"))
-        });
+        let first =
+            futures_util::stream::once(async { Ok::<_, BoxError>(Bytes::from_static(b"partial")) });
         let failure = futures_util::stream::once(async move {
             let _ = fail.await;
             Err::<Bytes, BoxError>(h2::Error::from(h2::Reason::CANCEL).into())

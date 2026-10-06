@@ -4122,7 +4122,10 @@ fn test_remaining_h2_upload_dispatchers_require_h2_end_stream() {
         let rewrite = dispatch
             .find("parts.version = hyper::Version::HTTP_11;")
             .expect("backend version rewrite");
-        assert!(read < rewrite, "{signature}: read the frontend version first");
+        assert!(
+            read < rewrite,
+            "{signature}: read the frontend version first"
+        );
     }
 
     let body = include_str!("../../../src/proxy/body.rs");
