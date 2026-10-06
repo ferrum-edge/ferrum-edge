@@ -7,7 +7,11 @@ use ferrum_edge::config::db_backend::{
     ConditionalNamespaceSnapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES, SnapshotDigest,
     is_namespace_snapshot_too_large,
 };
-use ferrum_edge::config::deployment_mutation::{DeploymentSnapshot, StoredEvidence};
+use ferrum_edge::config::deployment_mutation::{
+    DeploymentCommitOutcomeUnknown, DeploymentMutationNotStarted, DeploymentSnapshot,
+    StoredEvidence, deployment_commit_unknown, deployment_not_started,
+    is_deployment_commit_outcome_unknown, is_deployment_mutation_not_started,
+};
 use ferrum_edge::config::types::{ApiSpec, GatewayConfig, SpecFormat};
 use serde_json::json;
 
@@ -124,13 +128,13 @@ fn over_bound_representations_are_refused_with_a_typed_error() {
 
 #[test]
 fn deployment_digest_streams_the_same_canonical_evidence() {
-    let deployment = DeploymentSnapshot {
-        snapshot: snapshot(vec![spec("a", vec![9; 2048])]),
-        stored: json!({
+    let deployment = DeploymentSnapshot::new(
+        snapshot(vec![spec("a", vec![9; 2048])]),
+        json!({
             "api_specs": [{"spec_content": {"value": {"sha256": "00", "len": 2048}}}],
             "proxies": [],
         }),
-    };
+    );
     let representation = deployment.representation().unwrap();
     assert_eq!(representation["profile"], "deployment-v1");
     assert_eq!(
@@ -143,7 +147,7 @@ fn deployment_digest_streams_the_same_canonical_evidence() {
     // Deployment and namespace digests are distinct domains of the same state.
     assert_ne!(
         deployment.digest().unwrap(),
-        deployment.snapshot.digest().unwrap()
+        deployment.snapshot().digest().unwrap()
     );
 }
 
@@ -168,14 +172,14 @@ fn assemble(
     snapshot: ConditionalNamespaceSnapshot,
     limit: usize,
 ) -> Result<DeploymentSnapshot, anyhow::Error> {
-    let mut evidence = StoredEvidence::for_snapshot_within(&snapshot, limit)?;
+    let mut evidence = StoredEvidence::for_snapshot_within(snapshot, limit)?;
     for (table, rows) in evidence_rows() {
         for row in rows {
             evidence.push(row)?;
         }
         evidence.end_table(table)?;
     }
-    Ok(evidence.finish(snapshot))
+    Ok(evidence.finish())
 }
 
 #[test]
@@ -192,6 +196,14 @@ fn stored_evidence_charges_exactly_the_canonical_deployment_representation() {
         deployment.digest().unwrap(),
         SnapshotDigest::of_representation(&representation).unwrap()
     );
+    // Resuming from the typed prefix hashed during assembly matches a full
+    // rendering of the same evidence.
+    let rendered = DeploymentSnapshot::new(typed(), deployment.stored.clone());
+    assert_eq!(rendered.digest().unwrap(), deployment.digest().unwrap());
+    assert_eq!(
+        rendered.digest_within(exact).unwrap(),
+        deployment.digest_within(exact).unwrap()
+    );
     // The running budget refuses exactly what the bounded digest refuses.
     let at_bound = assemble(typed(), exact).unwrap();
     assert_eq!(
@@ -203,20 +215,53 @@ fn stored_evidence_charges_exactly_the_canonical_deployment_representation() {
     assert!(is_namespace_snapshot_too_large(
         &deployment.digest_within(exact - 1).unwrap_err()
     ));
+    // A bound below the already-hashed typed prefix still refuses.
+    assert!(is_namespace_snapshot_too_large(
+        &deployment.digest_within(16).unwrap_err()
+    ));
+}
+
+#[test]
+fn only_a_tagged_commit_failure_has_an_unknown_deployment_outcome() {
+    let statement = anyhow::Error::new(std::io::Error::other("statement failed"));
+    assert!(!is_deployment_commit_outcome_unknown(&statement));
+    let commit = deployment_commit_unknown(std::io::Error::other("commit failed"));
+    assert!(is_deployment_commit_outcome_unknown(&commit));
+    // The driver error stays in the chain, and outer context keeps the tag.
+    assert!(commit.chain().any(|cause| cause.is::<std::io::Error>()));
+    assert!(is_deployment_commit_outcome_unknown(
+        &commit.context("outer")
+    ));
+    let bare = anyhow::Error::new(DeploymentCommitOutcomeUnknown);
+    assert!(is_deployment_commit_outcome_unknown(&bare));
+}
+
+#[test]
+fn only_a_tagged_pre_transaction_failure_is_not_started() {
+    let statement = anyhow::Error::new(std::io::Error::other("statement failed"));
+    assert!(!is_deployment_mutation_not_started(&statement));
+    let failed = anyhow::Error::new(std::io::Error::other("session start failed"));
+    let before = deployment_not_started(failed);
+    assert!(is_deployment_mutation_not_started(&before));
+    // Outer context keeps the pre-transaction tag.
+    assert!(is_deployment_mutation_not_started(&before.context("outer")));
+    let bare = anyhow::Error::new(DeploymentMutationNotStarted);
+    assert!(is_deployment_mutation_not_started(&bare));
 }
 
 #[test]
 fn stored_evidence_refuses_an_over_bound_typed_snapshot_before_raw_rows() {
     let typed = snapshot(vec![spec("a", vec![9; 2048])]);
     let resources = canonical_len(&typed.representation().unwrap());
-    let error = StoredEvidence::for_snapshot_within(&typed, resources)
+    let error = StoredEvidence::for_snapshot_within(typed, resources)
         .err()
         .unwrap();
     assert!(is_namespace_snapshot_too_large(&error), "{error}");
 
     // A row past the remaining budget is refused when it is pushed.
     let n = resources + 64;
-    let mut evidence = StoredEvidence::for_snapshot_within(&typed, n).unwrap();
+    let typed = snapshot(vec![spec("a", vec![9; 2048])]);
+    let mut evidence = StoredEvidence::for_snapshot_within(typed, n).unwrap();
     let row = json!({"value": "x".repeat(128)});
     let error = evidence.push(row).unwrap_err();
     assert!(is_namespace_snapshot_too_large(&error), "{error}");
