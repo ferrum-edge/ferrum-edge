@@ -74,10 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
   backend now answers before reading any request DATA, then drains the full
   2 MiB upload, alongside the existing variant that reads one DATA frame first.
+  A raw native-gRPC backend now sends its Trailers-Only response on request
+  HEADERS alone, before the client has sent any DATA. The upload must then
+  either reach the backend intact with END_STREAM or arrive as the client's
+  `CANCEL` with no DATA. This is checked with and without an authenticated
+  consumer.
 - **Test coverage for gateway-initiated backend resets** (#6022). A unit test
   drives a real hyper HTTP/2 client whose request body fails. It checks that
   the backend receives `RST_STREAM(CANCEL)` and that the error stays
   backend-health-neutral in both the streaming and reqwest classifiers.
+
 ### Fixed
 
 - **HTTP/2 bodies no longer leave as one DATA frame per small window
