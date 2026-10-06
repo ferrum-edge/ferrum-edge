@@ -39667,8 +39667,7 @@ async fn handle_proxy_request_inner(
                         proxy.dns_override.as_deref(),
                         proxy.dns_cache_ttl_seconds,
                     );
-                    match crate::plugins::await_grpc_deadline(ctx.grpc_deadline_at(), resolve)
-                        .await
+                    match crate::plugins::await_grpc_deadline(ctx.grpc_deadline_at(), resolve).await
                     {
                         Ok(result) => result.ok().map(|ip| ip.to_string()),
                         Err(()) => None,
