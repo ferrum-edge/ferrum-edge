@@ -68,6 +68,9 @@ FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 PERFORMANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
+DISTROLESS_IMAGE_PATTERN = re.compile(
+    r"gcr\.io/distroless/cc-debian13:[^\s@]+@sha256:([0-9a-fA-F]{64})"
+)
 
 # Only the PR-editable direct sites; frozen composites/FIPS/fuzz/perf retain
 # their separately governed contracts. True means compiler-cache-only reuse.
@@ -4128,6 +4131,49 @@ def check_dockerfile_image_pins(
         )
 
 
+FROZEN_PROTECTED_DISTROLESS_REFS = frozenset(
+    {
+        (
+            ".github/workflows/ci.yml",
+            "54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97",
+        )
+    }
+)
+
+
+def check_distroless_digest_consistency(
+    files: list[tuple[str, str]], dockerfile: str, failures: list[str]
+) -> None:
+    """Require every distroless cc-debian13 image ref to match Dockerfile."""
+
+    dockerfile_refs = [
+        reference
+        for _, _, reference in dockerfile_image_references(dockerfile)
+        if reference.startswith("gcr.io/distroless/cc-debian13:")
+    ]
+    require(
+        len(dockerfile_refs) == 1 and "@sha256:" in dockerfile_refs[0],
+        "Dockerfile must declare exactly one digest-pinned cc-debian13 source",
+        failures,
+    )
+    if len(dockerfile_refs) != 1 or "@sha256:" not in dockerfile_refs[0]:
+        return
+    expected_digest = dockerfile_refs[0].split("@sha256:", 1)[1].lower()
+    for path, contents in files:
+        for match in DISTROLESS_IMAGE_PATTERN.finditer(contents):
+            digest = match.group(1).lower()
+            # The protected `main-linux-image` job is frozen by the trusted
+            # Cross build policy; its base digest moves only through a reviewed
+            # policy migration (issue #6034). It builds an unpublished CI image.
+            if (path, digest) in FROZEN_PROTECTED_DISTROLESS_REFS:
+                continue
+            if digest != expected_digest:
+                failures.append(
+                    f"{path} uses distroless digest {match.group(1)}, but Dockerfile "
+                    f"pins {expected_digest}"
+                )
+
+
 def workflow_permissions_are_read_only(text: str) -> bool:
     """Require one explicit top-level permissions map with no write grants."""
 
@@ -5184,10 +5230,72 @@ def check_dockerfile(failures: list[str]) -> None:
         ("Dockerfile.iproute2-layer", iproute2_layer),
     ):
         check_dockerfile_image_pins(label, text, failures)
+    repository_files: list[tuple[str, str]] = []
+    for path in REPO_ROOT.rglob("*"):
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or ".git" in path.parts
+            or path == Path(__file__).resolve()
+            or path.stat().st_size > 8 * 1024 * 1024
+            or not (
+                path.name.startswith("Dockerfile")
+                or path.suffix.lower()
+                in {
+                    ".yml",
+                    ".yaml",
+                    ".md",
+                    ".txt",
+                    ".conf",
+                    ".toml",
+                    ".sh",
+                    ".py",
+                    ".rs",
+                    ".json",
+                }
+            )
+        ):
+            continue
+        try:
+            contents = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        repository_files.append((path.relative_to(REPO_ROOT).as_posix(), contents))
+    check_distroless_digest_consistency(repository_files, dockerfile, failures)
 
 
 def self_test() -> int:
     failures: list[str] = []
+    source_digest = "a" * 64
+    other_digest = "b" * 64
+    source_dockerfile = (
+        "ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:"
+        f"{source_digest}\nFROM ${{RUNTIME_BASE}} AS runtime\n"
+    )
+    distroless_files = [
+        (
+            "Dockerfile.live",
+            f"FROM gcr.io/distroless/cc-debian13:nonroot@sha256:{source_digest}\n",
+        )
+    ]
+    pin_failures: list[str] = []
+    check_distroless_digest_consistency(distroless_files, source_dockerfile, pin_failures)
+    require(
+        not pin_failures,
+        "self-test: matching distroless image refs should pass",
+        failures,
+    )
+    pin_failures = []
+    check_distroless_digest_consistency(
+        [("ci.yml", f"image: gcr.io/distroless/cc-debian13:nonroot@sha256:{other_digest}\n")],
+        source_dockerfile,
+        pin_failures,
+    )
+    require(
+        len(pin_failures) == 1 and "ci.yml" in pin_failures[0],
+        "self-test: stale distroless image refs must fail with their path",
+        failures,
+    )
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
         workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
         producer = extract_job(workflow, job_name)

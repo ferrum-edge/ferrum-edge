@@ -681,22 +681,13 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   explicit caller override remains supported. The refresh workflow already
   included this Dockerfile and updates its digest-pinned image references.
 
-The refresh workflow uses `GH_TOKEN: ${{ github.token }}` to create or update
-the PR. [GitHub's event rules](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs)
-allow token-created `pull_request` events (`opened`, `synchronize`, `reopened`)
-to create approval-required runs; other events, including `pull_request_target`,
-remain suppressed. Approving those PR runs does not create the missing
-`Trusted Cross Build Policy` check: `cross-build-policy.yml` uses
-`pull_request_target` for PRs and has no `workflow_dispatch` trigger.
-
-After reviewing the proposed inputs and completing meaningful necessary source
-or provenance changes, a maintainer must make an ordinary human-authenticated,
-fast-forward push to the existing PR branch. That fresh `synchronize` event
-allows both the trusted-base policy and fresh-head PR workflows to run. Verify
-both against the actual new head; earlier-head successes cannot qualify it.
-Re-running an existing PR workflow cannot create the absent trusted workflow.
-Do not substitute an admin bypass, fabricated check/status, protected-policy
-change, or empty/dummy commit for this reviewed update and its required checks.
+Dependency and frozen-policy PRs may be admin-merged by a maintainer after
+verification. Before an admin merge, verify every proposed dependency version
+and image digest against its authoritative registry or upstream source, and
+require all other applicable required checks to pass on the reviewed head. Use
+this path only when an intentionally frozen trusted-policy gate cannot qualify
+the change; record the affected gate and its frozen contract in the PR body.
+An admin merge does not waive failed or missing unrelated required checks.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
