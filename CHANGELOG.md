@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The base-image refresh inventory reports Cross tag drift for an independent
   trusted-policy rotation. The existing admission guard remains enforced;
   candidate CI cannot authorize a merge or release.
+- **hickory-resolver upgraded to 0.26.2** (GHSA-5j98-2g5x-46v6,
+  GHSA-6w6g-hm98-mhgm, GHSA-6f2x-v7q7-m7m5). The DNS resolver behind
+  `src/dns/` and the MongoDB `dns-resolver` path now moves with its matching
+  `hickory-proto` / `hickory-net` 0.26.2 siblings in the root, `fuzz`, and
+  `tests/performance/mesh` lockfiles. 0.26.2 bounds the truncated-response
+  (TC) retry loop in `NameServerPool::try_send` that a hostile or spoofed
+  nameserver could drive into resource exhaustion, stops following CNAME
+  records irrelevant to the query, rejects records whose class differs from
+  the query, and no longer lets `lookup()` / `lookup_ip()` hide DNSSEC
+  validation failures. Ferrum does not enable resolver DNSSEC validation, so
+  resolution results are otherwise unchanged; no call sites changed.
 
 ### Fixed
 
