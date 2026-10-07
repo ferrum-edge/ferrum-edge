@@ -6264,6 +6264,16 @@ mod inner {
                     .iter()
                     .map(|item| (item.namespace.clone(), item.id.clone()))
                     .collect(),
+                proxy_scoped_attachments: graph
+                    .plugin_configs
+                    .iter()
+                    .filter(|item| item.scope == PluginScope::Proxy)
+                    .filter_map(|item| {
+                        item.proxy_id.as_ref().map(|proxy_id| {
+                            (item.namespace.clone(), proxy_id.clone(), item.id.clone())
+                        })
+                    })
+                    .collect(),
                 chunk_size,
                 fault,
                 lease_namespace: graph.namespace.to_string(),
@@ -6461,14 +6471,49 @@ mod inner {
                 .await?;
             }
 
-            // MongoDB embeds plugin associations in the proxy document, so this
-            // phase has no separate write. The fault point is still honored so
-            // the phase is covered by the same fault-injection matrix as SQL.
+            // MongoDB embeds plugin associations in the proxy document, so a
+            // proxy's own `plugins` list was written with the proxy above. A
+            // proxy-scoped config additionally implies the association with its
+            // `proxy_id` (issue #4611), exactly as SQL's
+            // `insert_plugin_configs_in_tx` inserts the `proxy_plugins` row:
+            // the runtime only applies a config the proxy lists, so without it
+            // a batched proxy-scoped auth plugin would never be enforced.
             Self::check_atomic_batch_fault_in_session(
                 plan.fault,
                 AtomicBatchPhase::ProxyPluginAssociations,
                 0,
             )?;
+            for (namespace, proxy_id, plugin_config_id) in &plan.proxy_scoped_attachments {
+                let result = self
+                    .proxies()
+                    .update_one(
+                        doc! {
+                            "_id": namespaced_doc_id(namespace, proxy_id),
+                            "namespace": namespace.as_str(),
+                        },
+                        doc! {
+                            "$addToSet": { "plugins": { "plugin_config_id": plugin_config_id.as_str() } },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await?;
+                // SQL's `proxy_plugins` foreign key refuses an association with
+                // a missing proxy; fail the whole graph the same way rather
+                // than commit a config no proxy applies.
+                if result.matched_count != 1 {
+                    return Err(mongodb::error::Error::custom(
+                        "proxy-scoped plugin config targets a proxy that does not exist",
+                    ));
+                }
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace.as_str(),
+                    "proxy",
+                    proxy_id.as_str(),
+                    "upsert",
+                )
+                .await?;
+            }
             Self::check_atomic_batch_fault_in_session(
                 plan.fault,
                 AtomicBatchPhase::AdmissionRevalidation,
@@ -7909,6 +7954,10 @@ mod inner {
         proxy_changes: Vec<(String, String)>,
         plugin_config_docs: Vec<Document>,
         plugin_config_changes: Vec<(String, String)>,
+        /// `(namespace, proxy_id, plugin_config_id)` for every proxy-scoped
+        /// plugin config: the association each one implies on its target
+        /// proxy, attached inside the same transaction (issue #4611).
+        proxy_scoped_attachments: Vec<(String, String, String)>,
         chunk_size: usize,
         fault: Option<AtomicBatchFault>,
         lease_namespace: String,

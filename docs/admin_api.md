@@ -1530,6 +1530,7 @@ A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
 | `PUT /plugins/config/{id}` moving `proxy_id` from `P1` to `P2` | removes it from `P1`, adds it to `P2` |
 | `PUT /plugins/config/{id}` changing `scope` to `global` | removes the stale association |
 | `DELETE /plugins/config/{id}` | removes it from every proxy that lists it |
+| `POST /batch` or conditional `POST /restore` containing a `scope: "proxy"`, `proxy_id: P` config | appends it to `P` (idempotent) in the same transaction as the rest of the graph, on SQL and MongoDB alike; a `P` that does not exist fails the whole graph |
 
 The plugin-config row and the association commit in one transaction, and every
 touched proxy's `updated_at` advances so the next poll / control-plane
