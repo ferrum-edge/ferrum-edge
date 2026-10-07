@@ -99,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Name Ferrum Edge LLC as the copyright holder and commercial licensor in `LICENSE` (Required Notice), `LICENSE-COMMERCIAL.md` and the README license section.
 - **HTTP/2 small-window coalescing follow-ups** (#6038). New tests drive the
   production frontend accept loop over h2c and TLS with a raw client that
   opens its window a few bytes at a time, proving that both frontend HTTP/2

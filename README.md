@@ -640,7 +640,7 @@ exclusive. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 
 ## License
 
-Copyright (c) 2026 Ferrum Edge
+Copyright (c) 2026 Ferrum Edge LLC
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
 
