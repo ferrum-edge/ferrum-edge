@@ -71,6 +71,62 @@ The test runs in 10 batches. Each batch:
 
 After all 10 batches, a summary table is printed comparing RPS and latency percentiles across each scale point (3k, 6k, 9k, ... 30k).
 
+## Reload Under Load (`test_scale_reload_under_load`)
+
+The scale test above measures steady state *between* waves. This variant
+answers a different question: **does traffic to existing proxies keep flowing
+while config changes are written and hot-applied?**
+
+For each change it starts 50 workers on every already-live proxy, sends 5 s of
+discarded warmup, measures a 10 s steady baseline, and then, with load still
+running, writes the change through `POST /batch?apply=async`, waits for the
+apply cursor, proves the new routes are live, and measures 10 s more. Three kinds of change repeat up to 30,000 proxies:
+
+| Kind | Change | Reload path |
+|---|---|---|
+| `full` | 3,000 proxies with new consumers (12,000 resources) | Full rebuild: exceeds the poller's 10,000-row change-log limit |
+| `small+consumers` | 100 proxies with new consumers (400 resources) | Full rebuild: any consumer change forces a full reload by design (`IncrementalFullReloadRequired::for_consumer_changes`) |
+| `small-proxies` | 100 proxies whose plugins admit existing consumers (300 resources) | Incremental |
+
+The two small changes run after the initial wave and after every full wave.
+
+Every second records successful requests, p50/p99, errors, gateway CPU
+(cores), gateway RSS, load-generator CPU, and the host 1-minute load average.
+Each change reports four phases: `steady`; `change` (admin writes + apply +
+convergence); `apply` (from the last admin write to the confirmed apply, i.e.
+the reload alone); and `post`.
+
+**Any error from an already-live proxy fails the test** (non-2xx, timeout, or
+route-miss 404), which checks that an atomic config swap never drops or stalls
+existing routes. Degradation is reported, not asserted, because it depends on
+the host: a warning prints when a second during the change runs below 50% of
+steady RPS, when its p99 exceeds 10× steady p99, or when the host load average
+minus this test's own measured CPU (gateway + load generator) exceeds 2 cores
+(other processes competed and the numbers are noisy).
+
+```bash
+cargo build --release --bin ferrum-edge
+FERRUM_RELOAD_RESULTS_JSON=reload-under-load.json \
+cargo test --profile ci-release --test functional_tests -- --ignored --nocapture \
+  --exact functional::functional_scale_perf_test::test_scale_reload_under_load
+
+# On a shared machine, wait (up to 10 min) before each change until the host
+# 1-minute load average is below 30% of the CPU count
+FERRUM_RELOAD_WAIT_FOR_QUIET_HOST=1 FERRUM_RELOAD_RESULTS_JSON=reload-under-load.json \
+cargo test --profile ci-release --test functional_tests -- --ignored --nocapture \
+  --exact functional::functional_scale_perf_test::test_scale_reload_under_load
+
+# Shorter local run: stop at 9,000 proxies
+FERRUM_SCALE_TOTAL_PROXIES=9000 cargo test --profile ci-release --test functional_tests -- \
+  --ignored --nocapture --exact functional::functional_scale_perf_test::test_scale_reload_under_load
+```
+
+The JSON contains every phase plus the full per-second series for charting.
+Admin writes run inside the gateway process, so the `change` phase includes the
+CPU cost of handling those writes as well as the reload; `apply` isolates the
+reload. Run it on a quiet machine: another build or test competing for CPU shows
+up as dips with *low* gateway CPU and a high host load average.
+
 ## How to Run
 
 ```bash
