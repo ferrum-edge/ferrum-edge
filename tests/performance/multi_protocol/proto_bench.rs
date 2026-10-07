@@ -640,13 +640,18 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     // Build an HTTP/2 client builder with optimized flow-control settings.
     // The default 64 KB stream window throttles throughput on modern networks;
     // 8 MiB stream + 32 MiB connection windows match the gateway's tuned defaults.
+    //
+    // Keep these windows fixed. hyper's `adaptive_window(true)` silently resets
+    // both windows to 65,535 and grows them with BDP pings, and in that mode
+    // individual streams intermittently stall. Through a gateway that shows up
+    // as 10-20 s of idle warmup or drain; direct-to-backend the stream never
+    // recovers and the drain hits its 30 s abort.
     let make_h2_builder = || {
         let mut builder = http2::Builder::new(TokioExecutor::new());
         builder
             .timer(TokioTimer::new())
             .initial_stream_window_size(8_388_608) // 8 MiB
             .initial_connection_window_size(33_554_432) // 32 MiB
-            .adaptive_window(true) // BDP-based adaptive flow control
             .max_frame_size(1_048_576); // 1 MiB
         builder
     };

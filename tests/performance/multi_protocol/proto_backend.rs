@@ -260,10 +260,11 @@ async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
         tokio::spawn(async move {
             observer.record(connection_id, None, None, "connection_opened", None);
             let io = TokioIo::new(stream);
+            // Fixed windows only: `adaptive_window(true)` resets both to 65,535
+            // and intermittently stalls streams (see `run_http2` in proto_bench).
             let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .initial_stream_window_size(8_388_608) // 8 MiB
                 .initial_connection_window_size(33_554_432) // 32 MiB
-                .adaptive_window(true)
                 .max_frame_size(1_048_576) // 1 MiB
                 .max_concurrent_streams(1000)
                 .serve_connection(io, hyper::service::service_fn(handle_http))
@@ -328,10 +329,11 @@ async fn run_h2_tls_server(
             };
             observer.record(connection_id, None, None, "connection_opened", None);
             let io = TokioIo::new(tls_stream);
+            // Fixed windows only: `adaptive_window(true)` resets both to 65,535
+            // and intermittently stalls streams (see `run_http2` in proto_bench).
             let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .initial_stream_window_size(8_388_608) // 8 MiB
                 .initial_connection_window_size(33_554_432) // 32 MiB
-                .adaptive_window(true)
                 .max_frame_size(1_048_576) // 1 MiB
                 .max_concurrent_streams(1000)
                 .serve_connection(io, hyper::service::service_fn(handle_http))
