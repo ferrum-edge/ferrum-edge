@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.14] - 2026-10-07
 
 Release prepared on **2026-10-07 UTC** from main
-`930889700842a09874fb41b928c92168368dd5c1`. Library API, error
+`4f370a0b1921d231e9d0c498821e90e076aa64fb`. Library API, error
 classification and backend health attribution, and the control plane's backend
 egress policy discovery change; read
 [Upgrading to 0.9.14](docs/upgrade_guide.md#upgrading-to-0914) before

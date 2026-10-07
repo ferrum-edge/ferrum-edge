@@ -29,7 +29,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 ## Upgrading to 0.9.14
 
 0.9.14 (2026-10-07 UTC) is cut from main
-`930889700842a09874fb41b928c92168368dd5c1`. All previously released breaking
+`4f370a0b1921d231e9d0c498821e90e076aa64fb`. All previously released breaking
 identifiers and guidance below remain applicable. CP/DP must run the same
 build; the ConfigSync protocol revision is now `3` (#6020). 0.9.14 adds no core
 schema change; a changed baseline in any later release still requires a fresh
