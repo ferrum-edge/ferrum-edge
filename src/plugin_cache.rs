@@ -455,7 +455,9 @@ impl Plugin for MeshRouteDispatchFinalizer {
 /// the execution boundary after the final `mesh_route_dispatch` instance.
 /// Existing finalizers may be present when a global list is cloned during an
 /// incremental rebuild, so remove them before recomputing the boundary.
-fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
+pub(crate) fn install_mesh_route_dispatch_finalizer(
+    plugins: &mut Vec<Arc<dyn Plugin>>,
+) -> Result<(), String> {
     plugins.retain(|plugin| !is_builtin_named(plugin, MESH_ROUTE_DISPATCH_FINALIZER_NAME));
     let first_index = plugins
         .iter()
@@ -498,10 +500,8 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
 /// Install one aggregate CORS boundary after every attached CORS instance has
 /// evaluated the request. The chain must remain contiguous so an intervening
 /// short-circuit plugin cannot bypass a later CORS policy.
-fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
-    plugins.retain(|plugin| {
-        !is_builtin_named(plugin, crate::plugins::cors::CORS_FINALIZER_NAME)
-    });
+pub(crate) fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
+    plugins.retain(|plugin| !is_builtin_named(plugin, crate::plugins::cors::CORS_FINALIZER_NAME));
     let Some(first_index) = plugins
         .iter()
         .position(|plugin| is_builtin_named(plugin, CORS_NAME))

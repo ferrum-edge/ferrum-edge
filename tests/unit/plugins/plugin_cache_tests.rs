@@ -1644,9 +1644,11 @@ fn custom_plugins_named_like_cache_finalizers_survive_cleanup() {
         names,
         ["__cors_finalizer", "__mesh_route_dispatch_finalizer"]
     );
-    assert!(plugins
-        .iter()
-        .all(|plugin| !ferrum_edge::plugins::is_builtin_plugin(plugin.as_ref())));
+    assert!(
+        plugins
+            .iter()
+            .all(|plugin| !ferrum_edge::plugins::is_builtin_plugin(plugin.as_ref()))
+    );
 }
 
 /// Cache-internal finalizers are proven response-body non-producers whose
