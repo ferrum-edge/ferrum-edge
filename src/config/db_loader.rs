@@ -7709,9 +7709,7 @@ impl DatabaseStore {
                 .execute(&mut **tx)
                 .await?;
 
-            if pc.scope == PluginScope::Proxy
-                && let Some(proxy_id) = pc.proxy_id.as_deref()
-            {
+            if let Some(proxy_id) = pc.implied_proxy_association() {
                 sqlx::query(&assoc_sql)
                     .bind(&pc.namespace)
                     .bind(proxy_id)

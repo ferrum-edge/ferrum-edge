@@ -100,7 +100,7 @@ mod inner {
         Tls, TlsOptions, WriteConcern,
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::future::Future;
     use std::io::Write;
     use std::ops::Deref;
@@ -955,10 +955,7 @@ mod inner {
         if pc.scope == PluginScope::ProxyGroup {
             return;
         }
-        let desired = match pc.scope {
-            PluginScope::Proxy => pc.proxy_id.as_deref(),
-            _ => None,
-        };
+        let desired = pc.implied_proxy_association();
         for proxy in &mut candidate.proxies {
             if proxy.namespace != pc.namespace {
                 continue;
@@ -989,8 +986,7 @@ mod inner {
         plan: &ProxyAssociationPlan,
     ) -> Vec<String> {
         let mut touched = plan.touched.clone();
-        if pc.scope == PluginScope::Proxy
-            && let Some(proxy_id) = pc.proxy_id.as_deref()
+        if let Some(proxy_id) = pc.implied_proxy_association()
             && !touched.iter().any(|current| current.as_str() == proxy_id)
         {
             touched.push(proxy_id.to_string());
@@ -1012,6 +1008,67 @@ mod inner {
         detach: Vec<String>,
         /// `detach` plus `attach` — every proxy whose plugin set changes.
         touched: Vec<String>,
+    }
+
+    /// One proxy's batch-implied associations:
+    /// `(namespace, proxy_id, plugin_config_ids)`.
+    type ProxyScopedAttachment = (String, String, Vec<String>);
+
+    /// Group every config's implied proxy association
+    /// ([`PluginConfig::implied_proxy_association`]) by target proxy, so a
+    /// batch writes and records each proxy once (issue #4611).
+    fn group_proxy_scoped_attachments<'a>(
+        configs: impl IntoIterator<Item = &'a PluginConfig>,
+    ) -> Vec<ProxyScopedAttachment> {
+        let mut grouped: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for pc in configs {
+            if let Some(proxy_id) = pc.implied_proxy_association() {
+                let ids = grouped
+                    .entry((pc.namespace.clone(), proxy_id.to_string()))
+                    .or_default();
+                if !ids.contains(&pc.id) {
+                    ids.push(pc.id.clone());
+                }
+            }
+        }
+        grouped
+            .into_iter()
+            .map(|((namespace, proxy_id), ids)| (namespace, proxy_id, ids))
+            .collect()
+    }
+
+    /// Update pipeline appending each id the proxy does not already list.
+    /// Matching on `plugin_config_id` alone, rather than `$addToSet`'s
+    /// whole-document equality, keeps a stored association that carries extra
+    /// fields from gaining a duplicate.
+    fn proxy_scoped_attach_pipeline(plugin_config_ids: &[String]) -> Vec<Document> {
+        vec![doc! {
+            "$set": {
+                "plugins": {
+                    "$concatArrays": [
+                        { "$ifNull": ["$plugins", []] },
+                        {
+                            "$map": {
+                                "input": {
+                                    "$filter": {
+                                        "input": plugin_config_ids.to_vec(),
+                                        "cond": {
+                                            "$not": [{
+                                                "$in": [
+                                                    "$$this",
+                                                    { "$ifNull": ["$plugins.plugin_config_id", []] },
+                                                ],
+                                            }],
+                                        },
+                                    },
+                                },
+                                "in": { "plugin_config_id": "$$this" },
+                            },
+                        },
+                    ],
+                },
+            },
+        }]
     }
 
     #[derive(Clone)]
@@ -3446,10 +3503,7 @@ mod inner {
             if pc.scope == PluginScope::ProxyGroup {
                 return Ok(ProxyAssociationPlan::default());
             }
-            let desired = match pc.scope {
-                PluginScope::Proxy => pc.proxy_id.clone(),
-                _ => None,
-            };
+            let desired = pc.implied_proxy_association().map(str::to_string);
 
             let mut attached = Vec::new();
             let mut cursor = self
@@ -3639,6 +3693,119 @@ mod inner {
                         crate::startup::sanitize_startup_scalar(namespace),
                         crate::startup::sanitize_startup_scalar(plugin_config_id),
                         crate::startup::sanitize_startup_scalar(format!("{:?}", plan.detach))
+                    );
+                }
+            }
+        }
+
+        /// Attach batch-implied proxy-scoped associations inside a transaction,
+        /// as SQL's `insert_plugin_configs_in_tx` inserts `proxy_plugins` rows,
+        /// and record one `proxy` change per touched proxy not already in
+        /// `recorded`. A missing proxy aborts the transaction, matching the
+        /// SQL `proxy_plugins` foreign key.
+        async fn attach_proxy_scoped_plugin_configs_in_session(
+            &self,
+            session: &mut ClientSession,
+            attachments: &[ProxyScopedAttachment],
+            recorded: &[(String, String)],
+        ) -> mongodb::error::Result<()> {
+            if attachments.is_empty() {
+                return Ok(());
+            }
+            let recorded: HashSet<(&str, &str)> = recorded
+                .iter()
+                .map(|(namespace, id)| (namespace.as_str(), id.as_str()))
+                .collect();
+            for (namespace, proxy_id, plugin_config_ids) in attachments {
+                let result = self
+                    .proxies()
+                    .update_one(
+                        doc! {
+                            "_id": namespaced_doc_id(namespace, proxy_id),
+                            "namespace": namespace.as_str(),
+                        },
+                        proxy_scoped_attach_pipeline(plugin_config_ids),
+                    )
+                    .session(&mut *session)
+                    .await?;
+                if result.matched_count != 1 {
+                    return Err(mongodb::error::Error::custom(
+                        "proxy-scoped plugin config targets a proxy that does not exist",
+                    ));
+                }
+                if !recorded.contains(&(namespace.as_str(), proxy_id.as_str())) {
+                    self.record_config_change_in_session(
+                        &mut *session,
+                        namespace.as_str(),
+                        "proxy",
+                        proxy_id.as_str(),
+                        "upsert",
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Standalone counterpart of
+        /// [`Self::attach_proxy_scoped_plugin_configs_in_session`]; the caller
+        /// records the `proxy` changes and compensates with
+        /// [`Self::detach_proxy_scoped_plugin_configs_best_effort`] on failure.
+        async fn attach_proxy_scoped_plugin_configs(
+            &self,
+            attachments: &[ProxyScopedAttachment],
+        ) -> Result<(), anyhow::Error> {
+            for (namespace, proxy_id, plugin_config_ids) in attachments {
+                let result = self
+                    .proxies()
+                    .update_one(
+                        doc! {
+                            "_id": namespaced_doc_id(namespace, proxy_id),
+                            "namespace": namespace.as_str(),
+                        },
+                        proxy_scoped_attach_pipeline(plugin_config_ids),
+                    )
+                    .await?;
+                if result.matched_count != 1 {
+                    anyhow::bail!("proxy-scoped plugin config targets a proxy that does not exist");
+                }
+            }
+            Ok(())
+        }
+
+        /// Best-effort inverse of [`Self::attach_proxy_scoped_plugin_configs`]
+        /// for a standalone batch whose follow-up failed. The configs were
+        /// just inserted and are being rolled back, so no proxy may keep
+        /// referencing them; failures are logged as a hand repair.
+        async fn detach_proxy_scoped_plugin_configs_best_effort(
+            &self,
+            attachments: &[ProxyScopedAttachment],
+        ) {
+            for (namespace, proxy_id, plugin_config_ids) in attachments {
+                let result = self
+                    .proxies()
+                    .update_one(
+                        doc! {
+                            "_id": namespaced_doc_id(namespace, proxy_id),
+                            "namespace": namespace.as_str(),
+                        },
+                        doc! {
+                            "$pull": {
+                                "plugins": {
+                                    "plugin_config_id": { "$in": plugin_config_ids.to_vec() },
+                                },
+                            },
+                        },
+                    )
+                    .await;
+                if let Err(_error) = result {
+                    warn!(
+                        "standalone plugin-config batch failed after attaching proxy \
+                         associations and the compensating detach also failed \
+                         (namespace={} proxy_id={}): database error (details withheld); \
+                         repair the proxy's `plugins` array by hand",
+                        crate::startup::sanitize_startup_scalar(namespace),
+                        crate::startup::sanitize_startup_scalar(proxy_id)
                     );
                 }
             }
@@ -6264,16 +6431,7 @@ mod inner {
                     .iter()
                     .map(|item| (item.namespace.clone(), item.id.clone()))
                     .collect(),
-                proxy_scoped_attachments: graph
-                    .plugin_configs
-                    .iter()
-                    .filter(|item| item.scope == PluginScope::Proxy)
-                    .filter_map(|item| {
-                        item.proxy_id.as_ref().map(|proxy_id| {
-                            (item.namespace.clone(), proxy_id.clone(), item.id.clone())
-                        })
-                    })
-                    .collect(),
+                proxy_scoped_attachments: group_proxy_scoped_attachments(graph.plugin_configs),
                 chunk_size,
                 fault,
                 lease_namespace: graph.namespace.to_string(),
@@ -6483,37 +6641,12 @@ mod inner {
                 AtomicBatchPhase::ProxyPluginAssociations,
                 0,
             )?;
-            for (namespace, proxy_id, plugin_config_id) in &plan.proxy_scoped_attachments {
-                let result = self
-                    .proxies()
-                    .update_one(
-                        doc! {
-                            "_id": namespaced_doc_id(namespace, proxy_id),
-                            "namespace": namespace.as_str(),
-                        },
-                        doc! {
-                            "$addToSet": { "plugins": { "plugin_config_id": plugin_config_id.as_str() } },
-                        },
-                    )
-                    .session(&mut *session)
-                    .await?;
-                // SQL's `proxy_plugins` foreign key refuses an association with
-                // a missing proxy; fail the whole graph the same way rather
-                // than commit a config no proxy applies.
-                if result.matched_count != 1 {
-                    return Err(mongodb::error::Error::custom(
-                        "proxy-scoped plugin config targets a proxy that does not exist",
-                    ));
-                }
-                self.record_config_change_in_session(
-                    &mut *session,
-                    namespace.as_str(),
-                    "proxy",
-                    proxy_id.as_str(),
-                    "upsert",
-                )
-                .await?;
-            }
+            self.attach_proxy_scoped_plugin_configs_in_session(
+                &mut *session,
+                &plan.proxy_scoped_attachments,
+                &plan.proxy_changes,
+            )
+            .await?;
             Self::check_atomic_batch_fault_in_session(
                 plan.fault,
                 AtomicBatchPhase::AdmissionRevalidation,
@@ -7954,10 +8087,10 @@ mod inner {
         proxy_changes: Vec<(String, String)>,
         plugin_config_docs: Vec<Document>,
         plugin_config_changes: Vec<(String, String)>,
-        /// `(namespace, proxy_id, plugin_config_id)` for every proxy-scoped
-        /// plugin config: the association each one implies on its target
-        /// proxy, attached inside the same transaction (issue #4611).
-        proxy_scoped_attachments: Vec<(String, String, String)>,
+        /// The association every proxy-scoped plugin config implies on its
+        /// target proxy, grouped per proxy and attached inside the same
+        /// transaction (issue #4611).
+        proxy_scoped_attachments: Vec<ProxyScopedAttachment>,
         chunk_size: usize,
         fault: Option<AtomicBatchFault>,
         lease_namespace: String,
@@ -13982,6 +14115,10 @@ mod inner {
                 .iter()
                 .map(plugin_config_to_doc)
                 .collect::<Result<_, _>>()?;
+            // The association each proxy-scoped config implies, written with
+            // the configs as SQL's `insert_plugin_configs_in_tx` does
+            // (issue #4611).
+            let attachments = group_proxy_scoped_attachments(configs);
             let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
                 let count = if self.replica_set_configured() {
                     let connection = self.connection();
@@ -13992,27 +14129,36 @@ mod inner {
                         .collect();
                     let count = session
                         .start_transaction()
-                        .and_run((self, docs, changes), |s, (this, docs, changes)| {
-                            Box::pin(async move {
-                                let result = this
-                                    .plugin_configs()
-                                    .insert_many(docs.clone())
-                                    .ordered(false)
-                                    .session(&mut *s)
-                                    .await?;
-                                for (namespace, id) in changes.iter() {
-                                    this.record_config_change_in_session(
+                        .and_run(
+                            (self, docs, changes, &attachments),
+                            |s, (this, docs, changes, attachments)| {
+                                Box::pin(async move {
+                                    let result = this
+                                        .plugin_configs()
+                                        .insert_many(docs.clone())
+                                        .ordered(false)
+                                        .session(&mut *s)
+                                        .await?;
+                                    for (namespace, id) in changes.iter() {
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "plugin_config",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                    }
+                                    this.attach_proxy_scoped_plugin_configs_in_session(
                                         &mut *s,
-                                        namespace.as_str(),
-                                        "plugin_config",
-                                        id.as_str(),
-                                        "upsert",
+                                        attachments,
+                                        &[],
                                     )
                                     .await?;
-                                }
-                                Ok(result.inserted_ids.len())
-                            })
-                        })
+                                    Ok(result.inserted_ids.len())
+                                })
+                            },
+                        )
                         .await
                         .map_err(anyhow::Error::new)
                         .context("batch_create_plugin_configs transaction failed")?;
@@ -14052,6 +14198,18 @@ mod inner {
                             return Err(err);
                         }
                     };
+                    if let Err(err) = self.attach_proxy_scoped_plugin_configs(&attachments).await {
+                        self.detach_proxy_scoped_plugin_configs_best_effort(&attachments)
+                            .await;
+                        self.rollback_standalone_created_documents(
+                            "plugin_configs",
+                            "plugin_config",
+                            &ids,
+                            &err,
+                        )
+                        .await;
+                        return Err(err);
+                    }
                     let changes: Vec<ConfigChangeWrite<'_>> = configs
                         .iter()
                         .map(|config| ConfigChangeWrite {
@@ -14060,8 +14218,18 @@ mod inner {
                             resource_id: &config.id,
                             operation: "upsert",
                         })
+                        .chain(attachments.iter().map(|(namespace, proxy_id, _)| {
+                            ConfigChangeWrite {
+                                namespace,
+                                resource_type: "proxy",
+                                resource_id: proxy_id,
+                                operation: "upsert",
+                            }
+                        }))
                         .collect();
                     if let Err(err) = self.record_config_changes_batch(&changes).await {
+                        self.detach_proxy_scoped_plugin_configs_best_effort(&attachments)
+                            .await;
                         self.rollback_standalone_created_documents(
                             "plugin_configs",
                             "plugin_config",

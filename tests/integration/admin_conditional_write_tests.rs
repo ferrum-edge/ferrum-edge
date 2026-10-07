@@ -1429,6 +1429,9 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
 /// config the proxy lists, so a batched proxy-scoped auth plugin that SQL
 /// attaches but MongoDB does not would be silently unenforced on MongoDB.
 async fn assert_batch_proxy_scoped_plugin_association_parity(db: &dyn DatabaseBackend) {
+    use ferrum_edge::_test_support::{
+        AtomicBatchFault, AtomicBatchPhase, set_atomic_batch_fault_for_test,
+    };
     use ferrum_edge::config::db_backend::{
         AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
         NamespaceConfigAdmissionLeaseRef,
@@ -1534,6 +1537,38 @@ async fn assert_batch_proxy_scoped_plugin_association_parity(db: &dyn DatabaseBa
             .plugins
             .iter()
             .any(|association| association.plugin_config_id == "late-p6")
+    );
+
+    // The per-family path used by non-conditional restore and import
+    // (`persist_payload_resources`) attaches the same way.
+    db.batch_create_plugin_configs(
+        &[plugin("family-p7", "proxy", Some("p7"))],
+        &BatchConfigWriteMode::Admission,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p7").await.unwrap()),
+        ["family-p7", "local-p7"]
+    );
+
+    // An abort at the final gate rolls the attachment back with the config.
+    set_atomic_batch_fault_for_test(
+        &namespace,
+        Some(AtomicBatchFault::new(AtomicBatchPhase::Commit, 0)),
+    );
+    let faulted = batch(Vec::new(), vec![plugin("faulted-p6", "proxy", Some("p6"))]).await;
+    set_atomic_batch_fault_for_test(&namespace, None);
+    assert!(faulted.is_err());
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p6").await.unwrap()),
+        ["group-b", "late-p6", "local-p6"]
+    );
+    assert!(
+        db.get_plugin_config(&namespace, "faulted-p6")
+            .await
+            .unwrap()
+            .is_none()
     );
 
     // A proxy-scoped config naming a missing proxy fails the whole graph on
