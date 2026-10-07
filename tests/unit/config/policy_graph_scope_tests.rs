@@ -149,3 +149,55 @@ fn enabled_global_tcp_throttle_requires_full_graph() {
     config.plugin_configs.push(throttle);
     assert!(requires_full_policy_graph(&config));
 }
+
+/// Scoped plugin-graph admission only sees a write's neighborhood, so every
+/// gateway-wide composition rule must be classified here: either per proxy
+/// (decided from the affected proxies' chains) or namespace-wide (its plugin
+/// type is in `NAMESPACE_WIDE_POLICY_PLUGIN_NAMES`, so every instance is
+/// loaded). A new rule that is not classified fails this test instead of
+/// silently escaping scoped admission (issue #6056).
+#[test]
+fn every_gateway_composition_rule_is_classified_for_scoped_admission() {
+    const NAMESPACE_WIDE_RULES: &[(&str, &str)] = &[
+        (
+            "validate_prometheus_metrics_ownership",
+            "prometheus_metrics",
+        ),
+        ("validate_mesh_bpf_metrics_ownership", "__mesh_bpf_metrics"),
+        ("validate_api_chargeback_ownership", "api_chargeback"),
+    ];
+    const PER_PROXY_RULES: &[&str] = &[
+        "validate_replay_provenance_composition",
+        "validate_soap_ws_security_composition",
+    ];
+
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let body = source
+        .split("fn validate_gateway_plugin_composition(config: &GatewayConfig)")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("validate_gateway_plugin_composition body");
+    let mut called: Vec<&str> = body
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| token.starts_with("validate_"))
+        .collect();
+    called.sort_unstable();
+    called.dedup();
+
+    let mut classified: Vec<&str> = NAMESPACE_WIDE_RULES
+        .iter()
+        .map(|(rule, _)| *rule)
+        .chain(PER_PROXY_RULES.iter().copied())
+        .collect();
+    classified.sort_unstable();
+    assert_eq!(
+        called, classified,
+        "classify every gateway composition rule as per-proxy or namespace-wide"
+    );
+    for (rule, plugin_name) in NAMESPACE_WIDE_RULES {
+        assert!(
+            NAMESPACE_WIDE_POLICY_PLUGIN_NAMES.contains(plugin_name),
+            "{rule} compares every {plugin_name} instance, so scoped admission must load them all"
+        );
+    }
+}

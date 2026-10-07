@@ -1991,10 +1991,24 @@ fn overlay_plugin_graph_write(
             .plugin_configs
             .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
     }
-    overlay_resources_by_id(&mut candidate.proxies, proxies, |proxy| proxy.id.as_str());
-    overlay_resources_by_id(&mut candidate.plugin_configs, plugins, |plugin| {
+    // Only same-namespace rows replace by id; a row from another namespace is
+    // appended, never mistaken for this namespace's same-id resource.
+    let (in_namespace, foreign): (Vec<&Proxy>, Vec<&Proxy>) = proxies
+        .iter()
+        .partition(|proxy| proxy.namespace == namespace);
+    overlay_resources_by_id(&mut candidate.proxies, in_namespace, |proxy| {
+        proxy.id.as_str()
+    });
+    candidate.proxies.extend(foreign.into_iter().cloned());
+    let (in_namespace, foreign): (Vec<&PluginConfig>, Vec<&PluginConfig>) = plugins
+        .iter()
+        .partition(|plugin| plugin.namespace == namespace);
+    overlay_resources_by_id(&mut candidate.plugin_configs, in_namespace, |plugin| {
         plugin.id.as_str()
     });
+    candidate
+        .plugin_configs
+        .extend(foreign.into_iter().cloned());
 
     let proxy_index: std::collections::HashMap<String, usize> = candidate
         .proxies

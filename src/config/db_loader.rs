@@ -2958,6 +2958,8 @@ impl DatabaseStore {
                 "SELECT DISTINCT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id IN",
                 namespace,
                 &changed_ids,
+                "",
+                Self::ASSOCIATION_LOOKUP_CHUNK_SIZE,
             )
             .await
             .map_err(|e| Self::proxy_plugin_association_query_error(operation, Some(namespace), e))?
@@ -2973,6 +2975,8 @@ impl DatabaseStore {
                 "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id IN",
                 namespace,
                 &proxy_ids,
+                "",
+                Self::ASSOCIATION_LOOKUP_CHUNK_SIZE,
             )
             .await
             .map_err(|e| Self::proxy_plugin_association_query_error(operation, Some(namespace), e))?
@@ -2996,6 +3000,8 @@ impl DatabaseStore {
                 "SELECT * FROM proxies WHERE namespace = ? AND id IN",
                 namespace,
                 &proxy_ids,
+                " ORDER BY id",
+                Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE,
             )
             .await?
         {
@@ -3010,53 +3016,57 @@ impl DatabaseStore {
         }
         Self::ensure_no_unmatched_proxy_plugin_associations(operation, &plugins_by_proxy)?;
 
-        let mut plugin_rows = self
-            .fetch_namespace_rows_in_tx(
-                &mut tx,
-                "SELECT * FROM plugin_configs WHERE namespace = ? AND id IN",
-                namespace,
-                &plugin_ids,
-            )
-            .await?;
-        plugin_rows.extend(
-            sqlx::query(
-                &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND scope = 'global'"),
-            )
-            .bind(namespace)
-            .fetch_all(&mut *tx)
-            .await?,
+        // One statement per chunk, ordered by the database like the full
+        // load, so plugin-chain tie order matches runtime under any collation.
+        let namespace_wide_names =
+            crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+        let plugin_select = format!(
+            "SELECT * FROM plugin_configs WHERE namespace = ? AND (scope = 'global' \
+             OR plugin_name IN ({namespace_wide_names})"
         );
-        plugin_rows.extend(
+        let plugin_rows = if plugin_ids.is_empty() {
+            sqlx::query(&self.q(&format!("{plugin_select}) ORDER BY id")))
+                .bind(namespace)
+                .fetch_all(&mut *tx)
+                .await?
+        } else {
             self.fetch_namespace_rows_in_tx(
                 &mut tx,
-                "SELECT * FROM plugin_configs WHERE namespace = ? AND plugin_name IN",
+                &format!("{plugin_select} OR id IN"),
                 namespace,
-                crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES,
+                &plugin_ids,
+                ") ORDER BY id",
+                Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE,
             )
-            .await?,
-        );
+            .await?
+        };
         tx.commit().await?;
 
-        let mut plugin_configs: BTreeMap<String, PluginConfig> = BTreeMap::new();
+        // Rows repeat only when the ids span more than one chunk; keep the
+        // first occurrence.
+        let mut seen_plugin_ids = HashSet::with_capacity(plugin_rows.len());
+        let mut plugin_configs = Vec::with_capacity(plugin_rows.len());
         for row in plugin_rows {
             let id: String = row.try_get("id").map_err(|error| {
                 purpose.map_row_error("plugin_config", None, anyhow::Error::new(error))
             })?;
-            if plugin_configs.contains_key(&id) {
+            if !seen_plugin_ids.insert(id.clone()) {
                 continue;
             }
-            let plugin_config = row_to_plugin_config(&row)
-                .map_err(|error| purpose.map_row_error("plugin_config", Some(id.clone()), error))?;
-            plugin_configs.insert(id, plugin_config);
+            plugin_configs.push(
+                row_to_plugin_config(&row)
+                    .map_err(|error| purpose.map_row_error("plugin_config", Some(id), error))?,
+            );
         }
 
-        // Match the full load's `ORDER BY id`, which fixes stable tie order in
-        // plugin-chain composition.
-        proxies.sort_by(|left, right| left.id.cmp(&right.id));
         let mut config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
-            plugin_configs: plugin_configs.into_values().collect(),
+            plugin_configs,
             loaded_at,
             known_namespaces: Vec::new(),
             ..Default::default()
@@ -3066,22 +3076,24 @@ impl DatabaseStore {
         Ok(config)
     }
 
-    /// `{select_prefix} (?, ?, ...)` over `values` in bounded chunks inside
-    /// `tx`. `select_prefix` must bind `namespace` as its only placeholder and
-    /// end with `IN`.
+    /// `{select_prefix} (?, ?, ...){suffix}` over `values` in chunks of
+    /// `chunk_size` inside `tx`. `select_prefix` must bind `namespace` as its
+    /// only placeholder and end with `IN`.
     async fn fetch_namespace_rows_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         select_prefix: &str,
         namespace: &str,
         values: &[&str],
+        suffix: &str,
+        chunk_size: usize,
     ) -> Result<Vec<AnyRow>, sqlx::Error> {
         let mut rows = Vec::new();
-        for chunk in values.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+        for chunk in values.chunks(chunk_size) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = self.q(&format!("{select_prefix} ({placeholders})"));
+            let sql = self.q(&format!("{select_prefix} ({placeholders}){suffix}"));
             let mut query = sqlx::query(&sql).bind(namespace);
             for value in chunk {
                 query = query.bind(*value);
@@ -7316,6 +7328,11 @@ impl DatabaseStore {
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
     const ASSOCIATION_LOOKUP_CHUNK_SIZE: usize = 500;
+    /// Ids per ordered policy-neighborhood read. One statement orders the
+    /// whole neighborhood by the database's collation, like the full load;
+    /// beyond this many ids the chunks are each ordered. Stays under SQLite's
+    /// 32,766 and PostgreSQL/MySQL's 65,535 bind-parameter limits.
+    const ORDERED_NEIGHBORHOOD_CHUNK_SIZE: usize = 10_000;
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 
