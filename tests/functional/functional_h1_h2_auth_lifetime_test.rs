@@ -64,6 +64,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::scaffolding::backends::{ScriptedTcpBackend, TcpStep};
+use crate::scaffolding::clients::raw_h2::join_idle_h2_driver;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 
@@ -915,18 +916,21 @@ async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: boo
         0
     );
     let mut frontend_driver = tokio::task::JoinSet::new();
-    let mut send_request = tokio::time::timeout(TERMINATION_GRACE, async {
+    let (frontend_ping, mut send_request) = tokio::time::timeout(TERMINATION_GRACE, async {
         let tcp = tokio::net::TcpStream::connect(authority.as_str())
             .await
             .expect("connect to the gateway plaintext port");
-        let (send_request, connection) = h2::client::handshake(tcp)
+        let (send_request, mut connection) = h2::client::handshake(tcp)
             .await
             .expect("h2c handshake with the gateway");
+        // Taken before the driver is spawned: cleanup uses it to wake the driver.
+        let ping_pong = connection.ping_pong().expect("fresh connection PingPong");
         frontend_driver.spawn(connection);
-        send_request
+        let send_request = send_request
             .ready()
             .await
-            .expect("the h2 connection must accept a new stream")
+            .expect("the h2 connection must accept a new stream");
+        (ping_pong, send_request)
     })
     .await
     .expect("bounded frontend readiness");
@@ -1032,13 +1036,18 @@ async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: boo
         1,
         "successful recovery must not recount the cancelled RPC"
     );
+    // Every request handle is gone, so the client must close the connection.
+    // Joining the driver alone can hang on an h2 lost wakeup (see `raw_h2`).
     drop(send_request);
-    tokio::time::timeout(TERMINATION_GRACE, frontend_driver.join_next())
-        .await
-        .expect("bounded frontend cleanup")
-        .expect("owned frontend driver")
-        .expect("join frontend driver")
-        .expect("frontend closed cleanly");
+    tokio::time::timeout(
+        TERMINATION_GRACE,
+        join_idle_h2_driver(frontend_ping, &mut frontend_driver),
+    )
+    .await
+    .expect("bounded frontend cleanup")
+    .expect("owned frontend driver")
+    .expect("join frontend driver")
+    .expect("frontend closed cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
