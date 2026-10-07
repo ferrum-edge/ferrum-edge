@@ -587,6 +587,8 @@ async fn h3_grpc_bridge_drain_oversize_runs_reject_hooks_and_logs() {
 
 /// The same drain when the shared request-buffer budget cannot admit the
 /// upload's retained ceiling: a 1 MiB gRPC ceiling against a one-block budget.
+/// `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` has a 64 KiB floor, which also
+/// floors the total budget; this case pins both values to that minimum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_grpc_bridge_drain_capacity_refusal_runs_reject_hooks_and_logs() {

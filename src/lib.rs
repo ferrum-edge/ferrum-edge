@@ -1495,6 +1495,14 @@ pub mod _test_support {
         crate::PluginCache::with_http_client(config, http_client)
     }
 
+    /// Reapply cache-internal plugin finalizers to a chain for type-trust tests.
+    pub fn install_plugin_finalizers_for_test(
+        plugins: &mut Vec<std::sync::Arc<dyn crate::plugins::Plugin>>,
+    ) -> Result<(), String> {
+        crate::plugin_cache::install_cors_finalizer(plugins)?;
+        crate::plugin_cache::install_mesh_route_dispatch_finalizer(plugins)
+    }
+
     /// Whether an incremental rebuild of `proxy_ids_to_rebuild` / globals would
     /// reconstruct an active `ai_response_guard` with a node-local descriptor.
     pub fn ai_response_guard_descriptor_preload_required_for_test(
