@@ -827,6 +827,14 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
     acc.finish(previous, last_hard_error)
 }
 
+/// A loaded snapshot that will not publish must not leave its namespace marked
+/// free of consumer quarantine (issue #6060).
+fn forget_consumer_quarantine_states<B: CpFullLoadSource + ?Sized>(db: &B, namespaces: &[String]) {
+    for namespace in namespaces {
+        db.forget_consumer_quarantine_state(namespace);
+    }
+}
+
 /// Pure accumulator for multi-namespace CP full loads. `load_full_config_multi`
 /// feeds per-namespace outcomes here so stamp / LKG aggregation is unit-testable
 /// without implementing `DatabaseBackend`.
@@ -1129,13 +1137,20 @@ async fn load_full_config_multi_with_sequence(
             failed_namespaces: Vec::new(),
         }
     } else {
-        load_full_config_multi(db, &load_namespaces, previous).await?
+        load_full_config_multi(db, &load_namespaces, previous)
+            .await
+            .inspect_err(|_| forget_consumer_quarantine_states(db, &load_namespaces))?
     };
 
     // The same whole-store rule applies after resource loading when the
     // snapshot will publish a global revision. An unsequenced `All` snapshot
     // preserves the per-namespace LKG continuation contract.
     if publishes_store_global_revision {
+        // Nothing below publishes, so no namespace loaded here may keep the
+        // clean consumer-quarantine state its load recorded (issue #6060).
+        if !outcome.failed_namespaces.is_empty() || !outcome.rejected_namespaces.is_empty() {
+            forget_consumer_quarantine_states(db, &load_namespaces);
+        }
         if !outcome.failed_namespaces.is_empty() {
             anyhow::bail!(
                 "CP All-scope full reload could not refresh every namespace; retaining the prior \

@@ -41,6 +41,7 @@ mod cni_tests;
 mod connection_pool_tests;
 mod consumer_delta_quarantine_tests;
 mod consumer_identity_enforcement_tests;
+mod cp_consumer_quarantine_forget_tests;
 mod cp_dp_grpc_tests;
 mod cp_grpc_handshake_admission_tests;
 mod cp_multi_namespace_tests;

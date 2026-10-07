@@ -13281,7 +13281,12 @@ impl ProxyState {
             country_mmdb_load_mode,
         )?;
         let consumer_inner = if consumer_changed {
-            ConsumerIndex::build_inner(&new_config.consumers)
+            ConsumerIndex::build_delta_inner(
+                &current.consumer_index,
+                &delta.added_consumers,
+                &delta.removed_consumer_ids,
+                &delta.modified_consumers,
+            )
         } else {
             Arc::clone(&current.consumer_index)
         };
