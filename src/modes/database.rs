@@ -2774,7 +2774,7 @@ pub async fn run(
                                                     path: "incremental",
                                                     trigger: config_poll_wake_label(wake),
                                                     resources: changed_resources,
-                                                    sequence: next_cursor.sequence,
+                                                    sequence: Some(next_cursor.sequence),
                                                     load: load_elapsed,
                                                     apply: apply_elapsed,
                                                     write_to_live: runtime_config_apply_poll
@@ -2808,7 +2808,7 @@ pub async fn run(
                                                     path: "incremental (unchanged)",
                                                     trigger: config_poll_wake_label(wake),
                                                     resources: changed_resources,
-                                                    sequence: next_cursor.sequence,
+                                                    sequence: Some(next_cursor.sequence),
                                                     load: load_elapsed,
                                                     apply: apply_elapsed,
                                                     write_to_live: runtime_config_apply_poll
@@ -3404,7 +3404,7 @@ async fn try_publish_full_reload_after_gate(
                 path: "full reload",
                 trigger: commit_context,
                 resources,
-                sequence: cursor.sequence,
+                sequence: Some(cursor.sequence),
                 load,
                 apply: apply_started.elapsed(),
                 write_to_live: runtime_config_apply.take_write_to_live(cursor),
@@ -3415,23 +3415,26 @@ async fn try_publish_full_reload_after_gate(
     published
 }
 
-/// Where one published config change spent its time (issue #6057).
-struct ConfigChangeStages<'a> {
+/// Where one published config change spent its time (issue #6057). Shared by
+/// the database-mode and control-plane poll loops.
+pub(crate) struct ConfigChangeStages<'a> {
     /// `incremental`, `incremental (unchanged)`, or `full reload`.
-    path: &'static str,
+    pub(crate) path: &'static str,
     /// What started the poll: its wake-up, or the full-reload reason.
-    trigger: &'a str,
+    pub(crate) trigger: &'a str,
     /// Resources the change carried (incremental) or loaded (full reload).
-    resources: usize,
-    /// Change-log sequence the published generation covers.
-    sequence: u64,
+    pub(crate) resources: usize,
+    /// Change-log sequence the published generation covers, when it has one
+    /// (a multi-namespace CP generation does not).
+    pub(crate) sequence: Option<u64>,
     /// Database read: the delta point-loads or the full snapshot.
-    load: Duration,
-    /// Runtime application: validation, cache rebuilds, and the swap.
-    apply: Duration,
+    pub(crate) load: Duration,
+    /// Runtime application or CP publication: validation, cache rebuilds or
+    /// composition, and the swap.
+    pub(crate) apply: Duration,
     /// From the oldest admin write in this process the generation covers to
     /// now, when this process issued one.
-    write_to_live: Option<Duration>,
+    pub(crate) write_to_live: Option<Duration>,
 }
 
 fn config_poll_wake_label(wake: ConfigPollWake) -> &'static str {
@@ -3442,7 +3445,7 @@ fn config_poll_wake_label(wake: ConfigPollWake) -> &'static str {
     }
 }
 
-fn incremental_resource_count(result: &db_backend::IncrementalResult) -> usize {
+pub(crate) fn incremental_resource_count(result: &db_backend::IncrementalResult) -> usize {
     result.added_or_modified_proxies.len()
         + result.removed_proxy_ids.len()
         + result.added_or_modified_consumers.len()
@@ -3457,7 +3460,10 @@ fn incremental_resource_count(result: &db_backend::IncrementalResult) -> usize {
 /// spent before this poll's database read started: poll scheduling plus any
 /// earlier reload still running. WARN when the change took longer than the
 /// slow-query threshold, INFO otherwise.
-fn log_config_change_applied(stages: ConfigChangeStages<'_>, slow_threshold_ms: Option<u64>) {
+pub(crate) fn log_config_change_applied(
+    stages: ConfigChangeStages<'_>,
+    slow_threshold_ms: Option<u64>,
+) {
     let poll_ms = (stages.load + stages.apply).as_millis() as u64;
     let write_to_live_ms = stages
         .write_to_live

@@ -16526,6 +16526,7 @@ pub mod _test_support {
             cp_scope,
             mesh_update_tx,
             mesh_registry,
+            None,
         );
     }
 
