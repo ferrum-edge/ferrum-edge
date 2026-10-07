@@ -2,10 +2,12 @@
 
 ## Status
 
-Deliberate fork, unfiled upstream. Owner: Ferrum Edge maintainers. This correction
-was accepted during issue #6010 review and follows the weekly review and
-stable-release checkpoint in [dependency policy](../../dependency-policy.md).
-Hosted qualification of the new head remains required before merge.
+Fixed upstream; not yet released. Upstream corrected the same two arms in
+[launchbadge/sqlx#4359](https://github.com/launchbadge/sqlx/pull/4359), merged
+2026-08-19 on `main` after v0.9.0. SQLx v0.8.6 and v0.9.0 still reverse them.
+Owner: Ferrum Edge maintainers. This correction was accepted during issue #6010
+review and follows the weekly review and stable-release checkpoint in
+[dependency policy](../../dependency-policy.md).
 
 ## Patch
 

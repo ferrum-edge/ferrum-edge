@@ -108,9 +108,9 @@
       "owner_github": null,
       "reason": "SQLx Any reverses REAL and DOUBLE native parameter types when converting typed NULL arguments in 0.8.6; the correction preserves the supplied floating-point type.",
       "upstream": {
-        "filing": "deliberate_fork_unfiled",
+        "filing": "filed",
         "github_repo": "launchbadge/sqlx",
-        "pr_number": null,
+        "pr_number": 4359,
         "issue_number": null,
         "fork_ref": null
       },
@@ -120,7 +120,7 @@
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
-          "notes": null
+          "notes": "Upstream fixed the reversed arms in launchbadge/sqlx#4359 (merged 2026-08-19 on main, after v0.9.0). No released SQLx contains it yet; v0.8.6 and v0.9.0 still reverse them."
         }
       },
       "regression_tests": [
