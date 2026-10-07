@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "budget_version": "2026-07-26.v1",
-  "workload_revision": "2026-09-18.h1-h3-observation.v3",
+  "workload_revision": "2026-10-07.h2-fixed-bench-windows.v1",
   "description": "Per-protocol performance budgets for the scheduled multi-protocol regression workflow. Absolute throughput/latency floors stay unset until runner variance is measured on ubuntu-latest with the ci-release profile; enforcement starts as alert-only so shared-runner noise does not block merges.",
   "runner_class": "ubuntu-latest",
   "build_profile": "ci-release",
