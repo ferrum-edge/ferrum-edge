@@ -64,6 +64,21 @@ against the published hyper 1.10.0 crate with patches 001–004 applied. Apply
   `Buf::copy_to_bytes`, which for `Bytes` is a zero-copy split. The split head
   is sent through a new `SendBuf::Bytes` variant, so h2 never buffers bytes it
   would later cut into small frames.
+- **Only a short window splits a chunk.** h2's `capacity()` is also capped by
+  the per-stream send buffer (Hyper's `max_send_buf_size`, 400 KiB by
+  default). When the stream already holds window for the whole chunk and only
+  that buffer limits `capacity()`, the pipe hands h2 the whole chunk at once,
+  without a hold or a split: h2 frames it at its maximum frame size from
+  window it already has, so no later increment can cut a small frame. This is
+  how the pipe behaved before this patch, and the send buffer still applies
+  backpressure from the next chunk on. Telling the two cases apart takes
+  `SendStream::assigned_capacity()`, which Ferrum's vendored h2 adds
+  ([h2 patch 003](../../upstream-h2-patches/003-assigned-send-capacity/README.md)).
+  The pipe reads it through a private `AssignedCapacity` trait whose fallback
+  returns `capacity()`; an inherent method wins method resolution, so the
+  vendored h2's accessor is used, while against stock h2 the fallback keeps
+  this crate compiling and no chunk counts as covered, so every chunk that
+  exceeds `capacity()` is split as described above.
 - The 256-byte minimum is h2's `DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD`. Frames
   at or above it are never charged against a receiver's budget.
 - **The client** (`src/proto/h2/client.rs`) enables coalescing on every
@@ -114,6 +129,21 @@ deadlock:
   every next hold move it earlier instead, a timer-wheel update per hold. Only
   a pause between holds longer than the rest of the wait costs the spurious
   wake.
+- **Chunks larger than the send buffer (measured; fixed).** As first shipped
+  (#6036), the pipe also split a chunk whenever h2's send buffer, not the
+  window, capped `capacity()`, and then waited for the connection to drain the
+  buffer before handing over the rest. Ferrum's backend pool advertises a
+  1 MiB maximum frame size by default, so a backend's response arrives in
+  chunks of up to 1 MiB against the frontend's 400 KiB send buffer, and every
+  large chunk stalled the response pipe mid-chunk. On the hosted HTTP/2
+  protocol benchmark (TLS on both legs, 200 streams, 4 vCPU), the same runner
+  ran the shipped patch and the window-aware split, two interleaved pairs of
+  10 s each. The window-aware split delivered 1.07× and 1.08× the requests per
+  second at 500 KiB and 1 MiB on an Intel Xeon 6973P-C, 1.04–1.07× and
+  1.03–1.09× on two AMD EPYC 7763 runners, 0.99–1.05× at 5 MiB, and stayed
+  within run-to-run noise (0.98–1.00×) at 10 KiB and 70 KiB. Disabling
+  coalescing altogether measured the same, so the window-aware split recovers
+  this patch's large-payload cost and keeps its small-window protection.
 - **Chunks larger than the window (unmeasured).** Before this patch, a ready
   chunk went to h2 whole and h2 framed the rest itself as WINDOW_UPDATEs
   arrived. Now the pipe hands h2 only the assigned capacity, so each
@@ -129,7 +159,8 @@ deadlock:
   extra wake per 21 KiB sent, around 50,000 per second for each GB/s on a
   window-limited stream, each paying a task wake and a `send_data` call.
   With the benchmark's 8 MiB stream windows a chunk rarely exceeds its
-  capacity, so the default protocol matrix should show no change. The peer
+  window, so this case does not arise in the default protocol matrix (the
+  send-buffer case above did). The peer
   windows are fixed in `proto_bench` and `proto_backend`
   (`tests/performance/multi_protocol/`), so no hosted benchmark workflow can
   run the 64 KiB case yet; measuring it needs a window option there first.
@@ -173,6 +204,12 @@ on machine speed:
 - `a_window_below_a_useful_frame_progresses_after_the_bounded_wait` holds each
   increment for at least the bound and less than four times it. It also checks
   that the final piece of the body is not held.
+- `a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer` gives
+  the client a 10,000-byte send buffer and a 60,000-byte chunk that the
+  peer's windows already cover, and checks that every non-final frame is a
+  full 16,384-byte frame, not a send-buffer-sized piece. It needs h2 patch 003
+  and therefore runs only on the vendored h2; against stock h2 it fails by
+  design, because the fallback splits.
 
 CI runs the module in the vendored-hyper step's `--lib ferrum_` pass on the
 vendored h2:
@@ -206,4 +243,5 @@ group. Retire it with them, or earlier if hyper or h2 adopts sender-side
 coalescing of small window increments that keeps every positive window live.
 Before retirement, hosted tests must show that the replacement avoids runs of
 sub-256-byte DATA frames against a trickling window and still completes
-against a window that never reaches 256 bytes.
+against a window that never reaches 256 bytes. h2 patch 003 exists only for
+this patch and retires with it.

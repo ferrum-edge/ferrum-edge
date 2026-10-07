@@ -195,13 +195,13 @@ a8b3c5cd24b1f83770576ba21d5fcd555f144afd88f246f7d5dbe9e39563c74a  vendor/h2-0.4.
 49a9d42775813e08ae6318441314c3a4dca58a345a04b73275cd9755e348a621  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/mod.rs
 5eba6fc5c252104676fa76e13fe07459fdbb9bc55df6483b1683fa99ad6fa674  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/prioritize.rs
 fed37fe0528eadc27acdbaea7f2367e1ebc88c45de1a5739b446142c610badf4  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/recv.rs
-ee355358b86ea048fd0e64642595e7be6e7f03a39d96745e74503cba2f1b08ef  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/send.rs
+68d16a16700ed746f6bc3296db14186c0bcff5047730d9d110b1a6870d69a39e  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/send.rs
 486b99b293d0f874b72724e1511cb0b11b44b3906ea20eb176fae1821772794d  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/state.rs
 040005e8af13193db7bd89c20a44e28f5d18976a4b8562bf068dd8bd4a982668  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/store.rs
 e31a59444ba7b885040556b89c19b308321e2adeab1cdb2cce720285701d56a0  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/stream.rs
-28b74ed10ceb24d404008652af0b5b9818bb9ea3e492bb6517e6ed2c935ad33a  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/streams.rs
+bd543117eeb0c4e9d22e6247dabfdf64e58e3bf41f6d98a0aab5e97e0c0e3181  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/streams.rs
 a567d950e49e897f844e865b945a748b3bf6226645c2d9c97af214d66118d596  vendor/h2-0.4.19-ferrum-patched/src/server.rs
-e313c11a24b649d4c9da937fb37e5c2cc7c689c53f6afd2470fd40fd030237c5  vendor/h2-0.4.19-ferrum-patched/src/share.rs
+14ca4233493467c44b0719201982e35fb11961d1fef8ed2d9054e5e9ad555415  vendor/h2-0.4.19-ferrum-patched/src/share.rs
 5e7eaa0427066d620a7c0f1ca390cfec628de0eb652e275ed639c61eba26e626  vendor/h3-0.0.8-ferrum-patched/Cargo.toml
 a0d039cdafe68f363893abddb5e4d50dbe6f8b56611e2650aaab4237103285f1  vendor/h3-0.0.8-ferrum-patched/LICENSE
 ffd5e71698c9b8e6ad37c236937624646a7d4b91b99feb98d71005750a4c501d  vendor/h3-0.0.8-ferrum-patched/README.md
@@ -307,7 +307,7 @@ c482e01ab0513e31c610b181de7a36f34b7da7f8469dfa4759c1f37fcb7ee7fe  vendor/hyper-1
 bdb49167f68428e34b9b60a46c535fa44d9a3a6a849b1f232a466f8379efd792  vendor/hyper-1.10.0-ferrum-patched/src/proto/h1/mod.rs
 1a382c3f9e395fdbdac557072e1f6c5e4fcebcb53dc604410e117f34adb16ffc  vendor/hyper-1.10.0-ferrum-patched/src/proto/h1/role.rs
 323d957facddb0f881515dbb162c22ddfce47eeb3042b85439f55629c8e6bd2b  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/client.rs
-a12177c6542e6ce05b85449165f3fe63eb218d1294f73e0a5e903135448cec37  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/mod.rs
+15bf3233c3fef784e7c4373c259210e2a91799295e64d247c32da2c96972b00c  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/mod.rs
 b091b7c2123a4003805992ea369d748ccbf65895e5f5b45ed2806da6cf1df171  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/ping.rs
 95e96a9fc3ce476a9613500233bd4c530202d05a171c16ce1adb1db5c8496dd5  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/server.rs
 bbafd7712757b5e2994e265e188bf7f55c430d54ff86cf9fcc3e2a5435a32610  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/upgrade.rs

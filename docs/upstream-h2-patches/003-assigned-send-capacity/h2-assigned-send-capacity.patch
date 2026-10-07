@@ -1,0 +1,153 @@
+diff --git a/src/proto/streams/send.rs b/src/proto/streams/send.rs
+index 4d9486960..8a1602174 100644
+--- a/src/proto/streams/send.rs
++++ b/src/proto/streams/send.rs
+@@ -413,6 +413,12 @@ impl Send {
+         stream.capacity(self.prioritize.max_buffer_size())
+     }
+ 
++    // FERRUM PATCH 003: assigned window not yet claimed by buffered data,
++    // ignoring the send-buffer limit.
++    pub fn assigned_capacity(&self, stream: &mut store::Ptr) -> WindowSize {
++        stream.capacity(usize::MAX)
++    }
++
+     pub fn poll_reset(
+         &self,
+         cx: &Context,
+diff --git a/src/proto/streams/streams.rs b/src/proto/streams/streams.rs
+index e01dc8b48..edbfb232e 100644
+--- a/src/proto/streams/streams.rs
++++ b/src/proto/streams/streams.rs
+@@ -1410,6 +1410,16 @@ impl<B> StreamRef<B> {
+         me.actions.send.capacity(&mut stream)
+     }
+ 
++    // FERRUM PATCH 003: see `SendStream::assigned_capacity`.
++    pub fn assigned_capacity(&self) -> WindowSize {
++        let mut me = self.opaque.inner.lock().unwrap();
++        let me = &mut *me;
++
++        let mut stream = me.store.resolve(self.opaque.key);
++
++        me.actions.send.assigned_capacity(&mut stream)
++    }
++
+     /// Request to be notified when the stream's capacity increases
+     pub fn poll_capacity(&mut self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
+         let mut me = self.opaque.inner.lock().unwrap();
+diff --git a/src/share.rs b/src/share.rs
+index 101987342..e921148fa 100644
+--- a/src/share.rs
++++ b/src/share.rs
+@@ -295,6 +295,16 @@ impl<B: Buf> SendStream<B> {
+         self.inner.capacity() as usize
+     }
+ 
++    /// FERRUM PATCH 003: flow-control window already assigned to this stream
++    /// and not yet claimed by buffered data.
++    ///
++    /// Unlike [`capacity`](Self::capacity), this ignores the connection's
++    /// send-buffer limit. Data up to this amount can be framed from window the
++    /// stream already holds, so it never waits on a later WINDOW_UPDATE.
++    pub fn assigned_capacity(&self) -> usize {
++        self.inner.assigned_capacity() as usize
++    }
++
+     /// Requests to be notified when the stream's capacity increases.
+     ///
+     /// Before calling this, capacity should be requested with
+@@ -604,3 +614,93 @@ impl fmt::Debug for Pong {
+         fmt.debug_struct("Pong").finish()
+     }
+ }
++
++#[cfg(test)]
++mod ferrum_assigned_capacity_tests {
++    //! FERRUM PATCH (h2-003-assigned-send-capacity).
++    use super::*;
++    use std::future::{poll_fn, Future};
++    use std::pin::Pin;
++
++    /// Polls the client connection once and lets other tasks run.
++    async fn drive<T, B>(conn: &mut crate::client::Connection<T, B>)
++    where
++        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
++        B: Buf,
++    {
++        poll_fn(|cx| {
++            let _ = Pin::new(&mut *conn).poll(cx);
++            Poll::Ready(())
++        })
++        .await;
++        tokio::task::yield_now().await;
++    }
++
++    /// `capacity` stops at the send-buffer limit; `assigned_capacity` reports
++    /// the window the stream actually holds. Both shrink by buffered data.
++    #[tokio::test]
++    async fn assigned_capacity_ignores_the_send_buffer_limit() {
++        const RESERVED: usize = 100_000;
++        const SEND_BUFFER: usize = 1024;
++        const BUFFERED: usize = 40_000;
++
++        let (client_io, server_io) = tokio::io::duplex(1 << 20);
++        let server = tokio::spawn(async move {
++            let mut conn = crate::server::Builder::new()
++                .initial_window_size(1 << 20)
++                .initial_connection_window_size(1 << 20)
++                .handshake::<_, Bytes>(server_io)
++                .await
++                .unwrap();
++            // Hold every request: dropping one resets its stream.
++            let mut held = Vec::new();
++            while let Some(request) = conn.accept().await {
++                held.push(request);
++            }
++        });
++
++        let (client, mut conn) = crate::client::Builder::new()
++            .max_send_buffer_size(SEND_BUFFER)
++            .handshake::<_, Bytes>(client_io)
++            .await
++            .unwrap();
++        let mut client = client;
++        let request = http::Request::post("https://example.com/")
++            .body(())
++            .unwrap();
++        let mut stream = loop {
++            if let Poll::Ready(ready) = poll_fn(|cx| Poll::Ready(client.poll_ready(cx))).await {
++                ready.unwrap();
++                break client.send_request(request, false).unwrap().1;
++            }
++            drive(&mut conn).await;
++        };
++        // Let the connection send HEADERS (a pending-open stream is never
++        // assigned capacity) and apply the server's SETTINGS and
++        // WINDOW_UPDATE, which open both windows past the reservation.
++        for _ in 0..16 {
++            drive(&mut conn).await;
++        }
++        stream.reserve_capacity(RESERVED);
++        for _ in 0..64 {
++            if stream.assigned_capacity() == RESERVED {
++                break;
++            }
++            drive(&mut conn).await;
++        }
++        assert_eq!(stream.assigned_capacity(), RESERVED);
++        assert_eq!(stream.capacity(), SEND_BUFFER);
++
++        // Buffered, not yet written: the connection is not polled here.
++        stream
++            .send_data(Bytes::from(vec![b'x'; BUFFERED]), false)
++            .unwrap();
++        assert_eq!(stream.assigned_capacity(), RESERVED - BUFFERED);
++        assert_eq!(stream.capacity(), 0);
++
++        drop(stream);
++        drop(client);
++        drop(conn);
++        let _ = server.await;
++    }
++}
