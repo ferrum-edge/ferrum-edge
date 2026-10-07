@@ -24,7 +24,7 @@ use ferrum_edge::{
         db_backend::{BatchConfigWriteMode, DatabaseBackend},
         db_loader::{DatabaseStore, DbPoolConfig},
         policy_graph_scope::PolicyGraphScope,
-        types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy},
+        types::{GatewayConfig, PluginAssociation, PluginConfig, Proxy},
     },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
