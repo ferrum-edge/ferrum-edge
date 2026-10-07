@@ -191,22 +191,26 @@ impl Coalesce {
     }
 }
 
-/// FERRUM PATCH 005: flow-control window a stream already holds, regardless
-/// of the send-buffer limit that caps `SendStream::capacity`.
+/// FERRUM PATCH 005: `SendStream::capacity` together with the flow-control
+/// window the stream already holds, which the send-buffer limit does not cap.
 ///
-/// Ferrum's vendored h2 adds an inherent `SendStream::assigned_capacity` (h2
-/// patch 003), and method resolution prefers an inherent method over this
-/// trait's. Against stock h2 this fallback reports `capacity()`, so no chunk is
-/// ever treated as covered by window and the pipe splits as it always has.
-trait AssignedCapacity {
+/// Ferrum's vendored h2 adds an inherent `SendStream::capacity_and_assigned`
+/// (h2 patch 003) that reads both under one lock, and method resolution prefers
+/// an inherent method over this trait's. Against stock h2 this fallback reports
+/// `capacity()` twice, so no chunk is ever treated as covered by window and the
+/// pipe splits as it always has. Ferrum's gateway tests bind the vendored
+/// method's exact signature, so dropping or changing it fails there rather
+/// than silently selecting this fallback.
+trait CapacityAndAssigned {
     // Unused when the inherent method exists, which is the point.
     #[allow(dead_code)]
-    fn assigned_capacity(&self) -> usize;
+    fn capacity_and_assigned(&self) -> (usize, usize);
 }
 
-impl<B: Buf> AssignedCapacity for SendStream<B> {
-    fn assigned_capacity(&self) -> usize {
-        self.capacity()
+impl<B: Buf> CapacityAndAssigned for SendStream<B> {
+    fn capacity_and_assigned(&self) -> (usize, usize) {
+        let capacity = self.capacity();
+        (capacity, capacity)
     }
 }
 
@@ -348,12 +352,15 @@ where
             // the peer advertises a smaller stream window or only one byte of
             // connection capacity remains.
             if let Some((mut chunk, is_eos)) = me.pending_data.take() {
-                let mut capacity = me.body_tx.capacity() as usize;
+                let (mut capacity, mut assigned) = me.body_tx.capacity_and_assigned();
                 // FERRUM PATCH 005: whether the stream already holds window
                 // for the whole chunk. Then only the send buffer limits
                 // `capacity`, and h2 frames the whole chunk from window it
                 // already has, so no later increment can cut a small frame;
-                // holding or splitting would only stall the pipe.
+                // holding or splitting would only stall the pipe. A pipe with
+                // a write-stall bound (patch 004) keeps splitting: the bound
+                // can only time a chunk the pipe still holds, so a chunk
+                // handed over whole would sit in h2 untimed.
                 let mut covered = false;
                 while chunk.has_remaining() {
                     // FERRUM PATCH 005: positive capacity is enough unless it
@@ -361,8 +368,9 @@ where
                     // for more is still running.
                     if capacity > 0 {
                         covered = me.coalesce.is_some()
+                            && me.write_timeout.is_none()
                             && capacity < chunk.remaining()
-                            && me.body_tx.assigned_capacity() >= chunk.remaining();
+                            && assigned >= chunk.remaining();
                         if covered
                             || !me.coalesce.as_mut().map_or(false, |coalesce| {
                                 coalesce.should_hold(capacity, chunk.remaining(), cx)
@@ -390,7 +398,9 @@ where
                             *me.pending_data = Some((chunk, is_eos));
                             return Poll::Pending;
                         }
-                        Poll::Ready(Some(Ok(_))) => capacity = me.body_tx.capacity() as usize,
+                        Poll::Ready(Some(Ok(_))) => {
+                            (capacity, assigned) = me.body_tx.capacity_and_assigned()
+                        }
                         Poll::Ready(Some(Err(e))) => {
                             return Poll::Ready(Err(crate::Error::new_body_write(e)))
                         }
@@ -1205,6 +1215,83 @@ mod ferrum_h2_small_window_coalescing_tests {
             .await
             .expect("the upload completes")
             .expect("peer");
+        let total: usize = frames.iter().map(|(len, _)| len).sum();
+        assert_eq!(total, BODY);
+        let (last, rest) = frames.split_last().expect("DATA frames");
+        assert!(last.1, "the last frame ends the stream: {frames:?}");
+        assert!(
+            rest.iter().all(|(len, _)| *len == MAX_FRAME),
+            "every non-final frame is a full {MAX_FRAME}-byte frame: {frames:?}"
+        );
+    }
+
+    /// The response direction: the server's body pipe hands a chunk the
+    /// client's window already covers to h2 whole, even when the send buffer
+    /// caps `capacity` below it. This is the frontend leg, where a backend's
+    /// 1 MiB response chunk meets the 400 KiB default server send buffer.
+    /// Needs the vendored h2 (h2 patch 003), like the request-direction test.
+    #[tokio::test(start_paused = true)]
+    async fn a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer() {
+        const SEND_BUFFER: usize = 10_000;
+        // Inside the 65,535-byte initial connection and stream windows.
+        const BODY: usize = 60_000;
+        const MAX_FRAME: usize = 16_384;
+        const HEADERS: u8 = 0x1;
+        const END_HEADERS: u8 = 0x4;
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let mut builder = crate::server::conn::http2::Builder::new(TokioExecutor);
+        builder.timer(TokioTimer).max_send_buf_size(SEND_BUFFER);
+        let body = Bytes::from(vec![b'x'; BODY]);
+        let service = crate::service::service_fn(move |_request| {
+            let response = http::Response::new(Full::new(body.clone()));
+            async move { Ok::<_, std::convert::Infallible>(response) }
+        });
+        let connection = builder.serve_connection(Compat::new(server_io), service);
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let client = tokio::spawn(async move {
+            let mut io = client_io;
+            io.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .expect("client preface");
+            io.write_all(&frame(SETTINGS, 0, 0, &[]))
+                .await
+                .expect("SETTINGS");
+            // GET http://t/ from the static table, with a literal authority.
+            let block = [0x82, 0x86, 0x84, 0x01, 0x01, b't'];
+            io.write_all(&frame(HEADERS, END_STREAM | END_HEADERS, 1, &block))
+                .await
+                .expect("HEADERS");
+            let mut frames = Vec::new();
+            loop {
+                let mut head = [0u8; 9];
+                io.read_exact(&mut head).await.expect("frame header");
+                let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+                let mut payload = vec![0u8; len];
+                io.read_exact(&mut payload).await.expect("frame payload");
+                match (head[3], head[4]) {
+                    (DATA, flags) => {
+                        frames.push((len, flags & END_STREAM != 0));
+                        if flags & END_STREAM != 0 {
+                            return frames;
+                        }
+                    }
+                    (SETTINGS, flags) if flags & ACK == 0 => {
+                        io.write_all(&frame(SETTINGS, ACK, 0, &[]))
+                            .await
+                            .expect("SETTINGS ACK");
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let frames = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("the response completes")
+            .expect("client");
         let total: usize = frames.iter().map(|(len, _)| len).sum();
         assert_eq!(total, BODY);
         let (last, rest) = frames.split_last().expect("DATA frames");

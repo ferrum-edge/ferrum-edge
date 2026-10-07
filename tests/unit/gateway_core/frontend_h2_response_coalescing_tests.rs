@@ -273,3 +273,16 @@ async fn tls_h2_response_coalesces_small_connection_window_increments() {
     harness.shutdown().await;
     backend.abort();
 }
+
+/// Hyper patch 005 reads h2 patch 003's inherent
+/// `SendStream::capacity_and_assigned` through a trait whose fallback compiles
+/// against stock h2 and silently splits every chunk the send buffer caps
+/// (#6055). Binding the exact vendored signature here makes dropping, renaming
+/// or re-receivering that accessor fail the gateway's own test build instead of
+/// quietly reintroducing the large-payload regression.
+#[test]
+fn vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads() {
+    let accessor: fn(&h2::SendStream<Bytes>) -> (usize, usize) =
+        h2::SendStream::<Bytes>::capacity_and_assigned;
+    let _ = accessor;
+}

@@ -65,20 +65,35 @@ against the published hyper 1.10.0 crate with patches 001–004 applied. Apply
   is sent through a new `SendBuf::Bytes` variant, so h2 never buffers bytes it
   would later cut into small frames.
 - **Only a short window splits a chunk.** h2's `capacity()` is also capped by
-  the per-stream send buffer (Hyper's `max_send_buf_size`, 400 KiB by
-  default). When the stream already holds window for the whole chunk and only
-  that buffer limits `capacity()`, the pipe hands h2 the whole chunk at once,
-  without a hold or a split: h2 frames it at its maximum frame size from
-  window it already has, so no later increment can cut a small frame. This is
-  how the pipe behaved before this patch, and the send buffer still applies
-  backpressure from the next chunk on. Telling the two cases apart takes
-  `SendStream::assigned_capacity()`, which Ferrum's vendored h2 adds
-  ([h2 patch 003](../../upstream-h2-patches/003-assigned-send-capacity/README.md)).
-  The pipe reads it through a private `AssignedCapacity` trait whose fallback
-  returns `capacity()`; an inherent method wins method resolution, so the
-  vendored h2's accessor is used, while against stock h2 the fallback keeps
-  this crate compiling and no chunk counts as covered, so every chunk that
-  exceeds `capacity()` is split as described above.
+  the per-stream send buffer (Hyper's `max_send_buf_size`: 400 KiB by default
+  on the server, so on Ferrum's frontend responses, and 1 MiB on the client,
+  so on backend uploads). When the stream already holds window for the whole
+  chunk and only that buffer limits `capacity()`, the pipe hands h2 the whole
+  chunk at once, without a hold or a split: h2 frames it at its maximum frame
+  size from window it already has, so no later increment can cut a small
+  frame. This is how the pipe behaved before this patch, and the send buffer
+  still applies backpressure from the next chunk on. Telling the two cases
+  apart takes `SendStream::capacity_and_assigned()`, which Ferrum's vendored
+  h2 adds
+  ([h2 patch 003](../../upstream-h2-patches/003-assigned-send-capacity/README.md))
+  and which reads both values under one lock, wherever the pipe reads
+  capacity. The pipe calls it through a private `CapacityAndAssigned` trait
+  whose fallback reports `capacity()` twice; an inherent method wins method
+  resolution, so the vendored h2's accessor is used, while against stock h2
+  the fallback keeps this crate compiling and no chunk counts as covered, so
+  every chunk that exceeds `capacity()` is split as described above. Because
+  that fallback is silent, Ferrum's
+  `vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads` test
+  binds the accessor's exact signature, so dropping or changing it fails the
+  gateway's test build.
+- **Not on a pipe with a write-stall bound.** A request body pipe carrying
+  patch 004's `Http2BodyWriteTimeout` keeps splitting at `capacity()` even when
+  the window covers the chunk. The bound can only time a chunk the pipe still
+  holds; a chunk handed to h2 whole would leave up to a whole chunk (a whole
+  buffered body, when it is the last one) beyond the send buffer untimed, so
+  a backend that stops reading with its window open would no longer be cut
+  after `backend_write_timeout_ms`. Response pipes and uploads without a write
+  timeout take the covered path.
 - The 256-byte minimum is h2's `DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD`. Frames
   at or above it are never charged against a receiver's budget.
 - **The client** (`src/proto/h2/client.rs`) enables coalescing on every
@@ -134,7 +149,7 @@ deadlock:
   window, capped `capacity()`, and then waited for the connection to drain the
   buffer before handing over the rest. Ferrum's backend pool advertises a
   1 MiB maximum frame size by default, so a backend's response arrives in
-  chunks of up to 1 MiB against the frontend's 400 KiB send buffer, and every
+  chunks of up to 1 MiB against the frontend server's 400 KiB send buffer, and every
   large chunk stalled the response pipe mid-chunk. On the hosted HTTP/2
   protocol benchmark (TLS on both legs, 200 streams, 4 vCPU), the same runner
   ran the shipped patch and the window-aware split, two interleaved pairs of
@@ -144,6 +159,15 @@ deadlock:
   within run-to-run noise (0.98–1.00×) at 10 KiB and 70 KiB. Disabling
   coalescing altogether measured the same, so the window-aware split recovers
   this patch's large-payload cost and keeps its small-window protection.
+- **Memory per stream on the covered path.** Handing a covered chunk over
+  whole lets h2 hold up to `max_send_buf_size` plus that chunk for one stream,
+  and the pipe then polls the next chunk while waiting for the buffer to
+  drain. With the backend pool's default 1 MiB frames, a slow-reading client
+  whose window is open can therefore cost a stream about one upstream chunk
+  (up to 1 MiB) more than with this patch as first shipped, and the backend's
+  receive credit is released one chunk earlier. This is the envelope Hyper had
+  before this patch; it is bounded by the client's own advertised window and
+  by the inbound frame size, never by an unbounded queue.
 - **Chunks larger than the window (unmeasured).** Before this patch, a ready
   chunk went to h2 whole and h2 framed the rest itself as WINDOW_UPDATEs
   arrived. Now the pipe hands h2 only the assigned capacity, so each
@@ -207,9 +231,11 @@ on machine speed:
 - `a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer` gives
   the client a 10,000-byte send buffer and a 60,000-byte chunk that the
   peer's windows already cover, and checks that every non-final frame is a
-  full 16,384-byte frame, not a send-buffer-sized piece. It needs h2 patch 003
-  and therefore runs only on the vendored h2; against stock h2 it fails by
-  design, because the fallback splits.
+  full 16,384-byte frame, not a send-buffer-sized piece.
+  `a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer`
+  does the same for the server's response pipe against a raw-frame client.
+  Both need h2 patch 003 and therefore run only on the vendored h2; against
+  stock h2 they fail by design, because the fallback splits.
 
 CI runs the module in the vendored-hyper step's `--lib ferrum_` pass on the
 vendored h2:

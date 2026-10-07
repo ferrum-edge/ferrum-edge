@@ -13,13 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers.** Hyper patch 005 (#6033/#6036) split every body chunk larger than
   `SendStream::capacity()` so h2 could not cut tiny DATA frames from small
   window increments. But `capacity()` is also capped by h2's per-stream send
-  buffer (400 KiB by default), and the backend pool's default 1 MiB maximum
+  buffer (400 KiB by default on the frontend server), and the backend pool's default 1 MiB maximum
   frame size delivers response chunks of up to 1 MiB, so on the frontend leg
   nearly every large chunk was split and the response pipe waited for the
   buffer to drain mid-chunk. The pipe now splits only when the window is short:
-  vendored h2 patch 003 adds a read-only `SendStream::assigned_capacity()`, and
-  a chunk the stream already holds window for goes to h2 whole, as it did
-  before #6036. Small-window coalescing is unchanged. On the hosted HTTP/2
+  vendored h2 patch 003 adds a read-only `SendStream::capacity_and_assigned()`,
+  and a chunk the stream already holds window for goes to h2 whole, as it did
+  before #6036. Small-window coalescing is unchanged, and a backend upload
+  with a `backend_write_timeout_ms` bound keeps splitting so that bound still
+  times every byte beyond the send buffer. On the hosted HTTP/2
   protocol benchmark, same runner, this delivered 1.03–1.09× the requests per
   second at 500 KiB and 1 MiB (Intel Xeon 6973P-C and AMD EPYC 7763) and was
   within noise at 10 KiB and 70 KiB.

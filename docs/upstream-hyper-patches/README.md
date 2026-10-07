@@ -26,7 +26,7 @@ correction that required the old fixed-minimum patch and patch 004 first.
 No stage reinstates the unsafe 1 KiB send-capacity threshold; patch 005's
 coalescing wait is bounded, so every positive window still makes progress.
 Patch 005 splits a chunk only when the window, not the send buffer, is short;
-telling them apart uses the vendored h2's `SendStream::assigned_capacity()`
+telling them apart uses the vendored h2's `SendStream::capacity_and_assigned()`
 ([h2 patch 003](../upstream-h2-patches/003-assigned-send-capacity/README.md)).
 Against stock h2 the stack still builds and patch 005 falls back to splitting
 at `capacity()`.

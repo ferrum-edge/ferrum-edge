@@ -897,7 +897,7 @@
       "docs_path": "docs/upstream-hyper-patches/005-h2-small-window-coalescing/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "With patch 002's positive-capacity progress, h2 cut one DATA frame from every window increment, so a peer opening its window a few bytes at a time received a self-sustaining run of small frames that an unpatched h2 0.4.16+ receiver answers with GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) (#6033). On connections with a Timer, the client and server body pipes hold capacity below min(chunk remaining, 256) for at most 2 ms, then hand h2 exactly the assigned capacity; the bounded wait keeps every positive window live. A chunk the stream already holds window for is handed to h2 whole even when the send buffer caps capacity(), using h2 patch 003's assigned_capacity() (stock h2 falls back to splitting).",
+      "reason": "With patch 002's positive-capacity progress, h2 cut one DATA frame from every window increment, so a peer opening its window a few bytes at a time received a self-sustaining run of small frames that an unpatched h2 0.4.16+ receiver answers with GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) (#6033). On connections with a Timer, the client and server body pipes hold capacity below min(chunk remaining, 256) for at most 2 ms, then hand h2 exactly the assigned capacity; the bounded wait keeps every positive window live. A chunk the stream already holds window for is handed to h2 whole even when the send buffer caps capacity(), using h2 patch 003's capacity_and_assigned() (stock h2 falls back to splitting); a pipe with a patch-004 write-stall bound keeps splitting.",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/hyper",
@@ -990,7 +990,7 @@
       "docs_path": "docs/upstream-h2-patches/003-assigned-send-capacity/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "SendStream::capacity() is capped by the per-stream send buffer as well as the window, so Hyper patch 005 could not tell a short peer window from a full send buffer and split every chunk larger than the buffer. A 1 MiB backend response chunk against the 400 KiB default buffer then stalled the frontend response pipe mid-chunk. The read-only assigned_capacity() accessor lets the pipe split only when the window is short.",
+      "reason": "SendStream::capacity() is capped by the per-stream send buffer as well as the window, so Hyper patch 005 could not tell a short peer window from a full send buffer and split every chunk larger than the buffer. A 1 MiB backend response chunk against the 400 KiB default buffer then stalled the frontend response pipe mid-chunk. The read-only capacity_and_assigned() accessor, which reads both values under one lock, lets the pipe split only when the window is short.",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/h2",
@@ -1009,7 +1009,8 @@
       },
       "regression_tests": [
         "vendor/h2-0.4.19-ferrum-patched (share::ferrum_assigned_capacity_tests)",
-        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests::a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer)"
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests::a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer, a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer)",
+        "tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs (vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads)"
       ]
     }
   ]

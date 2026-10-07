@@ -413,10 +413,13 @@ impl Send {
         stream.capacity(self.prioritize.max_buffer_size())
     }
 
-    // FERRUM PATCH 003: assigned window not yet claimed by buffered data,
-    // ignoring the send-buffer limit.
-    pub fn assigned_capacity(&self, stream: &mut store::Ptr) -> WindowSize {
-        stream.capacity(usize::MAX)
+    // FERRUM PATCH 003: `capacity` together with the assigned window not yet
+    // claimed by buffered data, which ignores the send-buffer limit.
+    pub fn capacity_and_assigned(&self, stream: &mut store::Ptr) -> (WindowSize, WindowSize) {
+        (
+            stream.capacity(self.prioritize.max_buffer_size()),
+            stream.capacity(usize::MAX),
+        )
     }
 
     pub fn poll_reset(

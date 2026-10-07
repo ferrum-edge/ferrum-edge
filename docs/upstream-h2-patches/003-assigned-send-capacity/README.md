@@ -30,7 +30,7 @@ once per buffer-full of every large chunk.
 
 Ferrum's backend pool advertises a 1 MiB maximum frame size by default, so a
 backend's response body arrives in chunks of up to 1 MiB, against Hyper's
-400 KiB default send buffer on the frontend leg. Before this patch, every such
+400 KiB default server send buffer on the frontend leg. Before this patch, every such
 chunk was split and the frontend response pipe stalled mid-chunk.
 
 ## Patch
@@ -39,13 +39,15 @@ chunk was split and the frontend response pipe stalled mid-chunk.
 after Ferrum's h2 patches 001 and 002. It adds one read-only accessor and
 changes no state:
 
-- `SendStream::assigned_capacity()` (`src/share.rs`) returns the window already
-  assigned to the stream that buffered data has not yet claimed, ignoring the
-  send-buffer limit. It goes through `StreamRef::assigned_capacity`
-  (`src/proto/streams/streams.rs`) and `Send::assigned_capacity`
-  (`src/proto/streams/send.rs`), which evaluate the existing
-  `Stream::capacity` with no buffer limit, under the same lock `capacity()`
-  takes.
+- `SendStream::capacity_and_assigned()` (`src/share.rs`) returns
+  `capacity()` together with the window already assigned to the stream that
+  buffered data has not yet claimed, which ignores the send-buffer limit. Both
+  come from one acquisition of the streams lock, so the pair is a consistent
+  snapshot and a caller that needs both pays one lock, not two. It goes
+  through `StreamRef::capacity_and_assigned` (`src/proto/streams/streams.rs`)
+  and `Send::capacity_and_assigned` (`src/proto/streams/send.rs`), which
+  evaluate the existing `Stream::capacity` with and without the buffer
+  limit.
 
 `capacity()`, `reserve_capacity()`, `poll_capacity()`, flow control and
 framing are unchanged.
@@ -54,17 +56,25 @@ framing are unchanged.
 
 `share::ferrum_assigned_capacity_tests` opens a client stream with a 1 KiB send
 buffer against a server whose windows cover a 100,000-byte reservation, and
-proves that `capacity()` stops at the 1 KiB buffer while
-`assigned_capacity()` reports the full assignment, and that both drop by the
-amount buffered by `send_data` before the connection writes it.
+proves that the capped value stops at the 1 KiB buffer while the assigned
+value reports the full assignment, and that both drop by the amount buffered
+by `send_data` before the connection writes it. It waits for the server to
+accept the request and for the assignment to land, bounded by a deadline,
+rather than polling a fixed number of times.
 
 ```bash
 cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
 ```
 
 Hyper patch 005's
-`a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer`
-regression proves the caller's behaviour on the vendored combination.
+`a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer` and
+`a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer`
+regressions prove the caller's behaviour on the vendored combination, and
+Ferrum's
+`tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs::vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads`
+binds the accessor's exact signature, so dropping or changing it breaks the
+gateway's test build instead of silently disabling Hyper patch 005's
+window-aware path.
 
 ## Retirement
 

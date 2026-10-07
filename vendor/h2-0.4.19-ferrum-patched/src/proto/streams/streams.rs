@@ -1410,14 +1410,14 @@ impl<B> StreamRef<B> {
         me.actions.send.capacity(&mut stream)
     }
 
-    // FERRUM PATCH 003: see `SendStream::assigned_capacity`.
-    pub fn assigned_capacity(&self) -> WindowSize {
+    // FERRUM PATCH 003: see `SendStream::capacity_and_assigned`.
+    pub fn capacity_and_assigned(&self) -> (WindowSize, WindowSize) {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
         let mut stream = me.store.resolve(self.opaque.key);
 
-        me.actions.send.assigned_capacity(&mut stream)
+        me.actions.send.capacity_and_assigned(&mut stream)
     }
 
     /// Request to be notified when the stream's capacity increases
