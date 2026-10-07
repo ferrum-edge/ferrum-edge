@@ -75,10 +75,13 @@ PR #6051 root-caused it and worked around it in the test client by sending a
 ### Product impact (low, pre-existing)
 
 An h2 client connection whose last handle drops while its task is mid-poll can
-stay open until the peer closes it. Without HTTP/2 keepalive (for example the
-HBONE pool in `src/proxy/hbone_pool.rs`, and hyper-driven backend HTTP/2
-connections), the connection and its pool slot stay alive until the peer's
-idle timeout. Requests are not affected; this is neither a correctness nor a
+stay open until the peer closes it. A hyper-driven backend HTTP/2 connection
+(`src/proxy/http2_pool.rs`) pings only while streams are open, so its socket
+and driver task, already evicted from the pool, stay alive until the peer's
+idle timeout. The HBONE pool (`src/proxy/hbone_pool.rs`) runs its own PING
+keepalive by default (every 30 s), which wakes the task and bounds the linger
+to about one interval; with that keepalive disabled it behaves like the
+backend case. Requests are not affected; this is neither a correctness nor a
 security issue for requests.
 
 ## Patch
