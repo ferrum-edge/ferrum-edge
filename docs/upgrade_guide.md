@@ -26,7 +26,37 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased changes after 0.9.13
+## Upgrading to 0.9.14
+
+0.9.14 (2026-10-07 UTC) is cut from main
+`4f370a0b1921d231e9d0c498821e90e076aa64fb`. All previously released breaking
+identifiers and guidance below remain applicable. CP/DP must run the same
+build; the ConfigSync protocol revision is now `3` (#6020). 0.9.14 adds no core
+schema change; a changed baseline in any later release still requires a fresh
+database with the old database kept intact for rollback.
+
+Before rolling out, check:
+
+- code that links the `ferrum-edge` crate: `GrpcProxyError::ClientDeadlineExceeded`
+  carries a `GrpcDeadlinePhase`, the test-only `Http3ConnectionPool` streaming
+  entry points are removed, `request` / `request_with_target` are crate-private,
+  and `Plugin` now has `Any` as a supertrait (#6022);
+- custom plugins whose `name()` reports a built-in plugin name: trust,
+  composition checks and finalizer cleanup now treat them as custom plugins
+  (#6022);
+- dashboards, alerts, and circuit-breaker or passive-health tuning keyed on
+  `error_class` or `body_error_class`: backend HTTP/2 resets other than
+  `NO_ERROR` are now `protocol_error` and charged to the target (#6019, #6022),
+  and buffered response read errors report their real class;
+- backends that receive HTTP/2 client uploads: a client reset now reaches them
+  as a cancelled or aborted upload, never as a complete body (#6022);
+- gRPC clients that match request-buffer capacity refusals: the HTTP/1.1 and
+  HTTP/2 terminal drain and the gRPC-Web plain bridge now answer
+  `RESOURCE_EXHAUSTED` instead of `UNAVAILABLE` (#6022);
+- control-plane consumers of `GET /backend-egress-policy` and `GET /cluster`,
+  which gain optional data-plane egress attestation (#6020);
+- deployment-mutation clients that branch on `durable`, which can now be
+  `"not_started"` or `"not_committed"` where it used to be `"unknown"` (#6021).
 
 **Library API:** code linking the `ferrum-edge` crate that constructs or matches
 `GrpcProxyError::ClientDeadlineExceeded` must build the new
@@ -60,13 +90,41 @@ value changes, but operators who key dashboards, alerts, or breaker policy on
   in `retryable_methods`, as the small-response collector's already were.
   `response_body_too_large` was never retried.
 
+A backend reset with any reason but `NO_ERROR` after the response headers on a
+direct HTTP/2 or gRPC response body is likewise `protocol_error` rather than
+`request_error` (#6019), so `body_error_class` dashboards move and those
+backends can now open circuit breakers and fail passive health checks.
+
+**Data-plane backend egress attestation (#6020).** On a control plane,
+`GET /backend-egress-policy` gains an optional `data_plane_attestation` object
+for the selected namespace, and `GET /cluster` adds each data plane's
+`backend_egress_policy_attestation` / `backend_egress_policy` plus a
+cluster-wide `data_plane_backend_egress_policy` aggregate. The fields are
+additive and `schema_version` stays `2`; the CP's own `public_only_guaranteed`
+stays false on `admission-only`. A data plane that sends no report is
+`unknown` and makes `all_connected_public_only_guaranteed` false, so upgrade
+data planes with the control plane. Disconnected data planes that still serve
+cached config are not listed; compare `connected_data_planes` with your
+expected inventory.
+
+**Deployment mutation `durable` values (#6021).** A conditional
+`DELETE /proxies/{id}` or `PUT /api-specs/{id}` that fails before commit now
+returns `503` with `durable: "not_started"` (failure ahead of the transaction)
+or `durable: "not_committed"` (rolled-back transaction) instead of
+`"unknown"`. Only a failed commit or commit acknowledgement still reports
+`"unknown"`. None of these values authorizes cleanup or replay; retain the
+original evidence and journal as for any other refusal. See
+[deployment mutations](deployment_mutations.md).
+
 ## Upgrading to 0.9.13
 
-0.9.13 (2026-10-06 UTC) is cut from main
-`fd02c5f45bb9dee86a52bc612fcefd0223d6157b`. All previously released breaking
-identifiers and guidance below remain applicable. CP/DP must run the same
-build. 0.9.13 adds no core schema change; a changed baseline in any later release still requires a fresh
-database with the old database kept intact for rollback.
+0.9.13 was published at **2026-10-06T17:04:49Z** at release merge
+`9b83115de7ec23ab51ec4feae6bed65e596db425`, whose second parent is reviewed
+#6026 head `71c282279a38591c8c50fd11a1d0ba0c5be4a484`. All previously released
+breaking identifiers and guidance below remain applicable. CP/DP must run the
+same build. 0.9.13 adds no core schema change; a changed baseline in any later
+release still requires a fresh database with the old database kept intact for
+rollback.
 
 Before rolling out, check:
 
