@@ -939,7 +939,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The runtime-budget patch must also retire before removing the vendored crate.",
+        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The runtime-budget and client close-wakeup patches must also retire before removing the vendored crate.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -979,6 +979,36 @@
       "regression_tests": [
         "vendor/h2-0.4.19-ferrum-patched (proto::streams::counts budget tests)",
         "tests/functional/scripted_backend_h2_tests.rs (grpc_upload_progresses_with_512_byte_backend_stream_window)"
+      ]
+    },
+    {
+      "id": "h2-003-client-close-wakeup",
+      "label": "h2 client connection closes when its last handle drops mid-poll",
+      "crate": "h2",
+      "vendored_version": "0.4.19",
+      "vendor_path": "vendor/h2-0.4.19-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/003-client-close-wakeup/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "The client Connection future read whether streams or handles were held twice per poll: once to decide the idle close and once for the post-poll recheck. A last SendRequest dropped between the two reads found no parked waker and was missed by both, so an idle client connection with no keepalive stayed open until the peer wrote or closed (#6052). The close decision and the recheck now share one read.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h2",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "An h2 release that decides the client close and the post-poll recheck from one read (or otherwise wakes a client connection whose last handle drops mid-poll) is adopted, or Ferrum stops using h2.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": "Not yet filed upstream; the draft issue text is in the patch README."
+        }
+      },
+      "regression_tests": [
+        "vendor/h2-0.4.19-ferrum-patched (client::ferrum_client_close_wakeup_tests)"
       ]
     }
   ]

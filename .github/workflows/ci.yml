@@ -2095,6 +2095,10 @@ jobs:
           # Patch 002: an automatic small-DATA-frame budget follows runtime
           # target-window changes without resetting outstanding charges.
           cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib budget
+          # Patch 003: a client connection whose last handle drops right after
+          # Connection::poll decided not to close still wakes itself and
+          # closes against an idle peer (issue #6052).
+          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_client_close_wakeup
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

@@ -62,6 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An idle HTTP/2 client connection closes when its last handle drops
+  mid-poll** (issue #6052). The vendored h2 client `Connection` read whether
+  any stream or handle was still held twice per poll: once to decide whether
+  to close, and again for the recheck after polling. A last `SendRequest`
+  dropped between the two reads found no parked waker, so neither the drop
+  nor the poll woke the connection again. Without HTTP/2 keepalive (HBONE
+  pool, hyper-driven backend connections) the connection and its pool slot
+  stayed open until the peer wrote or closed. The close decision and the
+  recheck now use one read. Carried as vendored h2 patch
+  `h2-003-client-close-wakeup`
+  (`docs/upstream-h2-patches/003-client-close-wakeup/`).
 - **A client reset of a pumped HTTP/2 upload reaches the backend as
   `CANCEL`** (#6038). A direct HTTP/2 upload runs through a gateway-owned pump
   when the route has a request size limit and a `backend_write_timeout_ms`,

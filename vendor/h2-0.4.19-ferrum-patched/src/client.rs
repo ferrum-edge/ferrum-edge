@@ -1473,8 +1473,21 @@ where
     type Output = Result<(), crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.maybe_close_connection_if_no_streams();
-        let had_streams_or_refs = self.inner.has_streams_or_other_references();
+        // FERRUM PATCH (h2-003-client-close-wakeup): decide the close and the
+        // post-poll recheck from one read. Dropping the last handle wakes
+        // this task only through the waker parked by `poll_complete`, and
+        // the wake that started this poll has already taken it. Upstream read
+        // twice: a last handle dropped between the two reads was not closed
+        // by the first read nor reported as held by the second, so neither
+        // this poll nor the drop woke the task, and an idle connection
+        // stayed open until the peer wrote or closed. With one read, a drop
+        // after it is caught by the recheck below (or, once `poll_complete`
+        // has parked a waker, wakes the task itself). The recheck cannot
+        // spin: it wakes only when this read saw something held, and the
+        // next poll then reads nothing held and closes, so it does not wake.
+        let had_streams_or_refs = self.inner.maybe_close_connection_if_no_streams();
+        #[cfg(test)]
+        ferrum_client_close_wakeup_tests::run_after_close_decision();
         let result = self.inner.poll(cx).map_err(Into::into);
         // if we had streams/refs, and don't anymore, wake up one more time to
         // ensure proper shutdown
@@ -1742,5 +1755,118 @@ impl proto::Peer for Peer {
         *response.headers_mut() = fields;
 
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod ferrum_client_close_wakeup_tests {
+    //! FERRUM PATCH (h2-003-client-close-wakeup).
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+
+    thread_local! {
+        static AFTER_CLOSE_DECISION: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Runs the hook armed on this thread, once, right after
+    /// `Connection::poll` has decided whether to close.
+    pub(super) fn run_after_close_decision() {
+        let hook = AFTER_CLOSE_DECISION.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl WakeCount {
+        fn get(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The last `SendRequest` drops right after `Connection::poll` decided
+    /// not to close, in the poll started by the wake that took the waker
+    /// parked by `poll_complete`, so the drop finds no waker to wake. The
+    /// peer is idle and never writes, so unless that poll schedules itself
+    /// again nothing ever polls the connection, and it is never closed.
+    /// Upstream ordering (close decision, then a second read of "held?")
+    /// misses the drop here and leaves the wake count unchanged.
+    #[tokio::test]
+    async fn last_handle_dropped_mid_poll_still_closes_the_connection() {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let mut conn = crate::server::handshake(server_io).await.unwrap();
+            // Idle peer: never opens a stream and never writes unprompted.
+            while let Some(Ok(_)) = conn.accept().await {}
+        });
+
+        let (client, mut conn) = crate::client::handshake(client_io).await.unwrap();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        // Exchange SETTINGS until a poll is followed by no wakeup: the
+        // connection is idle and `poll_complete` has parked `waker`.
+        let mut idle = false;
+        for _ in 0..32 {
+            let before = wakes.get();
+            assert!(Pin::new(&mut conn).poll(&mut cx).is_pending());
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            if wakes.get() == before {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle, "the SETTINGS exchange never settled");
+
+        // Drop the last handle right after the next poll's close decision.
+        AFTER_CLOSE_DECISION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || drop(client)));
+        });
+
+        // Wake the connection the way production does: a window update
+        // takes the parked waker, so the drop below finds none.
+        let before = wakes.get();
+        conn.set_target_window_size(1 << 20);
+        assert_eq!(
+            wakes.get(),
+            before + 1,
+            "the window update must take and wake the parked waker"
+        );
+
+        let before = wakes.get();
+        assert!(Pin::new(&mut conn).poll(&mut cx).is_pending());
+        assert!(
+            AFTER_CLOSE_DECISION.with(|hook| hook.borrow().is_none()),
+            "the hook must have dropped the last handle during the poll"
+        );
+        assert!(
+            wakes.get() > before,
+            "a connection whose last handle dropped mid-poll must wake itself again"
+        );
+
+        // The poll that wakeup schedules closes the idle connection.
+        match Pin::new(&mut conn).poll(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("the idle connection did not close: {other:?}"),
+        }
     }
 }

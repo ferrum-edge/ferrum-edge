@@ -150,7 +150,7 @@ f64cfd9e2d9317a9fe173a04485130e6118f80d141c089eec3bba4816fa87467  vendor/dimpl-0
 161f7d05b3d83cac78bf0d03f97d5d801f06387b541e2a8dd1219bb4c16d4f0b  vendor/h2-0.4.19-ferrum-patched/Cargo.toml
 b21623012e6c453d944b0342c515b631cfcbf30704c2621b291526b69c10724d  vendor/h2-0.4.19-ferrum-patched/LICENSE
 5981f9df0b61ed7e098fb802b154f892401ceea00fd83cf43fc55b11a4dee303  vendor/h2-0.4.19-ferrum-patched/README.md
-e8b69bda2a21338e909282b888c320e0e260711fb4869ca80ccc009889e223a4  vendor/h2-0.4.19-ferrum-patched/src/client.rs
+eb05b5f9178fcd7af117b5150671ee28afa6772a62b47182cf4cd4d300e2cb0c  vendor/h2-0.4.19-ferrum-patched/src/client.rs
 4384868a883fc21676888f61380ddf43cd15703bd6377b79d2eec2183e8edecf  vendor/h2-0.4.19-ferrum-patched/src/codec/error.rs
 061131d2280ec0903507eb73b675791b79643ec312cefd5b8bf46dbe3b7707d2  vendor/h2-0.4.19-ferrum-patched/src/codec/framed_read.rs
 9e634d75a9701dfe33c77ae500e82822242567a0c5bc1d62e13f43448c40e476  vendor/h2-0.4.19-ferrum-patched/src/codec/framed_write.rs
@@ -182,7 +182,7 @@ cac4ed7dec7b9a5d92ab7d139a4500698206ca8eff1fbd569f0e6c29d4747a59  vendor/h2-0.4.
 4ff6130c3f7eb2e0cc30416976e6c8f54b42378ff55ab47fe3a1b04465f19cb6  vendor/h2-0.4.19-ferrum-patched/src/hpack/test/fuzz.rs
 56ad5643e7f1e273e5bce8a6fc0552be39c326dacfffd7f9757ccdbe75e9b66e  vendor/h2-0.4.19-ferrum-patched/src/hpack/test/mod.rs
 c8680fc4eb13ccb4ce944716042bd33c6554677cf8261c371442f91fbee352e0  vendor/h2-0.4.19-ferrum-patched/src/lib.rs
-12d772013c4a7cf16e371521de5a6caa3b52c10ca7c5bb9959d9f4fb8cdd924e  vendor/h2-0.4.19-ferrum-patched/src/proto/connection.rs
+6b55d169160f5e37e05ba205072c68a6c956e1784b4a06312673ede2f3a29d80  vendor/h2-0.4.19-ferrum-patched/src/proto/connection.rs
 ae3d3e0613586970bbcae17af539cfab739d1b8df5cabce3b9d866cdba11315a  vendor/h2-0.4.19-ferrum-patched/src/proto/error.rs
 51d467027bc30873fc76166ed731e968a23725e7b106b58ecadcb85044466a5f  vendor/h2-0.4.19-ferrum-patched/src/proto/go_away.rs
 592f8c60d97425946ff62cf694e3f36097a793863fc218fb4357dd440ed377e8  vendor/h2-0.4.19-ferrum-patched/src/proto/mod.rs

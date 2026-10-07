@@ -211,6 +211,11 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   (upstream [hyperium/h2#902](https://github.com/hyperium/h2/issues/902) /
   [#903](https://github.com/hyperium/h2/pull/903),
   [patch](upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch))
+- 002 — [update the automatic DATA-frame budget at runtime](upstream-h2-patches/002-runtime-data-frame-budget/README.md)
+  (upstream [hyperium/h2#965](https://github.com/hyperium/h2/pull/965),
+  [patch](upstream-h2-patches/002-runtime-data-frame-budget/h2-runtime-data-frame-budget.patch))
+- 003 — [close an idle client connection whose last handle drops mid-poll](upstream-h2-patches/003-client-close-wakeup/README.md)
+  ([patch](upstream-h2-patches/003-client-close-wakeup/h2-client-close-wakeup.patch))
 
 ### hyper-util
 
