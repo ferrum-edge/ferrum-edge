@@ -5234,6 +5234,26 @@ impl GatewayConfig {
     }
 
     /// Validate plugin resource invariants and proxy/plugin associations.
+    /// Enabled `global` plugin configs grouped by plugin name, in config order.
+    ///
+    /// Composition validators resolve each proxy's effective instances of a
+    /// plugin as "its scoped instances, else the enabled globals". Looking the
+    /// globals up here once keeps that resolution O(proxies + plugin configs);
+    /// scanning every plugin config per proxy made each validator
+    /// O(proxies × plugin configs) on every reload (issue #6057).
+    pub fn enabled_global_plugin_configs_by_name(&self) -> HashMap<&str, Vec<&PluginConfig>> {
+        let mut globals: HashMap<&str, Vec<&PluginConfig>> = HashMap::new();
+        for plugin in &self.plugin_configs {
+            if plugin.enabled && plugin.scope == PluginScope::Global {
+                globals
+                    .entry(plugin.plugin_name.as_str())
+                    .or_default()
+                    .push(plugin);
+            }
+        }
+        globals
+    }
+
     pub fn validate_plugin_references(&self) -> Result<(), Vec<String>> {
         // Proxy and plugin identities are namespace-local. Bare-id indexes
         // would accept a dangling same-namespace proxy_id whenever another

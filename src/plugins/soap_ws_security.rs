@@ -5156,6 +5156,8 @@ pub fn validate_composition(
         .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
 
+    let globals_by_name = config.enabled_global_plugin_configs_by_name();
+
     // Resolve the effective instances of `name` for `proxy` exactly the way the
     // runtime merge does: a scoped instance shadows the same-named global by
     // its outer `enabled` flag alone.
@@ -5179,13 +5181,7 @@ pub fn validate_composition(
         if !local.is_empty() {
             return local;
         }
-        config
-            .plugin_configs
-            .iter()
-            .filter(|plugin| {
-                plugin.enabled && plugin.scope == PluginScope::Global && plugin.plugin_name == name
-            })
-            .collect()
+        globals_by_name.get(name).cloned().unwrap_or_default()
     };
 
     let mut errors = Vec::new();

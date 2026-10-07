@@ -414,6 +414,7 @@ pub fn validate_composition(
         .iter()
         .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
+    let globals_by_name = config.enabled_global_plugin_configs_by_name();
 
     // Resolve each name the way the runtime merge does before deciding whether
     // the pair is actually effective together. Two properties of that merge are
@@ -452,15 +453,7 @@ pub fn validate_composition(
             })
             .collect();
         let effective: Vec<&PluginConfig> = if local.is_empty() {
-            config
-                .plugin_configs
-                .iter()
-                .filter(|plugin| {
-                    plugin.enabled
-                        && plugin.scope == PluginScope::Global
-                        && plugin.plugin_name == name
-                })
-                .collect()
+            globals_by_name.get(name).cloned().unwrap_or_default()
         } else {
             local
         };
