@@ -332,12 +332,15 @@ async fn run_http2(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMet
             };
 
             let io = TokioIo::new(tls_stream);
+            // Keep these windows fixed. hyper's `adaptive_window(true)` silently
+            // resets both to 65,535 and grows them with BDP pings; in that mode the
+            // multi-protocol bench client intermittently stalled single streams
+            // for 10-30 s (see `run_http2` in multi_protocol/proto_bench.rs).
             let mut h2_builder =
                 hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
             h2_builder
                 .initial_stream_window_size(8 * 1024 * 1024) // 8 MiB
                 .initial_connection_window_size(32 * 1024 * 1024) // 32 MiB
-                .adaptive_window(true)
                 .max_frame_size(1_048_576); // 1 MiB
             let (sender, conn) = match h2_builder.handshake(io).await {
                 Ok(pair) => pair,
