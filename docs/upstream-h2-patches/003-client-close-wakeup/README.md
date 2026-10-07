@@ -6,12 +6,13 @@
 
 ## Status
 
-**Deliberate fork**: not filed upstream yet. Filing needs owner approval; the
-draft issue text is [below](#draft-upstream-issue-hyperiumh2). Owner: Ferrum
-Edge maintainers. Ferrum issue
+**Filed (fixed upstream)**: upstream fixed the same race independently in
+[hyperium/h2#956](https://github.com/hyperium/h2/pull/956) ("fix: rare race
+during shutdown", merged 2026-09-09), released in h2 0.4.20 on 2026-10-06.
+Upstream takes the "held?" snapshot before the close check; this patch takes it
+from the close check itself. Both leave no window between the two decisions.
+Owner: Ferrum Edge maintainers. Ferrum issue
 [#6052](https://github.com/ferrum-edge/ferrum-edge/issues/6052).
-
-The bug is in published h2 0.4.19 and in h2's `master` at the time of writing.
 
 ## Problem
 
@@ -163,86 +164,12 @@ hang (`functional_h1_h2_auth_lifetime_test.rs`).
 
 ## Retirement
 
-Retire this patch when an h2 release reads the close decision and the
-post-poll recheck from one snapshot, or otherwise wakes a client connection
-whose last handle drops mid-poll. Remove the inventory row, the
+Retire this patch when Ferrum adopts an h2 release containing
+hyperium/h2#956 (h2 0.4.20 or later), which also contains patch 002's
+hyperium/h2#965. Remove the inventory row, the
 `docs/vendored-patch-lifecycle.json` entry, this directory, and its entry in
 `tests/performance/multi_protocol/h2_guard/prepare.py`. Keep a behavioural
 regression for the released dependency if one can be written outside the
 crate, and regenerate `vendor/VENDOR_INTEGRITY.sha256`. Patches 001 and 002
 must also retire before the vendored crate is dropped; see
 [patch 001's retirement steps](../001-coalesce-data-frame-writes/README.md#retirement).
-
-## Draft upstream issue (hyperium/h2)
-
-Not filed. File only with owner approval.
-
-> **Title:** Client `Connection` can miss its close wakeup when the last
-> `SendRequest` drops during `poll`
->
-> **Version:** h2 0.4.19 (and `master`)
->
-> `impl Future for client::Connection` checks whether any streams or
-> references remain twice before polling the inner connection:
->
-> ```rust
-> self.inner.maybe_close_connection_if_no_streams();
-> let had_streams_or_refs = self.inner.has_streams_or_other_references();
-> let result = self.inner.poll(cx).map_err(Into::into);
-> if result.is_pending()
->     && had_streams_or_refs
->     && !self.inner.has_streams_or_other_references()
-> {
->     cx.waker().wake_by_ref();
-> }
-> ```
->
-> Each check takes the streams lock separately. Dropping the last handle
-> (`Drop for Streams` / `drop_stream_ref`) wakes the connection task only
-> through `actions.task`, the waker parked by `Streams::poll_complete`. The
-> wake that started the current poll has already taken that waker.
->
-> If another thread drops the last `SendRequest` between the first check and
-> the second:
->
-> 1. `maybe_close_connection_if_no_streams` sees a reference and does not
->    close;
-> 2. the drop finds `actions.task == None` and wakes nothing;
-> 3. `had_streams_or_refs` is `false`;
-> 4. `inner.poll` parks a new waker and returns `Pending`;
-> 5. the recheck does not fire, because `had_streams_or_refs` is `false`.
->
-> No handle remains to wake the task, so it waits for socket I/O. Against an
-> idle peer, the client never sends `GOAWAY` or closes the socket, so the
-> connection stays open until the peer closes it or a keepalive `PING` fires.
->
-> hyper's HTTP/2 client makes this reachable. `ClientTask` drops
-> `conn_drop_ref` (waking `ConnTask` through an mpsc channel) just before it
-> drops its h2 `SendRequest`, so on a multi-threaded runtime `ConnTask` can
-> poll the `Connection` at the moment the last `SendRequest` drops.
->
-> **Suggested fix:** take one snapshot per poll and use it for both decisions:
->
-> ```rust
-> // proto::Connection
-> pub fn maybe_close_connection_if_no_streams(&mut self) -> bool {
->     let has_streams_or_refs = self.inner.streams.has_streams_or_other_references();
->     if !has_streams_or_refs {
->         self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
->     }
->     has_streams_or_refs
-> }
->
-> // client::Connection::poll
-> let had_streams_or_refs = self.inner.maybe_close_connection_if_no_streams();
-> let result = self.inner.poll(cx).map_err(Into::into);
-> // ...unchanged recheck...
-> ```
->
-> A drop after the snapshot is then caught by the existing recheck, or, once
-> `poll_complete` has parked a waker, wakes the task directly. The recheck
-> still fires at most once: the next poll sees nothing held and closes.
->
-> We carry this fix as a downstream patch, with a deterministic unit test that
-> drops the last `SendRequest` right after the close decision through a
-> `cfg(test)` hook, and can open a PR.

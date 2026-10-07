@@ -992,19 +992,19 @@
       "owner_github": null,
       "reason": "The client Connection future read whether streams or handles were held twice per poll: once to decide the idle close and once for the post-poll recheck. A last SendRequest dropped between the two reads found no parked waker and was missed by both, so an idle client connection with no keepalive stayed open until the peer wrote or closed (#6052). The close decision and the recheck now share one read.",
       "upstream": {
-        "filing": "deliberate_fork_unfiled",
+        "filing": "filed",
         "github_repo": "hyperium/h2",
-        "pr_number": null,
+        "pr_number": 956,
         "issue_number": null,
         "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release that decides the client close and the post-poll recheck from one read (or otherwise wakes a client connection whose last handle drops mid-poll) is adopted, or Ferrum stops using h2.",
+        "trigger": "An h2 release containing hyperium/h2#956 (first released in h2 0.4.20) is adopted, or Ferrum stops using h2.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
-          "notes": "Not yet filed upstream; the draft issue text is in the patch README."
+          "notes": "Upstream fixed the same race independently in hyperium/h2#956 (merged 2026-09-09, released in h2 0.4.20 on 2026-10-06) by taking the snapshot before the close check. h2 0.4.20 also contains hyperium/h2#965 (patch 002)."
         }
       },
       "regression_tests": [
