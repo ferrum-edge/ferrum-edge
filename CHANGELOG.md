@@ -74,7 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about one interval. The close decision and the
   recheck now use one read. Carried as vendored h2 patch
   `h2-003-client-close-wakeup`
-  (`docs/upstream-h2-patches/003-client-close-wakeup/`).
+  (`docs/upstream-h2-patches/003-client-close-wakeup/`) until Ferrum adopts
+  h2 0.4.20, which fixes the same race (hyperium/h2#956).
 - **A client reset of a pumped HTTP/2 upload reaches the backend as
   `CANCEL`** (#6038). A direct HTTP/2 upload runs through a gateway-owned pump
   when the route has a request size limit and a `backend_write_timeout_ms`,
