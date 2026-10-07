@@ -181,6 +181,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusals run the reject-path hooks and write the transaction log, and that a
   buffered native-H3 request returns its request-buffer charge before its
   response streams.
+- **Functional coverage for route total deadlines during pre-authentication
+  SOAP body collection** (#6008). Real-binary tests drive scripted HTTP/1.1,
+  h2c, and native HTTP/3 clients against `soap_ws_security` in all three
+  identity modes (UsernameToken, X.509 signature, SAML) under a
+  `mesh_route_dispatch` `request_timeout_ms`. They cover stalled, trickling,
+  and expired-ready uploads, and a chunk that is ready when the total elapses
+  (refused, not collected). They check read-bound/route-total ordering, and
+  that `backend_read_timeout_ms: 0` is still bounded by the total (plain
+  `504` and gRPC `DEADLINE_EXCEEDED`). They check the candidate-max profile,
+  including an untimed sibling, and that a reload during collection keeps the
+  pinned generation's total. They also cover open HTTP/2 DATA without
+  `Content-Length`, and that HTTP/3 writes the `504` before
+  `STOP_SENDING(H3_NO_ERROR)` and releases the retained-request permit. Each
+  test asserts the status, that the backend is never reached, and a lower
+  bound on the time to the answer. `docs/plugins.md` now spells out the
+  candidate-max profile with worked examples. No product change.
 - **BREAKING (library API) — `GrpcProxyError::ClientDeadlineExceeded`
   payload** (issue #6022). The variant carries a typed `GrpcDeadlinePhase`
   (ConnectionAcquisition / Handoff / RetryBackoff / StreamingResponseHeaders /
