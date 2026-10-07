@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Keep custom plugins named like cache finalizers in the chain** (#6022).
   Plugin-cache finalizer cleanup and CORS/mesh-route lookups now identify
-  built-ins by their registered concrete type as well as their name, so a
-  custom plugin cannot be removed or treated as a cache-internal finalizer by
-  reporting a sentinel name.
+  built-ins by their registered concrete type as well as their name. A custom
+  plugin that reports a finalizer's sentinel name is no longer silently removed
+  from its chain, and a custom plugin reporting `cors` or `mesh_route_dispatch`
+  is no longer treated as that built-in: placed between two real instances, it
+  now makes the chain fail the "must remain contiguous" check.
 - **Built-in plugin trust follows the registered type, not the reported
   name** (#6022). A custom plugin whose `name()` returned a built-in name was
   trusted as that built-in: its request-input declarations, its later
