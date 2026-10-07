@@ -194,8 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned generation's total. They also cover open HTTP/2 DATA without
   `Content-Length`, and that HTTP/3 writes the `504` before
   `STOP_SENDING(H3_NO_ERROR)` and releases the retained-request permit. Each
-  test asserts the status, that the backend is never reached, and a lower
-  bound on the time to the answer. `docs/plugins.md` now spells out the
+  refused upload asserts the status, that the backend is not reached, and a
+  lower bound on the time to the answer. `docs/plugins.md` now spells out the
   candidate-max profile with worked examples. No product change.
 - **BREAKING (library API) — `GrpcProxyError::ClientDeadlineExceeded`
   payload** (issue #6022). The variant carries a typed `GrpcDeadlinePhase`

@@ -9348,10 +9348,11 @@ Three consequences follow:
 - The bound is anchored at request receipt and pinned to the receiving
   generation. A reload that lands during the collect changes neither.
 
-`tests/functional/functional_soap_preauth_deadline_matrix_test.rs` checks
-this profile over real HTTP/1.1, HTTP/2, and HTTP/3 streams for every SOAP
-identity mode, together with stalled, trickling, late-wake, and expired-ready
-uploads and a reload during collection.
+`tests/functional/functional_soap_preauth_deadline_matrix_test.rs` drives the
+pre-authentication collect over real HTTP/1.1, HTTP/2, and HTTP/3 streams in
+all three SOAP identity modes (a stalled upload each), and checks this profile,
+trickling, late-wake, and expired-ready uploads and a reload during collection
+with UsernameToken.
 
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not
