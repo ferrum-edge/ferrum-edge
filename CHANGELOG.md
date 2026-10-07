@@ -68,6 +68,16 @@ upgrading crate consumers, dashboards or contract consumers.
   obsolete lockfile workflow and completed #5912 evidence page are removed.
   The dependency policy now documents how to lift the GCP, Smithy, and xxhash
   pins.
+- **OIDC session-secret screening refuses two more published fixture keys**
+  (#6037). `session.encryption_secret` and
+  `session.encryption_secret_previous` now also refuse two fixture keys that
+  Edge's own tests published. A stored config that uses either one now fails
+  admission and config load; generate a unique random secret. A known public
+  value is refused before the length check, so a short placeholder reports why
+  it is refused. Screening is narrower in two places: a secret that merely
+  contains `example`, or `${` not followed by an environment-variable name and
+  `}`, is accepted, and an unresolved `${NAME}` placeholder now fails with its
+  own error, "contains an unresolved `${NAME}` placeholder".
 
 ### Added
 
@@ -116,7 +126,8 @@ upgrading crate consumers, dashboards or contract consumers.
   header or authority rule on the same chain got no early bound. Each plugin
   now names the credential headers it strips and the claim headers it owns, so
   only rules on those headers stay undetermined.
-- **Backend HTTP/2 resets mid-response count as backend failures** (#6019).
+- **BREAKING — backend HTTP/2 resets mid-response count as backend failures**
+  (issue #6019).
   A backend `RST_STREAM` or `GOAWAY` with any reason other than `NO_ERROR`
   after response headers reached the body classifier as a hyper body error
   whose text matched no heuristic. It was logged as
@@ -180,8 +191,8 @@ upgrading crate consumers, dashboards or contract consumers.
   version compare per streaming request and, at the end of each HTTP/2
   upload, one read of the client stream's receive state, which takes h2's
   connection lock once.
-- **A backend HTTP/2 reset on a reqwest request or buffered response counts as
-  a backend failure** (#6022). `classify_reqwest_error` now uses the same typed
+- **BREAKING — a backend HTTP/2 reset on a reqwest request or buffered response
+  counts as a backend failure** (issue #6022). `classify_reqwest_error` now uses the same typed
   `h2::Error` check as the streaming body classifier (#6019). A non-`NO_ERROR`
   `RST_STREAM` or `GOAWAY` that the backend sent before the response headers,
   or while the eager collector read a buffered body, is `protocol_error`. It
