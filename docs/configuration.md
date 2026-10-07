@@ -294,9 +294,14 @@ replica-set pollers read ordered `config_changes` rows/documents after the
 accepted cursor, collapse each resource to the final operation in the batch, and
 point-load only those changed IDs. Delete records carry removals, so normal
 incremental polling does not scan every runtime collection or table ID.
-Retained-history gaps, saturated change batches (10,000 or more unread
-`config_changes` rows for the namespace), and consumer changes (which rehydrate
-quarantined credentials) force the same authoritative full-reload path. The
+Retained-history gaps and saturated change batches (10,000 or more unread
+`config_changes` rows for the namespace) force the same authoritative
+full-reload path. Consumer creates, updates, and deletes ride the incremental
+delta unless load-time quarantine could change their outcome: they escalate to
+a full reload (which rehydrates quarantined credentials from storage) while
+the namespace's last published full load quarantined a colliding consumer
+identity or an `hmac_auth` credential, before any full load has been published,
+and whenever a changed consumer carries `hmac_auth`. The
 reload records the change-log watermark it read before loading as its accepted
 cursor, so rows committed while it ran are picked up by the next incremental
 poll, and its validation cost is linear in cheap per-row work: the plugin

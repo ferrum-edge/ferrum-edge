@@ -1343,9 +1343,11 @@ const RELOAD_STEADY_SECS: u64 = 10;
 const RELOAD_POST_SECS: u64 = 10;
 /// Proxies in each small change applied after every wave. A 12,000-resource
 /// wave exceeds the poller's 10,000-row change-log limit and forces a full
-/// rebuild. Small changes come in two kinds: with new consumers (any consumer
-/// change also forces a full reload, by design) and proxies-only (new proxies
-/// whose plugins admit existing consumers), which takes the incremental path.
+/// rebuild. Small changes come in two kinds: with new `key_auth` consumers and
+/// proxies-only (new proxies whose plugins admit existing consumers). Both take
+/// the incremental path: consumer changes escalate to a full reload only while
+/// load-time quarantine is active or a changed consumer carries `hmac_auth`
+/// (issue #6060).
 const RELOAD_SMALL_CHANGE_PROXIES: usize = 100;
 /// Index bases for small-change proxies, clear of every wave's range.
 const RELOAD_SMALL_WITH_CONSUMERS_BASE: usize = 1_000_000;
@@ -1881,8 +1883,8 @@ fn second_points(buckets: &[LoadBucket], samples: &[ResourceSample]) -> Vec<Seco
 #[derive(serde::Serialize)]
 struct ReloadWaveResult {
     /// `"full"`: 3k proxies + consumers. `"small+consumers"`: 100 proxies +
-    /// consumers (consumer changes force a full reload). `"small-proxies"`: 100
-    /// proxies admitting existing consumers (incremental reload path).
+    /// `key_auth` consumers. `"small-proxies"`: 100 proxies admitting existing
+    /// consumers. Both small kinds take the incremental reload path.
     kind: &'static str,
     proxies_before: usize,
     proxies_after: usize,

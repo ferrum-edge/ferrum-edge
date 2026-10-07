@@ -2627,6 +2627,7 @@ pub async fn run(
                                 Ok((new_config, cursor)) => {
                                     match try_publish_full_reload_after_gate(
                                         &db_poll,
+                                        &poll_namespace,
                                         &db_available_poll,
                                         &proxy_state_poll,
                                         new_config,
@@ -2806,6 +2807,7 @@ pub async fn run(
                                                     Ok((new_config, cursor)) => {
                                                         match try_publish_full_reload_after_gate(
                                                             &db_poll,
+                                                            &poll_namespace,
                                                             &db_available_poll,
                                                             &proxy_state_poll,
                                                             new_config,
@@ -2883,6 +2885,7 @@ pub async fn run(
                                                                         Ok((new_config, cursor)) => {
                                                                             match try_publish_full_reload_after_gate(
                                                                                 &db_poll,
+                                                                                &poll_namespace,
                                                                                 &db_available_poll,
                                                                                 &proxy_state_poll,
                                                                                 new_config,
@@ -3000,6 +3003,7 @@ pub async fn run(
                                         Ok((new_config, cursor)) => {
                                             match try_publish_full_reload_after_gate(
                                                 &db_poll,
+                                                &poll_namespace,
                                                 &db_available_poll,
                                                 &proxy_state_poll,
                                                 new_config,
@@ -3066,6 +3070,7 @@ pub async fn run(
                                                             Ok((new_config, cursor)) => {
                                                                 match try_publish_full_reload_after_gate(
                                                                     &db_poll,
+                                                                    &poll_namespace,
                                                                     &db_available_poll,
                                                                     &proxy_state_poll,
                                                                     new_config,
@@ -3137,6 +3142,7 @@ pub async fn run(
                                 Ok((new_config, cursor)) => {
                                     match try_publish_full_reload_after_gate(
                                         &db_poll,
+                                        &poll_namespace,
                                         &db_available_poll,
                                         &proxy_state_poll,
                                         new_config,
@@ -3314,6 +3320,47 @@ pub(crate) async fn load_full_config_with_sequence(
 /// Returns `Some(accepted)` after `update_config` + [`commit_full_reload_poll_state`].
 #[allow(clippy::too_many_arguments)]
 async fn try_publish_full_reload_after_gate(
+    db: &Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    db_available: &AtomicBool,
+    proxy_state: &ProxyState,
+    new_config: GatewayConfig,
+    gate_context: &str,
+    commit_context: &str,
+    auto_apply_plugin_migrations: bool,
+    plugin_migration_reconcile_state: &AtomicU8,
+    last_change_cursor: &mut Option<LiveApplyCursor>,
+    cursor: LiveApplyCursor,
+    config_rejected: &AtomicBool,
+    runtime_config_apply: &RuntimeConfigApply,
+) -> Option<bool> {
+    let published = publish_full_reload_after_gate(
+        db,
+        db_available,
+        proxy_state,
+        new_config,
+        gate_context,
+        commit_context,
+        auto_apply_plugin_migrations,
+        plugin_migration_reconcile_state,
+        last_change_cursor,
+        cursor,
+        config_rejected,
+        runtime_config_apply,
+    )
+    .await;
+    // The loader recorded this snapshot's consumer quarantine state when it
+    // loaded it. If the snapshot did not go live, the published consumers
+    // still come from an older one, so consumer changes must escalate until a
+    // full reload publishes (issue #6060).
+    if published != Some(true) {
+        db.forget_consumer_quarantine_state(namespace);
+    }
+    published
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_full_reload_after_gate(
     db: &Arc<dyn DatabaseBackend>,
     db_available: &AtomicBool,
     proxy_state: &ProxyState,

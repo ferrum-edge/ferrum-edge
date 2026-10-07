@@ -27,6 +27,9 @@ use crate::config::db_backend::{
     ConditionalNamespaceRestore, ConditionalNamespaceSnapshot, GatewayTrustBundleRevisionConflict,
     NamespacePreconditionFailed,
 };
+use crate::config::db_backend::{
+    ConsumerQuarantineTracker, consumer_change_requires_authoritative_reload,
+};
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
     ExternalSpecUpstreamConflict, StoredEvidence, deployment_commit_unknown,
@@ -962,6 +965,9 @@ pub struct DatabaseStore {
     /// CLI > env > conf-file > default precedence and could protect the wrong
     /// namespaces.
     protected_namespaces: Vec<String>,
+    /// Namespaces whose last published full load quarantined no consumer, so
+    /// consumer changes can ride the incremental delta (issue #6060).
+    consumer_quarantine: Arc<ConsumerQuarantineTracker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2067,6 +2073,7 @@ impl DatabaseStore {
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+            consumer_quarantine: Arc::new(ConsumerQuarantineTracker::default()),
         };
 
         store.run_migrations().await?;
@@ -2166,6 +2173,7 @@ impl DatabaseStore {
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+            consumer_quarantine: Arc::new(ConsumerQuarantineTracker::default()),
         })
     }
 
@@ -2747,6 +2755,7 @@ impl DatabaseStore {
                 hmac_quarantined.len()
             );
         }
+        let consumer_quarantine_active = !quarantined.is_empty() || !hmac_quarantined.is_empty();
 
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
@@ -2830,6 +2839,12 @@ impl DatabaseStore {
             strip_api_spec_id_from_runtime_config(&mut config);
         }
 
+        // Only a load that reached here can be published, and only runtime
+        // and control-plane loads seed a poller (issue #6060).
+        if !matches!(purpose, FullConfigLoadPurpose::BackupExport) {
+            self.consumer_quarantine
+                .record_full_load(namespace, consumer_quarantine_active);
+        }
         self.check_slow_query("load_full_config", start);
         Ok(config)
     }
@@ -6727,7 +6742,10 @@ impl DatabaseStore {
             }
         }
 
-        if !consumer_ops.is_empty() {
+        // Consumer changes ride the delta only while the published consumer
+        // set has nothing quarantined; otherwise a delete or update may have
+        // to rehydrate a stripped credential (issue #6060).
+        if !consumer_ops.is_empty() && !self.consumer_quarantine.allows_consumer_deltas(namespace) {
             return Err(anyhow::Error::new(
                 crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
                     namespace,
@@ -6749,6 +6767,22 @@ impl DatabaseStore {
 
         let (proxy_upserts, mut removed_proxy_ids) = Self::split_change_ops(proxy_ops);
         let (consumer_upserts, mut removed_consumer_ids) = Self::split_change_ops(consumer_ops);
+        // Point-load consumers first: an upsert carrying a credential that
+        // quarantine judges across consumers escalates before any other
+        // resource is loaded.
+        let added_or_modified_consumers = self
+            .load_consumers_by_ids(namespace, &consumer_upserts)
+            .await?;
+        if added_or_modified_consumers
+            .iter()
+            .any(consumer_change_requires_authoritative_reload)
+        {
+            return Err(anyhow::Error::new(
+                crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                    namespace,
+                ),
+            ));
+        }
         let (plugin_config_upserts, mut removed_plugin_config_ids) =
             Self::split_change_ops(plugin_config_ops);
         let (upstream_upserts, mut removed_upstream_ids) = Self::split_change_ops(upstream_ops);
@@ -6766,9 +6800,6 @@ impl DatabaseStore {
                 .cloned(),
         );
 
-        let added_or_modified_consumers = self
-            .load_consumers_by_ids(namespace, &consumer_upserts)
-            .await?;
         let loaded_consumer_ids: HashSet<String> = added_or_modified_consumers
             .iter()
             .map(|consumer| consumer.id.clone())
@@ -12544,6 +12575,10 @@ impl DatabaseBackend for DatabaseStore {
         scope: &PolicyGraphScope,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_policy_neighborhood(self, namespace, scope).await
+    }
+
+    fn forget_consumer_quarantine_state(&self, namespace: &str) {
+        self.consumer_quarantine.forget(namespace);
     }
 
     async fn count_namespace_resources(

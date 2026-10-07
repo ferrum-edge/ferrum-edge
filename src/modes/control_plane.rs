@@ -86,6 +86,10 @@ pub trait CpFullLoadSource: Send + Sync {
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
     async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error>;
+
+    /// See [`DatabaseBackend::forget_consumer_quarantine_state`]: a loaded
+    /// snapshot the CP rejects never goes live (issue #6060).
+    fn forget_consumer_quarantine_state(&self, _namespace: &str) {}
 }
 
 #[async_trait::async_trait]
@@ -107,6 +111,10 @@ where
 
     async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
         DatabaseBackend::latest_global_change_sequence(self).await
+    }
+
+    fn forget_consumer_quarantine_state(&self, namespace: &str) {
+        DatabaseBackend::forget_consumer_quarantine_state(self, namespace);
     }
 }
 
@@ -759,7 +767,9 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
         let config = db
             .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
             .await?;
-        let mut config = prepare_cp_full_snapshot(config)?;
+        let mut config = prepare_cp_full_snapshot(config).inspect_err(|_| {
+            db.forget_consumer_quarantine_state(ns);
+        })?;
         // `mesh` is owned by the K8s overlay slot, never by a DB snapshot; the
         // publication step re-merges it (#2982).
         config.mesh = None;
@@ -784,6 +794,7 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
                     acc.apply_success(ns, next);
                 }
                 Err(error) => {
+                    db.forget_consumer_quarantine_state(ns);
                     error!(
                         namespace = %sanitize_startup_scalar(ns),
                         error = %sanitize_startup_cause(&error, &[]),
