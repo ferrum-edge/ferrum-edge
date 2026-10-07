@@ -754,8 +754,7 @@ async fn h1_upload(
     let complete = upload.script.complete_body();
     let mut head = format!(
         "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {}\r\n",
-        upload.path,
-        upload.content_type
+        upload.path, upload.content_type
     );
     for (name, value) in &upload.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
