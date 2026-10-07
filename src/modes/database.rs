@@ -2803,7 +2803,21 @@ pub async fn run(
                                             runtime_config_apply_poll
                                                 .record_accepted_cursor(next_cursor);
                                             drop(final_topology_permit);
-                                            debug!("Incremental config poll valid but unchanged");
+                                            log_config_change_applied(
+                                                ConfigChangeStages {
+                                                    path: "incremental (unchanged)",
+                                                    trigger: config_poll_wake_label(wake),
+                                                    resources: changed_resources,
+                                                    sequence: next_cursor.sequence,
+                                                    load: load_elapsed,
+                                                    apply: apply_elapsed,
+                                                    write_to_live: runtime_config_apply_poll
+                                                        .take_write_to_live(next_cursor),
+                                                },
+                                                proxy_state_poll
+                                                    .env_config
+                                                    .db_slow_query_threshold_ms,
+                                            );
                                             rejected_delta_tracker.record_accepted();
                                         }
                                         Ok(proxy::ConfigApplyOutcome::Rejected { errors }) => {
@@ -3403,7 +3417,7 @@ async fn try_publish_full_reload_after_gate(
 
 /// Where one published config change spent its time (issue #6057).
 struct ConfigChangeStages<'a> {
-    /// `incremental` or `full reload`.
+    /// `incremental`, `incremental (unchanged)`, or `full reload`.
     path: &'static str,
     /// What started the poll: its wake-up, or the full-reload reason.
     trigger: &'a str,

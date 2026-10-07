@@ -339,3 +339,20 @@ async fn write_to_live_times_the_oldest_covered_write_once() {
         Some(Duration::from_millis(50))
     );
 }
+
+/// A rejected generation settles the writes it covers, so the next accepted
+/// change does not report their age as its write-to-live latency.
+#[tokio::test(start_paused = true)]
+async fn rejected_generation_clears_the_pending_write() {
+    let apply = RuntimeConfigApply::at_epoch("ferrum", 1, 10);
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 11));
+    tokio::time::advance(Duration::from_secs(600)).await;
+    apply.record_rejected_cursor(LiveApplyCursor::new(1, 11));
+
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 12));
+    tokio::time::advance(Duration::from_millis(40)).await;
+    assert_eq!(
+        apply.take_write_to_live(LiveApplyCursor::new(1, 12)),
+        Some(Duration::from_millis(40))
+    );
+}

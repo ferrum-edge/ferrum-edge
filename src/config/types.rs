@@ -5233,7 +5233,6 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate plugin resource invariants and proxy/plugin associations.
     /// Enabled `global` plugin configs grouped by plugin name, in config order.
     ///
     /// Composition validators resolve each proxy's effective instances of a
@@ -5254,6 +5253,7 @@ impl GatewayConfig {
         globals
     }
 
+    /// Validate plugin resource invariants and proxy/plugin associations.
     pub fn validate_plugin_references(&self) -> Result<(), Vec<String>> {
         // Proxy and plugin identities are namespace-local. Bare-id indexes
         // would accept a dangling same-namespace proxy_id whenever another

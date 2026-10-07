@@ -382,6 +382,16 @@ impl RuntimeConfigApply {
     }
 
     pub fn record_rejected_cursor(&self, cursor: LiveApplyCursor) {
+        // A rejected generation settles the writes it covers: a later accepted
+        // change must not report write-to-live from them (issue #6057).
+        if let Ok(mut oldest) = self.oldest_unapplied_write.lock()
+            && oldest.is_some_and(|(pending, _)| {
+                pending.topology_epoch == cursor.topology_epoch
+                    && pending.sequence <= cursor.sequence
+            })
+        {
+            *oldest = None;
+        }
         self.snapshot.send_modify(|snap| {
             if cursor.topology_epoch > snap.topology_epoch {
                 snap.topology_epoch = cursor.topology_epoch;
