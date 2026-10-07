@@ -6,12 +6,14 @@
 //! - [`grpc`] — raw `h2`-crate gRPC client. No codegen; tests supply bytes.
 //! - [`http3`] — Phase 3 QUIC + HTTP/3 client (uses `quinn` + `h3`).
 //! - [`udp`] / [`dtls`] — Phase 4 raw-UDP and DTLS clients.
+//! - [`raw_h2`] — deterministic shutdown for a raw `h2` client connection.
 
 pub mod dtls;
 pub mod grpc;
 pub mod http1;
 pub mod http2;
 pub mod http3;
+pub mod raw_h2;
 pub mod udp;
 
 pub use dtls::DtlsClient;
