@@ -211,6 +211,10 @@ def render_markdown(manifest, summary):
         lines.append(f"## {suite}")
         lines.append("")
         lines.append(f"Concurrency {first.get('concurrency')}, {first.get('duration_secs')} s measured per leg.")
+        if first.get("concurrency") == 1:
+            lines.append("")
+            lines.append("One connection: RPS is bounded by round-trip latency, so read `Added p50` "
+                         "(the time the gateway hop adds) rather than `Overhead`.")
         lines.append("")
         lines.append("| Protocol | Gateway RPS | Direct RPS | Overhead | Gateway p50 | Gateway p99 | Added p50 | "
                      "Gateway CPU/req | RPS CV | Errors | Flags |")
@@ -227,6 +231,11 @@ def render_markdown(manifest, summary):
     return "\n".join(lines)
 
 
+def suite_order(suite):
+    """Throughput suites by payload size first, then the latency suite."""
+    return (suite.startswith("latency"), payload_from_suite(suite) or 0, suite)
+
+
 def payload_from_suite(suite):
     digits = "".join(ch for ch in suite.rsplit("_", 1)[-1] if ch.isdigit())
     return int(digits) if digits else None
@@ -238,7 +247,8 @@ def summarize(out):
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     samples = load_samples(out)
     summary = {}
-    for suite, per_protocol in samples.items():
+    for suite in sorted(samples, key=suite_order):
+        per_protocol = samples[suite]
         rows = {}
         for protocol in ordered(per_protocol):
             row = summarize_protocol(per_protocol[protocol])
@@ -250,7 +260,7 @@ def summarize(out):
     document = {"manifest": manifest, "suites": summary}
     (out / "summary.json").write_text(json.dumps(document, indent=2, allow_nan=False) + "\n")
     # Every raw leg report, so the summary can be re-derived without the logs.
-    (out / "samples.json").write_text(json.dumps(samples, indent=1, allow_nan=False) + "\n")
+    (out / "samples.json").write_text(json.dumps(samples, separators=(",", ":"), allow_nan=False) + "\n")
     (out / "summary.md").write_text(render_markdown(manifest, summary) + "\n")
     return document
 

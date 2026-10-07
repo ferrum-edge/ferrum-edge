@@ -1,0 +1,48 @@
+{
+  "started_utc": "2026-10-06T23:17:56Z",
+  "suite": "tests/performance/multi_protocol/run_published_benchmark.sh",
+  "git": {
+    "commit": "e5c7616277549e81ed5cc8534cbb82764d01118c",
+    "describe": "v0.9.13-11-ge5c761627",
+    "dirty": false
+  },
+  "gateway_version": "0.9.13",
+  "build_profile": "release",
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "environment": {
+    "os": "macOS 26.6.1 (arm64)",
+    "cpu": "Apple M4",
+    "logical_cpus": 10,
+    "memory_gib": 16.0,
+    "load_average": [
+      4.94,
+      9.48,
+      8.96
+    ]
+  },
+  "args": {
+    "protocols": [
+      "http1",
+      "http1-tls",
+      "http2",
+      "http3",
+      "ws",
+      "grpc",
+      "tcp",
+      "tcp-tls",
+      "udp",
+      "udp-dtls"
+    ],
+    "runs": 3,
+    "duration_secs": 15,
+    "concurrency": 200,
+    "payload_sizes": [
+      64,
+      10240
+    ],
+    "latency_duration_secs": 10,
+    "latency_concurrency": 1,
+    "cooldown_secs": 2,
+    "udp_payload_cap_bytes": 2048
+  }
+}

@@ -251,6 +251,13 @@ JSON output (`--json`):
 
 ## Benchmark Results
 
+> **Current published results** live in
+> [`../published/`](../published/) — one provenance-stamped bundle per
+> publicly quoted run (latest: [`2026-10-06-apple-m4`](../published/2026-10-06-apple-m4/summary.md)).
+> The tables in this section are historical investigation notes from single
+> runs, and the HTTP/1.1+TLS rows used a plain-HTTP direct baseline. Do not
+> quote them.
+
 ### Phases and observed concurrency (tracker #5588, section 1)
 
 Every throughput protocol uses the same five phases:

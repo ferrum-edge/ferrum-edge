@@ -156,9 +156,35 @@ Every chunk posts with **`?apply=async`** (issue #4139): the graph commits durab
 
 (Numbers above are from a real run -- actual results depend on hardware.)
 
-## Baseline Results (SQLite, release build, Apple Silicon)
+## Baseline Results (SQLite, release build, Apple M4)
 
-Results from a real run on a MacBook, showing proxy hot-path performance as config scales from 3k to 30k. Always use `cargo build --release` for meaningful performance numbers — debug builds have significant overhead from disabled optimizations and extra bounds checking. The echo backend uses hyper with HTTP/1.1 keep-alive, and the test runtime uses `multi_thread` flavor for realistic async throughput.
+Run 2026-10-06 at commit `e5c7616` on an Apple M4 (10 cores, 16 GB, macOS
+26.6.1): gateway `cargo build --release`, test binary `--profile ci-release`,
+5 s warmup + 30 s measured window per wave, 50 workers. Raw JSON:
+[`tests/performance/published/2026-10-06-apple-m4/scale-sqlite.json`](../performance/published/2026-10-06-apple-m4/scale-sqlite.json).
+
+| Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | Max(ms) | CPU/req(µs) | % Baseline |
+|---------|------|---------|---------|---------|---------|---------|-------------|------------|
+| 3,000 | 88,874 | 0.6 | 0.5 | 0.8 | 1.0 | 3.3 | 56.5 | 100% |
+| 6,000 | 88,355 | 0.6 | 0.5 | 0.8 | 1.0 | 3.2 | 56.3 | 99% |
+| 9,000 | 88,229 | 0.6 | 0.5 | 0.8 | 1.0 | 3.7 | 56.9 | 99% |
+| 12,000 | 87,465 | 0.6 | 0.6 | 0.8 | 1.0 | 3.3 | 58.0 | 98% |
+| 15,000 | 86,972 | 0.6 | 0.6 | 0.9 | 1.0 | 20.8 | 57.5 | 98% |
+| 18,000 | 87,024 | 0.6 | 0.6 | 0.9 | 1.0 | 4.3 | 58.3 | 98% |
+| 21,000 | 86,967 | 0.6 | 0.6 | 0.9 | 1.0 | 3.2 | 58.6 | 98% |
+| 24,000 | 86,762 | 0.6 | 0.6 | 0.9 | 1.1 | 3.2 | 58.5 | 98% |
+| 27,000 | 86,663 | 0.6 | 0.6 | 0.9 | 1.1 | 13.9 | 57.9 | 98% |
+| 30,000 | 86,736 | 0.6 | 0.6 | 0.9 | 1.0 | 3.0 | 59.0 | 98% |
+
+**2.4% throughput change** from 3k to 30k proxies; 0 failed out of
+26,221,987 measured requests. Gateway CPU per authenticated request rose from
+56.5 µs to 59.0 µs.
+
+### Historical results (undated, provenance unrecorded)
+
+An earlier undated run recorded ~49k RPS at 3k proxies and 13.8% degradation to
+30k. It had no warmup, counted failed requests in RPS, and its commit, host, and test
+profile were not recorded, so it is kept only for context:
 
 | Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | Max(ms) | % Baseline |
 |---------|------|---------|---------|---------|---------|---------|------------|
@@ -172,10 +198,6 @@ Results from a real run on a MacBook, showing proxy hot-path performance as conf
 | 24,000 | 45,612 | 1.1 | 1.0 | 1.7 | 2.4 | 25.6 | 93% |
 | 27,000 | 44,363 | 1.1 | 1.0 | 1.7 | 2.5 | 26.2 | 90% |
 | 30,000 | 42,434 | 1.2 | 1.1 | 1.9 | 2.8 | 113.2 | 86% |
-
-**13.8% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures. ~49k RPS baseline with 1.0ms P50 latency on a release build.
-
-Batch API creation speed: ~3,200-3,900 resources/s (vs ~5-116/s with individual API calls).
 
 ## Interpreting Results
 
