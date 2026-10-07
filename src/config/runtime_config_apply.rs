@@ -222,6 +222,10 @@ pub struct RuntimeConfigApply {
     waiter_count: AtomicUsize,
     max_waiting_epoch: AtomicU64,
     max_waiting: AtomicU64,
+    /// The oldest admin write this process issued a cursor for that no
+    /// accepted generation covers yet, and when it committed. Lets the poll
+    /// loop report write-to-live latency per change (issue #6057).
+    oldest_unapplied_write: std::sync::Mutex<Option<(LiveApplyCursor, Instant)>>,
 }
 
 impl RuntimeConfigApply {
@@ -275,6 +279,7 @@ impl RuntimeConfigApply {
             waiter_count: AtomicUsize::new(0),
             max_waiting_epoch: AtomicU64::new(topology_epoch),
             max_waiting: AtomicU64::new(0),
+            oldest_unapplied_write: std::sync::Mutex::new(None),
         }
     }
 
@@ -306,6 +311,11 @@ impl RuntimeConfigApply {
     /// sequences from continuously re-arming the database poll loop while
     /// preserving the covering-cursor semantics for concurrent mutations.
     pub fn record_issued_cursor(&self, cursor: LiveApplyCursor) {
+        if let Ok(mut oldest) = self.oldest_unapplied_write.lock()
+            && oldest.is_none_or(|(pending, _)| pending.topology_epoch != cursor.topology_epoch)
+        {
+            *oldest = Some((cursor, Instant::now()));
+        }
         self.snapshot.send_modify(|snap| {
             if cursor.topology_epoch == snap.topology_epoch {
                 snap.issued_through = Some(
@@ -314,6 +324,21 @@ impl RuntimeConfigApply {
                 );
             }
         });
+    }
+
+    /// Time since the oldest admin write that `accepted` now covers committed,
+    /// if this process issued one. Clears it so the next write starts a new
+    /// measurement. Writes issued later but also covered are not timed
+    /// separately: the oldest one is the change's write-to-live latency.
+    pub fn take_write_to_live(&self, accepted: LiveApplyCursor) -> Option<Duration> {
+        let mut oldest = self.oldest_unapplied_write.lock().ok()?;
+        let (pending, committed_at) = (*oldest)?;
+        if pending.topology_epoch != accepted.topology_epoch || pending.sequence > accepted.sequence
+        {
+            return None;
+        }
+        *oldest = None;
+        Some(committed_at.elapsed())
     }
 
     /// Whether `cursor` is covered by a cursor minted by this process in the

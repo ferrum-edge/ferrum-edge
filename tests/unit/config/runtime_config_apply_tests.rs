@@ -304,3 +304,38 @@ async fn only_a_blocking_status_wait_raises_the_immediate_wake() {
         "a blocking status wait must nudge the poll loop"
     );
 }
+
+/// Issue #6057: the poll loop reports write-to-live latency from the oldest
+/// admin write an accepted generation covers.
+#[tokio::test(start_paused = true)]
+async fn write_to_live_times_the_oldest_covered_write_once() {
+    let apply = RuntimeConfigApply::at_epoch("ferrum", 1, 10);
+    assert_eq!(apply.take_write_to_live(LiveApplyCursor::new(1, 20)), None);
+
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 11));
+    tokio::time::advance(Duration::from_millis(300)).await;
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 12));
+    tokio::time::advance(Duration::from_millis(200)).await;
+
+    // A generation that does not cover the oldest write reports nothing yet.
+    assert_eq!(apply.take_write_to_live(LiveApplyCursor::new(1, 10)), None);
+    // Another topology's generation never matches.
+    assert_eq!(apply.take_write_to_live(LiveApplyCursor::new(2, 50)), None);
+    assert_eq!(
+        apply.take_write_to_live(LiveApplyCursor::new(1, 12)),
+        Some(Duration::from_millis(500)),
+        "measured from the oldest covered write"
+    );
+    assert_eq!(
+        apply.take_write_to_live(LiveApplyCursor::new(1, 12)),
+        None,
+        "each write is reported once"
+    );
+
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 13));
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert_eq!(
+        apply.take_write_to_live(LiveApplyCursor::new(1, 13)),
+        Some(Duration::from_millis(50))
+    );
+}
