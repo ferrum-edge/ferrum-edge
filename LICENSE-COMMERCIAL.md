@@ -1,6 +1,6 @@
 # Commercial License
 
-Copyright (c) 2026 Ferrum Edge
+Copyright (c) 2026 Ferrum Edge LLC
 
 The software in this repository is licensed under the PolyForm Noncommercial
 License 1.0.0 for noncommercial use. See the [LICENSE](LICENSE) file for details.
@@ -8,7 +8,7 @@ License 1.0.0 for noncommercial use. See the [LICENSE](LICENSE) file for details
 ## Commercial Use
 
 If you wish to use Ferrum Edge for commercial purposes, you must obtain a
-separate commercial license.
+separate commercial license from Ferrum Edge LLC.
 
 Commercial use includes, but is not limited to:
 
