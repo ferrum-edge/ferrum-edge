@@ -233,8 +233,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SOAP body collection** (#6008). Real-binary tests drive scripted HTTP/1.1,
   h2c, and native HTTP/3 clients against `soap_ws_security` in all three
   identity modes (UsernameToken, X.509 signature, SAML) under a
-  `mesh_route_dispatch` `request_timeout_ms`. They cover stalled, trickling,
-  and expired-ready uploads, and a chunk that is ready when the total elapses
+  `mesh_route_dispatch` `request_timeout_ms`. They cover stalled and
+  trickling uploads, a complete upload whose total elapses after collection
+  but before dispatch, and a chunk that is ready when the total elapses
   (refused, not collected). They check read-bound/route-total ordering, and
   that `backend_read_timeout_ms: 0` is still bounded by the total (plain
   `504` and gRPC `DEADLINE_EXCEEDED`). They check the candidate-max profile,

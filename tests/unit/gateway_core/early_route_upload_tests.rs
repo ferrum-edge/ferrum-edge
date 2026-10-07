@@ -35,7 +35,7 @@ use ferrum_edge::_test_support::{
     EarlyBodyCollectOutcomeForTest as Outcome, H3UploadWaitOutcomeForTest,
     buffer_early_request_body_for_test, collect_h3_upload_under_authorization_for_test,
     early_route_total_ms_for_test, early_upload_deadlines_for_test,
-    plugin_cache_early_route_total_ms_for_test,
+    plugin_cache_early_route_total_ms_for_test, request_view_early_route_total_ms_for_test,
 };
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
@@ -736,19 +736,22 @@ fn proxy_plugin(id: &str, name: &str, config: serde_json::Value) -> PluginConfig
     make_plugin_config_with_json(id, name, config, PluginScope::Proxy, Some("p1"))
 }
 
-fn cached(plugin_configs: Vec<PluginConfig>) -> PluginCache {
+fn gateway_config(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
     let ids: Vec<String> = plugin_configs
         .iter()
         .map(|config| config.id.clone())
         .collect();
     let proxy = make_proxy("p1", "/", ids.iter().map(String::as_str).collect());
-    let config = GatewayConfig {
+    GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
         plugin_configs,
         ..Default::default()
-    };
-    PluginCache::new(&config).expect("plugin cache")
+    }
+}
+
+fn cached(plugin_configs: Vec<PluginConfig>) -> PluginCache {
+    PluginCache::new(&gateway_config(plugin_configs)).expect("plugin cache")
 }
 
 fn cached_preview(cache: &PluginCache, ctx: &RequestContext) -> Option<u64> {
@@ -813,6 +816,37 @@ async fn cached_fixed_header_writers_keep_other_header_rules_decided() {
     let gold = request("/soap", &[("x-soap-tier", "gold")]);
     assert_eq!(cached_preview(&cache, &gold), Some(800));
     assert_eq!(cached_preview(&cache, &request("/soap", &[])), Some(5000));
+}
+
+fn single_route_generation(total_ms: u64) -> GatewayConfig {
+    let rules = json!({ "rules": [path_rule("/", Some(total_ms))] });
+    gateway_config(vec![mesh_config("route", rules)])
+}
+
+/// The preview reads the generation the request was received on. A reload
+/// that lands after the request view is taken, and before the early collector
+/// previews the total, changes neither that request's bound nor anything
+/// else it reads; the next request takes the new generation's total.
+#[tokio::test]
+async fn the_preview_reads_the_generation_the_request_was_received_on() {
+    let cache = PluginCache::new(&single_route_generation(6_000)).expect("plugin cache");
+    let ctx = request("/soap", &[]);
+    let received = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    cache
+        .rebuild(&single_route_generation(600))
+        .expect("reload");
+
+    assert_eq!(
+        request_view_early_route_total_ms_for_test(&received, &ctx, false),
+        Some(6_000),
+        "a request previews the total of the generation it was received on"
+    );
+    assert_eq!(
+        cached_preview(&cache, &ctx),
+        Some(600),
+        "a request received after the reload takes the new total"
+    );
 }
 
 /// Run the cache's real `before_proxy` chain and report the total it arms.

@@ -9,7 +9,8 @@
 //! with scripted clients that control every chunk's timing, and check:
 //!
 //! - all three SOAP identity modes (UsernameToken, X.509 signature, SAML);
-//! - stalled, trickling and expired-ready uploads;
+//! - stalled and trickling uploads, and a complete upload whose total elapses
+//!   after it was collected but before dispatch;
 //! - read/route deadline ordering, and a chunk that is ready when the route
 //!   total elapses (late wake: refused, never collected);
 //! - `backend_read_timeout_ms: 0` still bounded by the route total, for plain
@@ -352,8 +353,9 @@ fn soap_yaml(backend_port: u16, total_ms: u64) -> String {
 // Backend
 // ---------------------------------------------------------------------------
 
-/// A plaintext HTTP/1.1 backend that answers every client request `200 ok`
-/// and counts them.
+/// A plaintext backend that answers every HTTP/1.1 client request `200 ok`
+/// and counts it. It also counts every request stream a gateway opens over
+/// h2c (a native gRPC dispatch), so a gRPC upload that reached it is seen.
 struct CountingBackend {
     port: u16,
     hits: Arc<AtomicUsize>,
@@ -418,9 +420,11 @@ async fn serve_counted_connection(mut stream: TcpStream, hits: Arc<AtomicUsize>)
                 return;
             }
         };
-        // The file-mode capability probe opens with the h2c preface, whose
-        // `PRI * HTTP/2.0` line also ends in a blank line. It is no request.
+        // The h2c preface's `PRI * HTTP/2.0` line also ends in a blank line.
+        // Only its request streams are requests: the file-mode capability
+        // probe opens the preface too, but sends no HEADERS.
         if buf.starts_with(b"PRI * HTTP/2.0") {
+            count_h2c_requests(stream, buf, hits).await;
             return;
         }
         // Every upload under test is a POST; anything else is a probe.
@@ -453,6 +457,43 @@ async fn serve_counted_connection(mut stream: TcpStream, hits: Arc<AtomicUsize>)
         buf.drain(..body_end);
         if stream.write_all(BACKEND_RESPONSE).await.is_err() {
             return;
+        }
+    }
+}
+
+const H2C_PREFACE_LEN: usize = 24;
+/// How long an h2c connection may stay quiet before it is closed. The
+/// capability probe waits for SETTINGS that never come, so it then sees the
+/// close and classifies h2c unsupported, as it would against any HTTP/1.1
+/// backend.
+const H2C_QUIET: Duration = Duration::from_millis(250);
+const H2_FRAME_HEADER_LEN: usize = 9;
+const H2_FRAME_HEADERS: u8 = 0x1;
+
+/// Count each client HEADERS frame on an h2c connection as one request, and
+/// close the connection once it goes quiet. Nothing is answered.
+async fn count_h2c_requests(mut stream: TcpStream, mut buf: Vec<u8>, hits: Arc<AtomicUsize>) {
+    while buf.len() < H2C_PREFACE_LEN {
+        if !fill(&mut stream, &mut buf).await {
+            return;
+        }
+    }
+    buf.drain(..H2C_PREFACE_LEN);
+    loop {
+        while buf.len() >= H2_FRAME_HEADER_LEN {
+            let length = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+            let frame_end = H2_FRAME_HEADER_LEN + length;
+            if buf.len() < frame_end {
+                break;
+            }
+            if buf[3] == H2_FRAME_HEADERS {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }
+            buf.drain(..frame_end);
+        }
+        match timeout(H2C_QUIET, fill(&mut stream, &mut buf)).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return,
         }
     }
 }
@@ -1364,20 +1405,45 @@ async fn a_chunk_ready_when_the_route_total_elapses_is_refused_not_collected() {
     backend.assert_untouched("late-wake upload").await;
 }
 
-/// Expired-ready: the whole valid body is ready with the request head, under
-/// a 1 ms total that has elapsed by the time anything can act on it. Whether
-/// the collector refuses before polling or a later stage refuses before
-/// dispatch, the answer is the route-timeout `504` and no backend is dialed.
+/// A complete, valid body ready with the request head is collected and
+/// authenticated well inside the total, and the matched rule's fault delay
+/// then outlasts the total. Gateway-local hooks are not cancelled mid-hook,
+/// so the answer cannot come before the delay ends: it is the pre-dispatch
+/// refusal of an elapsed total, the route-timeout `504` with the
+/// `request_timeout` token, and no backend is dialed.
+///
+/// This cannot exercise the collector's refuse-before-poll of an elapsed,
+/// ready body. Nothing the gateway does between receipt and the collector's
+/// first poll reliably outlasts even a 1 ms total, so a host fast enough
+/// collects that body, authenticates it, and hands it to the backend before
+/// the total elapses: a 504 the backend held, correctly `backend_timeout`.
+/// The deterministic collector tests pin that property
+/// (`tests/unit/gateway_core/early_route_upload_tests.rs`,
+/// `*_an_elapsed_*_refuses_a_ready_body_without_polling_it`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-async fn an_upload_ready_at_receipt_under_an_elapsed_total_never_reaches_the_backend() {
+async fn a_ready_upload_whose_total_elapses_before_dispatch_never_reaches_the_backend() {
+    const FAULT_DELAY_MS: u64 = 2 * ROUTE_TOTAL_MS;
     let backend = CountingBackend::spawn().await;
-    let gateway = MatrixGateway::spawn(soap_yaml(backend.port, 1), &[]).await;
+    let port = backend.port;
+    let mut delayed = rule(port, json!({}), Some(ROUTE_TOTAL_MS));
+    delayed["fault"] = json!({"delay": {"duration_ms": FAULT_DELAY_MS, "percentage": 100.0}});
+    let yaml = gateway_yaml(
+        port,
+        &[Route::soap(
+            "soap",
+            "/soap",
+            SoapMode::UsernameToken,
+            LONG_READ_TIMEOUT_MS,
+            vec![delayed],
+        )],
+    );
+    let gateway = MatrixGateway::spawn(yaml, &[]).await;
     let upload = Upload::soap("/soap/op", BodyScript::complete(valid_envelope()));
     for outcome in gateway.upload_on_every_protocol(&upload).await {
-        assert_route_timeout(&outcome, ms(1), "expired-ready upload");
+        assert_route_timeout(&outcome, ms(FAULT_DELAY_MS), "elapsed before dispatch");
     }
-    backend.assert_untouched("expired-ready upload").await;
+    backend.assert_untouched("elapsed before dispatch").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,7 +1576,9 @@ async fn undecided_rules_bound_the_collect_at_the_largest_candidate_total() {
 }
 
 /// If any candidate is untimed there is no early route bound: the read bound
-/// ends the collect with its `408`, never the shorter sibling's `504`.
+/// ends the collect with its `408`, never the shorter sibling's `504`. The
+/// untimed candidate is a catch-all on the path, which is decided before
+/// authentication, behind the undecided identity rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn an_untimed_candidate_leaves_only_the_read_bound() {
@@ -1527,7 +1595,7 @@ async fn an_untimed_candidate_leaves_only_the_read_bound() {
             READ_MS,
             vec![
                 identity_rule(port, Some(SIBLING_MS)),
-                rule(port, json!({}), None),
+                rule(port, json!({"uri": {"prefix": "/"}}), None),
             ],
         )],
     );
@@ -1548,6 +1616,13 @@ async fn an_untimed_candidate_leaves_only_the_read_bound() {
 /// upload's bound: it keeps the total of the generation it was received on.
 /// The interim `100 Continue` proves the collect had started before the
 /// reload; a request received afterwards takes the new total.
+///
+/// The collector previews its total just before that first poll, so here the
+/// bound is already armed when the reload lands. A reload between receipt and
+/// the preview cannot be timed from outside the gateway; that the preview
+/// reads the received generation is pinned by
+/// `the_preview_reads_the_generation_the_request_was_received_on`
+/// (`tests/unit/gateway_core/early_route_upload_tests.rs`).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
