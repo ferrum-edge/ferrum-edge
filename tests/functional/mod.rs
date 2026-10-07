@@ -140,6 +140,7 @@ mod functional_serverless_grpc_terminate_test;
 mod functional_serverless_mirror_test;
 mod functional_service_discovery_test;
 mod functional_shared_harness_smoke_test;
+mod functional_soap_preauth_deadline_matrix_test;
 mod functional_spec_expose_test;
 mod functional_sse_test;
 mod functional_stream_listener_failure_test;

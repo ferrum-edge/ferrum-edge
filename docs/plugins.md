@@ -3347,6 +3347,8 @@ A configuration that establishes a principal — `username_token`, `x509_signatu
 
 A **timestamp-only** configuration proves freshness and nothing about the caller. It establishes no principal, is not an authentication plugin (so it never turns an ordinary request into "Authentication required"), and keeps validating in `before_proxy`. The two phases are selected by configuration and never both run, so a message is never validated twice.
 
+The pre-authentication collect is bounded by the earliest of three deadlines: the proxy's `backend_read_timeout_ms`, any client RPC deadline, and the receipt-anchored `request_timeout_ms` of the `mesh_route_dispatch` rule the request will select. When that rule cannot be decided before authentication, the largest candidate total applies, and an untimed candidate turns the route bound off. See [Route request deadline → Candidate-max profile](#route-request-deadline). A route expiry answers `504` `{"error":"Request timeout"}` (gRPC `DEADLINE_EXCEEDED`) without reaching the backend.
+
 Because authentication precedes the shared buffered-body normalization phase, two compositions are rejected at config admission (file-mode startup fails, Admin validation returns `400`, a DP/reload keeps the last known good generation):
 
 - An identity-establishing instance alongside any other authentication plugin (including a second identity-establishing `soap_ws_security` instance), in either auth mode. Both modes stop after the first mechanism establishes an identity; single-auth also makes the first rejection terminal, while multi-auth can let a later success override an earlier rejection. Any of those outcomes can skip or ignore a mandatory WS-Security message gate. Disable the other authentication mechanisms on that proxy.
@@ -9301,6 +9303,56 @@ is the `before_dispatch` `504` above, and gRPC folds the total into
   routes.
 - The transaction log names an early route expiry
   `route_request_timeout_early_upload` on HTTP/1.1, HTTP/2, and HTTP/3.
+
+**Candidate-max profile.** The early bound is a ceiling on the collect only.
+Once `before_proxy` selects a rule, that rule's own total is armed as usual
+for the rest of the request. The preview computes the bound per request, from
+the generation the request was received on:
+
+1. It walks the `mesh_route_dispatch` instances in chain order and each
+   instance's rules in order. A rule is *decided* when no input it matches on
+   may still change. A decided rule that does not match is skipped. The first
+   decided match ends that instance's walk.
+2. Each rule that cannot be decided, and the decided match that ends the walk
+   after one, is a *candidate* if it reaches a backend. It contributes its
+   `request_timeout_ms`, or "untimed" when it has none. A redirect, a certain
+   fault abort, or a decided waypoint veto contributes nothing.
+3. If the instance may still publish nothing, the unmatched outcome is a
+   candidate too. Without `reject_unmatched`, the request goes to the proxy's
+   own backend with no total, so the candidate is untimed. The deferred
+   `reject_unmatched` `404` contributes nothing, unless a routing plugin may
+   publish an override first.
+4. The bound is the largest candidate total. There is no early route bound if
+   any candidate is untimed, if an instance cannot be previewed, or if a
+   decided rule reached before any undecided one answers the request itself (a
+   redirect or a certain abort), because that request never arms a total.
+
+| Rules that can still be selected when the body is collected | Early bound |
+|---|---|
+| A decided match with `request_timeout_ms: T` | `T` |
+| An undecided rule `T1`, then a decided catch-all `T2` | the larger of `T1` and `T2` |
+| An undecided rule `T1`, then a decided catch-all with no `request_timeout_ms` | none: `backend_read_timeout_ms` and the RPC deadline only |
+| An undecided rule `T1` and no catch-all, without `reject_unmatched` | none: an unmatched request dispatches untimed |
+| An undecided rule `T1` and no catch-all, with `reject_unmatched` | `T1`: the deferred `404` never dispatches |
+| An undecided redirect, then a decided catch-all `T2` | `T2`: the redirect adds no candidate |
+
+Three consequences follow:
+
+- The bound can only be the longest possible total, never a shorter one the
+  client picks. A client that sends `x-consumer-username` itself does not
+  decide a rule on that header, so it cannot select a shorter sibling's total.
+- An untimed sibling turns the early bound off. With
+  `backend_read_timeout_ms: 0` on such a route, no time bound applies to the
+  collect except a client RPC deadline. The read timeout is the operator's
+  backstop.
+- The bound is anchored at request receipt and pinned to the receiving
+  generation. A reload that lands during the collect changes neither.
+
+`tests/functional/functional_soap_preauth_deadline_matrix_test.rs` drives the
+pre-authentication collect over real HTTP/1.1, HTTP/2, and HTTP/3 streams in
+all three SOAP identity modes (a stalled upload each). With UsernameToken it
+checks this profile, trickling and late-wake uploads, a ready upload whose
+total elapses before dispatch, and a reload during collection.
 
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not

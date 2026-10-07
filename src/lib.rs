@@ -14857,6 +14857,17 @@ pub mod _test_support {
         identity_ready: bool,
     ) -> Option<u64> {
         let view = cache.request_view(namespace, proxy_id, protocol);
+        request_view_early_route_total_ms_for_test(&view, ctx, identity_ready)
+    }
+
+    /// [`plugin_cache_early_route_total_ms_for_test`] through a request view
+    /// the caller already holds, so a test can pin one generation across a
+    /// reload. Milliseconds from receipt, or `None`.
+    pub fn request_view_early_route_total_ms_for_test(
+        view: &crate::plugin_cache::PluginCacheRequestView,
+        ctx: &crate::plugins::RequestContext,
+        identity_ready: bool,
+    ) -> Option<u64> {
         let at = view.early_route_total_at(ctx, identity_ready)?;
         let elapsed = at.duration_since(ctx.grpc_deadline_received_at);
         Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))

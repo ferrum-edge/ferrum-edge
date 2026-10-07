@@ -2269,6 +2269,7 @@ jobs:
               functional_protocol_h2_body_limit_config_test
               functional_protocol_body_limit_config_test
               functional_early_upload_deadline_test
+              functional_soap_preauth_deadline_matrix_test
               functional_h1_h2_auth_lifetime_test
               functional_h3_auth_lifetime_test
               functional_h3_authority_validation_test
