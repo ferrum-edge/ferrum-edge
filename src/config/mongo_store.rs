@@ -2608,6 +2608,115 @@ mod inner {
             Ok(candidate)
         }
 
+        /// Policy-graph neighborhood for plugin-graph admission (issue #6056):
+        /// the SQL loader's indexed point reads, expressed as `_id`,
+        /// `plugins.plugin_config_id`, `scope`, and `plugin_name` filters in one
+        /// snapshot transaction when a replica set provides one.
+        async fn load_policy_graph_neighborhood(
+            &self,
+            namespace: &str,
+            scope: &crate::config::policy_graph_scope::PolicyGraphScope,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            let loaded_at = Utc::now();
+            let scoped_proxy_ids: Vec<String> = scope.proxy_ids.iter().cloned().collect();
+            let changed_ids: Vec<&str> = scope
+                .changed_plugin_config_ids
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let proxy_filter = doc! {
+                "namespace": namespace,
+                "$or": [
+                    { "_id": { "$in": namespaced_doc_ids(namespace, &scoped_proxy_ids) } },
+                    { "plugins.plugin_config_id": { "$in": changed_ids } },
+                ],
+            };
+            let plugin_filter = |proxies: &[Proxy]| {
+                let mut ids: std::collections::BTreeSet<&str> = scope.named_plugin_config_ids();
+                ids.extend(
+                    proxies
+                        .iter()
+                        .flat_map(|proxy| proxy.plugins.iter())
+                        .map(|association| association.plugin_config_id.as_str()),
+                );
+                let ids: Vec<String> = ids
+                    .into_iter()
+                    .map(|id| namespaced_doc_id(namespace, id))
+                    .collect();
+                doc! {
+                    "namespace": namespace,
+                    "$or": [
+                        { "_id": { "$in": ids } },
+                        { "scope": "global" },
+                        { "plugin_name": {
+                            "$in": crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES.to_vec(),
+                        } },
+                    ],
+                }
+            };
+            let (mut proxies, mut plugin_configs) = if self.replica_set_configured() {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .read_concern(ReadConcern::snapshot())
+                    .write_concern(WriteConcern::majority())
+                    .await?;
+
+                let loaded = async {
+                    let proxies = self
+                        .find_proxies_opt_session(
+                            proxy_filter,
+                            Some((connection.as_ref(), &mut session)),
+                            true,
+                        )
+                        .await?;
+                    let plugin_configs = self
+                        .find_plugin_configs_opt_session(
+                            plugin_filter(&proxies),
+                            Some((connection.as_ref(), &mut session)),
+                            true,
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>((proxies, plugin_configs))
+                }
+                .await;
+
+                match loaded {
+                    Ok(resources) => {
+                        session.commit_transaction().await?;
+                        resources
+                    }
+                    Err(error) => {
+                        let _ = session.abort_transaction().await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                let proxies = self
+                    .find_proxies_opt_session(proxy_filter, None, true)
+                    .await?;
+                let plugin_configs = self
+                    .find_plugin_configs_opt_session(plugin_filter(&proxies), None, true)
+                    .await?;
+                (proxies, plugin_configs)
+            };
+
+            // Match the SQL loader's id order, which fixes stable tie order in
+            // plugin-chain composition.
+            proxies.sort_by(|left, right| left.id.cmp(&right.id));
+            plugin_configs.sort_by(|left, right| left.id.cmp(&right.id));
+            let mut candidate = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+                proxies,
+                plugin_configs,
+                loaded_at,
+                ..Default::default()
+            };
+            candidate.normalize_fields();
+            Ok(candidate)
+        }
+
         async fn acquire_durable_admission_lock(
             &self,
             collection_name: &str,
@@ -9820,6 +9929,14 @@ mod inner {
             namespace: &str,
         ) -> Result<GatewayConfig, anyhow::Error> {
             self.load_mtls_dns_policy_candidate(namespace).await
+        }
+
+        async fn load_namespace_policy_neighborhood(
+            &self,
+            namespace: &str,
+            scope: &crate::config::policy_graph_scope::PolicyGraphScope,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            self.load_policy_graph_neighborhood(namespace, scope).await
         }
 
         async fn count_namespace_resources(
@@ -17357,7 +17474,18 @@ mod inner {
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
             snapshot: bool,
         ) -> Result<Vec<Proxy>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
+            self.find_proxies_opt_session(doc! { "namespace": namespace }, session, snapshot)
+                .await
+        }
+
+        /// Decode every proxy document matching `filter`, which must carry the
+        /// namespace predicate.
+        async fn find_proxies_opt_session(
+            &self,
+            filter: Document,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
+        ) -> Result<Vec<Proxy>, anyhow::Error> {
             let mut proxies = Vec::new();
 
             if let Some((connection, s)) = session {
@@ -17441,7 +17569,18 @@ mod inner {
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
             snapshot: bool,
         ) -> Result<Vec<PluginConfig>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
+            self.find_plugin_configs_opt_session(doc! { "namespace": namespace }, session, snapshot)
+                .await
+        }
+
+        /// Decode every plugin-config document matching `filter`, which must
+        /// carry the namespace predicate.
+        async fn find_plugin_configs_opt_session(
+            &self,
+            filter: Document,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
+        ) -> Result<Vec<PluginConfig>, anyhow::Error> {
             let mut plugin_configs = Vec::new();
 
             if let Some((connection, s)) = session {

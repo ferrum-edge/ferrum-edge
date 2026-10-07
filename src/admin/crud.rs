@@ -27,6 +27,7 @@ use crate::config::db_backend::{
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::policy_graph_scope::{PolicyGraphScope, requires_full_policy_graph};
 use crate::config::runtime_config_apply::LiveApplyMode;
 use crate::config::types::{
     Consumer, GatewayConfig, PlaceholderRendering, PluginConfig, PluginScope, Proxy,
@@ -1909,45 +1910,144 @@ pub(crate) async fn validate_plugin_graph_candidates(
     plugins: &[PluginConfig],
     removed_plugin_id: Option<&str>,
 ) -> Result<(), AfterValidateError> {
+    let candidate =
+        plugin_graph_admission_candidate(db, namespace, proxies, plugins, removed_plugin_id)
+            .await
+            .map_err(AfterValidateError::Db)?;
+    let http_client = super::plugin_validation_http_client(state);
+    validate_candidate_plugin_graph(&candidate, &http_client)
+}
+
+/// The post-write policy graph a plugin-graph admission validates.
+///
+/// Composition invariants are per proxy apart from a few namespace-wide plugin
+/// types, so a write that only touches some proxies' chains is validated
+/// against the neighborhood [`PolicyGraphScope`] names: those proxies, their
+/// plugin configs, every global, and every namespace-wide instance. Loading
+/// and revalidating the whole namespace for every write made one `POST /batch`
+/// cost O(namespace) and bulk onboarding O(N²) (issue #6056).
+///
+/// The full graph is still used when the write submits, replaces, or removes a
+/// global plugin config (a global joins every chain), or when the candidate
+/// holds a policy only the whole namespace can decide
+/// ([`requires_full_policy_graph`]).
+pub(crate) async fn plugin_graph_admission_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxies: &[Proxy],
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> DbResult<GatewayConfig> {
     // Global plugin scope is global within one runtime namespace. CP snapshots
     // are filtered before broadcast and file/database modes load one namespace,
     // so cross-namespace plugins must never create false admission conflicts.
-    let mut candidate = db
-        .load_namespace_policy_graph(namespace)
-        .await
-        .map_err(AfterValidateError::Db)?;
+    if let Some(scope) = PolicyGraphScope::for_write(proxies, plugins, removed_plugin_id) {
+        let neighborhood = db
+            .load_namespace_policy_neighborhood(namespace, &scope)
+            .await?;
+        // The neighborhood carries every global, so a write replacing or
+        // removing a config that is global today is visible here.
+        let changes_existing_global = neighborhood.plugin_configs.iter().any(|plugin| {
+            plugin.scope == PluginScope::Global
+                && scope.changed_plugin_config_ids.contains(&plugin.id)
+        });
+        if !changes_existing_global {
+            let candidate = overlay_plugin_graph_write(
+                neighborhood,
+                namespace,
+                proxies,
+                plugins,
+                removed_plugin_id,
+            );
+            if !requires_full_policy_graph(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    let graph = db.load_namespace_policy_graph(namespace).await?;
+    Ok(overlay_plugin_graph_write(
+        graph,
+        namespace,
+        proxies,
+        plugins,
+        removed_plugin_id,
+    ))
+}
 
+/// Apply a Proxy/PluginConfig write to a loaded policy graph exactly as
+/// persistence will: submitted rows replace same-id rows or are appended, a
+/// removed config disappears, and a proxy-scoped config is attached to its
+/// `proxy_id` (persistence inserts that association in the same transaction,
+/// issue #4611). Overlays are id-indexed so a large write stays linear.
+fn overlay_plugin_graph_write(
+    mut candidate: GatewayConfig,
+    namespace: &str,
+    proxies: &[Proxy],
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> GatewayConfig {
     if let Some(removed_plugin_id) = removed_plugin_id {
         candidate
             .plugin_configs
             .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
     }
+    overlay_resources_by_id(&mut candidate.proxies, proxies, |proxy| proxy.id.as_str());
+    overlay_resources_by_id(&mut candidate.plugin_configs, plugins, |plugin| {
+        plugin.id.as_str()
+    });
 
-    for proxy in proxies {
-        if let Some(existing) = candidate
-            .proxies
-            .iter_mut()
-            .find(|item| item.namespace == namespace && item.id == proxy.id)
-        {
-            *existing = proxy.clone();
-        } else {
-            candidate.proxies.push(proxy.clone());
-        }
-    }
+    let proxy_index: std::collections::HashMap<String, usize> = candidate
+        .proxies
+        .iter()
+        .enumerate()
+        .map(|(index, proxy)| (proxy.id.clone(), index))
+        .collect();
     for plugin in plugins {
-        if let Some(existing) = candidate
-            .plugin_configs
-            .iter_mut()
-            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        if plugin.namespace != namespace || plugin.scope != PluginScope::Proxy {
+            continue;
+        }
+        let Some(&index) = plugin
+            .proxy_id
+            .as_deref()
+            .and_then(|proxy_id| proxy_index.get(proxy_id))
+        else {
+            continue;
+        };
+        let proxy = &mut candidate.proxies[index];
+        if !proxy
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == plugin.id)
         {
-            *existing = plugin.clone();
-        } else {
-            candidate.plugin_configs.push(plugin.clone());
+            proxy.plugins.push(crate::config::types::PluginAssociation {
+                plugin_config_id: plugin.id.clone(),
+            });
         }
     }
+    candidate
+}
 
-    let http_client = super::plugin_validation_http_client(state);
-    validate_candidate_plugin_graph(&candidate, &http_client)
+/// Replace each same-id resource in `existing` with its `incoming` version, or
+/// append it, in O(existing + incoming).
+pub(crate) fn overlay_resources_by_id<'a, T: Clone + 'a>(
+    existing: &mut Vec<T>,
+    incoming: impl IntoIterator<Item = &'a T>,
+    id: impl Fn(&T) -> &str,
+) {
+    let mut index: std::collections::HashMap<String, usize> = existing
+        .iter()
+        .enumerate()
+        .map(|(position, item)| (id(item).to_string(), position))
+        .collect();
+    for item in incoming {
+        match index.get(id(item)) {
+            Some(&position) => existing[position] = item.clone(),
+            None => {
+                index.insert(id(item).to_string(), existing.len());
+                existing.push(item.clone());
+            }
+        }
+    }
 }
 
 /// Validate the exact graph produced by deleting a Proxy, including the

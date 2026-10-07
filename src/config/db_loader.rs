@@ -38,6 +38,7 @@ use crate::config::namespace_registry::{
     NamespaceRegistryRetryableConflict, check_namespace_registry_fault, namespace_registry_fault,
     protected_namespaces_contains, require_namespace_registry_admission_leases,
 };
+use crate::config::policy_graph_scope::PolicyGraphScope;
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -2926,6 +2927,168 @@ impl DatabaseStore {
         config.normalize_fields();
         self.check_slow_query("load_namespace_policy_graph", start);
         Ok(config)
+    }
+
+    /// Load the policy-graph neighborhood `scope` names with indexed point
+    /// reads in one snapshot transaction, so plugin-graph admission costs what
+    /// the write touches rather than the namespace (issue #6056). Equal to
+    /// `scope.restrict(load_namespace_policy_graph(namespace))`.
+    pub async fn load_namespace_policy_neighborhood(
+        &self,
+        namespace: &str,
+        scope: &PolicyGraphScope,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
+        let loaded_at = Utc::now();
+        let purpose = FullLoadPurpose::AdmissionValidation;
+        let operation = purpose.operation();
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+
+        // Proxies associated with a changed plugin config join the scope.
+        let changed_ids: Vec<&str> = scope
+            .changed_plugin_config_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut proxy_ids: BTreeSet<String> = scope.proxy_ids.clone();
+        for row in self
+            .fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT DISTINCT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id IN",
+                namespace,
+                &changed_ids,
+            )
+            .await
+            .map_err(|e| Self::proxy_plugin_association_query_error(operation, Some(namespace), e))?
+        {
+            proxy_ids.insert(Self::proxy_plugin_association_proxy_id(&row, operation)?);
+        }
+        let proxy_ids: Vec<&str> = proxy_ids.iter().map(String::as_str).collect();
+
+        let mut plugins_by_proxy: ProxyPluginAssociations = HashMap::new();
+        for row in self
+            .fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id IN",
+                namespace,
+                &proxy_ids,
+            )
+            .await
+            .map_err(|e| Self::proxy_plugin_association_query_error(operation, Some(namespace), e))?
+        {
+            Self::push_proxy_plugin_association_row(&mut plugins_by_proxy, &row, operation)?;
+        }
+        let mut plugin_ids: BTreeSet<&str> = scope.named_plugin_config_ids();
+        plugin_ids.extend(
+            plugins_by_proxy
+                .values()
+                .flatten()
+                .map(|association| association.plugin_config_id.as_str()),
+        );
+        let plugin_ids: Vec<String> = plugin_ids.into_iter().map(str::to_string).collect();
+        let plugin_ids: Vec<&str> = plugin_ids.iter().map(String::as_str).collect();
+
+        let mut proxies = Vec::with_capacity(proxy_ids.len());
+        for row in self
+            .fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT * FROM proxies WHERE namespace = ? AND id IN",
+                namespace,
+                &proxy_ids,
+            )
+            .await?
+        {
+            let id: String = row
+                .try_get("id")
+                .map_err(|error| purpose.map_row_error("proxy", None, anyhow::Error::new(error)))?;
+            let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
+            proxies.push(
+                row_to_proxy(&row, id.clone(), plugins)
+                    .map_err(|error| purpose.map_row_error("proxy", Some(id), error))?,
+            );
+        }
+        Self::ensure_no_unmatched_proxy_plugin_associations(operation, &plugins_by_proxy)?;
+
+        let mut plugin_rows = self
+            .fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT * FROM plugin_configs WHERE namespace = ? AND id IN",
+                namespace,
+                &plugin_ids,
+            )
+            .await?;
+        plugin_rows.extend(
+            sqlx::query(
+                &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND scope = 'global'"),
+            )
+            .bind(namespace)
+            .fetch_all(&mut *tx)
+            .await?,
+        );
+        plugin_rows.extend(
+            self.fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT * FROM plugin_configs WHERE namespace = ? AND plugin_name IN",
+                namespace,
+                crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES,
+            )
+            .await?,
+        );
+        tx.commit().await?;
+
+        let mut plugin_configs: BTreeMap<String, PluginConfig> = BTreeMap::new();
+        for row in plugin_rows {
+            let id: String = row.try_get("id").map_err(|error| {
+                purpose.map_row_error("plugin_config", None, anyhow::Error::new(error))
+            })?;
+            if plugin_configs.contains_key(&id) {
+                continue;
+            }
+            let plugin_config = row_to_plugin_config(&row)
+                .map_err(|error| purpose.map_row_error("plugin_config", Some(id.clone()), error))?;
+            plugin_configs.insert(id, plugin_config);
+        }
+
+        // Match the full load's `ORDER BY id`, which fixes stable tie order in
+        // plugin-chain composition.
+        proxies.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs: plugin_configs.into_values().collect(),
+            loaded_at,
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        };
+        config.normalize_fields();
+        self.check_slow_query("load_namespace_policy_neighborhood", start);
+        Ok(config)
+    }
+
+    /// `{select_prefix} (?, ?, ...)` over `values` in bounded chunks inside
+    /// `tx`. `select_prefix` must bind `namespace` as its only placeholder and
+    /// end with `IN`.
+    async fn fetch_namespace_rows_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        select_prefix: &str,
+        namespace: &str,
+        values: &[&str],
+    ) -> Result<Vec<AnyRow>, sqlx::Error> {
+        let mut rows = Vec::new();
+        for chunk in values.chunks(Self::ASSOCIATION_LOOKUP_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!("{select_prefix} ({placeholders})"));
+            let mut query = sqlx::query(&sql).bind(namespace);
+            for value in chunk {
+                query = query.bind(*value);
+            }
+            rows.extend(query.fetch_all(&mut **tx).await?);
+        }
+        Ok(rows)
     }
 
     async fn conditional_namespace_snapshot_tx(
@@ -12343,6 +12506,14 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_policy_graph(self, namespace).await
+    }
+
+    async fn load_namespace_policy_neighborhood(
+        &self,
+        namespace: &str,
+        scope: &PolicyGraphScope,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_namespace_policy_neighborhood(self, namespace, scope).await
     }
 
     async fn count_namespace_resources(

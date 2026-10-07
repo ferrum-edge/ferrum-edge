@@ -152,6 +152,10 @@ fn batch_create_admission_uses_point_uniqueness_instead_of_namespace_snapshot() 
         !plugin_graph.contains("load_namespace_snapshot(namespace)"),
         "plugin-graph admission must not load the full namespace snapshot"
     );
+    assert!(
+        plugin_graph.contains("load_namespace_policy_neighborhood(namespace, &scope)"),
+        "plugin-graph admission must load only the write's neighborhood when it can (issue #6056)"
+    );
 }
 
 #[test]
