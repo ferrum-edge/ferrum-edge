@@ -39,6 +39,27 @@ crate-private (#6022). None carried an authorization lifetime, and the gateway
 never called them. Gateway configuration, the Admin API, and metrics are
 unchanged.
 
+**Backend HTTP/2 resets and buffered response read errors are reclassified
+(#6022).** No `gateway-errors` class, token, status, or `request_reached_wire`
+value changes, but operators who key dashboards, alerts, or breaker policy on
+`error_class` should check:
+
+- a backend `RST_STREAM` or `GOAWAY` with any reason but `NO_ERROR` before the
+  response headers on a reqwest route is now `protocol_error`, not
+  `request_error`, and is charged to that target's circuit breaker and passive
+  health. That includes `RST_STREAM(REFUSED_STREAM)`;
+- a read error while buffering a larger or size-limited reqwest response now
+  reports its real class (`protocol_error`, `connection_closed`,
+  `read_write_timeout`, and so on) instead of `response_body_too_large`. A
+  `request_error`-class read error is no longer charged to the breaker;
+- a reqwest read timeout while buffering that response is now `504`
+  (`backend_timeout`), and the other read errors' `502` body is now
+  `{"error":"Backend response body read failed"}` instead of
+  `{"error":"Backend response read error"}`;
+- those `502`s can now be retried under `retryable_status_codes` for a method
+  in `retryable_methods`, as the small-response collector's already were.
+  `response_body_too_large` was never retried.
+
 ## Upgrading to 0.9.13
 
 0.9.13 (2026-10-06 UTC) is cut from main

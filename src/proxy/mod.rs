@@ -48799,6 +48799,13 @@ async fn proxy_to_backend(
                 // Pass `ctx_bytes_sent_observed` as the shared counter so the
                 // body adapter writes byte counts directly into the context that
                 // summary builders read — no separate handle-capture needed.
+                //
+                // An HTTP/2 client's upload EOF must be its own END_STREAM
+                // (issue #6022): hyper reports an inbound RST_STREAM(NO_ERROR)
+                // as a clean end of body, which must abort the backend upload,
+                // never complete it. Never for HTTP/1.1, whose valid chunked
+                // EOF need not update `is_end_stream()`.
+                let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
                 let incoming = (*original_req).into_body();
                 // Authorization lifetime for the UPLOAD direction (#3815). A
                 // client-streaming or bidirectional upload whose backend
@@ -48816,7 +48823,8 @@ async fn proxy_to_backend(
                         effective_max_request_body_size_bytes,
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
-                    );
+                    )
+                    .with_h2_end_stream_required(require_end_stream);
                     // Adapter deadline PLUS a gateway-owned pump. Reqwest may
                     // negotiate HTTP/2, in which case its connection task parks
                     // on stream send capacity exactly like the direct-H2 pipe
@@ -48850,7 +48858,8 @@ async fn proxy_to_backend(
                     let counting = body::CountingIncoming::new_with_counter(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
-                    );
+                    )
+                    .with_h2_end_stream_required(require_end_stream);
                     // Same pairing as the size-limited arm above; see there for
                     // why the join point is observed rather than awaited to
                     // completion.
@@ -50526,6 +50535,10 @@ async fn proxy_to_backend_direct_h1(
                 }
             }
             ClientRequestBody::Streaming(original_req) => {
+                // An HTTP/2 client's upload EOF must be its own END_STREAM
+                // (issue #6022), so a masked client reset aborts the backend
+                // upload instead of completing it. Never for HTTP/1.1.
+                let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
                 let incoming = (*original_req).into_body();
                 let upload_auth_deadline = request_upload_auth_deadline(
                     Some(request_ctx),
@@ -50539,7 +50552,8 @@ async fn proxy_to_backend_direct_h1(
                         effective_max_request_body_size_bytes,
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
-                    );
+                    )
+                    .with_h2_end_stream_required(require_end_stream);
                     let (limited, pump) = install_streaming_upload_authorization(
                         limited,
                         upload_auth_deadline.as_ref(),
@@ -50554,7 +50568,8 @@ async fn proxy_to_backend_direct_h1(
                     let counting = body::CountingIncoming::new_with_counter(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
-                    );
+                    )
+                    .with_h2_end_stream_required(require_end_stream);
                     let (counting, pump) = install_counting_upload_authorization(
                         counting,
                         upload_auth_deadline.as_ref(),
@@ -51070,16 +51085,21 @@ impl BufferedCollectFailure {
         }
     }
 
-    /// Mid-body read failure. The class is deliberately unchanged from before
-    /// this failure type existed — both former `Err` arms of the collector were
-    /// mapped to `ResponseBodyTooLarge` by every call site. Re-labelling it is a
-    /// telemetry change with no bearing on the buffering bounds, so it is left
-    /// for a separate change.
-    fn read_error() -> Self {
+    /// Mid-body read failure, classified exactly as the eager small-body
+    /// collector classifies the same failure
+    /// ([`eager_buffer_body_read_status_and_class`] over
+    /// [`retry::classify_reqwest_error`]), so one backend fault gets one class
+    /// on every reqwest response arm (issue #6022). A backend HTTP/2 reset is
+    /// `ProtocolError`, as on the streaming arm; it used to be labelled
+    /// `ResponseBodyTooLarge`. Response headers already arrived, so the class
+    /// is post-wire and `retry_on_connect_failure` never replays it.
+    fn read_error(error: &reqwest::Error) -> Self {
+        let (status_code, error_class) =
+            eager_buffer_body_read_status_and_class(retry::classify_reqwest_error(error));
         Self {
-            status_code: 502,
-            body: r#"{"error":"Backend response read error"}"#.as_bytes().to_vec(),
-            error_class: retry::ErrorClass::ResponseBodyTooLarge,
+            status_code,
+            body: eager_buffer_body_read_error_body(status_code),
+            error_class,
         }
     }
 
@@ -51155,7 +51175,7 @@ async fn collect_response_with_limit(
             },
             Err(e) => {
                 error!("Error reading backend response: {}", e);
-                return Err(BufferedCollectFailure::read_error());
+                return Err(BufferedCollectFailure::read_error(&e));
             }
         }
     }
@@ -56304,12 +56324,17 @@ async fn proxy_to_backend_hbone_after_ready(
     let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
+            // Read before `parts.version` is rewritten for the backend: an
+            // HTTP/2 client's upload EOF must be its own END_STREAM (issue
+            // #6022). Never for HTTP/1.1.
+            let require_end_stream = parts.version == hyper::Version::HTTP_2;
             let body = body::SizeLimitedIncoming::new_with_counter(
                 body,
                 max_request_body_size,
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
-            );
+            )
+            .with_h2_end_stream_required(require_end_stream);
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
@@ -57378,12 +57403,17 @@ async fn proxy_to_backend_unix(
     let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
+            // Read before `parts.version` is rewritten for the backend: an
+            // HTTP/2 client's upload EOF must be its own END_STREAM (issue
+            // #6022). Never for HTTP/1.1.
+            let require_end_stream = parts.version == hyper::Version::HTTP_2;
             let body = body::SizeLimitedIncoming::new_with_counter(
                 body,
                 max_request_body_size,
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
-            );
+            )
+            .with_h2_end_stream_required(require_end_stream);
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
@@ -59003,12 +59033,17 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
+            // Read before `parts.version` is rewritten for the backend: an
+            // HTTP/2 client's upload EOF must be its own END_STREAM (issue
+            // #6022). Never for HTTP/1.1.
+            let require_end_stream = parts.version == hyper::Version::HTTP_2;
             let body = body::SizeLimitedIncoming::new_with_counter(
                 body,
                 max_request_body_size,
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
-            );
+            )
+            .with_h2_end_stream_required(require_end_stream);
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
@@ -61163,6 +61198,10 @@ async fn proxy_to_backend_http3(
                     );
                 }
 
+                // An HTTP/2 client's upload EOF must be its own END_STREAM
+                // (issue #6022), so a masked client reset cancels the backend
+                // H3 stream instead of finishing it. Never for HTTP/1.1.
+                let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
                 let (_parts, body) = (*original_req).into_parts();
                 let http3_headers = build_http3_backend_headers(
                     state,
@@ -61204,6 +61243,7 @@ async fn proxy_to_backend_http3(
                             backend_url,
                             &http3_headers,
                             body,
+                            require_end_stream,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
@@ -61227,6 +61267,7 @@ async fn proxy_to_backend_http3(
                             backend_url,
                             &http3_headers,
                             body,
+                            require_end_stream,
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,

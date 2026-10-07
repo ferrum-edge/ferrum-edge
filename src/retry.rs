@@ -1498,7 +1498,9 @@ pub(crate) fn error_chain_is_protocol_nack(e: &(dyn StdError + 'static)) -> bool
 /// 4. [`classify_typed_chain`] with `phase_is_connect = false` — rustls is
 ///    conservatively `ConnectionReset` (case 4); hyper `is_canceled` is
 ///    `ConnectionPoolError` (case 3); other mid-stream classification.
-/// 5. HTTP/2 protocol-error substring fallback (`h2` / `GOAWAY` / `RESET_STREAM`).
+/// 5. Typed backend HTTP/2 reset ([`is_backend_h2_reset`]) → `ProtocolError`,
+///    the same verdict [`classify_body_error`] gives a streaming body.
+/// 6. HTTP/2 protocol-error substring fallback (`h2` / `GOAWAY` / `RESET_STREAM`).
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
     // rebinds — to a blocked IP) surfaces as a connect-phase io error carrying
@@ -1571,9 +1573,19 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return class;
     }
 
-    // HTTP/2 protocol errors don't surface a typed downcast through
-    // reqwest's chain (reqwest hides hyper internals), so this substring
-    // fallback remains. Tokens are HTTP/2-specific, not generic.
+    // A backend RST_STREAM / GOAWAY reaches here typed, as the `h2::Error`
+    // under reqwest's hyper error, and its text carries no token the substring
+    // fallback below recognizes, so it used to fall through to `RequestError`
+    // and be banked as a backend success. Same predicate as the streaming
+    // classifier (`classify_body_error`). `ProtocolError` is post-wire: a reset
+    // before response headers stays out of `retry_on_connect_failure`, because
+    // the backend may already have processed the request.
+    if backend_h2_reset_in_chain(StdError::source(e)) {
+        return ErrorClass::ProtocolError;
+    }
+
+    // HTTP/2 protocol errors that are not a typed backend reset fall back to
+    // substring matching. Tokens are HTTP/2-specific, not generic.
     let source_chain = format!("{:?}", e);
     if source_chain.contains("GOAWAY")
         || source_chain.contains("RESET_STREAM")
@@ -1615,6 +1627,45 @@ pub fn classify_hyper_client_error(e: &hyper::Error) -> ErrorClass {
         return ErrorClass::ConnectionClosed;
     }
     ErrorClass::RequestError
+}
+
+/// Whether `err` is an HTTP/2 `RST_STREAM` or `GOAWAY` the BACKEND caused.
+///
+/// Only backend-caused frames count: received from the peer (`is_remote`) or
+/// sent by h2 because the peer violated the protocol (`is_library`). A
+/// gateway-originated reset (hyper resetting the backend stream because the
+/// gateway's request body errored, e.g. a client reset relayed as CANCEL, an
+/// authorization expiry, or a request-size refusal) or a bare reason
+/// (`h2::Error::from(Reason)`) is not charged to the backend.
+///
+/// NO_ERROR is excluded: hyper's body already ends a NO_ERROR reset as a clean
+/// early response (RFC 9113 §8.1) and a NO_ERROR GOAWAY is a graceful
+/// shutdown, so one that still reaches a classifier keeps its previous class
+/// instead of becoming a backend failure.
+///
+/// Shared by [`classify_body_error`] (streaming bodies) and
+/// [`classify_reqwest_error`] (request-phase errors and buffered body reads),
+/// so the same backend reset gets the same class on every reqwest arm. Typed,
+/// and allocates nothing.
+fn is_backend_h2_reset(err: &(dyn StdError + 'static)) -> bool {
+    err.downcast_ref::<h2::Error>().is_some_and(|h2_err| {
+        (h2_err.is_remote() || h2_err.is_library())
+            && h2_err
+                .reason()
+                .is_some_and(|reason| reason != h2::Reason::NO_ERROR)
+    })
+}
+
+/// [`is_backend_h2_reset`] anywhere in `start`'s source chain.
+fn backend_h2_reset_in_chain(start: Option<&(dyn StdError + 'static)>) -> bool {
+    let mut current = start;
+    while let Some(err) = current {
+        if is_backend_h2_reset(err) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 /// Whether the error chain contains a native-H3 stream error
@@ -1709,20 +1760,8 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
         // `h2::Error`, and neither its Display nor its Debug text carries a token
         // the string fallback recognizes, so it used to fall through to
         // `RequestError` and the deferred dispatch banked a phantom success.
-        // Only backend-caused frames count: received from the peer (`is_remote`)
-        // or sent by h2 because the peer violated the protocol (`is_library`).
-        // A gateway-originated reset or bare reason (`h2::Error::from(Reason)`,
-        // e.g. the upload pump relaying a client CANCEL) is not charged to the
-        // backend. NO_ERROR keeps its existing meaning: hyper's body already ends
-        // a NO_ERROR reset as a clean early response (RFC 9113 §8.1) and a
-        // NO_ERROR GOAWAY is a graceful shutdown, so one that still reaches this
-        // point falls through unchanged instead of becoming a backend failure.
-        if let Some(h2_err) = err.downcast_ref::<h2::Error>()
-            && (h2_err.is_remote() || h2_err.is_library())
-            && h2_err
-                .reason()
-                .is_some_and(|reason| reason != h2::Reason::NO_ERROR)
-        {
+        // See `is_backend_h2_reset` for which frames are charged.
+        if is_backend_h2_reset(err) {
             return (ErrorClass::ProtocolError, false);
         }
         if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
