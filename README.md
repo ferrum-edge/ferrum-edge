@@ -592,21 +592,24 @@ publishes them in
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
 Edge source. The latest tag is
+[`contracts-edge-0.9.13`](https://github.com/ferrum-edge/ferrum-contracts/tree/9626821eb089c71f5d4d71268c7b8276a8a5ab50)
+at `9626821eb089c71f5d4d71268c7b8276a8a5ab50`, prepared against Edge
+**v0.9.13**, published at 2026-10-06T17:04:49Z at release merge
+`9b83115de7ec23ab51ec4feae6bed65e596db425` (see the
+[v0.9.13 release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.13)).
+The earlier
 [`contracts-edge-0.9.12`](https://github.com/ferrum-edge/ferrum-contracts/tree/31f0a21d707795be293d15837c2f77c3d84219d8)
-at `31f0a21d707795be293d15837c2f77c3d84219d8`, prepared against Edge
-**v0.9.12**, published at 2026-10-05T12:33:02Z at release merge
-`0d917701b63ef38210c49df830f48cf0457cbc7d` (see the
-[0.9.12 record](docs/releases/v0.9.12.md)). The earlier
-[`contracts-edge-0.9.11`](https://github.com/ferrum-edge/ferrum-contracts/tree/390edbd5b2485af0988e02f7827fde778d76ae0a)
-tag at `390edbd5b2485af0988e02f7827fde778d76ae0a` remains unchanged.
+tag at `31f0a21d707795be293d15837c2f77c3d84219d8` remains unchanged.
 
-Edge **v0.9.13** changes Edge-owned admin contract surfaces: namespace and
-deployment snapshot tags move to `v2` MAC domains, deployment snapshots add
-`api_spec_contents` and digest-only spec evidence, conditional snapshot paths
-can return `507`, and `GET /backend-egress-policy` reports `schema_version: 2`.
-Consumer pins to `contracts-edge-0.9.12` or earlier predate these changes; move
-them only to a ferrum-contracts tag published for Edge 0.9.13. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0913).
+Edge **v0.9.14** changes Edge-owned contract surfaces: on a control plane,
+`GET /backend-egress-policy` gains an optional `data_plane_attestation` object
+and `GET /cluster` adds per-data-plane backend egress reports (additive;
+`schema_version` stays `2`); deployment mutation failures before commit report
+`durable: "not_committed"`; and backend HTTP/2 resets are reclassified as
+`protocol_error` without any `ErrorClass`, token or status change. Consumer pins
+to `contracts-edge-0.9.13` or earlier predate these changes; move them only to a
+ferrum-contracts tag published for Edge 0.9.14. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0914).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the
