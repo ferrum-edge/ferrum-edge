@@ -931,9 +931,9 @@ This means every WebSocket plugin works on H3 sessions unchanged:
   CONNECT, and H3 Extended CONNECT identical completion accounting)
 - Connection-admission via `FERRUM_WEBSOCKET_MAX_CONNECTIONS` and `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` (shared with H1/H2)
 - All authentication, authorization, and `before_proxy` plugins (run BEFORE the bridge accepts the upgrade)
-- Method policy sees `GET`, the method of the backend WebSocket handshake: route `allowed_methods`, `mesh_authz` `:method`, and `opa` `input.method` evaluate an H3 Extended CONNECT exactly like an H1 `GET` Upgrade or an H2 Extended CONNECT. The `FERRUM_TLS_EARLY_DATA_METHODS` 0-RTT gate still matches the wire method (`CONNECT`); plain CONNECT and CONNECT-UDP keep `CONNECT`
+- Method policy sees `GET`, the method of the backend WebSocket handshake: route `allowed_methods`, `mesh_authz` `:method`, and `opa` `input.method` evaluate an H3 Extended CONNECT exactly like an H1 `GET` Upgrade or an H2 Extended CONNECT. The `FERRUM_TLS_EARLY_DATA_METHODS` 0-RTT gate still matches the wire method (`CONNECT`) and runs before the rewrite, exactly as the HTTP/2 Extended CONNECT gate does; plain CONNECT and CONNECT-UDP keep `CONNECT`
 - Sticky-session cookies on the 200 response (same as H1/H2)
-- All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "GET"`, matching the H2 Extended CONNECT path)
+- All logging plugins. WebSocket session records — the `TransactionSummary` emitted at upgrade time, the `websocket_backend_error` record for a failed backend handshake, and the session-end disconnect context — carry the wire method `http_method = "CONNECT"` with status `200`, matching the H2 Extended CONNECT path (an H1 Upgrade logs `GET`/`101`). A request refused before the bridge dials (routing, `allowed_methods`, or a plugin rejection) is logged with the policy method `GET`
 
 ### Frame masking — RFC 6455 §5.1 applies unchanged on HTTP/3
 
@@ -1010,7 +1010,10 @@ pinning the recv task for the QUIC idle-timeout window.
 RFC 9220 Extended CONNECT can in principle be carried in QUIC 0-RTT
 early data, but `FERRUM_TLS_EARLY_DATA_METHODS` does NOT list `CONNECT`
 by default — operators who want WebSocket upgrades via 0-RTT must opt
-in explicitly. **CONNECT-UDP is never admitted in early data**, even
+in explicitly. The allowlist is matched against the wire method
+`CONNECT` before the WebSocket request is rewritten to `GET` for method
+policy, so `GET` alone answers a 0-RTT WebSocket `425 Too Early`. HTTP/2
+Extended CONNECT (RFC 8441) is gated on the same wire method. **CONNECT-UDP is never admitted in early data**, even
 when that allowlist includes `CONNECT`: UDP has no `Early-Data: 1`
 header boundary for a target to make its own replay-safety decision, so
 the handler rejects every 0-RTT `connect-udp` stream with `425 Too Early`

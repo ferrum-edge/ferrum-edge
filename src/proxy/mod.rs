@@ -32850,7 +32850,8 @@ async fn handle_proxy_request_inner(
     }
     if is_h2_websocket_connect(&req) {
         // The WebSocket backend handshake is a GET. Keep route and plugin
-        // policy aligned with the method the backend receives.
+        // policy aligned with the method the backend receives. The 0-RTT
+        // allowlist below still gates the wire method (`CONNECT`).
         method = "GET".to_string();
     }
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
@@ -33227,11 +33228,16 @@ async fn handle_proxy_request_inner(
             .is_some_and(|v| v.as_bytes() == b"1");
         if is_early_data {
             ctx.is_early_data = true;
-            if !state.early_data_methods.contains(&method) {
+            // Gate the wire method, not the policy method. An RFC 8441
+            // WebSocket was normalized to `GET` above, but the replayable
+            // request is a `CONNECT` stream; HTTP/3 gates its RFC 9220
+            // WebSocket on `CONNECT` before the same rewrite.
+            let wire_method = req.method().as_str();
+            if !state.early_data_methods.contains(wire_method) {
                 let is_grpc = grpc_proxy::is_grpc_request(&req);
                 warn!(
                     "Rejected 0-RTT request: method {} not in allowed early data methods",
-                    method
+                    wire_method
                 );
                 record_request(&state, 425);
                 if is_grpc {
