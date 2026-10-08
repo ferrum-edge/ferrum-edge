@@ -103,7 +103,10 @@ impl H3Listener {
             ..Http3ServerConfig::default()
         };
 
-        let port = reserve_udp_port().await.expect("reserve udp port").drop_and_take_port();
+        let port = reserve_udp_port()
+            .await
+            .expect("reserve udp port")
+            .drop_and_take_port();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -141,7 +144,10 @@ impl H3Listener {
     }
 
     fn active_connections(&self) -> u64 {
-        self.state.overload.active_connections.load(Ordering::Relaxed)
+        self.state
+            .overload
+            .active_connections
+            .load(Ordering::Relaxed)
     }
 
     async fn wait_for_active_connections(&self, expected: u64) {
@@ -288,7 +294,10 @@ async fn h3_get_status(connection: quinn::Connection, port: u16) -> http::Status
     });
     let uri = format!("https://localhost:{port}/");
     let request = http::Request::get(uri).body(()).expect("request");
-    let mut stream = send_request.send_request(request).await.expect("send request");
+    let mut stream = send_request
+        .send_request(request)
+        .await
+        .expect("send request");
     stream.finish().await.expect("finish request");
     let response = tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
         .await
