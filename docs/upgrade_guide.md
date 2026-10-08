@@ -26,6 +26,41 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.15
+
+### Process-environment AWS credentials reach only AWS endpoints (issue [#6111](https://github.com/ferrum-edge/ferrum-edge/issues/6111))
+
+`serverless_function` (`aws_lambda`) and `ai_federation` (`aws_bedrock`) still
+fall back to `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_SESSION_TOKEN` when the plugin config omits them, but such a credential
+may now only be signed for an official endpoint of that service in the
+configured region, over HTTPS on the default port:
+`lambda[-fips].<region>.amazonaws.com[.cn]` /
+`bedrock-runtime[-fips].<region>.amazonaws.com[.cn]`, the dual-stack
+`<service>[-fips].<region>.api.aws`, or an interface VPC endpoint
+`vpce-<id>.<service>.<region>.vpce.amazonaws.com[.cn]`. A row whose effective
+endpoint is anything else is refused at admission: the Admin API answers
+`400`, file mode and `ferrum-edge validate` fail, and existing database rows
+are quarantined as unconstructible.
+
+Affected rows combine an environment-resolved credential (including only an
+environment `AWS_SESSION_TOKEN` beside a config key pair) with a non-AWS
+endpoint: a LocalStack or mock `aws_endpoint_url` / `AWS_LAMBDA_ENDPOINT_URL`,
+a Bedrock `base_url` proxy, an `aws_region` that is not a lowercase AWS region
+identifier, or an ISO-partition endpoint. Before upgrading, for each one either:
+
+1. write the AWS credentials into the plugin config (a config key pair, plus
+   `aws_session_token` when one is in effect, is not scoped), or
+2. set `allow_custom_endpoint_with_ambient_credentials: true` (top-level for
+   `serverless_function`, on the provider for `ai_federation`) to deliberately
+   send the process credentials to that endpoint. Anyone who can write the
+   plugin config can then redirect those credentials, so prefer option 1 or an
+   official VPC endpoint (which needs no opt-in).
+
+Rows that use the default derived endpoint, or an official override, are
+unaffected. See
+[Ambient AWS credential scope](plugins.md#ambient-aws-credential-scope).
+
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main

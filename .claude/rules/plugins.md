@@ -1000,6 +1000,18 @@ on a native-gRPC request.
   field to `ENV_REFERENCE_FIELDS` in
   `tests/unit/plugins/plugin_secret_env_tests.rs`. `ai_transcript_audit`'s
   `${secret:NAME}` keeps its own `FERRUM_TRANSCRIPT_SINK_SECRET_*` namespace.
+- The standard AWS credential fallbacks (`AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) in `serverless_function`
+  (`aws_lambda`) and `ai_federation` (`aws_bedrock`) are the only remaining
+  ambient credential fallbacks. Whenever any of them resolves from the
+  environment, the effective endpoint (derived host, `aws_endpoint_url`,
+  `AWS_LAMBDA_ENDPOINT_URL`, `base_url`) must pass
+  `plugins::utils::ambient_cloud_credentials::AmbientAwsEndpointScope` at
+  admission AND again before signing each request (issue #6111). Never widen
+  it to generic `*.amazonaws.com` (customer-owned EC2/ELB/API Gateway/S3 names
+  live there). Config-supplied credentials are unscoped; the only bypass is the
+  per-instance `allow_custom_endpoint_with_ambient_credentials` opt-in. A new
+  ambient cloud credential fallback must use the same scope.
 - Shared entrypoint is `plugins::validate_plugin_config(name, config)`.
 - CP admission runs the SAME construction gate over every enabled plugin config
   before a snapshot or delta can be accepted and broadcast

@@ -9201,3 +9201,147 @@ fn service_account_config_errors_keep_fields_without_parser_payloads() {
         assert!(rendered.contains("invalid") || rendered.contains("not a valid URL"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #6111 — process-environment AWS credentials are scoped to official
+// Amazon Bedrock Runtime endpoints
+// ---------------------------------------------------------------------------
+
+const AMBIENT_OPT_IN: &str = "allow_custom_endpoint_with_ambient_credentials";
+
+/// Own the process-wide environment lock with only a process AWS key pair
+/// published. The region stays in each provider config, so no sibling test
+/// that reads `AWS_REGION` / `AWS_DEFAULT_REGION` can observe this fixture.
+fn ambient_aws_key_pair_env() -> crate::unit::env_lock::EnvGuard {
+    let env = crate::unit::env_lock::EnvGuard::new(&[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ]);
+    env.set("AWS_ACCESS_KEY_ID", "AKIAAMBIENTFIXTURE01");
+    env.set("AWS_SECRET_ACCESS_KEY", "ambient-fixture-secret");
+    env.unset("AWS_SESSION_TOKEN");
+    env
+}
+
+/// A Bedrock provider that carries no credentials of its own.
+fn credential_less_bedrock(base_url: Option<&str>) -> Value {
+    let mut provider = json!({
+        "name": "bedrock",
+        "provider_type": "aws_bedrock",
+        "aws_region": "us-east-1"
+    });
+    if let Some(base_url) = base_url {
+        provider["base_url"] = json!(base_url);
+    }
+    provider
+}
+
+fn build_federation(provider: Value) -> Result<ai_federation::AiFederation, String> {
+    let config = json!({"providers": [provider]});
+    ai_federation::AiFederation::new(&config, create_test_http_client())
+}
+
+#[test]
+fn ambient_bedrock_credentials_reach_official_runtime_endpoints() {
+    let _env = ambient_aws_key_pair_env();
+
+    build_federation(credential_less_bedrock(None))
+        .expect("the derived regional Bedrock Runtime endpoint is official");
+    for base_url in [
+        "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse",
+        "https://bedrock-runtime-fips.us-east-1.amazonaws.com/model/m/converse",
+        "https://vpce-0abc123.bedrock-runtime.us-east-1.vpce.amazonaws.com/model/m/converse",
+    ] {
+        if let Err(error) = build_federation(credential_less_bedrock(Some(base_url))) {
+            panic!("base_url={base_url} must be accepted: {error}");
+        }
+    }
+}
+
+#[test]
+fn ambient_bedrock_credentials_refuse_custom_endpoints() {
+    let _env = ambient_aws_key_pair_env();
+
+    for base_url in [
+        "https://bedrock-proxy.example.com/model/m/converse",
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/m/converse",
+        "https://bedrock-runtime.us-east-1.amazonaws.com:8443/model/m/converse",
+        "https://bedrock-runtime.us-east-1.amazonaws.com.attacker.example/converse",
+        "https://ec2-203-0-113-10.compute-1.amazonaws.com/converse",
+    ] {
+        let error = match build_federation(credential_less_bedrock(Some(base_url))) {
+            Ok(_) => panic!("base_url={base_url} must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("resolves `aws_access_key_id`, `aws_secret_access_key` from the"),
+            "base_url={base_url}, got: {error}"
+        );
+        assert!(
+            error.contains(AMBIENT_OPT_IN),
+            "base_url={base_url}, got: {error}"
+        );
+        assert!(
+            !error.contains(base_url),
+            "base_url={base_url}, got: {error}"
+        );
+        assert!(!error.contains("ambient-fixture-secret"), "got: {error}");
+    }
+
+    // A plaintext private endpoint is refused even with `allow_plaintext`.
+    let mut provider = credential_less_bedrock(Some("http://localhost:4566/model/m/converse"));
+    provider["allow_plaintext"] = json!(true);
+    assert!(build_federation(provider).is_err());
+}
+
+#[test]
+fn ambient_bedrock_custom_endpoint_requires_the_explicit_opt_in() {
+    let _env = ambient_aws_key_pair_env();
+
+    let mut provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    provider[AMBIENT_OPT_IN] = json!(true);
+    build_federation(provider.clone())
+        .expect("the explicit opt-in admits a deliberately chosen private endpoint");
+
+    provider[AMBIENT_OPT_IN] = json!("true");
+    let error = match build_federation(provider) {
+        Ok(_) => panic!("a non-boolean opt-in must be refused"),
+        Err(error) => error,
+    };
+    assert!(error.contains(AMBIENT_OPT_IN), "got: {error}");
+}
+
+#[test]
+fn config_bedrock_credentials_may_target_a_custom_endpoint() {
+    // The process key pair is present too; the provider's own credentials win
+    // and are not scoped.
+    let _env = ambient_aws_key_pair_env();
+
+    let mut provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    provider["aws_access_key_id"] = json!("AKIACONFIGFIXTURE01");
+    provider["aws_secret_access_key"] = json!("config-fixture-secret");
+    build_federation(provider).expect("a config-supplied key pair is not scoped");
+}
+
+#[test]
+fn an_environment_session_token_scopes_a_config_bedrock_key_pair() {
+    let env = ambient_aws_key_pair_env();
+    env.set("AWS_SESSION_TOKEN", "ambient-session-fixture");
+
+    let mut provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    provider["aws_access_key_id"] = json!("AKIACONFIGFIXTURE01");
+    provider["aws_secret_access_key"] = json!("config-fixture-secret");
+    let error = match build_federation(provider.clone()) {
+        Ok(_) => panic!("an environment session token must scope the endpoint"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("resolves `aws_session_token` from the process environment"),
+        "got: {error}"
+    );
+    assert!(!error.contains("ambient-session-fixture"), "got: {error}");
+
+    provider["aws_session_token"] = json!("config-session-fixture");
+    build_federation(provider).expect("a fully config-supplied credential set is not scoped");
+}

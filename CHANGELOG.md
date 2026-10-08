@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — process-environment AWS credentials are scoped to the
+  provider's own endpoints** (issue #6111). `serverless_function`
+  (`aws_lambda`) and `ai_federation` (`aws_bedrock`) fall back to the process's
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` when the
+  plugin config omits them. Those are the gateway's own cloud identity, yet the
+  same config could choose where they were signed for (`aws_endpoint_url`,
+  `AWS_LAMBDA_ENDPOINT_URL`, `base_url`, or a malformed `aws_region`
+  interpolated into the derived host). Whenever any of those credentials comes
+  from the environment, the effective endpoint must now be an official
+  endpoint of that service for the configured region over HTTPS on the default
+  port — `<service>[-fips].<region>.amazonaws.com[.cn]`,
+  `<service>[-fips].<region>.api.aws`, or an interface VPC endpoint
+  `vpce-<id>.<service>.<region>.vpce.amazonaws.com[.cn]` (`lambda` /
+  `bedrock-runtime`). Admission refuses anything else with a validation error
+  (CP/admin shape-only admission screens a configured `aws_endpoint_url` when
+  the row omits the key pair), and every request re-checks the endpoint before
+  signing: `serverless_function` fails closed with `500`
+  (`ambient_credential_endpoint_refused`) regardless of `on_error`, and
+  `ai_federation` rejects the provider pre-wire. Credentials written into the
+  plugin config are not scoped. The new `allow_custom_endpoint_with_ambient_credentials`
+  field (top-level for `serverless_function`, per provider for
+  `ai_federation`; default `false`) deliberately lifts the scope for a private
+  endpoint such as LocalStack. The trust model is documented in
+  `docs/plugins.md` (Ambient AWS credential scope); `openapi.yaml` gains the
+  field on both schemas.
+
 ### Performance
 
 - **Large config writes apply as deltas instead of full reloads** (issue

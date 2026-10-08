@@ -32782,10 +32782,10 @@ components:
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars. The default endpoint is partition-aware: cn-* regions derive lambda.<region>.amazonaws.com.cn and every other region derives lambda.<region>.amazonaws.com. The air-gapped ISO partitions are not derived and require an explicit aws_endpoint_url."
         aws_access_key_id:
           type: string
-          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var."
+          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
         aws_secret_access_key:
           type: string
-          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var."
+          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
         aws_function_name:
           type: string
           minLength: 1
@@ -32794,7 +32794,7 @@ components:
           description: "Lambda function name, partial ARN, or full ARN (aws_lambda only), matching the Lambda Invoke API FunctionName grammar. Falls back to AWS_LAMBDA_FUNCTION_NAME env var; the environment value is held to the same grammar. Validated whenever supplied, whichever provider is selected. Existence and invoke permission are not checked at admission."
         aws_session_token:
           type: string
-          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var."
+          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var. A process-environment token may only be sent to an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
         aws_qualifier:
           type: string
           minLength: 1
@@ -32813,7 +32813,34 @@ components:
             control characters). Validated whenever supplied, whichever
             provider is selected. Falls back to `AWS_LAMBDA_ENDPOINT_URL`. A
             non-default port is part of the signed SigV4 canonical `Host`, so
-            a verifying endpoint accepts the invocation.
+            a verifying endpoint accepts the invocation. When the AWS
+            credentials resolve from the process environment, the override
+            must be an official AWS Lambda endpoint unless
+            `allow_custom_endpoint_with_ambient_credentials` is true (see that
+            field).
+        allow_custom_endpoint_with_ambient_credentials:
+          type: boolean
+          default: false
+          description: >-
+            aws_lambda only. When any of `aws_access_key_id`,
+            `aws_secret_access_key`, or `aws_session_token` is omitted from the
+            config and resolves from the gateway process environment, the
+            effective Lambda endpoint (the host derived from `aws_region`, or
+            the `aws_endpoint_url` / `AWS_LAMBDA_ENDPOINT_URL` override) must be
+            an official AWS Lambda endpoint for the configured region over
+            HTTPS on the default port: lambda[-fips].<region>.amazonaws.com[.cn],
+            lambda[-fips].<region>.api.aws, or an interface VPC endpoint
+            vpce-<id>.lambda.<region>.vpce.amazonaws.com[.cn]. Any other
+            endpoint is refused at configuration admission (CP/admin
+            shape-only admission screens a configured `aws_endpoint_url`
+            whenever the config omits the key pair), and every invocation
+            re-checks the endpoint and fails closed with 500
+            (`ambient_credential_endpoint_refused`) regardless of `on_error`.
+            Credentials written into the config are not scoped. Set true only
+            to deliberately sign invocations for a private endpoint (for
+            example LocalStack or an air-gapped partition) with the process
+            credentials; anyone who can write this plugin config can then
+            direct those credentials to that endpoint.
         azure_function_key:
           type: string
           pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
@@ -36183,13 +36210,34 @@ components:
                 description: "AWS region for Bedrock (e.g. us-east-1). Required for aws_bedrock unless AWS_DEFAULT_REGION/AWS_REGION env var is set."
               aws_access_key_id:
                 type: string
-                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var."
+                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
               aws_secret_access_key:
                 type: string
-                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var."
+                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
               aws_session_token:
                 type: string
-                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var."
+                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var. A process-environment token may only be sent to an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+              allow_custom_endpoint_with_ambient_credentials:
+                type: boolean
+                default: false
+                description: >-
+                  aws_bedrock only. When any of aws_access_key_id,
+                  aws_secret_access_key, or aws_session_token is omitted here
+                  and resolves from the gateway process environment, the
+                  provider endpoint (base_url, or the host derived from
+                  aws_region) must be an official Amazon Bedrock Runtime
+                  endpoint for the configured region over HTTPS on the default
+                  port: bedrock-runtime[-fips].<region>.amazonaws.com[.cn],
+                  bedrock-runtime[-fips].<region>.api.aws, or an interface VPC
+                  endpoint vpce-<id>.bedrock-runtime.<region>.vpce.amazonaws.com[.cn].
+                  Any other endpoint is refused at configuration admission, and
+                  every provider call re-checks the rendered endpoint fail
+                  closed. Credentials written into the provider config are not
+                  scoped. Set true only to deliberately sign requests for a
+                  private endpoint (for example LocalStack or an air-gapped
+                  partition) with the process credentials; anyone who can write
+                  this plugin config can then direct those credentials to that
+                  endpoint.
               circuit_breaker:
                 type: object
                 additionalProperties: false

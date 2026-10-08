@@ -6915,3 +6915,231 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #6111 — process-environment AWS credentials are scoped to official
+// AWS Lambda endpoints
+// ---------------------------------------------------------------------------
+
+const AMBIENT_OPT_IN: &str = "allow_custom_endpoint_with_ambient_credentials";
+const FIPS_LAMBDA_ENDPOINT: &str = "https://lambda-fips.us-east-1.amazonaws.com";
+
+/// A cleared provider environment holding only a process key pair.
+fn ambient_key_pair_env() -> EnvGuard {
+    let env = cleared_provider_env();
+    env.set("AWS_ACCESS_KEY_ID", "AKIAAMBIENTFIXTURE01");
+    env.set("AWS_SECRET_ACCESS_KEY", "ambient-fixture-secret");
+    env
+}
+
+/// A Lambda row that carries no credentials of its own.
+fn credential_less_lambda_config(endpoint: Option<&str>) -> Value {
+    let mut config = json!({
+        "provider": "aws_lambda",
+        "aws_region": "us-east-1",
+        "aws_function_name": "audit"
+    });
+    if let Some(endpoint) = endpoint {
+        config["aws_endpoint_url"] = json!(endpoint);
+    }
+    config
+}
+
+fn shape_only_admission(config: &Value) -> Result<(), String> {
+    ferrum_edge::plugins::validate_plugin_config("serverless_function", config)
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_ambient_aws_credentials_reach_official_lambda_endpoints() {
+    let _env = ambient_key_pair_env();
+
+    let config = credential_less_lambda_config(None);
+    let plugin = ServerlessFunction::new(&config, default_client())
+        .expect("the derived regional endpoint is official");
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["lambda.us-east-1.amazonaws.com".to_string()]
+    );
+
+    for endpoint in [
+        "https://lambda.us-east-1.amazonaws.com",
+        FIPS_LAMBDA_ENDPOINT,
+        "https://lambda.us-east-1.api.aws",
+        "https://vpce-0abc123-def456.lambda.us-east-1.vpce.amazonaws.com",
+    ] {
+        let config = credential_less_lambda_config(Some(endpoint));
+        ServerlessFunction::new(&config, default_client())
+            .unwrap_or_else(|error| panic!("endpoint={endpoint} must be accepted: {error}"));
+    }
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_ambient_aws_credentials_refuse_custom_lambda_endpoints() {
+    let _env = ambient_key_pair_env();
+
+    for endpoint in [
+        "http://localhost:4566",
+        "https://attacker.example",
+        "http://lambda.us-east-1.amazonaws.com",
+        "https://lambda.us-east-1.amazonaws.com:8443",
+        "https://lambda.us-west-2.amazonaws.com",
+        "https://lambda.us-east-1.amazonaws.com.attacker.example",
+        "https://ec2-203-0-113-10.compute-1.amazonaws.com",
+        "https://203.0.113.10",
+    ] {
+        let config = credential_less_lambda_config(Some(endpoint));
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains("`aws_access_key_id`, `aws_secret_access_key` resolved from the"),
+            "endpoint={endpoint}, got: {err}"
+        );
+        assert!(
+            err.contains(AMBIENT_OPT_IN),
+            "endpoint={endpoint}, got: {err}"
+        );
+        assert!(!err.contains(endpoint), "endpoint={endpoint}, got: {err}");
+        assert!(!err.contains("ambient-fixture-secret"), "got: {err}");
+    }
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_ambient_aws_credentials_screen_the_environment_endpoint_override() {
+    let env = ambient_key_pair_env();
+
+    env.set("AWS_LAMBDA_ENDPOINT_URL", "http://localhost:4566");
+    let config = credential_less_lambda_config(None);
+    let err = expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(err.contains(AMBIENT_OPT_IN), "got: {err}");
+
+    env.set("AWS_LAMBDA_ENDPOINT_URL", FIPS_LAMBDA_ENDPOINT);
+    let plugin = ServerlessFunction::new(&config, default_client())
+        .expect("an official environment endpoint override is accepted");
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["lambda-fips.us-east-1.amazonaws.com".to_string()]
+    );
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_ambient_aws_credentials_refuse_a_region_that_redirects_the_derived_host() {
+    let _env = ambient_key_pair_env();
+
+    for region in [
+        "attacker.example#",
+        "us-east-1.attacker.example/x",
+        "US-EAST-1",
+    ] {
+        let mut config = credential_less_lambda_config(None);
+        config["aws_region"] = json!(region);
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains("official AWS Lambda endpoint"),
+            "region={region}, got: {err}"
+        );
+        assert!(!err.contains(region), "region={region}, got: {err}");
+    }
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_ambient_aws_credentials_custom_endpoint_requires_the_explicit_opt_in() {
+    let _env = ambient_key_pair_env();
+
+    let mut config = credential_less_lambda_config(Some("http://localhost:4566"));
+    config[AMBIENT_OPT_IN] = json!(true);
+    let plugin = ServerlessFunction::new(&config, default_client())
+        .expect("the explicit opt-in admits a deliberately chosen private endpoint");
+    assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
+
+    config[AMBIENT_OPT_IN] = json!(false);
+    let err = expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(err.contains(AMBIENT_OPT_IN), "got: {err}");
+
+    config[AMBIENT_OPT_IN] = json!("true");
+    let err = expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(
+        err.contains("`allow_custom_endpoint_with_ambient_credentials` must be a boolean"),
+        "got: {err}"
+    );
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_config_credentials_may_target_a_custom_lambda_endpoint() {
+    // The process key pair is present too: config values take precedence, so
+    // the row signs with its own credentials and is not scoped.
+    let _env = ambient_key_pair_env();
+
+    let mut config = credential_less_lambda_config(Some("http://localhost:4566"));
+    config["aws_access_key_id"] = json!("AKIACONFIGFIXTURE01");
+    config["aws_secret_access_key"] = json!("config-fixture-secret");
+    let plugin = ServerlessFunction::new(&config, default_client())
+        .expect("a config-supplied key pair is not scoped to AWS endpoints");
+    assert_eq!(plugin.warmup_hostnames(), vec!["localhost".to_string()]);
+    shape_only_admission(&config).expect("shape-only admission agrees");
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_an_environment_session_token_scopes_a_config_key_pair() {
+    let env = cleared_provider_env();
+    env.set("AWS_SESSION_TOKEN", "ambient-session-fixture");
+
+    let mut config = credential_less_lambda_config(Some("http://localhost:4566"));
+    config["aws_access_key_id"] = json!("AKIACONFIGFIXTURE01");
+    config["aws_secret_access_key"] = json!("config-fixture-secret");
+    let err = expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(
+        err.contains("`aws_session_token` resolved from the process environment"),
+        "got: {err}"
+    );
+    assert!(!err.contains("`aws_access_key_id`"), "got: {err}");
+    assert!(!err.contains("ambient-session-fixture"), "got: {err}");
+
+    config["aws_session_token"] = json!("config-session-fixture");
+    ServerlessFunction::new(&config, default_client())
+        .expect("a fully config-supplied credential set is not scoped");
+}
+
+#[test]
+#[serial(serverless_env)]
+fn test_shape_only_admission_screens_a_configured_endpoint_for_ambient_credentials() {
+    // The admitting node holds no AWS environment at all; a row without its
+    // own key pair still signs with process credentials wherever it is served.
+    let _env = cleared_provider_env();
+
+    for endpoint in [
+        "https://attacker.example",
+        "http://localhost:4566",
+        "https://lambda.us-west-2.amazonaws.com",
+    ] {
+        let config = credential_less_lambda_config(Some(endpoint));
+        let err = shape_only_admission(&config)
+            .expect_err("a credential-less row may not choose a custom endpoint");
+        assert!(
+            err.contains(AMBIENT_OPT_IN),
+            "endpoint={endpoint}, got: {err}"
+        );
+        assert!(!err.contains(endpoint), "endpoint={endpoint}, got: {err}");
+    }
+
+    let config = credential_less_lambda_config(Some(FIPS_LAMBDA_ENDPOINT));
+    shape_only_admission(&config).expect("an official endpoint is admitted");
+
+    // Without a configured region the serving node supplies it, so admission
+    // pins the service and the region shape but not the region itself.
+    let mut config = credential_less_lambda_config(Some("https://lambda.eu-west-1.amazonaws.com"));
+    config
+        .as_object_mut()
+        .expect("fixture is an object")
+        .remove("aws_region");
+    shape_only_admission(&config).expect("any well-formed region is admitted");
+
+    let mut config = credential_less_lambda_config(Some("http://localhost:4566"));
+    config[AMBIENT_OPT_IN] = json!(true);
+    shape_only_admission(&config).expect("the explicit opt-in is honored at admission");
+}

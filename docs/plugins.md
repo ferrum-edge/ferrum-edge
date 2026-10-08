@@ -4689,12 +4689,13 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `provider` | String | (required) | `"aws_lambda"` |
 | `aws_region` | String | — | AWS region. Falls back to `AWS_DEFAULT_REGION` / `AWS_REGION` env var. The default endpoint is partition-aware: a `cn-*` region derives `https://lambda.<region>.amazonaws.com.cn`, every other region derives `https://lambda.<region>.amazonaws.com` |
-| `aws_access_key_id` | String | — | IAM access key. Falls back to `AWS_ACCESS_KEY_ID` env var |
-| `aws_secret_access_key` | String | — | IAM secret key. Falls back to `AWS_SECRET_ACCESS_KEY` env var |
+| `aws_access_key_id` | String | — | IAM access key. Falls back to `AWS_ACCESS_KEY_ID` env var; a process-environment credential is [scoped to official AWS Lambda endpoints](#ambient-aws-credential-scope) |
+| `aws_secret_access_key` | String | — | IAM secret key. Falls back to `AWS_SECRET_ACCESS_KEY` env var; a process-environment credential is [scoped to official AWS Lambda endpoints](#ambient-aws-credential-scope) |
 | `aws_function_name` | String | — | Lambda function name, partial ARN, or full ARN, validated against the Lambda Invoke API `FunctionName` grammar (≤ 170 characters). Falls back to `AWS_LAMBDA_FUNCTION_NAME` env var; the environment value is held to the same grammar |
-| `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var |
+| `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var; a process-environment token is [scoped to official AWS Lambda endpoints](#ambient-aws-credential-scope) |
 | `aws_qualifier` | String | — | Optional version/alias qualifier (e.g., `$LATEST`, `prod`), validated against the Lambda Invoke API `Qualifier` grammar: `A-Z a-z 0-9 $ _ -`, ≤ 128 characters |
-| `aws_endpoint_url` | String | — | Optional HTTP(S) origin-only Lambda endpoint override. No userinfo, path, query, or fragment; falls back to `AWS_LAMBDA_ENDPOINT_URL` |
+| `aws_endpoint_url` | String | — | Optional HTTP(S) origin-only Lambda endpoint override. No userinfo, path, query, or fragment; falls back to `AWS_LAMBDA_ENDPOINT_URL`. With process-environment credentials it must be an official AWS Lambda endpoint unless `allow_custom_endpoint_with_ambient_credentials` is `true` |
+| `allow_custom_endpoint_with_ambient_credentials` | Boolean | `false` | Deliberately let process-environment AWS credentials sign invocations for a non-AWS endpoint (LocalStack, an air-gapped partition). See [Ambient AWS credential scope](#ambient-aws-credential-scope) |
 
 **Azure Functions** — calls the HTTP trigger URL:
 
@@ -4876,6 +4877,23 @@ If request deduplication acquired an idempotency key earlier in the chain, each 
 #### Environment Variable Fallback
 
 Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.). The Azure function key and GCP bearer token are sent to the config-chosen `function_url`, so their fallbacks are confined to the [plugin-secret namespace](configuration.md): `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`. The ambient `AZURE_FUNCTIONS_KEY` / `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` variables are never read.
+
+#### Ambient AWS credential scope
+
+The AWS credential fallbacks (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are a different trust class from the `FERRUM_PLUGIN_SECRET_<NAME>` namespace. A plugin-secret value is one the environment owner deliberately placed where plugin configs may use it, so it may follow a config to its chosen endpoint. The standard AWS variables are the gateway process's own cloud identity — often present for unrelated reasons (an ECS task role, an EC2 instance profile exported by a launcher, a CI runner) — and the principal writing plugin config (an admin API `operator`, a CP tenant, a mesh policy author) does not own them. The same rule therefore applies to `serverless_function` (`aws_lambda`) and to `ai_federation` (`aws_bedrock`):
+
+- **Config credentials are not scoped.** When `aws_access_key_id`, `aws_secret_access_key`, and (if one is in effect) `aws_session_token` are all written into the plugin config, they are the config author's own credentials and may sign requests for any endpoint the config validly names — a LocalStack origin, a mock server, a corporate proxy.
+- **Process-environment credentials are scoped to the service.** When any of those fields is omitted and resolves from the environment, the effective endpoint must be an official endpoint of that service for the configured region, over HTTPS on the default port:
+  - `<service>.<region>.amazonaws.com` or `<service>-fips.<region>.amazonaws.com` (commercial and GovCloud),
+  - the same names under `amazonaws.com.cn` (China),
+  - dual-stack `<service>[-fips].<region>.api.aws`,
+  - an interface VPC endpoint `vpce-<id>[-<az>].<service>.<region>.vpce.amazonaws.com[.cn]`.
+
+  `<service>` is `lambda` for `serverless_function` and `bedrock-runtime` for `ai_federation`. Generic `*.amazonaws.com` is deliberately **not** accepted: customer-owned EC2 DNS names, load balancers, API Gateway stages, and S3 websites live under that suffix too. The "effective endpoint" is whichever source chose it — the host derived from `aws_region` (so a malformed region cannot redirect the derived host), `aws_endpoint_url`, `AWS_LAMBDA_ENDPOINT_URL`, or the Bedrock `base_url`.
+- **Enforced twice.** Configuration admission refuses an out-of-scope endpoint with a validation error that names the environment-resolved fields and the opt-in, never the endpoint or a credential. CP/admin shape-only admission of `serverless_function` cannot see a serving node's environment, so it screens a configured `aws_endpoint_url` whenever the row omits the key pair; the serving node re-checks the fully resolved endpoint when it builds its plugin cache. Every request then re-checks the endpoint before signing: `serverless_function` fails closed with `500` (`ambient_credential_endpoint_refused`) regardless of `on_error`, and `ai_federation` treats it as a pre-wire dispatch-policy rejection of that provider. Both emit a sampled warning that names the redacted destination or the provider, never a credential.
+- **Explicit opt-in.** `allow_custom_endpoint_with_ambient_credentials: true` (a top-level `serverless_function` field, a per-provider `ai_federation` field; default `false`) lifts the scope for that instance or provider, for a deliberately chosen private endpoint such as LocalStack or an air-gapped ISO partition. Anyone who can write that plugin config can then direct the process credentials to the endpoint it names, so prefer config credentials (or an official VPC endpoint, which needs no opt-in) where possible.
+
+Azure Functions and GCP Cloud Functions credentials have no process-environment fallback outside the plugin-secret namespace, and `ai_federation` reads no ambient credential for any provider other than `aws_bedrock` (Google Vertex service-account OAuth is additionally pinned to `https://oauth2.googleapis.com/token`).
 
 #### Example: AWS Lambda pre-proxy enrichment
 
@@ -6987,7 +7005,7 @@ Gemini function calls do not carry an OpenAI call ID in the native response shap
 
 **Google Vertex additional fields:** `google_project_id`, `google_region`, `google_service_account_json`.
 
-**AWS Bedrock additional fields:** `aws_region`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`. Credentials fall back to standard AWS environment variables (`AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+**AWS Bedrock additional fields:** `aws_region`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`, `allow_custom_endpoint_with_ambient_credentials` (Boolean, default `false`). Credentials fall back to standard AWS environment variables (`AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`). A credential resolved from the process environment may only be signed for an official Amazon Bedrock Runtime endpoint of the configured region (`bedrock-runtime[-fips].<region>.amazonaws.com[.cn]`, `bedrock-runtime[-fips].<region>.api.aws`, or an interface VPC endpoint); a `base_url` outside that scope is refused at admission unless `allow_custom_endpoint_with_ambient_credentials: true` is set on the provider, and every provider call re-checks the rendered endpoint. Credentials written into the provider config are not scoped. See [Ambient AWS credential scope](#ambient-aws-credential-scope).
 
 **Example configuration:**
 
