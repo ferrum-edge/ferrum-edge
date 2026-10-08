@@ -2857,6 +2857,8 @@ jobs:
         # intentionally local-only:
         #   - test_scale_perf_30k_proxies (matches base + _postgres + _mongodb)
         #   - test_load_stress_10k_proxies (single ignored test in that file)
+        #   - test_scale_reload_under_load (waves up to 30k proxies under live
+        #     load; it also builds its own release gateway)
         #
         # `FERRUM_SKIP_GATEWAY_BUILD=1` makes `ensure_gateway_built()` in the
         # harness skip its per-process `cargo build --bin ferrum-edge` and
@@ -2880,7 +2882,7 @@ jobs:
             --workspace-remap . \
             --run-ignored=all \
             --no-fail-fast \
-            -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)' \
+            -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/) and not test(/test_scale_reload_under_load/)' \
             "${nextest_args[@]}" \
             "${filters[@]}"
         env:

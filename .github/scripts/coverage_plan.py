@@ -162,7 +162,8 @@ FUNCTIONAL_DATA_MODULES = (
 # The long stress suites stay local-only, as in ci.yml's functional shards.
 FUNCTIONAL_STRESS_EXCLUSION = (
     "not test(/test_scale_perf_30k_proxies/) "
-    "and not test(/test_load_stress_10k_proxies/)"
+    "and not test(/test_load_stress_10k_proxies/) "
+    "and not test(/test_scale_reload_under_load/)"
 )
 FUNCTIONAL_DATA_MODULES_FILTERSET = (
     "test(/::(" + "|".join(FUNCTIONAL_DATA_MODULES) + ")::/)"
