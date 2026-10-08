@@ -7,34 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **BREAKING — plugin-config environment references are confined to
-  `FERRUM_PLUGIN_SECRET_<NAME>`** (issue #6086). Plugin config fields that
-  name a process environment variable now resolve only the dedicated
-  `FERRUM_PLUGIN_SECRET_<NAME>` namespace (`<NAME>` uppercase
-  `[A-Z_][A-Z0-9_]*`), through one shared resolver: `api_chargeback_sink`
-  `clickhouse.password_ref` (previously any `FERRUM_*` name),
-  `ai_semantic_firewall` `provider.api_key_env`, `ai_stream_router`
-  `api_key: "${...}"`, `workload_metrics` Lightstep `access_token_env` /
-  `accessTokenEnv` (including Istio Telemetry translation), and `proxy_alerts`
-  channel `webhook_url_env` / `url_env` / `username_env` / `password_env`
-  (previously any variable). Any other name — including gateway-owned settings
-  such as `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_DB_URL` — is refused at
-  plugin-config admission (Admin API `400`, file-mode / `ferrum-edge validate`
-  failure) before anything is read, so a plugin-config writer can no longer
-  direct a gateway secret to an endpoint the same config chooses. The
-  `serverless_function` Azure/GCP credential fallbacks now read
-  `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and
-  `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` instead of the
-  ambient `AZURE_FUNCTIONS_KEY` / `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`. An empty
-  referenced value now fails like an unset one. The documented
-  `FERRUM_CLICKHOUSE_PASSWORD` example becomes
-  `FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD`. Rename each referenced variable
-  (and its `_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` source) into the
-  namespace and update the plugin configs before upgrading; see
-  [docs/upgrade_guide.md](docs/upgrade_guide.md#unreleased).
-
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already
