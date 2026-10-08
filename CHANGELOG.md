@@ -319,6 +319,10 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   0.4.20 also brings upstream protocol hardening and HPACK/locking performance
   work: GOAWAY stream-id validation, `:status` enforcement, duplicate
   `content-length` rejection, refused-stream and push-promise accounting.
+  Refused streams now count toward
+  `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` (default 256), so a
+  client that overruns `max_concurrent_streams` that many times on one
+  connection receives `GOAWAY(ENHANCE_YOUR_CALM)`.
 
 ### Fixed
 

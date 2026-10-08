@@ -117,5 +117,5 @@ lockstep-window regressions. Keep the gateway behavioral regressions and
 regenerate any remaining patch stack. No compatible replacement release has
 been selected or tested. The fixed 1 KiB behavior must not be restored.
 
-Retire h2 patch 002 independently when an h2 release containing PR #965 or an
-equivalent runtime budget update is adopted and its accounting regressions pass.
+h2 patch 002 (the runtime budget update) already retired independently: h2
+0.4.20 ships hyperium/h2#965, and its accounting regressions still run in CI.

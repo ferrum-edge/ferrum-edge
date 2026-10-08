@@ -5,7 +5,9 @@
 //! `RecvStream` is gone. Waiting for that after dropping the last handle can
 //! hang, because h2 0.4.19 and earlier could lose the one wakeup the drop
 //! delivers (fixed upstream in h2 0.4.20 by hyperium/h2#956, which Ferrum now
-//! vendors; the PING below stays as a cheap guard against a regression):
+//! vendors). The PING below is kept so driver cleanup stays deterministic; note
+//! that it wakes the driver itself, so it would also mask a reintroduced race
+//! rather than detect one:
 //!
 //! - `Connection::poll` (h2 0.4.19 `src/client.rs`) read
 //!   "anything still held?" three times, each under its own lock: (1)
