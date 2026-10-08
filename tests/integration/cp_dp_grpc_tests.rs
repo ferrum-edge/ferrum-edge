@@ -7650,9 +7650,14 @@ mod configsync_identity_binding {
         assert!(failure.contains("namespace=\"ferrum\""));
         assert!(failure.contains("node_id does not match authenticated subject"));
         assert!(!failure.contains("victim-dp"));
+        // A non-JWS bearer fails header parsing; either fixed verifier reason
+        // is acceptable, but the audit must keep one rather than "request refused".
         let bounded_rejection = captured
             .lines()
-            .find(|line| line.contains("Invalid token: authentication failed"))
+            .find(|line| {
+                line.contains("Invalid token: authentication failed")
+                    || line.contains("Invalid token: malformed JWS header")
+            })
             .expect("bad-token audit should keep the fixed rejection reason");
         assert!(bounded_rejection.len() < 2_048);
         assert!(!bounded_rejection.contains(&"x".repeat(1_000)));

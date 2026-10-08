@@ -118,6 +118,7 @@ fn bounded_log_value(value: &str) -> String {
 fn bounded_tenant_rejection_reason(reason: &str) -> &'static str {
     match reason {
         "Invalid token: authentication failed" => "Invalid token: authentication failed",
+        "Invalid token: malformed JWS header" => "Invalid token: malformed JWS header",
         "node_id does not match authenticated subject" => {
             "node_id does not match authenticated subject"
         }
