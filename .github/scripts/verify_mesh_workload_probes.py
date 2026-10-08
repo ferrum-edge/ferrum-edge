@@ -623,7 +623,87 @@ def validate_startup_overrides(results_dir: Path, expectations: dict) -> None:
                 "Liveness lost computed handler after startup override",
                 f"{name} livenessProbe must remain health --live",
             )
+    validate_service_account_isolation(rendered)
     print("mesh probe startup overrides ok")
+
+
+def validate_service_account_isolation(rendered: str) -> None:
+    expected_accounts = {
+        "ferrum-mesh-control-plane": "ferrum-mesh-control-plane",
+        "ferrum-mesh-ambient": "ferrum-mesh-ambient",
+        "ferrum-mesh-east-west": "ferrum-mesh-east-west",
+        "ferrum-mesh-injector": "ferrum-mesh-injector",
+        "ferrum-mesh-ca": "ferrum-mesh-ca",
+    }
+    workloads = {
+        "ferrum-mesh-control-plane": ("Deployment", "ferrum-mesh-control-plane"),
+        "ferrum-mesh-ambient": ("DaemonSet", "ferrum-mesh-ambient"),
+        "ferrum-mesh-east-west": ("Deployment", "ferrum-mesh-east-west"),
+        "ferrum-mesh-injector": ("Deployment", "ferrum-mesh-injector"),
+        "ferrum-mesh-ca": ("Deployment", "ferrum-mesh-ca"),
+    }
+    for component, account in expected_accounts.items():
+        kind, workload_name = workloads[component]
+        workload = resource_document(rendered, workload_name, kind)
+        pod_spec = re.search(r"(?ms)^    spec:\n(?P<body>.*?)(?=^  [^ ]|\Z)", workload)
+        if pod_spec is None or not re.search(
+            rf"(?m)^      serviceAccountName:\s*{re.escape(account)}\s*$",
+            pod_spec.group("body"),
+        ):
+            fail(
+                "Mesh workload ServiceAccount is shared",
+                f"{workload_name} must use {account}",
+            )
+        service_account = resource_document(rendered, account, "ServiceAccount")
+        if account != "ferrum-mesh-control-plane" and not re.search(
+            r"(?m)^automountServiceAccountToken:\s*false\s*$", service_account
+        ):
+            fail(
+                "Mesh workload token automount enabled",
+                f"{account} must disable automatic token mounting",
+            )
+
+    control_plane_binding = resource_document(
+        rendered, "ferrum-mesh-control-plane-ferrum", "ClusterRoleBinding"
+    )
+    if not re.search(
+        r"(?m)^    name:\s*ferrum-mesh-control-plane\s*$", control_plane_binding
+    ):
+        fail(
+            "Control-plane permissions bound to wrong identity",
+            "the cluster-wide controller role must target only the control-plane account",
+        )
+    ambient_role = resource_document(rendered, "ferrum-mesh-ambient-secrets", "Role")
+    if not re.search(r"(?m)^    resources:\s*\[\"secrets\"\]$", ambient_role):
+        fail("Ambient Secret access missing", "ambient needs namespace-scoped Secret get")
+    if not re.search(r"(?m)^    verbs:\s*\[\"get\"\]$", ambient_role):
+        fail("Ambient Secret access too broad", "ambient Secret access must be get-only")
+
+
+def validate_host_veth_source_usage() -> None:
+    sources = (
+        REPO_ROOT / "src/proxy/node_waypoint_udp_identity.rs",
+        REPO_ROOT / "src/proxy/host_udp_capture.rs",
+        REPO_ROOT / "src/modes/node_agent.rs",
+    )
+    for path in sources:
+        source = path.read_text(encoding="utf-8")
+        if "discover_veth_for_pod(" in source:
+            fail(
+                "Host veth ownership uses pod-visible sysfs",
+                f"{path.relative_to(REPO_ROOT)} must resolve ownership from host routes",
+            )
+        if not any(
+            resolver in source
+            for resolver in (
+                "discover_veth_for_pod_ip",
+                "discover_dedicated_veth_for_pod_ip",
+            )
+        ):
+            fail(
+                "Host route ownership lookup missing",
+                f"{path.relative_to(REPO_ROOT)} must resolve from the pod IP route",
+            )
 
 
 def main(argv: list[str]) -> int:
@@ -664,6 +744,7 @@ def main(argv: list[str]) -> int:
     validate_node_agent_https_collision_policy(results_dir, expectations)
     validate_node_waypoint_ambient(results_dir, expectations)
     validate_startup_overrides(results_dir, expectations)
+    validate_host_veth_source_usage()
     return 0
 
 

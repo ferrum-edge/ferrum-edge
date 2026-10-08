@@ -7325,18 +7325,16 @@ fn handle_pod_added_inner(
     let pod_ip6 = event.pod_source_ips.ipv6;
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
-    // Production: the kube-rs caller sets `veth_iface_override = None`; the
-    // resolver first uses an explicit pod PID when available, then falls back
-    // to the resolved pod cgroup to find a live process in that pod. Some
-    // container runtimes expose neither pod sysfs nor setns from the node-agent
-    // container, so use the host route table as a final pod-IP-scoped fallback.
+    // Production: the kube-rs caller sets `veth_iface_override = None`. Resolve
+    // from the host route table using the registry-published pod IP; a pod's
+    // sysfs view is workload-controlled and cannot establish veth ownership.
     // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
     // is satisfied without a real pod PID / Linux kernel.
     let veth_iface = event
         .veth_iface_override
         .map(|s| s.to_string())
-        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()))
-        .or_else(|| pod_ip.and_then(veth::discover_veth_for_pod_ip));
+        .or_else(|| pod_ip.and_then(veth::discover_veth_for_pod_ip))
+        .or_else(|| pod_ip6.and_then(veth::discover_veth_for_pod_ip6));
 
     if !pod_states.contains_key(pod_uid)
         && has_failed_pod_enrollment_attempt(&state_key)

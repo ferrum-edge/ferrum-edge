@@ -66,6 +66,38 @@ roleRef:
   name: ferrum-mesh-ambient-{{ .Release.Name }}
 subjects:
   - kind: ServiceAccount
-    name: ferrum-mesh
+    name: ferrum-mesh-ambient
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.ambient.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-mesh-ambient-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-mesh-ambient-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-mesh-ambient-secrets
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-mesh-ambient
     namespace: {{ .Release.Namespace }}
 {{- end }}

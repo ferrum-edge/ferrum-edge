@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Separate mesh workload Kubernetes identities and restrict Secret access.**
+  The control plane now owns the cluster-wide controller permissions; Ambient
+  can read Secrets only in its release namespace, and gateway, injector, and CA
+  workloads use tokenless identities. Upgrade guidance is in
+  [upgrade_guide.md](docs/upgrade_guide.md#helm-chart-workload-serviceaccounts).
+  (PR pending.)
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

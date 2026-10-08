@@ -334,6 +334,7 @@ def latest_run_on_main(
     query = urllib.parse.urlencode(
         {
             "branch": "main",
+            "event": "schedule",
             "per_page": str(WORKFLOW_RUN_LIST_PER_PAGE),
         }
     )
@@ -362,6 +363,13 @@ def latest_run_on_main(
         head_branch = entry.get("head_branch")
         if head_branch != "main":
             return None, "schema: workflow run is not on main"
+        if entry.get("event") != "schedule":
+            return None, "schema: workflow run is not scheduled"
+        head_repository = entry.get("head_repository")
+        if not isinstance(head_repository, dict) or head_repository.get("full_name") != repo:
+            return None, "schema: workflow run is not from the repository"
+        if entry.get("path") != f".github/workflows/{WORKFLOW_FILE}":
+            return None, "schema: workflow run path is unexpected"
         try:
             created = parse_iso8601(entry.get("created_at"), "workflow run created_at")
         except SignalError as exc:
@@ -743,6 +751,9 @@ def self_test() -> int:
             "status": status,
             "conclusion": conclusion,
             "head_branch": head_branch,
+            "event": "schedule",
+            "head_repository": {"full_name": "ferrum-edge/ferrum-edge"},
+            "path": f".github/workflows/{WORKFLOW_FILE}",
         }
         if extra:
             run.update(extra)
@@ -756,8 +767,8 @@ def self_test() -> int:
                 raise AssertionError(f"unexpected {method} {url}")
             if "status=success" in url:
                 raise AssertionError(f"must not query only successful runs: {url}")
-            if "branch=main" not in url:
-                raise AssertionError(f"must query main branch runs: {url}")
+            if "branch=main" not in url or "event=schedule" not in url:
+                raise AssertionError(f"must query scheduled main branch runs: {url}")
             if f"per_page={WORKFLOW_RUN_LIST_PER_PAGE}" not in url:
                 raise AssertionError(f"must bound workflow run pagination: {url}")
             return {"workflow_runs": runs}
@@ -807,6 +818,18 @@ def self_test() -> int:
         False,
         "latest fresh success",
     )
+    fork_run = workflow_run(
+        created=timedelta(minutes=1),
+        run_id=221,
+        extra={"head_repository": {"full_name": "attacker/ferrum-edge"}},
+    )
+    expect_history([fork_run], "open", True, "fork run is not trusted")
+    pull_request_run = workflow_run(
+        created=timedelta(minutes=1),
+        run_id=222,
+        extra={"event": "pull_request"},
+    )
+    expect_history([pull_request_run], "open", True, "pull request run is not trusted")
     expect_history(
         [workflow_run(created=timedelta(days=9), run_id=23)],
         "open",

@@ -20,6 +20,10 @@ use std::path::Path;
 /// interface's peer ifindex from the pod's sysfs view, then resolving that
 /// ifindex in the host network namespace.
 ///
+/// The values under a pod-visible sysfs mount are workload-controlled and
+/// must not be used as proof that a host interface belongs to that pod. Capture
+/// ownership callers use the host route-table resolvers below instead.
+///
 /// When the Kubernetes watch path does not have an explicit process id, the
 /// cgroup path is used to find a live process in the pod cgroup tree.
 /// Returns `None` if the interface cannot be determined (non-Linux or missing
@@ -52,15 +56,31 @@ pub fn discover_veth_for_pod(pod_pid: Option<u32>, cgroup_path: Option<&str>) ->
 
 /// Discover the host-side interface that routes to a local pod IP.
 ///
-/// This is a fallback for runtimes that expose the pod cgroup and host route
-/// table but block reading peer indexes through `/proc/<pid>/root/sys` or
-/// `setns`. The caller should prefer PID/cgroup netns discovery first because
-/// it identifies the veth peer directly; the route fallback is still scoped by
-/// the tc program's destination-pod-IP map before any packet is classified.
+/// This host-side route lookup is an ownership source for capture callers.
+/// Shared routes are acceptable for eBPF because its destination-pod-IP map
+/// narrows classification before any packet is attributed.
 pub fn discover_veth_for_pod_ip(pod_ip: std::net::Ipv4Addr) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         resolve_iface_by_ipv4_route(Path::new("/proc/net/route"), pod_ip)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pod_ip;
+        None
+    }
+}
+
+/// Discover the host-side interface that routes to a local pod IPv6 address.
+///
+/// This is the dual-stack counterpart to [`discover_veth_for_pod_ip`]. Unlike
+/// the dedicated capture resolver below, eBPF narrows classification with its
+/// destination pod-IP map, so a route through a shared CNI bridge is usable.
+pub fn discover_veth_for_pod_ip6(pod_ip: std::net::Ipv6Addr) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        resolve_iface_by_ipv6_route(Path::new("/proc/net/ipv6_route"), pod_ip)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -362,6 +382,20 @@ fn resolve_iface_by_ipv4_route_mode(
 
 #[cfg(target_os = "linux")]
 fn resolve_dedicated_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) -> Option<String> {
+    resolve_iface_by_ipv6_route_inner(route_path, pod_ip, true)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) -> Option<String> {
+    resolve_iface_by_ipv6_route_inner(route_path, pod_ip, false)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_iface_by_ipv6_route_inner(
+    route_path: &Path,
+    pod_ip: Ipv6Addr,
+    require_host_route: bool,
+) -> Option<String> {
     // An unspecified, loopback, or multicast "pod address" names no single pod
     // interface, so it is refused before the table is consulted rather than
     // being allowed to match a broad route.
@@ -394,11 +428,14 @@ fn resolve_dedicated_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) ->
         ) else {
             continue;
         };
-        // Only a host route is evidence that this device belongs to this pod.
-        // A covering subnet route commonly names a shared CNI bridge; placing
-        // that device in an ingress-interface capture rule would intercept all
-        // attached pods, including unenrolled ones.
-        if flags & 0x1 == 0 || prefix_len != 128 {
+        // A covering subnet route may identify a shared CNI bridge. The eBPF
+        // caller can use it because its pod-IP map narrows classification;
+        // interface-scoped capture requires the dedicated resolver instead.
+        if flags & 0x1 == 0
+            || prefix_len == 0
+            || prefix_len > 128
+            || (require_host_route && prefix_len != 128)
+        {
             continue;
         }
         if !ipv6_prefix_matches(&destination, &address, prefix_len) {

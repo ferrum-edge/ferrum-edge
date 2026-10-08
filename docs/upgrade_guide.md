@@ -1894,6 +1894,18 @@ a CP pod that immediately fails startup because `FERRUM_DB_TYPE`,
 `FERRUM_DB_URL`, `FERRUM_ADMIN_JWT_SECRET`, and
 `FERRUM_CP_DP_GRPC_JWT_SECRET` are absent.
 
+### Helm Chart Workload ServiceAccounts
+
+The `ferrum-mesh` chart assigns separate ServiceAccounts to the control plane,
+Ambient proxy, east-west gateway, injector, and CA. Upgrade the chart to roll
+these workloads onto their new identities. Only the control-plane account keeps
+the cluster-wide controller permissions. Ambient retains `get` access to
+Secrets in the Helm release namespace and the optional read-only node lookup
+used by its UDP preflight. If Ambient TLS sources reference Secrets in another
+namespace, grant `get` to `ferrum-mesh-ambient` with a Role and RoleBinding in
+that namespace; do not restore cluster-wide Secret list/watch access. The
+gateway, injector, and CA accounts do not mount API tokens automatically.
+
 Before upgrading an existing Helm install that relied on the old defaults, set
 the component switches and move reserved CP settings into the new structured
 values:
