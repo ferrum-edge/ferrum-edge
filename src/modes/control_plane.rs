@@ -2810,7 +2810,7 @@ pub async fn run(
         let grpc_startup_ready = startup_ready.clone();
         let grpc_serving_degraded = serving_degraded.clone();
         let handle = tokio::spawn(async move {
-            let mut builder = Server::builder()
+            let builder = Server::builder()
                 .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
                 .http2_max_pending_accept_reset_streams(Some(
                     grpc_http2_max_pending_accept_reset_streams,

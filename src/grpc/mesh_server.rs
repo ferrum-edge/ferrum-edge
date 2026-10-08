@@ -1052,7 +1052,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let mut recorded = false;
         let namespaces: Vec<&str> = match identity.allowed_namespaces.effective_namespaces() {
             Some(namespaces) => {
-                let mut namespaces: Vec<_> = namespaces.map(String::as_str).collect();
+                let mut namespaces: Vec<_> = namespaces.iter().map(String::as_str).collect();
                 namespaces.sort_unstable();
                 namespaces
             }
