@@ -24,19 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A remaining fallback now logs its reason (for example
   `change-log batch over the cap`).
 
-### Security
-
-- **Update `quinn` to 0.11.12, `quinn-proto` to 0.11.19 and `quinn-udp` to 0.5.16** (issue #6113).
-  These releases fix published upstream advisories that apply to Ferrum's HTTP/3
-  frontend and backend client: remote panics and memory exhaustion in stream
-  and flow-control handling (GHSA-qfwj-vfxf-92j2, GHSA-hmxj-32vh-65vr,
-  GHSA-465w-v9q3-7j98, GHSA-53rm-773f-4q8c), a Retry with an oversized token
-  in the client (GHSA-wppq-2f6r-wfvm), and a `quinn-udp` receive loop that can
-  spin after a truncated datagram on the non-Linux fallback path
-  (GHSA-6pp4-4cxf-xf88). quinn-proto 0.11.19 also counts zero-length QUIC
-  datagrams toward the receive-buffer bound; Ferrum's HTTP/3 frontend has QUIC
-  DATAGRAM receive disabled. `fastbloom` moves to 0.17 with quinn-proto.
-
 ### Changed
 
 - **Vendored h2 moves to 0.4.20** (issue #6062). `vendor/h2-0.4.20-ferrum-patched/`
