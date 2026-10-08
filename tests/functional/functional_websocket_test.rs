@@ -613,11 +613,7 @@ plugin_configs:
 }
 
 /// Write a WebSocket config with a route-level method filter.
-fn write_ws_method_config(
-    config_path: &std::path::Path,
-    backend_port: u16,
-    allowed_method: &str,
-) {
+fn write_ws_method_config(config_path: &std::path::Path, backend_port: u16, allowed_method: &str) {
     let config = format!(
         r#"
 version: "1"
@@ -645,8 +641,7 @@ plugin_configs:
     scope: global
     enabled: true
 "#,
-        backend_port,
-        allowed_method
+        backend_port, allowed_method
     );
 
     let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
