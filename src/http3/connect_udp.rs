@@ -59,6 +59,7 @@
 //! | Bound | Source |
 //! |---|---|
 //! | Concurrent sessions | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` |
+//! | Concurrent sessions per client | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`, IPv6 grouped by [`CONNECT_UDP_PER_CLIENT_IPV6_PREFIX`] |
 //! | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS`, which also raises the frontend QUIC idle floor (see [`crate::http3::config::Http3ServerConfig::frontend_idle_timeout`]) |
 //! | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped by the RFC 9298 §5 ceiling of 65527 |
 //! | DATAGRAM capsule length | payload ceiling + [`CAPSULE_FRAMING_SLACK_BYTES`] |
@@ -1690,6 +1691,59 @@ enum ClientRelayStep {
     SocketUnusable,
 }
 
+/// IPv6 prefix length that groups CONNECT-UDP sources for the per-client
+/// tunnel cap (`FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`).
+///
+/// One IPv6 subscriber allocation is conventionally a `/64`, so per-address
+/// keys would let a single client rotate source addresses to mint a fresh
+/// budget for every tunnel. IPv4 (including IPv4-mapped IPv6) stays
+/// per-address.
+pub const CONNECT_UDP_PER_CLIENT_IPV6_PREFIX: u8 = 64;
+
+/// Key one resolved client identity for the per-client CONNECT-UDP tunnel cap.
+///
+/// IPv4 and IPv4-mapped IPv6 render as the canonical IPv4 address. Native IPv6
+/// is masked to `ipv6_prefix` bits (clamped to 128) so every address in that
+/// network shares one budget. A value that is not an address literal is used
+/// verbatim. Called once per tunnel admission, never on a datagram path.
+pub fn connect_udp_client_key(client_ip: &str, ipv6_prefix: u8) -> String {
+    match crate::util::client_identity::parse_canonical_client_ip(client_ip) {
+        Some(IpAddr::V6(v6)) => {
+            let prefix = u32::from(ipv6_prefix.min(128));
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            Ipv6Addr::from(u128::from(v6) & mask).to_string()
+        }
+        Some(ip) => crate::util::client_identity::canonical_ip_string(ip),
+        None => client_ip.to_string(),
+    }
+}
+
+/// Admit one CONNECT-UDP tunnel for `client_ip` against the per-client budget.
+///
+/// `counts == None` or `max == 0` means the cap is disabled (`Ok(None)`). The
+/// source is grouped by [`connect_udp_client_key`] with
+/// [`CONNECT_UDP_PER_CLIENT_IPV6_PREFIX`]. The returned guard releases the
+/// slot on drop, so the caller must hold it for the tunnel's whole lifetime —
+/// past the per-IP *request* guard, which ends when the 200 is committed.
+pub fn try_acquire_connect_udp_client_slot(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    client_ip: &str,
+    max: u64,
+) -> Result<Option<crate::proxy::PerIpConnectionGuard>, crate::proxy::PerIpLimitExceeded> {
+    let Some(counts) = counts else {
+        return Ok(None);
+    };
+    if max == 0 {
+        return Ok(None);
+    }
+    let key = connect_udp_client_key(client_ip, CONNECT_UDP_PER_CLIENT_IPV6_PREFIX);
+    crate::proxy::try_acquire_per_ip_slot(Some(counts), &key, max)
+}
+
 /// Everything the handler needs that is not already an `Arc` on `ProxyState`.
 pub(crate) struct ConnectUdpRequest {
     pub(crate) state: Arc<ProxyState>,
@@ -2029,6 +2083,42 @@ pub(crate) async fn handle_h3_connect_udp(
         )
         .await;
     }
+
+    // Per-client tunnel bound, taken before the process-wide permit so one
+    // source cannot occupy every session slot. Keyed on the resolved
+    // `ctx.client_ip` (socket peer, or forwarding headers only from a trusted
+    // proxy) with IPv6 grouped by prefix. Held for the tunnel's lifetime — the
+    // per-IP *request* guard ends when the 200 is committed — and released by
+    // RAII on every refusal, error, and cancellation path.
+    let client_tunnel_guard = match try_acquire_connect_udp_client_slot(
+        state.per_ip_connect_udp_sessions.as_ref(),
+        &ctx.client_ip,
+        state.http3_connect_udp_max_sessions_per_ip,
+    ) {
+        Ok(guard) => guard,
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                max_sessions_per_ip = state.http3_connect_udp_max_sessions_per_ip,
+                "Rejected HTTP/3 CONNECT-UDP: per-client session limit reached"
+            );
+            return reject(
+                &mut stream,
+                &state,
+                &plugins,
+                &ctx,
+                &initial_response_header_policy_plugins,
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"CONNECT-UDP session limit exceeded"}"#,
+                "connect_udp_per_ip_session_limit",
+                plugin_execution_ns,
+                start_time,
+                &request_path,
+                HashMap::new(),
+            )
+            .await;
+        }
+    };
 
     // `None` means the limiter is disabled by configuration; a present limiter
     // is the only thing that can refuse.
@@ -2401,6 +2491,7 @@ pub(crate) async fn handle_h3_connect_udp(
             )
             .await;
             drop(session_permit);
+            drop(client_tunnel_guard);
             drop(request_guard);
             drop(per_ip_guard);
             drop(socket);
@@ -2429,7 +2520,8 @@ pub(crate) async fn handle_h3_connect_udp(
     let session_guard = crate::overload::ConnectionGuard::new(&state.overload);
     drop(request_guard);
     // The tunnel is established; per-IP *request* accounting ends here exactly
-    // as it does for an H3 WebSocket upgrade.
+    // as it does for an H3 WebSocket upgrade. `client_tunnel_guard` keeps the
+    // per-client tunnel slot until the relay ends.
     drop(per_ip_guard);
 
     emit_session_summary(
@@ -2477,9 +2569,10 @@ pub(crate) async fn handle_h3_connect_udp(
         "HTTP/3 CONNECT-UDP tunnel closed"
     );
 
-    // Explicit: the permit and the connection guard release here, after both
-    // relays are gone and the socket is dropped.
+    // Explicit: the permit, the per-client tunnel slot, and the connection
+    // guard release here, after both relays are gone and the socket is dropped.
     drop(session_permit);
+    drop(client_tunnel_guard);
     drop(session_guard);
 
     // An internal relay failure is not a completed tunnel. The stream was

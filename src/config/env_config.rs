@@ -3268,6 +3268,13 @@ pub struct EnvConfig {
     /// `Semaphore::MAX_PERMITS`. A larger configured value is a validation
     /// error, never a silent clamp and never a silent "unlimited".
     pub http3_connect_udp_max_sessions: usize,
+    /// Maximum concurrent RFC 9298 CONNECT-UDP tunnels per resolved client
+    /// (default 32). `0` disables the per-client cap. IPv4 is keyed per
+    /// address; IPv6 sources in one
+    /// [`crate::http3::connect_udp::CONNECT_UDP_PER_CLIENT_IPV6_PREFIX`]
+    /// network share a budget. The slot is held for the tunnel's lifetime, so
+    /// one client cannot occupy every `http3_connect_udp_max_sessions` slot.
+    pub http3_connect_udp_max_sessions_per_ip: u64,
     /// Seconds a CONNECT-UDP tunnel may carry no datagram in either direction
     /// before it is closed (default 120). RFC 9298 §3.2 recommends that a UDP
     /// proxy "SHOULD NOT" use an idle timeout shorter than two minutes, so the
@@ -4354,6 +4361,7 @@ impl Default for EnvConfig {
             http3_websocket_enabled: true,
             http3_connect_udp_enabled: false,
             http3_connect_udp_max_sessions: 256,
+            http3_connect_udp_max_sessions_per_ip: 32,
             http3_connect_udp_idle_timeout_seconds: 120,
             http3_connect_udp_max_datagram_bytes:
                 crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES,
@@ -5006,6 +5014,7 @@ impl EnvConfig {
             http3_websocket_enabled: bool = "FERRUM_HTTP3_WEBSOCKET_ENABLED" => true;
             http3_connect_udp_enabled: bool = "FERRUM_HTTP3_CONNECT_UDP_ENABLED" => false;
             http3_connect_udp_max_sessions: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS" => 256usize;
+            http3_connect_udp_max_sessions_per_ip: u64 = "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP" => 32u64;
             http3_connect_udp_idle_timeout_seconds: u64 = "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS" => 120u64, clamp(1u64, 86_400u64);
             http3_connect_udp_max_datagram_bytes: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES" => crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES, clamp(1usize, crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
@@ -5882,6 +5891,7 @@ impl EnvConfig {
             http3_websocket_enabled,
             http3_connect_udp_enabled,
             http3_connect_udp_max_sessions,
+            http3_connect_udp_max_sessions_per_ip,
             http3_connect_udp_idle_timeout_seconds,
             http3_connect_udp_max_datagram_bytes,
             h3_request_body_drain_ms,
