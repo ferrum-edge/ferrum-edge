@@ -153,6 +153,36 @@ deploy_control_plane() {
 
 deploy_data_plane() {
   cat <<YAML | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-gateway-conformance
+  namespace: ${CP_NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-gateway-conformance
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-gateway-conformance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-gateway-conformance
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-gateway-conformance
+    namespace: ${CP_NAMESPACE}
+YAML
+
+  cat <<YAML | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -170,7 +200,7 @@ spec:
       labels:
         app.kubernetes.io/name: ${DP_SERVICE_NAME}
     spec:
-      serviceAccountName: ferrum-mesh
+      serviceAccountName: ferrum-gateway-conformance
       containers:
         - name: ferrum-edge
           image: ${FERRUM_IMAGE}
