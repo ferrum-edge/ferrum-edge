@@ -2812,25 +2812,15 @@ mod per_client_tunnel_cap {
     #[test]
     fn per_client_cap_is_disabled_when_unconfigured() {
         assert!(
-            try_acquire_connect_udp_client_slot(
-                None,
-                "198.51.100.1",
-                64,
-                1,
-            )
-            .expect("disabled cap admits")
-            .is_none()
+            try_acquire_connect_udp_client_slot(None, "198.51.100.1", 64, 1,)
+                .expect("disabled cap admits")
+                .is_none()
         );
         let counts = counts();
         assert!(
-            try_acquire_connect_udp_client_slot(
-                Some(&counts),
-                "198.51.100.1",
-                64,
-                0,
-            )
-            .expect("zero cap admits")
-            .is_none()
+            try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 64, 0,)
+                .expect("zero cap admits")
+                .is_none()
         );
         assert!(counts.is_empty());
     }
@@ -2838,32 +2828,16 @@ mod per_client_tunnel_cap {
     #[test]
     fn per_client_cap_refuses_one_client_and_admits_another() {
         let counts = counts();
-        let first = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "198.51.100.1",
-            64,
-            2,
-        )
-        .expect("first tunnel admitted")
-        .expect("cap is enabled");
-        let second = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "198.51.100.1",
-            64,
-            2,
-        )
-        .expect("second tunnel admitted")
-        .expect("cap is enabled");
+        let first = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 64, 2)
+            .expect("first tunnel admitted")
+            .expect("cap is enabled");
+        let second = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 64, 2)
+            .expect("second tunnel admitted")
+            .expect("cap is enabled");
         assert_eq!(live(&counts, "198.51.100.1"), 2);
 
         assert!(
-            try_acquire_connect_udp_client_slot(
-                Some(&counts),
-                "198.51.100.1",
-                64,
-                2,
-            )
-            .is_err(),
+            try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 64, 2,).is_err(),
             "a third concurrent tunnel from one client must be refused"
         );
         assert_eq!(
@@ -2872,14 +2846,9 @@ mod per_client_tunnel_cap {
             "a refused admission must not leak its increment"
         );
 
-        let other = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "198.51.100.2",
-            64,
-            2,
-        )
-        .expect("another client is independent")
-        .expect("cap is enabled");
+        let other = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.2", 64, 2)
+            .expect("another client is independent")
+            .expect("cap is enabled");
         assert_eq!(live(&counts, "198.51.100.2"), 1);
 
         drop((first, second, other));
@@ -2888,32 +2857,16 @@ mod per_client_tunnel_cap {
     #[test]
     fn per_client_slot_is_released_when_the_tunnel_closes() {
         let counts = counts();
-        let tunnel = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "198.51.100.1",
-            64,
-            1,
-        )
-        .expect("first tunnel admitted");
+        let tunnel = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 64, 1)
+            .expect("first tunnel admitted");
         assert!(
-            try_acquire_connect_udp_client_slot(
-                Some(&counts),
-                "198.51.100.1",
-                64,
-                1,
-            )
-            .is_err()
+            try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 64, 1,).is_err()
         );
 
         drop(tunnel);
         assert_eq!(live(&counts, "198.51.100.1"), 0);
-        let reopened = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "198.51.100.1",
-            64,
-            1,
-        )
-        .expect("closing a tunnel must release its slot");
+        let reopened = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 64, 1)
+            .expect("closing a tunnel must release its slot");
         assert!(reopened.is_some());
     }
 
@@ -2922,13 +2875,9 @@ mod per_client_tunnel_cap {
         let counts = counts();
         let ipv6_prefix = EnvConfig::default().per_ip_ipv6_prefix;
         assert_eq!(ipv6_prefix, 64);
-        let held = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "2001:db8:1:2::1",
-            ipv6_prefix,
-            1,
-        )
-        .expect("first IPv6 tunnel admitted");
+        let held =
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", ipv6_prefix, 1)
+                .expect("first IPv6 tunnel admitted");
         assert!(
             try_acquire_connect_udp_client_slot(
                 Some(&counts),
@@ -2939,13 +2888,9 @@ mod per_client_tunnel_cap {
             .is_err(),
             "rotating addresses inside one /64 must not mint a fresh budget"
         );
-        let neighbour = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "2001:db8:1:3::1",
-            ipv6_prefix,
-            1,
-        )
-        .expect("a different /64 is an independent client");
+        let neighbour =
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:3::1", ipv6_prefix, 1)
+                .expect("a different /64 is an independent client");
         assert!(neighbour.is_some());
         assert_eq!(live(&counts, "2001:db8:1:2::"), 1);
 
@@ -2965,32 +2910,18 @@ mod per_client_tunnel_cap {
     #[test]
     fn per_client_cap_uses_configured_slash_56_prefix() {
         let counts = counts();
-        let held = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "2001:db8:1:2::1",
-            56,
-            1,
-        )
-        .expect("first IPv6 tunnel admitted");
+        let held = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", 56, 1)
+            .expect("first IPv6 tunnel admitted");
         assert!(
-            try_acquire_connect_udp_client_slot(
-                Some(&counts),
-                "2001:db8:1:3:ffff::1",
-                56,
-                1,
-            )
-            .is_err(),
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:3:ffff::1", 56, 1,)
+                .is_err(),
             "addresses in one /56 must share a budget when /56 is configured"
         );
         assert_eq!(live(&counts, "2001:db8:1::"), 1);
 
-        let outside_prefix = try_acquire_connect_udp_client_slot(
-            Some(&counts),
-            "2001:db8:1:100::1",
-            56,
-            1,
-        )
-        .expect("a different /56 is an independent client");
+        let outside_prefix =
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:100::1", 56, 1)
+                .expect("a different /56 is an independent client");
         assert!(outside_prefix.is_some());
         drop((held, outside_prefix));
     }
