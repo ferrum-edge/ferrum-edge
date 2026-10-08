@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`soap_ws_security` refuses MTOM packages with padded or bare-line-ending
+  delimiter lines** (#6077). A `--boundary` that opens a line in an MTOM/XOP
+  `multipart/related` body must now be an exact CRLF delimiter line. Before
+  this change, a delimiter line with RFC 2046 transport padding (a trailing
+  space or tab) or an LF terminator was skipped as payload, and a boundary
+  opened by a bare LF or CR was ignored. Backend parsers that accept those
+  forms frame a part at that line, so the root part the gateway validated
+  could differ from the one the backend executed. These packages now get the
+  existing `400` malformed-encoding refusal. A `--boundary` in the middle of a
+  line is still ordinary payload. A package framed only with padded or LF-only
+  delimiters was already refused, so conforming CRLF-framed packages are
+  unaffected.
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already
