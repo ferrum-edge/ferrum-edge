@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **HTTP/3 validates QUIC client addresses before charging the shared
-  connection budget, and no longer advertises QUIC datagrams** (#PR_NUMBER).
+  connection budget, and no longer advertises QUIC datagrams** (#6085).
   Handshakes from clients whose source address has not been validated now run
   inside a per-listener budget, `FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES`
   (default `1024`), and count toward the overload connection budget only once
