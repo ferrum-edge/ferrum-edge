@@ -66,9 +66,8 @@ impl MeshNodeRegistry {
         expected_connected_at: DateTime<Utc>,
     ) {
         let key = super::admission::authenticated_principal_key(namespace, node_id);
-        self.nodes.remove_if(&key, |_, info| {
-            info.connected_at == expected_connected_at
-        });
+        self.nodes
+            .remove_if(&key, |_, info| info.connected_at == expected_connected_at);
     }
 
     pub fn touch_heartbeat(

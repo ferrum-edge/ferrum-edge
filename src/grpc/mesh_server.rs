@@ -1052,7 +1052,12 @@ impl MeshConfigSync for MeshGrpcServer {
         let status = mesh_slice_report_status(report.phase, report.reject_reason)
             .map_err(mesh_slice_drift_status)?;
         let mut recorded = false;
-        for namespace in identity.allowed_namespaces.effective_namespaces().into_iter().flatten() {
+        for namespace in identity
+            .allowed_namespaces
+            .effective_namespaces()
+            .into_iter()
+            .flatten()
+        {
             let key = super::admission::authenticated_principal_key(namespace, &identity.subject);
             match self.drift.record_status(
                 &key,
@@ -1070,7 +1075,9 @@ impl MeshConfigSync for MeshGrpcServer {
             }
         }
         if !recorded {
-            return Err(mesh_slice_drift_status(MeshSliceDriftAdmitError::UnknownNode));
+            return Err(mesh_slice_drift_status(
+                MeshSliceDriftAdmitError::UnknownNode,
+            ));
         }
 
         Ok(Response::new(MeshSliceStatusResponse {}))

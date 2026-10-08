@@ -989,8 +989,7 @@ impl CpGrpcServer {
         mesh.virtual_service_cors_policies.retain(|policy| {
             visible_namespaces.contains(&policy.namespace)
                 && Self::namespace_allowed_by_scope(&policy.namespace, scope)
-                && bearer_namespaces
-                    .is_none_or(|allowed| allowed.contains(&policy.namespace))
+                && bearer_namespaces.is_none_or(|allowed| allowed.contains(&policy.namespace))
                 && crate::modes::mesh::config::virtual_service_cors_policy_exported_to_namespace(
                     policy, namespace,
                 )
