@@ -26,68 +26,6 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased changes after 0.9.15
-
-### Process-environment AWS credentials reach only AWS endpoints (issue [#6111](https://github.com/ferrum-edge/ferrum-edge/issues/6111))
-
-`serverless_function` (`aws_lambda`) and `ai_federation` (`aws_bedrock`) still
-fall back to `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
-`AWS_SESSION_TOKEN` when the plugin config omits them, but such a credential
-may now only be signed for an official endpoint of that service in the
-configured region, over HTTPS on the default port:
-
-- `<service>[-fips].<region>.amazonaws.com`,
-- dual-stack `<service>[-fips].<region>.api.aws`,
-- an interface VPC endpoint
-  `vpce-<id>[-<az>].<service>[-fips].<region>.vpce.amazonaws.com`,
-
-where `<service>` is `lambda` or `bedrock-runtime` and `<region>` is a
-commercial or GovCloud region; a China (`cn-*`) region uses
-`amazonaws.com.cn` in place of `amazonaws.com` and the dual-stack
-`api.amazonwebservices.com.cn` in place of `api.aws`. The region itself must
-be a commercial (`us|eu|ap|sa|ca|me|af|il|mx-<area>-<n>`), GovCloud
-(`us-gov-<area>-<n>`), or China (`cn-<area>-<n>`) region in lowercase. A row
-whose region or config-chosen endpoint is anything else is refused at
-admission: the Admin API answers `400`, file mode and `ferrum-edge validate`
-fail, and existing database rows are quarantined as unconstructible.
-
-Two related behaviour changes ship with it:
-
-- `AWS_SESSION_TOKEN` is now used only when the key id and secret also come
-  from the environment. A config key pair no longer picks up the process
-  session token (an STS token is bound to its access key, so that pairing was
-  never a valid credential). If a row relied on it, write `aws_session_token`
-  into the config beside the keys.
-- An `AWS_LAMBDA_ENDPOINT_URL` set in the environment is trusted like the
-  environment credentials: a `serverless_function` row that sets no
-  `aws_endpoint_url` can use it (for example a LocalStack container) without
-  the opt-in. A config-set `aws_endpoint_url` stays scoped, and the region is
-  still screened.
-
-Affected rows combine an environment-resolved key id or secret with:
-
-- a LocalStack, mock, or proxy `aws_endpoint_url` or Bedrock `base_url`,
-- an `aws_region` that is not a lowercase commercial, GovCloud, or China region
-  (including region-shaped S3 labels such as `s3-us-west-2`), or
-- an air-gapped ISO partition (`us-iso-*`, `us-isob-*`, `eu-isoe-*`,
-  `us-isof-*`) or the AWS European Sovereign Cloud (`eusc-*`,
-  `*.amazonaws.eu`), which are not modelled.
-
-Before upgrading, for each one either:
-
-1. write the AWS credentials into the plugin config (a config key pair, plus
-   `aws_session_token` when one is in effect, is not scoped), or
-2. set `allow_custom_endpoint_with_ambient_credentials: true` (top-level for
-   `serverless_function`, on the provider for `ai_federation`) to deliberately
-   send the process credentials to that endpoint or partition. Anyone who can
-   write the plugin config can then redirect those credentials, so prefer
-   option 1 or an official VPC endpoint (which needs no opt-in).
-
-Rows that use the default derived endpoint, or an official override, are
-unaffected. The `aws_bedrock` default endpoint is now partition-aware: a
-`cn-*` region derives `bedrock-runtime.<region>.amazonaws.com.cn`. See
-[Ambient AWS credential scope](plugins.md#ambient-aws-credential-scope).
-
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main

@@ -7,46 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **BREAKING — process-environment AWS credentials are scoped to the
-  provider's own endpoints** (issue #6111). `serverless_function`
-  (`aws_lambda`) and `ai_federation` (`aws_bedrock`) fall back to the process's
-  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` when the
-  plugin config omits them. Those are the gateway's own cloud identity, yet the
-  same config could choose where they were signed for (`aws_endpoint_url`,
-  `base_url`, or a malformed `aws_region` interpolated into the derived host).
-  Whenever the key id or secret comes from the environment, `aws_region` must
-  now be a commercial, GovCloud, or China region (the AWS SDK partition
-  grammars, lowercase only, so region-shaped S3 labels such as `s3-us-west-2`
-  are refused), and the config-chosen endpoint must be an official endpoint of
-  that service for that region over HTTPS on the default port:
-  `<service>[-fips].<region>.amazonaws.com`, the dual-stack
-  `<service>[-fips].<region>.api.aws`, or an interface VPC endpoint
-  `vpce-<id>[-<az>].<service>[-fips].<region>.vpce.amazonaws.com` for a
-  commercial or GovCloud region, with `amazonaws.com.cn` and the dual-stack
-  `api.amazonwebservices.com.cn` for a `cn-*` region (`lambda` /
-  `bedrock-runtime`). Admission refuses anything else with a validation error
-  (CP/admin shape-only admission screens a configured `aws_region` and
-  `aws_endpoint_url` when the row omits the key pair), and every request
-  re-checks the endpoint before signing: `serverless_function` fails closed with
-  `500` (`ambient_credential_endpoint_refused`) regardless of `on_error`, and
-  `ai_federation` rejects the provider pre-wire. Credentials written into the
-  plugin config are not scoped, and `AWS_SESSION_TOKEN` is now used only when
-  the key id and secret also come from the environment (it is never paired with
-  a config key pair). An `AWS_LAMBDA_ENDPOINT_URL` set in the environment is
-  trusted like the environment credentials when the row sets no
-  `aws_endpoint_url`. The new `allow_custom_endpoint_with_ambient_credentials`
-  field (top-level for `serverless_function`, per provider for
-  `ai_federation`; default `false`) deliberately lifts the scope for a private
-  endpoint such as LocalStack, an air-gapped ISO partition, or the AWS European
-  Sovereign Cloud. The `aws_bedrock` default endpoint is now partition-aware
-  (`bedrock-runtime.<region>.amazonaws.com.cn` for a `cn-*` region). These
-  plugins never consult the AWS SDK default credential chain, so the scope
-  covers every ambient credential source they use. The trust model is
-  documented in `docs/plugins.md` (Ambient AWS credential scope);
-  `openapi.yaml` gains the field on both schemas.
-
 ### Performance
 
 - **Large config writes apply as deltas instead of full reloads** (issue
