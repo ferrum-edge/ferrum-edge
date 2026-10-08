@@ -10867,7 +10867,9 @@ components:
             Default: false — the fixed initial stream/connection windows apply. While enabled, adaptive
             windowing replaces those fixed sizes: hyper restarts both at 65535 bytes and grows the connection
             window only as the link is measured, which fragments hundreds of concurrent streams into tiny
-            DATA frames and can trip h2's small-frame flood budget (GOAWAY ENHANCE_YOUR_CALM).
+            DATA frames and can trip h2's small-frame flood budget (GOAWAY ENHANCE_YOUR_CALM). Its BDP
+            PING/SETTINGS traffic can also deadlock a connection carrying large bodies in both directions
+            at once (issue #6073, upstream hyperium/h2#975).
             An explicit adaptive choice remains authoritative even alongside window overrides; omit this
             field when setting explicit windows to auto-disable adaptive so fixed sizes apply.
         pool_http2_max_frame_size:
