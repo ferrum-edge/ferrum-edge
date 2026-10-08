@@ -1821,8 +1821,7 @@ pub(crate) fn validate_trace_provider_secret_refs(
 ) -> Result<(), String> {
     for (index, provider) in providers.iter().enumerate() {
         if let TracingProvider::Lightstep {
-            access_token_env,
-            ..
+            access_token_env, ..
         } = provider
         {
             validate_plugin_secret_env_name(LIGHTSTEP_ACCESS_TOKEN_ENV_FIELD, access_token_env)
