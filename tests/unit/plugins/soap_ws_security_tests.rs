@@ -2764,6 +2764,20 @@ fn decode_rejects_duplicate_charset_parameters() {
 }
 
 #[test]
+fn decode_rejects_extended_charset_parameters() {
+    let xml = wrap_soap(&fresh_timestamp());
+    for content_type in [
+        "text/xml; charset*=utf-8''utf-16",
+        "text/xml; charset=utf-8; CHARSET*0=utf-16",
+        "text/xml; charset*0*=utf-8''utf-16",
+    ] {
+        let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
+            .expect_err("an RFC 2231 charset is a second declaration");
+        assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+    }
+}
+
+#[test]
 fn decode_rejects_unbalanced_charset_quotes() {
     let xml = wrap_soap(&fresh_timestamp());
     for content_type in ["text/xml; charset=\"utf-8", "text/xml; charset=utf-8\""] {
@@ -7110,6 +7124,35 @@ mod advisory_regressions {
         );
     }
 
+    /// RFC 2231 extended and continuation forms of `boundary`, `type`, and
+    /// `start` are decoded by some backend parsers and ignored by Ferrum, so a
+    /// package carrying one would be framed, typed, or rooted differently. They
+    /// are refused, alone or beside the plain form.
+    #[test]
+    fn multipart_extended_parameters_are_refused() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let config = strict_username_token_config();
+        let refused: Result<String, String> = Ok("reject:400:malformed_multipart".to_string());
+
+        for content_type in [
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; boundary*=utf-8''B",
+            "multipart/related; type=\"application/xop+xml\"; boundary*=utf-8''B",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; boundary*0=B",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; BOUNDARY*0*=utf-8''B",
+            "multipart/related; type*=utf-8''application%2Fxop%2Bxml; boundary=A",
+            "multipart/related; type=\"application/xop+xml\"; type*0=text; boundary=A",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; start*=utf-8''%3Cx%3E",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; Start*1=y",
+        ] {
+            let outcome = classify(&config, Some(content_type));
+            assert_eq!(outcome, refused, "{content_type}");
+        }
+
+        // A parameter that merely shares a prefix with one of them is unrelated.
+        let unrelated = "multipart/related; type=\"application/xop+xml\"; boundary=A; types*=x";
+        assert_eq!(classify(&config, Some(unrelated)), Ok("mtom".to_string()));
+    }
+
     #[test]
     fn multipart_parameters_follow_http_quoted_string_rules() {
         use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
@@ -7240,6 +7283,42 @@ mod advisory_regressions {
                 "a padded first delimiter must not be skipped as preamble"
             );
         }
+    }
+
+    /// A boundary token planted mid-line in the preamble, fronting an
+    /// unverified envelope, is refused rather than skipped: a parser that finds
+    /// the first delimiter without requiring it to open a line takes the
+    /// planted part as its root, while the later part carries a valid
+    /// credential.
+    #[tokio::test]
+    async fn mtom_preamble_fake_delimiter_is_refused() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let content_type =
+            "multipart/related; type=\"application/xop+xml\"; boundary=MIME_boundary";
+        let unverified = valid_username_token_body().replace("secret123", "wrong-password");
+        let valid_part = format!(
+            "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             \r\n\
+             {}\r\n\
+             --MIME_boundary--\r\n",
+            valid_username_token_body()
+        );
+        let package = format!(
+            "X--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             \r\n\
+             {unverified}\r\n\
+             {valid_part}"
+        );
+
+        let mut ctx = ctx_with(&package, Some(content_type));
+        let mut headers = soap_headers_with_content_type(content_type);
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert!(
+            is_reject(&result),
+            "a mid-line delimiter in the preamble must not be skipped"
+        );
     }
 
     /// Declaring that a route does not accept MTOM must refuse SOAP-bearing
@@ -7586,46 +7665,65 @@ mod mtom_strict_framing {
         assert_eq!(root_of(&with_preamble, Some(ROOT_ID)), "<soap:Envelope/>");
     }
 
-    /// A `--boundary` that is not at the start of a line is payload, not
-    /// framing. The unanchored byte-substring search this replaced truncated
-    /// the envelope at the first such occurrence, so Ferrum validated a prefix
-    /// of the message the backend executed in full.
+    /// A `--boundary` that is not at the start of a line is not framing to
+    /// CRLF parsing, but parsers that match the token inside a part body end
+    /// the part there. The unanchored byte-substring search this replaced
+    /// truncated the envelope the same way, so Ferrum validated a prefix of the
+    /// message the backend executed in full. The token inside a part body fails
+    /// closed, in the envelope and in an attachment alike.
     #[test]
-    fn an_embedded_boundary_substring_does_not_reframe_the_root() {
+    fn an_embedded_boundary_substring_fails_closed() {
         let root = "<soap:Envelope><!--MIME_boundary--></soap:Envelope>";
-        let package = package(root, "opaque-bytes");
-        assert_eq!(
-            root_of(&package, Some(ROOT_ID)),
-            root,
-            "a boundary substring inside the envelope is payload"
-        );
+        let in_root = package(root, "opaque-bytes");
+        assert_closed(&in_root, Some(ROOT_ID), "malformed_encoding");
+        assert_closed(&in_root, None, "malformed_encoding");
+
+        let in_attachment = package("<soap:Envelope/>", "opaque --MIME_boundary bytes");
+        assert_closed(&in_attachment, Some(ROOT_ID), "malformed_encoding");
     }
 
-    /// A fake part planted in the preamble must not become the root. With
-    /// first-part selection an unanchored search finds the planted delimiter
-    /// first and returns the attacker's envelope; anchored framing skips it and
-    /// selects the real first part.
+    /// A fake part planted in the preamble must not become the root. Parsers
+    /// that find the first delimiter without requiring it to open a line frame
+    /// the planted part as the first part, while CRLF framing skips it as
+    /// preamble, so any boundary token in the preamble fails closed: with or
+    /// without `start`, and whatever precedes it on its line.
     #[test]
     fn a_payload_fake_delimiter_cannot_become_the_root() {
         let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
-        // The planted delimiter is mid-line, so it is not a delimiter line for
-        // any conforming parser.
-        let planted = format!(
-            "preamble --MIME_boundary\r\n\
-             Content-Type: text/xml\r\n\
-             \r\n\
-             <soap:Envelope>forged</soap:Envelope>\r\n\
-             {real}"
-        );
-        assert_eq!(
-            root_of(&planted, None),
-            "<soap:Envelope>real</soap:Envelope>",
-            "an unanchored delimiter must not select a root"
-        );
-        assert_eq!(
-            root_of(&planted, Some(ROOT_ID)),
-            "<soap:Envelope>real</soap:Envelope>"
-        );
+        for lead in ["preamble ", "X", "preamble\r\nX"] {
+            let planted = format!(
+                "{lead}--MIME_boundary\r\n\
+                 Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                 \r\n\
+                 <soap:Envelope>forged</soap:Envelope>\r\n\
+                 {real}"
+            );
+            assert_closed(&planted, None, "malformed_encoding");
+            assert_closed(&planted, Some(ROOT_ID), "malformed_encoding");
+        }
+    }
+
+    /// A line that opens with the boundary token followed by more boundary
+    /// characters (`--boundaryX`) is a delimiter to a parser that ignores the
+    /// rest of the line and payload to one that requires an exact match, so it
+    /// fails closed wherever it appears.
+    #[test]
+    fn a_boundary_prefixed_token_at_line_start_fails_closed() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        let forged = "--MIME_boundaryX\r\n\
+                      Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                      \r\n\
+                      <soap:Envelope>forged</soap:Envelope>\r\n";
+
+        let leading = format!("{forged}{real}");
+        assert_closed(&leading, None, "malformed_encoding");
+        assert_closed(&leading, Some(ROOT_ID), "malformed_encoding");
+
+        let after_preamble = format!("preamble\r\n{forged}{real}");
+        assert_closed(&after_preamble, None, "malformed_encoding");
+
+        let in_part = real.replacen("opaque\r\n", &format!("opaque\r\n{forged}"), 1);
+        assert_closed(&in_part, Some(ROOT_ID), "malformed_encoding");
     }
 
     /// LF-only framing is not MIME framing. A parser that tolerates it and one
@@ -7825,6 +7923,50 @@ mod mtom_strict_framing {
 
         let blank_id = base.replace("<root@example.com>", "<>");
         assert_closed(&blank_id, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// `start` must name the first part. A parser that ignores `start` and
+    /// takes the first part as the root would otherwise execute a different
+    /// envelope than the one `start` selected for validation.
+    #[test]
+    fn a_start_naming_a_later_part_fails_closed() {
+        let package = "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+             Content-ID: <first@example.com>\r\n\
+             \r\n\
+             <soap:Envelope>first</soap:Envelope>\r\n\
+             --MIME_boundary\r\n\
+             Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+             Content-ID: <root@example.com>\r\n\
+             \r\n\
+             <soap:Envelope>second</soap:Envelope>\r\n\
+             --MIME_boundary--\r\n";
+        assert_closed(package, Some(ROOT_ID), "malformed_encoding");
+
+        let first = "<soap:Envelope>first</soap:Envelope>";
+        assert_eq!(root_of(package, None), first);
+        assert_eq!(root_of(package, Some("first@example.com")), first);
+    }
+
+    /// `Content-ID` comparison takes the widest reading a backend may use:
+    /// ASCII case is ignored and a `cid:` prefix is dropped. `start` resolves
+    /// under it, and two ids that differ only in those ways are duplicates.
+    #[test]
+    fn content_ids_compare_case_insensitively_and_without_cid_scheme() {
+        let base = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        let real = "<soap:Envelope>real</soap:Envelope>";
+        assert_eq!(root_of(&base, Some("ROOT@EXAMPLE.COM")), real);
+        assert_eq!(root_of(&base, Some("cid:root@example.com")), real);
+
+        for variant in [
+            "<ROOT@example.com>",
+            "<cid:root@example.com>",
+            "<CID:Root@Example.Com>",
+        ] {
+            let package = base.replace("<attachment@example.com>", variant);
+            assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+            assert_closed(&package, None, "malformed_encoding");
+        }
     }
 
     /// `start` naming a part the package does not contain has no envelope to
