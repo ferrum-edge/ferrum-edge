@@ -4563,12 +4563,12 @@ pub struct PodEvent<'a> {
     pub pod_pid: Option<u32>,
     /// Pre-resolved host-side veth interface name for this pod, bypassing
     /// the production resolver. Production always sets this to `None` and
-    /// relies on the procfs/sysfs probe from either the explicit pod PID or
-    /// the resolved pod cgroup; tests set it to a synthetic interface name
-    /// (e.g., `"veth-mock"`) to satisfy the post-`65606d87` enrollment
-    /// invariant that requires an inbound tc attach before the pod is
-    /// considered enrolled, without needing a real pod PID or a Linux kernel
-    /// under test.
+    /// relies on the dedicated host-route lookup keyed by the pod address
+    /// (`veth::discover_dedicated_veth_for_pod`); tests set it to a synthetic
+    /// interface name (e.g., `"veth-mock"`) to satisfy the post-`65606d87`
+    /// enrollment invariant that requires an inbound tc attach before the pod
+    /// is considered enrolled, without needing a real pod route or a Linux
+    /// kernel under test.
     pub veth_iface_override: Option<&'a str>,
     /// Kubernetes `spec.hostNetwork`. Host-network pods share the node's netns
     /// and are never enrolled for cgroup-keyed capture.
@@ -7326,15 +7326,17 @@ fn handle_pod_added_inner(
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
     // Production: the kube-rs caller sets `veth_iface_override = None`. Resolve
-    // from the host route table using the registry-published pod IP; a pod's
-    // sysfs view is workload-controlled and cannot establish veth ownership.
+    // from an exact `/32` or `/128` host route for the registry-published pod
+    // address to a dedicated host-side peer. A pod's sysfs view is
+    // workload-controlled and cannot establish veth ownership, and a shared CNI
+    // device (`cni0`, `cilium_host`) would leave pod-to-pod frames unguarded, so
+    // an unresolved pod is refused below rather than attached elsewhere.
     // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
-    // is satisfied without a real pod PID / Linux kernel.
+    // is satisfied without a real pod / Linux kernel.
     let veth_iface = event
         .veth_iface_override
         .map(|s| s.to_string())
-        .or_else(|| pod_ip.and_then(veth::discover_veth_for_pod_ip))
-        .or_else(|| pod_ip6.and_then(veth::discover_veth_for_pod_ip6));
+        .or_else(|| veth::discover_dedicated_veth_for_pod(pod_ip, pod_ip6));
 
     if !pod_states.contains_key(pod_uid)
         && has_failed_pod_enrollment_attempt(&state_key)
@@ -14323,11 +14325,10 @@ mod tests {
     #[test]
     fn handle_pod_added_enrolls_matching_pod() {
         // PR #934 (commit 65606d87) requires the inbound tc attach to
-        // succeed before enrollment is accepted; that means
-        // `discover_veth_for_pod` must return `Some(_)`. Tests don't have
-        // a real pod network namespace, so we use the test-only veth
-        // override seam (`crate::ebpf::veth::tests::TestOverrideGuard`)
-        // to feed the production path a stable interface name. The guard
+        // succeed before enrollment is accepted; that means the pod veth
+        // must resolve. This event supplies `veth_iface_override`; the
+        // test-only resolver seam (`crate::ebpf::veth::tests::TestOverrideGuard`)
+        // additionally covers any path that re-resolves without it. The guard
         // is RAII-scoped — it restores the previous override on drop so
         // sibling tests stay isolated.
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
@@ -14390,6 +14391,63 @@ mod tests {
             NODE_AGENT_CAPTURE_STATE_READY,
             "successful same-UID re-enrollment must supersede a stale detach blocker"
         );
+    }
+
+    #[test]
+    fn handle_pod_added_refuses_pod_without_dedicated_host_route() {
+        // A live pod PID used to resolve the veth from the pod's own sysfs
+        // view, which the workload controls. Only a dedicated host route keyed
+        // by the pod address may name the attachment device now, so a pod
+        // with a PID but no such route is refused and nothing attaches to a
+        // shared CNI device in its place. No `TestOverrideGuard` is pinned, so
+        // this exercises the production resolver against the test host's own
+        // route tables, which carry no route to the documentation address.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-no-route")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+        let event = PodEvent {
+            pod_uid: "pod-no-route",
+            pod_name: "no-route-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("203.0.113.77"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("203.0.113.77")),
+            node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
+            pod_pid: Some(std::process::id()),
+            veth_iface_override: None,
+            host_network: false,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let state_key = pod_state_key(&pod_states, event.pod_uid);
+        assert!(
+            backend.tc_attachments.is_empty(),
+            "no tc program may attach without a dedicated host route"
+        );
+        assert!(!pod_states.contains_key(event.pod_uid));
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 0);
+        assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&state_key));
+        forget_failed_pod_enrollment(&state_key);
     }
 
     #[test]

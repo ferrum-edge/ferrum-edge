@@ -1337,6 +1337,11 @@ fn node_waypoint_pod_endpoint(
     })
 }
 
+/// ServiceAccount the `ferrum-mesh` chart binds to the Ambient/NodeWaypoint
+/// DaemonSet. No other mesh component runs under it, so a pod that only copies
+/// the labels and topology env cannot be trusted as a NodeWaypoint.
+const NODE_WAYPOINT_SERVICE_ACCOUNT: &str = "ferrum-mesh-ambient";
+
 pub(super) fn trusted_node_waypoint_pod_object(
     options: &K8sTranslationOptions,
     object: &K8sObject,
@@ -1349,7 +1354,7 @@ pub(super) fn trusted_node_waypoint_pod_object(
             .labels
             .get("app.kubernetes.io/name")
             .is_some_and(|value| value == "ferrum-mesh-ambient")
-        && pod_service_account(object) == "ferrum-mesh"
+        && pod_service_account(object) == NODE_WAYPOINT_SERVICE_ACCOUNT
         && pod_env_value(object, "FERRUM_MESH_TOPOLOGY").is_some_and(matches_node_waypoint_topology)
 }
 

@@ -194,7 +194,7 @@ def _assert_errors(actual: Iterable[str], expected_substrings: list[str], label:
 
 def self_test() -> None:
     expected_spiffe = (
-        "spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2"
+        "spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2"
     )
     trust_domain = "cluster.local"
 
@@ -204,7 +204,7 @@ def self_test() -> None:
     hosted_present = """
 # HELP ferrum_mesh_cert_expiry_seconds Seconds until mesh X.509-SVID expiry.
 # TYPE ferrum_mesh_cert_expiry_seconds gauge
-ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2",source="spire_agent"} 3569
+ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2",source="spire_agent"} 3569
 # HELP ferrum_mesh_ca_health Mesh CA backend health, 1 healthy and 0 unhealthy.
 # TYPE ferrum_mesh_ca_health gauge
 ferrum_mesh_ca_health{ca_type="spire_agent"} 1
@@ -223,7 +223,7 @@ ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agen
     )
 
     wrong_source_only = """
-ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2",source="workload_api"} 3569
+ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2",source="workload_api"} 3569
 ferrum_mesh_ca_health{ca_type="spire_agent"} 1
 ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agent"} 1
 """
@@ -249,7 +249,7 @@ ferrum_mesh_trust_bundle_version 1
             trust_domain=trust_domain,
         ),
         [
-            'spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2"',
+            'spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2"',
             'ca_type="spire_agent"',
             'trust_domain="cluster.local"',
         ],
@@ -257,7 +257,7 @@ ferrum_mesh_trust_bundle_version 1
     )
 
     zero_expiry = """
-ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2",source="spire_agent"} 0
+ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2",source="spire_agent"} 0
 ferrum_mesh_ca_health{ca_type="spire_agent"} 1
 ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agent"} 1
 """
@@ -272,7 +272,7 @@ ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agen
     )
 
     unhealthy_ca = """
-ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2",source="spire_agent"} 3569
+ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2",source="spire_agent"} 3569
 ferrum_mesh_ca_health{ca_type="spire_agent"} 0
 ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agent"} 1
 """
@@ -287,7 +287,7 @@ ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agen
     )
 
     missing_bundle = """
-ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2",source="spire_agent"} 3569
+ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2",source="spire_agent"} 3569
 ferrum_mesh_ca_health{ca_type="spire_agent"} 1
 """
     _assert_errors(
@@ -301,7 +301,7 @@ ferrum_mesh_ca_health{ca_type="spire_agent"} 1
     )
 
     malformed_labels = """
-ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker2",source="spire_agent",broken} 3569
+ferrum_mesh_cert_expiry_seconds{spiffe_id="spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/ferrum-ebpf-live-worker2",source="spire_agent",broken} 3569
 ferrum_mesh_ca_health{ca_type="spire_agent",ca_type="other"} 1
 ferrum_mesh_trust_bundle_version{trust_domain="cluster.local",source="spire_agent",bad="\\t"} 1
 """

@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
 import sys
-import urllib.error
 import urllib.request
 from typing import Any
 
@@ -152,7 +152,10 @@ def main(argv: list[str]) -> int:
             current_sha=args.current_sha,
             limit=args.limit,
         )
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+    # `OSError` covers `URLError`, timeouts, and connection resets; a
+    # truncated body raises `http.client.IncompleteRead`. History is optional,
+    # so every transport or decode failure starts fresh instead of failing.
+    except (OSError, http.client.HTTPException, ValueError) as exc:
         print(
             f"::warning::Could not load trusted scheduled-run history; starting fresh: {exc}",
             file=sys.stderr,

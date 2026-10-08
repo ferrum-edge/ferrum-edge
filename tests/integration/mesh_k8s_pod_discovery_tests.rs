@@ -97,7 +97,7 @@ fn node_waypoint_pod(node_name: &str, ip: &str, ready: bool, hbone_port: u16) ->
         "ferrum-system",
         &format!("ferrum-node-waypoint-{node_name}"),
         json!({
-            "serviceAccountName": "ferrum-mesh",
+            "serviceAccountName": "ferrum-mesh-ambient",
             "nodeName": node_name,
             "hostNetwork": true,
             "containers": [{
@@ -1204,6 +1204,51 @@ fn k8s_pod_discovery_rejects_untrusted_node_waypoint_looking_pods() {
             .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
             .expect("reviews workload");
         assert!(workload.node_waypoint.is_none());
+    }
+}
+
+#[test]
+fn k8s_pod_discovery_trusts_only_the_ambient_service_account_for_node_waypoints() {
+    let spiffe_id = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
+    let node_waypoint_for = |service_account: &str| {
+        let mut waypoint =
+            node_waypoint_pod_with_spiffe("node-a", "192.0.2.10", true, 15008, spiffe_id);
+        waypoint.spec["serviceAccountName"] = json!(service_account);
+        let translation = translate_k8s_objects(
+            &[
+                node("node-a", "node-uid-a"),
+                service(),
+                ready_pod(),
+                endpoint_slice(),
+                waypoint,
+            ],
+            options(),
+        )
+        .expect("K8s core translation succeeds");
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh config")
+            .workloads
+            .iter()
+            .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+            .expect("reviews workload")
+            .node_waypoint
+            .clone()
+    };
+
+    let trusted = node_waypoint_for("ferrum-mesh-ambient").expect("trusted");
+    assert_eq!(trusted.address, "192.0.2.10");
+    assert_eq!(trusted.spiffe_id.as_str(), spiffe_id);
+
+    // The previous shared chart identity and the control-plane identity both
+    // run in the waypoint namespace, but neither runs the NodeWaypoint.
+    for service_account in ["ferrum-mesh", "ferrum-mesh-control-plane", "default"] {
+        assert!(
+            node_waypoint_for(service_account).is_none(),
+            "{service_account} must not be trusted as a NodeWaypoint identity"
+        );
     }
 }
 

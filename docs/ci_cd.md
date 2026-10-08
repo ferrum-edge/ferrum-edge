@@ -1440,7 +1440,10 @@ issue so the streak cannot stay silent. Weekly and daily publisher jobs
 share `concurrency.group: scaling-gate-publisher` with `queue: max` and
 `cancel-in-progress: false` so a newer publisher does not replace queued
 work; they do not claim FIFO dispatch. The publisher always inspects the
-API's newest-first `scaling-regression.yml` run on `main` and treats the
+newest `scaling-regression.yml` run on `main`, merging the API's
+newest-first `schedule` and `workflow_dispatch` listings; every run must
+come from this repository and this workflow path, so a manual run on `main`
+can close the issue while a fork's pull-request run never counts. It treats the
 current weekly `SCALING_JOB_RESULT` as authoritative only when
 `GITHUB_RUN_ID` is that exact run. An older publisher derives the issue
 from that latest run instead, so a stale success cannot close over a

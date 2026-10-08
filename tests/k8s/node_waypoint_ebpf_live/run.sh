@@ -489,7 +489,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh/node/"'$(FERRUM_K8S_NODE_NAME)'
+  local spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh-ambient/node/"'$(FERRUM_K8S_NODE_NAME)'
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
@@ -556,7 +556,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local shared_spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh"
+  local shared_spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh-ambient"
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
@@ -1030,12 +1030,12 @@ discover_ingress_redirect_ifaces() {
 }
 
 node_waypoint_spiffe_template() {
-  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
 }
 
 node_waypoint_spiffe_for_node() {
   local node="$1"
-  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/%s' "$TRUST_DOMAIN" "$MESH_NS" "$node"
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh-ambient/node/%s' "$TRUST_DOMAIN" "$MESH_NS" "$node"
 }
 
 collect_spire_diagnostics() {
@@ -1081,7 +1081,7 @@ install_spire_production_identity() {
       "$spiffe_id" \
       "$agent_parent_id" \
       "$MESH_NS" \
-      ferrum-mesh \
+      ferrum-mesh-ambient \
       "k8s:node-name:$node" \
       "k8s:container-name:ferrum-edge"
   done
@@ -1324,7 +1324,7 @@ for pod in items:
         continue
 
     env = {item["name"]: item for item in ferrum.get("env") or []}
-    expected_spiffe_template = f"spiffe://{trust_domain}/ns/{mesh_ns}/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)"
+    expected_spiffe_template = f"spiffe://{trust_domain}/ns/{mesh_ns}/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)"
     expected_values = {
         "FERRUM_MESH_CA_BACKEND": "spire_agent",
         "FERRUM_MESH_SPIRE_AGENT_SOCKET": "/run/spire/sockets/agent.sock",
