@@ -472,7 +472,10 @@ fn concurrent_moves_of_one_expired_marker_have_exactly_one_winner() {
         .collect();
     for (principal, outcome) in &outcomes {
         assert!(
-            matches!(outcome, Some(ReplayAdmission::Admitted | ReplayAdmission::Replay)),
+            matches!(
+                outcome,
+                Some(ReplayAdmission::Admitted | ReplayAdmission::Replay)
+            ),
             "every losing claim must be a replay ({principal}): {outcome:?}"
         );
     }
@@ -489,8 +492,7 @@ fn concurrent_moves_of_one_expired_marker_have_exactly_one_winner() {
         let charged = lane.principal_entries_for_tests(&proof_for(sub, "proof", principal));
         let expected = usize::from(principal == winners[0]);
         assert_eq!(
-            charged,
-            expected,
+            charged, expected,
             "only the winner may hold the marker's charge ({principal})"
         );
         total += charged;
