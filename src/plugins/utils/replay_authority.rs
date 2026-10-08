@@ -322,6 +322,11 @@ impl ReplayDomain {
     /// thumbprint and the `jti`; for HMAC v2 the consumer identity and client
     /// nonce). They are consumed here and never retained: only the resulting
     /// digest leaves this function.
+    ///
+    /// The first part is the principal charged for the process lane's
+    /// per-principal quota, so a caller must put a verified principal there
+    /// (HMAC v2 passes the consumer id). A caller whose first part is not a
+    /// principal must use [`Self::marker_with_principal`] instead.
     pub fn marker(&self, parts: &[&[u8]]) -> ReplayMarker {
         let principal = parts.first().copied().unwrap_or_default();
         self.marker_with_principal(parts, &[principal])

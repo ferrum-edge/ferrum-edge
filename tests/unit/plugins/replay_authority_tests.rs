@@ -28,9 +28,9 @@ use ferrum_edge::plugins::utils::redis_rate_limiter::{
     shared_replay_transition_lock_held_for_test,
 };
 use ferrum_edge::plugins::utils::replay_authority::{
-    MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
-    SharedReplayAuthorityHealth, admit_process_at, counters, monotonic_millis, process_lane,
-    process_lane_registered_for_tests, process_max_entries, shared_authority_degraded,
+    MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayMarker,
+    ReplayScope, SharedReplayAuthorityHealth, admit_process_at, counters, monotonic_millis,
+    process_lane, process_lane_registered_for_tests, process_max_entries, shared_authority_degraded,
     shared_health_snapshot, validate_scope_backend,
 };
 
@@ -53,6 +53,13 @@ fn domain(sub: &str) -> ReplayDomain {
 fn process_authority(sub: &str, max_entries: usize) -> ReplayAuthority {
     ReplayAuthority::process("test", &domain(sub), max_entries, RETENTION, 8)
         .expect("process lane should be created")
+}
+
+/// A marker charged to a principal of its own. Lane-wide capacity tests use
+/// it so the per-principal quota (a quarter of the cap, minimum one) cannot
+/// refuse first and mask the lane-cap behavior under test.
+fn lane_marker(sub: &str, proof: &str) -> ReplayMarker {
+    domain(sub).marker_with_principal(&[b"c", proof.as_bytes()], &[proof.as_bytes()])
 }
 
 #[tokio::test]
@@ -106,6 +113,125 @@ async fn dpop_capacity_is_charged_to_token_principal_across_proof_keys() {
     assert_eq!(
         authority.admit(&other_principal).await,
         ReplayAdmission::Admitted
+    );
+}
+
+/// Reclaiming a principal's expired markers returns its quota share, so the
+/// per-principal bound throttles retained claims instead of locking the
+/// principal out for the life of the lane.
+#[test]
+fn expired_markers_return_their_principal_quota_share() {
+    let sub = "principal-quota-reclaim";
+    // A cap of 8 gives each principal a share of 2.
+    let authority = process_authority(sub, 8);
+    let now = monotonic_millis();
+    let first = domain(sub).marker(&[b"principal-a", b"first"]);
+    let second = domain(sub).marker(&[b"principal-a", b"second"]);
+    let third = domain(sub).marker(&[b"principal-a", b"third"]);
+
+    for marker in [&first, &second] {
+        assert_eq!(
+            admit_process_at(&authority, marker, now),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    assert_eq!(
+        admit_process_at(&authority, &third, now),
+        Some(ReplayAdmission::CapacityRefused),
+        "a principal at its share is refused while its markers are live"
+    );
+
+    let after_expiry = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&authority, &third, after_expiry),
+        Some(ReplayAdmission::Admitted),
+        "pruning the principal's expired markers must return its share"
+    );
+    let lane = process_lane(&authority).expect("process lane");
+    assert_eq!(lane.retained_entries(), 1);
+}
+
+/// Refreshing a principal's own expired marker in place reuses the slot it
+/// already holds: it is admitted at the share without being charged twice,
+/// and the share still refuses a genuinely new marker afterwards.
+#[test]
+fn a_principal_at_its_share_may_reuse_its_own_expired_marker() {
+    let sub = "principal-quota-refresh";
+    let authority = process_authority(sub, 8);
+    let now = monotonic_millis();
+    let later = now + 1_000;
+    let first = domain(sub).marker(&[b"principal-a", b"first"]);
+    let second = domain(sub).marker(&[b"principal-a", b"second"]);
+    let third = domain(sub).marker(&[b"principal-a", b"third"]);
+
+    assert_eq!(
+        admit_process_at(&authority, &first, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &second, later),
+        Some(ReplayAdmission::Admitted)
+    );
+
+    // `first` has expired; `second` is still live.
+    let after_first_expires = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&authority, &first, after_first_expires),
+        Some(ReplayAdmission::Admitted),
+        "a principal at its share may reuse its own expired slot"
+    );
+    assert_eq!(
+        admit_process_at(&authority, &third, after_first_expires),
+        Some(ReplayAdmission::CapacityRefused),
+        "the in-place refresh must still count against the principal's share"
+    );
+    assert_eq!(
+        admit_process_at(&authority, &second, after_first_expires),
+        Some(ReplayAdmission::Replay)
+    );
+}
+
+/// Concurrent claims by one principal reserve its share atomically: exactly
+/// the share is admitted however the claims interleave, while the lane itself
+/// still has room.
+#[test]
+fn concurrent_claims_by_one_principal_never_exceed_its_share() {
+    const WORKERS: usize = 32;
+    let sub = "principal-quota-concurrent";
+    // A cap of 32 gives each principal a share of 8.
+    let authority = Arc::new(process_authority(sub, WORKERS));
+    let barrier = Arc::new(Barrier::new(WORKERS));
+
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|idx| {
+            let authority = Arc::clone(&authority);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let nonce = idx.to_string();
+                let marker = domain(sub).marker(&[b"principal-a", nonce.as_bytes()]);
+                barrier.wait();
+                admit_process_at(&authority, &marker, monotonic_millis())
+                    .expect("process authority")
+            })
+        })
+        .collect();
+
+    let admitted = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker should not panic"))
+        .filter(|outcome| *outcome == ReplayAdmission::Admitted)
+        .count();
+    assert_eq!(
+        admitted,
+        WORKERS / 4,
+        "one principal may hold only its share"
+    );
+
+    let other = domain(sub).marker(&[b"principal-b", b"first"]);
+    assert_eq!(
+        admit_process_at(&authority, &other, monotonic_millis()),
+        Some(ReplayAdmission::Admitted),
+        "another principal keeps the lane capacity the first could not take"
     );
 }
 
@@ -191,7 +317,7 @@ fn concurrent_distinct_markers_are_all_admitted() {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let label = idx.to_string();
-                let marker = domain("concurrent-distinct").marker(&[b"consumer", label.as_bytes()]);
+                let marker = lane_marker("concurrent-distinct", &label);
                 barrier.wait();
                 admit_process_at(&authority, &marker, monotonic_millis())
                     .expect("process authority")
@@ -216,9 +342,9 @@ fn concurrent_distinct_markers_are_all_admitted() {
 fn capacity_refuses_rather_than_evicting_a_live_marker() {
     let authority = process_authority("capacity", 2);
     let now = monotonic_millis();
-    let first = domain("capacity").marker(&[b"c", b"first"]);
-    let second = domain("capacity").marker(&[b"c", b"second"]);
-    let third = domain("capacity").marker(&[b"c", b"third"]);
+    let first = lane_marker("capacity", "first");
+    let second = lane_marker("capacity", "second");
+    let third = lane_marker("capacity", "third");
 
     assert_eq!(
         admit_process_at(&authority, &first, now),
@@ -252,9 +378,9 @@ fn capacity_refuses_rather_than_evicting_a_live_marker() {
 fn repeated_full_live_refusals_do_not_rescan() {
     let authority = process_authority("capacity-no-rescan", 2);
     let now = monotonic_millis();
-    let first = domain("capacity-no-rescan").marker(&[b"c", b"first"]);
-    let second = domain("capacity-no-rescan").marker(&[b"c", b"second"]);
-    let third = domain("capacity-no-rescan").marker(&[b"c", b"third"]);
+    let first = lane_marker("capacity-no-rescan", "first");
+    let second = lane_marker("capacity-no-rescan", "second");
+    let third = lane_marker("capacity-no-rescan", "third");
 
     assert_eq!(
         admit_process_at(&authority, &first, now),
@@ -290,9 +416,9 @@ fn repeated_full_live_refusals_do_not_rescan() {
 fn expiration_triggers_reclamation_after_o1_refusals() {
     let authority = process_authority("capacity-expire-scan", 2);
     let now = monotonic_millis();
-    let first = domain("capacity-expire-scan").marker(&[b"c", b"first"]);
-    let second = domain("capacity-expire-scan").marker(&[b"c", b"second"]);
-    let third = domain("capacity-expire-scan").marker(&[b"c", b"third"]);
+    let first = lane_marker("capacity-expire-scan", "first");
+    let second = lane_marker("capacity-expire-scan", "second");
+    let third = lane_marker("capacity-expire-scan", "third");
 
     assert_eq!(
         admit_process_at(&authority, &first, now),
@@ -329,11 +455,9 @@ fn concurrent_insert_during_prune_cannot_forget_a_live_marker() {
     let authority = Arc::new(process_authority("capacity-concurrent-bound", 4));
     let now = monotonic_millis();
     let shorts: Vec<_> = (0..3)
-        .map(|idx| {
-            domain("capacity-concurrent-bound").marker(&[b"short", idx.to_string().as_bytes()])
-        })
+        .map(|idx| lane_marker("capacity-concurrent-bound", &format!("short-{idx}")))
         .collect();
-    let live = domain("capacity-concurrent-bound").marker(&[b"live", b"kept"]);
+    let live = lane_marker("capacity-concurrent-bound", "live-kept");
     for marker in &shorts {
         assert_eq!(
             admit_process_at(&authority, marker, now),
@@ -355,11 +479,10 @@ fn concurrent_insert_during_prune_cannot_forget_a_live_marker() {
             std::thread::spawn(move || {
                 barrier.wait();
                 if idx % 2 == 0 {
-                    let live = domain("capacity-concurrent-bound").marker(&[b"live", b"kept"]);
+                    let live = lane_marker("capacity-concurrent-bound", "live-kept");
                     admit_process_at(&authority, &live, after_shorts)
                 } else {
-                    let fresh = domain("capacity-concurrent-bound")
-                        .marker(&[b"fresh", idx.to_string().as_bytes()]);
+                    let fresh = lane_marker("capacity-concurrent-bound", &format!("fresh-{idx}"));
                     admit_process_at(&authority, &fresh, after_shorts)
                 }
             })
@@ -394,13 +517,13 @@ fn two_held_writers_cannot_hide_an_earlier_expiry_from_prune_publication() {
     let later_expires_at = t_later + retention_ms;
     let t_after_writers_expire = writer_expires_at + 1;
 
-    let first = domain("capacity-multiwriter-bound").marker(&[b"c", b"first"]);
-    let second = domain("capacity-multiwriter-bound").marker(&[b"c", b"second"]);
-    let later_a = domain("capacity-multiwriter-bound").marker(&[b"later", b"a"]);
-    let later_b = domain("capacity-multiwriter-bound").marker(&[b"later", b"b"]);
-    let early_a = domain("capacity-multiwriter-bound").marker(&[b"early", b"a"]);
-    let early_b = domain("capacity-multiwriter-bound").marker(&[b"early", b"b"]);
-    let extra = domain("capacity-multiwriter-bound").marker(&[b"c", b"extra"]);
+    let first = lane_marker("capacity-multiwriter-bound", "first");
+    let second = lane_marker("capacity-multiwriter-bound", "second");
+    let later_a = lane_marker("capacity-multiwriter-bound", "later-a");
+    let later_b = lane_marker("capacity-multiwriter-bound", "later-b");
+    let early_a = lane_marker("capacity-multiwriter-bound", "early-a");
+    let early_b = lane_marker("capacity-multiwriter-bound", "early-b");
+    let extra = lane_marker("capacity-multiwriter-bound", "extra");
 
     assert_eq!(
         admit_process_at(&authority, &first, t_early),
@@ -469,9 +592,9 @@ fn two_held_writers_cannot_hide_an_earlier_expiry_from_prune_publication() {
 fn expired_markers_are_reclaimed_to_admit_new_requests() {
     let authority = process_authority("capacity-reclaim", 2);
     let now = monotonic_millis();
-    let first = domain("capacity-reclaim").marker(&[b"c", b"first"]);
-    let second = domain("capacity-reclaim").marker(&[b"c", b"second"]);
-    let third = domain("capacity-reclaim").marker(&[b"c", b"third"]);
+    let first = lane_marker("capacity-reclaim", "first");
+    let second = lane_marker("capacity-reclaim", "second");
+    let third = lane_marker("capacity-reclaim", "third");
 
     assert_eq!(
         admit_process_at(&authority, &first, now),
@@ -502,8 +625,8 @@ fn expired_markers_are_reclaimed_to_admit_new_requests() {
 fn a_single_slot_lane_still_rejects_a_live_duplicate_before_refusing() {
     let authority = process_authority("capacity-one", 1);
     let now = monotonic_millis();
-    let marker = domain("capacity-one").marker(&[b"c", b"only"]);
-    let other = domain("capacity-one").marker(&[b"c", b"other"]);
+    let marker = lane_marker("capacity-one", "only");
+    let other = lane_marker("capacity-one", "other");
 
     assert_eq!(
         admit_process_at(&authority, &marker, now),
@@ -661,9 +784,9 @@ fn an_existing_marker_keeps_at_least_its_admitted_interval() {
 /// fresh lane.
 #[test]
 fn equivalent_reload_decrease_enforces_new_capacity_without_forgetting_live_markers() {
-    let first = domain("capacity-decrease").marker(&[b"c", b"first"]);
-    let second = domain("capacity-decrease").marker(&[b"c", b"second"]);
-    let third = domain("capacity-decrease").marker(&[b"c", b"third"]);
+    let first = lane_marker("capacity-decrease", "first");
+    let second = lane_marker("capacity-decrease", "second");
+    let third = lane_marker("capacity-decrease", "third");
     let now = monotonic_millis();
 
     let original = process_authority("capacity-decrease", 2);
@@ -711,9 +834,9 @@ fn equivalent_reload_decrease_enforces_new_capacity_without_forgetting_live_mark
 /// admit above the replacement generation's cap.
 #[test]
 fn decreased_capacity_refuses_an_expired_occupied_marker_while_live_markers_fill_the_cap() {
-    let first = domain("capacity-decrease-expired").marker(&[b"c", b"first"]);
-    let second = domain("capacity-decrease-expired").marker(&[b"c", b"second"]);
-    let third = domain("capacity-decrease-expired").marker(&[b"c", b"third"]);
+    let first = lane_marker("capacity-decrease-expired", "first");
+    let second = lane_marker("capacity-decrease-expired", "second");
+    let third = lane_marker("capacity-decrease-expired", "third");
     let now = monotonic_millis();
 
     let original = process_authority("capacity-decrease-expired", 3);
@@ -764,10 +887,10 @@ fn decreased_capacity_refuses_an_expired_occupied_marker_while_live_markers_fill
 /// again. Live markers stay claimed.
 #[test]
 fn decreased_capacity_admits_after_expired_pruning_restores_headroom() {
-    let first = domain("capacity-decrease-headroom").marker(&[b"c", b"first"]);
-    let second = domain("capacity-decrease-headroom").marker(&[b"c", b"second"]);
-    let third = domain("capacity-decrease-headroom").marker(&[b"c", b"third"]);
-    let fourth = domain("capacity-decrease-headroom").marker(&[b"c", b"fourth"]);
+    let first = lane_marker("capacity-decrease-headroom", "first");
+    let second = lane_marker("capacity-decrease-headroom", "second");
+    let third = lane_marker("capacity-decrease-headroom", "third");
+    let fourth = lane_marker("capacity-decrease-headroom", "fourth");
     let now = monotonic_millis();
 
     let original = process_authority("capacity-decrease-headroom", 3);
@@ -822,8 +945,8 @@ fn decreased_capacity_admits_after_expired_pruning_restores_headroom() {
 /// the same marker history without reopening an already-claimed proof.
 #[test]
 fn equivalent_reload_increase_restores_headroom_without_reopening_live_markers() {
-    let first = domain("capacity-increase").marker(&[b"c", b"first"]);
-    let second = domain("capacity-increase").marker(&[b"c", b"second"]);
+    let first = lane_marker("capacity-increase", "first");
+    let second = lane_marker("capacity-increase", "second");
     let now = monotonic_millis();
 
     let original = process_authority("capacity-increase", 1);
@@ -866,9 +989,9 @@ fn equivalent_authorities_enforce_their_own_capacity_regardless_of_construction_
         ("capacity-order-high-first", 4, 2),
         ("capacity-order-low-first", 2, 4),
     ] {
-        let first_marker = domain(sub).marker(&[b"c", b"first"]);
-        let second_marker = domain(sub).marker(&[b"c", b"second"]);
-        let third_marker = domain(sub).marker(&[b"c", b"third"]);
+        let first_marker = lane_marker(sub, "first");
+        let second_marker = lane_marker(sub, "second");
+        let third_marker = lane_marker(sub, "third");
 
         let first = process_authority(sub, first_cap);
         let second = process_authority(sub, second_cap);
