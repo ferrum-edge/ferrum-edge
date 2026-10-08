@@ -1295,6 +1295,7 @@ jobs:
               integration::gateway_api_backend_ref_kinds_tests
               integration::gateway_api_backend_tls_policy_tests
               integration::gateway_api_listenerset_tests
+              integration::gateway_api_route_isolation_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_gatewayclass_authority_tests
               integration::k8s_controller_istio_status_cas_tests
