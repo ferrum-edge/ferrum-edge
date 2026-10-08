@@ -78,13 +78,23 @@ info:
     rejected with `403 Forbidden`. A control plane serving multiple namespaces
     (`FERRUM_CP_NAMESPACES` names more than one namespace or `*`) engages this
     enforcement automatically. With the flag unset and no multi-namespace CP
-    scope, any valid admin JWT may address any namespace; read-only
-    `/config/export` and `/backend-egress-policy` still enforce a present ns
-    claim. The `/namespaces` registry is not
+    scope, an admin JWT without an `ns` claim may address any namespace; a
+    token that carries an `ns` claim is held to it on every namespace-scoped
+    endpoint whatever the flag says. The `/namespaces` registry is not
     selected by `X-Ferrum-Namespace`: list results are filtered to claimed
-    names (a token with no `ns` claim sees an empty list), and
+    names (with the flag on, a token with no `ns` claim sees an empty list), and
     create/get/rename/delete of a specific name return `403` when the token
     cannot address that name (rename checks both the current and target names).
+
+    A token that carries an `ns` claim is a tenant credential: every
+    fleet-global endpoint (chargeback, `/metrics`, `/admin/metrics`,
+    `/metrics/runtime`, `/cluster`, `/config/apply-status`, backend
+    capabilities, every `/mesh/*` endpoint, the waypoint listings, every
+    `/admin/tls/*` endpoint, and any endpoint not explicitly allowlisted)
+    returns `403` to it, and `/health`, `/status`, and `/overload` serve it
+    only their minimal tier. `GET /plugins`, `/live`, the namespace registry,
+    and `GET /diagnostics/v1/refs/{ref}` stay reachable. Fleet-global
+    endpoints need an admin JWT without an `ns` claim.
 
     ## Namespace registry atomicity
 
@@ -1987,6 +1997,8 @@ paths:
                 ferrum_cp_grpc_rejected_connections_total{reason="max_connections"} 0
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
 
   /metrics/runtime:
     get:
@@ -2023,6 +2035,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
 
   # ── Charges ────────────────────────────────────────────────────────
   /charges:
@@ -2097,6 +2111,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "500":
           description: |
             Charge export failed because a monetary sample would be non-finite
@@ -2139,6 +2155,8 @@ paths:
                 $ref: "#/components/schemas/ChargebackSinkStatusResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
 
   /admin/metrics:
     get:
@@ -2182,6 +2200,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
 
   # ── Cluster Status ───────────────────────────────────────────────────
   /config/apply-status:
@@ -2480,6 +2500,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
 
   /backend-egress-policy:
     parameters:
@@ -2698,6 +2720,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "503":
           description: Proxy state unavailable in this mode (e.g., CP without proxy serving)
           content:
@@ -3064,6 +3088,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: Node-waypoint topology not enabled in this mode
           content:
@@ -3129,6 +3155,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: Service-waypoint topology not enabled or no mesh slice installed
           content:
@@ -3273,6 +3301,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: No active mesh service graph
           content:
@@ -3316,6 +3346,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: No active mesh egress scope
           content:
@@ -3500,6 +3532,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: No mesh federation bundles cached yet (poller disabled, not in mesh mode, or no successful poll)
           content:
@@ -3737,6 +3771,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: Not in mesh mode (mesh runtime state not wired into the admin API)
           content:
@@ -3870,6 +3906,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: No active mesh runtime overlay
           content:
@@ -4349,6 +4387,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: No active mesh runtime state (not in mesh mode)
           content:
@@ -4475,6 +4515,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: Not in control-plane mode, or drift tracker not wired
           content:
@@ -4775,6 +4817,8 @@ paths:
                     type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/NamespaceBoundedGlobalRoute"
         "404":
           description: |
             No active mesh policy-deny recorder — the gateway is running
@@ -8945,11 +8989,22 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Forbidden:
-      description: Authenticated token lacks the required admin role or its namespace claim does not authorize the selected namespace
+      description: Authenticated token lacks the required admin role, its namespace claim does not authorize the selected namespace, or it is namespace-bounded (carries an `ns` claim, or is a viewer-key token under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`) and the endpoint is fleet-global
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NamespaceBoundedGlobalRoute:
+      description: >-
+        The admin JWT is namespace-bounded (it carries an `ns` claim, or it is a
+        viewer-key token under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`) and this
+        endpoint is fleet-global. Use an admin JWT without an `ns` claim.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "global route '/cluster' is unavailable to admin JWTs with an `ns` claim; fleet-global routes require a token without one"
     ReadOnly:
       description: Admin API is in read-only mode, the token role cannot perform this mutation, or its namespace claim does not authorize the selected namespace
       content:

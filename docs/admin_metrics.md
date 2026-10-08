@@ -13,7 +13,7 @@ For the full Prometheus family reference (exact names, types, HELP text, label k
 | `/metrics` | GET | JWT / metrics token / allowed CIDR | 5-second TTL (configurable via `render_cache_ttl_seconds`); process-static families are exempt — see below | Prometheus exposition format, including request, AI token/cost, and TLS certificate metrics |
 | `/health` | GET | None (tiered) | None | `status`+`ready` unauthenticated; full diagnostics require auth |
 
-`/metrics` "Auth" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401`. The same credential set unlocks the detailed `/health` and `/overload` views.
+`/metrics` "Auth" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401`. An admin JWT carrying an `ns` claim (or a viewer-key JWT under a namespace ceiling) is namespace-bounded: it receives `403` from `/metrics`, `/admin/metrics`, and `/metrics/runtime`. The same credential set unlocks the detailed `/health` and `/overload` views.
 
 #### What `render_cache_ttl_seconds` does and does not cover
 

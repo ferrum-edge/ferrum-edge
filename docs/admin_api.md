@@ -21,7 +21,7 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 | `/overload` | coarse `{level}` + status code (503 at critical) | full pressure/counter and sanitized listener-failure snapshots |
 | `/metrics` | **401** unless the client IP is in `FERRUM_METRICS_ALLOWED_CIDRS` | 200 Prometheus text |
 
-"Authenticated" here means **any** of: a primary admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT with a namespace ceiling does not itself authorize detail: without another authorization method, it receives the minimal health/status and overload projections. The same rule applies on all three routes. A matching metrics bearer token or allowlisted source IP keeps the detail it would receive with no JWT; the ceiling-bound JWT never adds detail. Ceiling-bound viewer-key tokens receive `403` from detailed metrics routes. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
+"Authenticated" here means **any** of: a primary admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. A namespace-bounded JWT — a viewer-key JWT with a namespace ceiling, or any admin JWT carrying an `ns` claim — does not itself authorize detail: without another authorization method, it receives the minimal health/status and overload projections. The same rule applies on all three routes. A matching metrics bearer token or allowlisted source IP keeps the detail it would receive with no JWT; the namespace-bounded JWT never adds detail. Namespace-bounded tokens receive `403` from detailed metrics routes. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
@@ -40,20 +40,48 @@ on namespace-scoped routes; it never silently selects the default. Invalid
 backup attempts retain the canonical audit bucket and fixed
 `namespace_status: invalid` metadata without storing the rejected value.
 
-On a single-namespace deployment, admin JWTs are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace.
+On a single-namespace deployment, admin JWTs **without an `ns` claim** are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. A token that **carries** an `ns` claim is always bounded by it: it may address only the namespaces it lists, and it is refused on fleet-global routes (see [Namespace-scoped tokens and fleet-global routes](#namespace-scoped-tokens-and-fleet-global-routes)). Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` additionally makes namespace-scoped admin routes refuse tokens that carry no `ns` claim.
 
 **Enforcement also engages automatically on a multi-namespace control plane.** When `FERRUM_CP_NAMESPACES` names more than one namespace (e.g. `"prod,staging"`) or is `*`, `cp` mode turns namespace-claim enforcement on for the admin plane regardless of `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` — the same rule the CP↔DP gRPC plane applies to `ConfigSync`, `MeshConfigSync`, and xDS streams. On such a CP, **admin tokens without an `ns` claim are refused with `403` on namespace-scoped routes**, including `GET /backup` (which serialises consumer credentials) and `POST /restore`. Mint admin tokens with an explicit `ns` claim before pointing them at a multi-namespace CP. `database`, `file`, `dp`, `mesh`, and `node_agent` modes have no CP scope and keep the flag's `false` default.
 
 Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
-- A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/export` and `/backend-egress-policy` also check a present `ns` claim when enforcement is off. `/config/apply-status` is not namespace-scoped.
-- The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, `GET /namespaces` is **filtered** to the JWT `ns` claim — a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
-- Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected: `X-Ferrum-Namespace` does not select a tenant there. Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
+- A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`, whether or not enforcement is on. With enforcement on, tokens without an `ns` claim are also rejected on namespace-scoped routes — tenancy intent must be explicit.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/apply-status` is not namespace-scoped.
+- The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, or the token carries an `ns` claim, `GET /namespaces` is **filtered** to the JWT `ns` claim — with the flag on, a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
+- Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) are not selected by `X-Ferrum-Namespace`; a token without an `ns` claim reaches them whatever the flag says, and a token with one is refused (see below). Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
 
-With enforcement off — the flag unset and the CP scope single-namespace — the namespace header remains a routing selector only.
+With enforcement off — the flag unset and the CP scope single-namespace — the namespace header remains a routing selector only for tokens without an `ns` claim.
+
+#### Namespace-scoped tokens and fleet-global routes
+
+An admin JWT that carries an `ns` claim is a tenant credential. Whatever
+`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` says, the dispatcher refuses it with
+`403 Forbidden` on every fleet-global route before the route runs, and the
+refusal depends only on the credential and the route, never on the
+`X-Ferrum-Namespace` header or on any resource. Fleet-global routes need an
+admin JWT **without** an `ns` claim; there is no claim that re-grants fleet
+scope to a token that names its namespaces. A `scope` claim (for example
+`diagnostics:read`) does not widen it either.
+
+| Route class | Token with an `ns` claim |
+| --- | --- |
+| Namespace-scoped routes (listed above) | Allowed for the claimed namespaces only; `403` for any other, including the `ferrum` default when the header is omitted |
+| `GET /plugins` (plugin type catalog) | Allowed |
+| `GET /live`, `/health`, `/status`, `/overload` | Allowed, minimal tier only (`status`/`ready`, or `{level}`), like an unauthenticated probe; a metrics bearer token or allowlisted source IP still grants the detail it grants on its own |
+| `GET /namespaces` | Allowed, filtered to the claim |
+| `GET`/`PUT`/`DELETE /namespaces/{name}`, `POST /namespaces` | Allowed for claimed names only (rename checks both names); role checks still apply |
+| `GET /diagnostics/v1/refs/{ref}` | Allowed; the lookup checks the reference against the claim itself |
+| Everything else: `/charges`, `/charges/sink/status`, `/metrics`, `/admin/metrics`, `/metrics/runtime`, `/cluster`, `/config/apply-status`, `/backend-capabilities` (including `POST /backend-capabilities/refresh`), every `/mesh/*` route (including `POST /mesh/config-revision/reset`), `/node-waypoint/identities`, `/service-waypoint/services`, every `/admin/tls/*` route, and any route not listed in this table | `403` |
+
+The list is explicit and fails closed: a global route added later is refused
+to `ns`-claim tokens until it is classified here. Viewer-key tokens under
+`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` follow the stricter ceiling allowlist
+described under [Namespace ceiling](#namespace-ceiling-ferrum_admin_jwt_viewer_namespaces).
+Refusals are logged as `audit.event = "admin_namespace_authz"` with
+`namespace_claim = "global_route_denied"`.
 
 | Role | Access |
 | --- | --- |

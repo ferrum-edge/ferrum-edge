@@ -1973,6 +1973,77 @@ fn admin_shared_namespace_and_id_gates_document_bad_request() {
     );
 }
 
+/// Global operations (not selected by `X-Ferrum-Namespace`) that stay reachable
+/// to namespace-bounded admin JWTs: tokens carrying an `ns` claim, and
+/// viewer-key tokens under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`. Mirrors the
+/// global-route allowlists in `src/admin/mod.rs`; registry writes and the
+/// diagnostic lookup are allowlisted there but document `403` for their own
+/// name and claim checks.
+const NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST: &[(&str, &str)] = &[
+    ("GET", "/live"),
+    ("GET", "/health"),
+    ("GET", "/status"),
+    ("GET", "/overload"),
+    ("GET", "/plugins"),
+    ("GET", "/namespaces"),
+];
+
+/// First path segments of the namespace-scoped resource surfaces, mirroring
+/// `namespace_scoped_resource_kind` in `src/admin/mod.rs`.
+const NAMESPACE_SCOPED_FIRST_SEGMENTS: &[&str] = &[
+    "proxies",
+    "consumers",
+    "upstreams",
+    "api-specs",
+    "batch",
+    "backup",
+    "deployment-snapshot",
+    "restore",
+    "audit",
+    "gateway-trust-bundles",
+    "gateway-trust",
+];
+
+/// Whether an OpenAPI path is a namespace-scoped resource surface.
+fn is_namespace_scoped_openapi_path(path: &str) -> bool {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["plugins", _, ..] | ["config", "export"] | ["backend-egress-policy"] => true,
+        [first, ..] => NAMESPACE_SCOPED_FIRST_SEGMENTS.contains(first),
+        [] => false,
+    }
+}
+
+#[test]
+fn fleet_global_operations_document_the_namespace_bounded_refusal() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let allowlisted: BTreeSet<(String, String)> = NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST
+        .iter()
+        .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
+        .collect();
+    let documented = normalized_operation_set(&openapi_operations_with_status(&spec, "403"));
+    let missing: Vec<_> = openapi_operations(&spec)
+        .into_iter()
+        .filter(|(_, path)| !is_namespace_scoped_openapi_path(path))
+        .filter(|operation| !allowlisted.contains(operation))
+        .filter(|operation| !documented.contains(operation))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "fleet-global operations refuse namespace-bounded admin JWTs with 403 and must \
+         document it: {missing:?}"
+    );
+
+    for (method, path) in NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST {
+        assert!(
+            !is_namespace_scoped_openapi_path(path),
+            "{method} {path} is global"
+        );
+    }
+}
+
 #[test]
 fn operator_gated_refresh_and_egress_test_document_forbidden() {
     let spec: serde_json::Value =

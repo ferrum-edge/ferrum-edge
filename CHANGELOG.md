@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — admin JWTs with an `ns` claim are limited to namespace
+  routes** (issue #6091). A token that carries an `ns` claim is now a tenant
+  credential whatever `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` says. It may
+  address only the namespaces it lists on namespace-scoped routes and the
+  `/namespaces` registry (the list is filtered to the claim), it receives
+  only the minimal `/health`, `/status` and `/overload` tier, and every
+  fleet-global route answers `403`: `/charges`, `/metrics`, `/admin/metrics`,
+  `/metrics/runtime`, `/cluster`, `/config/apply-status`,
+  `/backend-capabilities` (including the refresh), every `/mesh/*` route
+  (including `POST /mesh/config-revision/reset`), the waypoint identity and
+  service listings, every `/admin/tls/*` route, and any route not explicitly
+  allowlisted. `GET /plugins`, the probe endpoints, the namespace registry and
+  the diagnostic reference lookup stay reachable. Tokens without an `ns`
+  claim are unchanged. Automation that used an `ns`-claim token on a
+  fleet-global route must use a separate admin token without an `ns` claim;
+  see [Upgrading: namespace-scoped admin tokens](docs/upgrade_guide.md#unreleased-namespace-scoped-admin-tokens).
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

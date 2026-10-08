@@ -26,6 +26,52 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased: namespace-scoped admin tokens
+
+**BREAKING** (#6091). An admin JWT that carries an `ns` claim is now bounded by
+it whatever `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` says:
+
+- on namespace-scoped routes (`/proxies`, `/consumers`, `/plugins/config`,
+  `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, `/audit`,
+  `/config/export`, `/backend-egress-policy`, `/gateway-trust-bundles`,
+  `/gateway-trust`) an `X-Ferrum-Namespace` outside the claim — including the
+  `ferrum` default when the header is omitted — answers `403`, even with the
+  flag off;
+- `GET /namespaces` is filtered to the claim, and `/namespaces/{name}` reads
+  and writes answer `403` for unclaimed names;
+- `/health`, `/status` and `/overload` return only the minimal tier to such a
+  token (a metrics bearer token or allowlisted source IP still grants detail);
+- every fleet-global route answers `403`: `/charges`, `/charges/sink/status`,
+  `/metrics`, `/admin/metrics`, `/metrics/runtime`, `/cluster`,
+  `/config/apply-status`, `/backend-capabilities` and its refresh, every
+  `/mesh/*` route, `/node-waypoint/identities`, `/service-waypoint/services`,
+  every `/admin/tls/*` route, and any global route not explicitly allowlisted.
+  `GET /plugins`, `/live`, the namespace registry and
+  `GET /diagnostics/v1/refs/{ref}` stay reachable.
+
+Tokens without an `ns` claim keep their existing fleet-wide behaviour.
+
+Before upgrading, check admin automation, portals and scrapers that mint admin
+JWTs with an `ns` claim:
+
+1. Find every call such a client makes to a fleet-global route (metrics
+   scrapes, chargeback exports, cluster or mesh dashboards, TLS rotation,
+   capability refreshes, detailed health checks).
+2. Mint a **separate** admin token **without** an `ns` claim for those calls,
+   and keep the `ns`-claim token for namespace-scoped work. On a gateway with
+   `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` (or a multi-namespace CP) the
+   claim-less token is still refused on namespace-scoped routes, so the two
+   tokens are not interchangeable.
+3. For Prometheus, prefer `FERRUM_METRICS_BEARER_TOKEN` or
+   `FERRUM_METRICS_ALLOWED_CIDRS` over any admin JWT.
+4. Make sure every `ns`-claim token lists each namespace its client addresses,
+   including `ferrum` when the client omits `X-Ferrum-Namespace`.
+
+Refusals are logged as `audit.event = "admin_namespace_authz"` with
+`namespace_claim = "global_route_denied"` (fleet-global route) or the existing
+namespace denial fields, so a staged rollout can find affected clients before
+cut-over. Rollback is binary-only: no data or configuration changes.
+
 ## Upgrading to 0.9.14
 
 0.9.14 (2026-10-07 UTC) is cut from main
