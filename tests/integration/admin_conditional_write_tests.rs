@@ -2735,6 +2735,10 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     assert_batch_proxy_scoped_plugin_association_parity(&db).await;
     assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
+    crate::integration::admin_plugin_graph_scope_tests::assert_policy_neighborhood_matches_restricted_graph(
+        db.as_ref(),
+    )
+    .await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
@@ -2777,6 +2781,10 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
     assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "postgres", &url).await;
+    crate::integration::admin_plugin_graph_scope_tests::assert_policy_neighborhood_matches_restricted_graph(
+        db.as_ref(),
+    )
+    .await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
@@ -2807,6 +2815,10 @@ async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
     assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "mysql", &url).await;
+    crate::integration::admin_plugin_graph_scope_tests::assert_policy_neighborhood_matches_restricted_graph(
+        db.as_ref(),
+    )
+    .await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;

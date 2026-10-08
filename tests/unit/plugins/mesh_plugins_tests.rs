@@ -9480,3 +9480,367 @@ fn connection_sni_bare_fqdn_warning_logs_debug_escaped_fields() {
         "a newline in the policy name must not reach the log unescaped: {logs}"
     );
 }
+
+// ── Mesh CONNECT relays are authorized on transport facts only ───────────────
+//
+// A byte-stream or datagram HBONE CONNECT is relayed as opaque bytes: the
+// requests written into the tunnel are never parsed. The CONNECT's own method,
+// path, authority, headers and credentials describe the tunnel, so L7 fields
+// are unobservable on it. These pin the Layer-4 semantics: DENY ignores
+// HTTP-only fields and still matches on the rest, ALLOW never matches on them.
+
+const RELAY_PEER: &str = "spiffe://cluster.local/ns/attacker/sa/client";
+const RELAY_APP_PORT: u16 = 8080;
+
+/// A relayed CONNECT as the proxy hands it to the plugin chain, carrying the
+/// CONNECT authority and a peer-written header.
+fn marked_connect_relay_context() -> RequestContext {
+    let mut ctx = hbone_relay_request_context(RELAY_PEER, None, "10.0.0.20", RELAY_APP_PORT);
+    ctx.mesh_inbound_listener_authz_port = Some(RELAY_APP_PORT);
+    ctx.headers
+        .insert("host".to_string(), "10.0.0.20:8080".to_string());
+    ctx.headers
+        .insert("x-allow".to_string(), "granted".to_string());
+    ctx.mark_hbone_connect_relay();
+    ctx
+}
+
+/// The same peer sending an ordinary HTTP request, for contrast.
+fn http_context(method: &str, path: &str) -> RequestContext {
+    let mut ctx = request_context(Some(RELAY_PEER));
+    ctx.method = method.to_string();
+    ctx.path = path.to_string();
+    ctx.headers
+        .insert("host".to_string(), "10.0.0.20:8080".to_string());
+    ctx
+}
+
+fn allow_relay_peer_policy() -> MeshPolicy {
+    MeshPolicy {
+        name: "allow-peer".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(RELAY_PEER.to_string()),
+                namespace_pattern: None,
+                trust_domain: None,
+                trust_domain_pattern: None,
+            }],
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+fn operation_policy(name: &str, action: PolicyAction, to: RequestMatch) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![to],
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+fn condition_policy(name: &str, action: PolicyAction, key: &str, value: &str) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            when: vec![ConditionMatch {
+                key: key.to_string(),
+                values: vec![value.to_string()],
+                not_values: Vec::new(),
+            }],
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+async fn authorize_with(policies: &[MeshPolicy], ctx: &mut RequestContext) -> PluginResult {
+    let plugin = MeshAuthz::new(&json!({ "mesh_policies": policies })).expect("mesh_authz");
+    plugin.authorize(ctx).await
+}
+
+fn assert_forbidden(result: &PluginResult, case: &str) {
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "{case}: expected 403, got {result:?}"
+    );
+}
+
+fn assert_continue(result: &PluginResult, case: &str) {
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{case}: expected Continue, got {result:?}"
+    );
+}
+
+#[test]
+fn a_new_request_context_is_not_a_connect_relay_until_marked() {
+    let mut ctx = hbone_relay_request_context(RELAY_PEER, None, "10.0.0.20", RELAY_APP_PORT);
+    assert!(!ctx.is_hbone_connect_relay());
+    ctx.mark_hbone_connect_relay();
+    let snapshot = ctx.clone();
+    assert!(ctx.is_hbone_connect_relay());
+    assert!(
+        snapshot.is_hbone_connect_relay(),
+        "a cloned context (the admission-fence snapshot) keeps the mark"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_connect_relay_l7_deny_rules_refuse_the_tunnel() {
+    let deny_rules = [
+        (
+            "deny-admin-path",
+            RequestMatch {
+                paths: vec!["/admin/*".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+        (
+            "deny-delete",
+            RequestMatch {
+                methods: vec!["DELETE".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+        (
+            "deny-admin-host",
+            RequestMatch {
+                hosts: vec!["admin.internal".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+        (
+            "deny-admin-header",
+            RequestMatch {
+                headers: HashMap::from([("x-admin".to_string(), "*".to_string())]),
+                ..RequestMatch::default()
+            },
+        ),
+    ];
+    for (name, to) in deny_rules {
+        let policies = [
+            allow_relay_peer_policy(),
+            operation_policy(name, PolicyAction::Deny, to),
+        ];
+        let mut relay = marked_connect_relay_context();
+        let result = authorize_with(&policies, &mut relay).await;
+        assert_forbidden(&result, name);
+        assert_eq!(
+            relay.metadata.get("mesh_authz.deny_policy"),
+            Some(&name.to_string()),
+            "{name}: the L7 DENY itself must refuse the tunnel"
+        );
+
+        // The same rule still judges a parsed HTTP request on its own terms.
+        let mut http = http_context("GET", "/public");
+        assert_continue(&authorize_with(&policies, &mut http).await, name);
+    }
+
+    let mut http = http_context("GET", "/admin/users");
+    let policies = [
+        allow_relay_peer_policy(),
+        operation_policy(
+            "deny-admin-path",
+            PolicyAction::Deny,
+            RequestMatch {
+                paths: vec!["/admin/*".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+    ];
+    assert_forbidden(
+        &authorize_with(&policies, &mut http).await,
+        "plain GET /admin/users",
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_connect_relay_header_conditions_are_unobservable() {
+    // A DENY keyed on a header the tunnel cannot show still refuses it.
+    let policies = [
+        allow_relay_peer_policy(),
+        condition_policy(
+            "deny-admin-header",
+            PolicyAction::Deny,
+            "request.headers[x-admin]",
+            "*",
+        ),
+    ];
+    let mut relay = marked_connect_relay_context();
+    assert_forbidden(
+        &authorize_with(&policies, &mut relay).await,
+        "DENY when request.headers",
+    );
+
+    // An ALLOW keyed on a header the peer wrote onto the CONNECT never
+    // admits the tunnel.
+    let policies = [condition_policy(
+        "allow-header",
+        PolicyAction::Allow,
+        "request.headers[x-allow]",
+        "granted",
+    )];
+    let mut relay = marked_connect_relay_context();
+    assert_forbidden(
+        &authorize_with(&policies, &mut relay).await,
+        "ALLOW when request.headers",
+    );
+    let mut http = http_context("GET", "/");
+    http.headers
+        .insert("x-allow".to_string(), "granted".to_string());
+    assert_continue(
+        &authorize_with(&policies, &mut http).await,
+        "ALLOW when request.headers on HTTP",
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_connect_relay_l7_allow_rules_never_admit_the_tunnel() {
+    let allow_rules = [
+        (
+            "allow-not-admin",
+            RequestMatch {
+                not_paths: vec!["/admin/*".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+        (
+            "allow-everything-path",
+            RequestMatch {
+                paths: vec!["/*".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+        (
+            "allow-connect-method",
+            RequestMatch {
+                methods: vec!["CONNECT".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+        (
+            "allow-not-delete",
+            RequestMatch {
+                not_methods: vec!["DELETE".to_string()],
+                ..RequestMatch::default()
+            },
+        ),
+    ];
+    for (name, to) in allow_rules {
+        let policies = [operation_policy(name, PolicyAction::Allow, to)];
+        let mut relay = marked_connect_relay_context();
+        assert_forbidden(&authorize_with(&policies, &mut relay).await, name);
+    }
+
+    // `notPaths` still admits a parsed request outside the excluded prefix.
+    let policies = [operation_policy(
+        "allow-not-admin",
+        PolicyAction::Allow,
+        RequestMatch {
+            not_paths: vec!["/admin/*".to_string()],
+            ..RequestMatch::default()
+        },
+    )];
+    let mut http = http_context("GET", "/public");
+    assert_continue(
+        &authorize_with(&policies, &mut http).await,
+        "notPaths on HTTP",
+    );
+
+    // A JWT principal is an HTTP-only attribute too.
+    let mut policy = allow_relay_peer_policy();
+    policy.rules[0].request_principals = vec!["*".to_string()];
+    let mut relay = marked_connect_relay_context();
+    relay.metadata.insert(
+        "mesh.request_principal".to_string(),
+        "https://issuer.example/user".to_string(),
+    );
+    assert_forbidden(
+        &authorize_with(&[policy], &mut relay).await,
+        "requestPrincipals",
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_connect_relay_keeps_transport_rules() {
+    let mut relay = marked_connect_relay_context();
+    assert_continue(
+        &authorize_with(&[allow_relay_peer_policy()], &mut relay).await,
+        "source-only ALLOW",
+    );
+
+    // An L7 DENY scoped to another port does not reach this tunnel.
+    let policies = [
+        allow_relay_peer_policy(),
+        operation_policy(
+            "deny-admin-other-port",
+            PolicyAction::Deny,
+            RequestMatch {
+                paths: vec!["/admin/*".to_string()],
+                ports: vec![9090],
+                ..RequestMatch::default()
+            },
+        ),
+    ];
+    let mut relay = marked_connect_relay_context();
+    assert_continue(
+        &authorize_with(&policies, &mut relay).await,
+        "port-scoped L7 DENY on another port",
+    );
+
+    // A port DENY on the tunnel's own port refuses it.
+    let policies = [
+        allow_relay_peer_policy(),
+        operation_policy(
+            "deny-app-port",
+            PolicyAction::Deny,
+            RequestMatch {
+                ports: vec![RELAY_APP_PORT],
+                ..RequestMatch::default()
+            },
+        ),
+    ];
+    let mut relay = marked_connect_relay_context();
+    assert_forbidden(
+        &authorize_with(&policies, &mut relay).await,
+        "port DENY on the tunnel port",
+    );
+
+    // An L7 DENY for a different source does not reach this peer.
+    let mut deny_other = operation_policy(
+        "deny-other-source-admin",
+        PolicyAction::Deny,
+        RequestMatch {
+            paths: vec!["/admin/*".to_string()],
+            ..RequestMatch::default()
+        },
+    );
+    deny_other.rules[0].from = vec![PrincipalMatch {
+        spiffe_id_pattern: Some("spiffe://cluster.local/ns/other/sa/client".to_string()),
+        namespace_pattern: None,
+        trust_domain: None,
+        trust_domain_pattern: None,
+    }];
+    let policies = [allow_relay_peer_policy(), deny_other];
+    let mut relay = marked_connect_relay_context();
+    assert_continue(
+        &authorize_with(&policies, &mut relay).await,
+        "L7 DENY for another source",
+    );
+}

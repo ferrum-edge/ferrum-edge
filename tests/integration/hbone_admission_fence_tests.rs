@@ -89,8 +89,8 @@ use ferrum_edge::identity::{
 };
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshExtAuthzProvider, MeshInboundRelayDestination, MeshInboundRelayHost,
-    MeshPolicy, MeshRelayEnrollmentEvidence, MtlsMode, OutboundTrafficPolicy, PolicyAction,
-    PolicyScope,
+    MeshPolicy, MeshRelayEnrollmentEvidence, MeshRule, MtlsMode, OutboundTrafficPolicy,
+    PolicyAction, PolicyScope, RequestMatch,
 };
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTrafficDirection, prepare_gateway_config_for_mesh,
@@ -884,6 +884,88 @@ impl AdmittedFixture {
         let _ = self.shutdown_tx.send(true);
         self.backend_handle.abort();
         self.conn_task.abort();
+    }
+}
+
+/// An `action: DENY` rule whose only match constraint is an L7 path. A relayed
+/// tunnel carries no parsed request, so the rule can only be satisfied through
+/// the relay's Layer-4 authorization: a DENY ignores HTTP-only fields and
+/// matches on its remaining constraints.
+fn deny_l7_path() -> MeshPolicy {
+    MeshPolicy {
+        name: "deny-l7-path".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: namespace_scope(),
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                paths: vec!["/admin/*".to_string()],
+                ..RequestMatch::default()
+            }],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+/// A real authenticated HBONE CONNECT through the production handler chain is
+/// refused at admission by an L7 DENY, and never becomes a tunnel.
+///
+/// The ALLOW admits the peer and the DENY carries only a path, so this only
+/// holds because the proxy marks the CONNECT as an opaque relay before the
+/// plugin chain runs. Without that mark the CONNECT would be judged as an HTTP
+/// request whose path does not reach the rule, and the ALLOW would admit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_l7_deny_refuses_a_real_hbone_connect_at_admission() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client(), deny_l7_path()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an L7 DENY must refuse the relayed CONNECT at admission"
+    );
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        0,
+        "a refused CONNECT must never become a tunnel"
+    );
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// The datagram tag has no live-policy fixture in this suite, so this pins that
+/// BOTH HBONE tag entry points mark the relay before they record it as HBONE.
+/// The end-to-end test above proves the byte-stream mark is reached through the
+/// production handler chain.
+#[test]
+fn both_hbone_tag_entry_points_mark_the_connect_relay() {
+    let proxy = include_str!("../../src/proxy/hbone_proxy.rs");
+    for function in ["fn tag_request_metadata", "fn tag_udp_request_metadata"] {
+        let start = proxy
+            .find(function)
+            .unwrap_or_else(|| panic!("{function} must exist"));
+        let body = &proxy[start..];
+        let mark = body
+            .find("ctx.mark_hbone_connect_relay();")
+            .unwrap_or_else(|| panic!("{function} must mark the relay"));
+        let protocol_tag = body
+            .find(".insert(\"request_protocol\"")
+            .unwrap_or_else(|| panic!("{function} must tag the request protocol"));
+        assert!(
+            mark < protocol_tag,
+            "{function} must mark the relay before it records HBONE metadata"
+        );
     }
 }
 

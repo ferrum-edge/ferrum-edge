@@ -12,15 +12,17 @@
 //! [`crate::plugins::priority::MESH_AUTHZ`], step 3 of the plugin lifecycle),
 //! i.e. after authentication and before `before_proxy`. Every HTTP-family
 //! ingress path that runs the plugin chain reaches it identically — HTTP/1.1,
-//! HTTP/2, native gRPC, HTTP/3, and HTTP relayed inside a mesh/HBONE CONNECT —
-//! because they all funnel through the same `authorize` ladder.
+//! HTTP/2, native gRPC, and HTTP/3 — because they all funnel through the same
+//! `authorize` ladder.
 //!
 //! Layer-4 sessions (`on_stream_connect`: raw TCP, TLS passthrough, UDP, DTLS)
 //! have no HTTP request to check and therefore CANNOT run a provider check.
 //! They do not silently skip it: `evaluate_mesh_authorization_policies` turns a
 //! matched-but-unexecutable CUSTOM delegation into a denial. A CUSTOM policy
 //! whose rules match an L4 connection closes it rather than serving it
-//! unchecked.
+//! unchecked. A mesh/HBONE CONNECT relay is treated the same way: the requests
+//! inside the tunnel are opaque bytes, so `mesh_authz` refuses a matched
+//! delegation instead of asking the provider about the CONNECT itself.
 //!
 //! ## Fail-closed contract
 //!

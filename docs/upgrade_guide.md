@@ -85,6 +85,30 @@ rolling out, check:
   duplicate ids. Data planes also refuse such a ConfigSync snapshot and keep
   serving their last accepted configuration. Run the control plane and data
   planes on the same build, as always.
+## Unreleased changes after 0.9.14
+
+**Mesh CONNECT relays are authorized on transport attributes only (#6081).**
+An HBONE byte-stream or datagram CONNECT — the Ambient / waypoint `:15008`
+transport, and a bare authenticated HTTP/2 CONNECT on the Sidecar `:15006`
+listener — relays the traffic inside the tunnel unparsed. `mesh_authz` now
+evaluates it as a Layer-4 session: `to.operation` methods, paths, hosts and
+headers (and their `not*` forms), `requestPrincipals` / `notRequestPrincipals`,
+and `when: request.headers[...]` / `request.auth.*` conditions are
+unobservable. Before upgrading, review every `AuthorizationPolicy` that selects
+a workload reached over HBONE:
+
+- a DENY rule with L7 fields now matches the tunnel on its remaining
+  constraints and refuses it, where it previously missed;
+- an ALLOW rule that relies on L7 fields (`paths: ["/*"]`, `notPaths`,
+  `methods`, `notMethods`, header or `request.auth.*` conditions,
+  `requestPrincipals`) no longer admits the tunnel, so an ALLOW set made only
+  of such rules refuses it;
+- a matched CUSTOM rule refuses the tunnel without calling the provider.
+
+Scope L7 rules with `to.operation.ports` so they do not select the ports a
+workload is reached on over HBONE, or enforce L7 policy on an HTTP route
+where the request is parsed. Sidecar HTTP traffic between workloads rides plain
+mesh-mTLS HTTP/2, not a CONNECT, and is unaffected.
 
 ## Upgrading to 0.9.14
 

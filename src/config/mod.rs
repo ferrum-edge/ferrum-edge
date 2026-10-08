@@ -16,6 +16,7 @@
 //! - `config_migration` — Config format version migrations (chain-of-responsibility)
 //! - `migrations` — SQL schema migrations for database mode
 //! - `plugin_trigger` — Declarative per-plugin-instance execution triggers
+//! - `policy_graph_scope` — The proxies/plugin configs one plugin-graph write affects
 //! - `pool_config` — Connection pool configuration (global defaults + per-proxy overrides)
 
 // The fault-injection seam is driven by external tests through the lib target's
@@ -51,6 +52,7 @@ pub mod namespace_filter;
 #[allow(dead_code)]
 pub mod namespace_registry;
 pub mod plugin_trigger;
+pub mod policy_graph_scope;
 pub mod pool_config;
 #[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.
 pub mod public_env_inventory;
