@@ -7,27 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **BREAKING — Gateway API backendRefs to selector-less Services reach only
-  Pods of the Service's namespace** (issue #6108). Kubernetes does not manage
-  the EndpointSlices of a Service without `spec.selector`, so whoever can
-  write EndpointSlices in its namespace could point it at another namespace's
-  Pods, or any address, and reach them without a ReferenceGrant. A backendRef
-  to such a Service is now admitted only when every endpoint IP belongs to an
-  observed Pod in the Service's namespace and to no other namespace's Pod; an
-  endpoint `targetRef` naming another namespace is refused, and a `targetRef`
-  never vouches for an address. HTTPRoute/GRPCRoute fail that backend closed,
-  TCPRoute/TLSRoute/UDPRoute refuse the route, status reports
-  `ResolvedRefs=False` / `RefNotPermitted`, and the controller logs a
-  translation warning. The new `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`
-  (default `false`) admits endpoint IPs no observed Pod claims, such as an
-  external database, for routes in the Service's own namespace only. FQDN
-  endpoints and loopback, link-local, unspecified, multicast and broadcast
-  addresses stay refused. The check needs pod discovery; with
-  `FERRUM_K8S_POD_DISCOVERY_ENABLED=false` such backendRefs are admitted with
-  a warning that they were not verified.
-
 ### Performance
 
 - **Large config writes apply as deltas instead of full reloads** (issue
