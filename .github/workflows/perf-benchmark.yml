@@ -63,9 +63,7 @@ jobs:
   benchmark:
     name: Multi-Protocol Benchmark
     runs-on: ubuntu-latest
-    # The default release profile is a fat-LTO, codegen-units=1 build; leave
-    # room for it before the protocol runs.
-    timeout-minutes: 180
+    timeout-minutes: 90
     permissions:
       contents: read
 
