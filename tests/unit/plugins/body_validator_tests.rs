@@ -100,6 +100,7 @@ fn test_invalid_config_shapes_rejected() {
         json!({"content_types": "application/json"}),
         json!({"content_types": ["application/json", 123]}),
         json!({"grpc_max_decompressed_size_bytes": "10"}),
+        json!({"grpc_max_decompressed_size_bytes": 0}),
         json!({"response_json_schema": false}),
         json!({"response_json_schema": {"type": "string", "pattern": "["}}),
         json!({"response_required_fields": [false]}),

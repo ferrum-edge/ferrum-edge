@@ -15123,14 +15123,20 @@ pub fn try_acquire_per_ip_slot(
     if max == 0 {
         return Ok(None);
     }
+    let per_ip_key = if ip.contains(':') {
+        crate::util::client_identity::rate_limit_client_ip_string(ip, 64)
+            .unwrap_or_else(|| ip.to_string())
+    } else {
+        ip.to_string()
+    };
     let current = {
         let count = counts
-            .entry(ip.to_string())
+            .entry(per_ip_key.clone())
             .or_insert_with(|| AtomicU64::new(0));
         count.value().fetch_add(1, Ordering::Relaxed) + 1
     };
     let guard = PerIpConnectionGuard {
-        ip: ip.to_string(),
+        ip: per_ip_key,
         counts: counts.clone(),
     };
     if current > max {
@@ -33162,14 +33168,20 @@ async fn handle_proxy_request_inner(
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
     // covering all 30+ return paths without manual tracking.
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let per_ip_key = if ctx.client_ip.contains(':') {
+            crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                .unwrap_or_else(|| ctx.client_ip.clone())
+        } else {
+            ctx.client_ip.clone()
+        };
         let current = {
             let count = counts
-                .entry(ctx.client_ip.clone())
+                .entry(per_ip_key.clone())
                 .or_insert_with(|| AtomicU64::new(0));
             count.value().fetch_add(1, Ordering::Relaxed) + 1
         };
         let guard = Some(PerIpRequestGuard {
-            ip: ctx.client_ip.clone(),
+            ip: per_ip_key,
             counts: counts.clone(),
         });
         if current > state.max_concurrent_requests_per_ip {

@@ -3291,11 +3291,20 @@ fn request_body_digest(
                         hasher.update(decoded);
                         return Ok(format!("sha256-{}", hex::encode(hasher.finalize())));
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        let (status_code, message) = match error {
+                            super::charged_decode::ChargedDecodeError::CapacityRefused => (
+                                503,
+                                "Request decode capacity is temporarily unavailable",
+                            ),
+                            _ => (
+                                400,
+                                "Request body encoding is invalid or exceeds fingerprint limits",
+                            ),
+                        };
                         return Err(PluginResult::Reject {
-                            status_code: 400,
-                            body: "Request body encoding is invalid or exceeds fingerprint limits"
-                                .to_string(),
+                            status_code,
+                            body: serde_json::json!({"error": message}).to_string(),
                             headers: HashMap::new(),
                         });
                     }

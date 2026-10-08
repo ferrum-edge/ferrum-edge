@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Bound per-client plugin state and compressed request fingerprinting** (#6079). IP-based rate limiters now group IPv6 addresses by a `/64` prefix (configurable in `rate_limiting`), aggregate MCP session admission evicts only the caller’s own oldest session and refuses admission at global capacity, and request deduplication refuses invalid or over-limit Brotli bodies using a strict-window decoder.
+- **Bound per-client plugin state and compressed request fingerprinting** (#6079). Gateway-wide per-IP caps and IP-keyed plugins group IPv6 clients by `/64`; `rate_limiting.ipv6_prefix` remains configurable per policy. This changes Redis key space for IPv6 quotas, so old and new IPv6 counters do not overlap during rollout. MCP aggregate sessions now have a default cap of 128 per authenticated principal, while anonymous session quotas are isolated by client `/64`; at global capacity the gateway refuses admission rather than evicting another principal's live session. Brotli decoding in response inspection and request fingerprinting uses the charged strict-window decoder. Request deduplication returns `503` when the shared decode budget is full and rejects malformed or over-limit Brotli bodies; malformed gzip continues to fingerprint the original bytes.
 
 ### Performance
 

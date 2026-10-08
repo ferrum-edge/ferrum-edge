@@ -533,6 +533,24 @@ async fn ipv6_rate_limit_prefix_defaults_to_64_and_can_be_overridden() {
     assert_continue(per_host.on_request_received(&mut sibling).await);
 }
 
+#[test]
+fn ipv6_prefix_rejects_out_of_range_and_non_integer_values() {
+    for value in [json!(0), json!(129), json!("64"), Value::Null] {
+        let result = RateLimiting::new(
+            &rate_limiting_config(json!({
+                "window_seconds": 60,
+                "max_requests": 1,
+                "ipv6_prefix": value
+            })),
+            PluginHttpClient::default(),
+        );
+        let Err(error) = result else {
+            panic!("invalid IPv6 prefix must fail plugin construction");
+        };
+        assert!(error.contains("ipv6_prefix"), "unexpected error: {error}");
+    }
+}
+
 #[tokio::test]
 async fn test_rate_limiting_spiffe_mode_on_request_received_is_noop() {
     let config = json!({

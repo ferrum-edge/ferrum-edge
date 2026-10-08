@@ -1308,6 +1308,12 @@ impl McpSessionPrincipal {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum McpSessionQuotaKey {
+    Principal(McpSessionPrincipal),
+    Anonymous(String),
+}
+
 #[derive(Clone)]
 struct DownstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
@@ -1318,6 +1324,9 @@ struct DownstreamMcpSession {
     /// Principal that created this session, or `None` when the request carried
     /// no authenticated principal (deployments with no authentication plugin).
     principal: Option<McpSessionPrincipal>,
+    /// Anonymous sessions are isolated for quota accounting by their /64
+    /// source prefix. This key never participates in session reuse checks.
+    quota_key: McpSessionQuotaKey,
     upstream_sessions: HashMap<String, UpstreamMcpSession>,
     catalog: Arc<RwLock<McpCatalog>>,
     // Per-session catalog refresh lock: serializes discovery for *this* session's
@@ -2557,6 +2566,13 @@ impl McpGateway {
         // admission critical section so the only work under the lock stays the
         // in-memory scan/insert.
         let principal = McpSessionPrincipal::from_context(ctx);
+        let quota_key = match principal.as_ref() {
+            Some(principal) => McpSessionQuotaKey::Principal(principal.clone()),
+            None => McpSessionQuotaKey::Anonymous(
+                crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                    .unwrap_or_else(|| ctx.client_ip.clone()),
+            ),
+        };
 
         // Enforce the cap and reclaim sessions atomically, but keep upstream
         // DELETE I/O *out* of the critical section. Under the admission lock we do
@@ -2584,14 +2600,14 @@ impl McpGateway {
                 }
             }
 
-            // Reclaim only this principal's oldest session at its own quota.
+            // Reclaim only this quota key's oldest session at its own quota.
             // A full aggregate store never sacrifices another principal's
             // live session; when this caller has no session to replace, refuse.
             let mut owned_live: Vec<(Instant, String)> = self
                 .session_store
                 .iter()
                 .filter(|entry| {
-                    !self.session_is_expired(entry.value()) && entry.value().principal == principal
+                    !self.session_is_expired(entry.value()) && entry.value().quota_key == quota_key
                 })
                 .map(|entry| (entry.value().last_seen, entry.key().clone()))
                 .collect();
@@ -2606,7 +2622,7 @@ impl McpGateway {
             }
 
             if self.session_store.len() >= self.sessions.max_sessions {
-                sse_admission_error = Some(AggregateSseError::SessionCardinalityOverflow);
+                sse_admission_error = Some(AggregateSseError::SessionCapacityRefused);
             }
 
             if sse_admission_error.is_none() {
@@ -2636,6 +2652,7 @@ impl McpGateway {
                         client_info,
                         client_capabilities,
                         principal,
+                        quota_key,
                         upstream_sessions,
                         catalog: Arc::clone(&catalog),
                         catalog_refresh_lock: Arc::new(Mutex::new(())),
@@ -9714,7 +9731,7 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
             .unwrap_or(DEFAULT_MAX_SESSIONS_PER_PRINCIPAL.min(max_sessions) as u64);
     if max_sessions_per_principal == 0 || max_sessions_per_principal > max_sessions as u64 {
         return Err(
-            "mcp_gateway: `sessions.max_sessions_per_principal` must be from 1 through +             `sessions.max_sessions`"
+            "mcp_gateway: `sessions.max_sessions_per_principal` must be from 1 through `sessions.max_sessions`"
                 .to_string(),
         );
     }

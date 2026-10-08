@@ -97,6 +97,10 @@ fn rate_limit_ipv6_prefix_groups_network_hosts_and_keeps_ipv4_exact() {
         rate_limit_ip_string(ip("2001:db8:abcd:12::2"), 128)
     );
     assert_eq!(rate_limit_ip_string(ip("192.0.2.1"), 64), "192.0.2.1");
+    assert_eq!(
+        rate_limit_ip_string(ip("::ffff:192.0.2.1"), 64),
+        rate_limit_ip_string(ip("192.0.2.1"), 64)
+    );
 }
 
 #[test]

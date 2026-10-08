@@ -12206,6 +12206,41 @@ async fn full_session_store_never_evicts_another_principals_live_session() {
 }
 
 #[tokio::test]
+async fn principal_at_its_session_cap_replaces_only_its_own_oldest_session() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({
+        "max_sessions": 3,
+        "max_sessions_per_principal": 1,
+        "session_ttl_seconds": 3600
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let alice_old = initialize_as(
+        &plugin,
+        caller_as_consumer(initialize_request_body(), "consumer-a", "alice"),
+    )
+    .await;
+    let bob = initialize_as(
+        &plugin,
+        caller_as_consumer(initialize_request_body(), "consumer-b", "bob"),
+    )
+    .await;
+    let alice_new = initialize_as(
+        &plugin,
+        caller_as_consumer(initialize_request_body(), "consumer-a", "alice"),
+    )
+    .await;
+
+    let alice = caller_as_consumer(tools_list_body(4), "consumer-a", "alice");
+    assert_session_refused(reuse_session_as(&plugin, &alice_old, alice).await);
+    let alice = caller_as_consumer(tools_list_body(5), "consumer-a", "alice");
+    assert_tools_listed(reuse_session_as(&plugin, &alice_new, alice).await);
+    let bob = caller_as_consumer(tools_list_body(6), "consumer-b", "bob");
+    assert_tools_listed(reuse_session_as(&plugin, &bob, bob).await);
+}
+
+#[tokio::test]
 async fn aggregate_session_is_bound_to_an_external_identity_without_a_consumer() {
     let server = start_mcp_catalog_server().await;
     let config = aggregate_config(&format!("{}/mcp", server.uri()));
@@ -12247,6 +12282,32 @@ async fn aggregate_sessions_are_unchanged_without_an_authentication_plugin() {
     // principal is not reusable by an authenticated one.
     let authenticated = caller_as_consumer(tools_list_body(4), "consumer-a", "alice");
     assert_session_refused(reuse_session_as(&plugin, &session_id, authenticated).await);
+}
+
+#[tokio::test]
+async fn anonymous_session_quotas_are_isolated_by_ipv6_prefix() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({
+        "max_sessions": 2,
+        "max_sessions_per_principal": 1,
+        "session_ttl_seconds": 3600
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let mut first = caller_unauthenticated(initialize_request_body());
+    first.0.client_ip = "2001:db8:1:1::1".to_string();
+    let first_id = initialize_as(&plugin, first).await;
+    let mut second = caller_unauthenticated(initialize_request_body());
+    second.0.client_ip = "2001:db8:1:2::1".to_string();
+    let second_id = initialize_as(&plugin, second).await;
+
+    let mut first = caller_unauthenticated(tools_list_body(2));
+    first.0.client_ip = "2001:db8:1:1::2".to_string();
+    assert_tools_listed(reuse_session_as(&plugin, &first_id, first).await);
+    let mut second = caller_unauthenticated(tools_list_body(3));
+    second.0.client_ip = "2001:db8:1:2::2".to_string();
+    assert_tools_listed(reuse_session_as(&plugin, &second_id, second).await);
 }
 
 // ---------------------------------------------------------------------------

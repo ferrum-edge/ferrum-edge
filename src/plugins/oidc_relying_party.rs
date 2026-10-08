@@ -60,6 +60,7 @@ const DEFAULT_SESSION_MAX_COOKIE_BYTES: u64 = 8000;
 /// minimum: every login answers 503 instead of the configuration being refused
 /// (issue #5029).
 const MIN_SESSION_MAX_COOKIE_BYTES: u64 = 1024;
+const STATE_CACHE_FULL_ERROR: &str = r#"{"error":"OIDC state cache full"}"#;
 const DEFAULT_STATE_TTL_SECS: u64 = 600;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE: usize = 32;
@@ -2231,7 +2232,11 @@ impl OidcRelyingParty {
             .unwrap_or_else(|| ctx.client_ip.clone()),
             expires_at: Instant::now() + self.behavior.state_ttl,
         };
-        self.session.state_cache.insert(state.clone(), flow)?;
+        insert_pending_flow_or_use_sealed_cookie(
+            &self.session.state_cache,
+            state.clone(),
+            flow,
+        )?;
         Ok(CreatedFlow {
             state,
             code_verifier,
@@ -2853,7 +2858,7 @@ impl StateCache {
             })
             .is_err()
         {
-            return Err(r#"{"error":"OIDC state cache full"}"#.to_string());
+            return Err(STATE_CACHE_FULL_ERROR.to_string());
         }
         if !self.reserve_source(&flow.source_ip) {
             decrement_atomic(&self.active_entries);
@@ -3044,6 +3049,24 @@ impl StateCache {
             self.per_source_entries
                 .remove_if(source_ip, |_, count| *count == 0);
         }
+    }
+}
+
+fn insert_pending_flow_or_use_sealed_cookie(
+    cache: &StateCache,
+    state: String,
+    flow: FlowState,
+) -> Result<(), String> {
+    match cache.insert(state, flow) {
+        Ok(()) => Ok(()),
+        Err(error) if error == STATE_CACHE_FULL_ERROR => {
+            // The sealed cookie carries the complete pending flow, and
+            // callbacks intentionally accept a missing local entry for
+            // cross-replica completion. Preserve browser login availability
+            // when this replica's optional replay cache is full.
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -5471,6 +5494,31 @@ mod tests {
                 flow_for("192.0.2.1", Instant::now() + Duration::from_secs(60)),
             )
             .expect("released capacity is reusable");
+    }
+
+    #[test]
+    fn full_pending_flow_cache_falls_back_to_the_sealed_cookie() {
+        let cache = StateCache::new(1, 1, Duration::from_secs(600), 16);
+        cache
+            .insert(
+                "cached-state".to_string(),
+                flow_for("192.0.2.1", Instant::now() + Duration::from_secs(60)),
+            )
+            .expect("first flow admitted");
+
+        insert_pending_flow_or_use_sealed_cookie(
+            &cache,
+            "sealed-only-state".to_string(),
+            flow_for("192.0.2.2", Instant::now() + Duration::from_secs(60)),
+        )
+        .expect("a full optional cache must not refuse the sealed flow");
+
+        assert!(cache.entries.contains_key("cached-state"));
+        assert!(
+            cache
+                .admit_callback("sealed-only-state", &[8; 32])
+                .is_ok()
+        );
     }
 
     #[test]

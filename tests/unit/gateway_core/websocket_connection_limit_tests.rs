@@ -210,6 +210,20 @@ fn per_ip_slot_counter_returns_to_zero_after_every_guard_drops() {
 }
 
 #[test]
+fn per_ip_slot_groups_ipv6_addresses_by_the_default_prefix() {
+    let counts = Arc::new(dashmap::DashMap::new());
+    let first = try_acquire_per_ip_slot(Some(&counts), "2001:db8:abcd:12::1", 1)
+        .expect("first source admitted")
+        .expect("guard");
+    assert!(matches!(
+        try_acquire_per_ip_slot(Some(&counts), "2001:db8:abcd:12::ffff", 1),
+        Err(PerIpLimitExceeded)
+    ));
+    drop(first);
+    assert!(counts.is_empty());
+}
+
+#[test]
 fn per_ip_stream_admission_default_is_disabled() {
     let admission = PerIpStreamAdmission::default();
     assert_eq!(admission.max, 0);

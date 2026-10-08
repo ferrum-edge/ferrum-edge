@@ -490,10 +490,15 @@ impl Plugin for UdpRateLimiting {
 
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         self.maybe_evict();
-        let key: Arc<str> = Arc::from(
-            crate::util::client_identity::rate_limit_client_ip_string(ctx.client_ip.as_ref(), 64)
-                .unwrap_or_else(|| ctx.client_ip.to_string()),
-        );
+        let key: Arc<str> = if !ctx.client_ip.contains(':') {
+            Arc::clone(ctx.client_ip)
+        } else {
+            crate::util::client_identity::parse_canonical_client_ip(ctx.client_ip.as_ref())
+                .map(|ip| {
+                    Arc::from(crate::util::client_identity::rate_limit_ip_string(ip, 64))
+                })
+                .unwrap_or_else(|| Arc::clone(ctx.client_ip))
+        };
 
         let Some(outcome) = self
             .limiter

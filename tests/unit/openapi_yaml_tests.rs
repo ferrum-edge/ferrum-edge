@@ -6339,7 +6339,7 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
     let fixtures = [
         (
             "body_validator",
-            json!({"grpc_max_decompressed_size_bytes": 0}),
+            json!({"grpc_max_decompressed_size_bytes": 1}),
         ),
         (
             "load_testing",
@@ -7362,7 +7362,7 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         .expect("BodyValidatorConfig must publish grpc_max_decompressed_size_bytes");
     assert_eq!(property["type"], json!("integer"));
     assert_eq!(property["format"], json!("uint64"));
-    assert_eq!(property["minimum"], json!(0));
+    assert_eq!(property["minimum"], json!(1));
     assert!(
         property.get("default").is_none(),
         "environment-derived omission semantics cannot be represented by a static OpenAPI default"
@@ -7372,7 +7372,7 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         .as_str()
         .expect("grpc_max_decompressed_size_bytes description");
     for contract in [
-        "`0` disables the decompressed cap",
+        "Zero is rejected so compressed input is always bounded",
         "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
         "parses as an unsigned integer",
         "10 MiB",
@@ -7391,8 +7391,14 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 1}),
         true,
+    );
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
+        false,
     );
     assert_component_validity(
         &spec,

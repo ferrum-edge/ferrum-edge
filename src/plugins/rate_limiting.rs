@@ -331,7 +331,13 @@ impl RateLimiting {
         )?;
         let limit_by = parse_limit_by(object)?;
         let ipv6_prefix = match object.get("ipv6_prefix") {
-            None | Some(Value::Null) => 64,
+            None => 64,
+            Some(Value::Null) => {
+                return Err(
+                    "rate_limiting: `ipv6_prefix` must be an integer from 1 through 128"
+                        .to_string(),
+                );
+            }
             Some(value) => {
                 let prefix = value.as_u64().ok_or_else(|| {
                     "rate_limiting: `ipv6_prefix` must be an integer from 1 through 128".to_string()
@@ -1759,8 +1765,40 @@ fn prefixed_key(prefix: &str, value: &str) -> String {
 }
 
 fn ip_key(client_ip: &str, ipv6_prefix: u8) -> String {
-    let key = crate::util::client_identity::rate_limit_client_ip_string(client_ip, ipv6_prefix);
-    prefixed_key("ip:", key.as_deref().unwrap_or(client_ip))
+    use std::fmt::Write as _;
+
+    let mut key = String::with_capacity(3 + client_ip.len());
+    key.push_str("ip:");
+    if !client_ip.contains(':') {
+        key.push_str(client_ip);
+        return key;
+    }
+    let Some(ip) = crate::util::client_identity::parse_canonical_client_ip(client_ip) else {
+        key.push_str(client_ip);
+        return key;
+    };
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let _ = write!(key, "{ipv4}");
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            let prefix = ipv6_prefix.min(128);
+            let mut octets = ipv6.octets();
+            let whole_bytes = usize::from(prefix / 8);
+            let remaining_bits = prefix % 8;
+            if remaining_bits != 0 {
+                octets[whole_bytes] &= u8::MAX << (8 - remaining_bits);
+            }
+            let zero_from = if remaining_bits == 0 {
+                whole_bytes
+            } else {
+                whole_bytes + 1
+            };
+            octets[zero_from..].fill(0);
+            let _ = write!(key, "{}", std::net::Ipv6Addr::from(octets));
+        }
+    }
+    key
 }
 
 /// Metadata key -> response header for the telemetry `expose_headers` publishes.

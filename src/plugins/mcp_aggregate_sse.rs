@@ -296,6 +296,7 @@ pub enum AggregateSseError {
     RetentionOverflow,
     StreamCardinalityOverflow,
     SessionCardinalityOverflow,
+    SessionCapacityRefused,
 }
 
 impl AggregateSseError {
@@ -328,6 +329,7 @@ impl AggregateSseError {
             Self::RetentionOverflow => "SSE session retention capacity exceeded",
             Self::StreamCardinalityOverflow => "SSE stream cardinality exceeded for this session",
             Self::SessionCardinalityOverflow => "SSE session cardinality exceeded",
+            Self::SessionCapacityRefused => "MCP session capacity is full",
         }
     }
 
@@ -358,6 +360,7 @@ impl AggregateSseError {
             Self::RetentionOverflow => "retention_overflow",
             Self::StreamCardinalityOverflow => "stream_cardinality_overflow",
             Self::SessionCardinalityOverflow => "session_cardinality_overflow",
+            Self::SessionCapacityRefused => "session_capacity_refused",
         }
     }
 
@@ -386,6 +389,7 @@ impl AggregateSseError {
             Self::RetentionOverflow
             | Self::StreamCardinalityOverflow
             | Self::SessionCardinalityOverflow => 503,
+            Self::SessionCapacityRefused => 503,
         }
     }
 }

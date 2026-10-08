@@ -10720,7 +10720,7 @@ components:
         backend_read_timeout_ms:
           type: integer
           format: uint64
-          minimum: 0
+          minimum: 1
           maximum: 86400000
           default: 30000
           description: >-
@@ -29639,7 +29639,7 @@ components:
             - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
             - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
         ipv6_prefix:
-          type: [integer, "null"]
+          type: integer
           minimum: 1
           maximum: 128
           default: 64
@@ -31093,8 +31093,9 @@ components:
           maximum: 18446744073709551615
           description: >-
             Maximum decompressed gRPC protobuf payload size in bytes for both
-            request and response validation. Nonnegative integer matching runtime
-            `usize` parsing. `0` disables the decompressed cap. When omitted,
+            request and response validation. Positive integer matching runtime
+            `usize` parsing. Zero is rejected so compressed input is always
+            bounded. When omitted,
             inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses
             as an unsigned integer; otherwise falls back to 10 MiB (10485760).
             No static OpenAPI default is advertised because the effective value
