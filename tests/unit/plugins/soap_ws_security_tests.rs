@@ -7195,6 +7195,53 @@ mod advisory_regressions {
         ));
     }
 
+    /// A padded first delimiter fronting an unverified envelope, followed by a
+    /// part carrying a valid credential, is refused rather than authenticated
+    /// on the later part: a padding-tolerant backend takes the first part as
+    /// its root.
+    #[tokio::test]
+    async fn mtom_padded_first_delimiter_is_refused() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let content_type =
+            "multipart/related; type=\"application/xop+xml\"; boundary=MIME_boundary";
+        let unverified = valid_username_token_body().replace("secret123", "wrong-password");
+        let valid_part = format!(
+            "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             \r\n\
+             {}\r\n\
+             --MIME_boundary--\r\n",
+            valid_username_token_body()
+        );
+
+        let mut ctx = ctx_with(&valid_part, Some(content_type));
+        let mut headers = soap_headers_with_content_type(content_type);
+        assert!(
+            matches!(
+                run_soap_request_policy(&plugin, &mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "the valid single-part package must authenticate"
+        );
+
+        for padding in [" ", "\t"] {
+            let package = format!(
+                "--MIME_boundary{padding}\r\n\
+                 Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+                 \r\n\
+                 {unverified}\r\n\
+                 {valid_part}"
+            );
+            let mut ctx = ctx_with(&package, Some(content_type));
+            let mut headers = soap_headers_with_content_type(content_type);
+            let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+            assert!(
+                is_reject(&result),
+                "a padded first delimiter must not be skipped as preamble"
+            );
+        }
+    }
+
     /// Declaring that a route does not accept MTOM must refuse SOAP-bearing
     /// multipart rather than let it stream past.
     #[tokio::test]
@@ -7589,6 +7636,100 @@ mod mtom_strict_framing {
         let package = raw.replace("\r\n", "\n");
         assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
         assert_closed(&package, None, "malformed_encoding");
+    }
+
+    /// RFC 2046 transport padding on a delimiter line is framing to a
+    /// padding-tolerant backend parser. Skipping the padded line as payload
+    /// frames the package from a later delimiter instead, so Ferrum would
+    /// validate a different root than such a backend executes. Every padded
+    /// variant fails closed: space or tab padding, on the first delimiter at
+    /// the body start or after a preamble, on a later part delimiter, and on
+    /// the close-delimiter.
+    #[test]
+    fn a_padded_delimiter_line_fails_closed() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        for padding in [" ", "\t", " \t "] {
+            let forged_first = format!(
+                "--MIME_boundary{padding}\r\n\
+                 Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                 \r\n\
+                 <soap:Envelope>forged</soap:Envelope>\r\n\
+                 {real}"
+            );
+            assert_closed(&forged_first, None, "malformed_encoding");
+            assert_closed(&forged_first, Some(ROOT_ID), "malformed_encoding");
+
+            let after_preamble = format!("preamble\r\n{forged_first}");
+            assert_closed(&after_preamble, None, "malformed_encoding");
+            assert_closed(&after_preamble, Some(ROOT_ID), "malformed_encoding");
+
+            let padded_part = real.replacen(
+                "\r\n--MIME_boundary\r\n",
+                &format!("\r\n--MIME_boundary{padding}\r\n"),
+                1,
+            );
+            assert_closed(&padded_part, None, "malformed_encoding");
+            assert_closed(&padded_part, Some(ROOT_ID), "malformed_encoding");
+
+            let padded_close = real.replace(
+                "--MIME_boundary--\r\n",
+                &format!("--MIME_boundary--{padding}\r\nepilogue\r\n--MIME_boundary--\r\n"),
+            );
+            assert_closed(&padded_close, None, "malformed_encoding");
+            assert_closed(&padded_close, Some(ROOT_ID), "malformed_encoding");
+        }
+    }
+
+    /// A boundary token that opens a line after a bare LF or a bare CR is a
+    /// delimiter to a parser that tolerates those line endings and payload to
+    /// strict CRLF framing, so the two select different roots. So is a
+    /// CRLF-opened delimiter line that ends in a bare LF. Each fails closed
+    /// rather than being skipped.
+    #[test]
+    fn a_boundary_opened_or_ended_by_a_bare_line_ending_fails_closed() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        for eol in ["\n", "\r"] {
+            let forged_preamble = format!(
+                "preamble{eol}--MIME_boundary\r\n\
+                 Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                 \r\n\
+                 <soap:Envelope>forged</soap:Envelope>\r\n\
+                 {real}"
+            );
+            assert_closed(&forged_preamble, None, "malformed_encoding");
+            assert_closed(&forged_preamble, Some(ROOT_ID), "malformed_encoding");
+
+            let bare_part = real.replacen(
+                "\r\n--MIME_boundary\r\n",
+                &format!("{eol}--MIME_boundary{eol}"),
+                1,
+            );
+            assert_closed(&bare_part, None, "malformed_encoding");
+            assert_closed(&bare_part, Some(ROOT_ID), "malformed_encoding");
+        }
+
+        let lf_terminated = real.replacen("\r\n--MIME_boundary\r\n", "\r\n--MIME_boundary\n", 1);
+        assert_closed(&lf_terminated, None, "malformed_encoding");
+        assert_closed(&lf_terminated, Some(ROOT_ID), "malformed_encoding");
+
+        let forged_first = format!(
+            "--MIME_boundary\n\
+             Content-Type: application/xop+xml; type=\"text/xml\"\n\
+             \n\
+             <soap:Envelope>forged</soap:Envelope>\n\
+             {real}"
+        );
+        assert_closed(&forged_first, None, "malformed_encoding");
+    }
+
+    /// Bare line endings that do not open a boundary line are ordinary
+    /// content: an LF-formatted envelope still resolves.
+    #[test]
+    fn bare_line_endings_inside_a_part_body_still_resolve() {
+        let root = "<soap:Envelope>\n  <soap:Body/>\r</soap:Envelope>";
+        let package = package(root, "line one\nline two");
+        assert_eq!(root_of(&package, Some(ROOT_ID)), root);
+        assert_eq!(root_of(&package, None), root);
     }
 
     /// The close-delimiter is mandatory, and nothing boundary-shaped may

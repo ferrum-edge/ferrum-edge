@@ -430,10 +430,11 @@ const MAX_MULTIPART_BOUNDARY_BYTES: usize = 70;
 /// this count and [`MAX_MULTIPART_PART_HEADER_BYTES`] so neither a few enormous
 /// lines nor very many tiny ones can drive unbounded work.
 const MAX_MULTIPART_PART_HEADERS: usize = 32;
-/// Delimiter-line candidates examined across one package. Every candidate that
-/// is rejected as payload advances the scan by at least `2 + boundary.len()`
-/// bytes, so this is a belt-and-braces ceiling on an adversarial package that
-/// embeds boundary-shaped bytes throughout its attachments.
+/// Boundary-token occurrences examined across one package. Every occurrence
+/// that is not a delimiter line either refuses the package or is mid-line
+/// payload that advances the scan by `2 + boundary.len()` bytes, so this is a
+/// belt-and-braces ceiling on an adversarial package that embeds
+/// boundary-shaped bytes throughout its attachments.
 const MAX_MULTIPART_DELIMITER_CANDIDATES: usize = 4_096;
 
 // ── Configuration admission bounds ──────────────────────────────────────────
@@ -7075,17 +7076,19 @@ struct MtomDelimiter {
     closing: bool,
 }
 
-/// Classify what follows `--boundary` on a candidate delimiter line.
+/// Classify what follows `--boundary` on a line it opens.
 ///
 /// Returns how many bytes the line occupies after the boundary token plus
-/// whether this is the closing delimiter, or `None` when the candidate is not a
-/// delimiter line at all — in which case those bytes are payload and the scan
-/// continues past them.
+/// whether this is the closing delimiter, or `None` when anything else follows
+/// the token. The caller refuses the whole package on `None`; the line is never
+/// skipped as payload.
 ///
 /// Framing is exact CRLF and nothing else. RFC 2046 transport padding is
-/// deliberately *not* accepted: a padded delimiter is precisely the construct
-/// one parser treats as framing and another as payload, and rejecting it fails
-/// closed instead of choosing a reading the backend may not share.
+/// deliberately *not* accepted, on a part delimiter or on the close-delimiter:
+/// a padded line is precisely the construct one parser treats as framing and
+/// another as payload. Skipping it would frame the package from a later
+/// delimiter while a padding-tolerant backend frames it from this one, so it
+/// fails closed instead of choosing a reading the backend may not share.
 fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
     let Some(after_dashes) = rest.strip_prefix(b"--") else {
         // A part delimiter line ends in exactly CRLF and nothing else.
@@ -7105,71 +7108,80 @@ fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
 /// A bounded, line-anchored scanner over one package's delimiter lines.
 ///
 /// A delimiter line exists only at the very start of the body or immediately
-/// after a CRLF. That anchoring is what makes an embedded `--boundary`
+/// after a CRLF. That anchoring is what makes a mid-line `--boundary`
 /// substring inside a preamble, a header value, or an attachment payload inert
 /// here — exactly as it is inert for a conforming backend parser. An unanchored
 /// byte-substring search would instead let an attacker plant a fake part inside
 /// a payload and have Ferrum validate it while the backend consumed the real
 /// root part (GHSA-435h-f785-wmm4).
+///
+/// A boundary token that opens a line is always decided, never skipped. After
+/// CRLF (or at the body start) it must be an exact delimiter line. After a bare
+/// LF or a bare CR it is refused outright: a parser that tolerates LF-only (or
+/// CR) line endings frames a part there that CRLF framing would not see.
 struct MtomScanner<'a> {
     bytes: &'a [u8],
     dash_boundary: Vec<u8>,
-    crlf_dash_boundary: Vec<u8>,
     /// Delimiter-line candidates examined so far, across the whole package.
     candidates: usize,
 }
 
 impl<'a> MtomScanner<'a> {
     fn new(bytes: &'a [u8], boundary: &str) -> Self {
-        let dash_boundary = format!("--{boundary}").into_bytes();
-        let mut crlf_dash_boundary = Vec::with_capacity(dash_boundary.len() + 2);
-        crlf_dash_boundary.extend_from_slice(b"\r\n");
-        crlf_dash_boundary.extend_from_slice(&dash_boundary);
         Self {
             bytes,
-            dash_boundary,
-            crlf_dash_boundary,
+            dash_boundary: format!("--{boundary}").into_bytes(),
             candidates: 0,
         }
     }
 
     /// The next delimiter line at or after `from`, or `Ok(None)` when the
     /// package has none left.
+    ///
+    /// Fails closed on a boundary token that opens a line without being an
+    /// exact delimiter line: a padded or otherwise non-CRLF tail, or a line
+    /// opened by a bare LF or bare CR.
     fn next_from(&mut self, from: usize) -> Result<Option<MtomDelimiter>, SoapBodyDecodeError> {
         let mut search = from;
         loop {
-            let line_start = if search == 0 && self.bytes.starts_with(&self.dash_boundary) {
-                0
-            } else {
-                let Some(tail) = self.bytes.get(search..) else {
-                    return Ok(None);
-                };
-                match find_subslice(tail, &self.crlf_dash_boundary) {
-                    // The line starts *after* the CRLF that introduces it.
-                    Some(offset) => search + offset + 2,
-                    None => return Ok(None),
-                }
+            let Some(tail) = self.bytes.get(search..) else {
+                return Ok(None);
             };
+            let Some(offset) = find_subslice(tail, &self.dash_boundary) else {
+                return Ok(None);
+            };
+            let line_start = search + offset;
             self.candidates += 1;
             if self.candidates > MAX_MULTIPART_DELIMITER_CANDIDATES {
                 return Err(SoapBodyDecodeError::MalformedEncoding);
             }
             let after_boundary = line_start + self.dash_boundary.len();
-            let rest = self
+            let before = self
                 .bytes
-                .get(after_boundary..)
+                .get(..line_start)
                 .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-            if let Some((tail_len, closing)) = mtom_delimiter_tail(rest) {
+            if before.is_empty() || before.ends_with(b"\r\n") {
+                let rest = self
+                    .bytes
+                    .get(after_boundary..)
+                    .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+                let (tail_len, closing) =
+                    mtom_delimiter_tail(rest).ok_or(SoapBodyDecodeError::MalformedEncoding)?;
                 return Ok(Some(MtomDelimiter {
                     line_start,
                     next: after_boundary + tail_len,
                     closing,
                 }));
             }
-            // Boundary-shaped bytes that are not a delimiter line. Skip past
-            // them and keep scanning; they belong to whatever part is being
-            // framed. `dash_boundary` is at least three bytes, so the scan
-            // always advances.
+            // A bare LF or bare CR opens a line for a lenient parser and not
+            // for this one, so the two would frame different parts.
+            if before.ends_with(b"\n") || before.ends_with(b"\r") {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            // Mid-line boundary bytes are payload of whatever part is being
+            // framed. Boundary bytes never include CR or LF, so no line-opening
+            // occurrence can overlap this one, and `dash_boundary` is at least
+            // three bytes, so the scan always advances.
             search = after_boundary;
         }
     }
@@ -7286,7 +7298,9 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
 /// about which bytes are the envelope (GHSA-435h-f785-wmm4):
 ///
 /// * Delimiter lines are recognized only at the body start or immediately after
-///   a CRLF, with exact CRLF framing and no transport padding.
+///   a CRLF, with exact CRLF framing and no transport padding. A boundary token
+///   that opens a line is never skipped as payload: a padded or non-CRLF tail,
+///   or a line opened by a bare LF or bare CR, refuses the package.
 /// * Exactly one close-delimiter must be present, and the epilogue after it
 ///   must not contain the boundary token at all.
 /// * Part headers are strict: US-ASCII, no obsolete folding, well-formed field
@@ -7299,9 +7313,9 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
 /// * The root part must itself declare a SOAP/XOP infoset and must not declare
 ///   a re-encoding `Content-Transfer-Encoding`.
 ///
-/// Every other shape — no parts, no matching root, LF-only framing, a missing
-/// or malformed closure, a part header block over its byte/line ceiling, more
-/// than [`MAX_MULTIPART_PARTS`] parts, or more than
+/// Every other shape — no parts, no matching root, LF-only or padded framing,
+/// a missing or malformed closure, a part header block over its byte/line
+/// ceiling, more than [`MAX_MULTIPART_PARTS`] parts, or more than
 /// [`MAX_MULTIPART_DELIMITER_CANDIDATES`] boundary-shaped candidates — fails
 /// closed.
 fn extract_mtom_root_part<'a>(
@@ -7312,7 +7326,9 @@ fn extract_mtom_root_part<'a>(
     let mut scanner = MtomScanner::new(bytes, boundary);
 
     // Anything before the first delimiter line is the RFC 2046 preamble, which
-    // every conforming parser ignores; it is skipped rather than inspected.
+    // every conforming parser ignores; it is skipped rather than inspected,
+    // except that a boundary token opening a line inside it is refused by the
+    // scanner rather than skipped.
     let first = scanner
         .next_from(0)?
         .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
