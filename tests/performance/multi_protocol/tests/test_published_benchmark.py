@@ -84,6 +84,24 @@ class PublishedBenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(udp["payload_bytes"], 2048)
         self.assertIn("| UDP |", markdown)
 
+    def test_planned_runs_and_protocols_missing_from_disk_are_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "manifest.json").write_text(json.dumps({"args": {
+                "protocols": ["http1", "grpc"], "runs": 3, "payload_sizes": [64],
+                "latency_duration_secs": 0}}))
+            # Only run 1 of 3 ever wrote a log, and grpc never ran at all.
+            write_run(root, "throughput_64b", 1, "http1",
+                      report("http://127.0.0.1:8000/echo", 100_000, 1, 1),
+                      report("http://127.0.0.1:3001/echo", 200_000, 1, 1))
+            document = summary.summarize(root)
+        rows = document["suites"]["throughput_64b"]
+        self.assertEqual(rows["http1"]["runs_complete"], 1)
+        self.assertEqual(rows["http1"]["runs_expected"], 3)
+        self.assertIn("incomplete-runs", rows["http1"]["flags"])
+        self.assertEqual(rows["grpc"]["runs_complete"], 0)
+        self.assertIn("incomplete-runs", rows["grpc"]["flags"])
+
 
 if __name__ == "__main__":
     unittest.main()

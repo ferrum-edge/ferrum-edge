@@ -618,25 +618,34 @@ async fn run_perf_test(
                 let url = format!("{}{}", base_url, path);
 
                 let req_start = Instant::now();
-                let result = client
+                // A request succeeds only once its whole body arrives: headers
+                // alone would count a truncated or stalled response as served.
+                let result = match client
                     .get(&url)
                     .header("X-API-Key", key.as_str())
                     .send()
-                    .await;
+                    .await
+                {
+                    Ok(response) => {
+                        let status = response.status();
+                        response.bytes().await.map(|_| status)
+                    }
+                    Err(error) => Err(error),
+                };
                 let latency_us = req_start.elapsed().as_micros() as u64;
                 // Warmup completions and requests finishing after the window
                 // closed are not samples.
                 let in_window = measuring.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed);
 
                 match result {
-                    Ok(r) if r.status().is_success() => {
+                    Ok(status) if status.is_success() => {
                         if in_window {
                             total_requests.fetch_add(1, Ordering::Relaxed);
                             successful_requests.fetch_add(1, Ordering::Relaxed);
                             local_latencies.push(latency_us);
                         }
                     }
-                    Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                    Ok(status) if status == reqwest::StatusCode::NOT_FOUND => {
                         // A route miss is a convergence signal in warmup too.
                         total_requests.fetch_add(1, Ordering::Relaxed);
                         failed_requests.fetch_add(1, Ordering::Relaxed);

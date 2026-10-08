@@ -100,7 +100,10 @@ def cv_pct(values):
     return statistics.stdev(values) / statistics.mean(values) * 100
 
 
-def summarize_protocol(samples):
+def summarize_protocol(samples, expected_runs=None):
+    """`expected_runs` is the manifest's planned run count: a run that never
+    produced a log is missing an observation just like a run whose log lacks a
+    leg, so the row must not look complete."""
     complete = [s for s in samples if s["gateway"] and s["direct"]]
     gw = [s["gateway"] for s in complete]
     dr = [s["direct"] for s in complete]
@@ -119,6 +122,7 @@ def summarize_protocol(samples):
     summary = {
         "runs_complete": len(complete),
         "runs_attempted": len(samples),
+        "runs_expected": max(expected_runs or 0, len(samples)),
         "concurrency": gw[0].get("concurrency") if gw else None,
         "duration_secs": gw[0].get("duration_secs") if gw else None,
         "gateway_rps_median": median(gw_rps),
@@ -150,7 +154,7 @@ def summarize_protocol(samples):
         ],
     }
     flags = []
-    if summary["runs_complete"] < summary["runs_attempted"]:
+    if summary["runs_complete"] < summary["runs_expected"]:
         flags.append("incomplete-runs")
     if summary["gateway_errors"] or summary["direct_errors"]:
         flags.append("errors")
@@ -248,17 +252,32 @@ def payload_from_suite(suite):
     return int(digits) if digits else None
 
 
+def expected_matrix(manifest):
+    """(runs, {suite: protocols}) the wrapper planned, from manifest.json, so a
+    suite, protocol, or run that never produced a log is reported as missing
+    rather than silently absent. Empty when the manifest has no arguments."""
+    args = manifest.get("args") or {}
+    runs = args.get("runs")
+    protocols = args.get("protocols") or []
+    suites = [f"throughput_{size}b" for size in args.get("payload_sizes") or []]
+    if args.get("latency_duration_secs"):
+        suites.append("latency_64b")
+    return runs, {suite: list(protocols) for suite in suites}
+
+
 def summarize(out):
     out = Path(out)
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     samples = load_samples(out)
+    expected_runs, expected = expected_matrix(manifest)
+    suites = set(samples) | set(expected)
     summary = {}
-    for suite in sorted(samples, key=suite_order):
-        per_protocol = samples[suite]
+    for suite in sorted(suites, key=suite_order):
+        per_protocol = samples.get(suite, {})
         rows = {}
-        for protocol in ordered(per_protocol):
-            row = summarize_protocol(per_protocol[protocol])
+        for protocol in ordered(set(per_protocol) | set(expected.get(suite, ()))):
+            row = summarize_protocol(per_protocol.get(protocol, []), expected_runs)
             row["payload_bytes"] = payload_from_suite(suite)
             if protocol.startswith("udp") and row["payload_bytes"]:
                 row["payload_bytes"] = min(row["payload_bytes"], 2048)
