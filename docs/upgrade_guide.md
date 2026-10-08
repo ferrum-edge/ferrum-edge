@@ -26,42 +26,6 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased changes after 0.9.15
-
-### Node-agent DaemonSet drops `hostPID` and NodeWaypoint `SYS_ADMIN` (issue [#6112](https://github.com/ferrum-edge/ferrum-edge/issues/6112))
-
-The `ferrum-mesh-node-agent` DaemonSet no longer renders `hostPID: true`, and
-`nodeAgent.proxyMode=node_waypoint` no longer adds `CAP_SYS_ADMIN` to it. Both
-served the old veth discovery that read a pod's `/proc/<pid>` view and
-`setns()`ed into its network namespace. Since 0.9.15 the node agent resolves
-veths only from host route tables and host sysfs, so neither grant has a
-consumer. `CAP_BPF`, `CAP_NET_ADMIN`, and `CAP_PERFMON` are unchanged.
-
-- **No action** on kernel 5.8 or later. A Helm upgrade rolls the node agent
-  with the narrower pod spec.
-- **Kernel 5.7.x:** `SYS_ADMIN` is still the BPF permission there. Keep (or
-  set) `nodeAgent.security.dropCapSysAdmin=false`. NodeWaypoint used to grant
-  it implicitly, so a 5.7.x NodeWaypoint node that relied on that must now set
-  the value explicitly. Only an explicit `false` grants `SYS_ADMIN`: a missing
-  or null `dropCapSysAdmin` key (or a nulled `nodeAgent.security` block) now
-  keeps it dropped.
-- **NodeWaypoint BPF load can now fail closed:** the old NodeWaypoint
-  `SYS_ADMIN` also satisfied the kernel's `perfmon_capable()`/`bpf_capable()`
-  checks and older container runtimes' `RuntimeDefault` seccomp profiles,
-  which allow `bpf()`/`perf_event_open()` only for `CAP_SYS_ADMIN`. Without it,
-  a NodeWaypoint node agent with `nodeAgent.security.addCapPerfmon=false`, or
-  on such a runtime, now fails at BPF load (capture stays closed and the node
-  agent does not become ready) instead of being masked. Fix: keep
-  `addCapPerfmon=true` (the default), and run a runtime whose `RuntimeDefault`
-  seccomp profile allows `bpf()` under `CAP_BPF` (current containerd and
-  CRI-O do), or set `nodeAgent.security.seccompProfile` to a `Localhost`
-  profile that does. This is the posture `local_pod` already required.
-- **Admission policy:** PodSecurity/Kyverno/OPA exceptions for the node agent
-  no longer need `hostPID`. The NodeWaypoint and per-pod-netns ambient proxy
-  DaemonSet keeps its own `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE`.
-- **Hand-maintained manifests:** remove `hostPID: true` and the NodeWaypoint
-  `SYS_ADMIN` from copied node-agent specs.
-
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main

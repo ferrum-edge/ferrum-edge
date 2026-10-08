@@ -7,24 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **Node-agent DaemonSet drops `hostPID` and NodeWaypoint `SYS_ADMIN`**
-  (issue #6112). Both existed for veth discovery that read a pod's
-  `/proc/<pid>` view and `setns()`ed into its network namespace. Since #6084
-  the node agent resolves veths only from host route tables and host sysfs,
-  and the eBPF operations NodeWaypoint adds (SOCK_OPS cgroup attach, tc ingress
-  redirect, map pinning) need only `CAP_BPF` + `CAP_NET_ADMIN`, like
-  `local_pod`. The chart now renders no `hostPID` for the node agent and adds
-  `SYS_ADMIN` only for `nodeAgent.security.dropCapSysAdmin=false` (kernel
-  5.7.x). The NodeWaypoint ambient proxy, which does enter pod network
-  namespaces, keeps `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE`. The unused
-  `PodEvent.pod_pid` field is removed. A missing or null
-  `dropCapSysAdmin` now keeps `SYS_ADMIN` dropped; only an explicit `false`
-  grants it. NodeWaypoint with `addCapPerfmon=false`, or on a runtime whose
-  `RuntimeDefault` seccomp profile allows `bpf()` only with `CAP_SYS_ADMIN`,
-  now fails closed at BPF load. See `docs/upgrade_guide.md`.
-
 ### Performance
 
 - **Large config writes apply as deltas instead of full reloads** (issue
