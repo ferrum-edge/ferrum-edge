@@ -49,7 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Early-Data: 1` was checked against `FERRUM_TLS_EARLY_DATA_METHODS` after
   its method was normalized to `GET`, while HTTP/3 checked `CONNECT`. Both now
   check `CONNECT`, so an allowlist of `GET` alone answers it `425 Too Early`.
-  Route and plugin method policy still see `GET`.
+  Route and plugin method policy still see `GET`. The default (unset, no
+  early-data method gate) is unaffected; on HTTP/2 the gate applies to
+  requests that carry `Early-Data: 1`. Listing `CONNECT` also admits mesh
+  HBONE CONNECT in early data, as before.
 
 ### Documentation
 
