@@ -2860,9 +2860,7 @@ mod per_client_tunnel_cap {
         let counts = counts();
         let tunnel = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 1)
             .expect("first tunnel admitted");
-        assert!(
-            try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 1).is_err()
-        );
+        assert!(try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 1).is_err());
 
         drop(tunnel);
         assert_eq!(live(&counts, "198.51.100.1"), 0);
@@ -2877,8 +2875,7 @@ mod per_client_tunnel_cap {
         let held = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", 1)
             .expect("first IPv6 tunnel admitted");
         assert!(
-            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::abcd", 1)
-                .is_err(),
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::abcd", 1).is_err(),
             "rotating addresses inside one /64 must not mint a fresh budget"
         );
         let neighbour = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:3::1", 1)
