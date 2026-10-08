@@ -1572,6 +1572,14 @@ impl Plugin for GraphqlPlugin {
         self.has_any_config
     }
 
+    /// Depth, complexity, alias, introspection, and rate-limit rules refuse
+    /// requests on HTTP. A JSON-bearing native gRPC `Content-Type` selects the
+    /// `Grpc` view, which this plugin does not run on, so the route must refuse
+    /// it instead of forwarding the body unchecked.
+    fn gates_request_admission(&self) -> bool {
+        self.has_any_config
+    }
+
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.limiter.tracked_keys_count())
     }

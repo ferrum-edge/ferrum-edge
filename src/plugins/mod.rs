@@ -6562,12 +6562,13 @@ impl RequestContext {
     ///
     /// Covers the whole gateway-owned `x-consumer-*` namespace
     /// ([`crate::proxy::headers::is_consumer_assertion_header`]), the private
-    /// GeoIP result, and route path-param captures. `name` is expected to be
-    /// lowercase (the `HeaderName` form).
+    /// GeoIP result, and route path-param captures
+    /// ([`crate::proxy::headers::is_path_param_assertion_header`]). Each treats
+    /// `_` as `-`, the folding CGI-style backends apply.
     #[inline]
     pub fn is_reserved_gateway_assertion_header(name: &str) -> bool {
         crate::proxy::headers::is_gateway_assertion_header(name)
-            || name.starts_with("x-path-param-")
+            || crate::proxy::headers::is_path_param_assertion_header(name)
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
@@ -12145,6 +12146,25 @@ pub trait Plugin: Any + Send + Sync {
     /// basic_auth, hmac_auth) override this to return `true`.
     fn is_auth_plugin(&self) -> bool {
         false
+    }
+
+    /// Returns `true` if this instance is request-admission policy a route
+    /// relies on: authentication, or a control that refuses requests the route
+    /// must not serve (schema validation, abuse and quota limits, AI request
+    /// guardrails).
+    ///
+    /// The client chooses the request flavor (native gRPC by `Content-Type`,
+    /// WebSocket by upgrade headers), and each flavor runs only the plugins
+    /// whose [`Self::supported_protocols`] include it. When a flavor's view
+    /// omits an instance like this that the route's HTTP view runs, the plugin
+    /// cache marks that view and the proxy refuses the request rather than
+    /// dispatching it without the policy.
+    ///
+    /// Defaults to [`Self::is_auth_plugin`], so every authentication plugin —
+    /// including a custom one that keeps the HTTP-only protocol default —
+    /// participates without opting in.
+    fn gates_request_admission(&self) -> bool {
+        self.is_auth_plugin()
     }
 
     /// Cache-build diagnostic: whether this instance has an execution trigger.

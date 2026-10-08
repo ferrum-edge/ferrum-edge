@@ -5315,6 +5315,14 @@ impl Plugin for SoapWsSecurity {
         self.establishes_identity()
     }
 
+    /// Every constructed instance enforces: construction refuses a policy with
+    /// no security feature, so a timestamp-only (freshness) policy and a
+    /// `strict` content-type policy refuse requests too, even though they
+    /// establish no identity and are not auth plugins.
+    fn gates_request_admission(&self) -> bool {
+        true
+    }
+
     fn needs_request_body_bytes(&self) -> bool {
         // SOAP may arrive as UTF-16 (or other non-UTF-8 XML encodings), and
         // MTOM/XOP packaging is binary framing. The shared proxy handoff only

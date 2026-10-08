@@ -1571,6 +1571,77 @@ async fn an_authorization_denial_outranks_a_transport_mismatch_in_one_sweep() {
     );
 }
 
+/// A globally scoped, timestamp-only `soap_ws_security` row: HTTP-only
+/// admission policy that is not an auth plugin.
+fn http_only_admission_plugin() -> PluginConfig {
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-soap-freshness".to_string(),
+        plugin_name: "soap_ws_security".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        config: json!({
+            "timestamp": {
+                "require": true,
+                "max_age_seconds": 300,
+                "clock_skew_seconds": 300
+            },
+            "reject_missing_security_header": true
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// The request path refuses a client-selected flavor whose plugin view omits
+/// the route's admission policy before any plugin runs. A reload that adds an
+/// HTTP-only admission plugin therefore refuses the peer's next CONNECT on a
+/// gRPC-classified view, so a live tunnel admitted on that view is revoked
+/// rather than outliving the policy, under the authorize gate's reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_omits_admission_policy_from_the_admitting_view_revokes_the_tunnel() {
+    const APP_PORT: u16 = 8080;
+    let state = build_state(prepared_config(Some(APP_PORT), vec![allow_client()]));
+    let fence = &state.hbone_admission_fence;
+    let proxy = Arc::new(create_mesh_proxy(APP_PORT));
+    let mut snapshot = dual_gate_snapshot(proxy, fence.sweep_epoch());
+    snapshot.request_protocol = ProxyProtocol::Grpc;
+    let tunnel = fence.admit(snapshot);
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // Negative control: a generation that still admits the principal and adds
+    // no admission policy leaves the gRPC-classified tunnel live.
+    let completed_before = fence.sweeps_completed();
+    let outcome = state.update_config(prepared_config(
+        Some(APP_PORT),
+        vec![allow_client(), allow_other()],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_sweep_after(&state, completed_before).await;
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    let outcome = state.update_config(prepared_config_with(
+        Some(APP_PORT),
+        None,
+        vec![allow_client()],
+        vec![http_only_admission_plugin()],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::AuthorizationDenied)
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 1, 0, 0, 0, 0]);
+}
+
 /// Retirement and revocation are ONE compare-exchange against the same terminal
 /// state, so exactly one wins. When the relay wins, the tunnel is neither
 /// counted, metered, nor classified as revoked: two separate atomics let a

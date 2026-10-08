@@ -278,6 +278,13 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Client-visible body (`403`, or gRPC `PERMISSION_DENIED`) for a request whose
+/// client-selected protocol flavor cannot run the route's authentication or
+/// admission policy
+/// ([`crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`]).
+pub(crate) const ROUTE_PROTOCOL_NOT_PERMITTED_BODY: &str =
+    r#"{"error":"Request protocol not permitted on this route"}"#;
+
 /// Precomputed circuit-breaker-open reject headers. Open-breaker 503s are
 /// still a reject path, but the map is rebuilt from this snapshot so the
 /// observability token is not `format!()`ed or assembled per request.
@@ -32700,7 +32707,7 @@ fn boxed_handle_proxy_request_inner(
 /// function can attach the [`RequestGuard`] to the response body.
 #[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_inner(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
@@ -32856,6 +32863,13 @@ async fn handle_proxy_request_inner(
         ));
     }
 
+    // Resolve the client's `Connection` nominations against the client's own
+    // fields before any plugin or gateway assertion can add a header that the
+    // backend-boundary hop-by-hop strip would otherwise remove.
+    headers_mod::confine_connection_nominated_request_headers(
+        req.headers_mut(),
+        state.env_config.real_ip_header.as_deref(),
+    );
     // Store raw headers for deferred materialization. The clone is a single
     // contiguous allocation (HeaderMap's internal Vec) — much cheaper than
     // N individual String allocations from the previous eager conversion.
@@ -33858,6 +33872,45 @@ async fn handle_proxy_request_inner(
     let initial_response_header_policy_plugins =
         plugin_cache_view.initial_response_header_policy_plugins();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
+
+    // The client selected this flavor (gRPC `Content-Type`, WebSocket upgrade)
+    // and its plugin view omits authentication or admission policy that the
+    // route's HTTP view runs. Refuse before any plugin runs instead of serving
+    // the route without that policy.
+    if plugin_cache_view
+        .capabilities()
+        .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            proxy_id = %proxy.id,
+            protocol = ?request_protocol,
+            "Rejected request: route admission policy does not run on the requested protocol"
+        );
+        let mut reject = normalize_reject_response(
+            StatusCode::FORBIDDEN,
+            Bytes::from_static(ROUTE_PROTOCOL_NOT_PERMITTED_BODY.as_bytes()),
+            &EMPTY_HEADERS,
+            is_grpc_request,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        record_status(&state, StatusCode::FORBIDDEN.as_u16());
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        return Ok(build_response_from_normalized_reject(reject));
+    }
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
     // Ordinary request hooks stay skipped, but terminal transaction logging

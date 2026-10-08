@@ -2215,6 +2215,10 @@ impl Plugin for AiRateLimiter {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn gates_request_admission(&self) -> bool {
+        true
+    }
+
     /// This limiter never mutates a backend-visible request header.
     ///
     /// `expose_headers` writes the four `x-ai-ratelimit-*` values into the

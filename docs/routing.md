@@ -244,7 +244,7 @@ proxies:
 
 Named captures are extracted on match and forwarded to backends and plugins:
 
-- **Request headers**: `x-path-param-{name}: value` (e.g., `x-path-param-user_id: 42`). Header names are case-insensitive, and the capture name is preserved verbatim after the prefix
+- **Request headers**: `x-path-param-{name}: value` (e.g., `x-path-param-user_id: 42`). Header names are case-insensitive, and the capture name is preserved verbatim after the prefix. Client-supplied headers in this namespace are dropped at ingress, including spellings that use `_` for `-` (`X_Path_Param_User_Id`), which CGI-style backends fold onto the same variable
 - **Plugin context**: `ctx.metadata["path_param.user_id"]`
 
 ### Path Overrides
