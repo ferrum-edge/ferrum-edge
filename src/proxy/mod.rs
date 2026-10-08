@@ -15482,6 +15482,13 @@ async fn handle_websocket_request_authenticated(
             username.to_string(),
         );
     }
+    if let Some(identity) = ctx.backend_authenticated_identity() {
+        push_forwardable_header_override(
+            &mut client_headers,
+            "x-authenticated-identity",
+            identity.to_string(),
+        );
+    }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
         push_forwardable_header_override(
             &mut client_headers,
@@ -17297,8 +17304,7 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
-/// Drop every gateway assertion (the whole `x-consumer-*` namespace plus
-/// `x-geo-country`), in any case variant, from a plugin-mutable header map.
+/// Drop every gateway assertion, in any case variant, from a plugin-mutable header map.
 fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));
 }
@@ -17306,8 +17312,8 @@ fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, Str
 /// Remove plugin-controlled gateway assertion headers and restore only the
 /// authenticated principal and private GeoIP lookup result for dispatch.
 ///
-/// Every `x-consumer-*` name is gateway-owned, so a plugin- or config-authored
-/// `x-consumer-role` is dropped here exactly like a forged
+/// Every `x-consumer-*` name and `x-authenticated-identity` are gateway-owned,
+/// so a plugin- or config-authored `x-consumer-role` is dropped here exactly
 /// `x-consumer-username`; only the authenticated `x-consumer-username` /
 /// `x-consumer-custom-id` are written back.
 ///
@@ -17319,16 +17325,22 @@ pub fn refresh_backend_gateway_assertion_headers(
     headers: &mut HashMap<String, String>,
 ) {
     let principal_username = ctx.backend_consumer_username().map(str::to_string);
+    let external_identity = ctx.backend_authenticated_identity().map(str::to_string);
     let principal_custom_id = principal_username
         .as_ref()
         .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
     let geo_country = ctx.backend_geo_country().map(str::to_string);
     let source_has_reserved_assertion = principal_username.is_none()
+        && external_identity.is_none()
         && geo_country.is_none()
         && headers
             .keys()
             .any(|name| headers_mod::is_gateway_assertion_header(name));
-    if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
+    if principal_username.is_none()
+        && external_identity.is_none()
+        && geo_country.is_none()
+        && !source_has_reserved_assertion
+    {
         return;
     }
 
@@ -17338,6 +17350,9 @@ pub fn refresh_backend_gateway_assertion_headers(
         if let Some(custom_id) = principal_custom_id {
             headers.insert("x-consumer-custom-id".to_string(), custom_id);
         }
+    }
+    if let Some(identity) = external_identity {
+        headers.insert("x-authenticated-identity".to_string(), identity);
     }
     if let Some(country) = geo_country {
         headers.insert("x-geo-country".to_string(), country);

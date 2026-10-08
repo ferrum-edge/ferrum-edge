@@ -718,6 +718,13 @@ pub(crate) async fn handle_h3_websocket(
             username.to_string(),
         );
     }
+    if let Some(identity) = ctx.backend_authenticated_identity() {
+        push_h3_forwardable_header_override(
+            &mut client_headers,
+            "x-authenticated-identity",
+            identity.to_string(),
+        );
+    }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
         push_h3_forwardable_header_override(
             &mut client_headers,

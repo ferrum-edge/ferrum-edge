@@ -196,8 +196,6 @@ pub struct LdapAuth {
     /// Maximum entries in the auth result cache. Prevents unbounded growth
     /// from brute-force attempts with unique credentials. Default: 10000.
     max_cache_entries: usize,
-    /// Whether to try mapping to a gateway Consumer via consumer_index
-    consumer_mapping: bool,
     /// Remove the verified `Authorization: Basic` credential from the backend
     /// request. Default `true`, matching `key_auth`.
     hide_credentials: bool,
@@ -481,7 +479,6 @@ impl LdapAuth {
             ));
         }
 
-        let consumer_mapping = parse_bool(config_obj, "consumer_mapping", true)?;
 
         // Basic credentials are a reusable directory password, typically the
         // user's corporate password. Removing them from the backend request by
@@ -573,7 +570,6 @@ impl LdapAuth {
             cache_entries: AtomicUsize::new(0),
             cache_hmac_key,
             max_cache_entries,
-            consumer_mapping,
             hide_credentials,
             request_headers_to_redact: vec!["authorization".to_string()],
             tls_config,
@@ -1345,7 +1341,6 @@ fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String>
         "max_concurrent_requests",
         "cache_ttl_seconds",
         "max_cache_entries",
-        "consumer_mapping",
         "hide_credentials",
     ];
     for key in config.keys() {
@@ -2103,12 +2098,11 @@ impl LdapAuth {
     }
 
     /// Build the auth result for a successfully authenticated LDAP user.
-    fn identity_outcome(&self, username: &str, consumer_index: &ConsumerIndex) -> VerifyOutcome {
-        let consumer = if self.consumer_mapping {
-            consumer_index.find_by_identity(username)
-        } else {
-            None
-        };
+    fn identity_outcome(&self, username: &str, _consumer_index: &ConsumerIndex) -> VerifyOutcome {
+        // A directory username is not a Consumer credential binding. Until
+        // mappings can name the directory authority explicitly, keep the
+        // verified principal external.
+        let consumer = None;
 
         if let Some(ref consumer) = consumer {
             debug!(

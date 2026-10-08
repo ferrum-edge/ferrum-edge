@@ -288,12 +288,15 @@ When a request is successfully authenticated, the gateway automatically injects 
 
 | Header | Value | Present |
 |--------|-------|---------|
-| `X-Consumer-Username` | Mapped Consumer `username`, otherwise external auth header/display identity, otherwise external `authenticated_identity` | Always (when authenticated) |
+| `X-Consumer-Username` | Mapped Consumer `username` | Only when a gateway Consumer is mapped |
 | `X-Consumer-Custom-Id` | The Consumer's `custom_id` field | Only when a gateway Consumer is mapped and `custom_id` is set |
+| `X-Authenticated-Identity` | External identity claim or configured display claim | Only when authenticated without a mapped Consumer |
 
-These headers are injected on all proxy paths (HTTP/1.1, HTTP/2, HTTP/3, gRPC, cross-protocol bridges, and WebSocket).
+These headers are injected on all proxy paths (HTTP/1.1, HTTP/2, HTTP/3, gRPC, cross-protocol bridges, and WebSocket). External identities are not implicitly mapped to Consumers by matching a username, ID, or custom ID; Consumer policy applies only when an authentication plugin establishes a gateway Consumer identity. Treat `X-Authenticated-Identity` as an external display value, not as a gateway-verified Consumer assertion.
 
 **The whole `x-consumer-*` request-header namespace is gateway-owned.** Every client-supplied request header whose name starts with `x-consumer-` (case-insensitive, with `_` treated as equivalent to `-`, so `X_Consumer_Role` and `x_consumer-groups` count too) — not only `X-Consumer-Username` and `X-Consumer-Custom-Id` — is removed before any plugin runs and before dispatch on every protocol path, and is also refused in request trailers. A client `X-Consumer-Role: admin` or `X-Consumer-Groups: admins` therefore never reaches a backend. After the plugin phases the gateway scrubs the namespace again from the outbound header map, so a plugin (built-in or custom) cannot author a name beneath it either, and then writes back only its own authenticated `X-Consumer-Username` / `X-Consumer-Custom-Id`. Backends may trust any `x-consumer-*` header they receive from Ferrum as a gateway assertion. The underscore spelling is covered because `_` is a legal header-name byte and CGI-style backends (Rack, WSGI, PHP-FPM) fold `X-Consumer-Role` and `X_Consumer_Role` onto the same `HTTP_X_CONSUMER_ROLE` variable. Plugin configuration cannot target the namespace (either spelling): `request_transformer` header destinations, `claim_headers` / `output_claim_headers` destinations, `correlation_id.header_name`, `mesh_route_dispatch` `request_transform` destinations, `request_deduplication.header_name`, and `mcp_gateway` `sessions.downstream_session_header` / `sessions.upstream_session_header` under `x-consumer-*` are rejected at config load. The Kubernetes Gateway API translator refuses an HTTPRoute or GRPCRoute `RequestHeaderModifier` `set`/`add` of an `x-consumer-*` name per route (`Accepted=False`, `UnsupportedValue`), so the rest of the cluster's config still loads. Other consequences: a load-balancer `hash_on: header:x-consumer-*` key no longer sees a client value, a mesh AuthorizationPolicy `when` condition on `request.headers[x-consumer-*]` sees the header as absent rather than the client's value, and mesh sidecars strip `x-consumer-*` headers the application propagates. Third-party AI provider dispatch (`ai_federation`, `ai_stream_router`) sends no `x-consumer-*` header at all.
+
+`X-Authenticated-Identity` is also gateway-owned: Ferrum removes client and plugin copies before dispatch, then writes the value only for an authenticated external principal. Backends must not treat this display value as proof of a mapped Consumer.
 
 ---
 
@@ -2437,7 +2440,7 @@ Every `claim_headers` destination configured on `jwks_auth`, `oauth2_introspecti
 
 There is deliberately **no fallback between them**. A per-replica fallback would silently reinstate the cross-replica bypass the shared authority exists to close, so a shared-backend timeout, partition, authentication failure, corruption, capacity failure, or proven-unsupported topology rejects the protected request. A configuration whose scope and backend disagree — `shared` with no Redis, or Redis with no `shared` consumer — is refused at admission rather than degraded at runtime.
 
-**Capacity never forgets a live marker.** At capacity the authority prunes **expired** markers only. If no expired slot can be reclaimed, the new protected request is refused with a fixed classification. Evicting an unexpired marker to admit a new request would treat capacity pressure as permission to forget a replay marker, letting one client with a valid credential burn other clients' protection by generating unique proofs. Capacity degrades into refusal, never into silent unprotection. Repeated refusals while every retained marker is still live are O(1): a conservative earliest-expiry lower bound skips the map walk until an expiry is actually due. Ordinary admission may move that bound only earlier (`fetch_min`) under a lock-free active-writer count plus a completed-revision counter; prune may store a later bound only after a scan that observed no active writer and no missed completed revision. An even/odd seqlock is not used, because two writers on different map shards can both be in flight while a single parity bit looks stable. Each live process-scoped authority enforces the `replay_max_entries` / `dpop_replay_max_entries` it was admitted with against the shared lane, so an equivalent reload that raises or lowers the cap takes effect without rebuilding the lane, evicting a live marker, or changing the replay domain. Duplicate equivalent `jwks_auth` providers that share one replay domain must declare the same `dpop_replay_scope` and, for `process`, the same `dpop_replay_max_entries`; incompatible authorities or capacities are refused at admission so matching order cannot pick which store or cap applies.
+**Capacity never forgets a live marker.** At capacity the authority prunes **expired** markers only. If no expired slot can be reclaimed, the new protected request is refused with a fixed classification. Process-scoped lanes also cap one principal at one quarter of the configured entry ceiling (rounded up, minimum one), preserving the remaining slots for other principals. The principal key is a digest and is never logged or exposed. Evicting an unexpired marker to admit a new request would treat capacity pressure as permission to forget a replay marker, letting one client with a valid credential burn other clients' protection by generating unique proofs. Capacity degrades into refusal, never into silent unprotection. Repeated refusals while every retained marker is still live are O(1): a conservative earliest-expiry lower bound skips the map walk until an expiry is actually due. Ordinary admission may move that bound only earlier (`fetch_min`) under a lock-free active-writer count plus a completed-revision counter; prune may store a later bound only after a scan that observed no active writer and no missed completed revision. An even/odd seqlock is not used, because two writers on different map shards can both be in flight while a single parity bit looks stable. Each live process-scoped authority enforces the `replay_max_entries` / `dpop_replay_max_entries` it was admitted with against the shared lane, so an equivalent reload that raises or lowers the cap takes effect without rebuilding the lane, evicting a live marker, or changing the replay domain. Duplicate equivalent `jwks_auth` providers that share one replay domain must declare the same `dpop_replay_scope` and, for `process`, the same `dpop_replay_max_entries`; incompatible authorities or capacities are refused at admission so matching order cannot pick which store or cap applies.
 
 **Retention is fixed, not configured.** Each caller declares one compile-time horizon that dominates the widest span any admissible configuration can accept one unchanged proof over (`2 × max clock skew`, plus one second). This is not a knob: a later generation that widens its clock skew would otherwise make a captured proof acceptable again after its shorter marker had already been reclaimed, and `SET … NX EX` cannot rewrite the TTL of a key it did not create. Because every generation and every replica writes the same horizon, an existing marker always keeps at least the protection interval it was admitted with, across reloads and rolling deployments alike.
 
@@ -2582,8 +2585,8 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present in the token. Equivalent providers that share one exact issuer must declare the same list **and**, when that list is non-empty, the same effective `role_claim`: matching order would otherwise let a sibling skip the stricter role gate |
 | `providers[].scope_claim` | String (optional) | Per-provider override for scope claim path. Equivalent providers that share one exact issuer and declare a non-empty `required_scopes` must resolve to the same effective claim path (override, else the plugin-level `scope_claim`); requiring the same scope VALUES from different claim paths is two different gates, and matching order would decide which applies |
 | `providers[].role_claim` | String (optional) | Per-provider override for role claim path. Same equivalence requirement as `scope_claim`, applied when `required_roles` is non-empty |
-| `providers[].consumer_identity_claim` | String (optional) | Per-provider override for consumer identity claim |
-| `providers[].consumer_header_claim` | String (optional) | Per-provider override for consumer header claim |
+| `providers[].consumer_identity_claim` | String (optional) | Per-provider override for external authenticated identity claim |
+| `providers[].consumer_header_claim` | String (optional) | Per-provider display claim for `X-Authenticated-Identity` |
 | `providers[].claim_headers` | Object (optional) | Per-provider claim-to-header mappings; keys are claim paths and values are upstream header names. Destinations in the gateway-owned `x-consumer-*` namespace are rejected at config load |
 | `providers[].claim_headers_separator` | String (optional) | Separator for array claim header values |
 | `providers[].output_claim_headers` | Object[] (optional, max 16) | Istio `RequestAuthentication.jwtRules[].outputClaimToHeaders` projection: an ordered list of `{header, claim}` pairs (a list, not a map, because one claim may be published to several headers). Destinations are gateway-owned exactly like `claim_headers` — stripped from the inbound request before validation and set only from a validated claim. Duplicate destinations (including collisions with the provider's effective `claim_headers` map), framing/provenance/gateway-reserved or credential-bearing destinations, and invalid header names are rejected at config load; only nonblank string, integer, and boolean claims no larger than 8192 bytes are published (Istio `ClaimToHeader` does not support arrays, objects, null, or floating-point numbers), and anything else (or a header-illegal value) leaves the destination absent |
@@ -2595,8 +2598,8 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`; remote sources only) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
-| `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
-| `consumer_header_claim` | String | Global JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
+| `consumer_identity_claim` | String | Global JWT claim used as the external authenticated identity (default: `"sub"`) |
+| `consumer_header_claim` | String | Global JWT display claim for `X-Authenticated-Identity` (default: same as `consumer_identity_claim`) |
 | `claim_headers` | Object | Global claim-to-header mappings used when the matched provider has no provider override |
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
@@ -2642,7 +2645,7 @@ Retention is **not** configurable. Every marker is retained for a fixed 601-seco
 
 ### `oauth2_introspection`
 
-Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, explicit multi-provider routing, client authentication, bounded token caches and outbound work, claim-based authorization, consumer lookup, claim header fan-out, and optional token stripping before proxying.
+Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, explicit multi-provider routing, client authentication, bounded token caches and outbound work, claim-based authorization, claim header fan-out, and optional token stripping before proxying. Introspection identities do not implicitly map to Consumers by matching a username, ID, or custom ID.
 
 **Priority:** 1050
 
@@ -2674,13 +2677,13 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
 | `providers[].scope_claim` | String (optional) | Per-provider override of the global `scope_claim` |
 | `providers[].role_claim` | String (optional) | Per-provider override of the global `role_claim` |
-| `providers[].consumer_identity_claim` | String (optional) | Per-provider override of the global `consumer_identity_claim` |
-| `providers[].consumer_header_claim` | String (optional) | Per-provider override of the global `consumer_header_claim` |
+| `providers[].consumer_identity_claim` | String (optional) | Per-provider override of the external authenticated identity claim |
+| `providers[].consumer_header_claim` | String (optional) | Per-provider display claim for `X-Authenticated-Identity` |
 | `providers[].claim_headers` | Object (optional) | Claim-to-header mappings; keys are claim paths and values are upstream header names |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
-| `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
-| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps; defaults to the effective `consumer_identity_claim` |
+| `consumer_identity_claim` | String | Global claim used as the external authenticated identity (default: `"username"`) |
+| `consumer_header_claim` | String | Global display claim for `X-Authenticated-Identity`; defaults to the effective `consumer_identity_claim` |
 
 Every claim path is a dot path (`realm_access.roles`) with no empty segments, and every non-empty string list entry is trimmed and must not be blank. A provider override replaces the global value for that provider only.
 
@@ -2753,8 +2756,8 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
 | `providers[].scope_claim` | String | Claim holding granted scopes (default: `scope`) |
 | `providers[].role_claim` | String | Claim holding roles (default: `roles`) |
-| `providers[].consumer_identity_claim` | String | Claim resolved against the consumer index (default: `sub`) |
-| `providers[].consumer_header_claim` | String | Claim emitted as the consumer username header (default: `sub`) |
+| `providers[].consumer_identity_claim` | String | Claim used as the external authenticated identity (default: `sub`) |
+| `providers[].consumer_header_claim` | String | Claim emitted in `X-Authenticated-Identity` (default: `sub`) |
 | `providers[].id_token_clock_skew_secs` | u64 | ID token expiry leeway (default: `60`; `0`–`3600`) |
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies. Published or placeholder values are rejected at admission |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation; the same published/placeholder rejection applies |
@@ -2770,7 +2773,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `session.same_site` | String | `lax` (default), `strict`, or `none`; case-insensitive. `none` requires `session.secure: true` |
 | `session.path` | String | Session cookie `Path` (default: `/`) |
 | `behavior.rp_initiated_logout` | Boolean | Default `true`; send the sealed session ID token as a logout hint and attempt discovered refresh-token revocation (five-second bound) |
-| `behavior.state_ttl_secs` | u64 | Pending authorization-flow lifetime (default: `600`; `1`–`3600`) |
+| `behavior.state_ttl_secs` | u64 | Pending authorization-flow lifetime (default: `600`; `1`–`3600`). At most two pending-flow cookies are retained per browser; creating another expires the oldest cookie before setting the new one |
 | `behavior.refresh_skew_secs` | u64 | Refresh lead time before token expiry (default: `30`; must be `<= session.ttl_secs / 2`) |
 | `behavior.challenge_html_status` | u64 | Browser challenge status: `302` (default), `303`, or `307` |
 | `behavior.challenge_api_status` | u64 | Non-browser challenge status: `401` (default) or `403` |
@@ -3237,14 +3240,13 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
 | `max_cache_entries` | u64 | `10000` | Strict cache cap (1–1,000,000). Atomic admission preserves the cap under concurrency, and a saturated cache replaces one entry without a full-map scan |
-| `consumer_mapping` | bool | `true` | Whether to look up a matching gateway Consumer via `consumer_index.find_by_identity()` |
 
 **Authentication modes** (must configure one):
 
 1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder and `canonical_identity_attribute`. Fastest option, no service account needed. After the user's bind succeeds, the plugin issues a base-scope search on the bound DN over that same authenticated connection and takes the canonical attribute's single value as the identity.
 2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user.
 
-In **both** modes the configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping and username-based group authorization. Directories match login attributes case- and whitespace-insensitively, so `alice`, `ALICE`, and `alice ` all bind to the same account; deriving the identity from the directory entry keeps them one Ferrum principal instead of three, so per-consumer rate limits and `access_control` `disallowed_consumers` revocation cannot be evaded by varying the presented login.
+In **both** modes the configured canonical attribute—not the client-supplied username—is exported and used for username-based group authorization. Directories match login attributes case- and whitespace-insensitively, so `alice`, `ALICE`, and `alice ` all bind to the same account; deriving the identity from the directory entry keeps them one Ferrum principal instead of three. LDAP identities do not implicitly map to a gateway Consumer by username.
 
 The two modes are mutually exclusive: a configuration that sets `bind_dn_template` together with `search_base_dn` or `search_filter` is **rejected** at load, rather than silently taking the direct-bind branch and leaving the search keys inert.
 
@@ -3275,7 +3277,7 @@ config:
   cache_ttl_seconds: 300
 ```
 
-In both modes the plugin sets `ctx.authenticated_identity` to the validated `canonical_identity_attribute` value taken from the authenticated directory entry — read with a base-scope search on the bound DN for direct bind, or from the unique search result for search-then-bind. The presented login is never exported, and an entry that cannot yield exactly one canonical value fails closed with a `500` rather than falling back to it. When `consumer_mapping` is enabled (default), the same authenticated identity is used to find a matching gateway Consumer for ACL and rate-limiting integration.
+In both modes the plugin sets `ctx.authenticated_identity` to the validated `canonical_identity_attribute` value taken from the authenticated directory entry — read with a base-scope search on the bound DN for direct bind, or from the unique search result for search-then-bind. The presented login is never exported, and an entry that cannot yield exactly one canonical value fails closed with a `500` rather than falling back to it. The external identity is emitted as `X-Authenticated-Identity`; it does not establish a mapped Consumer.
 
 **Status codes:** The plugin distinguishes failure classes so clients and operators get an accurate signal:
 
@@ -3395,7 +3397,7 @@ As a runtime backstop for every other transform (including custom plugins), an i
 | `saml.allowed_subject_confirmation_methods` | String[] | `["urn:oasis:names:tc:SAML:2.0:cm:bearer"]` | Accepted `SubjectConfirmation/@Method` URIs. Only `bearer` is implemented; `holder-of-key` is rejected at admission because the confirmation key is not bound to the message signature |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
 | `nonce.replay_scope` | String | *(required for PasswordDigest and for SAML)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
-| `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; a full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
+| `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; in process scope one principal may retain at most one quarter of this ceiling (rounded up, minimum one). A full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
 | `nonce.max_total_cache_bytes` | u64 | `67108864` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
 
@@ -3613,7 +3615,7 @@ max created_max_age_seconds (86400) + 2 × max created_clock_skew_seconds (3600)
 - There is no `nonce.cache_ttl_seconds`: the key is rejected as unknown rather than silently ignored, because it could not shorten effective retention.
 - A `PasswordText` or timestamp-only policy never populates replay state, so none of this costs it anything.
 
-**Sizing.** The cost is paid in capacity, not in security. Under `replay_scope: process`, size `nonce.max_cache_size` / `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × 93 601 s — plus peak accepted SAML assertion rate when `saml.enabled` is true, because accepted assertion-id claims share the same bounded process map for the same horizon (each charges a fixed 64-byte SHA-256 hex claim key). The defaults (`100000` entries / `67108864` bytes) sustain roughly **1 authenticated PasswordDigest request per second**; the `1000000`-entry ceiling sustains roughly **10 per second**. A higher sustained rate needs `replay_scope: shared`, where retention is Redis's memory cost rather than the gateway's. Under-provisioning surfaces as fail-closed `401` rejections — never as a silent replay window, because a live claim is never evicted to make room.
+**Sizing.** The cost is paid in capacity, not in security. Under `replay_scope: process`, size `nonce.max_cache_size` / `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × 93 601 s — plus peak accepted SAML assertion rate when `saml.enabled` is true, because accepted assertion-id claims share the same bounded process map for the same horizon (each charges a fixed 64-byte SHA-256 hex claim key). The defaults (`100000` entries / `67108864` bytes) sustain roughly **1 authenticated PasswordDigest request per second** across all principals; one principal is limited to roughly **0.25 per second** at that default. The `1000000`-entry ceiling sustains roughly **10 per second** overall and **2.5 per second** per principal. A higher sustained rate needs `replay_scope: shared`, where retention is Redis's memory cost rather than the gateway's memory. Under-provisioning surfaces as fail-closed `401` rejections — never as a silent replay window, because a live claim is never evicted to make room.
 
 **Across reload generations and replicas.** Every generation, in either scope, expires entries against the same constant, so no generation can expire, refresh, or under-protect another's claim in either direction. Under `shared`, `SET NX` declining to rewrite an existing key's TTL is therefore correct: whichever replica or generation wrote that key already gave it the full horizon.
 

@@ -4033,6 +4033,15 @@ pub mod _test_support {
             self.plugin.check_nonce_replay(nonce)
         }
 
+        pub fn claim_for_principal(
+            &self,
+            nonce: &str,
+            principal: &str,
+        ) -> Result<(), String> {
+            self.plugin
+                .check_nonce_replay_for_principal_for_tests(nonce, principal)
+        }
+
         pub fn claim_at(&self, nonce: &str, elapsed: std::time::Duration) -> Result<(), String> {
             let now = self
                 .epoch

@@ -1,5 +1,9 @@
 # Safe Upgrade Guide
 
+## External authentication identity headers (issue #6082)
+
+`X-Consumer-Username` now carries only the username of a gateway Consumer that the authentication flow mapped. An external identity or display claim is sent as `X-Authenticated-Identity`; this value is not a Consumer assertion. Update backends that read `X-Consumer-Username` for JWKS, OIDC, introspection, LDAP, or SOAP identities to read `X-Authenticated-Identity` when they need the external display value. Matching an external claim to a Consumer by username, ID, or custom ID no longer establishes a Consumer mapping, so those requests no longer inherit Consumer-specific ACL groups or policy tiers through that implicit match. Remove the LDAP `consumer_mapping` option; it is no longer accepted.
+
 > **BUILD-OUT — in-place database migration and binary-only rollback are
 > unsupported.** Ferrum Edge is still in active build-out: core schema changes
 > are folded into the editable `V001` baseline instead of shipping forward

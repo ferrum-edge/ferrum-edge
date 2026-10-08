@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — external identity claims use a separate backend header** (issue #6082). `X-Consumer-Username` now contains only a mapped Consumer username. External identities use `X-Authenticated-Identity`, and external auth plugins no longer map principals to Consumers by matching a process-wide username, ID, or custom ID. The LDAP `consumer_mapping` option is removed. Backends that use these values must update their header handling; Consumer-specific policy requires an authentication path that maps a gateway Consumer.
+- **Reserve replay capacity across authenticated principals.** Process-scoped DPoP, HMAC, PasswordDigest, and SAML replay stores limit each principal to one quarter of the configured entry ceiling and continue refusing to evict live markers. OIDC relying party login challenges also expire an older pending-flow cookie before a browser can accumulate more than two.
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

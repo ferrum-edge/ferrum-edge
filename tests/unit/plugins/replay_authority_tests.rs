@@ -55,6 +55,29 @@ fn process_authority(sub: &str, max_entries: usize) -> ReplayAuthority {
         .expect("process lane should be created")
 }
 
+#[tokio::test]
+async fn process_lane_reserves_replay_capacity_for_other_principals() {
+    let policy = "principal-quota-regression";
+    let authority = process_authority(policy, 8);
+    let replay_domain = domain(policy);
+
+    for nonce in [b"first".as_slice(), b"second".as_slice()] {
+        let marker = replay_domain.marker(&[b"principal-a", nonce]);
+        assert_eq!(authority.admit(&marker).await, ReplayAdmission::Admitted);
+    }
+    let over_quota = replay_domain.marker(&[b"principal-a", b"third"]);
+    assert_eq!(
+        authority.admit(&over_quota).await,
+        ReplayAdmission::CapacityRefused
+    );
+
+    let other_principal = replay_domain.marker(&[b"principal-b", b"first"]);
+    assert_eq!(
+        authority.admit(&other_principal).await,
+        ReplayAdmission::Admitted
+    );
+}
+
 /// The shared authority may admit only on Redis's exact successful `SET NX`
 /// reply. A RESP string with any other contents is semantically malformed and
 /// cannot prove that the marker was persisted.

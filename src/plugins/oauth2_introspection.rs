@@ -972,13 +972,13 @@ impl Oauth2Introspection {
     fn resolve_identity(
         &self,
         authorization: &CachedAuthorization,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
         let identity = authorization.identity.as_deref().map(str::to_string);
         let header_value = authorization.identity_header.as_deref().map(str::to_string);
-        let consumer = identity
-            .as_deref()
-            .and_then(|id| consumer_index.find_by_identity(id));
+        // Provider claims do not implicitly resolve through the global
+        // Consumer username index.
+        let consumer = None;
         VerifyOutcome::success(consumer, identity, header_value)
     }
 

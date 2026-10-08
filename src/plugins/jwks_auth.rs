@@ -136,9 +136,9 @@ pub struct JwksAuth {
     global_scope_claim: String,
     /// Global default: JWT claim path containing roles (default: `"roles"`).
     global_role_claim: String,
-    /// JWT claim used for ConsumerIndex lookup and rate-limit key (default: `"sub"`).
+    /// JWT claim used as the external authenticated identity (default: `"sub"`).
     consumer_identity_claim: String,
-    /// JWT claim value sent as `X-Consumer-Username` header to the backend.
+    /// JWT claim value sent as `X-Authenticated-Identity` to the backend.
     /// Defaults to `consumer_identity_claim` if not set separately.
     consumer_header_claim: String,
     claim_headers: Vec<ClaimHeaderMapping>,
@@ -1081,7 +1081,7 @@ impl JwksAuth {
         &self,
         claims: &Value,
         provider: &JwksProvider,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
         let effective_identity_claim = provider
             .consumer_identity_claim
@@ -1099,29 +1099,16 @@ impl JwksAuth {
             extract_claim_string_exact(claims, effective_header_claim).or_else(|| identity.clone())
         };
 
-        let consumer = if let Some(ref id) = identity {
-            match consumer_index.find_by_identity(id) {
-                Some(consumer) => {
-                    debug!(
-                        "jwks_auth: identified consumer '{}' via configured identity claim",
-                        consumer.username
-                    );
-                    Some(consumer)
-                }
-                None => {
-                    debug!(
-                        "jwks_auth: no consumer mapping found for configured identity claim — using external principal"
-                    );
-                    None
-                }
-            }
-        } else {
+        if identity.is_none() {
             warn!(
                 "jwks_auth: token valid but claim '{}' not present",
                 effective_identity_claim
             );
-            None
-        };
+        }
+
+        // External claims are scoped to the provider that verified them. The
+        // process-wide Consumer username index is not a provider mapping.
+        let consumer = None;
 
         VerifyOutcome::success(consumer, identity, header_value)
             .with_credential_deadline(credential_deadline_from_claims(claims, 0))

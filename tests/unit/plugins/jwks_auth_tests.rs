@@ -1374,8 +1374,8 @@ async fn test_jwks_auth_validates_rs256_token() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
-    assert!(ctx.identified_consumer.is_some());
-    assert_eq!(ctx.identified_consumer.unwrap().username, "idp-user");
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(ctx.backend_authenticated_identity(), Some("idp-user"));
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
 }
 
@@ -2508,7 +2508,8 @@ async fn test_jwks_auth_maps_subject_to_custom_id() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
-    assert_eq!(ctx.identified_consumer.unwrap().username, "local-user");
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(ctx.backend_authenticated_identity(), Some("idp-subject-12345"));
 }
 
 // ─── Scope/Role Claim-Based Authorization ──────────────────────────────
@@ -2990,9 +2991,9 @@ async fn test_jwks_auth_per_provider_consumer_identity_claim_override() {
         .insert("authorization".to_string(), format!("Bearer {}", token));
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
-    // Consumer found via "preferred_username", not "sub"
-    assert!(ctx.identified_consumer.is_some());
-    assert_eq!(ctx.identified_consumer.unwrap().username, "keycloak-user");
+    // The display claim remains external and does not resolve a Consumer.
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(ctx.backend_authenticated_identity(), Some("keycloak-user"));
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("keycloak-user"));
 }
 

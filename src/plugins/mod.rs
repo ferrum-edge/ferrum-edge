@@ -2435,8 +2435,8 @@ pub struct RequestContext {
     /// matching `Consumer` exists in the gateway. Used as the rate-limit key and
     /// for `consumer_username` in transaction logs.
     pub authenticated_identity: Option<String>,
-    /// Human-readable identity for the `X-Consumer-Username` header sent to the
-    /// backend. Falls back to `authenticated_identity` when not set separately.
+    /// Unverified display identity requested by the authentication provider.
+    /// This is forwarded separately from the gateway-owned Consumer username.
     pub authenticated_identity_header: Option<String>,
     /// Verified security realm of [`Self::authenticated_identity`]: the
     /// mechanism and verifying authority (issuer, key source, directory) that
@@ -6934,10 +6934,7 @@ impl RequestContext {
         self.observe_credential_deadline(deadline);
     }
 
-    /// Return the identity value to forward to the backend in
-    /// `X-Consumer-Username`. This prefers the gateway Consumer username, then
-    /// a plugin-provided display/header identity, then the raw external auth
-    /// identity.
+    /// Return the gateway-mapped Consumer username for the backend assertion.
     ///
     /// Returns `None` when a plugin set the shared
     /// [`SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY`] marker (e.g.
@@ -6948,16 +6945,23 @@ impl RequestContext {
     /// itself stays resolved — `effective_identity()` is unaffected, so rate
     /// limiting, logging, and policy plugins keep working.
     pub fn backend_consumer_username(&self) -> Option<&str> {
-        let username = self
-            .identified_consumer
-            .as_ref()
-            .map(|consumer| consumer.username.as_str())
-            .or_else(|| meaningful_identity(self.authenticated_identity_header.as_deref()))
-            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))?;
         if self.suppresses_backend_consumer_identity_headers() {
             return None;
         }
-        Some(username)
+        self.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str())
+    }
+
+    /// Return the external identity for its distinct backend header.
+    pub fn backend_authenticated_identity(&self) -> Option<&str> {
+        if self.suppresses_backend_consumer_identity_headers()
+            || self.identified_consumer.is_some()
+        {
+            return None;
+        }
+        meaningful_identity(self.authenticated_identity_header.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Return the Consumer custom ID to forward to the backend, if a gateway

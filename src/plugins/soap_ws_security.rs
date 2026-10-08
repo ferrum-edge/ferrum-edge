@@ -1032,6 +1032,7 @@ type NonceAgeKey = (Instant, u64);
 
 struct NonceEntry {
     age_key: NonceAgeKey,
+    principal_digest: [u8; 32],
 }
 
 /// PasswordDigest replay security state.
@@ -1061,6 +1062,7 @@ struct NonceEntry {
 struct NonceReplayState {
     cache: HashMap<Arc<str>, NonceEntry>,
     age_index: BTreeMap<NonceAgeKey, Arc<str>>,
+    principal_counts: HashMap<[u8; 32], usize>,
     retained_key_bytes: usize,
     next_sequence: u64,
     last_expired_removals: usize,
@@ -1071,6 +1073,7 @@ impl NonceReplayState {
         Self {
             cache: HashMap::new(),
             age_index: BTreeMap::new(),
+            principal_counts: HashMap::new(),
             retained_key_bytes: 0,
             next_sequence: 0,
             last_expired_removals: 0,
@@ -1100,16 +1103,30 @@ impl NonceReplayState {
             return false;
         }
         let mut retained_key_bytes = 0usize;
+        let mut principal_counts = HashMap::<[u8; 32], usize>::new();
         for (age_key, nonce) in &self.age_index {
             if !self.age_entry_matches(age_key, nonce) {
                 return false;
             }
+            let Some(entry) = self.cache.get(nonce.as_ref()) else {
+                return false;
+            };
+            let Some(count) = principal_counts
+                .get(&entry.principal_digest)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+            else {
+                return false;
+            };
+            principal_counts.insert(entry.principal_digest, count);
             let Some(total) = retained_key_bytes.checked_add(charged_claim_key_bytes(nonce)) else {
                 return false;
             };
             retained_key_bytes = total;
         }
         retained_key_bytes == self.retained_key_bytes
+            && principal_counts == self.principal_counts
     }
 
     fn allocate_age_key(&mut self, now: Instant) -> Option<NonceAgeKey> {
@@ -1142,8 +1159,22 @@ impl NonceReplayState {
             Some(nonce) => nonce,
             None => return Err(()),
         };
-        if self.cache.remove(nonce.as_ref()).is_none() {
+        let Some(entry) = self.cache.remove(nonce.as_ref()) else {
             return Err(());
+        };
+        let Some(updated_count) = self
+            .principal_counts
+            .get(&entry.principal_digest)
+            .copied()
+            .and_then(|count| count.checked_sub(1))
+        else {
+            return Err(());
+        };
+        if updated_count == 0 {
+            self.principal_counts.remove(&entry.principal_digest);
+        } else {
+            self.principal_counts
+                .insert(entry.principal_digest, updated_count);
         }
         self.retained_key_bytes = retained_key_bytes;
         Ok(())
@@ -2685,7 +2716,7 @@ impl SoapWsSecurity {
                     // poison a victim's nonce before the legitimate request
                     // arrives. The atomic entry check also prevents two
                     // concurrent valid requests from both accepting it.
-                    self.claim_nonce(nonce_b64)
+                    self.claim_nonce(nonce_b64, &username)
                         .await
                         .map_err(UsernameTokenError::Structural)?;
                     Ok(username)
@@ -2730,9 +2761,11 @@ impl SoapWsSecurity {
     ///
     /// Reached only after the PasswordDigest has verified, so untrusted input
     /// never mutates, consumes, or evicts replay state.
-    async fn claim_nonce(&self, nonce: &str) -> Result<(), String> {
+    async fn claim_nonce(&self, nonce: &str, principal: &str) -> Result<(), String> {
         match &self.nonce_backend {
-            NonceReplayBackend::Process(_) => self.check_nonce_replay(nonce),
+            NonceReplayBackend::Process(_) => {
+                self.check_nonce_replay_for_principal(nonce, principal)
+            }
             NonceReplayBackend::Shared(client) => self.claim_nonce_shared(client, nonce).await,
         }
     }
@@ -2754,7 +2787,12 @@ impl SoapWsSecurity {
     /// `shared` is one atomic Redis `SET NX EX` across every replica. There is
     /// deliberately no fallback between them: a per-replica fallback would
     /// silently reinstate "one replay per replica".
-    async fn claim_saml_assertion(&self, issuer: &str, assertion_id: &str) -> Result<(), String> {
+    async fn claim_saml_assertion(
+        &self,
+        issuer: &str,
+        assertion_id: &str,
+        principal: &str,
+    ) -> Result<(), String> {
         // The claim key is a fixed-width digest, never the issuer or the
         // assertion id: both are credential-adjacent values that would
         // otherwise reach a Redis keyspace, `MONITOR`, `SLOWLOG`, and the Redis
@@ -2768,7 +2806,11 @@ impl SoapWsSecurity {
 
         match &self.nonce_backend {
             NonceReplayBackend::Process(_) => self
-                .check_replay_claim_at(&saml_process_claim_key(&claim_key), Instant::now())
+                .check_replay_claim_at(
+                    &saml_process_claim_key(&claim_key),
+                    &sha256_array(principal.as_bytes()),
+                    Instant::now(),
+                )
                 .map_err(|error| {
                     if error == REPLAY_DETECTED_MESSAGE {
                         SAML_REPLAY_DETECTED_MESSAGE.to_string()
@@ -2919,15 +2961,33 @@ impl SoapWsSecurity {
     /// has no process-local state and fails closed here rather than answering
     /// from an empty map.
     pub fn check_nonce_replay(&self, nonce: &str) -> Result<(), String> {
-        self.check_nonce_replay_at(nonce, Instant::now())
+        self.check_nonce_replay_for_principal(nonce, nonce)
     }
 
-    fn check_nonce_replay_at(&self, nonce: &str, now: Instant) -> Result<(), String> {
+    fn check_nonce_replay_for_principal(
+        &self,
+        nonce: &str,
+        principal: &str,
+    ) -> Result<(), String> {
+        self.check_nonce_replay_at(nonce, principal, Instant::now())
+    }
+
+    fn check_nonce_replay_at(
+        &self,
+        nonce: &str,
+        principal: &str,
+        now: Instant,
+    ) -> Result<(), String> {
         // Attacker-controlled length compare only — outside the admission lock.
         if nonce.len() > self.max_nonce_encoded_length {
             return Err(Self::nonce_too_long());
         }
-        self.check_replay_claim_at(&nonce_process_claim_key(nonce), now)
+        let principal_digest = sha256_array(principal.as_bytes());
+        self.check_replay_claim_at(
+            &nonce_process_claim_key(nonce),
+            &principal_digest,
+            now,
+        )
     }
 
     /// Process-local single-use claim for an already-namespaced key.
@@ -2935,7 +2995,12 @@ impl SoapWsSecurity {
     /// Shared by PasswordDigest nonces and SAML assertion ids; the caller
     /// supplies a key carrying its own claim-kind prefix so the two classes can
     /// never collide in the one process-global map.
-    fn check_replay_claim_at(&self, nonce: &str, now: Instant) -> Result<(), String> {
+    fn check_replay_claim_at(
+        &self,
+        nonce: &str,
+        principal_digest: &[u8; 32],
+        now: Instant,
+    ) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
             // A shared-scope instance has no process-local state to consult;
             // answering from an empty local map would be a silent bypass.
@@ -2961,8 +3026,17 @@ impl SoapWsSecurity {
         // Same-key path first: replay / in-place refresh must not consume a new
         // entry or byte reservation, and must not be rejected as saturated
         // merely because the cache is otherwise full.
-        let existing_age_key = state.cache.get(nonce).map(|entry| entry.age_key);
+        let existing_entry = state
+            .cache
+            .get(nonce)
+            .map(|entry| (entry.age_key, entry.principal_digest));
+        let existing_age_key = existing_entry.map(|(age_key, _)| age_key);
         if let Some(age_key) = existing_age_key {
+            if existing_entry
+                .is_some_and(|(_, existing_principal)| existing_principal != *principal_digest)
+            {
+                return Err(REPLAY_DETECTED_MESSAGE.to_string());
+            }
             let indexed_nonce_matches = state
                 .age_index
                 .get(&age_key)
@@ -2993,6 +3067,32 @@ impl SoapWsSecurity {
             };
             entry.age_key = new_age_key;
             return Ok(());
+        }
+
+        let principal_limit = self.max_nonce_cache_size.div_ceil(4).max(1);
+        if state
+            .principal_counts
+            .get(principal_digest)
+            .copied()
+            .unwrap_or(0)
+            >= principal_limit
+            && Self::prune_expired_prefix_for_quota_locked(
+                &mut state,
+                retention_seconds,
+                now,
+            )
+            .is_err()
+        {
+            return Err(Self::nonce_state_saturated_after_unlock(state));
+        }
+        if state
+            .principal_counts
+            .get(principal_digest)
+            .copied()
+            .unwrap_or(0)
+            >= principal_limit
+        {
+            return Err(Self::nonce_state_saturated_after_unlock(state));
         }
 
         let incoming_bytes = charged_claim_key_bytes(nonce);
@@ -3041,12 +3141,37 @@ impl SoapWsSecurity {
         }
         if state
             .cache
-            .insert(shared_nonce, NonceEntry { age_key })
+            .insert(
+                shared_nonce,
+                NonceEntry {
+                    age_key,
+                    principal_digest: *principal_digest,
+                },
+            )
             .is_some()
         {
             return Err(Self::nonce_state_saturated_after_unlock(state));
         }
+        *state.principal_counts.entry(*principal_digest).or_default() += 1;
         state.retained_key_bytes = retained_key_bytes;
+        Ok(())
+    }
+
+    fn prune_expired_prefix_for_quota_locked(
+        state: &mut NonceReplayState,
+        ttl_seconds: u64,
+        now: Instant,
+    ) -> Result<(), ()> {
+        while state.last_expired_removals < NONCE_MAX_MAINTENANCE_ENTRIES {
+            let Some((&age_key, _)) = state.age_index.first_key_value() else {
+                break;
+            };
+            if Self::nonce_age_seconds(now, age_key.0) < ttl_seconds {
+                break;
+            }
+            state.remove_age_entry(&age_key)?;
+            state.last_expired_removals += 1;
+        }
         Ok(())
     }
 
@@ -3107,7 +3232,16 @@ impl SoapWsSecurity {
         nonce: &str,
         now: Instant,
     ) -> Result<(), String> {
-        self.check_nonce_replay_at(nonce, now)
+        self.check_nonce_replay_at(nonce, nonce, now)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn check_nonce_replay_for_principal_for_tests(
+        &self,
+        nonce: &str,
+        principal: &str,
+    ) -> Result<(), String> {
+        self.check_nonce_replay_for_principal(nonce, principal)
     }
 
     #[allow(dead_code)]
@@ -3199,7 +3333,7 @@ impl SoapWsSecurity {
         issuer: &str,
         assertion_id: &str,
     ) -> Result<(), String> {
-        self.claim_saml_assertion(issuer, assertion_id).await
+        self.claim_saml_assertion(issuer, assertion_id, issuer).await
     }
 
     /// The TTL a shared (Redis) claim is written with, without needing a live
@@ -3870,7 +4004,7 @@ impl SoapWsSecurity {
             .attribute("ID")
             .or_else(|| assertion_node.attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
-        self.claim_saml_assertion(&issuer, assertion_id).await?;
+        self.claim_saml_assertion(&issuer, assertion_id, name_id).await?;
 
         debug!("soap_ws_security: SAML assertion validated successfully");
         Ok(name_id)
@@ -4927,7 +5061,7 @@ impl SoapWsSecurity {
         &self,
         ctx: &mut RequestContext,
         content_type_header: Option<String>,
-        consumer_index: Option<&ConsumerIndex>,
+        _consumer_index: Option<&ConsumerIndex>,
     ) -> PluginResult {
         let media_class = match self.classify_request(content_type_header.as_deref()) {
             SoapRequestDisposition::Governed(class) => class,
@@ -5011,27 +5145,12 @@ impl SoapWsSecurity {
                 .insert("soap_ws_saml_subject".to_string(), subject);
         }
 
-        let Some(consumer_index) = consumer_index else {
-            return PluginResult::Continue;
-        };
         let Some(identity) = principal.principal else {
             return PluginResult::Continue;
         };
-
-        // Namespace-correct Consumer mapping: a Consumer resolved by identity
-        // only counts when it belongs to the matched proxy's namespace. A
-        // cross-namespace match is treated as "no Consumer", so the request
-        // still runs under the verified external principal rather than under
-        // another tenant's Consumer record.
-        let proxy_namespace = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|proxy| proxy.namespace.clone());
-        let consumer = proxy_namespace.and_then(|namespace| {
-            consumer_index
-                .find_by_identity(&identity)
-                .filter(|consumer| consumer.namespace == namespace)
-        });
+        // SOAP principals are not bound to Consumer credentials by the
+        // process-wide identity index.
+        let consumer = None;
 
         match auth_flow::commit_authentication_attempt(
             ctx,
