@@ -700,7 +700,7 @@ class GuardObservationTests(unittest.TestCase):
         assets = ROOT / "h2_guard"
         provenance = json.loads((assets / "source.json").read_text())
         self.assertEqual(provenance["sha256"], SHA256)
-        self.assertEqual(hashlib.sha256((assets / "h2-0.4.19.patch").read_bytes()).hexdigest(),
+        self.assertEqual(hashlib.sha256((assets / "h2-0.4.20.patch").read_bytes()).hexdigest(),
                          provenance["patch_sha256"])
         for name, digest in provenance["assets"].items():
             self.assertEqual(hashlib.sha256((assets / name).read_bytes()).hexdigest(), digest)
@@ -726,16 +726,12 @@ class GuardObservationTests(unittest.TestCase):
         repo = ROOT.parents[2]
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            shutil.copytree(repo / "vendor/h2-0.4.19-ferrum-patched/src", source / "src")
+            shutil.copytree(repo / "vendor/h2-0.4.20-ferrum-patched/src", source / "src")
             patches = (
                 repo / "docs/upstream-h2-patches/001-coalesce-data-frame-writes"
                 / "h2-coalesce-data-frame-writes.patch",
-                repo / "docs/upstream-h2-patches/002-runtime-data-frame-budget"
-                / "h2-runtime-data-frame-budget.patch",
                 repo / "docs/upstream-h2-patches/003-assigned-send-capacity"
                 / "h2-assigned-send-capacity.patch",
-                repo / "docs/upstream-h2-patches/004-client-close-wakeup"
-                / "h2-client-close-wakeup.patch",
             )
             for patch in reversed(patches):
                 subprocess.run(["patch", "--batch", "--fuzz=0", "-R", "-p1"],

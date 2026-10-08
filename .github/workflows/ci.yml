@@ -2065,7 +2065,7 @@ jobs:
         env:
           RUSTFLAGS: "--cap-lints=warn"
         run: |
-          cargo update --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.19
+          cargo update --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.20
           cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
           # Patch 002: every positive amount of HTTP/2 flow-control capacity
           # permits body progress, including a 512-byte peer stream window and
@@ -2080,10 +2080,10 @@ jobs:
           cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
           # The gateway runs hyper on the vendored h2 (h2-001), so run every
           # Ferrum hyper regression on that combination as well.
-          h2_vendored='patch.crates-io.h2.path="vendor/h2-0.4.19-ferrum-patched"'
+          h2_vendored='patch.crates-io.h2.path="vendor/h2-0.4.20-ferrum-patched"'
           # Fail unless the combination really resolves the vendored h2.
           cargo tree -i h2 --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full \
-            --config "$h2_vendored" | grep -F 'h2 v0.4.19 (' | grep -F 'vendor/h2-0.4.19-ferrum-patched)'
+            --config "$h2_vendored" | grep -F 'h2 v0.4.20 (' | grep -F 'vendor/h2-0.4.20-ferrum-patched)'
           cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_ \
             --config "$h2_vendored"
 
@@ -2096,17 +2096,14 @@ jobs:
         env:
           RUSTFLAGS: "--cap-lints=warn"
         run: |
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
-          # Patch 002: an automatic small-DATA-frame budget follows runtime
-          # target-window changes without resetting outstanding charges.
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib budget
+          cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
+          # Upstream hyperium/h2#965 (h2 0.4.20; formerly Ferrum patch 002): an
+          # automatic small-DATA-frame budget follows runtime target-window
+          # changes without resetting outstanding charges, on our patched crate.
+          cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib budget
           # Patch 003: assigned send window is reported apart from the
           # send-buffer limit that caps `capacity()` (Hyper patch 005 reads it).
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
-          # Patch 004: a client connection whose last handle drops right after
-          # Connection::poll decided not to close still wakes itself and
-          # closes against an idle peer (issue #6052).
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_client_close_wakeup
+          cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

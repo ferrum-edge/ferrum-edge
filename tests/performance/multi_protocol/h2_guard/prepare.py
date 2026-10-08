@@ -13,26 +13,24 @@ import urllib.request
 
 ASSETS = Path(__file__).resolve().parent
 ROOT = ASSETS.parents[3]
-SHA256 = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
-REVISION = "d57d1b852fec9dda6d42d3454502006d52104da8"
-URL = "https://static.crates.io/crates/h2/h2-0.4.19.crate"
-VENDOR = "vendor/h2-0.4.19-observation"
+SHA256 = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+REVISION = "b0e890842ac16d3c76836fd4fcc06421acb15fa7"
+URL = "https://static.crates.io/crates/h2/h2-0.4.20.crate"
+VENDOR = "vendor/h2-0.4.20-observation"
 # Input anchors shared by the hosted preparation and the quick pin check, so the
 # two cannot disagree about what "present" means.
 PATCH_TABLE = "[patch.crates-io]\n"
-# Ferrum ships a vendored h2 0.4.19 (three logical patches), so the
+# Ferrum ships a vendored h2 0.4.20 (two logical patches), so the
 # root lock records it path-sourced (no source/checksum lines) and the patch
 # table already names it. The observation build replaces that one entry.
-FERRUM_VENDOR = "vendor/h2-0.4.19-ferrum-patched"
+FERRUM_VENDOR = "vendor/h2-0.4.20-ferrum-patched"
 FERRUM_PATCHES = (
     "docs/upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch",
-    "docs/upstream-h2-patches/002-runtime-data-frame-budget/h2-runtime-data-frame-budget.patch",
     "docs/upstream-h2-patches/003-assigned-send-capacity/h2-assigned-send-capacity.patch",
-    "docs/upstream-h2-patches/004-client-close-wakeup/h2-client-close-wakeup.patch",
 )
 VENDOR_MANIFEST = "vendor/VENDOR_INTEGRITY.sha256"
 VENDORED_H2 = 'h2 = { path = "' + FERRUM_VENDOR + '" }\n'
-LOCK_PIN = 'name = "h2"\nversion = "0.4.19"\ndependencies = [\n'
+LOCK_PIN = 'name = "h2"\nversion = "0.4.20"\ndependencies = [\n'
 DOCKER_CARGO = 'cargo build --features "${FEATURES}"'
 METRICS_ANCHOR = b"        let mut metrics_output = registry.render();\n"
 
@@ -53,7 +51,7 @@ def extract_source(data, destination):
         for member in members:
             path = PurePosixPath(member.name)
             if (path.is_absolute() or ".." in path.parts or not path.parts
-                    or path.parts[0] != "h2-0.4.19" or member.name in names
+                    or path.parts[0] != "h2-0.4.20" or member.name in names
                     or not (member.isfile() or member.isdir())):
                 raise ValueError("invalid h2 archive member")
             names.add(member.name)
@@ -108,7 +106,7 @@ def apply_ferrum_patch(source, root):
 
 
 def patch_source(source, provenance):
-    patch = (ASSETS / "h2-0.4.19.patch").read_bytes()
+    patch = (ASSETS / "h2-0.4.20.patch").read_bytes()
     if sha(patch) != provenance["patch_sha256"]:
         raise ValueError("patch identity mismatch")
     for name, hashes in provenance["files"].items():
@@ -140,10 +138,10 @@ def select_dependency(context, evidence, provenance):
     diff = "".join(difflib.unified_diff(original.splitlines(True), modified.splitlines(True),
                                        fromfile="a/Cargo.toml", tofile="b/Cargo.toml"))
     # Both the vendored and the observation crate are path sources of h2
-    # 0.4.19, which the lock records identically: the lock stays unchanged.
+    # 0.4.20, which the lock records identically: the lock stays unchanged.
     lock = (context / "Cargo.lock").read_text()
     if lock.count(LOCK_PIN) != 1:
-        raise ValueError("root lock no longer pins one path-sourced h2 0.4.19")
+        raise ValueError("root lock no longer pins one path-sourced h2 0.4.20")
     # Keep the existing Docker stages/features/profile. Lock both Cargo calls in
     # this generated copy; the ordinary Dockerfile is never rewritten.
     docker = (context / "Dockerfile").read_text()
@@ -188,7 +186,7 @@ def check_pins_only(provenance):
 
     lock = (ROOT / "Cargo.lock").read_text()
     if lock.count(LOCK_PIN) != 1:
-        raise SystemExit("pin check failed: path-sourced h2 0.4.19 lock anchor must occur once")
+        raise SystemExit("pin check failed: path-sourced h2 0.4.20 lock anchor must occur once")
 
     manifest = (ROOT / "Cargo.toml").read_text()
     if manifest.count(PATCH_TABLE) != 1:
@@ -244,7 +242,7 @@ def main():
     shutil.copytree(ASSETS, evidence / "assets")
     with urllib.request.urlopen(URL, timeout=60) as response:
         raw = response.read(2 * 1024 * 1024 + 1)
-    (evidence / "h2-0.4.19.crate").write_bytes(raw)
+    (evidence / "h2-0.4.20.crate").write_bytes(raw)
     context = output / "context"
     shutil.copytree(ROOT, context, ignore=shutil.ignore_patterns(".git", "target", ".cache", "__pycache__"))
     source = context / VENDOR

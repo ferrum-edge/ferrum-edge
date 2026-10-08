@@ -306,6 +306,20 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   ConfigSync wire type is unchanged, and control-plane mode is not instrumented
   yet.
 
+### Changed
+
+- **Vendored h2 moves to 0.4.20** (issue #6062). `vendor/h2-0.4.20-ferrum-patched/`
+  replaces the 0.4.19 fork. Two Ferrum patches retire because upstream now
+  contains them:
+  - the runtime small-DATA-frame budget (`h2-002`, hyperium/h2#965);
+  - the client close-wakeup race (`h2-004`, hyperium/h2#956).
+
+  The DATA-frame write coalescing (`h2-001`) and the assigned-send-capacity
+  accessor (`h2-003`, read by Hyper patch 005) are re-applied unchanged.
+  0.4.20 also brings upstream protocol hardening and HPACK/locking performance
+  work: GOAWAY stream-id validation, `:status` enforcement, duplicate
+  `content-length` rejection, refused-stream and push-promise accounting.
+
 ### Fixed
 
 - **An idle HTTP/2 client connection closes when its last handle drops

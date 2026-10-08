@@ -51,9 +51,9 @@ timed out. The permanent gateway regression is
 
 The upstream review's receiver-side diagnosis was also correct: h2's automatic
 small-frame budget must follow runtime target-window changes made by adaptive
-flow control. Ferrum carries that correction separately as
-[h2 patch 002](../../upstream-h2-patches/002-runtime-data-frame-budget/README.md),
-filed upstream as [hyperium/h2#965](https://github.com/hyperium/h2/pull/965).
+flow control. Ferrum carried that correction separately as h2 patch 002 until
+it shipped upstream as [hyperium/h2#965](https://github.com/hyperium/h2/pull/965)
+in h2 0.4.20, which Ferrum now vendors.
 
 ## Patch
 

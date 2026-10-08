@@ -3,9 +3,11 @@
 //! An h2 client `Connection` closes itself (GOAWAY, then EOF) once it has no
 //! open streams and every `SendRequest`, `ResponseFuture`, `SendStream`, and
 //! `RecvStream` is gone. Waiting for that after dropping the last handle can
-//! hang, because h2 can lose the one wakeup the drop delivers:
+//! hang, because h2 0.4.19 and earlier could lose the one wakeup the drop
+//! delivers (fixed upstream in h2 0.4.20 by hyperium/h2#956, which Ferrum now
+//! vendors; the PING below stays as a cheap guard against a regression):
 //!
-//! - `Connection::poll` (`vendor/h2-0.4.19-ferrum-patched/src/client.rs`) reads
+//! - `Connection::poll` (h2 0.4.19 `src/client.rs`) read
 //!   "anything still held?" three times, each under its own lock: (1)
 //!   `maybe_close_connection_if_no_streams` closes if nothing is held, (2) it
 //!   records the answer as `had_streams_or_refs`, (3) after polling it wakes

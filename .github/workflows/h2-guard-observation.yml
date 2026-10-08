@@ -15,7 +15,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
-      - vendor/h2-0.4.19-ferrum-patched/**
+      - vendor/h2-0.4.20-ferrum-patched/**
       - vendor/VENDOR_INTEGRITY.sha256
       - docs/upstream-h2-patches/**
   # prepare.py fails closed when a repository file it pins drifts: the
@@ -40,7 +40,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
-      - vendor/h2-0.4.19-ferrum-patched/**
+      - vendor/h2-0.4.20-ferrum-patched/**
       - vendor/VENDOR_INTEGRITY.sha256
       - docs/upstream-h2-patches/**
   workflow_dispatch:
@@ -82,7 +82,7 @@ jobs:
       - name: Format generated dependency and compile real guard regressions
         run: |
           set -euo pipefail
-          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.19-observation"
+          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.20-observation"
           upstream="$RUNNER_TEMP/h2-guard/upstream"
           evidence="$RUNNER_TEMP/h2-guard/evidence"
           rustc --version --verbose > "$evidence/rustc.txt"
@@ -127,7 +127,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.19-observation"
+          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.20-observation"
           if [ -d "$crate" ]; then
             tar --exclude=target -czf "$RUNNER_TEMP/h2-guard/evidence/patched-source.tgz" -C "$crate" .
             sha256sum "$RUNNER_TEMP/h2-guard/evidence/patched-source.tgz" > "$RUNNER_TEMP/h2-guard/evidence/patched-source.sha256"
@@ -169,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 tests/performance/multi_protocol/h2_guard/prepare.py --output "$RUNNER_TEMP/h2-guard"
-          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.19-observation"
+          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.20-observation"
           cargo fmt --manifest-path "$crate/Cargo.toml" --all
           cargo fmt --manifest-path "$crate/Cargo.toml" --all -- --check
           cargo metadata --locked --format-version 1 --manifest-path "$RUNNER_TEMP/h2-guard/context/Cargo.toml" > "$RUNNER_TEMP/h2-guard/evidence/metadata.json"
@@ -194,7 +194,7 @@ jobs:
           push: false
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-            io.ferrum.h2-guard-source=ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16
+            io.ferrum.h2-guard-source=7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118
           # Never export this transient dependency into ordinary image caches.
           cache-from: type=gha
       - name: Retain image build identity
@@ -232,7 +232,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.19-observation"
+          crate="$RUNNER_TEMP/h2-guard/context/vendor/h2-0.4.20-observation"
           if [ -d "$crate" ]; then
             tar --exclude=target -czf "$RUNNER_TEMP/h2-guard/evidence/patched-source.tgz" -C "$crate" .
             sha256sum "$RUNNER_TEMP/h2-guard/evidence/patched-source.tgz" > "$RUNNER_TEMP/h2-guard/evidence/patched-source.sha256"

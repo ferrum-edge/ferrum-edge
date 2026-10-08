@@ -1,7 +1,7 @@
 # h2: report a stream's assigned send window apart from the send buffer
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/h2-0.4.19-ferrum-patched/` must regenerate the drift
+> Any change to `vendor/h2-0.4.20-ferrum-patched/` must regenerate the drift
 > manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -36,7 +36,7 @@ chunk was split and the frontend response pipe stalled mid-chunk.
 ## Patch
 
 [`h2-assigned-send-capacity.patch`](h2-assigned-send-capacity.patch) applies
-after Ferrum's h2 patches 001 and 002. It adds one read-only accessor and
+after Ferrum's h2 patch 001, against h2 0.4.20. It adds one read-only accessor and
 changes no state:
 
 - `SendStream::capacity_and_assigned()` (`src/share.rs`) returns
@@ -63,7 +63,7 @@ accept the request and for the assignment to land, bounded by a deadline,
 rather than polling a fixed number of times.
 
 ```bash
-cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
+cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
 ```
 
 Hyper patch 005's

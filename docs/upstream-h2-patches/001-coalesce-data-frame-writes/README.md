@@ -1,7 +1,7 @@
 # h2: coalesce DATA frames into one write
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/h2-0.4.19-ferrum-patched/` must regenerate the
+> Any change to `vendor/h2-0.4.20-ferrum-patched/` must regenerate the
 > drift manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -43,7 +43,7 @@ Ferrum relays HTTP/2 and gRPC through h2 on both legs. On the protocol benchmark
 
 The unified diff is
 [`h2-coalesce-data-frame-writes.patch`](h2-coalesce-data-frame-writes.patch),
-against h2 0.4.19. The change is in `src/codec/framed_write.rs`, plus a one-line idle hook in `src/proto/streams/streams.rs` (with its `Codec` delegate in `src/codec/mod.rs`) and test-only accessors in `src/proto/connection.rs` and `src/client.rs`.
+against h2 0.4.20 (first written against 0.4.19; it applied to 0.4.20 unchanged apart from line offsets). The change is in `src/codec/framed_write.rs`, plus a one-line idle hook in `src/proto/streams/streams.rs` (with its `Codec` delegate in `src/codec/mod.rs`) and test-only accessors in `src/proto/connection.rs` and `src/client.rs`.
 
 - `Encoder::buffer` copies a DATA payload into the write buffer, with its frame header, while the buffer stays within `COALESCE_LIMIT` (64 KiB, inclusive).
   - A copied frame is complete once buffered, so it is recorded in `last_data_frame` exactly as a sub-threshold frame already was, and `Prioritize` reclaims it before staging the next frame.
@@ -89,7 +89,7 @@ HBONE sanity check (cross-run, so errors and gross regressions only): `mesh-perf
 The regression tests are `codec::framed_write::ferrum_coalesce_data_frame_writes_tests` in the vendored crate. Run them with:
 
 ```bash
-cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
+cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
 ```
 
 They check that:
@@ -114,14 +114,14 @@ lane builds its observed h2 from the verified archive plus these patches.
 
 Retire this patch when an h2 release containing hyperium/h2#903 (or another
 change that batches DATA frames into one write) is adopted, or when Ferrum
-stops using h2. The [runtime-budget](../002-runtime-data-frame-budget/README.md),
-[assigned-send-capacity](../003-assigned-send-capacity/README.md) and
-[client close-wakeup](../004-client-close-wakeup/README.md) patches must also
-retire before dropping the vendored crate. To retire the crate after all four
-patches are superseded:
+stops using h2. The [assigned-send-capacity](../003-assigned-send-capacity/README.md)
+patch must also retire before dropping the vendored crate. (The runtime-budget
+and client close-wakeup patches retired when Ferrum adopted h2 0.4.20, which
+contains hyperium/h2#965 and #956.) To retire the crate after both patches are
+superseded:
 
 1. Remove the `h2` line from `[patch.crates-io]` in `Cargo.toml`, `tests/performance/mesh/Cargo.toml` and `fuzz/Cargo.toml`.
-2. Drop `vendor/h2-0.4.19-ferrum-patched/` and update the three lockfiles.
+2. Drop `vendor/h2-0.4.20-ferrum-patched/` and update the three lockfiles.
 3. Point the H2 guard lane (`tests/performance/multi_protocol/h2_guard/prepare.py`) back at the registry h2.
 4. Remove the inventory row and the `docs/vendored-patch-lifecycle.json` entry.
 5. Regenerate the drift manifest.
