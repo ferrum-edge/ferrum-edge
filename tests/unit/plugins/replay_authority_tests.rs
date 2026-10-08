@@ -410,12 +410,8 @@ fn held_expiry_refresh_respects_the_presenting_principals_share() {
     }
 
     let after_first_expires = now + RETENTION.as_millis() as u64 + 1;
-    let refused = lane.admit_at_holding_expiry_write_for_tests(
-        &proof_b,
-        RETENTION,
-        CAP,
-        after_first_expires,
-    );
+    let refused =
+        lane.admit_at_holding_expiry_write_for_tests(&proof_b, RETENTION, CAP, after_first_expires);
     assert_eq!(refused.err(), Some(ReplayAdmission::CapacityRefused));
     assert_eq!(
         lane.principal_entries_for_tests(&proof_a),
