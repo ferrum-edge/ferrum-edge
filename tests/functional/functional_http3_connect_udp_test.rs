@@ -739,6 +739,72 @@ async fn functional_h3_connect_udp_enforces_the_session_limit() {
     gateway.shutdown();
 }
 
+#[ignore]
+#[tokio::test]
+async fn functional_h3_connect_udp_enforces_the_per_client_session_limit() {
+    let echo = UdpEcho::spawn().await;
+    let (mut gateway, https_port) = start_masque_gateway(
+        masque_config(echo.port),
+        &[
+            ("FERRUM_HTTP3_CONNECT_UDP_ENABLED", "true"),
+            ("FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS", "8"),
+            ("FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP", "1"),
+        ],
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = tunnel_url(https_port, "127.0.0.1", echo.port);
+
+    let mut first = open_tunnel(&client, &url).await;
+    assert_eq!(first.status.as_u16(), 200);
+    // Prove the first tunnel is live: the per-client slot must outlive the
+    // per-IP request accounting that ends once the 200 is committed.
+    first.send_datagram(b"hold").await.expect("send");
+    assert_eq!(
+        first
+            .recv_datagram(Duration::from_secs(10))
+            .await
+            .expect("receive"),
+        b"hold"
+    );
+
+    // The process-wide budget still has room, so only the per-client cap can
+    // refuse this tunnel — on a fresh QUIC connection from the same source.
+    let second_client = Http3Client::insecure().expect("second H3 client");
+    let mut second = second_client
+        .connect_udp(&url)
+        .await
+        .expect("second request");
+    assert_eq!(
+        second.status.as_u16(),
+        503,
+        "the per-client session limit must refuse a second tunnel from one source"
+    );
+    let body = second
+        .recv_body_text(Duration::from_secs(5))
+        .await
+        .expect("drain body");
+    assert!(body.contains("session limit"), "unexpected body: {body}");
+
+    // Closing the live tunnel must release the per-client slot.
+    first.close().await;
+    let mut third = None;
+    for _ in 0..40 {
+        let candidate = client.connect_udp(&url).await.expect("third request");
+        if candidate.status.as_u16() == 200 {
+            third = Some(candidate);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let third = third.expect("closing a tunnel must release its slot");
+    assert_eq!(third.status.as_u16(), 200);
+    third.close().await;
+
+    gateway.shutdown();
+}
+
 #[cfg(unix)]
 #[ignore]
 #[tokio::test]

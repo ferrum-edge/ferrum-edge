@@ -931,6 +931,7 @@ This means every WebSocket plugin works on H3 sessions unchanged:
   CONNECT, and H3 Extended CONNECT identical completion accounting)
 - Connection-admission via `FERRUM_WEBSOCKET_MAX_CONNECTIONS` and `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` (shared with H1/H2)
 - All authentication, authorization, and `before_proxy` plugins (run BEFORE the bridge accepts the upgrade)
+- Method policy sees `GET`, the method of the backend WebSocket handshake: route `allowed_methods`, `mesh_authz` `:method`, and `opa` `input.method` evaluate an H3 Extended CONNECT exactly like an H1 `GET` Upgrade or an H2 Extended CONNECT. The `FERRUM_TLS_EARLY_DATA_METHODS` 0-RTT gate still matches the wire method (`CONNECT`); plain CONNECT and CONNECT-UDP keep `CONNECT`
 - Sticky-session cookies on the 200 response (same as H1/H2)
 - All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "GET"`, matching the H2 Extended CONNECT path)
 
@@ -1229,6 +1230,7 @@ the lookup instead of becoming an unscreened dial.
 | Bound | Source |
 | --- | --- |
 | Concurrent tunnels | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` (503 over the limit) |
+| Concurrent tunnels per client | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (503 over the limit; IPv6 grouped by `/64`, held for the tunnel lifetime) |
 | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS`, which also raises the frontend QUIC idle floor (below) |
 | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped at the RFC 9298 §5 ceiling of 65527 |
 | DATAGRAM capsule length | payload ceiling + 8 bytes of Context ID slack |
@@ -1745,6 +1747,7 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_WEBSOCKET_ENABLED` | `true` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT WebSocket. See [WebSocket over HTTP/3](#websocket-over-http3-rfc-9220-extended-connect). |
 | `FERRUM_HTTP3_CONNECT_UDP_ENABLED` | `false` | Accept RFC 9298 UDP proxying Extended CONNECT (`:protocol=connect-udp`). Off by default; `501` while disabled. **Process-wide:** every H3 HTTP route whose routing and `allowed_methods` policy admits CONNECT can match a `/udp/host/port/` suffix — use a dedicated MASQUE route/host/path, authentication/authorization, and explicit method filters on routes that must not expose CONNECT. Requires a build target with a do-not-fragment socket option (Linux/Android, macOS) because RFC 9298 §3.1 forbids introducing IP fragmentation — elsewhere `true` is a startup validation error. CONNECT-UDP in TLS 1.3 early data is always `425`, even when `CONNECT` is in `FERRUM_TLS_EARLY_DATA_METHODS`. See [CONNECT-UDP over HTTP/3](#connect-udp-over-http3-rfc-9298). |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` | `256` | Maximum concurrent CONNECT-UDP tunnels for this process; `503` over the limit. `0` disables the limit. A value above the tokio semaphore permit ceiling is a startup validation error, never a silent clamp or a silent "unlimited". |
+| `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` | `32` | Maximum concurrent CONNECT-UDP tunnels per resolved client (IPv4 per address, IPv6 grouped by `/64`); `503` over the limit. The slot is held for the tunnel's lifetime and released on every close path. `0` disables the per-client cap. |
 | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | `120` | Seconds a tunnel may carry no datagram in either direction (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below. This value is also the floor for the frontend QUIC connection idle timeout while the profile is enabled, so the advertised tunnel lifetime is the one that actually holds. |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales every per-session buffer — see [Bounds and lifecycle](#bounds-and-lifecycle). |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |

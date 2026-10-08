@@ -2769,9 +2769,9 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     let _ = gateway.wait();
 }
 
-/// Extended CONNECT is forwarded as a WebSocket GET, so route method policy
-/// admits it alongside an H1 GET upgrade. H1 upgrades using other methods are
-/// rejected before policy evaluation or backend dispatch.
+/// Extended CONNECT (H2 and H3) is forwarded as a WebSocket GET, so route
+/// method policy admits it alongside an H1 GET upgrade. H1 upgrades using
+/// other methods are rejected before policy evaluation or backend dispatch.
 #[ignore]
 #[tokio::test]
 async fn test_websocket_method_policy_uses_forwarded_get_method() {
@@ -2791,7 +2791,7 @@ async fn test_websocket_method_policy_uses_forwarded_get_method() {
     let cert_path = "tests/certs/server.crt";
     let key_path = "tests/certs/server.key";
     build_gateway().expect("Failed to build gateway");
-    let (mut gateway, gateway_http_port, _) =
+    let (mut gateway, gateway_http_port, gateway_https_port) =
         start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
 
     let h1_url = format!("ws://127.0.0.1:{gateway_http_port}/ws-echo");
@@ -2856,6 +2856,20 @@ async fn test_websocket_method_policy_uses_forwarded_get_method() {
         "route method policy must see the forwarded GET method"
     );
     h2_connection_task.abort();
+
+    let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
+    let h3_client = Http3Client::insecure().expect("H3 client");
+    let mut h3_ws = h3_client
+        .websocket(&h3_url, WebSocketOptions::default())
+        .await
+        .expect("send H3 Extended CONNECT");
+    assert_eq!(
+        h3_ws.status,
+        StatusCode::OK,
+        "H3 route method policy must see the forwarded GET method"
+    );
+    h3_ws.send_text("h3 get").await.expect("send text");
+    assert_eq!(h3_ws.recv_text().await.expect("echo"), "Echo: h3 get");
 
     let _ = gateway.kill();
     let _ = gateway.wait();

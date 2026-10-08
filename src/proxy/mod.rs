@@ -7107,6 +7107,13 @@ pub struct ProxyState {
     /// frontend. `None` when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS=0`
     /// (unlimited). Held for the tunnel lifetime, never on a datagram path.
     pub h3_connect_udp_sessions: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-client concurrent CONNECT-UDP tunnel counters, keyed by
+    /// `connect_udp::connect_udp_client_key` (IPv6 grouped by prefix). `None`
+    /// when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP=0` (disabled). Held
+    /// for the tunnel lifetime, never on a datagram path.
+    pub per_ip_connect_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Maximum concurrent CONNECT-UDP tunnels per resolved client. 0 = disabled.
+    pub http3_connect_udp_max_sessions_per_ip: u64,
     /// True only after the serving mode actually starts an H3 listener whose
     /// extended CONNECT/WebSocket support is enabled.
     ///
@@ -10107,6 +10114,8 @@ impl ProxyState {
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
         let websocket_max_connections_per_ip = env_config.websocket_max_connections_per_ip;
+        let http3_connect_udp_max_sessions_per_ip =
+            env_config.http3_connect_udp_max_sessions_per_ip;
         let mesh_egress_strip_baggage_keys =
             Arc::new(env_config.mesh_egress_strip_baggage_keys.clone());
         let pool_shard_amount =
@@ -10720,6 +10729,14 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             h3_connect_udp_sessions,
+            per_ip_connect_udp_sessions: if http3_connect_udp_max_sessions_per_ip > 0 {
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
+            } else {
+                None
+            },
+            http3_connect_udp_max_sessions_per_ip,
             h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
@@ -10822,7 +10839,8 @@ impl ProxyState {
 
     /// Start a background task that periodically removes stale zero-count
     /// entries from `per_ip_request_counts`, `per_ip_websocket_sessions`,
-    /// `per_ip_tcp_connections` and `per_ip_udp_sessions`.
+    /// `per_ip_connect_udp_sessions`, `per_ip_tcp_connections` and
+    /// `per_ip_udp_sessions`.
     /// Normally entries are cleaned via the RAII drop of
     /// [`PerIpRequestGuard`] / [`PerIpConnectionGuard`], but this sweep catches
     /// edge cases (e.g., task cancellation without guard drop).
@@ -10845,6 +10863,9 @@ impl ProxyState {
             maps.push(counts.clone());
         }
         if let Some(counts) = self.per_ip_websocket_sessions.as_ref() {
+            maps.push(counts.clone());
+        }
+        if let Some(counts) = self.per_ip_connect_udp_sessions.as_ref() {
             maps.push(counts.clone());
         }
         // Stream-listener per-source admission maps (issue #4544). Their
