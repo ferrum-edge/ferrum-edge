@@ -2729,10 +2729,6 @@ pub struct EnvConfig {
     /// old-generation backend pool entries. 0 leaves existing connections to
     /// expire naturally.
     pub mesh_svid_rotation_drain_seconds: u64,
-    /// Directories a DestinationRule outside the mesh root namespace may name
-    /// TLS material files under (`FERRUM_MESH_TENANT_TLS_FILE_ROOTS`). Empty
-    /// (the default) admits no tenant file.
-    pub mesh_tenant_tls_file_roots: Vec<std::path::PathBuf>,
     /// Ring capacity of the in-memory `mesh_authz` deny recorder consumed by
     /// `GET /mesh/policy-denies/recent`. Each entry is ~200–400 bytes. The
     /// recorder is exception-path only (touched only on a deny) and bounded
@@ -4262,7 +4258,6 @@ impl Default for EnvConfig {
                 crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES,
             mesh_node_waypoint_relay_pod_uid: None,
             mesh_svid_rotation_drain_seconds: 0,
-            mesh_tenant_tls_file_roots: Vec::new(),
             mesh_policy_deny_log_capacity: crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
@@ -5108,7 +5103,7 @@ impl EnvConfig {
         let mesh_tenant_tls_file_roots = parse_mesh_tenant_tls_file_roots(
             resolve_var(conf, MESH_TENANT_TLS_FILE_ROOTS_KEY).as_deref(),
         )?;
-        crate::tls::source::install_mesh_tenant_tls_file_roots(mesh_tenant_tls_file_roots.clone())?;
+        crate::tls::source::install_mesh_tenant_tls_file_roots(mesh_tenant_tls_file_roots)?;
 
         let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
             parse_tls_source_execution_policy(
@@ -5808,7 +5803,6 @@ impl EnvConfig {
             mesh_app_probe_max_active_probes,
             mesh_node_waypoint_relay_pod_uid,
             mesh_svid_rotation_drain_seconds,
-            mesh_tenant_tls_file_roots,
             mesh_policy_deny_log_capacity,
             node_agent_proxy_mode,
             node_agent_admin_enabled,

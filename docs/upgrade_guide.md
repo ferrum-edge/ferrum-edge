@@ -52,9 +52,12 @@ rolling out, check:
   name local files by default.** A path or `file://` value in
   `caCertificates`, `clientCertificate` or `privateKey` is refused unless it is
   an absolute path, without `..`, under a directory listed in the new
-  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default). Data planes re-check
-  each listed file after resolving symlinks and refuse the slice if it leaves
-  the listed directories. If tenants legitimately mount their own certificates
+  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default). A data plane
+  re-checks each listed file after resolving symlinks when it applies the rule
+  to one of its upstreams. If the file is missing on that node or resolves
+  outside the listed directories, backend TLS fails closed for the
+  destinations that rule governs and the rest of the configuration still
+  applies. If tenants legitimately mount their own certificates
   (for example into their Sidecar pods), list only those directories, on the
   control plane and on every mesh data plane; otherwise switch the rule to a
   `k8s://` Secret in its own namespace. Root-namespace rules are unchanged.

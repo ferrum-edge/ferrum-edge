@@ -8169,19 +8169,21 @@ pub(crate) fn destination_rule_tls_reference_error(
 
 /// Load-time re-check of a tenant DestinationRule's local TLS files on the
 /// node that reads them: each file must still resolve, after symlinks, under
-/// a `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` directory. Root-namespace rules are
-/// exempt. Returns the first refusal.
+/// one of `tenant_file_roots` (`FERRUM_MESH_TENANT_TLS_FILE_ROOTS`). A file
+/// that is missing or cannot be resolved is refused too. Root-namespace rules
+/// are exempt. Returns the first refusal as a schema path plus a fixed reason;
+/// the referenced value is never echoed.
 pub(crate) fn destination_rule_tls_file_escape_error(
     dr: &MeshDestinationRule,
     root_namespace: &str,
+    tenant_file_roots: &[std::path::PathBuf],
 ) -> Option<String> {
     use crate::tls::source::check_tenant_file_reference_resolved;
     if destination_rule_is_root_policy(&dr.namespace, root_namespace) {
         return None;
     }
-    let tenant_file_roots = crate::tls::source::effective_mesh_tenant_tls_file_roots();
     for (field, value, kind) in destination_rule_tls_references(dr) {
-        let verdict = check_tenant_file_reference_resolved(value, kind, &tenant_file_roots);
+        let verdict = check_tenant_file_reference_resolved(value, kind, tenant_file_roots);
         if let Err(refusal) = verdict {
             return Some(format!("{field}: {}", refusal.reason()));
         }

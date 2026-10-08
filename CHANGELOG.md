@@ -32,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule's own namespace, or a local file under a directory listed in the new
   `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default, so no local file).
   Listed files must be absolute paths without `..` and are re-checked after
-  symlink resolution on the data plane. Other sources are refused at
+  symlink resolution on each data plane that applies the rule; a missing or
+  escaping file fails backend TLS closed for that rule's destinations only,
+  without rejecting the rest of the configuration. Other sources are refused at
   Kubernetes translation and at native/file/xDS slice validation.
   Root-namespace rules are unchanged.
 - **BREAKING — namespace-scoped operators can set backend TLS material only
