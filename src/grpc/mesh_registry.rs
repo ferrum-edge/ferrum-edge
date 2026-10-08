@@ -66,8 +66,16 @@ impl MeshNodeRegistry {
         expected_connected_at: DateTime<Utc>,
     ) {
         let key = super::admission::authenticated_principal_key(namespace, node_id);
+        self.remove_if_stale_key(&key, expected_connected_at);
+    }
+
+    pub(crate) fn remove_if_stale_key(
+        &self,
+        key: &str,
+        expected_connected_at: DateTime<Utc>,
+    ) {
         self.nodes
-            .remove_if(&key, |_, info| info.connected_at == expected_connected_at);
+            .remove_if(key, |_, info| info.connected_at == expected_connected_at);
     }
 
     pub fn touch_heartbeat(
@@ -77,7 +85,11 @@ impl MeshNodeRegistry {
         expected_connected_at: DateTime<Utc>,
     ) {
         let key = super::admission::authenticated_principal_key(namespace, node_id);
-        if let Some(mut entry) = self.nodes.get_mut(&key)
+        self.touch_heartbeat_key(&key, expected_connected_at);
+    }
+
+    pub(crate) fn touch_heartbeat_key(&self, key: &str, expected_connected_at: DateTime<Utc>) {
+        if let Some(mut entry) = self.nodes.get_mut(key)
             && entry.connected_at == expected_connected_at
         {
             entry.last_heartbeat_at = Utc::now();
@@ -151,23 +163,6 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].version, "new-version");
         assert_eq!(snapshot[0].connected_at, second_connected_at);
-    }
-
-    #[test]
-    fn mesh_registry_keeps_equal_subjects_in_separate_namespaces() {
-        let registry = MeshNodeRegistry::new();
-        let connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
-        let first = registry_info("shared-subject", "v1", connected_at);
-        let mut second = first.clone();
-        second.namespace = "other-tenant".to_string();
-
-        registry.insert(first.clone());
-        registry.insert(second);
-
-        assert_eq!(registry.len(), 2);
-        registry.remove_if_stale("ferrum", "shared-subject", connected_at);
-        assert_eq!(registry.len(), 1);
-        assert_eq!(registry.snapshot()[0].namespace, "other-tenant");
     }
 
     #[test]

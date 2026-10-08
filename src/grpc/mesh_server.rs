@@ -59,7 +59,6 @@ struct TrackedMeshStream<S> {
     drift: Arc<MeshSliceDriftRegistry>,
     config: Arc<ArcSwap<GatewayConfig>>,
     node_id: String,
-    namespace: String,
     drift_key: String,
     connected_at: DateTime<Utc>,
     /// Opaque drift-session generation. Never logged or published.
@@ -69,7 +68,7 @@ struct TrackedMeshStream<S> {
 impl<S> Drop for TrackedMeshStream<S> {
     fn drop(&mut self) {
         self.registry
-            .remove_if_stale(&self.namespace, &self.node_id, self.connected_at);
+            .remove_if_stale_key(&self.drift_key, self.connected_at);
         if let Some(session_token) = self.session_token.as_deref() {
             self.drift.mark_disconnected_with_config(
                 &self.drift_key,
@@ -98,7 +97,7 @@ where
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(item)) => {
                 self.registry
-                    .touch_heartbeat(&self.namespace, &self.node_id, self.connected_at);
+                    .touch_heartbeat_key(&self.drift_key, self.connected_at);
                 Poll::Ready(Some(item))
             }
             other => other,
@@ -995,7 +994,6 @@ impl MeshConfigSync for MeshGrpcServer {
             drift: self.drift.clone(),
             config: self.config.clone(),
             node_id,
-            namespace: node_namespace,
             drift_key,
             connected_at: now,
             session_token,
@@ -1052,12 +1050,18 @@ impl MeshConfigSync for MeshGrpcServer {
         let status = mesh_slice_report_status(report.phase, report.reject_reason)
             .map_err(mesh_slice_drift_status)?;
         let mut recorded = false;
-        for namespace in identity
-            .allowed_namespaces
-            .effective_namespaces()
-            .into_iter()
-            .flatten()
-        {
+        let namespaces: Vec<&str> = match identity.allowed_namespaces.effective_namespaces() {
+            Some(namespaces) => {
+                let mut namespaces: Vec<_> = namespaces.map(String::as_str).collect();
+                namespaces.sort_unstable();
+                namespaces
+            }
+            None => match &self.scope {
+                CpScope::Single(namespace) => vec![namespace.as_str()],
+                CpScope::Set(_) | CpScope::All => Vec::new(),
+            },
+        };
+        for namespace in namespaces {
             let key = super::admission::authenticated_principal_key(namespace, &identity.subject);
             match self.drift.record_status(
                 &key,
@@ -1071,6 +1075,7 @@ impl MeshConfigSync for MeshGrpcServer {
                     break;
                 }
                 Err(MeshSliceDriftAdmitError::UnknownNode) => {}
+                Err(MeshSliceDriftAdmitError::SessionMismatch) => {}
                 Err(error) => return Err(mesh_slice_drift_status(error)),
             }
         }

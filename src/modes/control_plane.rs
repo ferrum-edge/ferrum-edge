@@ -2843,6 +2843,7 @@ pub async fn run(
             };
             let _ = grpc_started_tx.send(());
             let router = builder
+                .layer(crate::grpc::response_admission::FullConfigPermitLayer)
                 .add_service(grpc_server.into_service())
                 .add_service(mesh_grpc_server.into_service());
             let result = if let Some(xds_server) = xds_server {

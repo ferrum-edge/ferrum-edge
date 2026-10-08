@@ -133,6 +133,7 @@ mod mesh_injector_ca_crd_helm_tests;
 mod mesh_listener_direction_ports_tests;
 mod mesh_pool_shared_creation_tests;
 mod mesh_revision_gate_tests;
+mod native_unary_response_admission_tests;
 mod mesh_scoped_resolution_parity_tests;
 mod mesh_startup_rollback_tests;
 mod mesh_stream_lifecycle_tests;

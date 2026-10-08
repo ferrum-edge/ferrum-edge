@@ -42,7 +42,7 @@ use prost::Message;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -86,7 +86,42 @@ use crate::modes::mesh::slice::{
 /// Application-level ConfigSync heartbeat interval (matches DP silence budget).
 pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
-static LAST_TENANT_SUBSCRIPTION_REJECTION_LOG: AtomicU64 = AtomicU64::new(0);
+static TENANT_SUBSCRIPTION_REJECTION_LOGS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const TENANT_REJECTION_LOG_INTERVAL_SECS: u64 = 60;
+const TENANT_REJECTION_LOG_KEY_CAPACITY: usize = 1024;
+
+fn bounded_log_value(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        let escaped = if character.is_control() {
+            format!("\\u{{{:x}}}", u32::from(character))
+        } else {
+            character.to_string()
+        };
+        if output.len().saturating_add(escaped.len()) > 128 {
+            output.push_str("…");
+            break;
+        }
+        output.push_str(&escaped);
+    }
+    output
+}
+
+fn bounded_tenant_rejection_reason(reason: &str) -> &'static str {
+    match reason {
+        "Invalid token: authentication failed" => "Invalid token: authentication failed",
+        "node_id does not match authenticated subject" => {
+            "node_id does not match authenticated subject"
+        }
+        "Missing authorization token" => "Missing authorization token",
+        "GetFullConfig node_id does not match authenticated subject" => {
+            "GetFullConfig node_id does not match authenticated subject"
+        }
+        _ => "request refused",
+    }
+}
 
 /// Project this subscriber's namespace view of Gateway frontend TLS.
 ///
@@ -673,29 +708,54 @@ impl CpGrpcServer {
         node_id: &str,
         namespace: &str,
         result: &'static str,
-        _reason: &str,
+        reason: &str,
     ) {
         match result {
             "success" => info!(
                 audit.event = "tenant_subscription",
-                surface, node_id, namespace, result, "Tenant subscription accepted"
+                surface,
+                node_id = ?bounded_log_value(node_id),
+                namespace = ?bounded_log_value(namespace),
+                result,
+                "Tenant subscription accepted"
             ),
             _ => {
                 if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     let now = elapsed.as_secs();
-                    let last = LAST_TENANT_SUBSCRIPTION_REJECTION_LOG.load(Ordering::Relaxed);
-                    if now.saturating_sub(last) >= 60
-                        && LAST_TENANT_SUBSCRIPTION_REJECTION_LOG
-                            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                    {
+                    let key = format!(
+                        "{surface}:{}:{}",
+                        super::admission::redacted_identifier(namespace),
+                        super::admission::redacted_identifier(node_id),
+                    );
+                    let should_log = TENANT_SUBSCRIPTION_REJECTION_LOGS
+                        .lock()
+                        .ok()
+                        .map(|mut logs| {
+                            let last = logs.get(&key).copied().unwrap_or(0);
+                            if now.saturating_sub(last) < TENANT_REJECTION_LOG_INTERVAL_SECS {
+                                return false;
+                            }
+                            if logs.len() >= TENANT_REJECTION_LOG_KEY_CAPACITY {
+                                if let Some(oldest) = logs
+                                    .iter()
+                                    .min_by_key(|(_, timestamp)| **timestamp)
+                                    .map(|(key, _)| key.clone())
+                                {
+                                    logs.remove(&oldest);
+                                }
+                            }
+                            logs.insert(key, now);
+                            true
+                        })
+                        .unwrap_or(false);
+                    if should_log {
                         warn!(
                             audit.event = "tenant_subscription",
                             surface,
-                            node_id = "",
-                            namespace = "",
+                            node_id = ?bounded_log_value(node_id),
+                            namespace = ?bounded_log_value(namespace),
                             result,
-                            reason = "request refused",
+                            reason = bounded_tenant_rejection_reason(reason),
                             "Tenant subscription rejected"
                         );
                     }
@@ -2429,14 +2489,14 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<FullConfigRequest>,
     ) -> Result<Response<FullConfigResponse>, Status> {
+        let rejected_request = request.get_ref();
         let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
             Ok(identity) => identity,
             Err(status) => {
-                let req = request.get_ref();
                 Self::audit_tenant_subscription(
                     "ConfigSync.GetFullConfig",
-                    "",
-                    "",
+                    &rejected_request.node_id,
+                    &rejected_request.namespace,
                     "failure",
                     status.message(),
                 );
@@ -2450,8 +2510,8 @@ impl ConfigSync for CpGrpcServer {
         if req.node_id.trim() != identity.subject {
             Self::audit_tenant_subscription(
                 "ConfigSync.GetFullConfig",
-                "",
-                "",
+                &req.node_id,
+                &req.namespace,
                 "failure",
                 "node_id does not match authenticated subject",
             );
@@ -2477,8 +2537,7 @@ impl ConfigSync for CpGrpcServer {
             return Err(status);
         }
         // Same cross-namespace guard as `Subscribe` — without it
-        // `GetFullConfig` would leak the wrong namespace's snapshot. We
-        // discard the returned sender; `GetFullConfig` is unary.
+        // `GetFullConfig` would leak the wrong namespace's snapshot.
         if let Err(status) = self.authorise_namespace(&allowed, &req.namespace) {
             Self::audit_tenant_subscription(
                 "ConfigSync.GetFullConfig",
@@ -2489,7 +2548,22 @@ impl ConfigSync for CpGrpcServer {
             );
             return Err(status);
         }
-        let _admission_permit = match self.admission.reserve_native_stream(
+        if let Err(rejection) = self
+            .admission
+            .reserve_full_config_rate(&req.namespace, &identity.subject)
+        {
+            record_native_rejection(CpGrpcStreamSurface::ConfigSync, rejection);
+            let status = rejection.into_native_status();
+            Self::audit_tenant_subscription(
+                "ConfigSync.GetFullConfig",
+                &req.node_id,
+                &req.namespace,
+                "failure",
+                status.message(),
+            );
+            return Err(status);
+        }
+        let admission_permit = match self.admission.reserve_native_stream(
             &req.namespace,
             &identity.subject,
             &req.node_id,
@@ -2500,8 +2574,8 @@ impl ConfigSync for CpGrpcServer {
                 let status = rejection.into_native_status();
                 Self::audit_tenant_subscription(
                     "ConfigSync.GetFullConfig",
-                    "",
-                    "",
+                    &req.node_id,
+                    &req.namespace,
                     "failure",
                     status.message(),
                 );
@@ -2561,7 +2635,9 @@ impl ConfigSync for CpGrpcServer {
             )
         );
 
-        Ok(Response::new(response))
+        let mut tonic_response = Response::new(response);
+        tonic_response.extensions_mut().insert(admission_permit);
+        Ok(tonic_response)
     }
 }
 

@@ -17,9 +17,9 @@
 //!
 //! # Identity
 //!
-//! Entries are keyed by the authenticated JWT `sub` (bound to the
-//! `MeshSubscribeRequest.node_id` at subscribe time). Caller-supplied display
-//! fields are never trusted as identity.
+//! Entries are keyed by a namespace-bound digest of the authenticated JWT `sub`
+//! (bound to the `MeshSubscribeRequest.node_id` at subscribe time).
+//! Caller-supplied display fields are never trusted as identity.
 //!
 //! # Session semantics
 //!
@@ -1026,17 +1026,19 @@ fn reconcile_entry_desired(
 
 fn evict_oldest_disconnected(entries: &mut HashMap<String, LiveEntry>) -> bool {
     let oldest = entries
-        .values()
-        .filter_map(|entry| {
+        .iter()
+        .filter_map(|(key, entry)| {
             if entry.connected {
                 None
             } else {
-                entry.disconnected_at.map(|at| (entry.node_id.clone(), at))
+                entry
+                    .disconnected_at
+                    .map(|at| (key.clone(), at))
             }
         })
         .min_by_key(|(_, at)| *at);
-    if let Some((node_id, _)) = oldest {
-        entries.remove(&node_id);
+    if let Some((key, _)) = oldest {
+        entries.remove(&key);
         true
     } else {
         false

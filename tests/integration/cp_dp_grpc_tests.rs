@@ -7609,6 +7609,24 @@ mod configsync_identity_binding {
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.snapshot()[0].connected_at, connected_at);
 
+        let oversized_node_id = "x".repeat(16_384);
+        let mut unauthenticated = tonic::Request::new(SubscribeRequest {
+            node_id: oversized_node_id.clone(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
+            namespace: oversized_node_id.clone(),
+            real_ip_header: Some(String::new()),
+            backend_egress_policy: None,
+        });
+        unauthenticated
+            .metadata_mut()
+            .insert("authorization", "Bearer invalid-token".parse().unwrap());
+        let status = match server.subscribe(unauthenticated).await {
+            Ok(_) => panic!("invalid credentials must be refused"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
         let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
         let failure = captured
             .lines()
@@ -7620,6 +7638,12 @@ mod configsync_identity_binding {
         assert!(failure.contains("namespace=\"ferrum\""));
         assert!(failure.contains("node_id does not match authenticated subject"));
         assert!(!failure.contains("victim-dp"));
+        let bounded_rejection = captured
+            .lines()
+            .find(|line| line.contains("Invalid token: authentication failed"))
+            .expect("bad-token audit should keep the fixed rejection reason");
+        assert!(bounded_rejection.len() < 2_048);
+        assert!(!bounded_rejection.contains(&"x".repeat(1_000)));
 
         drop(stream);
         assert!(registry.is_empty());
