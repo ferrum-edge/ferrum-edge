@@ -198,9 +198,8 @@ fn refused_destination_errors_on_the_health_probe_verifier() {
     let before = backend_tls_refusal_count(BackendTlsRefusalSurface::HealthProbe);
     let refused = BackendTlsConfig::refused();
     let result = build_probe_server_verifier_for_test(&refused, material.ca.to_str(), &[]);
-    let error = result
-        .err()
-        .expect("a refused destination must not get a probe verifier from the global CA");
+    let error =
+        result.expect_err("a refused destination must not get a probe verifier from the global CA");
     assert!(error.contains("refused"), "got: {error}");
     assert!(backend_tls_refusal_count(BackendTlsRefusalSurface::HealthProbe) > before);
 }
