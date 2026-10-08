@@ -69,6 +69,7 @@ use super::configsync_lifecycle::{
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
+use super::response_admission::FullConfigPermitHandle;
 use crate::FERRUM_VERSION;
 use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
@@ -86,12 +87,17 @@ use crate::modes::mesh::slice::{
 /// Application-level ConfigSync heartbeat interval (matches DP silence budget).
 pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
-static TENANT_SUBSCRIPTION_REJECTION_LOGS: LazyLock<Mutex<HashMap<String, u64>>> =
+#[derive(Default)]
+struct TenantRejectionLogState {
+    last_logged: u64,
+    suppressed: u64,
+}
+
+static TENANT_SUBSCRIPTION_REJECTION_LOGS:
+    LazyLock<Mutex<HashMap<(&'static str, &'static str), TenantRejectionLogState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const TENANT_REJECTION_LOG_INTERVAL_SECS: u64 = 60;
-const TENANT_REJECTION_LOG_KEY_CAPACITY: usize = 1024;
-
 fn bounded_log_value(value: &str) -> String {
     let mut output = String::new();
     for character in value.chars() {
@@ -714,48 +720,39 @@ impl CpGrpcServer {
             "success" => info!(
                 audit.event = "tenant_subscription",
                 surface,
-                node_id = ?bounded_log_value(node_id),
-                namespace = ?bounded_log_value(namespace),
+                node_id = %bounded_log_value(node_id),
+                namespace = %bounded_log_value(namespace),
                 result,
                 "Tenant subscription accepted"
             ),
             _ => {
                 if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     let now = elapsed.as_secs();
-                    let key = format!(
-                        "{surface}:{}:{}",
-                        super::admission::redacted_identifier(namespace),
-                        super::admission::redacted_identifier(node_id),
-                    );
-                    let should_log = TENANT_SUBSCRIPTION_REJECTION_LOGS
+                    let reason = bounded_tenant_rejection_reason(reason);
+                    let suppressed = TENANT_SUBSCRIPTION_REJECTION_LOGS
                         .lock()
                         .ok()
-                        .map(|mut logs| {
-                            let last = logs.get(&key).copied().unwrap_or(0);
-                            if now.saturating_sub(last) < TENANT_REJECTION_LOG_INTERVAL_SECS {
-                                return false;
+                        .and_then(|mut logs| {
+                            let state = logs.entry((surface, reason)).or_default();
+                            if state.last_logged != 0
+                                && now.saturating_sub(state.last_logged)
+                                    < TENANT_REJECTION_LOG_INTERVAL_SECS
+                            {
+                                state.suppressed = state.suppressed.saturating_add(1);
+                                return None;
                             }
-                            if logs.len() >= TENANT_REJECTION_LOG_KEY_CAPACITY {
-                                if let Some(oldest) = logs
-                                    .iter()
-                                    .min_by_key(|(_, timestamp)| **timestamp)
-                                    .map(|(key, _)| key.clone())
-                                {
-                                    logs.remove(&oldest);
-                                }
-                            }
-                            logs.insert(key, now);
-                            true
-                        })
-                        .unwrap_or(false);
-                    if should_log {
+                            state.last_logged = now;
+                            Some(std::mem::take(&mut state.suppressed))
+                        });
+                    if let Some(suppressed) = suppressed {
                         warn!(
                             audit.event = "tenant_subscription",
                             surface,
-                            node_id = ?bounded_log_value(node_id),
-                            namespace = ?bounded_log_value(namespace),
+                            node_id = %bounded_log_value(node_id),
+                            namespace = %bounded_log_value(namespace),
                             result,
-                            reason = bounded_tenant_rejection_reason(reason),
+                            reason,
+                            suppressed_count = suppressed,
                             "Tenant subscription rejected"
                         );
                     }
@@ -2636,7 +2633,9 @@ impl ConfigSync for CpGrpcServer {
         );
 
         let mut tonic_response = Response::new(response);
-        tonic_response.extensions_mut().insert(admission_permit);
+        tonic_response
+            .extensions_mut()
+            .insert(FullConfigPermitHandle::new(admission_permit));
         Ok(tonic_response)
     }
 }

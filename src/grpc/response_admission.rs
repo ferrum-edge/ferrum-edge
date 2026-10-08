@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::{Request, Response};
@@ -8,6 +9,21 @@ use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
 use super::admission::CpGrpcStreamPermit;
+
+/// Cloneable response-extension handle for one non-cloneable admission permit.
+/// The permit is released once, when the final shared handle is dropped.
+#[derive(Clone, Debug)]
+pub struct FullConfigPermitHandle {
+    _permit: Arc<CpGrpcStreamPermit>,
+}
+
+impl FullConfigPermitHandle {
+    pub fn new(permit: CpGrpcStreamPermit) -> Self {
+        Self {
+            _permit: Arc::new(permit),
+        }
+    }
+}
 
 /// Holds a ConfigSync unary admission permit until its encoded HTTP body drops.
 #[derive(Clone, Copy, Debug, Default)]
@@ -48,7 +64,7 @@ where
         let future = self.inner.call(request);
         Box::pin(async move {
             let mut response = future.await?;
-            let permit = response.extensions_mut().remove::<CpGrpcStreamPermit>();
+            let permit = response.extensions_mut().remove::<FullConfigPermitHandle>();
             Ok(response.map(|inner| FullConfigPermitBody {
                 inner,
                 _permit: permit,
@@ -62,7 +78,7 @@ pin_project! {
     pub struct FullConfigPermitBody<B> {
         #[pin]
         inner: B,
-        _permit: Option<CpGrpcStreamPermit>,
+        _permit: Option<FullConfigPermitHandle>,
     }
 }
 

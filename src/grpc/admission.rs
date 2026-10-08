@@ -571,7 +571,7 @@ struct CpGrpcAdmissionState {
     /// "never warned". Plain atomics: the reservation path takes no lock and
     /// allocates nothing for the common (not-near-ceiling) case.
     near_ceiling_warned_ms: [AtomicU64; CpGrpcBudgetLayer::COUNT],
-    full_config_requests: Mutex<HashMap<String, Instant>>,
+    full_config_requests: Mutex<HashMap<String, HashMap<String, Instant>>>,
 }
 
 impl CpGrpcAdmissionController {
@@ -596,7 +596,7 @@ impl CpGrpcAdmissionController {
     }
 
     /// Admit at most one unary full-config request per authenticated principal
-    /// per second. Retained keys are bounded; lock poisoning fails closed.
+    /// per second. Retained keys are bounded per namespace; lock poisoning fails closed.
     pub fn reserve_full_config_rate(
         &self,
         namespace: &str,
@@ -604,25 +604,28 @@ impl CpGrpcAdmissionController {
     ) -> Result<(), CpGrpcAdmissionRejection> {
         const WINDOW: Duration = Duration::from_secs(1);
         const RETENTION: Duration = Duration::from_secs(60);
-        const MAX_KEYS: usize = 4096;
+        const MAX_KEYS_PER_NAMESPACE: usize = 4096;
 
         let key = authenticated_principal_key(namespace, subject);
         let now = Instant::now();
         let Ok(mut requests) = self.inner.full_config_requests.lock() else {
             return Err(CpGrpcAdmissionRejection::FullConfigRateLimit);
         };
-        if let Some(last) = requests.get_mut(&key) {
+        let namespace_requests = requests.entry(namespace.to_string()).or_default();
+        if let Some(last) = namespace_requests.get_mut(&key) {
             if now.duration_since(*last) < WINDOW {
                 return Err(CpGrpcAdmissionRejection::FullConfigRateLimit);
             }
             *last = now;
             return Ok(());
         }
-        requests.retain(|_, last| now.duration_since(*last) < RETENTION);
-        if requests.len() >= MAX_KEYS {
-            return Err(CpGrpcAdmissionRejection::FullConfigRateLimit);
+        if namespace_requests.len() >= MAX_KEYS_PER_NAMESPACE {
+            namespace_requests.retain(|_, last| now.duration_since(*last) < RETENTION);
+            if namespace_requests.len() >= MAX_KEYS_PER_NAMESPACE {
+                return Err(CpGrpcAdmissionRejection::FullConfigRateLimit);
+            }
         }
-        requests.insert(key, now);
+        namespace_requests.insert(key, now);
         Ok(())
     }
 
