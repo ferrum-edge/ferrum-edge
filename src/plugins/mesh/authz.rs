@@ -3016,11 +3016,22 @@ impl Plugin for MeshAuthz {
                 return reject;
             }
         };
+        // A mesh CONNECT relay carries its application requests as opaque
+        // bytes. Its own method, path, authority, headers and request
+        // credentials describe the tunnel, not what is written into it, so
+        // judging `to.operation`, `requestPrincipals` or `when: request.*`
+        // against them would let a DENY on `/admin/*` miss and a `notPaths` /
+        // `paths: ["/*"]` ALLOW admit the whole tunnel. The relay is judged as
+        // a Layer-4 session instead: DENY ignores the HTTP-only fields and
+        // still matches on the rest, ALLOW and AUDIT never match on them.
+        let connect_relay = ctx.is_hbone_connect_relay();
         let mut host = ctx
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
             .map(str::to_string);
-        let has_header_rules = if relay_policy_superset_request {
+        let has_header_rules = if connect_relay {
+            false
+        } else if relay_policy_superset_request {
             self.relay_policy_superset_has_header_rules
         } else {
             self.has_header_rules
@@ -3085,23 +3096,37 @@ impl Plugin for MeshAuthz {
         // entry point that skipped that refusal would still fail closed.
         let stripped_path =
             crate::modes::mesh::policy::mesh_authz_stripped_path(&authorization_path);
-        let request = MeshAuthzRequest {
-            source_principal,
-            request_principal,
-            method: Some(ctx.method.clone()),
-            path: Some(authorization_path),
-            stripped_path,
-            host,
-            port,
-            headers,
-            attributes,
-            source_ip,
-            remote_ip,
-            destination_ip,
-            // HTTP-family request (HTTP/1.1, H2, H3, gRPC, gRPC-Web, WebSocket
-            // upgrade, and HTTP relayed inside an HBONE CONNECT): every
-            // documented `when:` attribute family is sourceable here.
-            protocol: MeshAuthzProtocol::Http,
+        let request = if connect_relay {
+            MeshAuthzRequest {
+                source_principal,
+                port,
+                attributes,
+                source_ip,
+                remote_ip,
+                destination_ip,
+                // Only transport facts are observable on a relayed tunnel.
+                protocol: MeshAuthzProtocol::L4,
+                ..MeshAuthzRequest::default()
+            }
+        } else {
+            MeshAuthzRequest {
+                source_principal,
+                request_principal,
+                method: Some(ctx.method.clone()),
+                path: Some(authorization_path),
+                stripped_path,
+                host,
+                port,
+                headers,
+                attributes,
+                source_ip,
+                remote_ip,
+                destination_ip,
+                // HTTP-family request (HTTP/1.1, H2, H3, gRPC, gRPC-Web,
+                // WebSocket upgrade): every documented `when:` attribute family
+                // is sourceable here.
+                protocol: MeshAuthzProtocol::Http,
+            }
         };
         // GAP-2M.4: per-pod scoping for node-waypoint topology.
         //
@@ -3379,6 +3404,39 @@ impl Plugin for MeshAuthz {
         }
         let decision = match evaluation.custom {
             None => evaluation.decision,
+            // A relayed tunnel carries no request a provider could judge:
+            // asking it about the CONNECT would authorize the tunnel, not the
+            // requests written into it. Refuse, as the stream path does for a
+            // matched delegation. This makes no external call, so a live-tunnel
+            // re-evaluation applies it too.
+            Some(delegation) if connect_relay => {
+                let reason = crate::plugins::mesh::ext_authz::MeshExtAuthzReason::Unexecutable;
+                if !live_admission_reevaluation {
+                    crate::plugins::mesh::ext_authz::record(reason, false);
+                }
+                ctx.metadata.insert(
+                    "mesh_authz.ext_authz_outcome".to_string(),
+                    reason.as_str().to_string(),
+                );
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    format!("custom:{}", delegation.policy),
+                );
+                self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                if self.per_pod_policy_scoping
+                    && !asserted_identity_rejected
+                    && !live_admission_reevaluation
+                {
+                    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                        crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+                    );
+                }
+                return PluginResult::Reject {
+                    status_code: 403,
+                    body: r#"{"error":"Mesh authorization denied"}"#.into(),
+                    headers: HashMap::new(),
+                };
+            }
             // Live-tunnel re-evaluation keeps the provider's admission-time
             // verdict (see `MESH_AUTHZ_REEVALUATION_METADATA_KEY`).
             Some(_)
