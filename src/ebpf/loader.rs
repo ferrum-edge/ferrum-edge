@@ -461,7 +461,10 @@ impl EbpfBackend for AyaEbpfBackend {
             debug!(pod_uid, "BPF programs detached for pod");
             Ok(())
         } else {
-            Err(format!("Failed to detach BPF programs for pod: {}", errors.join(", ")))
+            Err(format!(
+                "Failed to detach BPF programs for pod: {}",
+                errors.join(", ")
+            ))
         }
     }
 

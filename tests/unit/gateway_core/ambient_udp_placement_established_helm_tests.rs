@@ -925,8 +925,7 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
     );
 
     assert!(
-        nodes_rbac.contains("resources: [\"nodes\"]")
-            && nodes_rbac.contains("verbs: [\"get\"]"),
+        nodes_rbac.contains("resources: [\"nodes\"]") && nodes_rbac.contains("verbs: [\"get\"]"),
         "the ambient service account needs a read-only nodes grant for the preflight lookup"
     );
     // Least privilege: get without list/watch/write. Kubernetes RBAC does not
@@ -953,9 +952,7 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
          is worse than documenting the runtime binding"
     );
     assert!(
-        nodes_rbac.contains(
-            "name: ferrum-mesh-ambient\n    namespace: {{ .Release.Namespace }}",
-        ),
+        nodes_rbac.contains("name: ferrum-mesh-ambient\n    namespace: {{ .Release.Namespace }}",),
         "the grant must bind the ambient DaemonSet's own service account"
     );
     assert!(

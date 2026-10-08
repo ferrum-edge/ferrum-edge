@@ -410,7 +410,8 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
     // with a ServiceAccount and no Service. Issue #4274's per-assertor grant
     // is derived from Workload.node_waypoint bindings, so identity-only
     // sources must carry the same per-node SVID as service-backed destinations.
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
     let dest_spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
     let mut source = object(
@@ -514,7 +515,8 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
 
 #[test]
 fn k8s_pod_discovery_does_not_grant_unenrolled_identity_only_sources() {
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
     let mut source = object(
         "Pod",
@@ -574,7 +576,8 @@ fn k8s_pod_discovery_does_not_grant_unenrolled_identity_only_sources() {
 
 #[test]
 fn k8s_pod_discovery_does_not_grant_identity_only_sources_in_excluded_namespaces() {
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/monitoring/sa/frontend";
     let mut source = object(
         "Pod",
