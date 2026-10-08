@@ -20,7 +20,8 @@ pub use crate::grpc::admission::{
     DEFAULT_CP_GRPC_MAX_STREAMS_PER_NODE as DEFAULT_XDS_MAX_STREAMS_PER_NODE,
     DEFAULT_CP_GRPC_MAX_STREAMS_PER_PRINCIPAL as DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL,
     DEFAULT_CP_GRPC_MAX_TOTAL_STREAMS as DEFAULT_XDS_MAX_TOTAL_STREAMS,
-    DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, principal_key, redacted_identifier, validate_node_id,
+    DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, authenticated_principal_key, principal_key,
+    redacted_identifier, validate_node_id,
 };
 
 use crate::grpc::admission::{CpGrpcAdmissionController, CpGrpcStreamPermit, node_state_key};

@@ -3,7 +3,7 @@
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
-use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
+use ferrum_edge::grpc::cp_server::{CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use ferrum_edge::grpc::dp_client;
 use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
@@ -393,6 +393,102 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
     assert!(body["data_planes"][0]["rejected"].is_null());
     assert_eq!(body["summary"]["accepted"], 0);
     assert_eq!(body["summary"]["converged"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_report_skips_session_mismatches_across_permitted_namespaces() {
+    let config = Arc::new(ArcSwap::from_pointee(GatewayConfig::default()));
+    let drift = Arc::new(MeshSliceDriftRegistry::new());
+    let registry = Arc::new(MeshNodeRegistry::new().with_drift(drift.clone()));
+    let (server, _tx) = MeshGrpcServer::builder(config, GRPC_JWT_SECRET.to_string())
+        .registry(registry)
+        .drift(drift)
+        .scope(CpScope::Set(HashSet::from([
+            "alpha".to_string(),
+            "beta".to_string(),
+        ])))
+        .expected_issuer(DEFAULT_CP_DP_JWT_ISSUER.to_string())
+        .build();
+    let listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(MeshConfigSyncServer::new(server))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await;
+    });
+
+    let now = Utc::now();
+    let token = encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &json!({
+            "iss": DEFAULT_CP_DP_JWT_ISSUER,
+            "sub": "mesh-dp-beta",
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "ns": ["alpha", "beta"],
+            "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE,
+        }),
+        &EncodingKey::from_secret(GRPC_JWT_SECRET.as_bytes()),
+    )
+    .expect("multi-namespace mesh JWT");
+    let auth_header = format!("Bearer {token}");
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client =
+        MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+            req.metadata_mut().insert(
+                "authorization",
+                tonic::metadata::MetadataValue::try_from(auth_header.as_str()).unwrap(),
+            );
+            Ok(req)
+        });
+    let mut alpha_stream = client
+        .mesh_subscribe(tonic::Request::new(MeshSubscribeRequest {
+            node_id: "mesh-dp-beta".to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "alpha".to_string(),
+            workload_spiffe_id: String::new(),
+            labels: HashMap::new(),
+            waypoint_name: String::new(),
+            ambient_udp_source_scoping: false,
+            remote_discovery: false,
+            node_waypoint_capture_scoping: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let _alpha_update = alpha_stream.message().await.unwrap().unwrap();
+    let mut stream = client
+        .mesh_subscribe(tonic::Request::new(MeshSubscribeRequest {
+            node_id: "mesh-dp-beta".to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "beta".to_string(),
+            workload_spiffe_id: String::new(),
+            labels: HashMap::new(),
+            waypoint_name: String::new(),
+            ambient_udp_source_scoping: false,
+            remote_discovery: false,
+            node_waypoint_capture_scoping: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let update = stream.message().await.unwrap().unwrap();
+    client
+        .report_mesh_slice_status(MeshSliceStatusReport {
+            version: update.version,
+            session_token: update.session_token,
+            phase: MeshSliceStatusPhase::Accepted as i32,
+            reject_reason: MeshSliceRejectReason::InstallRefused as i32,
+        })
+        .await
+        .expect("the beta session should match after alpha's session mismatches");
+    handle.abort();
 }
 
 /// Drift tracking is observability. A registry that refuses to admit this DP

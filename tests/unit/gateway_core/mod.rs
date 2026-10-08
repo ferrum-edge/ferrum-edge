@@ -145,6 +145,7 @@ mod mesh_udp_capture_outcome_tests;
 mod mesh_websocket_establishment_timeout_tests;
 mod metrics_tests;
 mod native_grpc_dispatch_auth_lifetime_tests;
+mod native_unary_response_admission_tests;
 mod node_agent_admin_https_helm_tests;
 mod node_agent_admin_https_tests;
 mod node_agent_identity_tests;
