@@ -3083,8 +3083,14 @@ async fn handle_h3_request(
     // its plugin snapshot until the timer expires.
     ctx.peer_connection = Some(peer_connection);
 
-    // Store raw headers for deferred materialization.
-    ctx.set_raw_headers(req.headers().clone());
+    // Store raw headers for deferred materialization. HTTP/3 does not reject a
+    // `Connection` field, so resolve its nominations against the client's own
+    // fields before any plugin or gateway assertion can add a header that the
+    // backend-boundary hop-by-hop strip would otherwise remove. `req` keeps the
+    // wire block for the protocol-shape checks below.
+    let mut raw_headers = req.headers().clone();
+    crate::proxy::headers::confine_connection_nominated_request_headers(&mut raw_headers);
+    ctx.set_raw_headers(raw_headers);
     crate::proxy::stamp_original_request_metadata(&mut ctx);
 
     // Validate URL length (path + query string)
@@ -3835,6 +3841,43 @@ async fn handle_h3_request(
             .plugin_cache
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
+
+    // Same refusal as the H1/H2 dispatcher: a client-selected flavor whose
+    // view omits the route's authentication or admission policy is refused
+    // before any plugin runs.
+    if plugin_cache_view
+        .capabilities()
+        .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    {
+        debug!(
+            proxy_id = %proxy.id,
+            protocol = ?request_protocol,
+            "Rejected HTTP/3 request: route admission policy does not run on the requested protocol"
+        );
+        record_h3_flavor_aware_reject(&state, http_flavor, 403);
+        send_h3_error_flavor_aware_with_policy(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::FORBIDDEN,
+            crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY,
+            crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+            "Request protocol not permitted on this route",
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await?;
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        return Ok(());
+    }
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();

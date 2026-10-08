@@ -2994,3 +2994,78 @@ fn streaming_h2_arm_uses_the_tested_body_regime() {
     assert!(!arm.contains("grpc_streaming_response_deadline("));
     assert!(!arm.contains("state.response_coalesce_flush("));
 }
+
+// ---------------------------------------------------------------------------
+// Client `Connection` nominations are resolved at ingress
+// ---------------------------------------------------------------------------
+//
+// Every backend builder strips the names the request's `Connection` field
+// lists from the FINAL outbound map, after the gateway and its plugins have
+// asserted identity, claim, GeoIP, and path-param headers. A frontend that
+// captured the client header block without resolving the nominations first
+// would let a client name one of those assertions and have the gateway strip
+// it. Each raw-header capture therefore confines the nominations first
+// (`proxy::headers::confine_connection_nominated_request_headers`).
+
+/// `(frontend, source file, function-body raw-header capture)`.
+const RAW_HEADER_INGRESS_SITES: &[(&str, &str, &str)] = &[
+    (
+        "H1/H2 (and HBONE inner requests)",
+        "src/proxy/mod.rs",
+        "ctx.set_raw_headers(req.headers().clone());",
+    ),
+    (
+        "native H3",
+        "src/http3/server.rs",
+        "ctx.set_raw_headers(raw_headers);",
+    ),
+];
+
+/// How many lines above the capture the confinement call may sit.
+const CONNECTION_CONFINEMENT_WINDOW_LINES: usize = 8;
+
+#[test]
+fn every_raw_header_ingress_confines_connection_nominations_first() {
+    for (frontend, file, capture) in RAW_HEADER_INGRESS_SITES {
+        let text = source(file);
+        let needle = format!("    {capture}");
+        let lines: Vec<&str> = text.lines().collect();
+        let sites: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == needle)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "{frontend}: `{file}` must capture the client header block exactly once"
+        );
+        let start = sites[0].saturating_sub(CONNECTION_CONFINEMENT_WINDOW_LINES);
+        let window = &lines[start..sites[0]];
+        assert!(
+            window
+                .iter()
+                .any(|line| line.contains("confine_connection_nominated_request_headers(")),
+            "{frontend}: `{file}` must confine `Connection` nominations before the capture"
+        );
+    }
+
+    // Every function-body capture in production sources is listed above.
+    let expected: BTreeSet<(String, String)> = RAW_HEADER_INGRESS_SITES
+        .iter()
+        .map(|(_, file, capture)| (file.to_string(), capture.to_string()))
+        .collect();
+    let mut found = BTreeSet::new();
+    for (path, text) in production_sources() {
+        for line in text.lines() {
+            if line.starts_with("    ctx.set_raw_headers(") {
+                found.insert((path.clone(), line.trim_start().to_string()));
+            }
+        }
+    }
+    assert_eq!(
+        found, expected,
+        "a raw client-header capture changed; list the new site above"
+    );
+}

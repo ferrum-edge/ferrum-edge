@@ -780,6 +780,58 @@ fn soap_composition_rejects_other_auth_plugins_in_both_auth_modes() {
     }
 }
 
+#[test]
+fn client_selected_flavor_views_flag_an_omitted_route_admission_policy() {
+    let config = make_config(
+        vec![
+            make_proxy("soap", "/soap", vec!["soap"]),
+            make_proxy("keyed", "/keyed", vec!["key"]),
+            make_proxy("cached", "/cached", vec!["cache"]),
+        ],
+        vec![
+            identity_soap_plugin_config("soap", "soap"),
+            make_plugin_config("key", "key_auth", PluginScope::Proxy, Some("keyed"), true),
+            make_plugin_config(
+                "cache",
+                "response_caching",
+                PluginScope::Proxy,
+                Some("cached"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let omits = |proxy: &str, protocol: ProxyProtocol| {
+        cache
+            .request_view("ferrum", proxy, protocol)
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    };
+
+    // An HTTP-only authentication plugin cannot run on a client-selected
+    // native-gRPC or WebSocket request, so both of those views are refused.
+    assert!(!omits("soap", ProxyProtocol::Http));
+    assert!(omits("soap", ProxyProtocol::Grpc));
+    assert!(omits("soap", ProxyProtocol::WebSocket));
+    // The composed gRPC-Web view keeps every HTTP plugin.
+    assert!(
+        !cache
+            .grpc_web_request_view("ferrum", "soap")
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    );
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+    ] {
+        // Authentication that runs on every HTTP-family flavor is unaffected.
+        assert!(!omits("keyed", protocol), "{protocol:?}");
+        // An HTTP-only plugin that is not admission policy refuses nothing.
+        assert!(!omits("cached", protocol), "{protocol:?}");
+    }
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};

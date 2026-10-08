@@ -30,6 +30,7 @@ mod collection_object_admission_tests;
 mod config_delta_namespace_prune_tests;
 mod config_delta_tests;
 mod configsync_lifecycle_tests;
+mod connection_nomination_ingress_tests;
 mod consumer_assertion_namespace_tests;
 mod consumer_index_tests;
 mod container_base_pinning_tests;

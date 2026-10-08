@@ -984,6 +984,7 @@ on a native-gRPC request.
 - New plugin file: `src/plugins/my_plugin.rs`, implements `Plugin`, constructor returns `Result<Self, String>`.
 - Add a priority constant in `src/plugins/mod.rs`.
 - Override `supported_protocols()` when not HTTP-only. Use the existing protocol constants.
+- Native gRPC and WebSocket views are selected by client headers, so a `Grpc` or `WebSocket` view that omits an instance its chain's `Http` view runs and that declares `gates_request_admission()` (default: `is_auth_plugin()`) is refused before any plugin runs (`PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`, rejection phase `route_protocol_admission`). A new HTTP-only plugin that refuses requests a route must not serve should declare `gates_request_admission()`; one that is not request-admission policy must not.
 - Register in `create_plugin_with_http_client()` with `?` on `new()` and add to `available_plugins()`.
 - Add unit tests for valid and invalid configs in `tests/unit/plugins/` and register the module.
 - Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.

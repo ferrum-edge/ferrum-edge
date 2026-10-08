@@ -26,6 +26,32 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased
+
+**gRPC and WebSocket requests are refused on routes whose authentication or
+admission plugins only run on HTTP** (issue
+[#6087](https://github.com/ferrum-edge/ferrum-edge/issues/6087)). A native gRPC
+or WebSocket request now gets `403`
+(`{"error":"Request protocol not permitted on this route"}`) or trailers-only
+`PERMISSION_DENIED` when its flavor's plugin view would omit a plugin that
+gates admission on the route's HTTP view. These requests used to run without
+that plugin. Before rolling out, check routes (and global plugin sets) that
+carry any of the following and also serve native gRPC or WebSocket clients:
+
+- `soap_ws_security`, or a custom authentication plugin that keeps the
+  HTTP-only `supported_protocols()` default;
+- `openapi_validator` in `block` mode, `mcp_gateway`, `ai_prompt_shield`,
+  `ai_rate_limiter`, `ai_tool_governor`, `ai_semantic_firewall`, or
+  `rate_limiting` with `mcp_tool_calls`.
+
+Serve that gRPC or WebSocket traffic from a separate route without those
+plugins, or authenticate it with a plugin that supports the flavor (every other
+built-in authentication plugin does). Custom authentication plugins that handle
+gRPC or WebSocket should list those protocols in `supported_protocols()`; other
+custom request-admission plugins can opt in with
+`Plugin::gates_request_admission()`. Refusals are logged with
+`rejection_phase: "route_protocol_admission"`. gRPC-Web is unaffected.
+
 ## Upgrading to 0.9.14
 
 0.9.14 (2026-10-07 UTC) is cut from main

@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — refuse gRPC and WebSocket requests that a route's
+  authentication or admission plugins cannot run on** (issue #6087). On an
+  HTTP-family route, native gRPC and WebSocket requests run the plugin view for
+  their flavor. When that view omits an authentication plugin or admission
+  policy that the route's HTTP view runs, the gateway now refuses the request
+  before any plugin runs, with `403`
+  `{"error":"Request protocol not permitted on this route"}` or trailers-only
+  `PERMISSION_DENIED` for native gRPC. The transaction log records
+  `rejection_phase: "route_protocol_admission"`. This covers every
+  authentication plugin (among built-ins only `soap_ws_security` is HTTP-only;
+  custom auth plugins that keep the HTTP-only `supported_protocols()` default
+  are included), `openapi_validator` in `block` mode, `mcp_gateway`,
+  `ai_prompt_shield`, `ai_rate_limiter`, `ai_tool_governor`,
+  `ai_semantic_firewall`, and `rate_limiting` with `mcp_tool_calls`. Custom
+  plugins opt in through the new `Plugin::gates_request_admission()`, which
+  defaults to `is_auth_plugin()`. The decision is a capability bit computed
+  when the plugin cache is built, so requests do no extra plugin scan. The
+  composed gRPC-Web view keeps every HTTP plugin and is unaffected. See
+  [Upgrade notes](docs/upgrade_guide.md#unreleased).
+- **Gateway-asserted request headers are applied after the client's
+  `Connection` nominations are resolved.** HTTP/1.1 and HTTP/3 ingress now
+  remove the fields a client's `Connection` header nominates before any plugin
+  runs, and rewrite `Connection` to keep only the `close` option and request
+  hop-by-hop names. The backend boundary's hop-by-hop strip can therefore no
+  longer remove consumer identity, `claim_headers`, GeoIP, path-param, or
+  transformer headers that the gateway adds. `Host`, `Content-Length`, and
+  `Expect` keep their values for routing and framing. HTTP/2 rejects
+  `Connection` and is unchanged.
+- **`claim_headers` destinations and `x-geo-country` treat `_` as `-` when
+  removing client values**, as the `x-consumer-*` namespace already does.
+  CGI-style backends (Rack, WSGI, PHP-FPM) fold both spellings onto one
+  variable, so they now see only the gateway's value.
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

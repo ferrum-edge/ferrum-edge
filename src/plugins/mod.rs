@@ -12123,6 +12123,25 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Returns `true` if this instance is request-admission policy a route
+    /// relies on: authentication, or a control that refuses requests the route
+    /// must not serve (schema validation, abuse and quota limits, AI request
+    /// guardrails).
+    ///
+    /// The client chooses the request flavor (native gRPC by `Content-Type`,
+    /// WebSocket by upgrade headers), and each flavor runs only the plugins
+    /// whose [`Self::supported_protocols`] include it. When a flavor's view
+    /// omits an instance like this that the route's HTTP view runs, the plugin
+    /// cache marks that view and the proxy refuses the request rather than
+    /// dispatching it without the policy.
+    ///
+    /// Defaults to [`Self::is_auth_plugin`], so every authentication plugin —
+    /// including a custom one that keeps the HTTP-only protocol default —
+    /// participates without opting in.
+    fn gates_request_admission(&self) -> bool {
+        self.is_auth_plugin()
+    }
+
     /// Cache-build diagnostic: whether this instance has an execution trigger.
     fn has_execution_trigger(&self) -> bool {
         false

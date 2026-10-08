@@ -143,16 +143,42 @@ pub fn is_consumer_assertion_header(name: &str) -> bool {
     true
 }
 
+/// Field-name equality under the folding backends apply: ASCII
+/// case-insensitive, with `_` and `-` treated as the same byte.
+///
+/// CGI-style backends (Rack, WSGI, PHP-FPM) map `X-Tenant-Id` and `X_Tenant_Id`
+/// onto the same `HTTP_X_TENANT_ID` variable, so a gateway-owned destination
+/// must be scrubbed of client values under this equivalence, not just case.
+/// Allocation-free.
+#[inline]
+pub fn field_names_equivalent_for_backends(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .all(|(x, y)| fold_field_name_byte(x) == fold_field_name_byte(y))
+}
+
+#[inline]
+fn fold_field_name_byte(byte: u8) -> u8 {
+    match byte {
+        b'_' => b'-',
+        other => other.to_ascii_lowercase(),
+    }
+}
+
 /// Returns `true` for every backend-visible gateway assertion: the
 /// [`is_consumer_assertion_header`] namespace plus the private GeoIP result
-/// (`x-geo-country`). ASCII case-insensitive and allocation-free.
+/// (`x-geo-country`). ASCII case-insensitive with `_` equivalent to `-`
+/// ([`field_names_equivalent_for_backends`]), and allocation-free.
 ///
 /// Outbound maps that plugins may have mutated are scrubbed of these names and
 /// then receive only the gateway's authoritative values
 /// (`crate::proxy::refresh_backend_gateway_assertion_headers`).
 #[inline]
 pub fn is_gateway_assertion_header(name: &str) -> bool {
-    is_consumer_assertion_header(name) || name.eq_ignore_ascii_case("x-geo-country")
+    is_consumer_assertion_header(name) || field_names_equivalent_for_backends(name, "x-geo-country")
 }
 
 define_header_name_set! {
@@ -425,6 +451,110 @@ pub fn strip_connection_listed_headers(headers: &mut http::HeaderMap) {
     let listed = parse_connection_listed_headers(headers);
     for name in listed {
         headers.remove(&name);
+    }
+}
+
+/// `Connection` options a client may keep nominating after ingress: the
+/// RFC 9110 §7.6.1 request-direction hop-by-hop fields, which every backend
+/// boundary strips anyway, plus the `close` connection option.
+#[inline]
+fn is_retained_connection_option(token: &str) -> bool {
+    const RETAINED: [&str; 9] = [
+        "close",
+        "connection",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    RETAINED
+        .iter()
+        .any(|retained| token.eq_ignore_ascii_case(retained))
+}
+
+/// Client fields that a `Connection` nomination must not remove at ingress
+/// because the gateway's own routing and framing read them. `Host` is routing
+/// input the client controls in any case, and `Content-Length` / `Expect` are
+/// stripped at the backend boundary ([`is_backend_request_strip_header`]).
+#[inline]
+fn is_ingress_protected_nominated_field(name: &str) -> bool {
+    matches!(name, "host" | "content-length" | "expect")
+}
+
+/// Resolve a client request's RFC 9110 §7.6.1 `Connection` nominations at
+/// ingress, before any plugin runs.
+///
+/// Every field the client nominates is removed from the client's own header
+/// set here, and `Connection` is rewritten to keep only `close` and the
+/// request hop-by-hop names. The backend builders still apply the
+/// Connection-listed strip to the FINAL outbound map; confining the nomination
+/// at ingress means that strip can no longer remove a field the gateway or a
+/// plugin asserted after admission — consumer identity, verified claim and
+/// path-param headers, GeoIP results, or transformer-added headers. Gateway
+/// assertions are therefore applied after the client's hop-by-hop fields are
+/// gone, not before.
+///
+/// `host`, `content-length`, and `expect` keep their client values for the
+/// gateway's routing and framing; retained hop-by-hop names keep theirs for
+/// protocol handling such as the WebSocket upgrade.
+///
+/// Hot path: returns after one lookup when `Connection` is absent (always on
+/// HTTP/2, where the field is malformed) and after an allocation-free scan
+/// when every token is already a retained option (`keep-alive`, `close`,
+/// `Upgrade`). Only a request that nominates some other field allocates.
+pub fn confine_connection_nominated_request_headers(headers: &mut http::HeaderMap) {
+    let connection = headers.get_all(http::header::CONNECTION);
+    let needs_rewrite = connection.iter().any(|value| {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        value.split(',').any(|token| {
+            let token = token.trim();
+            !token.is_empty() && !is_retained_connection_option(token)
+        })
+    });
+    if !needs_rewrite {
+        return;
+    }
+
+    let mut retained = String::new();
+    let mut nominated: Vec<http::HeaderName> = Vec::new();
+    for value in connection.iter() {
+        // A non-visible-ASCII value carries no usable option; drop it whole.
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if is_retained_connection_option(token) {
+                if !retained.is_empty() {
+                    retained.push_str(", ");
+                }
+                retained.push_str(token);
+                continue;
+            }
+            let Ok(name) = http::HeaderName::from_bytes(token.as_bytes()) else {
+                continue;
+            };
+            if !is_ingress_protected_nominated_field(name.as_str()) && !nominated.contains(&name) {
+                nominated.push(name);
+            }
+        }
+    }
+    for name in nominated {
+        headers.remove(&name);
+    }
+    headers.remove(http::header::CONNECTION);
+    if !retained.is_empty()
+        && let Ok(value) = http::HeaderValue::from_str(&retained)
+    {
+        headers.insert(http::header::CONNECTION, value);
     }
 }
 
