@@ -8492,7 +8492,9 @@ fn l4_route_proxies_for_namespace(
                 || base_suffix.clone(),
                 |namespace_suffix| format!("{base_suffix}-{namespace_suffix}"),
             );
-            let id = if scheme.is_udp() || config_namespace == object.metadata.namespace {
+            // Every L4 route kind shares one id rule: readable in its own
+            // namespace, source-bound when materialized in a parent's.
+            let id = if config_namespace == object.metadata.namespace {
                 resource_id(
                     "gwapi-l4",
                     &object.metadata.namespace,

@@ -44,6 +44,16 @@ remain the way to require `ns` claims on a **single-namespace** CP.
 > unless the token carries an `ns` claim. Re-mint operator tokens with `ns`
 > before widening the CP scope.
 
+> **Ferrum namespaces and Kubernetes namespaces share names.** With admin
+> enforcement on, an `operator` may set backend TLS material
+> (`backend_tls_client_cert_path`, `backend_tls_client_key_path`,
+> `backend_tls_server_ca_cert_path`) only to inline PEM, `system://`, or a
+> `k8s://` Secret in the addressed namespace (see `docs/admin_api.md`). That
+> Secret is read with the gateway's own ServiceAccount from the Kubernetes
+> namespace with the same name as the Ferrum namespace, so name Ferrum tenant
+> namespaces so they never coincide with a Kubernetes namespace the tenant must
+> not read, such as `kube-system` or a platform namespace.
+
 Both CP vars live in the *Control Plane / Data Plane (CP/DP)* section of
 `ferrum.conf` next to `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The resolved scope
 is printed in the CP startup log (`CP mode: serving single namespace ...`,

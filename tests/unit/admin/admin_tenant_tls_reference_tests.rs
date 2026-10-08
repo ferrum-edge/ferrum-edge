@@ -36,11 +36,15 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn operator_token(namespaces: &[&str]) -> String {
+    token("operator", namespaces)
+}
+
+fn token(role: &str, namespaces: &[&str]) -> String {
     let now = Utc::now();
     let claims = json!({
         "iss": JWT_ISSUER,
-        "sub": "tenant-a-operator",
-        "role": "operator",
+        "sub": format!("tenant-a-{role}"),
+        "role": role,
         "ns": namespaces,
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
@@ -133,8 +137,17 @@ async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
 }
 
 async fn post(base: &str, path: &str, token: &str, body: &Value) -> (u16, Value) {
-    let resp = reqwest::Client::new()
-        .post(format!("{base}{path}"))
+    let request = reqwest::Client::new().post(format!("{base}{path}"));
+    send(request, token, body).await
+}
+
+async fn put(base: &str, path: &str, token: &str, body: &Value) -> (u16, Value) {
+    let request = reqwest::Client::new().put(format!("{base}{path}"));
+    send(request, token, body).await
+}
+
+async fn send(request: reqwest::RequestBuilder, token: &str, body: &Value) -> (u16, Value) {
+    let resp = request
         .bearer_auth(token)
         .header("X-Ferrum-Namespace", "tenant-a")
         .json(body)
@@ -216,4 +229,161 @@ async fn namespace_scoped_operator_cannot_reference_material_outside_its_namespa
             );
         }
     }
+}
+
+/// A real self-signed CA, so an admitted reference also passes the load-time
+/// validation that runs after the scope check.
+fn ca_pem() -> String {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut params = CertificateParams::new(vec!["ca.test".to_string()]).expect("ca params");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.self_signed(&key).expect("ca cert").pem()
+}
+
+fn write_ca(temp_dir: &TempDir, file: &str) -> String {
+    let path = temp_dir.path().join(file);
+    std::fs::write(&path, ca_pem()).expect("write CA file");
+    path.to_str().expect("utf-8 temp path").to_string()
+}
+
+fn named_upstream(id: &str, ca: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "targets": [{"host": "127.0.0.1", "port": 8443, "weight": 100}],
+        "algorithm": "round_robin",
+        "backend_tls_server_ca_cert_path": ca,
+    })
+}
+
+fn is_scope_refusal(response: &Value) -> bool {
+    let error = response["error"].as_str().unwrap_or_default();
+    error.contains("namespace of the resource")
+        || error.contains("secret-manager")
+        || error.contains("gateway filesystem")
+}
+
+#[tokio::test]
+async fn namespace_scoped_operator_keeps_material_it_may_reference() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = sqlite_store(&temp_dir, "tenant_tls_reference_admitted.db").await;
+    let (base, _shutdown) = start_admin(tenant_control_plane_state(db)).await;
+    let token = operator_token(&["tenant-a"]);
+
+    let inline_ca = ca_pem();
+    for (id, ca) in [("u-inline", inline_ca.as_str()), ("u-system", "system://")] {
+        let body = named_upstream(id, ca);
+        let (status, response) = post(&base, "/upstreams", &token, &body).await;
+        assert!(
+            (200..300).contains(&status),
+            "{id} must be admitted: {status} {response}"
+        );
+    }
+
+    // The addressed namespace's own Secret passes the scope check; whatever
+    // the load then reports, it is not a scope refusal.
+    let own_secret = named_upstream("u-own-secret", "k8s://tenant-a/partner-ca#ca.crt");
+    let (_, response) = post(&base, "/upstreams", &token, &own_secret).await;
+    assert!(
+        !is_scope_refusal(&response),
+        "an own-namespace Secret must not be refused as out of scope: {response}"
+    );
+}
+
+#[tokio::test]
+async fn admin_tokens_and_unenforced_planes_are_unaffected() {
+    let temp_dir = TempDir::new().unwrap();
+    let ca_file = write_ca(&temp_dir, "platform-ca.pem");
+
+    let db = sqlite_store(&temp_dir, "tenant_tls_reference_admin.db").await;
+    let (base, _shutdown) = start_admin(tenant_control_plane_state(db)).await;
+    let (status, response) = post(
+        &base,
+        "/upstreams",
+        &operator_token(&["tenant-a"]),
+        &named_upstream("u-operator", &ca_file),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an operator may not name a gateway file: {response}"
+    );
+    assert!(is_scope_refusal(&response), "{response}");
+
+    let (status, response) = post(
+        &base,
+        "/upstreams",
+        &token("admin", &["tenant-a"]),
+        &named_upstream("u-admin", &ca_file),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "an admin token is not namespace-scoped for TLS material: {status} {response}"
+    );
+
+    // Without `ns`-claim enforcement the namespace header is only a routing
+    // selector, so the scope check does not apply.
+    let db = sqlite_store(&temp_dir, "tenant_tls_reference_unenforced.db").await;
+    let mut state = tenant_control_plane_state(db);
+    state.admin_require_namespace_claim = false;
+    let (base, _shutdown_unenforced) = start_admin(state).await;
+    let (status, response) = post(
+        &base,
+        "/upstreams",
+        &operator_token(&["tenant-a"]),
+        &named_upstream("u-unenforced", &ca_file),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "enforcement off must leave operator writes unaffected: {status} {response}"
+    );
+}
+
+#[tokio::test]
+async fn an_update_may_keep_a_stored_value_but_not_introduce_a_new_one() {
+    let temp_dir = TempDir::new().unwrap();
+    let stored_ca = write_ca(&temp_dir, "stored-ca.pem");
+    let other_ca = write_ca(&temp_dir, "other-ca.pem");
+    let db = sqlite_store(&temp_dir, "tenant_tls_reference_update.db").await;
+    let (base, _shutdown) = start_admin(tenant_control_plane_state(db)).await;
+
+    let (status, response) = post(
+        &base,
+        "/upstreams",
+        &token("admin", &["tenant-a"]),
+        &named_upstream("u-partner", &stored_ca),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "an admin configures the material: {status} {response}"
+    );
+
+    // An unrelated operator update that carries the stored value unchanged is
+    // admitted, and the stored value survives.
+    let operator = operator_token(&["tenant-a"]);
+    let mut unrelated = named_upstream("u-partner", &stored_ca);
+    unrelated["algorithm"] = json!("least_connections");
+    let (status, response) = put(&base, "/upstreams/u-partner", &operator, &unrelated).await;
+    assert!(
+        (200..300).contains(&status),
+        "keeping the stored value must be admitted: {status} {response}"
+    );
+    assert_eq!(
+        response["backend_tls_server_ca_cert_path"].as_str(),
+        Some(stored_ca.as_str()),
+        "the stored value must be preserved: {response}"
+    );
+
+    // Changing it to another gateway file is a new reference and is refused.
+    let changed = named_upstream("u-partner", &other_ca);
+    let (status, response) = put(&base, "/upstreams/u-partner", &operator, &changed).await;
+    assert_eq!(
+        status, 400,
+        "a new gateway file must be refused: {response}"
+    );
+    assert!(is_scope_refusal(&response), "{response}");
 }

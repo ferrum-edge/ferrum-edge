@@ -9,39 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — cross-namespace HTTPRoute/GRPCRoute resources keep distinct
-  ids** (issue #6092). A route materialized in its parent Gateway's namespace
-  now gets proxy, upstream and derived plugin ids bound to its full source
-  identity (`<readable id>__<digest>`), so two tenants whose namespace and
-  route names dash-join to the same string no longer share, replace or extend
-  each other's proxy, upstream or dispatch plugins. Routes in their own
-  namespace keep the readable id. A second route object that derives an id
-  another route already owns is refused and its claim is reported in Route
-  status. Data planes now refuse a ConfigSync snapshot that carries two
-  resources with one `(namespace, id)`.
-- **BREAKING — Gateway API backendRefs refuse `type: ExternalName` Services**
-  (issue #6092). An ExternalName Service is a DNS alias that can name any
-  host, including another namespace's Service or the gateway's own loopback,
-  without any ReferenceGrant being consulted. HTTPRoute/GRPCRoute refuse the
-  backend fail-closed, TCPRoute/TLSRoute/UDPRoute refuse the route, and status
-  reports `ResolvedRefs=False` / `UnsupportedProtocol`.
-- **BREAKING — DestinationRule TLS material stays in the rule's namespace**
-  (issue #6092). `trafficPolicy.tls` `caCertificates`, `clientCertificate` and
-  `privateKey` (top level, `portLevelSettings`, and subsets) in any namespace
-  other than the mesh root namespace may name only inline PEM, `system://`, a
-  local file, or a `k8s://` Secret in the rule's own namespace. Other
-  namespaces' Secrets and `vault`, `aws`, `azure`, `gcp`, `managed`, `acme` and
-  `pkcs11` sources are refused at Kubernetes translation and at
-  native/file/xDS slice validation. Root-namespace rules are unchanged.
-- **BREAKING — namespace-scoped operators cannot point backend TLS outside
-  their namespace** (issue #6092). Where the admin `ns` claim is enforced, an
-  `operator` creating or updating a proxy or upstream may introduce only inline
-  PEM, `system://`, or a `k8s://` Secret in the addressed namespace in
-  `backend_tls_client_cert_path`, `backend_tls_client_key_path` and
-  `backend_tls_server_ca_cert_path`. Any other reference is refused with `400`
-  before the material is loaded, so the answer no longer depends on whether
-  the material exists. A value already stored on the resource is left alone,
-  and `admin` tokens are unaffected.
+- **BREAKING — generated Gateway API route ids are bound to the full source
+  identity** (issue #6092). A route materialized in its parent Gateway's
+  namespace now gets proxy, upstream and derived plugin ids of the form
+  `<readable id>__<digest>`; routes in their own namespace keep the readable
+  id, and TCPRoute, TLSRoute and UDPRoute follow the same rule. A second route
+  object that derives an id another route already owns is refused and reported
+  in Route status.
+- **BREAKING — duplicate `(namespace, id)` resources are refused** (issue
+  #6092). The control plane refuses a full or incremental candidate, or a
+  Kubernetes translation, that carries two resources of one kind with the same
+  namespace and id, and keeps its last accepted configuration. Data planes
+  refuse such a ConfigSync snapshot as well.
+- **BREAKING — Gateway API backendRefs to `type: ExternalName` Services are
+  unsupported** (issue #6092). HTTPRoute/GRPCRoute fail that backend closed,
+  TCPRoute/TLSRoute/UDPRoute refuse the route, and status reports
+  `ResolvedRefs=False` / `UnsupportedProtocol`.
+- **BREAKING — DestinationRule TLS material outside the mesh root namespace
+  is namespace-scoped** (issue #6092). `trafficPolicy.tls` `caCertificates`,
+  `clientCertificate` and `privateKey` (top level, `portLevelSettings`, and
+  subsets) may name only inline PEM, `system://`, a `k8s://` Secret in the
+  rule's own namespace, or a local file under a directory listed in the new
+  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default, so no local file).
+  Listed files must be absolute paths without `..` and are re-checked after
+  symlink resolution on the data plane. Other sources are refused at
+  Kubernetes translation and at native/file/xDS slice validation.
+  Root-namespace rules are unchanged.
+- **BREAKING — namespace-scoped operators can set backend TLS material only
+  within their namespace** (issue #6092). Where the admin `ns` claim is
+  enforced, an `operator` creating or updating a proxy or upstream may
+  introduce only inline PEM, `system://`, or a `k8s://` Secret in the addressed
+  namespace in `backend_tls_client_cert_path`, `backend_tls_client_key_path`
+  and `backend_tls_server_ca_cert_path`; anything else is refused with `400`
+  before it is loaded. Values already stored on the resource are kept, and
+  `admin` tokens are unaffected.
 
 ### Performance
 

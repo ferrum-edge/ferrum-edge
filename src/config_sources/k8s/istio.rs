@@ -2728,39 +2728,6 @@ fn translate_client_tls_settings(
             return Err(invalid_resource(object, error));
         }
     }
-    // The proxy resolves this material with its own identity, so a rule in a
-    // tenant namespace may not name another namespace's Secret or a store only
-    // the gateway can read.
-    let referenced_material = [
-        (
-            "trafficPolicy.tls.caCertificates",
-            ca_certificates.as_deref(),
-            crate::tls::source::MaterialKind::CaBundle,
-        ),
-        (
-            "trafficPolicy.tls.clientCertificate",
-            client_certificate.as_deref(),
-            crate::tls::source::MaterialKind::Cert,
-        ),
-        (
-            "trafficPolicy.tls.privateKey",
-            private_key.as_deref(),
-            crate::tls::source::MaterialKind::Key,
-        ),
-    ];
-    for (field, value, kind) in referenced_material {
-        if let Some(value) = value
-            && let Some(error) = crate::modes::mesh::config::destination_rule_tls_reference_error(
-                field,
-                value,
-                kind,
-                &object.metadata.namespace,
-                root_namespace,
-            )
-        {
-            return Err(invalid_resource(object, error));
-        }
-    }
     if let Some(error) = validate_system_trust_roots_skip_verify_pairing(
         "trafficPolicy.tls.caCertificates",
         "trafficPolicy.tls.insecureSkipVerify",
@@ -2798,6 +2765,40 @@ fn translate_client_tls_settings(
                 object,
                 format!("trafficPolicy.tls.mode {mode_raw:?} is not a client-side TLS mode"),
             ));
+        }
+    }
+
+    // The proxy resolves this material with its own identity, so a rule in a
+    // tenant namespace may not name another namespace's Secret, a store only
+    // the gateway can read, or a file outside the tenant file roots.
+    let referenced_material = [
+        (
+            "trafficPolicy.tls.caCertificates",
+            ca_certificates.as_deref(),
+            crate::tls::source::MaterialKind::CaBundle,
+        ),
+        (
+            "trafficPolicy.tls.clientCertificate",
+            client_certificate.as_deref(),
+            crate::tls::source::MaterialKind::Cert,
+        ),
+        (
+            "trafficPolicy.tls.privateKey",
+            private_key.as_deref(),
+            crate::tls::source::MaterialKind::Key,
+        ),
+    ];
+    for (field, value, kind) in referenced_material {
+        if let Some(value) = value
+            && let Some(error) = crate::modes::mesh::config::destination_rule_tls_reference_error(
+                field,
+                value,
+                kind,
+                &object.metadata.namespace,
+                root_namespace,
+            )
+        {
+            return Err(invalid_resource(object, error));
         }
     }
 
@@ -18999,7 +19000,7 @@ extensionProviders:
                     "trafficPolicy": {
                         "tls": {
                             "mode": "SIMPLE",
-                            "caCertificates": "/etc/certs/ca.pem",
+                            "caCertificates": "k8s://default/reviews-tls#ca.crt",
                             "sni": "reviews.example.com"
                         }
                     }
@@ -19018,7 +19019,10 @@ extensionProviders:
             .as_ref()
             .expect("tls block");
         assert_eq!(tls.mode, MtlsMode::Simple);
-        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+        assert_eq!(
+            tls.ca_certificates.as_deref(),
+            Some("k8s://default/reviews-tls#ca.crt")
+        );
         assert_eq!(tls.sni.as_deref(), Some("reviews.example.com"));
         assert!(tls.client_certificate.is_none());
         assert!(tls.private_key.is_none());
@@ -19035,9 +19039,9 @@ extensionProviders:
                     "trafficPolicy": {
                         "tls": {
                             "mode": "MUTUAL",
-                            "caCertificates": "/etc/certs/ca.pem",
-                            "clientCertificate": "/etc/certs/client.pem",
-                            "privateKey": "/etc/certs/client.key",
+                            "caCertificates": "k8s://default/reviews-tls#ca.crt",
+                            "clientCertificate": "k8s://default/reviews-tls#tls.crt",
+                            "privateKey": "k8s://default/reviews-tls#tls.key",
                             "subjectAltNames": ["spiffe://example/sa/reviews"],
                             "insecureSkipVerify": false
                         }
@@ -19059,10 +19063,16 @@ extensionProviders:
         assert_eq!(tls.mode, MtlsMode::Mutual);
         assert_eq!(
             tls.client_certificate.as_deref(),
-            Some("/etc/certs/client.pem")
+            Some("k8s://default/reviews-tls#tls.crt")
         );
-        assert_eq!(tls.private_key.as_deref(), Some("/etc/certs/client.key"));
-        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+        assert_eq!(
+            tls.private_key.as_deref(),
+            Some("k8s://default/reviews-tls#tls.key")
+        );
+        assert_eq!(
+            tls.ca_certificates.as_deref(),
+            Some("k8s://default/reviews-tls#ca.crt")
+        );
         assert_eq!(
             tls.subject_alt_names,
             vec!["spiffe://example/sa/reviews".to_string()]
@@ -19484,7 +19494,7 @@ extensionProviders:
                         "trafficPolicy": {
                             "tls": {
                                 "mode": "SIMPLE",
-                                "caCertificates": "/etc/certs/v1-ca.pem"
+                                "caCertificates": "k8s://default/reviews-v1-tls#ca.crt"
                             }
                         }
                     }]
@@ -19504,7 +19514,10 @@ extensionProviders:
             .as_ref()
             .expect("subset tls");
         assert_eq!(tls.mode, MtlsMode::Simple);
-        assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/v1-ca.pem"));
+        assert_eq!(
+            tls.ca_certificates.as_deref(),
+            Some("k8s://default/reviews-v1-tls#ca.crt")
+        );
 
         // No translator-level warning is emitted because the per-subset TLS
         // overlay is applied on the cold path.
@@ -19528,7 +19541,7 @@ extensionProviders:
                 serde_json::json!({
                     "host": "reviews.default.svc.cluster.local",
                     "trafficPolicy": {
-                        "tls": {"caCertificates": "/etc/certs/ca.pem"}
+                        "tls": {"caCertificates": "k8s://default/reviews-tls#ca.crt"}
                     }
                 }),
             )],

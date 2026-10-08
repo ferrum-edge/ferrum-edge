@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::{GatewayConfig, K8sMeshOverlay};
+use crate::config::validation_pipeline::collect_duplicate_resource_id_errors;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, NodeWaypointInventory,
     translate_k8s_objects_collecting_skips,
@@ -776,6 +777,21 @@ pub fn publish_k8s_reconcile(
         // A retention publishes its edited copy; every other reconcile
         // publishes the candidate itself, with no clone at all.
         let effective_translation = retained_translation.as_ref().unwrap_or(translation);
+
+        // Every data plane refuses a snapshot carrying two resources with one
+        // `(namespace, id)`. Refuse the translation here instead, keeping the
+        // last accepted overlay, so the fault is reported on the CP rather than
+        // freezing the whole fleet on its last good snapshot.
+        let duplicate_ids = collect_duplicate_resource_id_errors(effective_translation);
+        if !duplicate_ids.is_empty() {
+            for message in &duplicate_ids {
+                error!(
+                    "Kubernetes configuration rejected — {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
+            }
+            return None;
+        }
 
         // Validate the exact composed candidate before retaining the overlay
         // or making it visible. Kubernetes translation can synthesize plugin

@@ -10391,6 +10391,23 @@ fn apply_destination_rules(
     sorted_destination_rules
         .sort_by(|a, b| (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host)));
 
+    // Slice validation admitted a tenant rule's local files lexically; this
+    // node reads them, so re-check each after symlink resolution before
+    // anything is applied.
+    for dr in &sorted_destination_rules {
+        let escape = crate::modes::mesh::config::destination_rule_tls_file_escape_error(
+            dr,
+            &mesh_slice.istio_root_namespace,
+        );
+        if let Some(error) = escape {
+            return Err(anyhow::anyhow!(
+                "DestinationRule {:?}/{:?} refused: {error}",
+                dr.namespace,
+                dr.name
+            ));
+        }
+    }
+
     // Owning Service port per materialized per-port outbound upstream
     // (forward-derived from the slice, like `mesh_outbound_service_groups`).
     // A per-port upstream accepts `portLevelSettings` ONLY for its owning
@@ -29158,9 +29175,9 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Mutual,
-                        ca_certificates: Some("/etc/certs/ca.pem".to_string()),
-                        client_certificate: Some("/etc/certs/client.pem".to_string()),
-                        private_key: Some("/etc/certs/client.key".to_string()),
+                        ca_certificates: Some("k8s://default/reviews-tls#ca.crt".to_string()),
+                        client_certificate: Some("k8s://default/reviews-tls#tls.crt".to_string()),
+                        private_key: Some("k8s://default/reviews-tls#tls.key".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -29178,15 +29195,15 @@ mod tests {
         let upstream = &config.upstreams[0];
         assert_eq!(
             upstream.backend_tls_client_cert_path.as_deref(),
-            Some("/etc/certs/client.pem")
+            Some("k8s://default/reviews-tls#tls.crt")
         );
         assert_eq!(
             upstream.backend_tls_client_key_path.as_deref(),
-            Some("/etc/certs/client.key")
+            Some("k8s://default/reviews-tls#tls.key")
         );
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
-            Some("/etc/certs/ca.pem")
+            Some("k8s://default/reviews-tls#ca.crt")
         );
         assert!(upstream.backend_tls_verify_server_cert);
     }
@@ -29223,7 +29240,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         sni: Some("reviews.default.svc.cluster.local".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
@@ -29236,9 +29253,9 @@ mod tests {
                     traffic_policy: Some(MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Mutual,
-                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
-                            client_certificate: Some("/etc/certs/v1-client.pem".to_string()),
-                            private_key: Some("/etc/certs/v1-client.key".to_string()),
+                            ca_certificates: Some("k8s://default/v1-tls#ca.crt".to_string()),
+                            client_certificate: Some("k8s://default/v1-tls#tls.crt".to_string()),
+                            private_key: Some("k8s://default/v1-tls#tls.key".to_string()),
                             sni: Some("v1.reviews.mesh.internal".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
@@ -29257,7 +29274,7 @@ mod tests {
         // Upstream-level TLS reflects the top-level DR.tls.
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
-            Some("/etc/certs/upstream-ca.pem"),
+            Some("k8s://default/up-tls#ca.crt"),
             "upstream CA still reflects upstream-level DR.tls"
         );
         assert_eq!(
@@ -29276,16 +29293,16 @@ mod tests {
             .expect("v1 resolved tls is Some");
         assert_eq!(
             subset_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/v1-ca.pem"),
+            Some("k8s://default/v1-tls#ca.crt"),
             "subset overlay swaps the CA for v1 dispatch"
         );
         assert_eq!(
             subset_tls.client_cert_path.as_deref(),
-            Some("/etc/certs/v1-client.pem")
+            Some("k8s://default/v1-tls#tls.crt")
         );
         assert_eq!(
             subset_tls.client_key_path.as_deref(),
-            Some("/etc/certs/v1-client.key")
+            Some("k8s://default/v1-tls#tls.key")
         );
         assert_eq!(
             subset_tls.sni.as_deref(),
@@ -29522,7 +29539,7 @@ mod tests {
             MeshTrafficPolicy {
                 tls: Some(MeshTrafficPolicyTls {
                     mode: MtlsMode::Simple,
-                    ca_certificates: Some("/etc/certs/port-8080-ca.pem".to_string()),
+                    ca_certificates: Some("k8s://default/secure-8080-tls#ca.crt".to_string()),
                     sni: Some("port8080.secure.internal".to_string()),
                     ..MeshTrafficPolicyTls::default()
                 }),
@@ -29555,7 +29572,7 @@ mod tests {
             .expect("port 8080 resolved backend TLS");
         assert_eq!(
             tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/port-8080-ca.pem"),
+            Some("k8s://default/secure-8080-tls#ca.crt"),
             "per-port TLS resolves the CA for port 8080"
         );
         assert_eq!(tls.sni.as_deref(), Some("port8080.secure.internal"));
@@ -29661,7 +29678,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -29673,7 +29690,7 @@ mod tests {
                     traffic_policy: Some(MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Simple,
-                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
+                            ca_certificates: Some("k8s://default/v1-tls#ca.crt".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
                         ..MeshTrafficPolicy::default()
@@ -29693,12 +29710,12 @@ mod tests {
 
         assert_eq!(
             p1.resolved_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/upstream-ca.pem"),
+            Some("k8s://default/up-tls#ca.crt"),
             "proxy without upstream_subset gets upstream-level CA"
         );
         assert_eq!(
             p2.resolved_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/v1-ca.pem"),
+            Some("k8s://default/v1-tls#ca.crt"),
             "proxy with upstream_subset='v1' gets subset overlay CA"
         );
     }
@@ -29725,7 +29742,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -39571,7 +39588,7 @@ mod tests {
                     MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Simple,
-                            ca_certificates: Some("/etc/certs/primary-ca.pem".to_string()),
+                            ca_certificates: Some("k8s://default/primary-tls#ca.crt".to_string()),
                             sni: Some("primary.external.com".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
@@ -39606,7 +39623,7 @@ mod tests {
             .expect("service-port override carries resolved TLS policy");
         assert_eq!(
             tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/primary-ca.pem")
+            Some("k8s://default/primary-tls#ca.crt")
         );
         assert_eq!(tls.sni.as_deref(), Some("primary.external.com"));
     }

@@ -295,6 +295,46 @@ pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, Str
     Ok(value.min(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
 }
 
+/// Settings key for the directories tenant DestinationRules may name TLS
+/// material files under.
+pub const MESH_TENANT_TLS_FILE_ROOTS_KEY: &str = "FERRUM_MESH_TENANT_TLS_FILE_ROOTS";
+
+/// Pure parse/validation for `FERRUM_MESH_TENANT_TLS_FILE_ROOTS`.
+///
+/// Comma-separated absolute directories; blank entries are ignored and an
+/// unset or blank value yields no roots (tenant DestinationRules may name no
+/// local file). Each entry must be absolute, contain no `..` component, and
+/// not be the filesystem root. Diagnostics name the entry position only.
+/// Used by [`EnvConfig`] and
+/// [`crate::tls::source::effective_mesh_tenant_tls_file_roots`].
+pub fn parse_mesh_tenant_tls_file_roots(
+    raw: Option<&str>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut roots = Vec::new();
+    let Some(raw) = raw else {
+        return Ok(roots);
+    };
+    for (index, entry) in raw.split(',').map(str::trim).enumerate() {
+        if entry.is_empty() {
+            continue;
+        }
+        let path = std::path::PathBuf::from(entry);
+        let has_parent_component = path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir));
+        if !path.is_absolute() || has_parent_component || path.parent().is_none() {
+            return Err(format!(
+                "{MESH_TENANT_TLS_FILE_ROOTS_KEY} entry {index} must be an absolute directory \
+                 without `..` components and must not be the filesystem root"
+            ));
+        }
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
 /// Settings key for the shared TLS state document byte ceiling.
 pub const TLS_STORE_MAX_DOCUMENT_BYTES_KEY: &str = "FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES";
 /// Default shared TLS state document byte ceiling (16 MiB).
@@ -2689,6 +2729,10 @@ pub struct EnvConfig {
     /// old-generation backend pool entries. 0 leaves existing connections to
     /// expire naturally.
     pub mesh_svid_rotation_drain_seconds: u64,
+    /// Directories a DestinationRule outside the mesh root namespace may name
+    /// TLS material files under (`FERRUM_MESH_TENANT_TLS_FILE_ROOTS`). Empty
+    /// (the default) admits no tenant file.
+    pub mesh_tenant_tls_file_roots: Vec<std::path::PathBuf>,
     /// Ring capacity of the in-memory `mesh_authz` deny recorder consumed by
     /// `GET /mesh/policy-denies/recent`. Each entry is ~200–400 bytes. The
     /// recorder is exception-path only (touched only on a deny) and bounded
@@ -4218,6 +4262,7 @@ impl Default for EnvConfig {
                 crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES,
             mesh_node_waypoint_relay_pod_uid: None,
             mesh_svid_rotation_drain_seconds: 0,
+            mesh_tenant_tls_file_roots: Vec::new(),
             mesh_policy_deny_log_capacity: crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
@@ -5058,6 +5103,13 @@ impl EnvConfig {
                 other => other.to_string(),
             })?;
 
+        // Shared by the Kubernetes translator, mesh slice validation, and
+        // DestinationRule application, so install one process snapshot.
+        let mesh_tenant_tls_file_roots = parse_mesh_tenant_tls_file_roots(
+            resolve_var(conf, MESH_TENANT_TLS_FILE_ROOTS_KEY).as_deref(),
+        )?;
+        crate::tls::source::install_mesh_tenant_tls_file_roots(mesh_tenant_tls_file_roots.clone())?;
+
         let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
             parse_tls_source_execution_policy(
                 resolve_var(conf, TLS_SOURCE_MAX_BLOCKING_CONCURRENCY_KEY).as_deref(),
@@ -5756,6 +5808,7 @@ impl EnvConfig {
             mesh_app_probe_max_active_probes,
             mesh_node_waypoint_relay_pod_uid,
             mesh_svid_rotation_drain_seconds,
+            mesh_tenant_tls_file_roots,
             mesh_policy_deny_log_capacity,
             node_agent_proxy_mode,
             node_agent_admin_enabled,

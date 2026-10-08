@@ -5737,7 +5737,7 @@ fn tls_reference_refusal<R: AdminResource>(
         if stored.contains(&(field, value, kind)) {
             continue;
         }
-        let verdict = check_namespace_scoped_material_reference(value, kind, namespace, false);
+        let verdict = check_namespace_scoped_material_reference(value, kind, namespace, &[]);
         if let Err(refusal) = verdict {
             return Some(super::json_response(
                 StatusCode::BAD_REQUEST,

@@ -38,17 +38,26 @@ rolling out, check:
   GRPCRoute answer that backend's share of traffic fail-closed, and
   TCPRoute/TLSRoute/UDPRoute reject the route. Find them with
   `kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="ExternalName")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'`
-  and replace each with a selector Service, or a selector-less Service with an
-  EndpointSlice you own, in the route's namespace (or a cross-namespace Service
-  authorized by a ReferenceGrant).
+  and point each backendRef at a selector Service in the route's namespace,
+  or at a Service in another namespace that a ReferenceGrant authorizes.
 - **Istio DestinationRules with client TLS material.** Outside the mesh root
   namespace, `caCertificates`, `clientCertificate` and `privateKey` may name
-  only inline PEM, `system://`, a local file, or a `k8s://` Secret in the
-  rule's own namespace. A rule that names another namespace's Secret or a
-  `vault://`, `aws://`, `azure://`, `gcp://`, `managed://`, `acme://` or
-  `pkcs11://` source now fails translation (`FerrumAccepted=False`) and native,
-  file and xDS slice validation. Copy the Secret into the rule's namespace, or
-  move the rule into the mesh root namespace if it is platform policy.
+  only inline PEM, `system://`, or a `k8s://` Secret in the rule's own
+  namespace. A rule that names another namespace's Secret or a `vault://`,
+  `aws://`, `azure://`, `gcp://`, `managed://`, `acme://` or `pkcs11://` source
+  now fails translation (`FerrumAccepted=False`) and native, file and xDS slice
+  validation. Copy the Secret into the rule's namespace, or move the rule into
+  the mesh root namespace if it is platform policy.
+- **BREAKING: DestinationRules outside the mesh root namespace can no longer
+  name local files by default.** A path or `file://` value in
+  `caCertificates`, `clientCertificate` or `privateKey` is refused unless it is
+  an absolute path, without `..`, under a directory listed in the new
+  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default). Data planes re-check
+  each listed file after resolving symlinks and refuse the slice if it leaves
+  the listed directories. If tenants legitimately mount their own certificates
+  (for example into their Sidecar pods), list only those directories, on the
+  control plane and on every mesh data plane; otherwise switch the rule to a
+  `k8s://` Secret in its own namespace. Root-namespace rules are unchanged.
 - **Namespace-scoped Admin API operators.** Where the `ns` claim is enforced
   (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, or a multi-namespace control
   plane), an `operator` token can set `backend_tls_client_cert_path`,
@@ -56,14 +65,23 @@ rolling out, check:
   inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace.
   Automation that writes file paths or secret-manager references with operator
   tokens must use an `admin` token instead. Values already stored on a
-  resource keep working and survive unrelated updates.
+  resource keep working and survive unrelated updates. The check treats the
+  Ferrum namespace an operator is scoped to as the Kubernetes namespace of the
+  same name: `k8s://<that namespace>/…` stays admitted and is read with the
+  gateway's own ServiceAccount. Do not give a Ferrum tenant namespace the name
+  of a Kubernetes namespace that tenant should not read (for example
+  `kube-system` or a platform namespace).
 - **Generated ids of cross-namespace HTTPRoutes and GRPCRoutes** now end in
   `__<digest>`. Nothing needs to change in Kubernetes, but dashboards, alerts
   or log queries that match these proxy, upstream or plugin ids by exact value
   must be updated. Same-namespace routes keep their ids.
-- **Data planes refuse ConfigSync snapshots with duplicate `(namespace, id)`
-  resources** and keep serving their last accepted configuration. Run the
-  control plane and data planes on the same build, as always.
+- **Duplicate `(namespace, id)` resources are refused.** The control plane
+  refuses a full or incremental candidate, or a Kubernetes translation, that
+  carries two resources of one kind with the same namespace and id; a refused
+  translation keeps the last accepted Kubernetes configuration and logs the
+  duplicate ids. Data planes also refuse such a ConfigSync snapshot and keep
+  serving their last accepted configuration. Run the control plane and data
+  planes on the same build, as always.
 
 ## Upgrading to 0.9.14
 

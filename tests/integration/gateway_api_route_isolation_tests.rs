@@ -119,12 +119,26 @@ fn proxy_for<'a>(config: &'a GatewayConfig, host: &str) -> &'a Proxy {
 fn dash_joined_cross_namespace_routes_keep_distinct_proxies_upstreams_and_plugins() {
     // `shop/checkout-api` and `shop-checkout/api` dash-join to the same
     // readable id; both are materialized in the Gateway's `infra` namespace.
-    let objects = vec![
+    assert_dash_joined_tenants_stay_isolated(vec![
         gateway_class(),
         shared_gateway("infra", "All"),
         tenant_route("shop", "checkout-api", VICTIM_HOST, "checkout"),
         tenant_route("shop-checkout", "api", OTHER_HOST, "storefront"),
-    ];
+    ]);
+}
+
+#[test]
+fn dash_joined_cross_namespace_routes_stay_isolated_in_reverse_order() {
+    // Isolation must not depend on which tenant's route is observed first.
+    assert_dash_joined_tenants_stay_isolated(vec![
+        gateway_class(),
+        tenant_route("shop-checkout", "api", OTHER_HOST, "storefront"),
+        tenant_route("shop", "checkout-api", VICTIM_HOST, "checkout"),
+        shared_gateway("infra", "All"),
+    ]);
+}
+
+fn assert_dash_joined_tenants_stay_isolated(objects: Vec<K8sObject>) {
     let translation = translate_k8s_objects(&objects, options()).expect("translation");
     let config = &translation.config;
 
@@ -208,17 +222,27 @@ fn external_name_fixture(service_spec: Value) -> Vec<K8sObject> {
 }
 
 fn resolved_refs(objects: &[K8sObject]) -> (String, Option<String>) {
+    route_condition(objects, "HTTPRoute", "store", "ResolvedRefs")
+}
+
+/// `(status, reason)` of one condition on a route's first parent status.
+fn route_condition(
+    objects: &[K8sObject],
+    kind: &str,
+    name: &str,
+    condition_type: &str,
+) -> (String, Option<String>) {
     let updates = plan_gateway_api_status_updates(objects, options(), &[]);
     let route = updates
         .iter()
-        .find(|update| update.kind == "HTTPRoute" && update.name == "store")
-        .expect("HTTPRoute status");
+        .find(|update| update.kind == kind && update.name == name)
+        .unwrap_or_else(|| panic!("{kind} {name} status"));
     let condition = route.status["parents"][0]["conditions"]
         .as_array()
         .expect("route parent conditions")
         .iter()
-        .find(|condition| condition["type"] == "ResolvedRefs")
-        .expect("ResolvedRefs condition");
+        .find(|condition| condition["type"] == condition_type)
+        .unwrap_or_else(|| panic!("{condition_type} condition"));
     (
         condition["status"].as_str().unwrap_or_default().to_string(),
         condition["reason"].as_str().map(ToOwned::to_owned),
@@ -275,4 +299,141 @@ fn cluster_ip_service_backend_still_resolves() {
         "a ClusterIP Service keeps resolving through Service DNS"
     );
     assert_eq!(resolved_refs(&objects).0, "True");
+}
+
+#[test]
+fn external_name_service_refuses_an_l4_route() {
+    let objects = vec![
+        gateway_class(),
+        object(
+            "Gateway",
+            "shared",
+            "tenant-a",
+            "gateway.networking.k8s.io/v1",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "postgres",
+                    "port": 5432,
+                    "protocol": "TCP",
+                    "allowedRoutes": {
+                        "namespaces": { "from": "Same" },
+                        "kinds": [{ "kind": "TCPRoute" }]
+                    }
+                }]
+            }),
+        ),
+        object(
+            "TCPRoute",
+            "db",
+            "tenant-a",
+            "gateway.networking.k8s.io/v1alpha2",
+            json!({
+                "parentRefs": [{ "name": "shared", "sectionName": "postgres" }],
+                "rules": [{ "backendRefs": [{ "name": "payroll", "port": 5432 }] }]
+            }),
+        ),
+        object(
+            "Service",
+            "payroll",
+            "tenant-a",
+            "v1",
+            json!({
+                "type": "ExternalName",
+                "externalName": "payroll.hr.svc.cluster.local",
+                "ports": [{ "name": "postgres", "port": 5432 }]
+            }),
+        ),
+    ];
+
+    let error = translate_k8s_objects(&objects, options())
+        .expect_err("an L4 route to an ExternalName Service is refused");
+    assert!(
+        error.to_string().contains("has type ExternalName"),
+        "unexpected refusal: {error}"
+    );
+    let (status, reason) = route_condition(&objects, "TCPRoute", "db", "ResolvedRefs");
+    assert_eq!(status, "False");
+    assert_eq!(reason.as_deref(), Some("UnsupportedProtocol"));
+}
+
+fn same_namespace_route(name: &str, host: &str, backend: &str) -> K8sObject {
+    object(
+        "HTTPRoute",
+        name,
+        "shop",
+        "gateway.networking.k8s.io/v1",
+        json!({
+            "parentRefs": [{ "name": "shared" }],
+            "hostnames": [host],
+            "rules": [{
+                "matches": [{ "path": { "type": "PathPrefix", "value": "/" } }],
+                "backendRefs": [{ "name": backend, "port": 8080 }]
+            }]
+        }),
+    )
+}
+
+#[test]
+fn same_namespace_routes_deriving_one_id_refuse_the_second_claimant() {
+    // `a.b` and `a-b` in one namespace sanitize to the same readable id. The
+    // second route object must be refused (and say so in status) rather than
+    // replace, merge into, or attach plugins to the first route's proxy.
+    let objects = vec![
+        gateway_class(),
+        shared_gateway("shop", "Same"),
+        same_namespace_route("a.b", VICTIM_HOST, "checkout"),
+        same_namespace_route("a-b", OTHER_HOST, "storefront"),
+    ];
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    let config = &translation.config;
+    config
+        .validate_unique_resource_ids()
+        .expect("a refused claimant leaves no duplicate (namespace, id)");
+
+    let served: Vec<&str> = [VICTIM_HOST, OTHER_HOST]
+        .into_iter()
+        .filter(|host| {
+            config
+                .proxies
+                .iter()
+                .any(|proxy| proxy.hosts.iter().any(|h| h == host))
+        })
+        .collect();
+    assert_eq!(
+        served.len(),
+        1,
+        "exactly one of the two colliding routes may be served: {served:?}"
+    );
+    let owner_backend = if served[0] == VICTIM_HOST {
+        "checkout.shop.svc.cluster.local"
+    } else {
+        "storefront.shop.svc.cluster.local"
+    };
+    assert!(
+        config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.hosts.iter().any(|h| h == served[0]))
+            .all(|proxy| proxy.backend_host == owner_backend),
+        "the served route keeps its own backend"
+    );
+
+    let accepted: Vec<(String, Option<String>)> = ["a.b", "a-b"]
+        .into_iter()
+        .map(|name| route_condition(&objects, "HTTPRoute", name, "Accepted"))
+        .collect();
+    let refused = accepted
+        .iter()
+        .filter(|(status, reason)| status == "False" && reason.as_deref() == Some("Conflicted"))
+        .count();
+    assert_eq!(
+        refused, 1,
+        "the refused claimant must report Accepted=False/Conflicted: {accepted:?}"
+    );
+    let owners = accepted
+        .iter()
+        .filter(|(status, _)| status == "True")
+        .count();
+    assert_eq!(owners, 1, "the owner stays accepted: {accepted:?}");
 }
