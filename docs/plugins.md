@@ -5785,7 +5785,7 @@ Media types outside `content_types` / `response_content_types`, and allowlisted 
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
 | `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields; at least one is required |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor (independent of required-field initialization, which is always enforced) |
-| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Positive maximum decompressed gRPC protobuf payload size for request and response validation; zero is rejected so compressed input is always bounded. When omitted, inherits a positive `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`; otherwise falls back to 10 MiB (10485760). |
+| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Positive maximum decompressed gRPC protobuf payload size for request and response validation; zero is rejected so compressed input is always bounded. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer greater than zero; otherwise falls back to 10 MiB (10485760). |
 
 **gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
 
