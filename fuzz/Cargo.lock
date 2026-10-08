@@ -1419,7 +1419,7 @@ version = "0.3.0"
 
 [[package]]
 name = "ferrum-edge"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "ahash",
  "anyhow",

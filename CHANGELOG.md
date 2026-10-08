@@ -7,16 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-10-08
+
+Release prepared on **2026-10-08 UTC** from main
+`b4f3b39863c4aeb1e32431cdc0d8b983d9ac1c07`. Namespace isolation for Gateway API,
+DestinationRule and Admin API TLS references, mesh CONNECT authorization,
+per-flavor route admission, external identity headers, plugin-config
+environment references, HTTP/3 CONNECT-UDP and WebSocket method policy, IPv6
+quota grouping and the `ferrum-mesh` chart's workload identities change; read
+[Upgrading to 0.9.15](docs/upgrade_guide.md#upgrading-to-0915) before
+upgrading operators, backends, plugin configs, charts or contract consumers.
+
 ### Security
 
+- **BREAKING — generated Gateway API route ids are bound to the full source
+  identity** (issue #6092). A route materialized in its parent Gateway's
+  namespace now gets proxy, upstream and derived plugin ids of the form
+  `<readable id>__<digest>`; routes in their own namespace keep the readable
+  id, and TCPRoute, TLSRoute and UDPRoute follow the same rule. A second route
+  object that derives an id another route already owns is refused and reported
+  in Route status.
+- **BREAKING — duplicate `(namespace, id)` resources are refused** (issue
+  #6092). The control plane refuses a full or incremental candidate, or a
+  Kubernetes translation, that carries two resources of one kind with the same
+  namespace and id, and keeps its last accepted configuration. Data planes
+  refuse such a ConfigSync snapshot as well.
+- **BREAKING — Gateway API backendRefs to `type: ExternalName` Services are
+  unsupported** (issue #6092). HTTPRoute/GRPCRoute fail that backend closed,
+  TCPRoute/TLSRoute/UDPRoute refuse the route, and status reports
+  `ResolvedRefs=False` / `UnsupportedProtocol`.
+- **BREAKING — DestinationRule TLS material outside the mesh root namespace
+  is namespace-scoped** (issue #6092). `trafficPolicy.tls` `caCertificates`,
+  `clientCertificate` and `privateKey` (top level, `portLevelSettings`, and
+  subsets) may name only inline PEM, `system://`, a `k8s://` Secret in the
+  rule's own namespace, or a local file under a directory listed in the new
+  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default, so no local file).
+  Listed files must be absolute paths without `..` and are re-checked after
+  symlink resolution on each data plane that applies the rule; a missing or
+  escaping file fails backend TLS closed for that rule's destinations only,
+  without rejecting the rest of the configuration. Other sources are refused at
+  Kubernetes translation and at native/file/xDS slice validation.
+  Root-namespace rules are unchanged.
+- **BREAKING — namespace-scoped operators can set backend TLS material only
+  within their namespace** (issue #6092). Where the admin `ns` claim is
+  enforced, an `operator` creating or updating a proxy or upstream may
+  introduce only inline PEM, `system://`, or a `k8s://` Secret in the addressed
+  namespace in `backend_tls_client_cert_path`, `backend_tls_client_key_path`
+  and `backend_tls_server_ca_cert_path`; anything else is refused with `400`
+  before it is loaded. Values already stored on the resource are kept, and
+  `admin` tokens are unaffected.
+- **BREAKING — HTTP/3 CONNECT-UDP tunnels are bounded per client**
+  (issue #6098). Each RFC 9298 tunnel now also takes a per-client slot,
+  keyed on the resolved client IP with IPv6 sources grouped by
+  `FERRUM_PER_IP_IPV6_PREFIX` (default `/64`; #6100), held for the tunnel's
+  lifetime and released when it closes. The new
+  `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (default `32`, `0` disables)
+  sits under the process-wide `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS`, so one
+  client can no longer occupy every tunnel slot. Over the cap the request is
+  refused with `503` before any socket is created.
+- **BREAKING — HTTP/3 WebSocket Extended CONNECT is evaluated as `GET`**
+  (issue #6098). Route `allowed_methods`, `mesh_authz` `:method`, and `opa`
+  `input.method` now see `GET` — the method of the backend WebSocket
+  handshake — for an H3 `:protocol=websocket` request, matching HTTP/1.1
+  Upgrade and HTTP/2 Extended CONNECT. Plain CONNECT and CONNECT-UDP keep
+  `CONNECT`, and the `FERRUM_TLS_EARLY_DATA_METHODS` 0-RTT gate still matches
+  the wire method.
 - **BREAKING — mesh CONNECT relays are authorized on transport attributes
   only** (issue #6081). A byte-stream or datagram HBONE CONNECT, including a
   bare authenticated HTTP/2 CONNECT on the Sidecar inbound listener, relays
-  the traffic inside the tunnel as opaque bytes. `mesh_authz` used to judge
-  such a relay as an HTTP request whose method was `CONNECT`, path `/` and
-  host the CONNECT authority, so an `AuthorizationPolicy` with L7 fields was
-  matched against the tunnel's own pseudo-headers rather than the requests
-  inside it. A relay is now authorized as a Layer-4 session, following
+  the traffic inside the tunnel as opaque bytes. A relay is now authorized as
+  a Layer-4 session, following
   Istio's non-HTTP-port semantics: method, path, host, header,
   `requestPrincipals`, and `when: request.headers[...]` / `request.auth.*`
   attributes are unobservable, so a DENY rule ignores them and still matches
@@ -24,25 +84,210 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches, and a matched CUSTOM rule refuses the relay instead of asking the
   provider about the CONNECT. An L7 rule that selects a workload reached over
   HBONE now applies to the whole tunnel; scope it with `to.operation.ports`.
+- **BREAKING — refuse gRPC and WebSocket requests that a route's
+  authentication or admission plugins cannot run on** (issue #6087). On an
+  HTTP-family route, native gRPC and WebSocket requests run the plugin view for
+  their flavor. When that view omits an authentication plugin or admission
+  policy that the route's HTTP view runs, the gateway now refuses the request
+  before any plugin runs, with `403`
+  `{"error":"Request protocol not permitted on this route"}` or trailers-only
+  `PERMISSION_DENIED` for native gRPC. The transaction log records
+  `rejection_phase: "route_protocol_admission"`. This covers every
+  authentication plugin (custom auth plugins that keep the HTTP-only
+  `supported_protocols()` default are included), `soap_ws_security` in every
+  configuration (identity, timestamp-only freshness, and `strict` media-type
+  governance alike), `openapi_validator` in `block` mode, `mcp_gateway`,
+  `request_deduplication` with `enforce_required`, `ai_prompt_shield`,
+  `ai_rate_limiter`, `ai_tool_governor`, `ai_semantic_firewall`, and
+  `rate_limiting` with `mcp_tool_calls`, on both flavors; `graphql` with any
+  protection rule on native gRPC (it already runs on WebSocket); and
+  `a2a_gateway` with a deny policy on WebSocket (it already runs on gRPC).
+  Custom plugins opt in through the new `Plugin::gates_request_admission()`,
+  which defaults to `is_auth_plugin()`; a custom enforcement plugin that is
+  not an auth plugin must opt in or declare the flavors it supports. The
+  decision is a capability bit computed when the plugin cache is built, so
+  requests do no extra plugin scan. A live HBONE tunnel admitted on such a
+  view is revoked (`authorization_denied`) when a reload adds the policy. The
+  composed gRPC-Web view keeps every HTTP plugin and is unaffected. See
+  [Upgrading to 0.9.15](docs/upgrade_guide.md#upgrading-to-0915).
+- **Gateway-asserted request headers are applied after the client's
+  `Connection` nominations are resolved** (#6090). HTTP/1.1 and HTTP/3 ingress
+  now remove the fields a client's `Connection` header nominates before any
+  plugin runs, and rewrite `Connection` to keep only the `close` option and
+  request hop-by-hop names. Consumer identity, `claim_headers`, GeoIP,
+  path-param, and transformer headers that the gateway adds reach the backend
+  as the gateway set them. `Host`,
+  `Content-Length`, and `Expect` keep their values for routing and framing, and
+  the forwarding fields (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, and the
+  configured `FERRUM_REAL_IP_HEADER`) keep theirs for trusted-proxy client-IP
+  resolution. A nominated `Authorization` is removed before authentication, so
+  such a request now gets `401`. HTTP/2 rejects `Connection` and is unchanged.
+- **`claim_headers` destinations, `x-geo-country`, and `x-path-param-*`
+  treat `_` as `-` when removing client values** (#6090), as the
+  `x-consumer-*` namespace already does, so backends see only the gateway's
+  value.
+- **BREAKING — plugin-config environment references are confined to
+  `FERRUM_PLUGIN_SECRET_<NAME>`** (issue #6086). Plugin config fields that
+  name a process environment variable now resolve only the dedicated
+  `FERRUM_PLUGIN_SECRET_<NAME>` namespace (`<NAME>` uppercase
+  `[A-Z_][A-Z0-9_]*`), through one shared resolver: `api_chargeback_sink`
+  `clickhouse.password_ref`, `ai_semantic_firewall` `provider.api_key_env`,
+  `ai_stream_router` `api_key: "${...}"`, `workload_metrics` Lightstep
+  `access_token_env` / `accessTokenEnv` (including Istio Telemetry
+  translation), and `proxy_alerts` channel `webhook_url_env` / `url_env` /
+  `username_env` / `password_env`. Any name outside the namespace, including
+  other `FERRUM_*` settings, is refused at plugin-config admission (Admin API
+  `400`, file-mode / `ferrum-edge validate` failure) before anything is read.
+  The `serverless_function` Azure/GCP
+  credential fallbacks now read `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and
+  `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` instead of the
+  ambient `AZURE_FUNCTIONS_KEY` / `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`. An empty
+  referenced value now fails like an unset one. The documented
+  `FERRUM_CLICKHOUSE_PASSWORD` example becomes
+  `FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD`. Rename each referenced variable
+  (and its `_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` source) into the
+  namespace and update the plugin configs before upgrading; see
+  [Upgrading to 0.9.15](docs/upgrade_guide.md#upgrading-to-0915).
+- **BREAKING — external identity claims use a separate backend header**
+  (issue #6082). `X-Consumer-Username` now contains only a mapped Consumer
+  username. External identities use the gateway-owned
+  `X-Authenticated-Identity`, and external auth plugins no longer map
+  principals to Consumers by matching a process-wide username, ID, or custom
+  ID. The LDAP `consumer_mapping` option is removed. `X-Authenticated-Identity`
+  is refused as a configured header destination at config load. Backends that
+  use these values must update their header handling; Consumer-specific policy
+  requires an authentication path that maps a gateway Consumer.
+- **Reserve replay capacity across authenticated principals** (#6088).
+  Process-scoped DPoP, HMAC, PasswordDigest, and SAML replay stores limit each
+  principal to one quarter of the configured entry ceiling and continue
+  refusing to evict live markers. OIDC relying party login challenges also
+  expire an older pending-flow cookie before a browser can accumulate more
+  than two.
+- **BREAKING — separate mesh workload Kubernetes identities and opt-in Secret
+  access** (issue #6096). The `ferrum-mesh` chart replaces the shared
+  `ferrum-mesh` ServiceAccount with `ferrum-mesh-control-plane`,
+  `ferrum-mesh-ambient`, `ferrum-mesh-east-west`, `ferrum-mesh-injector`, and
+  `ferrum-mesh-ca`. Only the control plane keeps the cluster-wide controller
+  permissions, and the east-west gateway, injector, and CA identities do not
+  mount API tokens. The Ambient proxy has no Secret access by default: list each
+  `k8s://` TLS-source Secret in `ambient.tlsSecretRefs`, which renders a
+  namespaced Role restricted by `resourceNames`. NodeWaypoint discovery trusts
+  only Ambient pods running as `ferrum-mesh-ambient`, and with SPIRE `k8s:sa`
+  selectors the Ambient SPIFFE path becomes `sa/ferrum-mesh-ambient`, so
+  registration entries and policies that pin the old path must be updated.
+  Upgrade guidance is in
+  [upgrade_guide.md](docs/upgrade_guide.md#helm-chart-workload-serviceaccounts).
+  (#6084)
+- **BREAKING — node-agent capture attaches only to a dedicated pod interface**
+  (issue #6096). Capture ownership no longer relies on interface metadata
+  visible inside an enrolled pod. The node agent, Ambient host capture, and
+  NodeWaypoint attribution resolve the host-side interface from an exact
+  `/32` or `/128` host route to the pod address whose device is a dedicated
+  host-side peer. A pod reachable only through a subnet route on a shared CNI
+  device (for example `cni0` or `cilium_host`) is refused enrollment instead
+  of being guarded on that shared device. Pod removal now detaches the pod's
+  cgroup and tc programs. (#6084)
+- **Use only repository-owned scheduled or dispatched runs for trend history
+  and CI signals** (#6084). Fork-originated runs and other events cannot
+  supply the scaling signal or rolling performance history; a manual run on
+  `main` can still close the scaling alert.
+- **`soap_ws_security` frames MTOM packages strictly, so the gateway and the
+  backend always select the same root part** (#6077). In an MTOM/XOP
+  `multipart/related` body the `--boundary` token may now appear only as an
+  exact CRLF delimiter line at the start of the body or immediately after a
+  CRLF, and nowhere else in the package. A delimiter line with RFC 2046
+  transport padding (a trailing space or tab), an LF terminator, or trailing
+  characters (`--boundaryX`), a boundary opened by a bare LF or CR, and a
+  boundary in the middle of a line (in the preamble, inside the envelope or an
+  attachment, or in the epilogue) each get the existing `400`
+  malformed-encoding refusal. The root part is always the first part: when
+  `start` is supplied it must name the first part. `Content-ID`
+  uniqueness and `start` matching ignore ASCII case and a leading `cid:`; a
+  `Content-ID` or `start` carrying `%`, `+`, or embedded whitespace is refused;
+  and a package `Content-Type` carrying an RFC 2231 extended or continuation
+  form of `boundary`, `type`, or `start` (for example `boundary*=` or
+  `type*0=`) is refused with `400`. An RFC 2231 `charset*` on a SOAP
+  `Content-Type` is refused as a conflicting charset. Packages from standard
+  MTOM generators, which put the root first and choose a boundary that never
+  occurs in the content, are unaffected.
+- **Bound and scope control plane configuration responses** (#6078). Unary
+  full-config requests now hold namespace and principal admission through
+  response delivery and are rate limited per authenticated principal.
+  `GetFullConfig` now requires `node_id` to equal the JWT subject, as
+  `Subscribe` already did, and refuses a mismatch with `PERMISSION_DENIED`;
+  first-party data planes do not call it, so only external tooling that does
+  is affected. Mesh
+  CORS policy snapshots are filtered by namespace visibility and `exportTo`,
+  native admission and mesh registries distinguish equal subjects across
+  namespaces, and rejected subscription logs use bounded identifiers and
+  per-client rate limits.
+- **Bound per-client plugin state and compressed request fingerprinting**
+  (#6079). Per-client state keyed by IP now groups IPv6 sources by network
+  prefix instead of keying each address; IPv4 and IPv4-mapped IPv6 stay
+  per-address:
+  - gateway-wide per-source caps (`FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP`,
+    `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`,
+    `FERRUM_TCP_MAX_CONNECTIONS_PER_IP`, `FERRUM_UDP_MAX_SESSIONS_PER_IP`,
+    `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`,
+    `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`,
+    `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP` and, since #6099/#6100,
+    `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`) use the new
+    `FERRUM_PER_IP_IPV6_PREFIX` (default `64`; `128` restores per-address
+    accounting);
+  - `rate_limiting` IP keys default to an IPv6 `/64`, set per policy with the
+    new `ipv6_prefix` option (`1`–`128`; `128` restores per-address keys).
+    `FERRUM_PER_IP_IPV6_PREFIX` does not apply to the plugin;
+  - `graphql`, `grpc_method_router`, `udp_rate_limiting`, `ai_rate_limiter`
+    and `tcp_connection_throttle` IP keys, `mcp_gateway` anonymous session
+    quotas and `oidc_relying_party` pending-login source quotas use a fixed
+    `/64` with no override.
 
-### Performance
+  By default IPv6 clients in one `/64` now share a budget, and IPv6 quota keys
+  change, so old and new IPv6 counters (local and Redis) do not overlap during
+  rollout.
+  MCP aggregate sessions now have a default cap of 128 per authenticated
+  principal (`sessions.max_sessions_per_principal`); at that cap the
+  principal's own oldest session is replaced, and when the global store is
+  full the gateway refuses admission rather than evicting another principal's
+  live session. Brotli decoding in response inspection and request
+  fingerprinting uses the charged strict-window decoder. Request deduplication
+  returns `503` when the shared decode budget is full and rejects malformed or
+  over-limit Brotli bodies; malformed gzip continues to fingerprint the
+  original bytes. `body_validator` now refuses
+  `grpc_max_decompressed_size_bytes: 0`, which used to disable the
+  decompressed cap.
+- **Apply WebSocket method policy to the forwarded method** (#6080). Extended
+  CONNECT WebSockets over HTTP/2 are evaluated as `GET`, and HTTP/1.1 upgrade
+  attempts using another method are rejected. DTLS passthrough drops malformed
+  or unrepresentable ClientHello SNI before catch-all routing; a complete,
+  well-formed ClientHello without SNI can still use the catch-all.
+- **HTTP/3 validates QUIC client addresses before charging the shared
+  connection budget, and no longer advertises QUIC datagrams** (#6085).
+  Handshakes from clients whose source address has not been validated now run
+  inside a per-listener budget, `FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES`
+  (default `1024`), and count toward the overload connection budget only once
+  they complete. When that budget is full, further unvalidated clients receive
+  a stateless QUIC Retry and are admitted after echoing its token (one extra
+  round trip); `0` retries every unvalidated client. Clients holding a token
+  from an earlier connection are unaffected, and the 0.5-RTT early-data path is
+  now reserved for validated clients. The HTTP/3 listener and backend pools also
+  stop advertising the QUIC DATAGRAM extension, which nothing in the gateway
+  reads; a peer that sends a DATAGRAM frame anyway is closed with
+  `PROTOCOL_VIOLATION`. Upgrade note: under handshake pressure, or with the
+  budget set to `0`, first-time clients pay one extra round trip, and clients
+  without a token no longer get the 0.5-RTT early-response path. See
+  [docs/http3.md](docs/http3.md#quic-address-validation-and-handshake-admission).
 
-- **HTTP/2 body pipes no longer split a chunk the peer's window already
-  covers.** Hyper patch 005 (#6033/#6036) split every body chunk larger than
-  `SendStream::capacity()` so h2 could not cut tiny DATA frames from small
-  window increments. But `capacity()` is also capped by h2's per-stream send
-  buffer (400 KiB by default on the frontend server), and the backend pool's default 1 MiB maximum
-  frame size delivers response chunks of up to 1 MiB, so on the frontend leg
-  nearly every large chunk was split and the response pipe waited for the
-  buffer to drain mid-chunk. The pipe now splits only when the window is short:
-  vendored h2 patch 003 adds a read-only `SendStream::capacity_and_assigned()`,
-  and a chunk the stream already holds window for goes to h2 whole, as it did
-  before #6036. Small-window coalescing is unchanged, and a backend upload
-  with a `backend_write_timeout_ms` bound keeps splitting so that bound still
-  times every byte beyond the send buffer. On the hosted HTTP/2
-  protocol benchmark, same runner, this delivered 1.03–1.09× the requests per
-  second at 500 KiB and 1 MiB (Intel Xeon 6973P-C and AMD EPYC 7763) and was
-  within noise at 10 KiB and 70 KiB.
+### Added
+
+- **Database-mode config changes log their stages** (issue #6057, #6068).
+  Every published config change in database mode logs one line with what
+  triggered the poll, the resources changed, the sequence, `write_to_live_ms`
+  (oldest covered admin write to publication), `waiting_ms` (time before the
+  poll's database read), `load_ms` and `apply_ms`. The line is INFO normally
+  and WARN when the change exceeds `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS`. The
+  ConfigSync wire type is unchanged, and control-plane mode is not instrumented
+  yet.
 
 ### Fixed
 
@@ -60,13 +305,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `h2-004-client-close-wakeup`
   (`docs/upstream-h2-patches/004-client-close-wakeup/`) until Ferrum adopts
   h2 0.4.20, which fixes the same race (hyperium/h2#956).
+- **MongoDB batch writes attach proxy-scoped plugin configs to their proxy**
+  (#6065). On MongoDB, `POST /batch`, `POST /restore` (conditional and not)
+  and import saved a `scope: proxy` plugin config without adding it to the
+  target proxy's `plugins` list, so the runtime did not apply it to that proxy.
+  SQL already attached it (#4611). Every MongoDB batch path now attaches the
+  config in the same write (inside the replica-set transaction, or with a
+  compensating rollback on a standalone server), skips ids the proxy already
+  lists, records a proxy config change so incremental polling republishes the
+  proxy, and aborts when the target proxy does not exist. As on SQL's batch
+  path, the proxy's `updated_at` is not bumped. Rows written before this
+  release are not rewritten.
+- **MongoDB batch admission validates the associations its writer adds**
+  (issue #6070, #6074). MongoDB batch admission now projects each proxy-scoped
+  config's implied association onto the candidate it validates, exactly as the
+  writer attaches it, on both the atomic graph writer (also used by conditional
+  restore) and `batch_create_plugin_configs`. A policy that looked dormant to
+  admission can no longer become active in the committed graph; SQL already
+  re-validated the written graph inside its transaction.
+
+### Changed
+
+- **Plugin-graph admission composes a batch's proxy-scoped plugin into an
+  existing proxy's chain** (issue #6056, #6066). A `POST /batch` that adds a
+  proxy-scoped plugin to an existing proxy is now validated against that
+  proxy's chain, so a conflicting second `load_testing` or `api_chargeback` on
+  the same proxy is refused at admission instead of failing at reload, as
+  single-resource writes already were. A conflict already stored on one proxy
+  no longer blocks unrelated plugin-graph writes elsewhere in the namespace; a
+  write that touches that proxy still sees it.
+- **Benchmarks are reproducible and their published results carry
+  provenance** (#6048). The protocol, performance and payload scripts start the
+  gateway with the `run` subcommand, the preflight no longer claims port 5000,
+  the HTTP/1.1+TLS direct baseline uses TLS, bench binaries rebuild when their
+  crate-root sources change, small UDP payloads are honoured, and
+  `perf-benchmark.yml` defaults to a release build with 15 s legs.
+  `run_published_benchmark.sh` writes a provenance manifest and alternates leg
+  order, the summarizer reports gateway CPU per request with medians and
+  variability flags, and the scale test discards warmup and counts only
+  completed requests. The 2026-10-06 Apple M4 bundle is committed under
+  `tests/performance/published/`.
+- **Reload-under-load scale test** (#6059). `test_scale_reload_under_load`
+  keeps 50 closed-loop workers on every live proxy while config changes are
+  written and hot-applied, fails on any error from an already-live proxy, and
+  records per-second throughput, latency, CPU and memory. It is a local-only
+  stress test and is excluded from the hosted functional and coverage lanes.
+- **Benchmark HTTP/2 clients and backends use fixed windows** (#6064, #6069).
+  `proto_bench`, `proto_backend` and `payload_bench` no longer call hyper's
+  `adaptive_window(true)`, which reset the configured 8 MiB / 32 MiB windows to
+  65,535 and intermittently stalled single streams. The protocol perf
+  `workload_revision` is bumped, so absolute HTTP/2 history restarts.
+- **`payload_bench` is bounded and reports invalid runs** (issues #6071 /
+  #6072, #6075). A new `--request-timeout` (default 30 s) bounds every
+  connection setup and request, workers are joined by a hard deadline, setup
+  failures and timeouts are counted on every transport, and a run with a setup
+  failure, timeout, worker failure, missing worker or no completed request is
+  reported invalid and exits with status 2. `run_payload_test.sh` keeps that
+  report and never declares a winner from an invalid run.
+
+### Performance
+
+- **HTTP/2 body pipes no longer split a chunk the peer's window already
+  covers** (#6055). Hyper patch 005 (#6033/#6036) split every body chunk larger than
+  `SendStream::capacity()` so h2 could not cut tiny DATA frames from small
+  window increments. But `capacity()` is also capped by h2's per-stream send
+  buffer (400 KiB by default on the frontend server), and the backend pool's default 1 MiB maximum
+  frame size delivers response chunks of up to 1 MiB, so on the frontend leg
+  nearly every large chunk was split and the response pipe waited for the
+  buffer to drain mid-chunk. The pipe now splits only when the window is short:
+  vendored h2 patch 003 adds a read-only `SendStream::capacity_and_assigned()`,
+  and a chunk the stream already holds window for goes to h2 whole, as it did
+  before #6036. Small-window coalescing is unchanged, and a backend upload
+  with a `backend_write_timeout_ms` bound keeps splitting so that bound still
+  times every byte beyond the send buffer. On the hosted HTTP/2
+  protocol benchmark, same runner, this delivered 1.03–1.09× the requests per
+  second at 500 KiB and 1 MiB (Intel Xeon 6973P-C and AMD EPYC 7763) and was
+  within noise at 10 KiB and 70 KiB.
+- **Plugin-graph admission loads only the write's neighborhood** (issue
+  #6056, #6066). `POST /batch` and single Proxy/PluginConfig writes used to
+  load and revalidate the whole namespace policy graph on every request. They
+  now load the proxies the write names or affects, the plugin configs those
+  proxies use, every `global` config, and every instance of a namespace-wide
+  plugin (`prometheus_metrics`, the mesh BPF metrics exporter,
+  `api_chargeback`), on SQL and MongoDB alike. A write that submits, replaces
+  or removes a `global` config, or a candidate with an enabled global
+  `tcp_connection_throttle`, still uses the full graph. On the reference
+  SQLite harness a 3,000-proxy wave's plugin-config writes dropped from 54–195 s
+  to about 2.4 s.
+- **Consumer changes ride the incremental delta** (issue #6060, #6067). A
+  consumer create, update or delete no longer forces a full reload. It
+  escalates to the authoritative full reload only when the namespace's last
+  published full load quarantined a colliding identity or `hmac_auth`
+  credential (or no full load is recorded yet), or when a changed consumer
+  carries `hmac_auth`. A control plane now broadcasts consumer deltas instead
+  of a full snapshot for routine consumer churn.
+- **Reload composition validators look global plugins up once** (issue #6057,
+  #6068). The `request_deduplication`, `soap_ws_security` and `mcp_gateway`
+  composition checks no longer rescan every plugin config for each proxy on
+  each reload and full load. On the reference SQLite harness, time to live for
+  a 100-proxy incremental change at about 12,700 proxies dropped from 4.7 s to
+  1.2 s, and a 3,000-proxy full reload at 9,600 proxies from 12.9 s to 2.4 s.
+- **Config publication no longer clones the candidate** (part of #6058,
+  #6097). Full reloads, diff-based applies and database incremental deltas
+  publish the candidate itself instead of a deep copy, so a change no longer
+  holds a third whole configuration in memory. From about 9,500 live proxies
+  peak RSS during a change was 34–207 MiB lower on the reference harness.
+
+### Documentation
+
+- **Document the adaptive HTTP/2 window deadlock risk** (#6101). Wherever
+  `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` (global or per proxy) is described, the docs
+  now warn that the adaptive window can permanently stall a connection carrying
+  large bodies in both directions (upstream hyperium/h2#975). The option stays off
+  by default.
+- **Vendored sqlx patch 002 records its upstream fix** (issue #6021, #6061).
+  launchbadge/sqlx#4359 fixes the reversed REAL/DOUBLE typed-NULL arms on
+  SQLx `main`; no SQLx release carries it yet, so the vendored patch and its
+  retirement trigger are unchanged.
 
 ## [0.9.14] - 2026-10-07
 
-Release prepared on **2026-10-07 UTC** from main
-`4f370a0b1921d231e9d0c498821e90e076aa64fb`. Library API, error
-classification and backend health attribution, and the control plane's backend
-egress policy discovery change; read
+Published at **2026-10-07T08:59:56Z** (release 405571232) at immutable release
+merge `9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`, with reviewed #6050 head
+`c89044a3cc5a9ad1dd5e5a197a19760745e5ebfb` as second parent and main
+`4f370a0b1921d231e9d0c498821e90e076aa64fb` as first parent. The Docker Hub
+`v0.9.14` index digest is
+`sha256:15442f1b1d1758023fe871fe57be50f19caf34bbe6c499a6812f4ffd0da5e3f8`.
+Library API, error classification and backend health attribution, and the
+control plane's backend egress policy discovery change; read
 [Upgrading to 0.9.14](docs/upgrade_guide.md#upgrading-to-0914) before
 upgrading crate consumers, dashboards or contract consumers.
 
@@ -7269,7 +7635,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.14...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...HEAD
+[0.9.15]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...v0.9.12
