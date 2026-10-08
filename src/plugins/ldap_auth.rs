@@ -2105,11 +2105,7 @@ impl LdapAuth {
         // A directory username is not a Consumer credential binding. Until
         // mappings can name the directory authority explicitly, keep the
         // verified principal external.
-        VerifyOutcome::success(
-            None,
-            Some(username.to_string()),
-            Some(username.to_string()),
-        )
+        VerifyOutcome::success(None, Some(username.to_string()), Some(username.to_string()))
     }
 }
 
