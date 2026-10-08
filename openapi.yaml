@@ -27300,9 +27300,12 @@ components:
                 may carry at most one Content-Type / Content-ID /
                 Content-Transfer-Encoding each; Content-ID values must be
                 package-unique (ignoring ASCII case and a leading `cid:`) and
-                nonblank; and the root part must declare a SOAP/XOP essence and
-                must not declare a re-encoding Content-Transfer-Encoding
-                (anything other than 7bit/8bit/binary). The whole package is
+                nonblank, while a Content-ID or `start` carrying `%`, `+`, or
+                embedded whitespace is refused (a percent-decoding backend
+                would resolve it to a different part); and the root part must
+                declare a SOAP/XOP essence and must not declare a re-encoding
+                Content-Transfer-Encoding (anything other than 7bit/8bit/binary).
+                The whole package is
                 framed and every part parsed before a root is selected, so no
                 later ambiguity is missed by an early return. Bounds are
                 fail-closed (at most 64 parts; at most 8 KiB and 32 header lines

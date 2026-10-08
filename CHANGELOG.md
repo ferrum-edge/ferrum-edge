@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the one the backend executed. These packages now get the existing `400`
   malformed-encoding refusal. In addition, when `start` is supplied it must
   name the first part, `Content-ID` uniqueness and `start` matching ignore
-  ASCII case and a leading `cid:`, and a package `Content-Type` carrying an
+  ASCII case and a leading `cid:`, a `Content-ID` or `start` carrying `%`, `+`,
+  or embedded whitespace is refused (a backend that percent-decodes ids would
+  resolve it to a different part), and a package `Content-Type` carrying an
   RFC 2231 extended form of `boundary`, `type`, or `start` (for example
   `boundary*=`) is refused with `400`. An RFC 2231 `charset*` on a SOAP
   `Content-Type` is refused as a conflicting charset. Packages produced by

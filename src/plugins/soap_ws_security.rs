@@ -7279,7 +7279,7 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
     let content_id = match content_id_raw {
         Some(raw) => {
             let normalized = normalize_content_id(raw);
-            if normalized.is_empty() {
+            if normalized.is_empty() || content_id_has_decoding_ambiguity(&normalized) {
                 return Err(SoapBodyDecodeError::MalformedEncoding);
             }
             Some(normalized)
@@ -7318,7 +7318,10 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
 ///   names, and at most one `Content-Type` / `Content-ID` /
 ///   `Content-Transfer-Encoding` per part.
 /// * `Content-ID` values are unique across the package (RFC 2387), compared
-///   ASCII-case-insensitively and with any `cid:` prefix ignored.
+///   ASCII-case-insensitively and with any `cid:` prefix ignored. A value
+///   carrying `%`, `+`, or embedded whitespace is refused, because a backend
+///   that percent-decodes ids would resolve it to a different part than
+///   byte-exact matching does.
 /// * The root is the first part. When `start` is supplied it must name that
 ///   first part, so a parser that resolves `start` and one that always takes
 ///   the first part agree.
@@ -7401,10 +7404,14 @@ fn extract_mtom_root_part<'a>(
     let Some(root) = parts.first() else {
         return Err(SoapBodyDecodeError::MalformedEncoding);
     };
-    if let Some(start) = start
-        && !root.content_id_matches(start)
-    {
-        return Err(SoapBodyDecodeError::MalformedEncoding);
+    if let Some(start) = start {
+        // A `%`/`+`/whitespace-bearing `start` is decoded differently by a
+        // backend that percent-decodes ids, so the part it selects cannot be
+        // proven to be the first part Ferrum selects. Only a plain value is
+        // compared.
+        if content_id_has_decoding_ambiguity(start) || !root.content_id_matches(start) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
     }
 
     // The root part must itself declare a SOAP/XOP infoset. A root part
@@ -7452,6 +7459,21 @@ fn strip_cid_scheme(id: &str) -> &str {
         .filter(|scheme| scheme.eq_ignore_ascii_case("cid:"))
         .and_then(|_| id.get(4..))
         .unwrap_or(id)
+}
+
+/// Whether a normalized `Content-ID` / `start` value carries a character a
+/// percent-decoding backend would reinterpret.
+///
+/// Some stacks (for example JAX-WS's mimepull) look the id up exactly and, on
+/// a miss, retry after a `URLDecoder` pass that maps `%XX` escapes and `+` to a
+/// space. Ferrum's comparison is byte-exact apart from ASCII case folding and a
+/// `cid:` prefix, so a `%`, `+`, or embedded whitespace lets the two select
+/// different parts — the same gateway/backend split a duplicate id produces.
+/// Generated MTOM ids are plain tokens, so a value carrying one is refused
+/// rather than compared.
+fn content_id_has_decoding_ambiguity(id: &str) -> bool {
+    id.bytes()
+        .any(|byte| matches!(byte, b'%' | b'+') || byte.is_ascii_whitespace())
 }
 
 /// The strict MTOM package parser, reached through the lib target's

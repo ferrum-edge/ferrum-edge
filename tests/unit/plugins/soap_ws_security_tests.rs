@@ -7969,6 +7969,40 @@ mod mtom_strict_framing {
         }
     }
 
+    /// A backend that percent-decodes `Content-ID`s (`%XX` escapes and `+` to a
+    /// space) can resolve an id Ferrum treats as distinct, so `start` and the
+    /// part that backend executes can disagree. Any `Content-ID` or `start`
+    /// carrying `%`, `+`, or embedded whitespace fails closed instead of being
+    /// compared, while plain ids keep resolving.
+    #[test]
+    fn content_ids_a_percent_decoding_backend_would_reinterpret_fail_closed() {
+        let base = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+
+        // `start` names part 1's `<root@x>` case-insensitively; part 2's
+        // `<ROOT%40x>` decodes to the same id for a percent-decoding backend.
+        let start_collision = base
+            .replace("<root@example.com>", "<root@x>")
+            .replace("<attachment@example.com>", "<ROOT%40x>");
+        assert_closed(&start_collision, Some("ROOT@x"), "malformed_encoding");
+        assert_closed(&start_collision, None, "malformed_encoding");
+
+        // A `start` carrying a decoded character is refused before any part is
+        // compared, with or without the angle-bracket wrapper.
+        assert_closed(&base, Some("<ROOT%40example.com>"), "malformed_encoding");
+        assert_closed(&base, Some("root+example.com"), "malformed_encoding");
+        assert_closed(&base, Some("<root @example.com>"), "malformed_encoding");
+
+        // Plain ids are still accepted, including case and `cid:` variants.
+        assert_eq!(
+            root_of(&base, Some("ROOT@EXAMPLE.COM")),
+            "<soap:Envelope>real</soap:Envelope>"
+        );
+        assert_eq!(
+            root_of(&base, Some("cid:root@example.com")),
+            "<soap:Envelope>real</soap:Envelope>"
+        );
+    }
+
     /// `start` naming a part the package does not contain has no envelope to
     /// validate.
     #[test]
