@@ -9,42 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — generated Gateway API route ids are bound to the full source
-  identity** (issue #6092). A route materialized in its parent Gateway's
-  namespace now gets proxy, upstream and derived plugin ids of the form
-  `<readable id>__<digest>`; routes in their own namespace keep the readable
-  id, and TCPRoute, TLSRoute and UDPRoute follow the same rule. A second route
-  object that derives an id another route already owns is refused and reported
-  in Route status.
-- **BREAKING — duplicate `(namespace, id)` resources are refused** (issue
-  #6092). The control plane refuses a full or incremental candidate, or a
-  Kubernetes translation, that carries two resources of one kind with the same
-  namespace and id, and keeps its last accepted configuration. Data planes
-  refuse such a ConfigSync snapshot as well.
-- **BREAKING — Gateway API backendRefs to `type: ExternalName` Services are
-  unsupported** (issue #6092). HTTPRoute/GRPCRoute fail that backend closed,
-  TCPRoute/TLSRoute/UDPRoute refuse the route, and status reports
-  `ResolvedRefs=False` / `UnsupportedProtocol`.
-- **BREAKING — DestinationRule TLS material outside the mesh root namespace
-  is namespace-scoped** (issue #6092). `trafficPolicy.tls` `caCertificates`,
-  `clientCertificate` and `privateKey` (top level, `portLevelSettings`, and
-  subsets) may name only inline PEM, `system://`, a `k8s://` Secret in the
-  rule's own namespace, or a local file under a directory listed in the new
-  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default, so no local file).
-  Listed files must be absolute paths without `..` and are re-checked after
-  symlink resolution on each data plane that applies the rule; a missing or
-  escaping file fails backend TLS closed for that rule's destinations only,
-  without rejecting the rest of the configuration. Other sources are refused at
-  Kubernetes translation and at native/file/xDS slice validation.
-  Root-namespace rules are unchanged.
-- **BREAKING — namespace-scoped operators can set backend TLS material only
-  within their namespace** (issue #6092). Where the admin `ns` claim is
-  enforced, an `operator` creating or updating a proxy or upstream may
-  introduce only inline PEM, `system://`, or a `k8s://` Secret in the addressed
-  namespace in `backend_tls_client_cert_path`, `backend_tls_client_key_path`
-  and `backend_tls_server_ca_cert_path`; anything else is refused with `400`
-  before it is loaded. Values already stored on the resource are kept, and
-  `admin` tokens are unaffected.
 - **BREAKING — mesh CONNECT relays are authorized on transport attributes
   only** (issue #6081). A byte-stream or datagram HBONE CONNECT, including a
   bare authenticated HTTP/2 CONNECT on the Sidecar inbound listener, relays
