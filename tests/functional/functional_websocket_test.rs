@@ -612,9 +612,12 @@ plugin_configs:
         .expect("write invalid config file");
 }
 
-/// Write a WebSocket config whose route-level method filter rejects both the
-/// H1 Upgrade GET and H2/H3 Extended CONNECT before the ordinary plugin chain.
-fn write_ws_method_reject_config(config_path: &std::path::Path, backend_port: u16) {
+/// Write a WebSocket config with a route-level method filter.
+fn write_ws_method_config(
+    config_path: &std::path::Path,
+    backend_port: u16,
+    allowed_method: &str,
+) {
     let config = format!(
         r#"
 version: "1"
@@ -626,7 +629,7 @@ proxies:
     backend_port: {}
     strip_listen_path: true
     allowed_methods:
-      - POST
+      - {}
 
 consumers: []
 plugin_configs:
@@ -642,7 +645,8 @@ plugin_configs:
     scope: global
     enabled: true
 "#,
-        backend_port
+        backend_port,
+        allowed_method
     );
 
     let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
@@ -2676,7 +2680,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     let backend_port = free_port().await;
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
-    write_ws_method_reject_config(&config_path, backend_port);
+    write_ws_method_config(&config_path, backend_port, "POST");
 
     let cert_path = "tests/certs/server.crt";
     let key_path = "tests/certs/server.key";
@@ -2768,6 +2772,93 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
 
     let _ = gateway.kill();
     let _ = gateway.wait();
+}
+
+/// Extended CONNECT is forwarded as a WebSocket GET, so route method policy
+/// admits it alongside an H1 GET upgrade. H1 upgrades using other methods are
+/// rejected before policy evaluation or backend dispatch.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_method_policy_uses_forwarded_get_method() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_method_config(&config_path, backend_port, "GET");
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_http_port, _) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let h1_url = format!("ws://127.0.0.1:{gateway_http_port}/ws-echo");
+    let (mut h1_ws, _) = tokio_tungstenite::connect_async(&h1_url)
+        .await
+        .expect("H1 GET upgrade should satisfy the route method policy");
+    h1_ws.close(None).await.expect("close H1 WebSocket");
+
+    let mut h1_post = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
+        .await
+        .expect("connect to gateway H1 port");
+    h1_post
+        .write_all(
+            b"POST /ws-echo HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .expect("send non-GET H1 upgrade");
+    let mut response = [0u8; 512];
+    let read = tokio::time::timeout(Duration::from_secs(5), h1_post.read(&mut response))
+        .await
+        .expect("read non-GET H1 refusal")
+        .expect("read H1 response");
+    assert!(
+        String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 405"),
+        "non-GET H1 WebSocket upgrades must be rejected before forwarding: {}",
+        String::from_utf8_lossy(&response[..read])
+    );
+
+    let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
+        .await
+        .expect("connect to gateway H2 port");
+    let (mut h2_sender, h2_connection) =
+        http2::handshake(TokioExecutor::new(), TokioIo::new(h2_stream))
+            .await
+            .expect("H2 handshake");
+    let h2_connection_task = tokio::spawn(async move {
+        let _ = h2_connection.await;
+    });
+    let h2_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{gateway_http_port}/ws-echo"))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build H2 Extended CONNECT request");
+    let h2_response = h2_sender
+        .send_request(h2_request)
+        .await
+        .expect("send H2 Extended CONNECT");
+    assert_eq!(
+        h2_response.status(),
+        StatusCode::OK,
+        "route method policy must see the forwarded GET method"
+    );
+    h2_connection_task.abort();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }
 
 /// Issue #2467: response_mock intentionally participates in every WebSocket

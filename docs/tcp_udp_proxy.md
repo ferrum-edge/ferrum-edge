@@ -162,6 +162,8 @@ proxies:
 
 **SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and DNS suffix wildcards like `*.example.com`, which matches any DNS name below `example.com` but not `example.com` itself). One proxy per port may have empty `hosts` as a catch-all/default. The same routing plane is available on ordinary opaque `tcp` listeners — see [Opaque TLS SNI routing](#opaque-tls-sni-routing).
 
+For DTLS passthrough, a complete, well-formed ClientHello that omits SNI may use the catch-all route. A malformed or unrepresentable SNI, malformed ClientHello, or incomplete ClientHello is dropped before a backend session is created.
+
 ```yaml
 proxies:
   # Route TLS traffic for api.example.com to the API backend

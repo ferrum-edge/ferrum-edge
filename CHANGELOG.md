@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Apply WebSocket method policy to the forwarded method.** Extended CONNECT
+  WebSockets are evaluated as GET, and HTTP/1.1 upgrade attempts using another
+  method are rejected. DTLS passthrough drops malformed or unrepresentable
+  ClientHello SNI before catch-all routing; a complete, well-formed ClientHello
+  without SNI can still use the catch-all.
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already
