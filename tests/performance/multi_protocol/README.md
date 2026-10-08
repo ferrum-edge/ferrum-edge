@@ -683,9 +683,15 @@ quantiles are the maximum per-sample quantiles, explicitly labelled, because
 quantiles cannot be pooled without histograms. All constituent observations are
 validated. The rolling regression evaluator restarts its window when
 `protocol_perf_budgets.json.workload_revision` changes, excluding missing/older
-markers; this revision is `2026-09-18.h1-h3-observation.v3`, accounting for H1
-frame/header/TLS observation overhead and H3 observation holds and explicit
-retirement instrumentation. The historical
+markers; this revision is `2026-10-07.h2-fixed-bench-windows.v1`. It pins the
+H2 bench client (`proto_bench`) and echo backend (`proto_backend`) to fixed
+8 MiB stream / 32 MiB connection windows. Earlier revisions enabled hyper's
+`adaptive_window`, which silently resets both windows to 65,535 bytes and
+intermittently stalled single streams: 10-20 s of all-idle warmup or drain
+through every gateway, and direct drains that never recovered and hit the 30 s
+abort. Do not re-enable it on either side. The preceding revision
+`2026-09-18.h1-h3-observation.v3` accounted for H1 frame/header/TLS observation
+overhead and H3 observation holds and explicit retirement instrumentation. The historical
 H1 paired-ratio reference remains unchanged. The
 combined artifact also contains flattened `observed-samples.json` and
 `paired-comparisons.json`; use those or the raw samples for analysis. The frozen

@@ -214,8 +214,10 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
 - 002 — [update the automatic DATA-frame budget at runtime](upstream-h2-patches/002-runtime-data-frame-budget/README.md)
   (upstream [hyperium/h2#965](https://github.com/hyperium/h2/pull/965),
   [patch](upstream-h2-patches/002-runtime-data-frame-budget/h2-runtime-data-frame-budget.patch))
-- 003 — [close an idle client connection whose last handle drops mid-poll](upstream-h2-patches/003-client-close-wakeup/README.md)
-  ([patch](upstream-h2-patches/003-client-close-wakeup/h2-client-close-wakeup.patch))
+- 003 — [report a stream's assigned send window apart from the send buffer](upstream-h2-patches/003-assigned-send-capacity/README.md)
+  ([patch](upstream-h2-patches/003-assigned-send-capacity/h2-assigned-send-capacity.patch))
+- 004 — [close an idle client connection whose last handle drops mid-poll](upstream-h2-patches/004-client-close-wakeup/README.md)
+  ([patch](upstream-h2-patches/004-client-close-wakeup/h2-client-close-wakeup.patch))
 
 ### hyper-util
 

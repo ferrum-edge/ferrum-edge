@@ -114,10 +114,11 @@ lane builds its observed h2 from the verified archive plus these patches.
 
 Retire this patch when an h2 release containing hyperium/h2#903 (or another
 change that batches DATA frames into one write) is adopted, or when Ferrum
-stops using h2. The [runtime-budget](../002-runtime-data-frame-budget/README.md)
-and [client close-wakeup](../003-client-close-wakeup/README.md) patches must
-also retire before dropping the vendored crate. To retire the crate after all
-three patches are superseded:
+stops using h2. The [runtime-budget](../002-runtime-data-frame-budget/README.md),
+[assigned-send-capacity](../003-assigned-send-capacity/README.md) and
+[client close-wakeup](../004-client-close-wakeup/README.md) patches must also
+retire before dropping the vendored crate. To retire the crate after all four
+patches are superseded:
 
 1. Remove the `h2` line from `[patch.crates-io]` in `Cargo.toml`, `tests/performance/mesh/Cargo.toml` and `fuzz/Cargo.toml`.
 2. Drop `vendor/h2-0.4.19-ferrum-patched/` and update the three lockfiles.

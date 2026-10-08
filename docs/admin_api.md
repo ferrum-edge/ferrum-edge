@@ -1530,10 +1530,13 @@ A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
 | `PUT /plugins/config/{id}` moving `proxy_id` from `P1` to `P2` | removes it from `P1`, adds it to `P2` |
 | `PUT /plugins/config/{id}` changing `scope` to `global` | removes the stale association |
 | `DELETE /plugins/config/{id}` | removes it from every proxy that lists it |
+| `POST /batch` or `POST /restore` containing a `scope: "proxy"`, `proxy_id: P` config | appends it to `P` (idempotent) with the config's own write, on SQL and MongoDB alike |
 
 The plugin-config row and the association commit in one transaction, and every
-touched proxy's `updated_at` advances so the next poll / control-plane
-broadcast republishes it. `GET /proxies/{id}` is therefore authoritative: a
+touched proxy is republished by the next poll / control-plane broadcast. The
+single-resource routes also advance the touched proxy's `updated_at`; the
+`/batch` and `/restore` paths leave it unchanged. Those paths reject a `proxy_id`
+that does not exist in the namespace with `400` before anything is written. `GET /proxies/{id}` is therefore authoritative: a
 Plugin and proxy writes validate their complete prospective plugin composition
 before persistence. Invalid CORS/mesh-dispatch ordering, exclusive-instance
 conflicts, metric-tag plan budgets and global registry ownership return `400`;

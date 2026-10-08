@@ -897,7 +897,7 @@
       "docs_path": "docs/upstream-hyper-patches/005-h2-small-window-coalescing/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "With patch 002's positive-capacity progress, h2 cut one DATA frame from every window increment, so a peer opening its window a few bytes at a time received a self-sustaining run of small frames that an unpatched h2 0.4.16+ receiver answers with GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) (#6033). On connections with a Timer, the client and server body pipes hold capacity below min(chunk remaining, 256) for at most 2 ms, then hand h2 exactly the assigned capacity; the bounded wait keeps every positive window live.",
+      "reason": "With patch 002's positive-capacity progress, h2 cut one DATA frame from every window increment, so a peer opening its window a few bytes at a time received a self-sustaining run of small frames that an unpatched h2 0.4.16+ receiver answers with GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) (#6033). On connections with a Timer, the client and server body pipes hold capacity below min(chunk remaining, 256) for at most 2 ms, then hand h2 exactly the assigned capacity; the bounded wait keeps every positive window live. A chunk the stream already holds window for is handed to h2 whole even when the send buffer caps capacity(), using h2 patch 003's capacity_and_assigned() (stock h2 falls back to splitting); a pipe with a patch-004 write-stall bound keeps splitting.",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/hyper",
@@ -939,7 +939,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The runtime-budget and client close-wakeup patches must also retire before removing the vendored crate.",
+        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The runtime-budget, assigned-send-capacity and client close-wakeup patches must also retire before removing the vendored crate.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -982,12 +982,44 @@
       ]
     },
     {
-      "id": "h2-003-client-close-wakeup",
+      "id": "h2-003-assigned-send-capacity",
+      "label": "h2 reports a stream's assigned send window apart from the send buffer",
+      "crate": "h2",
+      "vendored_version": "0.4.19",
+      "vendor_path": "vendor/h2-0.4.19-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/003-assigned-send-capacity/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "SendStream::capacity() is capped by the per-stream send buffer as well as the window, so Hyper patch 005 could not tell a short peer window from a full send buffer and split every chunk larger than the buffer. A 1 MiB backend response chunk against the 400 KiB default buffer then stalled the frontend response pipe mid-chunk. The read-only capacity_and_assigned() accessor, which reads both values under one lock, lets the pipe split only when the window is short.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h2",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with Hyper patch 005, or earlier when an h2 release exposes the assigned send window (or Hyper stops splitting chunks at send capacity). Retiring it alone falls Hyper patch 005 back to splitting at capacity(), a throughput cost, not a correctness one.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/h2-0.4.19-ferrum-patched (share::ferrum_assigned_capacity_tests)",
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests::a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer, a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer)",
+        "tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs (vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads)"
+      ]
+    },
+    {
+      "id": "h2-004-client-close-wakeup",
       "label": "h2 client connection closes when its last handle drops mid-poll",
       "crate": "h2",
       "vendored_version": "0.4.19",
       "vendor_path": "vendor/h2-0.4.19-ferrum-patched",
-      "docs_path": "docs/upstream-h2-patches/003-client-close-wakeup/",
+      "docs_path": "docs/upstream-h2-patches/004-client-close-wakeup/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
       "reason": "The client Connection future read whether streams or handles were held twice per poll: once to decide the idle close and once for the post-poll recheck. A last SendRequest dropped between the two reads found no parked waker and was missed by both, so an idle client connection with no keepalive stayed open until the peer wrote or closed (#6052). The close decision and the recheck now share one read.",

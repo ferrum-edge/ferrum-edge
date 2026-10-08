@@ -1473,7 +1473,7 @@ where
     type Output = Result<(), crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // FERRUM PATCH (h2-003-client-close-wakeup): decide the close and the
+        // FERRUM PATCH (h2-004-client-close-wakeup): decide the close and the
         // post-poll recheck from one read. Dropping the last handle wakes
         // this task only through the waker parked by `poll_complete`, and
         // the wake that started this poll has already taken it. Upstream read
@@ -1760,7 +1760,7 @@ impl proto::Peer for Peer {
 
 #[cfg(test)]
 mod ferrum_client_close_wakeup_tests {
-    //! FERRUM PATCH (h2-003-client-close-wakeup).
+    //! FERRUM PATCH (h2-004-client-close-wakeup).
     use super::*;
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};

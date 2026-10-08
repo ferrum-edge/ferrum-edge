@@ -27,7 +27,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
   `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`,
   `hyper 1.10.0` (patches 001–005), and `h2 0.4.19` (coalescing,
-  runtime-budget, and client close-wakeup patches).
+  runtime-budget, and assigned-send-capacity,
+  and client close-wakeup patches).
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the

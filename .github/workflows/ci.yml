@@ -2095,7 +2095,10 @@ jobs:
           # Patch 002: an automatic small-DATA-frame budget follows runtime
           # target-window changes without resetting outstanding charges.
           cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib budget
-          # Patch 003: a client connection whose last handle drops right after
+          # Patch 003: assigned send window is reported apart from the
+          # send-buffer limit that caps `capacity()` (Hyper patch 005 reads it).
+          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
+          # Patch 004: a client connection whose last handle drops right after
           # Connection::poll decided not to close still wakes itself and
           # closes against an idle peer (issue #6052).
           cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_client_close_wakeup

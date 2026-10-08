@@ -88,7 +88,7 @@ security issue for requests.
 ## Patch
 
 [`h2-client-close-wakeup.patch`](h2-client-close-wakeup.patch) applies after
-Ferrum's h2 patches 001 and 002:
+Ferrum's h2 patches 001, 002 and 003:
 
 - `proto::Connection::maybe_close_connection_if_no_streams` returns the value
   it read: whether streams or handles were held.

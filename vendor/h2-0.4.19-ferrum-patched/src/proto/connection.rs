@@ -269,7 +269,7 @@ where
     /// Closes the connection by transitioning to a GOAWAY state
     /// iff there are no streams or references
     ///
-    /// FERRUM PATCH (h2-003): returns whether streams or references were
+    /// FERRUM PATCH (h2-004): returns whether streams or references were
     /// held, from the same read that decided not to close, so the caller's
     /// post-poll recheck cannot miss a last handle dropped after this read.
     pub fn maybe_close_connection_if_no_streams(&mut self) -> bool {

@@ -10216,6 +10216,17 @@ pub(crate) fn normalize_backend_tls_san_allow_list_entry(san: &mut String) {
 }
 
 impl PluginConfig {
+    /// The proxy this config implies an association with: a `scope: proxy`
+    /// config's `proxy_id` (issue #4611). Every persistence path that creates
+    /// a plugin config must attach it to this proxy in the same write, because
+    /// the runtime only applies configs the proxy lists in `plugins`.
+    pub fn implied_proxy_association(&self) -> Option<&str> {
+        match self.scope {
+            PluginScope::Proxy => self.proxy_id.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Normalize plugin config fields to their canonical in-memory form.
     pub fn normalize_fields(&mut self) {
         if self

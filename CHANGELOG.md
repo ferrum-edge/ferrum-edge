@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **HTTP/2 body pipes no longer split a chunk the peer's window already
+  covers.** Hyper patch 005 (#6033/#6036) split every body chunk larger than
+  `SendStream::capacity()` so h2 could not cut tiny DATA frames from small
+  window increments. But `capacity()` is also capped by h2's per-stream send
+  buffer (400 KiB by default on the frontend server), and the backend pool's default 1 MiB maximum
+  frame size delivers response chunks of up to 1 MiB, so on the frontend leg
+  nearly every large chunk was split and the response pipe waited for the
+  buffer to drain mid-chunk. The pipe now splits only when the window is short:
+  vendored h2 patch 003 adds a read-only `SendStream::capacity_and_assigned()`,
+  and a chunk the stream already holds window for goes to h2 whole, as it did
+  before #6036. Small-window coalescing is unchanged, and a backend upload
+  with a `backend_write_timeout_ms` bound keeps splitting so that bound still
+  times every byte beyond the send buffer. On the hosted HTTP/2
+  protocol benchmark, same runner, this delivered 1.03–1.09× the requests per
+  second at 500 KiB and 1 MiB (Intel Xeon 6973P-C and AMD EPYC 7763) and was
+  within noise at 10 KiB and 70 KiB.
+
+### Fixed
+
+- **An idle HTTP/2 client connection closes when its last handle drops
+  mid-poll** (issue #6052). The vendored h2 client `Connection` read whether
+  any stream or handle was still held twice per poll: once to decide whether
+  to close, and again for the recheck after polling. A last `SendRequest`
+  dropped between the two reads found no parked waker, so neither the drop
+  nor the poll woke the connection again. A hyper-driven backend HTTP/2
+  connection, which pings only while streams are open, could then keep its
+  socket and driver task (already evicted from the pool) until the peer wrote
+  or closed; the HBONE pool's default 30 s PING keepalive bounded it there to
+  about one interval. The close decision and the
+  recheck now use one read. Carried as vendored h2 patch
+  `h2-004-client-close-wakeup`
+  (`docs/upstream-h2-patches/004-client-close-wakeup/`) until Ferrum adopts
+  h2 0.4.20, which fixes the same race (hyperium/h2#956).
+
+## [0.9.14] - 2026-10-07
+
+Release prepared on **2026-10-07 UTC** from main
+`4f370a0b1921d231e9d0c498821e90e076aa64fb`. Library API, error
+classification and backend health attribution, and the control plane's backend
+egress policy discovery change; read
+[Upgrading to 0.9.14](docs/upgrade_guide.md#upgrading-to-0914) before
+upgrading crate consumers, dashboards or contract consumers.
+
 ### Security
 
 - **Keep custom plugins named like cache finalizers in the chain** (#6022).
@@ -59,23 +104,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   obsolete lockfile workflow and completed #5912 evidence page are removed.
   The dependency policy now documents how to lift the GCP, Smithy, and xxhash
   pins.
+- **OIDC session-secret screening refuses two more published fixture keys**
+  (#6037). `session.encryption_secret` and
+  `session.encryption_secret_previous` now also refuse two fixture keys that
+  Edge's own tests published. A stored config that uses either one now fails
+  admission and config load; generate a unique random secret. A known public
+  value is refused before the length check, so a short placeholder reports why
+  it is refused. Screening is narrower in two places: a secret that merely
+  contains `example`, or `${` not followed by an environment-variable name and
+  `}`, is accepted, and an unresolved `${NAME}` placeholder now fails with its
+  own error, "contains an unresolved `${NAME}` placeholder".
+
+### Added
+
+- **Control-plane attestation of data-plane backend egress policy** (issue
+  #6020, completing #5994). Data planes now report bounded metadata about their
+  loaded backend egress policy on ConfigSync `Subscribe`
+  (`SubscribeRequest.backend_egress_policy`): the mode and the
+  dangerous-range/allow-override/deny-override presence flags, never CIDRs,
+  addresses or counts. The control plane records the report per live Subscribe
+  stream, keyed by namespace, principal, node id and stream sequence, so
+  streams sharing a node id never replace or hide each other and
+  `connected_data_planes` counts streams. On a CP, `GET /backend-egress-policy`
+  gains an optional `data_plane_attestation` object for the selected
+  namespace: every live stream with its reported policy (without build
+  versions), a field-wise `weakest_policy`, and
+  `all_connected_public_only_guaranteed`. `GET /cluster` adds each data plane's
+  `backend_egress_policy_attestation` and `backend_egress_policy`, plus a
+  cluster-wide `data_plane_backend_egress_policy` aggregate. A data plane that
+  sends no recognised report is `unknown`, and an unknown data plane, like an
+  empty set, makes the weakest policy incomplete and the public-only guarantee
+  false. The CP's own top-level fields are unchanged: `public_only_guaranteed`
+  stays false on `admission-only`. The new object is optional and additive, so
+  `schema_version` stays `2`. Disconnected data planes that still serve cached
+  config are not listed, so consumers should compare `connected_data_planes`
+  with their expected inventory. The ConfigSync protocol revision is bumped to
+  `3`, so CP and DP must run the same build. ferrum-contracts and Nexus
+  GHSA-93rq Part B consume this contract.
 
 ### Fixed
 
-- **An idle HTTP/2 client connection closes when its last handle drops
-  mid-poll** (issue #6052). The vendored h2 client `Connection` read whether
-  any stream or handle was still held twice per poll: once to decide whether
-  to close, and again for the recheck after polling. A last `SendRequest`
-  dropped between the two reads found no parked waker, so neither the drop
-  nor the poll woke the connection again. A hyper-driven backend HTTP/2
-  connection, which pings only while streams are open, could then keep its
-  socket and driver task (already evicted from the pool) until the peer wrote
-  or closed; the HBONE pool's default 30 s PING keepalive bounded it there to
-  about one interval. The close decision and the
-  recheck now use one read. Carried as vendored h2 patch
-  `h2-003-client-close-wakeup`
-  (`docs/upstream-h2-patches/003-client-close-wakeup/`) until Ferrum adopts
-  h2 0.4.20, which fixes the same race (hyperium/h2#956).
 - **A client reset of a pumped HTTP/2 upload reaches the backend as
   `CANCEL`** (#6038). A direct HTTP/2 upload runs through a gateway-owned pump
   when the route has a request size limit and a `backend_write_timeout_ms`,
@@ -94,7 +162,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header or authority rule on the same chain got no early bound. Each plugin
   now names the credential headers it strips and the claim headers it owns, so
   only rules on those headers stay undetermined.
-- **Backend HTTP/2 resets mid-response count as backend failures** (#6019).
+- **BREAKING — backend HTTP/2 resets mid-response count as backend failures**
+  (issue #6019).
   A backend `RST_STREAM` or `GOAWAY` with any reason other than `NO_ERROR`
   after response headers reached the body classifier as a hyper body error
   whose text matched no heuristic. It was logged as
@@ -110,37 +179,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open circuit breakers and fail passive health checks where they did not
   before. Dashboards keyed on `body_error_class` will see these responses move
   from `request_error` to `protocol_error`.
-
-### Changed
-
-- Name Ferrum Edge LLC as the copyright holder and commercial licensor in `LICENSE` (Required Notice), `LICENSE-COMMERCIAL.md` and the README license section.
-- **HTTP/2 small-window coalescing follow-ups** (#6038). New tests drive the
-  production frontend accept loop over h2c and TLS with a raw client that
-  opens its window a few bytes at a time, proving that both frontend HTTP/2
-  builders give the response pipe a timer. The real-time gRPC pool test now
-  proves the bounded wait with a lower bound that holds on a loaded runner,
-  and allows small frames up to half the increments instead of 16 of 128.
-  Hyper patch 005's notes now explain the deliberate spurious wake after a
-  hold that ends early and reason about the unmeasured cost against a 64 KiB
-  window. They also list HTTP/2 CONNECT tunnels (WebSocket over HTTP/2,
-  inbound HBONE) as not covered: hyper's tunnel task applies no flow-control
-  backpressure, so a bounded hold there would change write and shutdown
-  behaviour as well as framing.
-- **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
-  backend now answers before reading any request DATA, then drains the full
-  2 MiB upload, alongside the existing variant that reads one DATA frame first.
-  A raw native-gRPC backend now sends its Trailers-Only response on request
-  HEADERS alone, before the client has sent any DATA. The upload must then
-  either reach the backend intact with END_STREAM or arrive as the client's
-  `CANCEL` with no DATA. This is checked with and without an authenticated
-  consumer.
-- **Test coverage for gateway-initiated backend resets** (#6022). A unit test
-  drives a real hyper HTTP/2 client whose request body fails. It checks that
-  the backend receives `RST_STREAM(CANCEL)` and that the error stays
-  backend-health-neutral in both the streaming and reqwest classifiers.
-
-### Fixed
-
 - **HTTP/2 bodies no longer leave as one DATA frame per small window
   increment** (#6033). Since the old 1 KiB send-capacity gate was removed
   (#6001), a backend or client that opened its HTTP/2 window a few bytes at a
@@ -189,8 +227,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version compare per streaming request and, at the end of each HTTP/2
   upload, one read of the client stream's receive state, which takes h2's
   connection lock once.
-- **A backend HTTP/2 reset on a reqwest request or buffered response counts as
-  a backend failure** (#6022). `classify_reqwest_error` now uses the same typed
+- **BREAKING — a backend HTTP/2 reset on a reqwest request or buffered response
+  counts as a backend failure** (issue #6022). `classify_reqwest_error` now uses the same typed
   `h2::Error` check as the streaming body classifier (#6019). A non-`NO_ERROR`
   `RST_STREAM` or `GOAWAY` that the backend sent before the response headers,
   or while the eager collector read a buffered body, is `protocol_error`. It
@@ -230,6 +268,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Name Ferrum Edge LLC as the copyright holder and commercial licensor in `LICENSE` (Required Notice), `LICENSE-COMMERCIAL.md` and the README license section.
+- **HTTP/2 small-window coalescing follow-ups** (#6038). New tests drive the
+  production frontend accept loop over h2c and TLS with a raw client that
+  opens its window a few bytes at a time, proving that both frontend HTTP/2
+  builders give the response pipe a timer. The real-time gRPC pool test now
+  proves the bounded wait with a lower bound that holds on a loaded runner,
+  and allows small frames up to half the increments instead of 16 of 128.
+  Hyper patch 005's notes now explain the deliberate spurious wake after a
+  hold that ends early and reason about the unmeasured cost against a 64 KiB
+  window. They also list HTTP/2 CONNECT tunnels (WebSocket over HTTP/2,
+  inbound HBONE) as not covered: hyper's tunnel task applies no flow-control
+  backpressure, so a bounded hold there would change write and shutdown
+  behaviour as well as framing.
+- **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
+  backend now answers before reading any request DATA, then drains the full
+  2 MiB upload, alongside the existing variant that reads one DATA frame first.
+  A raw native-gRPC backend now sends its Trailers-Only response on request
+  HEADERS alone, before the client has sent any DATA. The upload must then
+  either reach the backend intact with END_STREAM or arrive as the client's
+  `CANCEL` with no DATA. This is checked with and without an authenticated
+  consumer.
+- **Test coverage for gateway-initiated backend resets** (#6022). A unit test
+  drives a real hyper HTTP/2 client whose request body fails. It checks that
+  the backend receives `RST_STREAM(CANCEL)` and that the error stays
+  backend-health-neutral in both the streaming and reqwest classifiers.
 - **BREAKING (library API) — test-only HTTP/3 pool entry points** (issue #6022).
   `Http3ConnectionPool::request_streaming`, `request_with_target_streaming`,
   `request_streaming_incoming_body`, and
@@ -292,8 +355,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ACL that denied `MULTI` but allowed the write let it run outside the
   transaction, unfenced by `WATCH`. They now send `MULTI` alone and require a
   `QUEUED` reply before `EXEC`.
-### Changed
-
 - **Deployment mutations separate `not_started` from `not_committed`**
   (issue #6021). A conditional `DELETE /proxies/{id}` or `PUT /api-specs/{id}`
   whose store failed before commit was attempted returned `503` with
@@ -326,40 +387,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `If-Match`, not a validator of the response bytes. The internal contracts
   handoff page was removed; its user-facing pointers now link the published
   ferrum-contracts records.
-### Added
-
-- **Control-plane attestation of data-plane backend egress policy** (issue
-  #6020, completing #5994). Data planes now report bounded metadata about their
-  loaded backend egress policy on ConfigSync `Subscribe`
-  (`SubscribeRequest.backend_egress_policy`): the mode and the
-  dangerous-range/allow-override/deny-override presence flags, never CIDRs,
-  addresses or counts. The control plane records the report per live Subscribe
-  stream, keyed by namespace, principal, node id and stream sequence, so
-  streams sharing a node id never replace or hide each other and
-  `connected_data_planes` counts streams. On a CP, `GET /backend-egress-policy`
-  gains an optional `data_plane_attestation` object for the selected
-  namespace: every live stream with its reported policy (without build
-  versions), a field-wise `weakest_policy`, and
-  `all_connected_public_only_guaranteed`. `GET /cluster` adds each data plane's
-  `backend_egress_policy_attestation` and `backend_egress_policy`, plus a
-  cluster-wide `data_plane_backend_egress_policy` aggregate. A data plane that
-  sends no recognised report is `unknown`, and an unknown data plane, like an
-  empty set, makes the weakest policy incomplete and the public-only guarantee
-  false. The CP's own top-level fields are unchanged: `public_only_guaranteed`
-  stays false on `admission-only`. The new object is optional and additive, so
-  `schema_version` stays `2`. Disconnected data planes that still serve cached
-  config are not listed, so consumers should compare `connected_data_planes`
-  with their expected inventory. The ConfigSync protocol revision is bumped to
-  `3`, so CP and DP must run the same build. ferrum-contracts and Nexus
-  GHSA-93rq Part B consume this contract.
 
 ## [0.9.13] - 2026-10-06
 
-Release prepared on **2026-10-06 UTC** from main
-`fd02c5f45bb9dee86a52bc612fcefd0223d6157b`. Snapshot tags, deployment
-snapshot evidence and backend egress policy discovery change shape; read
-[Upgrading to 0.9.13](docs/upgrade_guide.md#upgrading-to-0913) before
-upgrading admin automation or contract consumers.
+Published at **2026-10-06T17:04:49Z** (release 404961860) at immutable release
+merge `9b83115de7ec23ab51ec4feae6bed65e596db425`, with reviewed #6026 head
+`71c282279a38591c8c50fd11a1d0ba0c5be4a484` as second parent and main
+`fd02c5f45bb9dee86a52bc612fcefd0223d6157b` as first parent. The Docker Hub
+`v0.9.13` index digest is
+`sha256:6caa0987adb4c0a3a368fcd800bb0459cff3d3e219522e2e9c56280205862e50`.
+Snapshot tags, deployment snapshot evidence and backend egress policy discovery
+change shape; read [Upgrading to 0.9.13](docs/upgrade_guide.md#upgrading-to-0913)
+before upgrading admin automation or contract consumers.
 
 ### Fixed
 
@@ -7212,7 +7251,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.13...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.14...HEAD
+[0.9.14]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...v0.9.11
