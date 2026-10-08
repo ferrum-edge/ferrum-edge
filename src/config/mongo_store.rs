@@ -100,7 +100,7 @@ mod inner {
         Tls, TlsOptions, WriteConcern,
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::future::Future;
     use std::io::Write;
     use std::ops::Deref;
@@ -1035,6 +1035,50 @@ mod inner {
             .into_iter()
             .map(|((namespace, proxy_id), ids)| (namespace, proxy_id, ids))
             .collect()
+    }
+
+    /// Project a batch's implied proxy associations onto an admission
+    /// candidate exactly as [`proxy_scoped_attach_pipeline`] writes them:
+    /// append-only, skipping ids the proxy already lists. Without it a
+    /// proxy-scoped policy the batch activates looks dormant to admission
+    /// (issue #6070). A missing target proxy is left to the writer, which
+    /// aborts the transaction.
+    fn project_proxy_scoped_attachments<'a>(
+        candidate: &mut GatewayConfig,
+        configs: impl IntoIterator<Item = &'a PluginConfig>,
+    ) {
+        let attachments = group_proxy_scoped_attachments(configs);
+        if attachments.is_empty() {
+            return;
+        }
+        let proxy_index: HashMap<(&str, &str), usize> = candidate
+            .proxies
+            .iter()
+            .enumerate()
+            .map(|(index, proxy)| ((proxy.namespace.as_str(), proxy.id.as_str()), index))
+            .collect();
+        let targets: Vec<(usize, Vec<String>)> = attachments
+            .into_iter()
+            .filter_map(|(namespace, proxy_id, ids)| {
+                proxy_index
+                    .get(&(namespace.as_str(), proxy_id.as_str()))
+                    .map(|&index| (index, ids))
+            })
+            .collect();
+        for (index, ids) in targets {
+            let proxy = &mut candidate.proxies[index];
+            for id in ids {
+                if !proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == id)
+                {
+                    proxy.plugins.push(PluginAssociation {
+                        plugin_config_id: id,
+                    });
+                }
+            }
+        }
     }
 
     /// Update pipeline appending each id the proxy does not already list.
@@ -13565,6 +13609,13 @@ mod inner {
                                 .filter(|item| item.namespace == namespace)
                                 .cloned(),
                         );
+                        project_proxy_scoped_attachments(
+                            candidate,
+                            graph
+                                .plugin_configs
+                                .iter()
+                                .filter(|item| item.namespace == namespace),
+                        );
                     })
                     .await?;
                 }
@@ -14106,6 +14157,12 @@ mod inner {
                                 .iter()
                                 .filter(|config| config.namespace == namespace)
                                 .cloned(),
+                        );
+                        project_proxy_scoped_attachments(
+                            candidate,
+                            configs
+                                .iter()
+                                .filter(|config| config.namespace == namespace),
                         );
                     })
                     .await?;

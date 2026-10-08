@@ -1423,6 +1423,116 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
     );
 }
 
+/// Batch admission validates the graph the batch commits, including each
+/// proxy-scoped config's implied association with its `proxy_id` (issue
+/// #6070). A proxy-scoped policy whose target proxy does not list it is still
+/// attached by persistence, so admission must see it as active: here a
+/// `san_dns` policy that makes two stored mTLS identities collide, and a TCP
+/// throttle on an HTTP proxy. Both batch entry points must reject the write
+/// with nothing durable and no cursor advance.
+async fn assert_batch_admission_sees_implied_proxy_associations(db: &dyn DatabaseBackend) {
+    use ferrum_edge::config::db_backend::{AtomicBatchGraph, BatchConfigWriteMode};
+    use ferrum_edge::config::types::{Consumer, PluginConfig, Proxy};
+
+    let namespace = format!("batch-implied-{}", uuid::Uuid::new_v4());
+    let proxy: Proxy = serde_json::from_value(json!({
+        "namespace": namespace,
+        "id": "p",
+        "listen_path": "/p",
+        "backend_scheme": "http",
+        "backend_host": "backend.internal",
+        "backend_port": 8080,
+    }))
+    .unwrap();
+    let consumer = |id: &str, identity: &str| -> Consumer {
+        serde_json::from_value(json!({
+            "namespace": namespace,
+            "id": id,
+            "username": id,
+            "credentials": { "mtls_auth": [{ "identity": identity }] },
+        }))
+        .unwrap()
+    };
+    let seed_consumers = [
+        consumer("upper", "Svc.Example"),
+        consumer("lower", "svc.example"),
+    ];
+    let seed = AtomicBatchGraph {
+        namespace: &namespace,
+        consumers: &seed_consumers,
+        upstreams: &[],
+        proxies: std::slice::from_ref(&proxy),
+        plugin_configs: &[],
+        admission_lease: None,
+    };
+    db.batch_create_config_graph_atomically(&seed, &BatchConfigWriteMode::Admission)
+        .await
+        .expect("case-variant identities are allowed while no san_dns policy is effective");
+
+    let proxy_scoped = |id: &str, plugin_name: &str, config: serde_json::Value| -> PluginConfig {
+        serde_json::from_value(json!({
+            "namespace": namespace,
+            "id": id,
+            "plugin_name": plugin_name,
+            "config": config,
+            "scope": "proxy",
+            "proxy_id": "p",
+        }))
+        .unwrap()
+    };
+    let rejected = [
+        proxy_scoped("dns", "mtls_auth", json!({ "cert_field": "san_dns" })),
+        proxy_scoped(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({ "max_connections_per_key": 10 }),
+        ),
+    ];
+    for config in &rejected {
+        let before = db.latest_change_sequence(&namespace).await.unwrap();
+        let graph = AtomicBatchGraph {
+            namespace: &namespace,
+            consumers: &[],
+            upstreams: &[],
+            proxies: &[],
+            plugin_configs: std::slice::from_ref(config),
+            admission_lease: None,
+        };
+        assert!(
+            db.batch_create_config_graph_atomically(&graph, &BatchConfigWriteMode::Admission)
+                .await
+                .is_err(),
+            "atomic batch must reject {:?} once attached to p",
+            config.id
+        );
+        assert!(
+            db.batch_create_plugin_configs(
+                std::slice::from_ref(config),
+                &BatchConfigWriteMode::Admission
+            )
+            .await
+            .is_err(),
+            "per-family batch must reject {:?} once attached to p",
+            config.id
+        );
+        assert!(
+            db.get_plugin_config(&namespace, &config.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_proxy(&namespace, "p")
+                .await
+                .unwrap()
+                .expect("proxy exists")
+                .plugins
+                .is_empty()
+        );
+        assert_eq!(db.latest_change_sequence(&namespace).await.unwrap(), before);
+    }
+}
+
 /// `POST /batch` and conditional restore persist a proxy-scoped plugin
 /// config's implied association with its `proxy_id` inside the same
 /// transaction on every backend (issue #4611). The runtime only applies a
@@ -1638,6 +1748,7 @@ async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transactio
     let (db, url) = make_store_with_url(&dir).await;
     assert_transaction_precondition(db.as_ref()).await;
     assert_batch_proxy_scoped_plugin_association_parity(db.as_ref()).await;
+    assert_batch_admission_sees_implied_proxy_associations(db.as_ref()).await;
     assert_sql_deployment_raw_preservation(db.clone(), "sqlite", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
@@ -2622,6 +2733,7 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     db.run_migrations().await.unwrap();
     assert_transaction_precondition(&db).await;
     assert_batch_proxy_scoped_plugin_association_parity(&db).await;
+    assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
@@ -2662,6 +2774,7 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     assert_batch_proxy_scoped_plugin_association_parity(&db).await;
+    assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "postgres", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
@@ -2691,6 +2804,7 @@ async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     assert_batch_proxy_scoped_plugin_association_parity(&db).await;
+    assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "mysql", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
