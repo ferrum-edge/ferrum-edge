@@ -376,7 +376,7 @@ fn both_harnesses_gate_measurement_on_bounded_convergence_not_a_fixed_sleep() {
 
     assert_eq!(MEASUREMENT_WINDOW_MAX_ATTEMPTS, 2);
     assert!(SCALE.contains("convergence_interruption.notified()"));
-    assert!(SCALE.contains("r.status() == reqwest::StatusCode::NOT_FOUND"));
+    assert!(SCALE.contains("Ok(status) if status == reqwest::StatusCode::NOT_FOUND"));
     assert!(SCALE.contains("discarding interrupted measurement window"));
     assert!(SCALE.contains("Configuration convergence instability interrupted all"));
 }
