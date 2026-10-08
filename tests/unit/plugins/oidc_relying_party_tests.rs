@@ -2289,6 +2289,31 @@ async fn pending_login_admission_is_bounded_per_source() {
 }
 
 #[tokio::test]
+async fn pending_login_source_limit_groups_ipv6_addresses_by_prefix() {
+    let mut config = base_config();
+    config["behavior"]["state_cache_max_entries"] = json!(4);
+    config["behavior"]["state_cache_max_entries_per_source"] = json!(1);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut first = html_ctx();
+    first.client_ip = "2001:db8:abcd:12::1".to_string();
+    assert_reject(
+        plugin
+            .authenticate(&mut first, &ConsumerIndex::new(&[]))
+            .await,
+        Some(302),
+    );
+    let mut sibling = html_ctx();
+    sibling.client_ip = "2001:db8:abcd:12::ffff".to_string();
+    assert_reject(
+        plugin
+            .authenticate(&mut sibling, &ConsumerIndex::new(&[]))
+            .await,
+        Some(503),
+    );
+}
+
+#[tokio::test]
 async fn pending_login_admission_is_bounded_globally_across_sources() {
     let mut config = base_config();
     config["behavior"]["state_cache_max_entries"] = json!(1);

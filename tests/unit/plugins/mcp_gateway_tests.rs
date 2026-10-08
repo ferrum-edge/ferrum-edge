@@ -12182,6 +12182,30 @@ async fn aggregate_session_is_bound_to_the_consumer_that_created_it() {
 }
 
 #[tokio::test]
+async fn full_session_store_never_evicts_another_principals_live_session() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({
+        "max_sessions": 1,
+        "max_sessions_per_principal": 1,
+        "session_ttl_seconds": 3600
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let owner = caller_as_consumer(initialize_request_body(), "consumer-a", "alice");
+    let session_id = initialize_as(&plugin, owner).await;
+
+    let other = caller_as_consumer(initialize_request_body(), "consumer-b", "bob");
+    let (mut ctx, mut headers) = other;
+    let refused = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (_, body, _) = reject_json(refused);
+    assert_eq!(body["error"]["code"], -32013);
+
+    let owner = caller_as_consumer(tools_list_body(3), "consumer-a", "alice");
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+}
+
+#[tokio::test]
 async fn aggregate_session_is_bound_to_an_external_identity_without_a_consumer() {
     let server = start_mcp_catalog_server().await;
     let config = aggregate_config(&format!("{}/mcp", server.uri()));

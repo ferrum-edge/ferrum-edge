@@ -469,8 +469,12 @@ impl GrpcMethodRouter {
             .then(|| ctx.effective_identity())
             .flatten()
         {
-            Some(identity) => ("consumer:", identity),
-            None => ("ip:", ctx.client_ip.as_str()),
+            Some(identity) => ("consumer:", identity.to_string()),
+            None => (
+                "ip:",
+                crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                    .unwrap_or_else(|| ctx.client_ip.to_string()),
+            ),
         };
         let mut key = String::with_capacity(
             "grpc_method::".len() + kind.len() + identity.len() + method_path.len(),

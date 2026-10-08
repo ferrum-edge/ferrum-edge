@@ -29638,6 +29638,12 @@ components:
             - `ip` (default) — client IP.
             - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
             - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
+        ipv6_prefix:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 128
+          default: 64
+          description: IPv6 prefix length used to group source addresses for IP rate-limit keys. IPv4 addresses remain host-specific.
         expose_headers:
           type: boolean
           default: false
@@ -36779,7 +36785,13 @@ components:
               format: uint64
               default: 16384
               minimum: 1
-              description: Maximum downstream MCP sessions retained by this plugin instance; oldest sessions are evicted when the cap is reached.
+              description: Maximum downstream MCP sessions retained by this plugin instance. When full, only an expired session or one owned by the principal opening a replacement may be removed; otherwise initialization is refused.
+            max_sessions_per_principal:
+              type: [integer, "null"]
+              format: uint64
+              default: 128
+              minimum: 1
+              description: Maximum live downstream MCP sessions owned by one authenticated principal (or by unauthenticated requests as one shared principal). At this cap, the principal's own oldest session is evicted.
             sse_multiplexing:
               type: [boolean, "null"]
               default: false

@@ -712,9 +712,11 @@ impl AiRateLimiter {
             return key;
         }
 
-        let mut key = String::with_capacity(ctx.client_ip.len() + 3);
+        let ip = crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+            .unwrap_or_else(|| ctx.client_ip.to_string());
+        let mut key = String::with_capacity(ip.len() + 3);
         key.push_str("ip:");
-        key.push_str(&ctx.client_ip);
+        key.push_str(&ip);
         key
     }
 

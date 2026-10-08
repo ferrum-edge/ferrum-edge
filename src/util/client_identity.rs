@@ -75,6 +75,35 @@ pub fn canonical_ip_string(ip: IpAddr) -> String {
     }
 }
 
+/// Render an IP address for a per-client quota key, folding IPv6 addresses to
+/// the configured network prefix while keeping IPv4 host keys unchanged.
+pub fn rate_limit_ip_string(ip: IpAddr, ipv6_prefix: u8) -> String {
+    match canonical_ip(ip) {
+        IpAddr::V4(ip) => ipv4_string(ip),
+        IpAddr::V6(ip) => {
+            let prefix = ipv6_prefix.min(128);
+            let mut octets = ip.octets();
+            let whole_bytes = usize::from(prefix / 8);
+            let remaining_bits = prefix % 8;
+            if remaining_bits != 0 {
+                octets[whole_bytes] &= u8::MAX << (8 - remaining_bits);
+            }
+            let zero_from = if remaining_bits == 0 {
+                whole_bytes
+            } else {
+                whole_bytes + 1
+            };
+            octets[zero_from..].fill(0);
+            Ipv6Addr::from(octets).to_string()
+        }
+    }
+}
+
+/// Parse and render a source address for a per-client quota key.
+pub fn rate_limit_client_ip_string(client_ip: &str, ipv6_prefix: u8) -> Option<String> {
+    parse_canonical_client_ip(client_ip).map(|ip| rate_limit_ip_string(ip, ipv6_prefix))
+}
+
 fn ipv4_string(ip: Ipv4Addr) -> String {
     let mut out = String::with_capacity(15);
     for (index, octet) in ip.octets().into_iter().enumerate() {

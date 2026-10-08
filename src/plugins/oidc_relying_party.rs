@@ -2224,7 +2224,11 @@ impl OidcRelyingParty {
         let sealed_binding_hash: [u8; 32] = Sha256::digest(sealed_cookie.as_bytes());
         let flow = FlowState {
             sealed_binding_hash,
-            source_ip: ctx.client_ip.clone(),
+            source_ip: crate::util::client_identity::rate_limit_client_ip_string(
+                &ctx.client_ip,
+                64,
+            )
+            .unwrap_or_else(|| ctx.client_ip.clone()),
             expires_at: Instant::now() + self.behavior.state_ttl,
         };
         self.session.state_cache.insert(state.clone(), flow)?;

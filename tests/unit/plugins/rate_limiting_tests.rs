@@ -506,6 +506,34 @@ async fn test_rate_limiting_consumer_fallback_to_ip() {
 }
 
 #[tokio::test]
+async fn ipv6_rate_limit_prefix_defaults_to_64_and_can_be_overridden() {
+    let shared = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "ip"
+    }));
+    let mut first = create_test_context();
+    first.client_ip = "2001:db8:abcd:12::1".to_string();
+    assert_continue(shared.on_request_received(&mut first).await);
+    let mut sibling = create_test_context();
+    sibling.client_ip = "2001:db8:abcd:12::ffff".to_string();
+    assert_reject(shared.on_request_received(&mut sibling).await, Some(429));
+
+    let per_host = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "ip",
+        "ipv6_prefix": 128
+    }));
+    let mut first = create_test_context();
+    first.client_ip = "2001:db8:abcd:12::1".to_string();
+    assert_continue(per_host.on_request_received(&mut first).await);
+    let mut sibling = create_test_context();
+    sibling.client_ip = "2001:db8:abcd:12::ffff".to_string();
+    assert_continue(per_host.on_request_received(&mut sibling).await);
+}
+
+#[tokio::test]
 async fn test_rate_limiting_spiffe_mode_on_request_received_is_noop() {
     let config = json!({
         "window_seconds": 60,
