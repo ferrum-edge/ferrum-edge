@@ -592,24 +592,28 @@ publishes them in
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
 Edge source. The latest tag is
-[`contracts-edge-0.9.13`](https://github.com/ferrum-edge/ferrum-contracts/tree/9626821eb089c71f5d4d71268c7b8276a8a5ab50)
-at `9626821eb089c71f5d4d71268c7b8276a8a5ab50`, prepared against Edge
-**v0.9.13**, published at 2026-10-06T17:04:49Z at release merge
-`9b83115de7ec23ab51ec4feae6bed65e596db425` (see the
-[v0.9.13 release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.13)).
+[`contracts-edge-0.9.14`](https://github.com/ferrum-edge/ferrum-contracts/tree/ddbdd845733b7046c4393ac951011dafb774db33)
+at `ddbdd845733b7046c4393ac951011dafb774db33`, prepared against Edge
+**v0.9.14**, published at 2026-10-07T08:59:56Z at release merge
+`9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d` (see the
+[v0.9.14 release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.14)).
 The earlier
-[`contracts-edge-0.9.12`](https://github.com/ferrum-edge/ferrum-contracts/tree/31f0a21d707795be293d15837c2f77c3d84219d8)
-tag at `31f0a21d707795be293d15837c2f77c3d84219d8` remains unchanged.
+[`contracts-edge-0.9.13`](https://github.com/ferrum-edge/ferrum-contracts/tree/9626821eb089c71f5d4d71268c7b8276a8a5ab50)
+tag at `9626821eb089c71f5d4d71268c7b8276a8a5ab50` remains unchanged.
 
-Edge **v0.9.14** changes Edge-owned contract surfaces: on a control plane,
-`GET /backend-egress-policy` gains an optional `data_plane_attestation` object
-and `GET /cluster` adds per-data-plane backend egress reports (additive;
-`schema_version` stays `2`); deployment mutation failures before commit report
-`durable: "not_committed"`; and backend HTTP/2 resets are reclassified as
-`protocol_error` without any `ErrorClass`, token or status change. Consumer pins
-to `contracts-edge-0.9.13` or earlier predate these changes; move them only to a
-ferrum-contracts tag published for Edge 0.9.14. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0914).
+Edge **v0.9.15** changes Edge-owned contract surfaces: `X-Consumer-Username`
+now carries only a mapped Consumer username and external identities move to the
+gateway-owned `X-Authenticated-Identity` header; client `Connection`
+nominations are resolved at ingress and gateway-owned assertion headers match
+`_`/`-` spellings; the plugin trait gains `gates_request_admission()` and the
+gateway rejection phase set gains `route_protocol_admission`; the LDAP
+`consumer_mapping` option is removed, plugin-config environment references must
+name `FERRUM_PLUGIN_SECRET_<NAME>`, and `rate_limiting` gains `ipv6_prefix`;
+and namespace-scoped `operator` writes of `backend_tls_*` references outside
+their namespace are refused with `400`. Consumer pins to
+`contracts-edge-0.9.14` or earlier predate these changes; move them only to a
+ferrum-contracts tag published for Edge 0.9.15. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0915).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the

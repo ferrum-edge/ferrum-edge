@@ -26,9 +26,119 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased changes after 0.9.14
+## Upgrading to 0.9.15
 
-**Mesh CONNECT relays are authorized on transport attributes only (#6081).**
+0.9.15 (2026-10-08 UTC) is cut from main
+`97cf0066a07d94665234ee9ed373fb831a04441f`. All previously released breaking
+identifiers and guidance below remain applicable. CP/DP must run the same
+build; the ConfigSync protocol revision stays `3`. 0.9.15 adds no core schema
+change; a changed baseline in any later release still requires a fresh
+database with the old database kept intact for rollback.
+
+Before rolling out, check:
+
+- Gateway API backendRefs to `type: ExternalName` Services, DestinationRules
+  outside the mesh root namespace that name another namespace's Secret, a
+  secret-manager source or a local file, namespace-scoped `operator`
+  automation that writes `backend_tls_*` file paths or secret-manager
+  references, dashboards that match generated ids of cross-namespace routes,
+  and configs that carry two resources of one kind with the same
+  `(namespace, id)` (#6092);
+- `AuthorizationPolicy` rules with L7 fields that select a workload reached
+  over HBONE, which now apply to the whole tunnel (#6081);
+- routes that serve native gRPC or WebSocket clients and carry an
+  authentication or admission plugin that runs only on HTTP, and custom
+  enforcement plugins that keep the HTTP-only `supported_protocols()` default
+  (#6087);
+- clients that nominate request fields in `Connection` (for example
+  `Connection: authorization`) on HTTP/1.1 or HTTP/3 (#6090);
+- every plugin-config environment reference, and the `serverless_function`
+  Azure/GCP fallback variables, which must move to
+  `FERRUM_PLUGIN_SECRET_<NAME>` (#6086);
+- backends that read `X-Consumer-Username` for external identities,
+  Consumer-specific policy that relied on an external claim matching a
+  Consumer, LDAP `consumer_mapping`, and header rules that set
+  `X-Authenticated-Identity` (#6082), plus replay-store sizing for
+  high-volume principals (#6088);
+- `ferrum-mesh` chart installs: the new workload ServiceAccounts,
+  `ambient.tlsSecretRefs`, SPIRE entries and policies that pin
+  `sa/ferrum-mesh`, and node agents on CNIs without per-pod host routes
+  (#6096);
+- HTTP/3 CONNECT-UDP clients that hold more than 32 tunnels from one address
+  or IPv6 `/64`, and H3 WebSocket routes or policies that match `CONNECT`
+  (#6098);
+- IPv6 per-source caps and IP-keyed plugin quotas, which now group a `/64` by
+  default, aggregate MCP session caps, and `body_validator` configs that set
+  `grpc_max_decompressed_size_bytes: 0` (#6079);
+- MTOM producers that do not put the root part first or that emit padded,
+  LF-only or extra boundary tokens (#6077);
+- HTTP/1.1 WebSocket clients that upgrade with a method other than `GET`, and
+  DTLS passthrough clients that send a malformed ClientHello SNI (#6080);
+- HTTP/3 deployments that see bursts of first-time clients, which may now pay
+  one Retry round trip, and peers that send QUIC DATAGRAM frames (#6085);
+- MongoDB deployments that created proxy-scoped plugin configs through
+  `POST /batch`, restore or import before 0.9.15 (#6065, #6070).
+
+### Namespace-scoped configuration stays inside its namespace (issue [#6092](https://github.com/ferrum-edge/ferrum-edge/issues/6092))
+
+Namespace-scoped configuration can no longer reach material or backends
+outside its own namespace. Before rolling out, check:
+
+- **Gateway API backendRefs to `type: ExternalName` Services.** They are now
+  refused (`ResolvedRefs=False` / `UnsupportedProtocol`): HTTPRoute and
+  GRPCRoute answer that backend's share of traffic fail-closed, and
+  TCPRoute/TLSRoute/UDPRoute reject the route. Find them with
+  `kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="ExternalName")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'`
+  and point each backendRef at a selector Service in the route's namespace,
+  or at a Service in another namespace that a ReferenceGrant authorizes.
+- **Istio DestinationRules with client TLS material.** Outside the mesh root
+  namespace, `caCertificates`, `clientCertificate` and `privateKey` may name
+  only inline PEM, `system://`, or a `k8s://` Secret in the rule's own
+  namespace. A rule that names another namespace's Secret or a `vault://`,
+  `aws://`, `azure://`, `gcp://`, `managed://`, `acme://` or `pkcs11://` source
+  now fails translation (`FerrumAccepted=False`) and native, file and xDS slice
+  validation. Copy the Secret into the rule's namespace, or move the rule into
+  the mesh root namespace if it is platform policy.
+- **DestinationRules outside the mesh root namespace can no longer name local
+  files by default.** A path or `file://` value in `caCertificates`,
+  `clientCertificate` or `privateKey` is refused unless it is an absolute path,
+  without `..`, under a directory listed in the new
+  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` (empty by default). A data plane
+  re-checks each listed file after resolving symlinks when it applies the rule
+  to one of its upstreams. If the file is missing on that node or resolves
+  outside the listed directories, backend TLS fails closed for the
+  destinations that rule governs and the rest of the configuration still
+  applies. If tenants legitimately mount their own certificates (for example
+  into their Sidecar pods), list only those directories, on the control plane
+  and on every mesh data plane; otherwise switch the rule to a `k8s://` Secret
+  in its own namespace. Root-namespace rules are unchanged.
+- **Namespace-scoped Admin API operators.** Where the `ns` claim is enforced
+  (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, or a multi-namespace control
+  plane), an `operator` token can set `backend_tls_client_cert_path`,
+  `backend_tls_client_key_path` and `backend_tls_server_ca_cert_path` only to
+  inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace.
+  Automation that writes file paths or secret-manager references with operator
+  tokens must use an `admin` token instead. Values already stored on a
+  resource keep working and survive unrelated updates. The check treats the
+  Ferrum namespace an operator is scoped to as the Kubernetes namespace of the
+  same name: `k8s://<that namespace>/…` stays admitted and is read with the
+  gateway's own ServiceAccount. Do not give a Ferrum tenant namespace the name
+  of a Kubernetes namespace that tenant should not read (for example
+  `kube-system` or a platform namespace).
+- **Generated ids of cross-namespace HTTPRoutes and GRPCRoutes** now end in
+  `__<digest>`. Nothing needs to change in Kubernetes, but dashboards, alerts
+  or log queries that match these proxy, upstream or plugin ids by exact value
+  must be updated. Same-namespace routes keep their ids.
+- **Duplicate `(namespace, id)` resources are refused.** The control plane
+  refuses a full or incremental candidate, or a Kubernetes translation, that
+  carries two resources of one kind with the same namespace and id; a refused
+  translation keeps the last accepted Kubernetes configuration and logs the
+  duplicate ids. Data planes also refuse such a ConfigSync snapshot and keep
+  serving their last accepted configuration. Run the control plane and data
+  planes on the same build, as always.
+
+### Mesh CONNECT relays are authorized on transport attributes only (issue [#6081](https://github.com/ferrum-edge/ferrum-edge/issues/6081))
+
 An HBONE byte-stream or datagram CONNECT — the Ambient / waypoint `:15008`
 transport, and a bare authenticated HTTP/2 CONNECT on the Sidecar `:15006`
 listener — relays the traffic inside the tunnel unparsed. `mesh_authz` now
@@ -51,14 +161,308 @@ workload is reached on over HBONE, or enforce L7 policy on an HTTP route
 where the request is parsed. Sidecar HTTP traffic between workloads rides plain
 mesh-mTLS HTTP/2, not a CONNECT, and is unaffected.
 
+### gRPC and WebSocket requests need the route's admission plugins (issue [#6087](https://github.com/ferrum-edge/ferrum-edge/issues/6087))
+
+A native gRPC or WebSocket request now gets `403`
+(`{"error":"Request protocol not permitted on this route"}`) or trailers-only
+`PERMISSION_DENIED` when its flavor's plugin view would omit a plugin that
+gates admission on the route's HTTP view. These requests used to run without
+that plugin. Before rolling out, check routes (and global plugin sets) that
+carry any of the following and also serve native gRPC or WebSocket clients:
+
+- `soap_ws_security` in any configuration, including a timestamp-only
+  (freshness) policy or `strict` media-type governance without identity;
+- a custom authentication plugin that keeps the HTTP-only
+  `supported_protocols()` default;
+- `openapi_validator` in `block` mode, `mcp_gateway`,
+  `request_deduplication` with `enforce_required`, `ai_prompt_shield`,
+  `ai_rate_limiter`, `ai_tool_governor`, `ai_semantic_firewall`, or
+  `rate_limiting` with `mcp_tool_calls`;
+- `graphql` with any protection rule (native gRPC only; it runs on
+  WebSocket);
+- `a2a_gateway` with a deny policy (WebSocket only; it runs on gRPC).
+
+Serve that gRPC or WebSocket traffic from a separate route without those
+plugins, or authenticate it with a plugin that supports the flavor (every other
+built-in authentication plugin does). Refusals are logged with
+`rejection_phase: "route_protocol_admission"`. gRPC-Web is unaffected. In mesh
+mode, a live HBONE tunnel admitted on a gRPC-classified view is revoked
+(`authorization_denied`) when a reload adds such a plugin to its route.
+
+**Custom plugins must declare how they relate to gRPC and WebSocket.** Only
+authentication plugins participate by default
+(`gates_request_admission()` defaults to `is_auth_plugin()`). A custom plugin
+that refuses requests a route must not serve (in `authorize`, `before_proxy`,
+or any other hook) but is not an authentication plugin, and that keeps the
+HTTP-only `supported_protocols()` default, is still skipped silently on native
+gRPC and WebSocket requests. Such a plugin must either list the flavors it
+handles in `supported_protocols()` or return `true` from
+`Plugin::gates_request_admission()` so the gateway refuses the flavors it
+cannot run on. Custom authentication plugins that handle gRPC or WebSocket
+should list those protocols in `supported_protocols()`.
+
+### Client `Connection` nominations are resolved at ingress (#6090)
+
+On HTTP/1.1 and HTTP/3, the fields a client's `Connection` header names are
+removed before any plugin runs, instead of only at the backend boundary. A
+client that sends `Connection: authorization` (to keep its token away from the
+backend) now has that credential removed before authentication and gets `401`
+on an authenticated route; send the credential without nominating it, and let
+the route strip it with a request transformer if the backend must not see it.
+`Host`, `Content-Length`, `Expect`, and the forwarding fields
+(`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, and the configured
+`FERRUM_REAL_IP_HEADER`) are never removed this way, so trusted-proxy
+client-IP resolution is unchanged. Client spellings of `claim_headers`
+destinations, `x-geo-country`, and `x-path-param-*` that use `_` for `-` are
+now removed too.
+
+### Plugin-config environment references use `FERRUM_PLUGIN_SECRET_<NAME>` (issue [#6086](https://github.com/ferrum-edge/ferrum-edge/issues/6086))
+
+Every plugin config field that names a process environment variable now
+resolves only `FERRUM_PLUGIN_SECRET_<NAME>` (`<NAME>` uppercase
+`[A-Z_][A-Z0-9_]*`). Any other name, including every other `FERRUM_*`
+setting, is refused at plugin-config admission: the Admin API answers `400`,
+file mode and `ferrum-edge validate` fail, and existing database rows are
+quarantined as unconstructible (optional plugins such as `proxy_alerts` and
+`workload_metrics` are omitted with a warning instead). Affected fields:
+
+| Plugin | Field | Before | After |
+|---|---|---|---|
+| `api_chargeback_sink` | `clickhouse.password_ref` | any `FERRUM_*` name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `ai_semantic_firewall` | `provider.api_key_env` | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `ai_stream_router` | `providers[].api_key: "${...}"` | any name | `${FERRUM_PLUGIN_SECRET_<NAME>}` |
+| `workload_metrics` | Lightstep `access_token_env` / `accessTokenEnv` (also Istio `Telemetry` / `meshConfig.extensionProviders`) | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `proxy_alerts` | channel `webhook_url_env`, `url_env`, `username_env`, `password_env` | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `serverless_function` | implicit Azure / GCP credential fallback | `AZURE_FUNCTIONS_KEY`, `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` | `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY`, `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` |
+
+An unset **or empty** referenced variable now fails the plugin where it
+resolves instead of sending an empty credential.
+
+Before upgrading:
+
+1. For every referenced variable, set the value under a namespaced name in the
+   gateway environment, for example rename `FERRUM_CLICKHOUSE_PASSWORD_FILE` to
+   `FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD_FILE` (the external-secret
+   suffixes `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` still materialize the
+   base name at startup). Values are read from the process environment only.
+2. Update the plugin configs to reference the new names
+   (`password_ref: FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD`,
+   `api_key: "${FERRUM_PLUGIN_SECRET_OPENAI_API_KEY}"`, and so on). On a CP/DP
+   deployment set the variables on every data plane before pushing the new
+   configs.
+3. Run `ferrum-edge validate` against file-mode configs.
+
+Only place a value in this namespace when every principal allowed to write
+plugin configs may use it: a plugin can send it to an endpoint its config
+chooses.
+
+### External authentication identity headers (issue [#6082](https://github.com/ferrum-edge/ferrum-edge/issues/6082))
+
+`X-Consumer-Username` now carries only the username of a gateway Consumer that
+the authentication flow mapped. An external identity or display claim is sent
+as `X-Authenticated-Identity`; this value is not a Consumer assertion. Update
+backends that read `X-Consumer-Username` for JWKS, OIDC, introspection, LDAP,
+or SOAP identities to read `X-Authenticated-Identity` when they need the
+external display value. Matching an external claim to a Consumer by username,
+ID, or custom ID no longer establishes a Consumer mapping, so those requests
+no longer inherit Consumer-specific ACL groups or policy tiers through that
+implicit match. Remove the LDAP `consumer_mapping` option; it is no longer
+accepted.
+
+`X-Authenticated-Identity` is gateway-owned and is refused as a configured
+destination at config load, including in `request_transformer`,
+`claim_headers`, Gateway API `RequestHeaderModifier`, and similar header
+mutation rules. Remove rules that attempt to set it; verified external
+identities are injected by the gateway.
+
+Process-scoped DPoP, HMAC, PasswordDigest, and SAML replay stores cap each
+principal at one quarter of the configured marker ceiling (#6088). Size
+capacity for each high-volume principal or expect fail-closed authentication
+refusals at that share; four principals can collectively fill a process lane,
+and live markers are never evicted to make room. Shared Redis replay scopes do
+not enforce per-principal quotas; a principal can still fill the shared store
+and cause claims to fail closed for everyone.
+
+### Helm Chart Workload ServiceAccounts
+
+**BREAKING** (issue [#6096](https://github.com/ferrum-edge/ferrum-edge/issues/6096)).
+The `ferrum-mesh` chart assigns separate ServiceAccounts to the control plane
+(`ferrum-mesh-control-plane`), Ambient proxy (`ferrum-mesh-ambient`), east-west
+gateway (`ferrum-mesh-east-west`), injector (`ferrum-mesh-injector`), and CA
+(`ferrum-mesh-ca`); the shared `ferrum-mesh` ServiceAccount is removed. Upgrade
+the chart to roll these workloads onto their new identities. Only the
+control-plane account keeps the cluster-wide controller permissions. The
+gateway, injector, and CA accounts do not mount API tokens automatically.
+
+- **Ambient Secret access is opt-in.** By default the Ambient account cannot
+  read any Secret. If Ambient `k8s://<namespace>/<name>` TLS sources reference
+  Secrets, list each one in `ambient.tlsSecretRefs`:
+
+  ```yaml
+  ambient:
+    tlsSecretRefs:
+      - namespace: edge
+        name: edge-frontend-tls
+  ```
+
+  The chart renders one Role and RoleBinding per namespace, restricted by
+  `resourceNames` with `get`, `list`, and `watch` (the reload watcher lists and
+  watches the one named Secret). Do not list the control plane's credential
+  Secrets, and do not restore namespace-wide or cluster-wide Secret access for
+  this account: its token is present on every node. Ambient keeps the optional
+  read-only node lookup used by its UDP preflight.
+- **NodeWaypoint discovery trusts only `ferrum-mesh-ambient`.** The control
+  plane marks a pod as a NodeWaypoint only when it runs as
+  `ferrum-mesh-ambient`. Roll the control plane and the Ambient DaemonSet
+  together; until both are upgraded, NodeWaypoint endpoints are withdrawn
+  (fail closed).
+- **SPIFFE IDs change under SPIRE `k8s:sa` selectors.** The Ambient SVID path
+  becomes `spiffe://<trust-domain>/ns/<namespace>/sa/ferrum-mesh-ambient/...`.
+  Update SPIRE registration entries to select `k8s:sa:ferrum-mesh-ambient`, set
+  `ambient.spire.workloadSpiffeId` to the new path, and update every
+  `AuthorizationPolicy`, `trusted_hbone_assertors` entry, or other policy that
+  pins the old `sa/ferrum-mesh` path. Control-plane, east-west, injector, and
+  CA identities change the same way if your SPIRE entries select them.
+
+### Node-Agent Capture Requires A Dedicated Pod Interface
+
+**BREAKING** (issue [#6096](https://github.com/ferrum-edge/ferrum-edge/issues/6096)).
+The node agent resolves each enrolled pod's host-side interface only from an
+unambiguous `/32` or `/128` host route to the pod address, and only when that
+device is a dedicated host-side peer (a distinct `iflink`, not a bridge). It
+never reads the pod's own sysfs view. CNIs that route each pod through a
+per-pod veth host route (Calico, Cilium with endpoint routes, kindnet) are
+unaffected. On a CNI that reaches pods only through a subnet route on a shared
+device, such as a flannel/bridge `cni0` or Cilium's default `cilium_host`
+routing, eBPF enrollment is refused (`attach_errors` increments and the pod is
+not captured) rather than attaching the inbound guard to the shared device.
+Enable per-pod host routes in the CNI (for example Cilium
+`endpointRoutes.enabled`) before upgrading such a node agent.
+
+### HTTP/3 CONNECT-UDP tunnels and WebSocket method policy (issue [#6098](https://github.com/ferrum-edge/ferrum-edge/issues/6098))
+
+**CONNECT-UDP tunnels are bounded per client.** With
+`FERRUM_HTTP3_CONNECT_UDP_ENABLED=true`, a single resolved client (IPv4
+address, or IPv6 `/64`) may hold at most
+`FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` concurrent tunnels (default
+`32`); further tunnels from that client receive `503`. If a legitimate client
+or a NAT/egress address in front of many clients needs more, raise the value
+(or set `0` to disable the per-client cap) before upgrading. Preserve the
+client address through `FERRUM_TRUSTED_PROXIES` rather than disabling the cap
+when a load balancer fronts the gateway.
+
+**HTTP/3 WebSocket method policy sees `GET`.** An H3 Extended CONNECT
+WebSocket is now evaluated as `GET` by route `allowed_methods`, `mesh_authz`
+`:method`, and `opa` `input.method`, as HTTP/1.1 and HTTP/2 WebSocket already
+are. A WebSocket route whose `allowed_methods` lists `CONNECT` but not `GET`
+now refuses H3 WebSocket with `405`; list `GET` instead. Policies that matched
+`CONNECT` to identify H3 WebSocket should match `GET` (plain CONNECT and
+CONNECT-UDP are unchanged).
+
+### Per-source quota grouping and MCP session caps (#6079)
+
+Per-client state keyed by IP now groups native IPv6 sources by network prefix
+instead of keying each address. IPv4, including IPv4-mapped IPv6, remains
+per-address.
+
+- **Gateway-wide per-source caps** (`FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP`,
+  `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`,
+  `FERRUM_TCP_MAX_CONNECTIONS_PER_IP`, `FERRUM_UDP_MAX_SESSIONS_PER_IP`,
+  `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`,
+  `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`, and
+  `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP`) group IPv6 addresses by the
+  new `FERRUM_PER_IP_IPV6_PREFIX` (default `64`). Set it to `128` for per-host
+  accounting. In Kubernetes clusters where pods on a node share a `/64` pod
+  CIDR, the default groups those pods under one cap; choose `128` if that
+  node-wide grouping is not intended.
+- **`rate_limiting`** IP keys now default to an IPv6 `/64` as well. Set the
+  new per-policy `ipv6_prefix` option (`1`–`128`) to change the grouping, or
+  `128` to keep per-address keys. `FERRUM_PER_IP_IPV6_PREFIX` does not apply
+  to the plugin.
+- **Other IP-keyed plugin state uses a fixed `/64`** with no override:
+  `graphql`, `grpc_method_router`, `udp_rate_limiting`, `ai_rate_limiter`, and
+  `tcp_connection_throttle` IP keys, `mcp_gateway` anonymous session quotas,
+  and `oidc_relying_party` pending-login source quotas.
+
+IPv6 clients that share a `/64` now share one budget, so review IPv6 limits
+for clients behind a shared prefix. IPv6 quota keys change, so old and new
+IPv6 counters (local and in Redis) do not overlap during rollout; expect each
+IPv6 client's window to restart once.
+
+`body_validator` now rejects `grpc_max_decompressed_size_bytes: 0`; set a
+positive limit or omit the field to use its default.
+
+Aggregate MCP sessions now default to at most 128 live sessions per
+authenticated principal. Anonymous session quota buckets use the resolved
+client `/64`. When a caller reaches its own cap, its oldest session is
+replaced; when the global session store is full and that caller has no session
+to replace, initialization is refused rather than evicting another caller's
+live session. Review `sessions.max_sessions` and
+`sessions.max_sessions_per_principal` against expected concurrency before
+rollout.
+
+### MTOM package framing (#6077)
+
+`soap_ws_security` now refuses, with `400`, MTOM/XOP packages that a backend
+parser could frame differently from the gateway:
+
+- the `--boundary` token may appear only as an exact CRLF delimiter line at
+  the start of the body or immediately after a CRLF. A padded (trailing space
+  or tab), LF-terminated, or `--boundaryX` delimiter line, a token opened by a
+  bare LF or CR, and a token in the middle of a line (in the preamble, inside
+  the envelope or an attachment, or in the epilogue) are refused;
+- the root part is always the first part. When the package `Content-Type`
+  supplies `start`, it must name the first part; a package whose `start`
+  names a later part is refused, where it used to be validated on that part;
+- a `Content-ID` or `start` carrying `%`, `+`, or embedded whitespace is
+  refused, and `Content-ID` uniqueness and `start` matching ignore ASCII case
+  and a leading `cid:`;
+- an RFC 2231 extended or continuation form of `boundary`, `type`, or
+  `start` (for example `boundary*=`) on the package `Content-Type`, or a
+  `charset*` on a SOAP `Content-Type`, is refused.
+
+Standard MTOM stacks put the root first and generate random boundaries, so
+they are unaffected. Check custom producers that reorder parts or build
+multipart bodies by hand.
+
+### WebSocket upgrade methods, DTLS SNI, and HTTP/3 address validation (#6080, #6085)
+
+An HTTP/1.1 WebSocket upgrade that uses a method other than `GET` is now
+rejected, and HTTP/2 Extended CONNECT WebSockets are evaluated as `GET` by
+method policy (#6080). DTLS passthrough drops a ClientHello whose SNI is
+malformed or unrepresentable before catch-all routing; a well-formed
+ClientHello without SNI can still use the catch-all.
+
+HTTP/3 handshakes from unvalidated client addresses now run inside
+`FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES` (default `1024`) (#6085). Under
+handshake pressure, or with the budget set to `0`, first-time clients pay one
+extra round trip for a QUIC Retry, and clients without a token no longer get
+the 0.5-RTT early-response path. The listener and backend pools no longer
+advertise QUIC DATAGRAM; a peer that sends a DATAGRAM frame is closed with
+`PROTOCOL_VIOLATION`. See
+[QUIC address validation](http3.md#quic-address-validation-and-handshake-admission).
+
+### MongoDB proxy-scoped plugin attachments (#6065, issue [#6070](https://github.com/ferrum-edge/ferrum-edge/issues/6070))
+
+On MongoDB, `POST /batch`, `POST /restore` and import now add a
+`scope: proxy` plugin config to its target proxy's `plugins` list in the same
+write, as SQL does, and batch admission validates the graph with those
+associations in place. Before 0.9.15 these paths saved the config without the
+association, so the runtime did not apply it to that proxy. Rows written
+before the upgrade are not rewritten: after upgrading a MongoDB deployment,
+check that every proxy-scoped config is listed in its proxy's `plugins`, and
+add any that should apply. Once listed, the plugin runs on that proxy, so
+confirm its policy first.
+
 ## Upgrading to 0.9.14
 
-0.9.14 (2026-10-07 UTC) is cut from main
-`4f370a0b1921d231e9d0c498821e90e076aa64fb`. All previously released breaking
-identifiers and guidance below remain applicable. CP/DP must run the same
-build; the ConfigSync protocol revision is now `3` (#6020). 0.9.14 adds no core
-schema change; a changed baseline in any later release still requires a fresh
-database with the old database kept intact for rollback.
+0.9.14 was published at **2026-10-07T08:59:56Z** at release merge
+`9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`, whose second parent is reviewed
+#6050 head `c89044a3cc5a9ad1dd5e5a197a19760745e5ebfb`. All previously released
+breaking identifiers and guidance below remain applicable. CP/DP must run the
+same build; the ConfigSync protocol revision is now `3` (#6020). 0.9.14 adds no
+core schema change; a changed baseline in any later release still requires a
+fresh database with the old database kept intact for rollback.
 
 Before rolling out, check:
 
