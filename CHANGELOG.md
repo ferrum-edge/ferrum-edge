@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Apply WebSocket method policy to the forwarded method.** Extended CONNECT
+- **Apply WebSocket method policy to the forwarded method** (#6080). Extended CONNECT
   WebSockets are evaluated as GET, and HTTP/1.1 upgrade attempts using another
   method are rejected. DTLS passthrough drops malformed or unrepresentable
   ClientHello SNI before catch-all routing; a complete, well-formed ClientHello
