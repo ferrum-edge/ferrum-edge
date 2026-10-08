@@ -8,7 +8,9 @@ Layout read (written by the wrapper):
     <out>/raw/<suite>/run<N>/<protocol>.cpu.jsonl  gateway CPU for the gateway leg
 
 Writes <out>/summary.json, <out>/summary.md, and <out>/samples.json (every
-raw leg report and gateway CPU sample). Every headline value is the
+raw leg report and gateway CPU sample). A published bundle under
+tests/performance/published/ commits samples.json's sha256 instead of the file:
+see that directory's README. Every headline value is the
 median across repeated runs; the spread (min..max, CV) is kept beside it so a
 noisy row is visible rather than averaged away.
 """
