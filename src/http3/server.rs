@@ -3089,7 +3089,10 @@ async fn handle_h3_request(
     // backend-boundary hop-by-hop strip would otherwise remove. `req` keeps the
     // wire block for the protocol-shape checks below.
     let mut raw_headers = req.headers().clone();
-    crate::proxy::headers::confine_connection_nominated_request_headers(&mut raw_headers);
+    crate::proxy::headers::confine_connection_nominated_request_headers(
+        &mut raw_headers,
+        state.env_config.real_ip_header.as_deref(),
+    );
     ctx.set_raw_headers(raw_headers);
     crate::proxy::stamp_original_request_metadata(&mut ctx);
 

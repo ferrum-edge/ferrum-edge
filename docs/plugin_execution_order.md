@@ -2014,15 +2014,22 @@ runs: `403` with `{"error":"Request protocol not permitted on this route"}`, or
 trailers-only `PERMISSION_DENIED` for native gRPC, logged with rejection phase
 `route_protocol_admission`. `gates_request_admission()` defaults to
 `is_auth_plugin()`, so every authentication plugin participates, including a
-custom one that keeps the HTTP-only default. Among built-ins the refusal applies
-to `soap_ws_security`, `openapi_validator` in `block` mode, `mcp_gateway`,
+custom one that keeps the HTTP-only default. A custom enforcement plugin that
+is not an authentication plugin must override `gates_request_admission()` or
+declare the flavors it supports; otherwise those flavors skip it. Among
+built-ins the refusal applies on both flavors to `soap_ws_security` in every
+configuration (timestamp-only included), `openapi_validator` in `block` mode,
+`mcp_gateway`, `request_deduplication` with `enforce_required`,
 `ai_prompt_shield`, `ai_rate_limiter`, `ai_tool_governor`,
-`ai_semantic_firewall`, and `rate_limiting` with `mcp_tool_calls`. Serve gRPC
-or WebSocket traffic from a separate route that does not carry those plugins,
-or use authentication that supports the flavor. The decision is a precomputed
+`ai_semantic_firewall`, and `rate_limiting` with `mcp_tool_calls`; to native
+gRPC for `graphql` with any protection rule (it runs on WebSocket); and to
+WebSocket for `a2a_gateway` with a deny policy (it runs on gRPC). Serve gRPC or
+WebSocket traffic from a separate route that does not carry those plugins, or
+use authentication that supports the flavor. The decision is a precomputed
 capability bit (`OMITS_ROUTE_ADMISSION_POLICY`), so the request path does no
-plugin scan. The composed gRPC-Web view below keeps every HTTP plugin and is
-never refused.
+plugin scan, and the HBONE admission fence re-checks it on every reload, so a
+live tunnel admitted on a now-refused view is revoked. The composed gRPC-Web
+view below keeps every HTTP plugin and is never refused.
 
 Recognized H3 gRPC-Web requests retain the ordinary `Http` protocol view so HTTP-only validators, deduplication, and other guardrails keep running. At cache rebuild time the gateway composes `grpc_method_router` and `grpc_deadline` into that same priority-ordered view when those native-gRPC policies are configured. No other gRPC-only plugin is added, and each plugin instance appears at most once.
 

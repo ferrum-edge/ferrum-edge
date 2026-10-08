@@ -175,6 +175,7 @@ async fn plugin_name_priority_protocols_and_registration() {
     assert_eq!(plugin.name(), "ai_semantic_firewall");
     assert_eq!(plugin.priority(), priority::AI_SEMANTIC_FIREWALL);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(plugin.gates_request_admission());
     assert!(plugin.requires_request_body_buffering());
 
     let created = create_plugin("ai_semantic_firewall", &config)

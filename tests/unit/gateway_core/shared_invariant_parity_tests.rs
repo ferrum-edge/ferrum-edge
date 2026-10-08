@@ -3069,3 +3069,54 @@ fn every_raw_header_ingress_confines_connection_nominations_first() {
         "a raw client-header capture changed; list the new site above"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Client-selected flavor views that omit route admission policy are refused
+// ---------------------------------------------------------------------------
+//
+// The client picks the native-gRPC or WebSocket plugin view with its own
+// headers. The plugin cache marks a view that omits an admission-gating
+// instance the route's HTTP view runs
+// (`PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`), and every request
+// dispatcher must refuse such a request after resolving the view and before
+// the first plugin hook runs. A dispatcher that resolved the view and went
+// straight to the hooks would serve the route without that policy.
+
+/// `(dispatcher, source file, function signature)`.
+const ROUTE_PROTOCOL_ADMISSION_DISPATCHERS: &[(&str, &str, &str)] = &[
+    (
+        "H1/H2",
+        "src/proxy/mod.rs",
+        "async fn handle_proxy_request_inner(",
+    ),
+    (
+        "native H3",
+        "src/http3/server.rs",
+        "async fn handle_h3_request(",
+    ),
+];
+
+#[test]
+fn every_dispatcher_refuses_a_flavor_view_that_omits_route_admission_policy() {
+    for (dispatcher, file, signature) in ROUTE_PROTOCOL_ADMISSION_DISPATCHERS {
+        let text = source(file);
+        let body = item_body(&text, signature, "\n}\n");
+        let position = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{dispatcher}: `{file}` must contain `{needle}`"))
+        };
+        let view = position("let plugin_cache_view = ");
+        let refusal = position("PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)");
+        let first_hook = position("plugin.on_request_received(&mut ctx)");
+        assert!(
+            view < refusal && refusal < first_hook,
+            "{dispatcher}: `{file}` must refuse the omitted-policy view after resolving it \
+             and before the first plugin hook"
+        );
+        assert_eq!(
+            body.matches("OMITS_ROUTE_ADMISSION_POLICY").count(),
+            1,
+            "{dispatcher}: `{file}` must check the omitted-policy bit exactly once"
+        );
+    }
+}

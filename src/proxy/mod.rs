@@ -32866,7 +32866,10 @@ async fn handle_proxy_request_inner(
     // Resolve the client's `Connection` nominations against the client's own
     // fields before any plugin or gateway assertion can add a header that the
     // backend-boundary hop-by-hop strip would otherwise remove.
-    headers_mod::confine_connection_nominated_request_headers(req.headers_mut());
+    headers_mod::confine_connection_nominated_request_headers(
+        req.headers_mut(),
+        state.env_config.real_ip_header.as_deref(),
+    );
     // Store raw headers for deferred materialization. The clone is a single
     // contiguous allocation (HeaderMap's internal Vec) — much cheaper than
     // N individual String allocations from the previous eager conversion.

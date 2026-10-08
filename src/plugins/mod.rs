@@ -6550,12 +6550,13 @@ impl RequestContext {
     ///
     /// Covers the whole gateway-owned `x-consumer-*` namespace
     /// ([`crate::proxy::headers::is_consumer_assertion_header`]), the private
-    /// GeoIP result, and route path-param captures. `name` is expected to be
-    /// lowercase (the `HeaderName` form).
+    /// GeoIP result, and route path-param captures
+    /// ([`crate::proxy::headers::is_path_param_assertion_header`]). Each treats
+    /// `_` as `-`, the folding CGI-style backends apply.
     #[inline]
     pub fn is_reserved_gateway_assertion_header(name: &str) -> bool {
         crate::proxy::headers::is_gateway_assertion_header(name)
-            || name.starts_with("x-path-param-")
+            || crate::proxy::headers::is_path_param_assertion_header(name)
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,

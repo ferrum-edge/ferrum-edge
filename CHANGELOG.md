@@ -18,14 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"error":"Request protocol not permitted on this route"}` or trailers-only
   `PERMISSION_DENIED` for native gRPC. The transaction log records
   `rejection_phase: "route_protocol_admission"`. This covers every
-  authentication plugin (among built-ins only `soap_ws_security` is HTTP-only;
-  custom auth plugins that keep the HTTP-only `supported_protocols()` default
-  are included), `openapi_validator` in `block` mode, `mcp_gateway`,
-  `ai_prompt_shield`, `ai_rate_limiter`, `ai_tool_governor`,
-  `ai_semantic_firewall`, and `rate_limiting` with `mcp_tool_calls`. Custom
-  plugins opt in through the new `Plugin::gates_request_admission()`, which
-  defaults to `is_auth_plugin()`. The decision is a capability bit computed
-  when the plugin cache is built, so requests do no extra plugin scan. The
+  authentication plugin (custom auth plugins that keep the HTTP-only
+  `supported_protocols()` default are included), `soap_ws_security` in every
+  configuration (identity, timestamp-only freshness, and `strict` media-type
+  governance alike), `openapi_validator` in `block` mode, `mcp_gateway`,
+  `request_deduplication` with `enforce_required`, `ai_prompt_shield`,
+  `ai_rate_limiter`, `ai_tool_governor`, `ai_semantic_firewall`, and
+  `rate_limiting` with `mcp_tool_calls`, on both flavors; `graphql` with any
+  protection rule on native gRPC (it already runs on WebSocket); and
+  `a2a_gateway` with a deny policy on WebSocket (it already runs on gRPC).
+  Custom plugins opt in through the new `Plugin::gates_request_admission()`,
+  which defaults to `is_auth_plugin()`; a custom enforcement plugin that is
+  not an auth plugin must opt in or declare the flavors it supports. The
+  decision is a capability bit computed when the plugin cache is built, so
+  requests do no extra plugin scan. A live HBONE tunnel admitted on such a
+  view is revoked (`authorization_denied`) when a reload adds the policy. The
   composed gRPC-Web view keeps every HTTP plugin and is unaffected. See
   [Upgrade notes](docs/upgrade_guide.md#unreleased).
 - **Gateway-asserted request headers are applied after the client's
@@ -35,11 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hop-by-hop names. The backend boundary's hop-by-hop strip can therefore no
   longer remove consumer identity, `claim_headers`, GeoIP, path-param, or
   transformer headers that the gateway adds. `Host`, `Content-Length`, and
-  `Expect` keep their values for routing and framing. HTTP/2 rejects
-  `Connection` and is unchanged.
-- **`claim_headers` destinations and `x-geo-country` treat `_` as `-` when
-  removing client values** (#6090), as the `x-consumer-*` namespace already
-  does.
+  `Expect` keep their values for routing and framing, and the forwarding
+  fields (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, and the configured
+  `FERRUM_REAL_IP_HEADER`) keep theirs for trusted-proxy client-IP
+  resolution. A nominated `Authorization` is removed before authentication,
+  so such a request now gets `401`. HTTP/2 rejects `Connection` and is
+  unchanged.
+- **`claim_headers` destinations, `x-geo-country`, and `x-path-param-*`
+  treat `_` as `-` when removing client values** (#6090), as the
+  `x-consumer-*` namespace already does.
   CGI-style backends (Rack, WSGI, PHP-FPM) fold both spellings onto one
   variable, so they now see only the gateway's value.
 

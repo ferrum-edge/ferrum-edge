@@ -7245,6 +7245,9 @@ mod advisory_regressions {
         assert!(!plugin.is_auth_plugin());
         assert!(!plugin.requires_request_body_before_authenticate());
         assert!(plugin.requires_request_body_before_before_proxy());
+        // Freshness enforcement still refuses requests, so a client-selected
+        // gRPC or WebSocket flavor that skips it must be refused instead.
+        assert!(plugin.gates_request_admission());
     }
 
     /// The two phases are mutually exclusive: an identity-establishing policy

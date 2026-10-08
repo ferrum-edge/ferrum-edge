@@ -301,7 +301,10 @@ impl Plugin for ExamplePlugin {
     //     // Return `true` if this plugin refuses requests its routes must not
     //     // serve. Like an auth plugin, it then makes the gateway refuse a
     //     // client-selected gRPC or WebSocket request it does not support.
-    //     // Defaults to `is_auth_plugin()`.
+    //     // Defaults to `is_auth_plugin()`, so a plugin that enforces policy
+    //     // but is not an auth plugin, and keeps the HTTP-only protocol
+    //     // default, must return `true` here or gRPC and WebSocket requests
+    //     // skip it silently.
     //     self.is_auth_plugin()
     // }
     //

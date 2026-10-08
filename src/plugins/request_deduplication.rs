@@ -3451,6 +3451,14 @@ impl Plugin for RequestDeduplication {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    /// With `enforce_required` the idempotency guarantee is admission policy
+    /// (requests without a usable key are refused), so a native gRPC or
+    /// WebSocket request, which this plugin never sees, must be refused rather
+    /// than served without it. Opportunistic deduplication refuses nothing.
+    fn gates_request_admission(&self) -> bool {
+        self.enforce_required
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         true
     }
