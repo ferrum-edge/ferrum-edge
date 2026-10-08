@@ -1139,39 +1139,81 @@ impl NonceReplayState {
         self.principal_counts.get(principal).copied().unwrap_or(0)
     }
 
-    /// Move one retained entry's quota charge from `from` to `to` (two
-    /// different principals). The new principal is charged first, bounded by
-    /// `principal_limit`, and only then is the previous principal's charge
-    /// released. Returns `Ok(false)` without changing anything when `to` is
-    /// already at its share, and `Err(())` on accounting drift.
-    fn move_principal_charge(
+    /// Refresh one expired claim in place as a new use charged to `principal`,
+    /// moving its quota charge when the claim is stored under another
+    /// principal. The caller has already proven the claim expired and decided
+    /// the refresh fits within the current caps and the presenting principal's
+    /// share.
+    ///
+    /// All-or-nothing: every fallible step (the index and cache lookups, the
+    /// checked count arithmetic and the age-key allocation) runs before the
+    /// first write, so `Err(())` (accounting drift or an exhausted age
+    /// sequence) leaves the claims, the age index, the sequence and the quota
+    /// counts exactly as they were. The writes that follow cannot fail, and the
+    /// count change is applied last, together with the entry's principal.
+    fn refresh_claim_in_place(
         &mut self,
-        from: &[u8; 32],
-        to: &[u8; 32],
-        principal_limit: usize,
-    ) -> Result<bool, ()> {
-        let charged = self.principal_count(to);
-        if charged >= principal_limit {
-            return Ok(false);
+        nonce: &str,
+        age_key: NonceAgeKey,
+        principal: &[u8; 32],
+        now: Instant,
+    ) -> Result<(), ()> {
+        let Some(indexed_nonce) = self.age_index.get(&age_key) else {
+            return Err(());
+        };
+        if indexed_nonce.as_ref() != nonce {
+            return Err(());
         }
-        let Some(charged) = charged.checked_add(1) else {
+        let shared_nonce = Arc::clone(indexed_nonce);
+        let Some(entry) = self.cache.get_mut(nonce) else {
             return Err(());
         };
-        let Some(released) = self
-            .principal_counts
-            .get(from)
-            .copied()
-            .and_then(|count| count.checked_sub(1))
-        else {
+        if entry.age_key != age_key {
             return Err(());
-        };
-        self.principal_counts.insert(*to, charged);
-        if released == 0 {
-            self.principal_counts.remove(from);
+        }
+        let previous = entry.principal_digest;
+        let moved_counts = if previous == *principal {
+            None
         } else {
-            self.principal_counts.insert(*from, released);
+            let charged = self
+                .principal_counts
+                .get(principal)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1);
+            let released = self
+                .principal_counts
+                .get(&previous)
+                .copied()
+                .and_then(|count| count.checked_sub(1));
+            let (Some(charged), Some(released)) = (charged, released) else {
+                return Err(());
+            };
+            Some((charged, released))
+        };
+        let sequence = self.next_sequence;
+        let Some(next_sequence) = sequence.checked_add(1) else {
+            return Err(());
+        };
+        let new_age_key = (now, sequence);
+        if self.age_index.contains_key(&new_age_key) {
+            return Err(());
         }
-        Ok(true)
+
+        self.next_sequence = next_sequence;
+        self.age_index.remove(&age_key);
+        self.age_index.insert(new_age_key, shared_nonce);
+        entry.age_key = new_age_key;
+        entry.principal_digest = *principal;
+        if let Some((charged, released)) = moved_counts {
+            self.principal_counts.insert(*principal, charged);
+            if released == 0 {
+                self.principal_counts.remove(&previous);
+            } else {
+                self.principal_counts.insert(previous, released);
+            }
+        }
+        Ok(())
     }
 
     fn remove_age_entry(&mut self, age_key: &NonceAgeKey) -> Result<(), ()> {
@@ -3076,44 +3118,33 @@ impl SoapWsSecurity {
 
             // Expired: re-admission is a *new* use of this nonce, charged to
             // the presenting principal even when the stale entry is still
-            // stored under another one. The new principal is charged first,
-            // bounded by its share, and only then is the previous principal's
-            // charge released. A new principal already at its share instead
-            // reclaims the stale entry (it is expired, so maintenance could
-            // remove it anyway) and takes the fresh-claim path below, which
-            // reclaims only expired entries and otherwise fails closed.
-            let refresh_in_place = if existing_principal == *principal_digest {
-                true
+            // stored under another one. Refreshing in place recycles the
+            // occupied slot, so it is allowed only while the store is within
+            // this generation's entry and byte caps (the state outlives reload
+            // generations, so a reload that lowered either cap can leave it
+            // over-full) and the presenting principal is within its share: a
+            // move needs room for one more charge, a same-principal refresh
+            // reuses its charge and is refused only when a lowered cap left the
+            // principal above its share. Otherwise the stale entry is
+            // reclaimed (it is expired, so maintenance could remove it anyway)
+            // and the fresh-claim path below decides; it reclaims only expired
+            // entries and otherwise fails closed, never evicting a live nonce.
+            let charged = state.principal_count(principal_digest);
+            let within_share = if existing_principal == *principal_digest {
+                charged <= principal_limit
             } else {
-                match state.move_principal_charge(
-                    &existing_principal,
-                    principal_digest,
-                    principal_limit,
-                ) {
-                    Ok(moved) => moved,
-                    Err(()) => return Err(Self::nonce_state_saturated_after_unlock(state)),
-                }
+                charged < principal_limit
             };
-            if refresh_in_place {
-                let Some(new_age_key) = state.allocate_age_key(now) else {
-                    return Err(Self::nonce_state_saturated_after_unlock(state));
-                };
-                let shared_nonce = match state.age_index.remove(&age_key) {
-                    Some(shared_nonce) => shared_nonce,
-                    None => return Err(Self::nonce_state_saturated_after_unlock(state)),
-                };
+            if within_share
+                && state.cache.len() <= self.max_nonce_cache_size
+                && state.retained_key_bytes <= self.max_nonce_cache_bytes
+            {
                 if state
-                    .age_index
-                    .insert(new_age_key, Arc::clone(&shared_nonce))
-                    .is_some()
+                    .refresh_claim_in_place(nonce, age_key, principal_digest, now)
+                    .is_err()
                 {
                     return Err(Self::nonce_state_saturated_after_unlock(state));
                 }
-                let Some(entry) = state.cache.get_mut(shared_nonce.as_ref()) else {
-                    return Err(Self::nonce_state_saturated_after_unlock(state));
-                };
-                entry.age_key = new_age_key;
-                entry.principal_digest = *principal_digest;
                 return Ok(());
             }
             if state.remove_age_entry(&age_key).is_err() {
@@ -3461,6 +3492,20 @@ impl SoapWsSecurity {
         state
             .age_index
             .insert(age_key, Arc::<str>::from("same-cardinality-index-drift"));
+        Ok(())
+    }
+
+    /// Exhaust the age-key sequence so the next age-key allocation fails
+    /// (test support). Reaching this for real takes 2^64 claims.
+    #[allow(dead_code)]
+    pub(crate) fn exhaust_nonce_age_sequence_for_tests(&self) -> Result<(), String> {
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay test state is process-scope only".to_string());
+        };
+        let mut state = replay_state
+            .lock()
+            .map_err(|_| "soap_ws_security: nonce replay test state unavailable".to_string())?;
+        state.next_sequence = u64::MAX;
         Ok(())
     }
 

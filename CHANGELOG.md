@@ -49,10 +49,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where `jwks_auth` DPoP proofs can reach this case, and the `soap_ws_security`
   `replay_scope: process` nonce / SAML assertion-id store), an expired marker
   still stored under a different principal was answered as a replay. It is now
-  re-admitted under the presenting principal, and the quota charge moves: the
-  new principal's share is charged and then the previous principal's charge is
-  released. A new principal already at its share is refused, and live markers
-  are still never evicted.
+  re-admitted under the presenting principal, and its quota charge moves to
+  that principal. In the replay authority the new principal's share is charged
+  and then the previous principal's charge is released; a new principal already
+  at its share is refused. In `soap_ws_security` the move happens in place only
+  when the new principal has room in its share. Otherwise the expired claim is
+  reclaimed and the nonce takes the ordinary new-claim path: it can still be
+  admitted once expired claims are reclaimed, and is otherwise refused by the
+  per-principal share, `nonce.max_cache_size`, or `nonce.max_total_cache_bytes`.
+  Live markers are still never evicted.
+- **`soap_ws_security` no longer refreshes an expired claim in place above a
+  lowered cap.** Process-scope replay state outlives reload generations, so a
+  reload that lowers `nonce.max_cache_size` or `nonce.max_total_cache_bytes`
+  can leave it over the new cap. An expired nonce or SAML assertion id
+  presented again was then refreshed in place regardless. It now goes through
+  the new-claim path while the store is over either cap, or while the lowered
+  cap leaves the presenting principal above its share. That path refuses
+  rather than evicting a live claim. This matches the replay authority.
 
 ## [0.9.15] - 2026-10-08
 

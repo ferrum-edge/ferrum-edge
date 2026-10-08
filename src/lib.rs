@@ -4068,6 +4068,11 @@ pub mod _test_support {
             self.plugin.nonce_principal_entries_for_tests(principal)
         }
 
+        /// Exhaust the age-key sequence so the next claim cannot allocate one.
+        pub fn exhaust_age_sequence(&self) -> Result<(), String> {
+            self.plugin.exhaust_nonce_age_sequence_for_tests()
+        }
+
         pub fn snapshot(&self) -> Result<SoapNonceReplaySnapshotForTest, String> {
             let snapshot = self.plugin.nonce_replay_observation_for_tests()?;
             Ok(SoapNonceReplaySnapshotForTest {
