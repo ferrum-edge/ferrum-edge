@@ -61,7 +61,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   `<readable id>__<digest>`; routes in their own namespace keep the readable
   id, and TCPRoute, TLSRoute and UDPRoute follow the same rule. A second route
   object that derives an id another route already owns is refused and reported
-  in Route status.
+  in Route status
+  ([GHSA-6r6j-9g99-37xc](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-6r6j-9g99-37xc)).
 - **BREAKING — duplicate `(namespace, id)` resources are refused** (issue
   #6092). The control plane refuses a full or incremental candidate, or a
   Kubernetes translation, that carries two resources of one kind with the same
@@ -70,7 +71,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
 - **BREAKING — Gateway API backendRefs to `type: ExternalName` Services are
   unsupported** (issue #6092). HTTPRoute/GRPCRoute fail that backend closed,
   TCPRoute/TLSRoute/UDPRoute refuse the route, and status reports
-  `ResolvedRefs=False` / `UnsupportedProtocol`.
+  `ResolvedRefs=False` / `UnsupportedProtocol`
+  ([GHSA-2j2j-w877-qmv8](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-2j2j-w877-qmv8)).
 - **BREAKING — DestinationRule TLS material outside the mesh root namespace
   is namespace-scoped** (issue #6092). `trafficPolicy.tls` `caCertificates`,
   `clientCertificate` and `privateKey` (top level, `portLevelSettings`, and
@@ -82,7 +84,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   escaping file fails backend TLS closed for that rule's destinations only,
   without rejecting the rest of the configuration. Other sources are refused at
   Kubernetes translation and at native/file/xDS slice validation.
-  Root-namespace rules are unchanged.
+  Root-namespace rules are unchanged
+  ([GHSA-wmmp-c4pg-rg6p](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-wmmp-c4pg-rg6p)).
 - **BREAKING — namespace-scoped operators can set backend TLS material only
   within their namespace** (issue #6092). Where the admin `ns` claim is
   enforced, an `operator` creating or updating a proxy or upstream may
@@ -90,7 +93,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   namespace in `backend_tls_client_cert_path`, `backend_tls_client_key_path`
   and `backend_tls_server_ca_cert_path`; anything else is refused with `400`
   before it is loaded. Values already stored on the resource are kept, and
-  `admin` tokens are unaffected.
+  `admin` tokens are unaffected
+  ([GHSA-wmmp-c4pg-rg6p](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-wmmp-c4pg-rg6p)).
 - **BREAKING — HTTP/3 CONNECT-UDP tunnels are bounded per client**
   (issue #6098). Each RFC 9298 tunnel now also takes a per-client slot,
   keyed on the resolved client IP with IPv6 sources grouped by
@@ -99,14 +103,16 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (default `32`, `0` disables)
   sits under the process-wide `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS`, so one
   client can no longer occupy every tunnel slot. Over the cap the request is
-  refused with `503` before any socket is created.
+  refused with `503` before any socket is created
+  ([GHSA-rm7h-jjqr-49wm](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-rm7h-jjqr-49wm)).
 - **BREAKING — HTTP/3 WebSocket Extended CONNECT is evaluated as `GET`**
   (issue #6098). Route `allowed_methods`, `mesh_authz` `:method`, and `opa`
   `input.method` now see `GET` — the method of the backend WebSocket
   handshake — for an H3 `:protocol=websocket` request, matching HTTP/1.1
   Upgrade and HTTP/2 Extended CONNECT. Plain CONNECT and CONNECT-UDP keep
   `CONNECT`, and the `FERRUM_TLS_EARLY_DATA_METHODS` 0-RTT gate still matches
-  the wire method.
+  the wire method
+  ([GHSA-xjh4-vh9x-g6r4](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-xjh4-vh9x-g6r4)).
 - **BREAKING — mesh CONNECT relays are authorized on transport attributes
   only** (issue #6081). A byte-stream or datagram HBONE CONNECT, including a
   bare authenticated HTTP/2 CONNECT on the Sidecar inbound listener, relays
@@ -118,7 +124,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   on its remaining constraints, an ALLOW or AUDIT rule that needs one never
   matches, and a matched CUSTOM rule refuses the relay instead of asking the
   provider about the CONNECT. An L7 rule that selects a workload reached over
-  HBONE now applies to the whole tunnel; scope it with `to.operation.ports`.
+  HBONE now applies to the whole tunnel; scope it with `to.operation.ports`
+  ([GHSA-7pgr-pvff-xxv6](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-7pgr-pvff-xxv6)).
 - **BREAKING — refuse gRPC and WebSocket requests that a route's
   authentication or admission plugins cannot run on** (issue #6087). On an
   HTTP-family route, native gRPC and WebSocket requests run the plugin view for
@@ -143,8 +150,9 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   decision is a capability bit computed when the plugin cache is built, so
   requests do no extra plugin scan. A live HBONE tunnel admitted on such a
   view is revoked (`authorization_denied`) when a reload adds the policy. The
-  composed gRPC-Web view keeps every HTTP plugin and is unaffected. See
-  [Upgrading to 0.9.15](docs/upgrade_guide.md#upgrading-to-0915).
+  composed gRPC-Web view keeps every HTTP plugin and is unaffected
+  ([GHSA-7c6h-2h3g-6898](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-7c6h-2h3g-6898)).
+  See [Upgrading to 0.9.15](docs/upgrade_guide.md#upgrading-to-0915).
 - **Gateway-asserted request headers are applied after the client's
   `Connection` nominations are resolved** (#6090). HTTP/1.1 and HTTP/3 ingress
   now remove the fields a client's `Connection` header nominates before any
@@ -156,7 +164,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   the forwarding fields (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, and the
   configured `FERRUM_REAL_IP_HEADER`) keep theirs for trusted-proxy client-IP
   resolution. A nominated `Authorization` is removed before authentication, so
-  such a request now gets `401`. HTTP/2 rejects `Connection` and is unchanged.
+  such a request now gets `401`. HTTP/2 rejects `Connection` and is unchanged
+  ([GHSA-v4wm-xpmm-mx3m](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-v4wm-xpmm-mx3m)).
 - **`claim_headers` destinations, `x-geo-country`, and `x-path-param-*`
   treat `_` as `-` when removing client values** (#6090), as the
   `x-consumer-*` namespace already does, so backends see only the gateway's
@@ -182,7 +191,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   `FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD`. Rename each referenced variable
   (and its `_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` source) into the
   namespace and update the plugin configs before upgrading; see
-  [Upgrading to 0.9.15](docs/upgrade_guide.md#upgrading-to-0915).
+  [Upgrading to 0.9.15](docs/upgrade_guide.md#upgrading-to-0915)
+  ([GHSA-qm4j-8254-cjwq](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-qm4j-8254-cjwq)).
 - **BREAKING — external identity claims use a separate backend header**
   (issue #6082). `X-Consumer-Username` now contains only a mapped Consumer
   username. External identities use the gateway-owned
@@ -191,13 +201,17 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   ID. The LDAP `consumer_mapping` option is removed. `X-Authenticated-Identity`
   is refused as a configured header destination at config load. Backends that
   use these values must update their header handling; Consumer-specific policy
-  requires an authentication path that maps a gateway Consumer.
+  requires an authentication path that maps a gateway Consumer
+  ([GHSA-xc8r-94fw-vww8](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-xc8r-94fw-vww8),
+  [GHSA-2xvv-h768-2xhq](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-2xvv-h768-2xhq)).
 - **Reserve replay capacity across authenticated principals** (#6088).
   Process-scoped DPoP, HMAC, PasswordDigest, and SAML replay stores limit each
   principal to one quarter of the configured entry ceiling and continue
   refusing to evict live markers. OIDC relying party login challenges also
   expire an older pending-flow cookie before a browser can accumulate more
-  than two.
+  than two
+  ([GHSA-m7mc-rjv8-59pj](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-m7mc-rjv8-59pj),
+  [GHSA-7m64-8fqg-xp24](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-7m64-8fqg-xp24)).
 - **BREAKING — separate mesh workload Kubernetes identities and opt-in Secret
   access** (issue #6096). The `ferrum-mesh` chart replaces the shared
   `ferrum-mesh` ServiceAccount with `ferrum-mesh-control-plane`,
@@ -211,7 +225,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   selectors the Ambient SPIFFE path becomes `sa/ferrum-mesh-ambient`, so
   registration entries and policies that pin the old path must be updated.
   Upgrade guidance is in
-  [upgrade_guide.md](docs/upgrade_guide.md#helm-chart-workload-serviceaccounts).
+  [upgrade_guide.md](docs/upgrade_guide.md#helm-chart-workload-serviceaccounts)
+  ([GHSA-5pfj-g48c-xjq5](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-5pfj-g48c-xjq5)).
   (#6084)
 - **BREAKING — node-agent capture attaches only to a dedicated pod interface**
   (issue #6096). Capture ownership no longer relies on interface metadata
@@ -222,6 +237,7 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   device (for example `cni0` or `cilium_host`) is refused enrollment instead
   of being guarded on that shared device. Pod removal now detaches the pod's
   cgroup and tc programs. (#6084)
+  ([GHSA-3j59-qg72-j9hg](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-3j59-qg72-j9hg)).
 - **Use only repository-owned scheduled or dispatched runs for trend history
   and CI signals** (#6084). Fork-originated runs and other events cannot
   supply the scaling signal or rolling performance history; a manual run on
@@ -244,7 +260,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   `type*0=`) is refused with `400`. An RFC 2231 `charset*` on a SOAP
   `Content-Type` is refused as a conflicting charset. Packages from standard
   MTOM generators, which put the root first and choose a boundary that never
-  occurs in the content, are unaffected.
+  occurs in the content, are unaffected
+  ([GHSA-cwc6-6v2g-77mx](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-cwc6-6v2g-77mx)).
 - **Bound and scope control plane configuration responses** (#6078). Unary
   full-config requests now hold namespace and principal admission through
   response delivery and are rate limited per authenticated principal.
@@ -255,7 +272,11 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   CORS policy snapshots are filtered by namespace visibility and `exportTo`,
   native admission and mesh registries distinguish equal subjects across
   namespaces, and rejected subscription logs use bounded identifiers and
-  per-client rate limits.
+  per-client rate limits
+  ([GHSA-qmh6-r92q-8mrc](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-qmh6-r92q-8mrc),
+  [GHSA-4gp6-47c9-2fjr](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-4gp6-47c9-2fjr),
+  [GHSA-c29h-h6hh-f6w4](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-c29h-h6hh-f6w4),
+  [GHSA-86jf-pcm4-43mq](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-86jf-pcm4-43mq)).
 - **Bound per-client plugin state and compressed request fingerprinting**
   (#6079). Per-client state keyed by IP now groups IPv6 sources by network
   prefix instead of keying each address; IPv4 and IPv4-mapped IPv6 stay
@@ -290,12 +311,17 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   over-limit Brotli bodies; malformed gzip continues to fingerprint the
   original bytes. `body_validator` now refuses
   `grpc_max_decompressed_size_bytes: 0`, which used to disable the
-  decompressed cap.
+  decompressed cap
+  ([GHSA-p7wp-8j6m-vrgw](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-p7wp-8j6m-vrgw),
+  [GHSA-7m94-q66g-8wxr](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-7m94-q66g-8wxr),
+  [GHSA-929q-v7xg-f38q](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-929q-v7xg-f38q)).
 - **Apply WebSocket method policy to the forwarded method** (#6080). Extended
   CONNECT WebSockets over HTTP/2 are evaluated as `GET`, and HTTP/1.1 upgrade
   attempts using another method are rejected. DTLS passthrough drops malformed
   or unrepresentable ClientHello SNI before catch-all routing; a complete,
-  well-formed ClientHello without SNI can still use the catch-all.
+  well-formed ClientHello without SNI can still use the catch-all
+  ([GHSA-xjh4-vh9x-g6r4](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-xjh4-vh9x-g6r4),
+  [GHSA-5q6w-8xq5-369h](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-5q6w-8xq5-369h)).
 - **HTTP/3 validates QUIC client addresses before charging the shared
   connection budget, and no longer advertises QUIC datagrams** (#6085).
   Handshakes from clients whose source address has not been validated now run
@@ -308,7 +334,10 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   now reserved for validated clients. The HTTP/3 listener and backend pools also
   stop advertising the QUIC DATAGRAM extension, which nothing in the gateway
   reads; a peer that sends a DATAGRAM frame anyway is closed with
-  `PROTOCOL_VIOLATION`. Upgrade note: under handshake pressure, or with the
+  `PROTOCOL_VIOLATION`
+  ([GHSA-7hhr-9q6w-8j87](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-7hhr-9q6w-8j87),
+  [GHSA-6rjg-6c3v-6cv3](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-6rjg-6c3v-6cv3)).
+  Upgrade note: under handshake pressure, or with the
   budget set to `0`, first-time clients pay one extra round trip, and clients
   without a token no longer get the 0.5-RTT early-response path. See
   [docs/http3.md](docs/http3.md#quic-address-validation-and-handshake-admission).
@@ -1011,7 +1040,8 @@ before upgrading admin automation or contract consumers.
   authentication or authorization rejection hooks run. **Known limitation:**
   an instance with an execution trigger stays undetermined whenever any
   request input may change, and a custom plugin that rewrites
-  `route_override_request_timeout_ms` directly is not modelled.
+  `route_override_request_timeout_ms` directly is not modelled
+  ([GHSA-gxfv-924p-wvx4](https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-gxfv-924p-wvx4)).
 - **BREAKING (developer fixtures) — sample Compose MongoDB and SQL TLS test
   fixtures no longer have working default credentials or wildcard ports**
   (issue #6002; GHSA-wq9h-xxp4-7r2m, GHSA-x87v-w7p2-77f4). Affects only the
