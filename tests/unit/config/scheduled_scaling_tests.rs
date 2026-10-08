@@ -320,7 +320,9 @@ fn retry_after_honors_delay_seconds_with_a_bounded_default() {
 
 #[test]
 fn both_harnesses_route_every_batch_phase_through_the_shared_helper() {
-    assert_eq!(SCALE.matches("post_admin_batch(").count(), 3);
+    // Three provisioning phases, plus the reload-under-load test's proxy and
+    // plugin-config batches.
+    assert_eq!(SCALE.matches("post_admin_batch(").count(), 5);
     assert_eq!(LOAD.matches("post_admin_batch(").count(), 4);
     assert!(
         !SCALE.contains(".post(format!(\"{}/batch\"")
