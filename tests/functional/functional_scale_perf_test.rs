@@ -1460,11 +1460,21 @@ fn start_live_load(
                 while !stop.load(Ordering::Relaxed) {
                     let (path, key) = &entries[idx];
                     let req_start = Instant::now();
-                    let result = client
+                    // Success and latency cover the whole body: a reload that
+                    // truncates or stalls a response after its headers must
+                    // count as an error, not as a served request.
+                    let result = match client
                         .get(format!("{base_url}{path}"))
                         .header("X-API-Key", key.as_str())
                         .send()
-                        .await;
+                        .await
+                    {
+                        Ok(response) => {
+                            let status = response.status();
+                            response.bytes().await.map(|_| status)
+                        }
+                        Err(error) => Err(error),
+                    };
                     let latency_us = req_start.elapsed().as_micros().min(u32::MAX as u128) as u32;
                     let second = started.elapsed().as_secs() as usize;
                     if buckets.len() <= second {
@@ -1472,11 +1482,11 @@ fn start_live_load(
                     }
                     let bucket = &mut buckets[second];
                     match result {
-                        Ok(r) if r.status().is_success() => {
+                        Ok(status) if status.is_success() => {
                             bucket.ok += 1;
                             bucket.latencies_us.push(latency_us);
                         }
-                        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                        Ok(status) if status == reqwest::StatusCode::NOT_FOUND => {
                             bucket.errors += 1;
                             bucket.not_found += 1;
                         }
