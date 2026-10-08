@@ -22,11 +22,19 @@ fn check(value: &str, kind: MaterialKind, allow_local_files: bool) -> Result<(),
 #[test]
 fn own_namespace_secrets_inline_pem_and_system_roots_are_admitted() {
     assert_eq!(
-        check("k8s://tenant-a/client-tls#tls.crt", MaterialKind::Cert, false),
+        check(
+            "k8s://tenant-a/client-tls#tls.crt",
+            MaterialKind::Cert,
+            false
+        ),
         Ok(())
     );
     assert_eq!(
-        check("kubernetes://tenant-a/client-tls#tls.key", MaterialKind::Key, false),
+        check(
+            "kubernetes://tenant-a/client-tls#tls.key",
+            MaterialKind::Key,
+            false
+        ),
         Ok(())
     );
     assert_eq!(check(INLINE_CERT, MaterialKind::Cert, false), Ok(()));
