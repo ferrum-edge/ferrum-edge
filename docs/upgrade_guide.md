@@ -1,13 +1,5 @@
 # Safe Upgrade Guide
 
-## External authentication identity headers (issue #6082)
-
-`X-Consumer-Username` now carries only the username of a gateway Consumer that the authentication flow mapped. An external identity or display claim is sent as `X-Authenticated-Identity`; this value is not a Consumer assertion. Update backends that read `X-Consumer-Username` for JWKS, OIDC, introspection, LDAP, or SOAP identities to read `X-Authenticated-Identity` when they need the external display value. Matching an external claim to a Consumer by username, ID, or custom ID no longer establishes a Consumer mapping, so those requests no longer inherit Consumer-specific ACL groups or policy tiers through that implicit match. Remove the LDAP `consumer_mapping` option; it is no longer accepted.
-
-`X-Authenticated-Identity` is gateway-owned and is refused as a configured destination at config load, including in `request_transformer`, `claim_headers`, Gateway API `RequestHeaderModifier`, and similar header mutation rules. Remove rules that attempt to set it; verified external identities are injected by the gateway.
-
-Process-scoped DPoP, HMAC, PasswordDigest, and SAML replay stores cap each principal at one quarter of the configured marker ceiling. Size capacity for each high-volume principal or expect fail-closed authentication refusals at that share; four principals can collectively fill a process lane, and live markers are never evicted to make room. Shared Redis replay scopes do not enforce per-principal quotas; a principal can still fill the shared store and cause claims to fail closed for everyone.
-
 > **BUILD-OUT — in-place database migration and binary-only rollback are
 > unsupported.** Ferrum Edge is still in active build-out: core schema changes
 > are folded into the editable `V001` baseline instead of shipping forward
