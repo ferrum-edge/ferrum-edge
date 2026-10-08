@@ -121,8 +121,12 @@ fn protocol_level_405_sites_emit_static_allow() {
         "H1/H2 TRACE/CONNECT 405s must share one Allow-bearing builder"
     );
     assert!(
-        proxy.contains(".header(\"Allow\", PROTOCOL_LEVEL_405_ALLOW)"),
+        proxy.contains("_with_allow(body, PROTOCOL_LEVEL_405_ALLOW)"),
         "H1/H2 protocol-level 405 must attach the static Allow value"
+    );
+    assert!(
+        proxy.contains(".header(\"Allow\", allow)"),
+        "the shared 405 builder must attach the Allow header it is given"
     );
     let h3 = include_str!("../../../src/http3/server.rs");
     assert_eq!(
