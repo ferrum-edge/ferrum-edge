@@ -85,7 +85,10 @@ fn namespace_refuses_external_secret_source_suffixes_without_echoing_them() {
             .expect_err("a source-suffix reference must be refused");
         assert!(error.contains("demo: `secret_ref`"), "{error}");
         assert!(error.contains("FERRUM_PLUGIN_SECRET_<NAME>"), "{error}");
-        assert!(!error.contains(name), "diagnostic echoed the reference: {error}");
+        assert!(
+            !error.contains(name),
+            "diagnostic echoed the reference: {error}"
+        );
     }
     // The materialized base name is the admitted reference.
     assert!(is_plugin_secret_env_name("FERRUM_PLUGIN_SECRET_DEMO"));
