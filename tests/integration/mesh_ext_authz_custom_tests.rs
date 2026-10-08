@@ -964,10 +964,10 @@ mod live_datapath {
 
     #[tokio::test]
     async fn a_connect_relay_is_refused_without_asking_the_provider() {
-        // The requests inside a relayed CONNECT are opaque bytes, so the
-        // `/admin/*` delegation cannot be ruled out for the tunnel. Asking the
-        // provider about the CONNECT would authorize the tunnel, not what is
-        // written into it, so a matched delegation refuses it outright.
+        // The requests inside a relayed CONNECT are opaque bytes, so a
+        // delegation cannot judge them. Asking the provider about the CONNECT
+        // would authorize the tunnel, not the requests written into it, so a
+        // matched delegation refuses it outright.
         let stub = start_status_stub(200).await;
         let plugin = plugin(slice_json(stub.port, None, false)).expect("generation builds");
         let mut ctx = ctx("/");

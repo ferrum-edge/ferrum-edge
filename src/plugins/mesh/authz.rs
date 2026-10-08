@@ -3018,12 +3018,13 @@ impl Plugin for MeshAuthz {
         };
         // A mesh CONNECT relay carries its application requests as opaque
         // bytes. Its own method, path, authority, headers and request
-        // credentials describe the tunnel, not what is written into it, so
-        // judging `to.operation`, `requestPrincipals` or `when: request.*`
-        // against them would let a DENY on `/admin/*` miss and a `notPaths` /
-        // `paths: ["/*"]` ALLOW admit the whole tunnel. The relay is judged as
-        // a Layer-4 session instead: DENY ignores the HTTP-only fields and
-        // still matches on the rest, ALLOW and AUDIT never match on them.
+        // credentials describe the tunnel, not the requests written into it,
+        // so L7 fields are unobservable on it: judging `to.operation`,
+        // `requestPrincipals` or `when: request.*` against the tunnel would
+        // decide access on facts the gateway cannot read. The relay is
+        // authorized on its transport attributes instead, as a Layer-4
+        // session: DENY ignores the HTTP-only fields and still matches on the
+        // rest, ALLOW and AUDIT never match on them.
         let connect_relay = ctx.is_hbone_connect_relay();
         let mut host = ctx
             .raw_header_get("host")

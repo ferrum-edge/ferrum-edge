@@ -9485,10 +9485,9 @@ fn connection_sni_bare_fqdn_warning_logs_debug_escaped_fields() {
 //
 // A byte-stream or datagram HBONE CONNECT is relayed as opaque bytes: the
 // requests written into the tunnel are never parsed. The CONNECT's own method,
-// path, authority, headers and credentials describe the tunnel, so an L7 rule
-// judged against them would let a DENY on `/admin/*` miss and a `notPaths`
-// ALLOW admit the whole tunnel. These pin the Layer-4 semantics instead: DENY
-// ignores HTTP-only fields and still matches, ALLOW never matches on them.
+// path, authority, headers and credentials describe the tunnel, so L7 fields
+// are unobservable on it. These pin the Layer-4 semantics: DENY ignores
+// HTTP-only fields and still matches on the rest, ALLOW never matches on them.
 
 const RELAY_PEER: &str = "spiffe://cluster.local/ns/attacker/sa/client";
 const RELAY_APP_PORT: u16 = 8080;
