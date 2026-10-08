@@ -930,7 +930,7 @@ This means every WebSocket plugin works on H3 sessions unchanged:
 - Connection-admission via `FERRUM_WEBSOCKET_MAX_CONNECTIONS` and `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` (shared with H1/H2)
 - All authentication, authorization, and `before_proxy` plugins (run BEFORE the bridge accepts the upgrade)
 - Sticky-session cookies on the 200 response (same as H1/H2)
-- All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "CONNECT"`, mirroring the H2 Extended CONNECT path)
+- All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "GET"`, matching the H2 Extended CONNECT path)
 
 ### Frame masking — RFC 6455 §5.1 applies unchanged on HTTP/3
 

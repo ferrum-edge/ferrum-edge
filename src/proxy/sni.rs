@@ -1201,10 +1201,11 @@ fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> WireSpan {
 /// type) hid that case as no-SNI and routed it.
 ///
 /// `InvalidFragment` is returned for a DTLS ClientHello fragment whose missing
-/// SNI may be carried by another fragment. `Malformed` is returned when a
-/// ClientHello is truncated, structurally invalid, or carries an unrepresentable
-/// hostname. Only a complete, well-formed ClientHello that omits SNI is `NoSni`
-/// and remains eligible for catch-all routing.
+/// SNI may be carried by another fragment. `Malformed` is returned when the
+/// first datagram is not a ClientHello, or a ClientHello is truncated,
+/// structurally invalid, or carries an unrepresentable hostname. Only a
+/// complete, well-formed ClientHello that omits SNI is `NoSni` and remains
+/// eligible for catch-all routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DtlsSniResult {
     /// A ClientHello with a parsed SNI hostname (already ASCII-lowercased).
@@ -1236,7 +1237,7 @@ pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> DtlsSniResult {
 
     // Content type 0x16 = Handshake
     if data[0] != 0x16 {
-        return DtlsSniResult::NoSni;
+        return DtlsSniResult::Malformed;
     }
 
     let record_len = u16::from_be_bytes([data[11], data[12]]) as usize;
@@ -1255,7 +1256,7 @@ pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> DtlsSniResult {
 
     // msg_type 0x01 = ClientHello
     if handshake_data[0] != 0x01 {
-        return DtlsSniResult::NoSni;
+        return DtlsSniResult::Malformed;
     }
 
     // DTLS handshake header: total length (1..4), message_seq (4..6),
@@ -1284,7 +1285,8 @@ pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> DtlsSniResult {
         return DtlsSniResult::Malformed;
     };
 
-    match parse_dtls_client_hello_body(client_hello) {
+    let fragmented = fragment_len < handshake_total_len;
+    match parse_dtls_client_hello_body(client_hello, fragmented) {
         // SNI was found within this fragment — route on it regardless of whether
         // the full message spans more datagrams.
         Ok(Some(hostname)) => DtlsSniResult::Hostname(hostname),
@@ -1374,76 +1376,105 @@ fn parse_tls_client_hello_body(body: &[u8]) -> Option<String> {
 /// Layout: version (2) + random (32) + session_id_len (1) + session_id (N) +
 ///         cookie_len (1) + cookie (N) + cipher_suites_len (2) + cipher_suites (N) +
 ///         compression_len (1) + compression (N) + extensions_len (2) + extensions (N)
-fn parse_dtls_client_hello_body(body: &[u8]) -> Result<Option<String>, ()> {
+fn parse_dtls_client_hello_body(body: &[u8], fragmented: bool) -> Result<Option<String>, ()> {
     let mut pos: usize = 0;
 
     // version (2) + random (32)
     pos = pos.checked_add(34).ok_or(())?;
     if body.len() < pos {
-        return Err(());
+        return if fragmented { Ok(None) } else { Err(()) };
     }
 
     // session_id
-    let session_id_len = *body.get(pos).ok_or(())? as usize;
+    let Some(session_id_len) = body.get(pos).copied() else {
+        return if fragmented { Ok(None) } else { Err(()) };
+    };
+    let session_id_len = session_id_len as usize;
     pos = pos.checked_add(1 + session_id_len).ok_or(())?;
     if body.len() < pos {
-        return Err(());
+        return if fragmented { Ok(None) } else { Err(()) };
     }
 
     // cookie (DTLS-specific, not present in TLS)
-    let cookie_len = *body.get(pos).ok_or(())? as usize;
+    let Some(cookie_len) = body.get(pos).copied() else {
+        return if fragmented { Ok(None) } else { Err(()) };
+    };
+    let cookie_len = cookie_len as usize;
     pos = pos.checked_add(1 + cookie_len).ok_or(())?;
     if body.len() < pos {
-        return Err(());
+        return if fragmented { Ok(None) } else { Err(()) };
     }
 
     // cipher_suites
     if body.len() < pos + 2 {
-        return Err(());
+        return if fragmented { Ok(None) } else { Err(()) };
     }
     let cipher_suites_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos = pos.checked_add(2 + cipher_suites_len).ok_or(())?;
     if body.len() < pos {
-        return Err(());
+        return if fragmented { Ok(None) } else { Err(()) };
     }
 
     // compression_methods
-    let compression_len = *body.get(pos).ok_or(())? as usize;
+    let Some(compression_len) = body.get(pos).copied() else {
+        return if fragmented { Ok(None) } else { Err(()) };
+    };
+    let compression_len = compression_len as usize;
     pos = pos.checked_add(1 + compression_len).ok_or(())?;
     if body.len() < pos {
-        return Err(());
+        return if fragmented { Ok(None) } else { Err(()) };
     }
 
-    // extensions
+    // ClientHello extensions are optional. A body ending here is a valid
+    // no-SNI ClientHello, while a partial extensions length is only incomplete
+    // when this is a DTLS fragment.
+    if body.len() == pos {
+        return Ok(None);
+    }
     if body.len() < pos + 2 {
-        return Err(());
+        return if fragmented { Ok(None) } else { Err(()) };
     }
     let extensions_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
     let extensions_end = pos.checked_add(extensions_len).ok_or(())?;
-    if extensions_end != body.len() {
+    if extensions_end < body.len() {
         return Err(());
     }
-    parse_sni_from_extensions_strict(&body[pos..extensions_end])
+    if extensions_end > body.len() && !fragmented {
+        return Err(());
+    }
+    parse_sni_from_dtls_extensions(&body[pos..], extensions_end > body.len())
 }
 
-fn parse_sni_from_extensions_strict(mut ext: &[u8]) -> Result<Option<String>, ()> {
+fn parse_sni_from_dtls_extensions(
+    mut ext: &[u8],
+    allow_incomplete_tail: bool,
+) -> Result<Option<String>, ()> {
     let mut hostname = None;
     while !ext.is_empty() {
         if ext.len() < 4 {
-            return Err(());
+            return if allow_incomplete_tail {
+                Ok(hostname)
+            } else {
+                Err(())
+            };
         }
         let ext_type = u16::from_be_bytes([ext[0], ext[1]]);
         let ext_len = u16::from_be_bytes([ext[2], ext[3]]) as usize;
-        let ext_end = 4usize.checked_add(ext_len).ok_or(())?;
-        let data = ext.get(4..ext_end).ok_or(())?;
+        let Some(data) = ext.get(4..4usize.checked_add(ext_len).ok_or(())?) else {
+            return if allow_incomplete_tail {
+                Ok(hostname)
+            } else {
+                Err(())
+            };
+        };
         if ext_type == 0x0000 {
             if hostname.is_some() {
                 return Err(());
             }
             hostname = parse_sni_hostname_strict(data)?;
         }
-        ext = &ext[ext_end..];
+        ext = &ext[4 + ext_len..];
     }
     Ok(hostname)
 }

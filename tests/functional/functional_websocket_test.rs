@@ -2821,6 +2821,12 @@ async fn test_websocket_method_policy_uses_forwarded_get_method() {
         "non-GET H1 WebSocket upgrades must be rejected before forwarding: {}",
         String::from_utf8_lossy(&response[..read])
     );
+    assert!(
+        String::from_utf8_lossy(&response[..read])
+            .to_ascii_lowercase()
+            .contains("allow: get"),
+        "WebSocket method refusal must advertise only GET"
+    );
 
     let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
         .await

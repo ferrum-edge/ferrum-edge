@@ -32723,8 +32723,9 @@ async fn handle_proxy_request_inner(
         && crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::WebSocket
     {
         record_request(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
-        return Ok(build_method_not_allowed_response(
+        return Ok(build_method_not_allowed_response_with_allow(
             r#"{"error":"WebSocket upgrades require GET"}"#,
+            "GET",
         ));
     }
     if is_h2_websocket_connect(&req) {
@@ -52633,10 +52634,14 @@ fn build_response_with_gateway_error(
 }
 
 fn build_method_not_allowed_response(body: &str) -> Response<ProxyBody> {
+    build_method_not_allowed_response_with_allow(body, PROTOCOL_LEVEL_405_ALLOW)
+}
+
+fn build_method_not_allowed_response_with_allow(body: &str, allow: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
         .header("Content-Type", "application/json")
-        .header("Allow", PROTOCOL_LEVEL_405_ALLOW)
+        .header("Allow", allow)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(

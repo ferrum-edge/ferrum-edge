@@ -1,6 +1,10 @@
 //! Tests for request_termination plugin
 
-use ferrum_edge::_test_support::{normalize_reject_response, set_request_http_flavor_for_test};
+use ferrum_edge::_test_support::{
+    normalize_reject_response, set_request_http_flavor_for_test,
+    set_request_wire_protocol_for_test,
+};
+use ferrum_edge::config::types::HttpWireTransport;
 use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::request_termination::{
     REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
@@ -1131,6 +1135,24 @@ async fn test_native_grpc_maps_to_trailers_only_error() {
     assert_eq!(normalized.http_status, StatusCode::OK);
     assert!(normalized.body.is_empty());
     assert_eq!(normalized.grpc_status, Some(13));
+}
+
+#[tokio::test]
+async fn test_websocket_extended_connect_2xx_termination_is_forced_to_403() {
+    let plugin = RequestTermination::new(&json!({ "status_code": 200 })).unwrap();
+    let mut ctx = make_ctx("GET", "/ws");
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::WebSocket);
+    set_request_wire_protocol_for_test(&mut ctx, HttpWireTransport::Http2, false);
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(body.contains("CONNECT termination requires a non-success status"));
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
 }
 
 #[test]

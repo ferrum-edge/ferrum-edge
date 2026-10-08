@@ -354,6 +354,30 @@ fn test_extract_sni_from_dtls_rejects_oversized_hostname() {
 
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_from_dtls_client_hello_without_extensions_block() {
+    let mut data = build_dtls_client_hello_without_sni();
+    data.drain(67..69);
+    let record_len = u16::from_be_bytes([data[11], data[12]]) as usize - 2;
+    data[11..13].copy_from_slice(&(record_len as u16).to_be_bytes());
+    let handshake_len = u24(&data[14..17]) - 2;
+    data[14..17].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
+    data[22..25].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
+
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
         DtlsSniResult::NoSni
     );
 }
@@ -573,6 +597,48 @@ fn extract_dtls_sni_fails_closed_on_initial_fragment_without_sni() {
 }
 
 #[test]
+fn extract_dtls_sni_routes_initial_fragment_when_sni_is_complete() {
+    let hostname = "frag.example.com";
+    let mut full = build_dtls_client_hello(hostname);
+    // Append an unknown extension after SNI so this remains an initial
+    // fragment while carrying the complete SNI extension.
+    full.extend_from_slice(&[0x00, 0x15, 0x00, 0x01, 0x00]);
+    let ext_len = u16::from_be_bytes([full[67], full[68]]) as usize;
+    full[67..69].copy_from_slice(&((ext_len + 5) as u16).to_be_bytes());
+    let handshake_len = u24(&full[14..17]) + 5;
+    full[14..17].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
+    full[22..25].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
+    let record_len = u16::from_be_bytes([full[11], full[12]]) as usize + 5;
+    full[11..13].copy_from_slice(&(record_len as u16).to_be_bytes());
+
+    let sni_end = full
+        .windows(hostname.len())
+        .position(|window| window == hostname.as_bytes())
+        .expect("hostname should be present in test ClientHello")
+        + hostname.len();
+    let fragment_len = sni_end - 25;
+    let mut fragment = full[..sni_end].to_vec();
+    fragment[22..25].copy_from_slice(&[
+        (fragment_len >> 16) as u8,
+        (fragment_len >> 8) as u8,
+        fragment_len as u8,
+    ]);
+    fragment[11..13].copy_from_slice(&((12 + fragment_len) as u16).to_be_bytes());
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&fragment),
+        DtlsSniResult::Hostname(hostname.to_string())
+    );
+}
+
+#[test]
 fn extract_dtls_sni_unfragmented_still_parses() {
     let data = build_dtls_client_hello("whole.example.com");
     assert_eq!(
@@ -647,7 +713,7 @@ fn test_extract_sni_from_dtls_wrong_content_type() {
     data[0] = 0x17;
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        DtlsSniResult::NoSni
+        DtlsSniResult::Malformed
     );
 }
 
@@ -776,12 +842,12 @@ fn test_extract_sni_dtls_rejects_malformed_sni_extension_lengths() {
 
 #[test]
 fn test_extract_sni_dtls_wrong_handshake_type() {
-    // Other handshake messages carry no SNI and retain catch-all behavior.
+    // Other handshake messages are not eligible to create a catch-all session.
     let mut data = build_dtls_client_hello("example.com");
     data[13] = 0x02;
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        DtlsSniResult::NoSni
+        DtlsSniResult::Malformed
     );
 }
 
