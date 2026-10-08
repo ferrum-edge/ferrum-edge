@@ -77,6 +77,9 @@ The scale test above measures steady state *between* waves. This variant
 answers a different question: **does traffic to existing proxies keep flowing
 while config changes are written and hot-applied?**
 
+It is local-only, like the 30k scale and 10k load-stress suites: the CI and
+coverage functional lanes exclude it by name.
+
 For each change it starts 50 workers on every already-live proxy, sends 5 s of
 discarded warmup, measures a 10 s steady baseline, and then, with load still
 running, writes the change through `POST /batch?apply=async`, waits for the
