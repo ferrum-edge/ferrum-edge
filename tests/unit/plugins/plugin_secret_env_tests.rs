@@ -226,7 +226,9 @@ fn proxy_alerts_smtp_credential_env(name: &str) -> Value {
 
 /// Every plugin config field that names a process environment variable, as
 /// `(plugin, config builder)`. A new env-reference field belongs here.
-const ENV_REFERENCE_FIELDS: [(&str, fn(&str) -> Value); 6] = [
+type ConfigBuilder = fn(&str) -> Value;
+
+const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 6] = [
     ("api_chargeback_sink", api_chargeback_sink_password_ref),
     ("ai_semantic_firewall", ai_semantic_firewall_api_key_env),
     ("ai_stream_router", ai_stream_router_api_key_reference),
