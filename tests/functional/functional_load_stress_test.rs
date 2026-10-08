@@ -1673,9 +1673,9 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
 
     // Gate every measurement on the gateway having actually published the
     // provisioned graph. Provisioning appends tens of thousands of
-    // `config_changes` rows, which pushes the poller past
-    // `CHANGE_LOG_BATCH_LIMIT` and forces a full reload; a load phase started
-    // inside that reload measures convergence, not proxy throughput. Both
+    // `config_changes` rows, which the poller applies as a large delta (or,
+    // past `CHANGE_LOG_MAX_ROWS`, a full reload); a load phase started inside
+    // that apply measures convergence, not proxy throughput. Both
     // safety valves are correct, so the harness waits them out under an
     // explicit bound instead of sleeping a fixed interval and measuring anyway.
     println!("\nWaiting for config convergence before measuring...");

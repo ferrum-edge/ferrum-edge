@@ -968,10 +968,9 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
         }
 
         // Second gate: prove the published config actually routes end to end.
-        // Provisioning appends ~12,000 `config_changes` rows, which
-        // pushes the poller past `CHANGE_LOG_BATCH_LIMIT` and forces a full
-        // reload; measuring inside that reload measures convergence, not
-        // routing throughput. Sample across the new batch — not only its first
+        // Provisioning appends ~12,000 `config_changes` rows, which the
+        // poller applies as one large delta; measuring inside that apply
+        // measures convergence, not routing throughput. Sample across the new batch — not only its first
         // proxy — plus the oldest proxy, so a reload that drops already-published
         // config is caught too.
         let sample_indices = convergence_sample_indices(batch_start, all_entries.len());

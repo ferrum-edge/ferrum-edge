@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Large config writes apply as deltas instead of full reloads** (issue
+  #6058). The database poller read at most 10,000 `config_changes` rows and
+  treated a full page as a backlog, forcing a reload of the whole namespace.
+  One admin batch of a few thousand proxies with plugins already writes that
+  many rows. It now pages through the change log (10,000 rows per query) and
+  falls back to a full reload only past 100,000 rows, the per-namespace
+  change-log retention. This applies to SQL and MongoDB.
+
+  On the reload-under-load test at 9,600 live proxies, a 3,000-proxy change
+  went from 2.1 s to 1.2 s to live, and its throughput dip from 6% average /
+  12% worst second to 4% / 5%.
+
+  A remaining fallback now logs its reason (for example
+  `change-log batch over the cap`).
+
 ## [0.9.15] - 2026-10-08
 
 Release prepared on **2026-10-08 UTC** from main

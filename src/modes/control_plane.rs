@@ -3735,6 +3735,7 @@ pub async fn run(
                                     );
                                 } else {
                                     warn!(
+                                        reason = db_backend::incremental_fallback_reason(&e),
                                         "Authoritative primary incremental poll failed, falling back to full reload"
                                     );
                                 }

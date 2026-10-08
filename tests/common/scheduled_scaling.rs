@@ -357,7 +357,7 @@ pub async fn post_admin_batch(
 /// routable before a measurement phase starts.
 ///
 /// Provisioning a batch appends tens of thousands of `config_changes` rows.
-/// When the poller's cursor falls more than `CHANGE_LOG_BATCH_LIMIT` (10,000)
+/// When the poller's cursor falls more than `CHANGE_LOG_MAX_ROWS` (100,000)
 /// rows behind, `load_config_changes_after` deliberately bails and forces a
 /// FULL reload; on a SQL store with tens of thousands of proxies, consumers and
 /// plugin configs that reload takes a substantial fraction of a 30-second
