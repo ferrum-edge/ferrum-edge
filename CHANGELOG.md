@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **Bound and scope control plane configuration responses** (#6078). Unary full-config requests
-  now hold namespace and principal admission through response delivery and are rate limited per
-  authenticated principal. Mesh CORS policy snapshots are filtered by namespace visibility and
-  `exportTo`, native admission and mesh registries distinguish equal subjects across namespaces,
-  and rejected subscription logs use bounded identifiers and per-client rate limits.
-
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already
