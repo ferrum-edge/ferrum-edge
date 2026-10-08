@@ -7,37 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **BREAKING — separate mesh workload Kubernetes identities and opt-in Secret
-  access** (issue #6096). The `ferrum-mesh` chart replaces the shared
-  `ferrum-mesh` ServiceAccount with `ferrum-mesh-control-plane`,
-  `ferrum-mesh-ambient`, `ferrum-mesh-east-west`, `ferrum-mesh-injector`, and
-  `ferrum-mesh-ca`. Only the control plane keeps the cluster-wide controller
-  permissions, and the gateway, injector, and CA identities do not mount API
-  tokens. The Ambient proxy has no Secret access by default: list each
-  `k8s://` TLS-source Secret in `ambient.tlsSecretRefs`, which renders a
-  namespaced Role restricted by `resourceNames`. NodeWaypoint discovery trusts
-  only Ambient pods running as `ferrum-mesh-ambient`, and with SPIRE `k8s:sa`
-  selectors the Ambient SPIFFE path becomes `sa/ferrum-mesh-ambient`, so
-  registration entries and policies that pin the old path must be updated.
-  Upgrade guidance is in
-  [upgrade_guide.md](docs/upgrade_guide.md#helm-chart-workload-serviceaccounts).
-  (#6084)
-- **BREAKING — node-agent capture attaches only to a dedicated pod interface**
-  (issue #6096). Capture ownership no longer relies on interface metadata
-  visible inside an enrolled pod. The node agent, Ambient host capture, and
-  NodeWaypoint attribution resolve the host-side interface from an exact
-  `/32` or `/128` host route to the pod address whose device is a dedicated
-  host-side peer. A pod reachable only through a subnet route on a shared CNI
-  device (for example `cni0` or `cilium_host`) is refused enrollment instead
-  of being guarded on that shared device. Pod removal now detaches the pod's
-  cgroup and tc programs. (#6084)
-- **Use only repository-owned scheduled or dispatched runs for trend history
-  and CI signals.** Fork-originated runs and other events cannot supply the
-  scaling signal or rolling performance history; a manual run on `main` can
-  still close the scaling alert. (#6084)
-
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

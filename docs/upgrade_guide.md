@@ -1894,63 +1894,6 @@ a CP pod that immediately fails startup because `FERRUM_DB_TYPE`,
 `FERRUM_DB_URL`, `FERRUM_ADMIN_JWT_SECRET`, and
 `FERRUM_CP_DP_GRPC_JWT_SECRET` are absent.
 
-### Helm Chart Workload ServiceAccounts
-
-**BREAKING** (issue [#6096](https://github.com/ferrum-edge/ferrum-edge/issues/6096)).
-The `ferrum-mesh` chart assigns separate ServiceAccounts to the control plane
-(`ferrum-mesh-control-plane`), Ambient proxy (`ferrum-mesh-ambient`), east-west
-gateway (`ferrum-mesh-east-west`), injector (`ferrum-mesh-injector`), and CA
-(`ferrum-mesh-ca`); the shared `ferrum-mesh` ServiceAccount is removed. Upgrade
-the chart to roll these workloads onto their new identities. Only the
-control-plane account keeps the cluster-wide controller permissions. The
-gateway, injector, and CA accounts do not mount API tokens automatically.
-
-- **Ambient Secret access is opt-in.** By default the Ambient account cannot
-  read any Secret. If Ambient `k8s://<namespace>/<name>` TLS sources reference
-  Secrets, list each one in `ambient.tlsSecretRefs`:
-
-  ```yaml
-  ambient:
-    tlsSecretRefs:
-      - namespace: edge
-        name: edge-frontend-tls
-  ```
-
-  The chart renders one Role and RoleBinding per namespace, restricted by
-  `resourceNames` with `get`, `list`, and `watch` (the reload watcher lists and
-  watches the one named Secret). Do not list the control plane's credential
-  Secrets, and do not restore namespace-wide or cluster-wide Secret access for
-  this account: its token is present on every node. Ambient keeps the optional
-  read-only node lookup used by its UDP preflight.
-- **NodeWaypoint discovery trusts only `ferrum-mesh-ambient`.** The control
-  plane marks a pod as a NodeWaypoint only when it runs as
-  `ferrum-mesh-ambient`. Roll the control plane and the Ambient DaemonSet
-  together; until both are upgraded, NodeWaypoint endpoints are withdrawn
-  (fail closed).
-- **SPIFFE IDs change under SPIRE `k8s:sa` selectors.** The Ambient SVID path
-  becomes `spiffe://<trust-domain>/ns/<namespace>/sa/ferrum-mesh-ambient/...`.
-  Update SPIRE registration entries to select `k8s:sa:ferrum-mesh-ambient`, set
-  `ambient.spire.workloadSpiffeId` to the new path, and update every
-  `AuthorizationPolicy`, `trusted_hbone_assertors` entry, or other policy that
-  pins the old `sa/ferrum-mesh` path. Control-plane, east-west, injector, and
-  CA identities change the same way if your SPIRE entries select them.
-
-### Node-Agent Capture Requires A Dedicated Pod Interface
-
-**BREAKING** (issue [#6096](https://github.com/ferrum-edge/ferrum-edge/issues/6096)).
-The node agent resolves each enrolled pod's host-side interface only from an
-unambiguous `/32` or `/128` host route to the pod address, and only when that
-device is a dedicated host-side peer (a distinct `iflink`, not a bridge). It
-never reads the pod's own sysfs view. CNIs that route each pod through a
-per-pod veth host route (Calico, Cilium with endpoint routes, kindnet) are
-unaffected. On a CNI that reaches pods only through a subnet route on a shared
-device, such as a flannel/bridge `cni0` or Cilium's default `cilium_host`
-routing, eBPF enrollment is refused (`attach_errors` increments and the pod is
-not captured) rather than attaching the inbound guard to the shared device,
-where frames forwarded between pods on that device would bypass it. Enable
-per-pod host routes in the CNI (for example Cilium `endpointRoutes.enabled`)
-before upgrading such a node agent.
-
 Before upgrading an existing Helm install that relied on the old defaults, set
 the component switches and move reserved CP settings into the new structured
 values:
