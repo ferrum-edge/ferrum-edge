@@ -26,6 +26,22 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.15
+
+### HTTP/2 WebSocket early data is gated on `CONNECT` (issue [#6107](https://github.com/ferrum-edge/ferrum-edge/issues/6107))
+
+With `FERRUM_TLS_EARLY_DATA_METHODS` set, an HTTP/2 Extended CONNECT
+WebSocket (RFC 8441) carrying `Early-Data: 1` is now checked against the
+wire method `CONNECT`, as HTTP/3 (RFC 9220) already was. It used to be
+checked against `GET`, the method route and plugin policy see. An allowlist
+of `GET` alone now answers such a request `425 Too Early`; add `CONNECT` to
+the allowlist only if WebSocket upgrades in early data are replay-safe for
+your backends. HTTP/1.1 Upgrade (`GET`) is unchanged.
+
+WebSocket session log records on HTTP/2 and HTTP/3 are unchanged and keep
+logging the wire method `CONNECT` with status `200`; the documentation that
+said `GET` was wrong and has been corrected.
+
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main
