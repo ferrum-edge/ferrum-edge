@@ -165,7 +165,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### Serverless Function Plugin
 
-- **Serverless Function** — invoke AWS Lambda, Azure Functions, or Google Cloud Functions as middleware. Pre-proxy mode enriches requests with function-computed headers; terminate mode returns function responses directly for HTTP and native unary gRPC (JSON contract with raw protobuf message bytes plus protocol-owned status/trailers; gRPC-Web terminate unsupported). Supports SigV4 signing for AWS, function key auth for Azure, and bearer token auth for GCP. Cloud credentials fall back to standard environment variables (`AWS_ACCESS_KEY_ID`, `AZURE_FUNCTIONS_KEY`, etc.) when not set in plugin config.
+- **Serverless Function** — invoke AWS Lambda, Azure Functions, or Google Cloud Functions as middleware. Pre-proxy mode enriches requests with function-computed headers; terminate mode returns function responses directly for HTTP and native unary gRPC (JSON contract with raw protobuf message bytes plus protocol-owned status/trailers; gRPC-Web terminate unsupported). Supports SigV4 signing for AWS, function key auth for Azure, and bearer token auth for GCP. Cloud credentials fall back to environment variables when not set in plugin config (`AWS_ACCESS_KEY_ID` and the other AWS SDK names; `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` / `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` for Azure and GCP).
 
 ### Response Mock Plugin
 

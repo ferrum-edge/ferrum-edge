@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::config::BackendEgressPolicy;
 use crate::plugins::utils::http_client::PluginHttpClient;
+use crate::plugins::utils::plugin_secret_env::validate_plugin_secret_env_name;
 use crate::plugins::utils::response_body::{BoundedReadError, measure_response_body_bounded};
 use crate::retry::{ErrorClass, classify_reqwest_error};
 use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};
@@ -301,6 +302,11 @@ pub(super) type EnvVarLookup<'a> = &'a dyn Fn(&str) -> Result<String, std::env::
 /// `*_env`-suffixed env-var reference. Returns the resolved string when one
 /// of the two is set; returns `Ok(None)` when neither is present.
 ///
+/// The `*_env` reference must name a `FERRUM_PLUGIN_SECRET_<NAME>` variable
+/// (see [`crate::plugins::utils::plugin_secret_env`]): channel configs are
+/// written through plugin config, so any other process variable is refused
+/// before it is read.
+///
 /// Env-var resolution feeds through the gateway's existing secret resolver
 /// (`src/secrets/`) — any `_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` suffix
 /// applied at startup will already have populated the named env var by the
@@ -339,6 +345,7 @@ pub(super) fn resolve_optional_string_with_lookup(
                 "channel {channel:?}: `{env_key}` must not be empty"
             ));
         }
+        validate_plugin_secret_env_name(&format!("channel {channel:?}: `{env_key}`"), env_name)?;
         let resolved = env_lookup(env_name).map_err(|_| {
             format!(
                 "channel {channel:?}: env var {env_name:?} (referenced by `{env_key}`) is not set"

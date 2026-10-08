@@ -7,9 +7,10 @@
 //!   free helpers such as `tls_managed_store_path_from_env`)
 //! - public controls resolved outside `EnvConfig` (conf-file bootstrap,
 //!   secret-fetch timeout, mesh/injector/node-agent/pool helpers, PKCS#11,
-//!   dynamically constructed injector resource quantities, and the dynamic
+//!   dynamically constructed injector resource quantities, the dynamic
 //!   `ai_transcript_audit` sink-secret namespace
-//!   [`TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV`])
+//!   [`TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV`], and the dynamic plugin-config
+//!   secret namespace [`PLUGIN_SECRET_EXAMPLE_ENV`])
 //!
 //! [`PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS`] is a small allowlist for accepted
 //! compatibility aliases that intentionally share the canonical setting's
@@ -33,6 +34,21 @@
 /// inventory member and owns the matching `docs/configuration.md` row and
 /// `ferrum.conf` template assignment for the whole namespace.
 pub const TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN";
+
+/// Canonical documented example key for the dynamic
+/// `FERRUM_PLUGIN_SECRET_<NAME>` namespace.
+///
+/// Every plugin-config field that names a process environment variable
+/// (`api_chargeback_sink` `clickhouse.password_ref`, `ai_semantic_firewall`
+/// `provider.api_key_env`, `ai_stream_router` `${...}` API keys,
+/// `workload_metrics` Lightstep `access_token_env`, `proxy_alerts` channel
+/// `*_env` fields, and the `serverless_function` Azure/GCP fallbacks) resolves
+/// ONLY this namespace, where `<NAME>` is any uppercase `[A-Z_][A-Z0-9_]*`
+/// suffix (see `crate::plugins::utils::plugin_secret_env`). The namespace has
+/// no fixed key set; this representative key is its machine-checkable
+/// inventory member and owns the matching `docs/configuration.md` row and
+/// `ferrum.conf` template assignment for the whole namespace.
+pub const PLUGIN_SECRET_EXAMPLE_ENV: &str = "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD";
 
 /// Complete sorted inventory of public operator `FERRUM_*` settings.
 ///
@@ -127,7 +143,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_BLOCKING_THREADS",
     "FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES",
     "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES",
-    "FERRUM_CLICKHOUSE_PASSWORD",
     "FERRUM_COMPRESSION_BROTLI_ENABLED",
     "FERRUM_COMPRESSION_GZIP_ENABLED",
     "FERRUM_CONF_PATH",
@@ -510,6 +525,12 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_PLUGIN_HTTP_MAX_RETRIES",
     "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS",
     "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS",
+    // Representative documented member of the dynamic
+    // `FERRUM_PLUGIN_SECRET_<NAME>` namespace that plugin-config environment
+    // references resolve. Arbitrary valid uppercase `<NAME>` suffixes are
+    // accepted at runtime; this example key is the canonical
+    // inventory/docs/`ferrum.conf` surface for the namespace.
+    PLUGIN_SECRET_EXAMPLE_ENV,
     "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS",
     "FERRUM_POOL_ENABLE_HTTP2",
     "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE",
@@ -654,6 +675,10 @@ pub fn is_public_ferrum_env_coverage_exempt(key: &str) -> bool {
 /// environment variables or extend secret-suffix resolution to ferrum.conf.
 pub fn is_recognized_ferrum_setting(key: &str) -> bool {
     if PUBLIC_FERRUM_ENV_SETTINGS.binary_search(&key).is_ok() {
+        return true;
+    }
+    // Preserve the documented dynamic plugin-secret namespace.
+    if crate::plugins::utils::plugin_secret_env::is_plugin_secret_env_name(key) {
         return true;
     }
     // Preserve the documented dynamic transcript sink-secret namespace.

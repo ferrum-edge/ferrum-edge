@@ -558,6 +558,7 @@ fn conf_file_recognizes_inventory_and_rejects_unknown_keys_without_values() {
         "FERRUM_DP_CP_GRPC_TOKEN_FILE",
         "FERRUM_MESH_STOCK_XDS_TOKEN_FILE",
         "FERRUM_TRANSCRIPT_SINK_SECRET_CUSTOM_42",
+        "FERRUM_PLUGIN_SECRET_CUSTOM_42",
     ] {
         assert!(ConfFile::parse(&format!("{key}=fixture")).is_ok(), "{key}");
     }

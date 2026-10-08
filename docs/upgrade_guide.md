@@ -26,6 +26,50 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased
+
+These notes apply to the next release cut from main after 0.9.14.
+
+### Plugin-config environment references use `FERRUM_PLUGIN_SECRET_<NAME>` (issue [#6086](https://github.com/ferrum-edge/ferrum-edge/issues/6086))
+
+Every plugin config field that names a process environment variable now
+resolves only `FERRUM_PLUGIN_SECRET_<NAME>` (`<NAME>` uppercase
+`[A-Z_][A-Z0-9_]*`). Any other name, including every other `FERRUM_*`
+setting, is refused at plugin-config admission: the Admin API answers `400`,
+file mode and `ferrum-edge validate` fail, and existing database rows are
+quarantined as unconstructible (optional plugins such as `proxy_alerts` and
+`workload_metrics` are omitted with a warning instead). Affected fields:
+
+| Plugin | Field | Before | After |
+|---|---|---|---|
+| `api_chargeback_sink` | `clickhouse.password_ref` | any `FERRUM_*` name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `ai_semantic_firewall` | `provider.api_key_env` | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `ai_stream_router` | `providers[].api_key: "${...}"` | any name | `${FERRUM_PLUGIN_SECRET_<NAME>}` |
+| `workload_metrics` | Lightstep `access_token_env` / `accessTokenEnv` (also Istio `Telemetry` / `meshConfig.extensionProviders`) | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `proxy_alerts` | channel `webhook_url_env`, `url_env`, `username_env`, `password_env` | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `serverless_function` | implicit Azure / GCP credential fallback | `AZURE_FUNCTIONS_KEY`, `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` | `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY`, `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` |
+
+An unset **or empty** referenced variable now fails the plugin where it
+resolves instead of sending an empty credential.
+
+Before upgrading:
+
+1. For every referenced variable, set the value under a namespaced name in the
+   gateway environment, for example rename `FERRUM_CLICKHOUSE_PASSWORD_FILE` to
+   `FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD_FILE` (the external-secret
+   suffixes `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` still materialize the
+   base name at startup). Values are read from the process environment only.
+2. Update the plugin configs to reference the new names
+   (`password_ref: FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD`,
+   `api_key: "${FERRUM_PLUGIN_SECRET_OPENAI_API_KEY}"`, and so on). On a CP/DP
+   deployment set the variables on every data plane before pushing the new
+   configs.
+3. Run `ferrum-edge validate` against file-mode configs.
+
+Only place a value in this namespace when every principal allowed to write
+plugin configs may use it: a plugin can send it to an endpoint its config
+chooses.
+
 ## Upgrading to 0.9.14
 
 0.9.14 (2026-10-07 UTC) is cut from main

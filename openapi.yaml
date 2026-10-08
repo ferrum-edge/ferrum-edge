@@ -22173,11 +22173,11 @@ components:
         channels:
           ops_slack:
             type: slack
-            webhook_url_env: FERRUM_ALERTS_SLACK_WEBHOOK
+            webhook_url_env: FERRUM_PLUGIN_SECRET_ALERTS_SLACK_WEBHOOK
             channel_override: "#alerts-prod"
           pagerduty_v2:
             type: webhook
-            url_env: FERRUM_PAGERDUTY_EVENTS_URL
+            url_env: FERRUM_PLUGIN_SECRET_PAGERDUTY_EVENTS_URL
             method: POST
             headers:
               Content-Type: application/json
@@ -22232,10 +22232,15 @@ components:
     ProxyAlertsEnvName:
       type: string
       minLength: 1
+      maxLength: 256
+      pattern: '^FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
       description: |
-        Environment variable name resolved at construction. Empty names are
-        rejected. The named variable must also be set and nonempty at
-        construction; that process-environment check is constructor-only.
+        Name of a `FERRUM_PLUGIN_SECRET_<NAME>` environment variable
+        (`<NAME>` uppercase `[A-Z_][A-Z0-9_]*`) resolved at construction.
+        Any other process environment variable, including every other
+        `FERRUM_*` setting, is refused at admission with a 400. The named
+        variable must also be set and nonempty at construction; that
+        process-environment check is constructor-only.
 
     ProxyAlertsEmailAddress:
       type: string
@@ -26893,14 +26898,23 @@ components:
                   not: {required: [access_token_env, accessTokenEnv]}
                   properties:
                     collector_url: {type: string}
-                    access_token_env: {type: string}
-                    accessTokenEnv: {type: string}
+                    access_token_env:
+                      type: string
+                      maxLength: 256
+                      pattern: '^FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
+                    accessTokenEnv:
+                      type: string
+                      maxLength: 256
+                      pattern: '^FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
           description: |
             Direct provider envelope; name-only references belong to Istio
             translation. Unknown fields are ignored by serde. Active exporters
             require an absolute HTTP(S) endpoint with a host and no embedded
             credentials. Lightstep reads its bearer token from the named local
-            environment variable at construction. URL/header/token validation
+            environment variable at construction; the name must be
+            `FERRUM_PLUGIN_SECRET_<NAME>` (`<NAME>` uppercase
+            `[A-Z_][A-Z0-9_]*`), and any other variable is refused at
+            admission even while span reporting is disabled. URL/header/token validation
             and local environment availability are runtime checks. Exporter
             ranges in the parent conditional apply only with at least one
             selected provider and reporting enabled; inactive numeric options
@@ -32763,11 +32777,11 @@ components:
         azure_function_key:
           type: string
           pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
-          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var. The value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); the effective config or environment value is parsed at admission so an unusable credential never reaches the serving cache. Validated whenever supplied, whichever provider is selected."
+          description: "Function key for x-functions-key auth (azure_functions only). Falls back to the FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY env var (never the ambient AZURE_FUNCTIONS_KEY, because the key is sent to the config-chosen function_url). The value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); the effective config or environment value is parsed at admission so an unusable credential never reaches the serving cache. Validated whenever supplied, whichever provider is selected."
         gcp_bearer_token:
           type: string
           pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
-          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var. The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
+          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to the FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var (never the ambient GCP_CLOUD_FUNCTIONS_BEARER_TOKEN). The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
         forward_body:
           type: boolean
           default: false
@@ -34367,7 +34381,9 @@ components:
               description: Embedding model sent in the request body.
             api_key_env:
               type: string
-              description: Environment variable holding the provider API key. The variable must exist after Ferrum startup secret resolution and is sent as Authorization Bearer when present.
+              maxLength: 256
+              pattern: '^\s*FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*\s*$|^\s*$'
+              description: "Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key (`<NAME>` uppercase `[A-Z_][A-Z0-9_]*`; surrounding whitespace is trimmed and an empty value means unset). Any other process environment variable, including every other `FERRUM_*` setting, is refused at admission with a 400. The variable must exist after Ferrum startup secret resolution (`FERRUM_PLUGIN_SECRET_<NAME>_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` work) and is sent as Authorization Bearer; an unset or empty value fails the first embedding call."
             request_timeout_ms:
               type: integer
               format: uint64
@@ -36324,7 +36340,7 @@ components:
               api_key:
                 type: string
                 minLength: 1
-                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
+                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a whole-value ${FERRUM_PLUGIN_SECRET_<NAME>} reference resolved from the process environment at construction; a ${...} reference to any other variable, including every other FERRUM_* setting, is refused at admission with a 400. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
               model_patterns:
                 type: array
                 minItems: 1
@@ -37794,7 +37810,7 @@ components:
         `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`; ClickHouse
         URL egress IP screening; whitespace-only trimming for `currency` /
         `pricing_version` / `password_ref`; that a nonempty `password_ref` *is
-        spelled* `FERRUM_*`; and UTF-8 byte bounds where `maxLength` above
+        spelled* `FERRUM_PLUGIN_SECRET_<NAME>`; and UTF-8 byte bounds where `maxLength` above
         counts characters instead.
 
         Activation (serving startup) adds the checks that require local files,
@@ -38083,12 +38099,15 @@ components:
               description: Optional ClickHouse HTTP Basic username. `null` is accepted and means unset.
             password_ref:
               type: [string, "null"]
-              pattern: '^\s*(?:FERRUM_.*)?\s*$'
+              pattern: '^\s*(?:FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*)?\s*$'
               description: |
-                FERRUM_* environment variable containing the ClickHouse password,
-                often materialized at startup from an existing `_FILE`, `_VAULT`,
-                `_AWS`, `_AZURE`, or `_GCP` secret suffix. Empty values are treated
-                as unset. Because the password is sent via HTTP Basic auth,
+                Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable
+                containing the ClickHouse password (`<NAME>` uppercase
+                `[A-Z_][A-Z0-9_]*`), often materialized at startup from a
+                `FERRUM_PLUGIN_SECRET_<NAME>_FILE`, `_VAULT`, `_AWS`, `_AZURE`,
+                or `_GCP` secret suffix. Any other process environment
+                variable, including every other `FERRUM_*` setting, is refused
+                at admission. Empty values are treated as unset. Because the password is sent via HTTP Basic auth,
                 `clickhouse.url` must use `https://` and TLS certificate/hostname
                 verification must stay enabled when this is nonempty after
                 trimming. Empty or whitespace-only values are treated as unset.

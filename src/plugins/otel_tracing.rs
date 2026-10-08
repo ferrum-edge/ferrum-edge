@@ -51,6 +51,7 @@ use super::utils::byte_budget::{
     ReservedPayload, RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
     record_batch_materialization_loss,
 };
+use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
@@ -1600,6 +1601,9 @@ impl TraceHttpExporterConfig {
     }
 }
 
+/// Schema label for the Lightstep bearer-token reference in diagnostics.
+const LIGHTSTEP_ACCESS_TOKEN_ENV_FIELD: &str = "Lightstep `access_token_env`";
+
 pub(crate) fn trace_exporters_from_providers(
     providers: &[TracingProvider],
     default_service_name: &str,
@@ -1651,11 +1655,8 @@ fn trace_exporter_from_provider(
             collector_url,
             access_token_env,
         } => {
-            let access_token = std::env::var(access_token_env).map_err(|_| {
-                format!(
-                    "Lightstep `access_token_env` {access_token_env:?} is not set or unreadable"
-                )
-            })?;
+            let access_token =
+                resolve_plugin_secret_env(LIGHTSTEP_ACCESS_TOKEN_ENV_FIELD, access_token_env)?;
             let exporter =
                 LightstepTraceExporter::new(collector_url.clone(), access_token, options.clone())
                     .map_err(|error| format!("`collector_url`: {error}"))?;
@@ -1811,6 +1812,26 @@ fn probe_span_for_test(index: usize, attribute_bytes: usize) -> SpanData {
     }
 }
 
+/// Refuse a Lightstep `access_token_env` outside the plugin-secret namespace.
+/// Runs at construction even when span reporting is disabled, so a config that
+/// names an unrelated process secret is refused at admission rather than only
+/// once an exporter is built.
+pub(crate) fn validate_trace_provider_secret_refs(
+    providers: &[TracingProvider],
+) -> Result<(), String> {
+    for (index, provider) in providers.iter().enumerate() {
+        if let TracingProvider::Lightstep {
+            access_token_env,
+            ..
+        } = provider
+        {
+            validate_plugin_secret_env_name(LIGHTSTEP_ACCESS_TOKEN_ENV_FIELD, access_token_env)
+                .map_err(|error| format!("`providers[{index}].config`: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_trace_provider_endpoints(
     providers: &[TracingProvider],
 ) -> Result<(), String> {
@@ -1831,9 +1852,13 @@ fn validate_trace_provider_endpoint(provider: &TracingProvider) -> Result<(), St
             let endpoint = datadog_traces_endpoint(agent_url)?;
             validate_endpoint_for_provider("Datadog", &endpoint)?;
         }
-        TracingProvider::Lightstep { collector_url, .. } => {
+        TracingProvider::Lightstep {
+            collector_url,
+            access_token_env,
+        } => {
             validate_endpoint_for_provider("Lightstep", collector_url)
                 .map_err(|error| format!("`collector_url`: {error}"))?;
+            validate_plugin_secret_env_name(LIGHTSTEP_ACCESS_TOKEN_ENV_FIELD, access_token_env)?;
         }
         TracingProvider::OpenTelemetry { endpoint } => {
             validate_endpoint_for_provider("OTLP", endpoint)?;

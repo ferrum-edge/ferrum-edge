@@ -89,9 +89,12 @@ rejected set is the exact names `user`, `password`, `access_token`, and
 `passwd`, `secret`, or `token`.
 
 Use `clickhouse.username` together with `clickhouse.password_ref` instead.
-`password_ref` names a `FERRUM_*` environment variable; the resolved value is
-sent as an HTTP Basic `Authorization` header, so it is never appended to a URL
-and never rendered in diagnostics.
+`password_ref` names a `FERRUM_PLUGIN_SECRET_<NAME>` environment variable; the
+resolved value is sent as an HTTP Basic `Authorization` header, so it is never
+appended to a URL and never rendered in diagnostics. Because that header goes
+to the config-chosen `clickhouse.url`, any other variable — including every
+other `FERRUM_*` setting such as `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_DB_URL` —
+is refused at admission.
 
 Parameter *values* remain arbitrary bounded strings (ClickHouse settings are
 operator tuning), so the sink never renders the INSERT query string. Every
@@ -531,7 +534,7 @@ identifiers must not be retained in the billing warehouse.
       "database": "ferrum",
       "table": "charges_raw",
       "username": "ferrum_ingest",
-      "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
+      "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD",
       "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" },
       "timeout_ms": 5000
     },
@@ -581,10 +584,12 @@ confused with durable mode:
 }
 ```
 
-Set `FERRUM_CLICKHOUSE_PASSWORD_FILE`, `FERRUM_CLICKHOUSE_PASSWORD_VAULT`, or
-another supported secret suffix at startup, then reference the materialized base
-variable (`FERRUM_CLICKHOUSE_PASSWORD`) from `password_ref`. `password_ref`
-must name a `FERRUM_*` variable.
+Set `FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD_FILE`,
+`FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD_VAULT`, or another supported secret
+suffix at startup, then reference the materialized base variable
+(`FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD`) from `password_ref`.
+`password_ref` must name a `FERRUM_PLUGIN_SECRET_<NAME>` variable (`<NAME>`
+uppercase `[A-Z_][A-Z0-9_]*`).
 
 ## Retry
 

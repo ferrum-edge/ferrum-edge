@@ -385,11 +385,11 @@ fn half_configured_credentials_are_refused() {
 fn credentials_resolve_through_the_env_convention() {
     let mut env = HashMap::new();
     env.insert(
-        "FERRUM_TEST_SMTP_USERNAME_3329".to_string(),
+        "FERRUM_PLUGIN_SECRET_TEST_SMTP_USERNAME_3329".to_string(),
         SMTP_USERNAME.to_string(),
     );
     env.insert(
-        "FERRUM_TEST_SMTP_PASSWORD_3329".to_string(),
+        "FERRUM_PLUGIN_SECRET_TEST_SMTP_PASSWORD_3329".to_string(),
         SMTP_PASSWORD.to_string(),
     );
 
@@ -398,8 +398,8 @@ fn credentials_resolve_through_the_env_convention() {
         &json!({
             "type": "email",
             "smtp_host": "smtp.example.com",
-            "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
-            "password_env": "FERRUM_TEST_SMTP_PASSWORD_3329",
+            "username_env": "FERRUM_PLUGIN_SECRET_TEST_SMTP_USERNAME_3329",
+            "password_env": "FERRUM_PLUGIN_SECRET_TEST_SMTP_PASSWORD_3329",
             "from": "ferrum@example.com",
             "to": ["oncall@example.com"]
         }),
@@ -420,8 +420,8 @@ fn credentials_resolve_through_the_env_convention() {
         &json!({
             "type": "email",
             "smtp_host": "smtp.example.com",
-            "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
-            "password_env": "FERRUM_TEST_SMTP_ABSENT_3329",
+            "username_env": "FERRUM_PLUGIN_SECRET_TEST_SMTP_USERNAME_3329",
+            "password_env": "FERRUM_PLUGIN_SECRET_TEST_SMTP_ABSENT_3329",
             "from": "ferrum@example.com",
             "to": ["oncall@example.com"]
         }),
@@ -1900,7 +1900,7 @@ fn startup_diagnostics_withhold_email_names_and_numeric_scalars() {
 #[test]
 fn startup_diagnostics_preserve_empty_credential_env_field() {
     let channel = "'ChannelName5594`\"\\\n";
-    let env_name = "'EnvName5594`\"\\\n";
+    let env_name = "FERRUM_PLUGIN_SECRET_ENVNAME5594";
     for (key, env_key) in [("username", "username_env"), ("password", "password_env")] {
         let mut config = minimal_def(587);
         config["username"] = json!(SMTP_USERNAME);
@@ -1920,8 +1920,51 @@ fn startup_diagnostics_preserve_empty_credential_env_field() {
             "{rendered}"
         );
         assert!(rendered.contains("resolved to empty string"), "{rendered}");
-        for hidden in ["ChannelName5594", "EnvName5594", "ResolvedValue5594"] {
+        for hidden in ["ChannelName5594", "ENVNAME5594", "ResolvedValue5594"] {
             assert!(!rendered.contains(hidden), "{rendered}");
+        }
+    }
+}
+
+/// A channel `*_env` reference is plugin config, so it may only name the
+/// dedicated `FERRUM_PLUGIN_SECRET_<NAME>` namespace. Gateway-owned secrets and
+/// unrelated process variables are refused before the lookup runs, and the
+/// refusal never echoes the supplied name or any value.
+#[test]
+fn credential_env_references_outside_the_plugin_secret_namespace_are_refused() {
+    const SENTINEL: &str = "out-of-namespace-sentinel-value";
+    for env_name in [
+        "FERRUM_ADMIN_JWT_SECRET",
+        "FERRUM_DB_URL",
+        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+        "AWS_SECRET_ACCESS_KEY",
+        "PATH",
+        "FERRUM_PLUGIN_SECRET_",
+        "FERRUM_PLUGIN_SECRET_lowercase",
+        "'EnvName5594`\"\\\n",
+    ] {
+        for (key, env_key) in [("username", "username_env"), ("password", "password_env")] {
+            let mut config = minimal_def(587);
+            config["username"] = json!(SMTP_USERNAME);
+            config["password"] = json!(SMTP_PASSWORD);
+            config.as_object_mut().unwrap().remove(key);
+            config[env_key] = json!(env_name);
+            let env = HashMap::from([(env_name.to_string(), SENTINEL.to_string())]);
+            let error = ferrum_edge::_test_support::email_channel_new_with_env_for_test(
+                "ops_email",
+                &config,
+                &env,
+            )
+            .expect_err("an out-of-namespace credential reference must be refused");
+            assert!(
+                error.contains("FERRUM_PLUGIN_SECRET_<NAME>"),
+                "{env_key} = {env_name:?}: {error}"
+            );
+            assert!(error.contains(env_key), "{error}");
+            assert!(!error.contains(SENTINEL), "{error}");
+            if env_name != "FERRUM_PLUGIN_SECRET_" {
+                assert!(!error.contains(env_name), "{error}");
+            }
         }
     }
 }
