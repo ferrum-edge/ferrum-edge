@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Update `quinn-proto` to 0.11.19 and `quinn-udp` to 0.5.16** (issue #6113).
+- **Update `quinn` to 0.11.12, `quinn-proto` to 0.11.19 and `quinn-udp` to 0.5.16** (issue #6113).
   These releases fix published upstream advisories that apply to Ferrum's HTTP/3
   frontend and backend client: remote panics and memory exhaustion in stream
   and flow-control handling (GHSA-qfwj-vfxf-92j2, GHSA-hmxj-32vh-65vr,
