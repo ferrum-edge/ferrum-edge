@@ -5,3 +5,4 @@ target/
 envoy_runtime.yaml
 kong_runtime.yaml
 krakend_runtime.json
+results/

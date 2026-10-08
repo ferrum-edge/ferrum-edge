@@ -5,10 +5,17 @@
 #   Options:
 #     --duration <secs>    Test duration (default: 30)
 #     --concurrency <n>    Concurrent connections (default: 100)
-#     --payload-size <n>   Payload bytes for echo tests (default: 64)
+#     --payload-size <n>   Payload bytes for echo tests (default: 10240; UDP legs cap at 2048)
 #     --json               Output JSON results
 #     --skip-build         Skip build entirely (use existing binaries)
 #     --envoy              Compare Ferrum Edge against Envoy (requires envoy in PATH)
+#   Environment (standard mode):
+#     BENCH_ORDER=gateway-first|direct-first  Leg order per protocol (default gateway-first).
+#                          Alternate it across repeated runs so thermal drift does
+#                          not always penalise the same leg.
+#     BENCH_COOLDOWN=<secs>  Idle pause before each measured leg (default 0).
+#     BENCH_CPU_OUT=<file>   Append one JSON line per gateway leg with the gateway
+#                          process CPU seconds consumed during that leg.
 
 set -e
 
@@ -54,8 +61,8 @@ GATEWAY_HTTPS_PORT=8443
 ENVOY_ADMIN_PORT=15000
 # Every fixed port the backend, gateway, and Envoy bind. The startup conflict
 # check and cleanup share this one list so they can never drift apart.
-BENCH_PORTS="3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
-$GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT"
+BENCH_PORTS="3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 50052 50053 \
+$GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5001 5003 5004 5010 $ENVOY_ADMIN_PORT"
 
 # Track PIDs and artifacts created by this run. Cleanup terminates only these
 # PIDs (never anything an unrelated local service or a prior run started) and
@@ -127,9 +134,20 @@ binary_is_fresh() {
     local binary="$1"
     local src_dir="$2"
     [ -f "$binary" ] || return 1
-    # If any .rs or .toml file is newer than the binary, it's stale
+    # If any Rust, TOML (manifests, .cargo/config.toml), lock, or .proto file
+    # is newer than the binary, it's stale
     local newer
-    newer=$(find "$src_dir" \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -newer "$binary" -print -quit 2>/dev/null)
+    newer=$(find "$src_dir" \( -name '*.rs' -o -name '*.toml' -o -name 'Cargo.lock' -o -name '*.proto' \) -newer "$binary" -print -quit 2>/dev/null)
+    [ -z "$newer" ]
+}
+
+# Top-level crate inputs (manifests, build script, root-level bin sources).
+manifest_is_fresh() {
+    local binary="$1"
+    local crate_dir="$2"
+    [ -f "$binary" ] || return 1
+    local newer
+    newer=$(find "$crate_dir" -maxdepth 1 \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -newer "$binary" -print -quit 2>/dev/null)
     [ -z "$newer" ]
 }
 
@@ -146,10 +164,19 @@ build() {
     local need_gateway=true
     local need_bench=true
 
-    if binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/src"; then
+    # The gateway build reads src/, the root manifests, build.rs, proto/, the
+    # patched crates in vendor/, and .cargo/config.toml; the bench crate keeps
+    # proto_bench.rs/proto_backend.rs at its root.
+    if binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/src" \
+        && binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/proto" \
+        && binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/vendor" \
+        && binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/.cargo" \
+        && manifest_is_fresh "$gateway_bin" "$PROJECT_ROOT"; then
         need_gateway=false
     fi
-    if binary_is_fresh "$bench_bin" "$SCRIPT_DIR/src"; then
+    if binary_is_fresh "$bench_bin" "$SCRIPT_DIR/src" \
+        && binary_is_fresh "$bench_bin" "$SCRIPT_DIR/proto" \
+        && manifest_is_fresh "$bench_bin" "$SCRIPT_DIR"; then
         need_bench=false
     fi
 
@@ -296,7 +323,7 @@ start_gateway() {
         done
     fi
 
-    "${env_cmd[@]}" ./target/release/ferrum-edge > "$SCRIPT_DIR/gateway.log" 2>&1 &
+    "${env_cmd[@]}" ./target/release/ferrum-edge run > "$SCRIPT_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
 
     for i in $(seq 1 10); do
@@ -382,6 +409,74 @@ stop_envoy() {
     sleep 1
 }
 
+# Cumulative user+system CPU seconds of a PID (all threads), or empty. `ps`
+# runs from the shell so the Python helpers never spawn a process.
+proc_cpu_seconds() {
+    local pid="$1"
+    if [ -r "/proc/$pid/stat" ]; then
+        python3 -c 'import os, sys
+fields = open(sys.argv[1]).read().rsplit(")", 1)[1].split()
+print((int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"))' "/proc/$pid/stat" 2>/dev/null
+    else
+        # macOS: cputime is [[DD-]HH:]MM:SS.ss with 10 ms resolution.
+        ps -o cputime= -p "$pid" 2>/dev/null | python3 -c 'import sys
+raw = sys.stdin.read().strip()
+if raw:
+    days, _, clock = raw.rpartition("-")
+    seconds = 0.0
+    for part in clock.split(":"):
+        seconds = seconds * 60 + float(part)
+    print(seconds + int(days or 0) * 86400)' 2>/dev/null
+    fi
+}
+
+BENCH_ORDER="${BENCH_ORDER:-gateway-first}"
+BENCH_COOLDOWN="${BENCH_COOLDOWN:-0}"
+BENCH_CPU_OUT="${BENCH_CPU_OUT:-}"
+
+# Measure one leg through the gateway, recording gateway CPU when requested.
+run_gateway_leg() {
+    local key="$1" label="$2" proto="$3" target="$4"
+    shift 4
+    if [ "$BENCH_COOLDOWN" != "0" ]; then sleep "$BENCH_COOLDOWN"; fi
+    local cpu_before wall_before
+    cpu_before=$(proc_cpu_seconds "$GATEWAY_PID")
+    wall_before=$(python3 -c 'import time; print(time.monotonic())')
+    run_bench "$label" "$proto" "$target" "$@"
+    if [ -n "$BENCH_CPU_OUT" ] && [ -n "$cpu_before" ]; then
+        local cpu_after wall_after
+        cpu_after=$(proc_cpu_seconds "$GATEWAY_PID")
+        wall_after=$(python3 -c 'import time; print(time.monotonic())')
+        python3 -c 'import json, sys; k, b, a, wb, wa = sys.argv[1:]; print(json.dumps({"protocol_key": k, "gateway_cpu_seconds": round(float(a) - float(b), 4), "wall_seconds": round(float(wa) - float(wb), 4)}))' \
+            "$key" "$cpu_before" "$cpu_after" "$wall_before" "$wall_after" >> "$BENCH_CPU_OUT"
+    fi
+}
+
+run_direct_leg() {
+    local label="$1" proto="$2" target="$3"
+    shift 3
+    if [ "$BENCH_COOLDOWN" != "0" ]; then sleep "$BENCH_COOLDOWN"; fi
+    run_bench "$label" "$proto" "$target" "$@"
+}
+
+# run_pair <key> <name> <proto> <gateway target> <direct target> [direct label suffix] -- [extra args]
+run_pair() {
+    local key="$1" name="$2" proto="$3" gateway_target="$4" direct_target="$5"
+    shift 5
+    if [ "$BENCH_ORDER" = "direct-first" ]; then
+        run_direct_leg "$name (direct backend)" "$proto" "$direct_target" "$@"
+        run_gateway_leg "$key" "$name (via gateway)" "$proto" "$gateway_target" "$@"
+    else
+        run_gateway_leg "$key" "$name (via gateway)" "$proto" "$gateway_target" "$@"
+        run_direct_leg "$name (direct backend)" "$proto" "$direct_target" "$@"
+    fi
+}
+
+# UDP datagrams stay below the loopback MTU: cap larger requested payloads.
+udp_payload() {
+    if [ "$PAYLOAD_SIZE" -gt 2048 ]; then echo 2048; else echo "$PAYLOAD_SIZE"; fi
+}
+
 # Run bench
 run_bench() {
     local label="$1"
@@ -436,66 +531,59 @@ run_bench_capture() {
 test_http1() {
     start_gateway "$SCRIPT_DIR/configs/http1_perf.yaml"
     sleep 1
-    run_bench "HTTP/1.1 (via gateway)" http1 "http://127.0.0.1:$GATEWAY_HTTP_PORT/echo"
-    run_bench "HTTP/1.1 (direct backend)" http1 "http://127.0.0.1:3001/echo"
+    run_pair http1 "HTTP/1.1" http1 "http://127.0.0.1:$GATEWAY_HTTP_PORT/echo" "http://127.0.0.1:3001/echo"
 }
 
 test_http1_tls() {
     start_gateway "$SCRIPT_DIR/configs/http1_tls_perf.yaml"
     sleep 1
-    run_bench "HTTP/1.1+TLS (via gateway)" http1 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
-    run_bench "HTTP/1.1+TLS (direct backend - no TLS)" http1 "http://127.0.0.1:3001/echo"
+    # Same client protocol on both legs: the direct baseline is HTTPS/1.1 to the
+    # backend's TLS listener, so the overhead is the gateway hop, not TLS itself.
+    run_pair http1-tls "HTTP/1.1+TLS" http1 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo" "https://127.0.0.1:3447/echo"
 }
 
 test_http2() {
     start_gateway "$SCRIPT_DIR/configs/http2_perf.yaml" "FERRUM_POOL_ENABLE_HTTP2=true"
     sleep 1
-    run_bench "HTTP/2 (via gateway)" http2 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
-    run_bench "HTTP/2 (direct backend)" http2 "https://127.0.0.1:3443/echo"
+    run_pair http2 "HTTP/2" http2 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo" "https://127.0.0.1:3443/echo"
 }
 
 test_http3() {
     start_gateway "$SCRIPT_DIR/configs/http3_perf.yaml" "FERRUM_ENABLE_HTTP3=true"
     sleep 1
-    run_bench "HTTP/3 (via gateway)" http3 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
-    run_bench "HTTP/3 (direct backend)" http3 "https://127.0.0.1:3445/echo"
+    run_pair http3 "HTTP/3" http3 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo" "https://127.0.0.1:3445/echo"
 }
 
 test_ws() {
     start_gateway "$SCRIPT_DIR/configs/ws_perf.yaml"
     sleep 1
-    run_bench "WebSocket (via gateway)" ws "ws://127.0.0.1:$GATEWAY_HTTP_PORT/ws"
-    run_bench "WebSocket (direct backend)" ws "ws://127.0.0.1:3003"
+    run_pair ws "WebSocket" ws "ws://127.0.0.1:$GATEWAY_HTTP_PORT/ws" "ws://127.0.0.1:3003"
 }
 
 test_grpc() {
     start_gateway "$SCRIPT_DIR/configs/grpc_perf.yaml"
     sleep 1
-    run_bench "gRPC (via gateway)" grpc "http://127.0.0.1:$GATEWAY_HTTP_PORT"
-    run_bench "gRPC (direct backend)" grpc "http://127.0.0.1:50052"
+    run_pair grpc "gRPC" grpc "http://127.0.0.1:$GATEWAY_HTTP_PORT" "http://127.0.0.1:50052"
 }
 
 test_tcp() {
     start_gateway "$SCRIPT_DIR/configs/tcp_perf.yaml"
     sleep 1
-    run_bench "TCP (via gateway)" tcp "127.0.0.1:5010"
-    run_bench "TCP (direct backend)" tcp "127.0.0.1:3004"
+    run_pair tcp "TCP" tcp "127.0.0.1:5010" "127.0.0.1:3004"
 }
 
 test_tcp_tls() {
     start_gateway "$SCRIPT_DIR/configs/tcp_tls_perf.yaml"
     sleep 1
-    run_bench "TCP+TLS (via gateway)" tcp "127.0.0.1:5001" --tls
-    run_bench "TCP+TLS (direct backend)" tcp "127.0.0.1:3444" --tls
+    run_pair tcp-tls "TCP+TLS" tcp "127.0.0.1:5001" "127.0.0.1:3444" --tls
 }
 
 test_udp() {
     start_gateway "$SCRIPT_DIR/configs/udp_perf.yaml"
     sleep 1
     local SAVED_PAYLOAD=$PAYLOAD_SIZE
-    PAYLOAD_SIZE=2048
-    run_bench "UDP (via gateway)" udp "127.0.0.1:5003"
-    run_bench "UDP (direct backend)" udp "127.0.0.1:3005"
+    PAYLOAD_SIZE=$(udp_payload)
+    run_pair udp "UDP" udp "127.0.0.1:5003" "127.0.0.1:3005"
     PAYLOAD_SIZE=$SAVED_PAYLOAD
 }
 
@@ -503,9 +591,8 @@ test_udp_dtls() {
     start_gateway "$SCRIPT_DIR/configs/udp_dtls_perf.yaml"
     sleep 1
     local SAVED_PAYLOAD=$PAYLOAD_SIZE
-    PAYLOAD_SIZE=2048
-    run_bench "UDP+DTLS (via gateway)" udp "127.0.0.1:5004" --tls
-    run_bench "UDP+DTLS (direct backend)" udp "127.0.0.1:3006" --tls
+    PAYLOAD_SIZE=$(udp_payload)
+    run_pair udp-dtls "UDP+DTLS" udp "127.0.0.1:5004" "127.0.0.1:3006" --tls
     PAYLOAD_SIZE=$SAVED_PAYLOAD
 }
 
@@ -534,7 +621,7 @@ envoy_compare_protocol() {
         http1-tls)
             bench_proto=http1
             bench_target="https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
-            direct_target="http://127.0.0.1:3001/echo"
+            direct_target="https://127.0.0.1:3447/echo"
             ferrum_config="$SCRIPT_DIR/configs/http1_tls_perf.yaml"
             envoy_config="$SCRIPT_DIR/configs/envoy/http1_tls.yaml"
             ;;
@@ -583,7 +670,7 @@ envoy_compare_protocol() {
     # Override payload size for UDP protocols
     local SAVED_PAYLOAD=$PAYLOAD_SIZE
     case "$p" in
-        udp|udp-dtls) PAYLOAD_SIZE=2048 ;;
+        udp|udp-dtls) PAYLOAD_SIZE=$(udp_payload) ;;
     esac
 
     echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -615,7 +702,7 @@ envoy_compare_protocol() {
 print_comparison_table() {
     local protocols=("$@")
 
-    python3 - "$RESULTS_DIR" "${protocols[@]}" <<'PYEOF'
+    BENCH_PAYLOAD_SIZE="$PAYLOAD_SIZE" python3 - "$RESULTS_DIR" "${protocols[@]}" <<'PYEOF'
 import json, sys, os
 
 results_dir = sys.argv[1]
@@ -657,7 +744,7 @@ print()
 print("\033[1m" + "=" * 105 + "\033[0m")
 print("\033[1m  Ferrum Edge vs Envoy \u2014 Through-Gateway Comparison\033[0m")
 if first:
-    print(f"  Duration: {first.get('duration_secs','')}s | Concurrency: {first.get('concurrency','')} | Payload: 10 KB (2 KB for UDP)")
+    print(f"  Duration: {first.get('duration_secs','')}s | Concurrency: {first.get('concurrency','')} | Payload: {os.environ.get('BENCH_PAYLOAD_SIZE', '?')} B (UDP capped at 2048 B)")
 print("\033[1m" + "=" * 105 + "\033[0m")
 print()
 

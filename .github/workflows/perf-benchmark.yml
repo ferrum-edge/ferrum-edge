@@ -22,7 +22,7 @@ on:
       duration:
         description: "Test duration per protocol (seconds)"
         required: false
-        default: "5"
+        default: "15"
         type: string
       concurrency:
         description: "Concurrent connections"
@@ -30,7 +30,7 @@ on:
         default: "100"
         type: string
       payload_size:
-        description: "Payload size in bytes (UDP uses 2048 regardless)"
+        description: "Payload size in bytes (UDP legs cap at 2048)"
         required: false
         default: "10240"
         type: string
@@ -49,9 +49,9 @@ on:
           - "2"
           - "3"
       build_profile:
-        description: "Cargo build profile for gateway binary"
+        description: "Cargo build profile for gateway binary (dev numbers are not meaningful)"
         required: false
-        default: "dev"
+        default: "release"
         type: choice
         options:
           - release

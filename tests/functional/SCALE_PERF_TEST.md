@@ -10,7 +10,7 @@
 
 2. **Latency distribution at scale** -- How do p50, p95, p99, and max latencies change as config size increases?
 
-3. **Config update resiliency** -- Resources are added between perf runs while the gateway continues serving traffic. The DB poller picks up new config mid-flight, exercising the atomic config swap and incremental cache rebuild paths.
+3. **Config update resiliency** -- Resources are added between perf windows to the running gateway process (no restart). The DB poller picks up each new wave, exercising the atomic config swap and cache rebuild paths, and every wave must converge before the next window is measured. Load is not applied while a wave is being provisioned, so this test does not measure throughput *during* a reload.
 
 4. **Auth + ACL hot path at scale** -- Every request goes through key_auth (O(1) consumer index lookup) and access_control (consumer allowlist check), verifying these remain fast with 30k consumers in the index.
 
@@ -67,7 +67,7 @@ The test runs in 10 batches. Each batch:
    - All proxies route to the same echo backend
 2. Waits for the highest deferred-apply cursor to be accepted by the poller
 3. Proves end-to-end data-plane convergence across the oldest proxy and the first, middle, and last proxies in the new batch
-4. Runs a **complete 30-second load test** with 50 concurrent workers hitting all accumulated proxies round-robin, each request authenticated with the correct API key. A route-miss 404 ends and discards the partial window, re-runs the bounded convergence gate, and restarts the full window once; a second interrupted window fails as convergence instability rather than being reported as a routing-throughput regression.
+4. Sends **5 seconds of discarded warmup traffic**, then runs a **complete 30-second measured window** with 50 concurrent workers hitting all accumulated proxies round-robin, each request authenticated with the correct API key. Only requests that complete inside the window count; RPS is successful requests ÷ window, latency percentiles cover successful requests, and the gateway process's CPU time over the window is divided by the requests it served (`CPU/req`). A route-miss 404 ends and discards the partial window, re-runs the bounded convergence gate, and restarts the full window once; a second interrupted window fails as convergence instability rather than being reported as a routing-throughput regression.
 
 After all 10 batches, a summary table is printed comparing RPS and latency percentiles across each scale point (3k, 6k, 9k, ... 30k).
 
@@ -79,8 +79,13 @@ After all 10 batches, a summary table is printed comparing RPS and latency perce
 cargo build --release --bin ferrum-edge
 
 # SQLite variant (no external dependencies). `--exact` keeps the filter from
-# also matching the _postgres and _mongodb variants.
-cargo test --test functional_tests -- --ignored --nocapture \
+# also matching the _postgres and _mongodb variants. `--profile ci-release`
+# optimizes the test binary, which hosts the load generator and echo backend;
+# a debug test binary can become the bottleneck and hide gateway slowdown.
+# Use it for any number you publish (CI's regression gate uses the debug
+# profile and compares batches only against each other).
+FERRUM_SCALE_RESULTS_JSON=scale-results.json \
+cargo test --profile ci-release --test functional_tests -- --ignored --nocapture \
   --exact functional::functional_scale_perf_test::test_scale_perf_30k_proxies
 
 # PostgreSQL variant (requires the Docker container above)
@@ -91,6 +96,16 @@ cargo test --test functional_tests test_scale_perf_30k_proxies_postgres \
 cargo test --test functional_tests test_scale_perf_30k_proxies_mongodb \
   -- --ignored --nocapture
 ```
+
+Set `FERRUM_SCALE_RESULTS_JSON=/path/to/scale.json` to also write every batch
+result (RPS, latency percentiles, gateway CPU per request) plus the run
+parameters and commit as JSON.
+
+The load generator and echo backend run inside the test process on the same
+host as the gateway. On a laptop they compete with the gateway for cores, so a
+client-side ceiling can hide part of a gateway slowdown: compare `CPU/req`
+across batches as well as RPS. CPU per request is measured on the gateway
+process alone and is not capped by the client.
 
 Do not add `--all-features`: it enables both `crypto-ring` and `fips`, which is a
 compile error. `--nocapture` is needed to see the progress output and results
@@ -104,7 +119,8 @@ Constants at the top of the test file control the test parameters:
 |--------------------------|---------|--------------------------------------------------|
 | `BATCH_SIZE`             | 3,000   | Proxies/consumers/plugins created per batch       |
 | `TOTAL_PROXIES`          | 30,000  | Total proxies to create (must be multiple of batch size) |
-| `PERF_TEST_DURATION_SECS`| 30      | Seconds each load test runs                       |
+| `PERF_WARMUP_SECS`       | 5       | Discarded warmup traffic before each window       |
+| `PERF_TEST_DURATION_SECS`| 30      | Seconds each measured window runs                 |
 | `CONCURRENCY`            | 50      | Number of concurrent HTTP workers per load test   |
 | `API_BATCH_CHUNK`        | 100     | Resources per batch API call                      |
 
@@ -140,9 +156,35 @@ Every chunk posts with **`?apply=async`** (issue #4139): the graph commits durab
 
 (Numbers above are from a real run -- actual results depend on hardware.)
 
-## Baseline Results (SQLite, release build, Apple Silicon)
+## Baseline Results (SQLite, release build, Apple M4)
 
-Results from a real run on a MacBook, showing proxy hot-path performance as config scales from 3k to 30k. Always use `cargo build --release` for meaningful performance numbers — debug builds have significant overhead from disabled optimizations and extra bounds checking. The echo backend uses hyper with HTTP/1.1 keep-alive, and the test runtime uses `multi_thread` flavor for realistic async throughput.
+Run 2026-10-06 at commit `e5c7616` on an Apple M4 (10 cores, 16 GB, macOS
+26.6.1): gateway `cargo build --release`, test binary `--profile ci-release`,
+5 s warmup + 30 s measured window per wave, 50 workers. Raw JSON:
+[`tests/performance/published/2026-10-06-apple-m4/scale-sqlite.json`](../performance/published/2026-10-06-apple-m4/scale-sqlite.json).
+
+| Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | Max(ms) | CPU/req(µs) | % Baseline |
+|---------|------|---------|---------|---------|---------|---------|-------------|------------|
+| 3,000 | 88,874 | 0.6 | 0.5 | 0.8 | 1.0 | 3.3 | 56.5 | 100% |
+| 6,000 | 88,355 | 0.6 | 0.5 | 0.8 | 1.0 | 3.2 | 56.3 | 99% |
+| 9,000 | 88,229 | 0.6 | 0.5 | 0.8 | 1.0 | 3.7 | 56.9 | 99% |
+| 12,000 | 87,465 | 0.6 | 0.6 | 0.8 | 1.0 | 3.3 | 58.0 | 98% |
+| 15,000 | 86,972 | 0.6 | 0.6 | 0.9 | 1.0 | 20.8 | 57.5 | 98% |
+| 18,000 | 87,024 | 0.6 | 0.6 | 0.9 | 1.0 | 4.3 | 58.3 | 98% |
+| 21,000 | 86,967 | 0.6 | 0.6 | 0.9 | 1.0 | 3.2 | 58.6 | 98% |
+| 24,000 | 86,762 | 0.6 | 0.6 | 0.9 | 1.1 | 3.2 | 58.5 | 98% |
+| 27,000 | 86,663 | 0.6 | 0.6 | 0.9 | 1.1 | 13.9 | 57.9 | 98% |
+| 30,000 | 86,736 | 0.6 | 0.6 | 0.9 | 1.0 | 3.0 | 59.0 | 98% |
+
+**2.4% throughput change** from 3k to 30k proxies; 0 failed out of
+26,221,987 measured requests. Gateway CPU per authenticated request rose from
+56.5 µs to 59.0 µs.
+
+### Historical results (undated, provenance unrecorded)
+
+An earlier undated run recorded ~49k RPS at 3k proxies and 13.8% degradation to
+30k. It had no warmup, counted failed requests in RPS, and its commit, host, and test
+profile were not recorded, so it is kept only for context:
 
 | Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | Max(ms) | % Baseline |
 |---------|------|---------|---------|---------|---------|---------|------------|
@@ -156,10 +198,6 @@ Results from a real run on a MacBook, showing proxy hot-path performance as conf
 | 24,000 | 45,612 | 1.1 | 1.0 | 1.7 | 2.4 | 25.6 | 93% |
 | 27,000 | 44,363 | 1.1 | 1.0 | 1.7 | 2.5 | 26.2 | 90% |
 | 30,000 | 42,434 | 1.2 | 1.1 | 1.9 | 2.8 | 113.2 | 86% |
-
-**13.8% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures. ~49k RPS baseline with 1.0ms P50 latency on a release build.
-
-Batch API creation speed: ~3,200-3,900 resources/s (vs ~5-116/s with individual API calls).
 
 ## Interpreting Results
 

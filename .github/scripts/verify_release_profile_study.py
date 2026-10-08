@@ -15,7 +15,7 @@ EXPECTED = [
     ("HTTP/1.1", "http://127.0.0.1:8000/echo"),
     ("HTTP/1.1", "http://127.0.0.1:3001/echo"),
     ("HTTP/1.1+TLS", "https://127.0.0.1:8443/echo"),
-    ("HTTP/1.1", "http://127.0.0.1:3001/echo"),
+    ("HTTP/1.1+TLS", "https://127.0.0.1:3447/echo"),
     ("HTTP/2", "https://127.0.0.1:8443/echo"),
     ("HTTP/2", "https://127.0.0.1:3443/echo"),
     ("HTTP/3", "https://127.0.0.1:8443/echo"),
