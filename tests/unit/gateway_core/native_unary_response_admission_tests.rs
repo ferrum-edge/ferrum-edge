@@ -35,9 +35,11 @@ async fn unary_admission_permit_lives_until_encoded_body_is_dropped() {
         .expect("service responds");
 
     assert_eq!(admission.active_streams(), 1);
-    assert!(admission
-        .reserve_native_stream("ferrum", "dp", "dp-2")
-        .is_err());
+    assert!(
+        admission
+            .reserve_native_stream("ferrum", "dp", "dp-2")
+            .is_err()
+    );
     drop(response);
     assert_eq!(admission.active_streams(), 0);
 }
@@ -45,8 +47,16 @@ async fn unary_admission_permit_lives_until_encoded_body_is_dropped() {
 #[test]
 fn unary_full_config_rate_is_scoped_to_authenticated_namespace_and_subject() {
     let admission = CpGrpcAdmissionController::new(CpGrpcAdmissionLimits::default());
-    assert!(admission.reserve_full_config_rate("alpha", "shared").is_ok());
-    assert!(admission.reserve_full_config_rate("alpha", "shared").is_err());
+    assert!(
+        admission
+            .reserve_full_config_rate("alpha", "shared")
+            .is_ok()
+    );
+    assert!(
+        admission
+            .reserve_full_config_rate("alpha", "shared")
+            .is_err()
+    );
     assert!(admission.reserve_full_config_rate("beta", "shared").is_ok());
 }
 
@@ -54,14 +64,20 @@ fn unary_full_config_rate_is_scoped_to_authenticated_namespace_and_subject() {
 fn unary_full_config_rate_capacity_is_partitioned_by_namespace() {
     let admission = CpGrpcAdmissionController::new(CpGrpcAdmissionLimits::default());
     for index in 0..4096 {
-        assert!(admission
-            .reserve_full_config_rate("alpha", &format!("subject-{index}"))
-            .is_ok());
+        assert!(
+            admission
+                .reserve_full_config_rate("alpha", &format!("subject-{index}"))
+                .is_ok()
+        );
     }
-    assert!(admission
-        .reserve_full_config_rate("alpha", "overflow")
-        .is_err());
-    assert!(admission
-        .reserve_full_config_rate("beta", "first-subject")
-        .is_ok());
+    assert!(
+        admission
+            .reserve_full_config_rate("alpha", "overflow")
+            .is_err()
+    );
+    assert!(
+        admission
+            .reserve_full_config_rate("beta", "first-subject")
+            .is_ok()
+    );
 }

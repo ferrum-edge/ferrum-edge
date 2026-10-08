@@ -56,8 +56,8 @@
 //! [`CpGrpcAdmissionRejection::metric_reason`] label.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;

@@ -69,11 +69,7 @@ impl MeshNodeRegistry {
         self.remove_if_stale_key(&key, expected_connected_at);
     }
 
-    pub(crate) fn remove_if_stale_key(
-        &self,
-        key: &str,
-        expected_connected_at: DateTime<Utc>,
-    ) {
+    pub(crate) fn remove_if_stale_key(&self, key: &str, expected_connected_at: DateTime<Utc>) {
         self.nodes
             .remove_if(key, |_, info| info.connected_at == expected_connected_at);
     }

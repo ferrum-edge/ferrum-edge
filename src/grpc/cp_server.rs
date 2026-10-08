@@ -42,8 +42,8 @@ use prost::Message;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -93,9 +93,9 @@ struct TenantRejectionLogState {
     suppressed: u64,
 }
 
-static TENANT_SUBSCRIPTION_REJECTION_LOGS:
-    LazyLock<Mutex<HashMap<(&'static str, &'static str), TenantRejectionLogState>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TENANT_SUBSCRIPTION_REJECTION_LOGS: LazyLock<
+    Mutex<HashMap<(&'static str, &'static str), TenantRejectionLogState>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const TENANT_REJECTION_LOG_INTERVAL_SECS: u64 = 60;
 fn bounded_log_value(value: &str) -> String {
@@ -729,21 +729,22 @@ impl CpGrpcServer {
                 if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     let now = elapsed.as_secs();
                     let reason = bounded_tenant_rejection_reason(reason);
-                    let suppressed = TENANT_SUBSCRIPTION_REJECTION_LOGS
-                        .lock()
-                        .ok()
-                        .and_then(|mut logs| {
-                            let state = logs.entry((surface, reason)).or_default();
-                            if state.last_logged != 0
-                                && now.saturating_sub(state.last_logged)
-                                    < TENANT_REJECTION_LOG_INTERVAL_SECS
-                            {
-                                state.suppressed = state.suppressed.saturating_add(1);
-                                return None;
-                            }
-                            state.last_logged = now;
-                            Some(std::mem::take(&mut state.suppressed))
-                        });
+                    let suppressed =
+                        TENANT_SUBSCRIPTION_REJECTION_LOGS
+                            .lock()
+                            .ok()
+                            .and_then(|mut logs| {
+                                let state = logs.entry((surface, reason)).or_default();
+                                if state.last_logged != 0
+                                    && now.saturating_sub(state.last_logged)
+                                        < TENANT_REJECTION_LOG_INTERVAL_SECS
+                                {
+                                    state.suppressed = state.suppressed.saturating_add(1);
+                                    return None;
+                                }
+                                state.last_logged = now;
+                                Some(std::mem::take(&mut state.suppressed))
+                            });
                     if let Some(suppressed) = suppressed {
                         warn!(
                             audit.event = "tenant_subscription",

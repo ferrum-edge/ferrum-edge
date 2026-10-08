@@ -1031,9 +1031,7 @@ fn evict_oldest_disconnected(entries: &mut HashMap<String, LiveEntry>) -> bool {
             if entry.connected {
                 None
             } else {
-                entry
-                    .disconnected_at
-                    .map(|at| (key.clone(), at))
+                entry.disconnected_at.map(|at| (key.clone(), at))
             }
         })
         .min_by_key(|(_, at)| *at);

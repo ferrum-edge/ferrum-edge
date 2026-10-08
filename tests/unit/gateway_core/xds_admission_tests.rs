@@ -394,7 +394,9 @@ fn same_xds_subject_has_independent_quota_per_namespace() {
     let _a = controller.reserve_stream("tenant-a", &tenant_a).unwrap();
     let _b = controller.reserve_stream("tenant-b", &tenant_b).unwrap();
     assert_eq!(
-        controller.reserve_stream("tenant-a", &tenant_a).unwrap_err(),
+        controller
+            .reserve_stream("tenant-a", &tenant_a)
+            .unwrap_err(),
         XdsAdmissionRejection::PrincipalStreams
     );
 }
