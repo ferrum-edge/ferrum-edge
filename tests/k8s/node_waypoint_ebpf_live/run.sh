@@ -457,12 +457,7 @@ render_chart_assertions() {
     grep -nE "name: ferrum-mesh-(ambient|node-agent)|FERRUM_ADMIN_HTTP_PORT|value: \"?(9000|$AMBIENT_ADMIN_PORT|$NODE_AGENT_ADMIN_PORT)\"?" <<<"$rendered" >&2 || true
     exit 1
   fi
-  local ambient_block
-  ambient_block="$(awk '
-    /name: ferrum-mesh-ambient/ { in_ambient = 1 }
-    in_ambient { print }
-    /name: ferrum-mesh-node-agent/ && in_ambient { exit }
-  ' <<<"$rendered")"
+  local ambient_block="$ambient_ds"
   if ! grep -q "readinessProbe:" <<<"$ambient_block" ||
     ! grep -A15 "readinessProbe:" <<<"$ambient_block" | grep -q -- "- \"$AMBIENT_ADMIN_PORT\""; then
     echo "NodeWaypoint ambient render did not add an admin health readiness probe" >&2
