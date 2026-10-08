@@ -222,10 +222,35 @@ pub struct RuntimeConfigApply {
     waiter_count: AtomicUsize,
     max_waiting_epoch: AtomicU64,
     max_waiting: AtomicU64,
-    /// The oldest admin write this process issued a cursor for that no
-    /// accepted generation covers yet, and when it committed. Lets the poll
-    /// loop report write-to-live latency per change (issue #6057).
-    oldest_unapplied_write: std::sync::Mutex<Option<(LiveApplyCursor, Instant)>>,
+    /// Admin writes this process issued cursors for that no accepted
+    /// generation covers yet, and when each committed. Lets the poll loop
+    /// report write-to-live latency per change (issue #6057).
+    unapplied_writes: std::sync::Mutex<UnappliedWrites>,
+}
+
+/// Bound on remembered unapplied writes. Beyond it new writes go untimed; the
+/// oldest ones, which set the reported latency, are kept.
+const MAX_UNAPPLIED_WRITES: usize = 4096;
+
+/// Commit times of issued-but-unapplied writes in one topology, by sequence.
+#[derive(Default)]
+struct UnappliedWrites {
+    topology_epoch: u64,
+    committed_at: std::collections::BTreeMap<u64, Instant>,
+}
+
+impl UnappliedWrites {
+    /// Drop the writes `cursor` covers and return the oldest one's commit time.
+    fn settle(&mut self, cursor: LiveApplyCursor) -> Option<Instant> {
+        if cursor.topology_epoch != self.topology_epoch {
+            return None;
+        }
+        let later = self
+            .committed_at
+            .split_off(&cursor.sequence.saturating_add(1));
+        let covered = std::mem::replace(&mut self.committed_at, later);
+        covered.into_values().min()
+    }
 }
 
 impl RuntimeConfigApply {
@@ -279,7 +304,7 @@ impl RuntimeConfigApply {
             waiter_count: AtomicUsize::new(0),
             max_waiting_epoch: AtomicU64::new(topology_epoch),
             max_waiting: AtomicU64::new(0),
-            oldest_unapplied_write: std::sync::Mutex::new(None),
+            unapplied_writes: std::sync::Mutex::new(UnappliedWrites::default()),
         }
     }
 
@@ -311,10 +336,17 @@ impl RuntimeConfigApply {
     /// sequences from continuously re-arming the database poll loop while
     /// preserving the covering-cursor semantics for concurrent mutations.
     pub fn record_issued_cursor(&self, cursor: LiveApplyCursor) {
-        if let Ok(mut oldest) = self.oldest_unapplied_write.lock()
-            && oldest.is_none_or(|(pending, _)| pending.topology_epoch != cursor.topology_epoch)
-        {
-            *oldest = Some((cursor, Instant::now()));
+        if let Ok(mut writes) = self.unapplied_writes.lock() {
+            if writes.topology_epoch != cursor.topology_epoch {
+                writes.topology_epoch = cursor.topology_epoch;
+                writes.committed_at.clear();
+            }
+            if writes.committed_at.len() < MAX_UNAPPLIED_WRITES {
+                writes
+                    .committed_at
+                    .entry(cursor.sequence)
+                    .or_insert_with(Instant::now);
+            }
         }
         self.snapshot.send_modify(|snap| {
             if cursor.topology_epoch == snap.topology_epoch {
@@ -327,17 +359,12 @@ impl RuntimeConfigApply {
     }
 
     /// Time since the oldest admin write that `accepted` now covers committed,
-    /// if this process issued one. Clears it so the next write starts a new
-    /// measurement. Writes issued later but also covered are not timed
-    /// separately: the oldest one is the change's write-to-live latency.
+    /// if this process issued one. Retires every covered write; writes past
+    /// `accepted` keep their own commit times for a later generation. Covered
+    /// writes are not timed separately: the oldest one is the change's
+    /// write-to-live latency.
     pub fn take_write_to_live(&self, accepted: LiveApplyCursor) -> Option<Duration> {
-        let mut oldest = self.oldest_unapplied_write.lock().ok()?;
-        let (pending, committed_at) = (*oldest)?;
-        if pending.topology_epoch != accepted.topology_epoch || pending.sequence > accepted.sequence
-        {
-            return None;
-        }
-        *oldest = None;
+        let committed_at = self.unapplied_writes.lock().ok()?.settle(accepted)?;
         Some(committed_at.elapsed())
     }
 
@@ -384,13 +411,8 @@ impl RuntimeConfigApply {
     pub fn record_rejected_cursor(&self, cursor: LiveApplyCursor) {
         // A rejected generation settles the writes it covers: a later accepted
         // change must not report write-to-live from them (issue #6057).
-        if let Ok(mut oldest) = self.oldest_unapplied_write.lock()
-            && oldest.is_some_and(|(pending, _)| {
-                pending.topology_epoch == cursor.topology_epoch
-                    && pending.sequence <= cursor.sequence
-            })
-        {
-            *oldest = None;
+        if let Ok(mut writes) = self.unapplied_writes.lock() {
+            writes.settle(cursor);
         }
         self.snapshot.send_modify(|snap| {
             if cursor.topology_epoch > snap.topology_epoch {

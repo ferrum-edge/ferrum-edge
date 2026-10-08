@@ -340,6 +340,28 @@ async fn write_to_live_times_the_oldest_covered_write_once() {
     );
 }
 
+/// Accepting an earlier cursor retires only the writes it covers; a later
+/// pending write keeps its own commit time for the generation that covers it.
+#[tokio::test(start_paused = true)]
+async fn write_to_live_keeps_writes_past_the_accepted_cursor() {
+    let apply = RuntimeConfigApply::at_epoch("ferrum", 1, 10);
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 11));
+    tokio::time::advance(Duration::from_millis(300)).await;
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 12));
+    tokio::time::advance(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        apply.take_write_to_live(LiveApplyCursor::new(1, 11)),
+        Some(Duration::from_millis(500))
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert_eq!(
+        apply.take_write_to_live(LiveApplyCursor::new(1, 12)),
+        Some(Duration::from_millis(300)),
+        "write 12 is timed from its own commit"
+    );
+}
+
 /// A rejected generation settles the writes it covers, so the next accepted
 /// change does not report their age as its write-to-live latency.
 #[tokio::test(start_paused = true)]
