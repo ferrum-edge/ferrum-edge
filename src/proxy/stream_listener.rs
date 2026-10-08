@@ -359,9 +359,10 @@ struct BackendTlsReloadKey {
     /// compiled into the cached verifier, so a CRL rotation (delivered via
     /// [`StreamListenerManager::set_crls`]) must change the key and rebuild
     /// the listener's cached `ClientConfig`. Treated as material *content*
-    /// (not source identity) by [`Self::same_tls_sources`], so a CRL rotation
-    /// that pairs with invalid cert material still qualifies for the
-    /// keep-old-listener path.
+    /// (not source identity) by [`Self::same_tls_sources`], but
+    /// [`Self::may_keep_previous_listener`] refuses the keep-old-listener path
+    /// when it changed: the kept listener would go on verifying against the
+    /// revocation list the reload just replaced.
     crl_fingerprint: Option<String>,
     /// [`crate::config::types::BackendTlsConfig::tls_refused`]: a refused
     /// destination carries no material, so without this field its key would
@@ -495,6 +496,17 @@ impl BackendTlsReloadKey {
             && source_matches(&self.client_key, &other.client_key)
     }
 
+    /// True when a listener built from `self` may keep serving while the
+    /// rotation to `other` is invalid: the TLS sources are unchanged
+    /// ([`Self::same_tls_sources`]) AND the CRL content is unchanged. A CRL
+    /// rotation that arrives with invalid material fails closed instead (the
+    /// listener is torn down and its port stays closed until the material is
+    /// fixed), so a stale revocation list is never kept in service — the same
+    /// outcome every HTTP-family and DTLS backend gets from that reload.
+    fn may_keep_previous_listener(&self, other: &Self) -> bool {
+        self.same_tls_sources(other) && self.crl_fingerprint == other.crl_fingerprint
+    }
+
     async fn from_proxy(
         proxy: &Proxy,
         global_tls_ca_bundle_path: Option<&str>,
@@ -622,7 +634,9 @@ pub enum StreamListenerDegradation {
     BackendTlsInvalid,
     /// In-place backend TLS material rotated to invalid content; the previous
     /// listener was kept running rather than tearing down the port. Hard bind
-    /// failure (surfaced so the failed rotation is visible).
+    /// failure (surfaced so the failed rotation is visible). Never used when
+    /// the gateway CRL also changed: that listener is torn down and reported
+    /// as [`Self::BackendTlsInvalid`].
     BackendTlsRotationInvalid,
     /// A `frontend_tls` TCP listener is deferred because the rustls
     /// `ServerConfig` has not been loaded yet. Non-fatal: the listener starts
@@ -3144,18 +3158,23 @@ impl StreamListenerManager {
             //
             // The keep-old path applies ONLY to a pure in-place content
             // rotation: the proxy's TLS *source configuration* (verify flag,
-            // SAN allow-list, CA / client cert / client key source identity)
-            // AND its backend routing fields must both be unchanged, i.e. the
-            // only difference is rotated content under the same sources.
-            // Decision matrix:
+            // SAN allow-list, CA / client cert / client key source identity),
+            // the gateway CRL content, AND its backend routing fields must all
+            // be unchanged, i.e. the only difference is rotated cert/key/CA
+            // content under the same sources. Decision matrix:
             //
-            //   TLS sources | backend routing | new TLS valid | action
-            //   ------------+-----------------+---------------+-----------------------------
-            //   unchanged   | unchanged       | valid         | restart with fresh config
-            //   unchanged   | unchanged       | invalid       | KEEP OLD listener, retry
-            //   changed     | (any)           | (any)         | normal teardown + restart;
-            //   unchanged   | changed         | (any)         |   invalid TLS -> port closed
-            //                                                 |   + bind_failures visible
+            //   TLS sources | CRL       | backend routing | new TLS valid | action
+            //   ------------+-----------+-----------------+---------------+---------------------
+            //   unchanged   | unchanged | unchanged       | valid         | restart, fresh config
+            //   unchanged   | unchanged | unchanged       | invalid       | KEEP OLD, retry
+            //   changed     | (any)     | (any)           | (any)         | teardown + restart;
+            //   unchanged   | changed   | (any)           | (any)         |   invalid TLS -> port
+            //   unchanged   | unchanged | changed         | (any)         |   closed + visible in
+            //                                                             |   bind_failures
+            //
+            // A changed CRL never keeps the old listener: its cached verifier
+            // has the pre-rotation revocation list compiled in, and the reload
+            // has already published the new list to every other backend.
             //
             // Rationale for the fall-through rows: backend routing
             // (backend_host / backend_port / upstream) is read live per
@@ -3170,7 +3189,7 @@ impl StreamListenerManager {
             if !identity_changed && *scheme == BackendScheme::Tcps {
                 let content_only_rotation =
                     match (&handle.backend_tls_reload_key, backend_tls_reload_key) {
-                        (Some(old), Some(new)) => old.same_tls_sources(new),
+                        (Some(old), Some(new)) => old.may_keep_previous_listener(new),
                         _ => false,
                     };
                 let current_routing_key = find_proxy_by_identity(&current_config, identity)
@@ -4947,6 +4966,10 @@ mod tests {
             original.same_tls_sources(&rotated),
             "in-place rotation keeps the same source identity"
         );
+        assert!(
+            original.may_keep_previous_listener(&rotated),
+            "an invalid in-place rotation under an unchanged CRL may keep the old listener"
+        );
 
         // Source path change -> NOT a content-only rotation.
         let new_source = key(other_ca_path_str, vec![]).await;
@@ -4977,8 +5000,9 @@ mod tests {
             "removing a source must not count as an in-place rotation"
         );
 
-        // CRL content rotation -> key changes, but it IS a content-only
-        // rotation (same sources), so the keep-old path stays eligible.
+        // CRL content rotation -> key changes and the sources are the same,
+        // but the keep-old path is refused: the kept listener would go on
+        // verifying against the replaced revocation list.
         let crl_rotated = BackendTlsReloadKey {
             crl_fingerprint: Some("sha256:deadbeef".to_string()),
             ..original.clone()
@@ -4990,6 +5014,10 @@ mod tests {
         assert!(
             original.same_tls_sources(&crl_rotated),
             "a CRL content rotation keeps the same source identity"
+        );
+        assert!(
+            !original.may_keep_previous_listener(&crl_rotated),
+            "a CRL rotation must never keep the old listener's cached verifier"
         );
     }
 

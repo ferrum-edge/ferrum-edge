@@ -133,8 +133,11 @@ pub enum BackendTlsRefusalSurface {
     /// Mesh slice apply marked one upstream's backend TLS refused (counted once
     /// per refused upstream per apply).
     SliceApply,
-    /// The shared backend TLS client builder refused a build (proxy pools,
-    /// capability probes, TCP+TLS stream listeners, live-reload validation).
+    /// A backend TLS client build was refused: at a pool entry point (reqwest,
+    /// direct HTTP/2, gRPC, HTTP/3, WebSocket) before any pool, cache, or TLS
+    /// build queue work, or inside the shared builder (capability probes,
+    /// TCP+TLS stream listeners). Counted once per refused build attempt, so it
+    /// scales with traffic to refused destinations.
     ClientBuild,
     /// The backend DTLS builder refused a build.
     DtlsBuild,
@@ -184,6 +187,24 @@ pub fn record_backend_tls_refusal(surface: BackendTlsRefusalSurface) {
 /// Process-lifetime refusal count for `surface`.
 pub fn backend_tls_refusal_count(surface: BackendTlsRefusalSurface) -> u64 {
     BACKEND_TLS_REFUSALS[surface.index()].load(Ordering::Relaxed)
+}
+
+/// Refuse a destination whose backend TLS this node refused
+/// ([`BackendTlsConfig::tls_refused`]).
+///
+/// Pool entry points call this before their pool lookup, TLS config cache
+/// lookup, and TLS source executor admission, so a refused destination never
+/// takes a slot in the bounded build queue. It is one field read; only a
+/// refusal also bumps `ferrum_backend_tls_refusals_total{surface="client_build"}`.
+/// [`BackendTlsConfigBuilder::check_refusal`] runs the same check inside every
+/// build as a backstop.
+#[inline]
+pub fn refuse_backend_tls_if_refused(tls: &BackendTlsConfig) -> Result<(), TlsError> {
+    if tls.tls_refused {
+        record_backend_tls_refusal(BackendTlsRefusalSurface::ClientBuild);
+        return Err(TlsError::Refused);
+    }
+    Ok(())
 }
 
 /// Map a TLS source executor failure (admission/run deadline or unavailable
@@ -1502,11 +1523,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
     /// the global client cert/key pair, and `FERRUM_TLS_NO_VERIFY` never get a
     /// chance to stand in for the refused material.
     pub fn check_refusal(&self) -> Result<(), TlsError> {
-        if self.proxy.resolved_tls.tls_refused {
-            record_backend_tls_refusal(BackendTlsRefusalSurface::ClientBuild);
-            return Err(TlsError::Refused);
-        }
-        Ok(())
+        refuse_backend_tls_if_refused(&self.proxy.resolved_tls)
     }
 
     pub fn build_rustls(&self) -> Result<ClientConfig, TlsError> {

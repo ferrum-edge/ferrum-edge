@@ -311,3 +311,25 @@ fn process_families_render_both_tls_reason_buckets_and_the_retry_counter() {
     let (timeouts, errors) = data_path_metrics::frontend_tls_handshake_failures_total();
     assert!(timeouts >= 1 && errors >= 1);
 }
+
+#[test]
+fn process_families_render_every_backend_tls_reload_validation_kind() {
+    use ferrum_edge::data_path_metrics::BackendTlsReloadValidationFailure;
+    const FAMILY: &str = "ferrum_backend_tls_reload_validation_failures_total";
+
+    let kind = BackendTlsReloadValidationFailure::RouteDispatchRule;
+    let before = data_path_metrics::backend_tls_reload_validation_failures_total(kind);
+    data_path_metrics::record_backend_tls_reload_validation_failure(kind);
+    let after = data_path_metrics::backend_tls_reload_validation_failures_total(kind);
+    assert!(after > before, "the recorded failure is counted");
+
+    let mut out = String::new();
+    data_path_metrics::render_process_families(&mut out, NS_LABEL);
+
+    // Closed kind set: every bucket renders, even at zero.
+    assert_eq!(samples(&out, FAMILY).len(), 3);
+    for kind in ["proxy", "route_dispatch_rule", "route_dispatch_config"] {
+        let series = format!("{FAMILY}{{kind=\"{kind}\"{NS_LABEL}}}");
+        assert!(out.contains(&series), "missing {series}: {out}");
+    }
+}

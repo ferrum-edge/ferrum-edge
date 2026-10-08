@@ -2732,6 +2732,16 @@ impl HealthChecker {
     ) -> Option<Arc<reqwest::Client>> {
         // A refused destination carries no material but must still reach the
         // TLS-aware builder, which refuses it, instead of the default client.
+        //
+        // This refuses plaintext `http` probes too, while `grpc_probe` refuses
+        // only when `use_tls`. Each probe mirrors its own data path. An HTTP
+        // probe client is a reqwest client that always carries a TLS config,
+        // like the shared reqwest dispatch client, and `ConnectionPool::get_client`
+        // refuses a refused destination for `http` and `https` alike. A
+        // plaintext gRPC probe dials h2c with no TLS config at all, like the
+        // h2c gRPC data path, which `GrpcConnectionPool` does not refuse
+        // because no backend TLS material is involved. Change both probes
+        // together with their data paths, never one alone.
         let has_tls_config = tls_config.tls_refused
             || tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()

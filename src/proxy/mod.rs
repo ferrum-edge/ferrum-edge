@@ -7909,14 +7909,19 @@ impl<'a> BackendTlsValidationInputs<'a> {
 /// at a time.
 ///
 /// Never stops at the first failure: a destination whose material cannot build
-/// is warned and counted in [`BackendTlsValidationReport::failed`], and a
-/// refused destination is counted in [`BackendTlsValidationReport::refused`]
-/// without a build. Either way the remaining destinations are still validated,
-/// so a backend TLS live reload keeps reloading the others (issue #6105).
+/// is warned, counted in [`BackendTlsValidationReport::failed`], and recorded on
+/// `ferrum_backend_tls_reload_validation_failures_total{kind}`, and a refused
+/// destination is counted in [`BackendTlsValidationReport::refused`] without a
+/// build. Either way the remaining destinations are still validated, so a
+/// backend TLS live reload keeps reloading the others (issue #6105).
 pub fn validate_backend_tls_material_for_config(
     config: &GatewayConfig,
     inputs: BackendTlsValidationInputs<'_>,
 ) -> BackendTlsValidationReport {
+    use crate::data_path_metrics::{
+        BackendTlsReloadValidationFailure, record_backend_tls_reload_validation_failure,
+    };
+
     let mut report = BackendTlsValidationReport::default();
     for proxy in config
         .proxies
@@ -7931,6 +7936,9 @@ pub fn validate_backend_tls_material_for_config(
             Ok(_) => report.validated = report.validated.saturating_add(1),
             Err(error) => {
                 report.failed = report.failed.saturating_add(1);
+                record_backend_tls_reload_validation_failure(
+                    BackendTlsReloadValidationFailure::Proxy,
+                );
                 warn!(
                     proxy_id = %crate::startup::sanitize_startup_scalar(&proxy.id),
                     error = %crate::startup::sanitize_startup_cause(&error, &[]),
@@ -7954,6 +7962,9 @@ pub fn validate_backend_tls_material_for_config(
             Ok(dispatch_config) => dispatch_config,
             Err(error) => {
                 report.failed = report.failed.saturating_add(1);
+                record_backend_tls_reload_validation_failure(
+                    BackendTlsReloadValidationFailure::RouteDispatchConfig,
+                );
                 warn!(
                     plugin_id = %crate::startup::sanitize_startup_scalar(&plugin.id),
                     error = %crate::startup::sanitize_startup_cause(&error, &[]),
@@ -8001,6 +8012,9 @@ pub fn validate_backend_tls_material_for_config(
                 Ok(_) => report.validated = report.validated.saturating_add(1),
                 Err(error) => {
                     report.failed = report.failed.saturating_add(1);
+                    record_backend_tls_reload_validation_failure(
+                        BackendTlsReloadValidationFailure::RouteDispatchRule,
+                    );
                     warn!(
                         plugin_id = %crate::startup::sanitize_startup_scalar(&plugin.id),
                         rule = rule_idx,

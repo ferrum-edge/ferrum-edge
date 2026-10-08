@@ -1510,6 +1510,13 @@ impl GrpcConnectionPool {
         proxy: &Proxy,
         purpose: GrpcEstablishmentPurpose,
     ) -> Result<GrpcPooledSender, GrpcProxyError> {
+        // A refused destination's TLS fails before the pool lookup and the
+        // bounded TLS build queue; `get_tls_config` keeps the builder's own
+        // check as a backstop. Cleartext h2c carries no TLS and is unaffected.
+        if matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
+            crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
+                .map_err(grpc_backend_tls_config_error)?;
+        }
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -1734,6 +1741,12 @@ enum GrpcPhase1 {
     },
 }
 
+/// [`GrpcProxyError`] for a backend TLS config that could not be built,
+/// including a refused destination ([`TlsError::Refused`]).
+fn grpc_backend_tls_config_error(e: TlsError) -> GrpcProxyError {
+    GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
+}
+
 impl GrpcPoolManager {
     /// Cached backend rustls config for this proxy's TLS identity. A miss is
     /// built once on the bounded TLS source executor and shared by every
@@ -1760,9 +1773,7 @@ impl GrpcPoolManager {
                 }
             })
             .await
-            .map_err(|e| {
-                GrpcProxyError::Internal(format!("Failed to build backend TLS config: {}", e))
-            })
+            .map_err(grpc_backend_tls_config_error)
     }
 
     async fn create_connection(

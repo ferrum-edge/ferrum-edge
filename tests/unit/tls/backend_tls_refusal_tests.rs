@@ -11,13 +11,22 @@
 //! failing destination instead of stopping at it.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{BackendTlsConfig, GatewayConfig, Proxy, Upstream};
+use ferrum_edge::connection_pool::ConnectionPool;
+use ferrum_edge::data_path_metrics::{
+    BackendTlsReloadValidationFailure, backend_tls_reload_validation_failures_total,
+};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::health_check::build_probe_server_verifier_for_test;
+use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
+use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
 use ferrum_edge::proxy::{BackendTlsValidationInputs, validate_backend_tls_material_for_config};
 use ferrum_edge::tls::backend::{
     BackendTlsConfigBuilder, BackendTlsRefusalSurface, TlsError, backend_tls_config_cache_key,
-    backend_tls_refusal_count,
+    backend_tls_refusal_count, refuse_backend_tls_if_refused,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use tempfile::TempDir;
@@ -265,6 +274,8 @@ fn live_reload_validation_skips_a_failing_destination_and_validates_the_rest() {
         ..GatewayConfig::default()
     };
 
+    let failures_before =
+        backend_tls_reload_validation_failures_total(BackendTlsReloadValidationFailure::Proxy);
     let report = validate_backend_tls_material_for_config(
         &config,
         BackendTlsValidationInputs {
@@ -289,4 +300,113 @@ fn live_reload_validation_skips_a_failing_destination_and_validates_the_rest() {
         report.validated, 1,
         "the destination after the failure is still validated: {report:?}"
     );
+    // Process-global counter shared with other tests: assert monotonic growth.
+    assert!(
+        backend_tls_reload_validation_failures_total(BackendTlsReloadValidationFailure::Proxy)
+            > failures_before,
+        "the skipped destination is counted on the reload validation failure counter"
+    );
+}
+
+#[test]
+fn pool_entry_refusal_check_passes_ordinary_destinations_and_counts_refusals() {
+    assert!(refuse_backend_tls_if_refused(&BackendTlsConfig::default_verify()).is_ok());
+
+    let before = backend_tls_refusal_count(BackendTlsRefusalSurface::ClientBuild);
+    assert!(
+        matches!(
+            refuse_backend_tls_if_refused(&BackendTlsConfig::refused()),
+            Err(TlsError::Refused)
+        ),
+        "a refused destination fails at the pool entry point"
+    );
+    assert!(backend_tls_refusal_count(BackendTlsRefusalSurface::ClientBuild) > before);
+}
+
+fn dns_cache() -> DnsCache {
+    DnsCache::new(DnsConfig::default())
+}
+
+/// The direct HTTP/2 and gRPC pools resolve DNS before they build TLS. A
+/// refused destination with an unresolvable host must therefore fail with the
+/// refusal, not a DNS error: the refusal ran first, before any pool, cache, or
+/// TLS build queue work.
+#[tokio::test]
+async fn h2_and_grpc_pools_refuse_before_resolving_or_building() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut refused = refused_proxy("refused-pools");
+    refused.backend_host = "unresolvable.refusal.invalid".to_string();
+
+    let h2 = Http2ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let error = h2
+        .get_sender(&refused)
+        .await
+        .err()
+        .expect("a refused destination must not get an HTTP/2 sender");
+    assert!(
+        error.to_string().contains("refused"),
+        "direct HTTP/2 must refuse before DNS: {error}"
+    );
+    assert_eq!(h2.pool_size(), 0);
+
+    let grpc = GrpcConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let error = grpc
+        .get_sender(&refused)
+        .await
+        .err()
+        .expect("a refused destination must not get a gRPC sender");
+    assert!(
+        error.to_string().contains("refused"),
+        "gRPC over TLS must refuse before DNS: {error}"
+    );
+    assert_eq!(grpc.pool_size(), 0);
+}
+
+#[tokio::test]
+async fn reqwest_h3_and_websocket_entry_points_refuse_without_caching() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let refused = refused_proxy("refused-reqwest");
+
+    let error = pool
+        .get_client(&refused)
+        .await
+        .err()
+        .expect("a refused destination must not get a reqwest client");
+    assert!(error.to_string().contains("refused"), "got: {error}");
+    let error = pool
+        .get_tls_config_for_backend(&refused)
+        .await
+        .err()
+        .expect("a refused destination must not get an HTTP/3 TLS config");
+    assert!(error.to_string().contains("refused"), "got: {error}");
+    let error = pool
+        .get_websocket_tls_config_for_backend(&refused)
+        .await
+        .err()
+        .expect("a refused destination must not get a WebSocket TLS config");
+    assert!(error.to_string().contains("refused"), "got: {error}");
+
+    assert_eq!(pool.pool_gauges().0, 0, "no reqwest client is pooled");
+    assert!(pool.backend_tls_config_cache().is_empty());
+    assert!(pool.backend_websocket_tls_config_cache().is_empty());
+    assert!(pool.backend_reqwest_tls_config_cache().is_empty());
 }

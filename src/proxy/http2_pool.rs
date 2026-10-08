@@ -599,16 +599,7 @@ impl Http2PoolManager {
                 }
             })
             .await
-            .map_err(|e| {
-                let message = format!("Failed to build backend TLS config: {}", e);
-                let source = match e {
-                    TlsError::Io { source, .. } => Some(InternalSource::Io(source)),
-                    TlsError::Pem { .. } | TlsError::Rustls(_) | TlsError::Refused => {
-                        Some(InternalSource::Message(message.clone()))
-                    }
-                };
-                Http2PoolError::Internal { message, source }
-            })
+            .map_err(backend_tls_config_error)
     }
 }
 
@@ -1048,6 +1039,11 @@ impl Http2ConnectionPool {
         proxy: &Proxy,
         caller: PoolCreateCaller,
     ) -> Result<Http2Sender, Http2PoolError> {
+        // Every connection here is TLS. A refused destination fails before the
+        // pool lookup and the bounded TLS build queue; `get_tls_config` keeps
+        // the builder's own check as a backstop.
+        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
+            .map_err(backend_tls_config_error)?;
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -1547,16 +1543,7 @@ impl Http2PoolManager {
                 }
             })
             .await
-            .map_err(|e| {
-                let message = format!("Failed to build backend TLS config: {}", e);
-                let source = match e {
-                    TlsError::Io { source, .. } => Some(InternalSource::Io(source)),
-                    TlsError::Pem { .. } | TlsError::Rustls(_) | TlsError::Refused => {
-                        Some(InternalSource::Message(message.clone()))
-                    }
-                };
-                Http2PoolError::Internal { message, source }
-            })
+            .map_err(backend_tls_config_error)
     }
 
     async fn create_h1_connection(
@@ -1728,6 +1715,12 @@ impl Http2ConnectionPool {
         connect_timeout: Duration,
         fresh: bool,
     ) -> Result<Http1Checkout, Http2PoolError> {
+        // A refused destination's TLS lane fails before the idle set and the
+        // bounded TLS build queue. Its plaintext lane is unaffected.
+        if tls {
+            crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
+                .map_err(backend_tls_config_error)?;
+        }
         let manager = self.pool.manager();
         let svid_generation = if tls {
             manager.svid_generation_for_proxy(proxy)
@@ -2358,6 +2351,19 @@ impl std::fmt::Display for BackendUnavailableSource {
             Self::Shared(e) => write!(f, "{}", e),
         }
     }
+}
+
+/// [`Http2PoolError`] for a backend TLS config that could not be built,
+/// including a refused destination ([`TlsError::Refused`]).
+fn backend_tls_config_error(e: TlsError) -> Http2PoolError {
+    let message = format!("Failed to build backend TLS config: {}", e);
+    let source = match e {
+        TlsError::Io { source, .. } => Some(InternalSource::Io(source)),
+        TlsError::Pem { .. } | TlsError::Rustls(_) | TlsError::Refused => {
+            Some(InternalSource::Message(message.clone()))
+        }
+    };
+    Http2PoolError::Internal { message, source }
 }
 
 /// Typed source for `Http2PoolError::Internal`.
