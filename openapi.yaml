@@ -10720,7 +10720,7 @@ components:
         backend_read_timeout_ms:
           type: integer
           format: uint64
-          minimum: 1
+          minimum: 0
           maximum: 86400000
           default: 30000
           description: >-
@@ -31089,7 +31089,7 @@ components:
         grpc_max_decompressed_size_bytes:
           type: integer
           format: uint64
-          minimum: 0
+          minimum: 1
           maximum: 18446744073709551615
           description: >-
             Maximum decompressed gRPC protobuf payload size in bytes for both
