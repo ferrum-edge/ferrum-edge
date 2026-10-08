@@ -89,7 +89,10 @@ fn bedrock_scope_admits_the_runtime_endpoints_only() {
 #[test]
 fn china_partition_endpoints_are_official() {
     let scope = AmbientAwsEndpointScope::new(AwsService::Lambda, "cn-north-1");
-    assert!(permits(&scope, "https://lambda.cn-north-1.amazonaws.com.cn"));
+    assert!(permits(
+        &scope,
+        "https://lambda.cn-north-1.amazonaws.com.cn"
+    ));
     assert!(permits(
         &scope,
         "https://vpce-0abc.lambda.cn-north-1.vpce.amazonaws.com.cn"
@@ -132,10 +135,19 @@ fn an_ill_formed_pinned_region_matches_nothing() {
 fn any_region_scope_still_pins_the_service_and_region_shape() {
     let scope = AmbientAwsEndpointScope::any_region(AwsService::Lambda);
     assert_eq!(scope.service(), AwsService::Lambda);
-    assert!(permits(&scope, "https://lambda.ap-southeast-2.amazonaws.com"));
-    assert!(permits(&scope, "https://lambda-fips.us-gov-west-1.amazonaws.com"));
+    assert!(permits(
+        &scope,
+        "https://lambda.ap-southeast-2.amazonaws.com"
+    ));
+    assert!(permits(
+        &scope,
+        "https://lambda-fips.us-gov-west-1.amazonaws.com"
+    ));
     assert!(!permits(&scope, "https://lambda.evil.amazonaws.com"));
-    assert!(!permits(&scope, "https://bedrock-runtime.us-east-1.amazonaws.com"));
+    assert!(!permits(
+        &scope,
+        "https://bedrock-runtime.us-east-1.amazonaws.com"
+    ));
     assert!(!is_official_aws_service_host(
         "lambda.us-east-1.amazonaws.com",
         AwsService::BedrockRuntime,
