@@ -27280,30 +27280,36 @@ components:
               type: boolean
               default: true
               description: |
-                Accept MTOM/XOP multipart/related packaging. The gateway locates
-                the root part (by the `start` parameter, else the first part),
-                validates that part's envelope, and never reads or decodes
-                attachment payloads. Set false to declare that this route does
-                not accept MTOM at all; a SOAP-bearing multipart then returns
-                415. Package framing is STRICT because the parser decides which
-                bytes are the envelope: delimiter LINES are recognized only at
-                the body start or immediately after a CRLF with exact CRLF
-                framing and no transport padding (so a `--boundary` sequence in
-                a preamble, header value, attachment payload, or the envelope
-                itself is inert payload); exactly one close-delimiter is
-                required and the epilogue must not contain the boundary token;
-                part headers must be US-ASCII with no obsolete folding, must be
-                well-formed `token: value` pairs, and may carry at most one
-                Content-Type / Content-ID / Content-Transfer-Encoding each;
-                Content-ID values must be package-unique and nonblank, and with
-                `start` supplied exactly one part may match; and the root part
-                must declare a SOAP/XOP essence and must not declare a
-                re-encoding Content-Transfer-Encoding (anything other than
-                7bit/8bit/binary). The whole package is framed and every part
-                parsed before a root is selected, so no later ambiguity is
-                missed by an early return. Bounds are fail-closed (at most 64
-                parts; at most 8 KiB and 32 header lines per part; a ceiling on
-                boundary-shaped candidates per package). MUST NOT be explicitly
+                Accept MTOM/XOP multipart/related packaging. The root part is
+                the first part (when the `start` parameter is supplied it must
+                name that part); the gateway validates that part's envelope and
+                never reads or decodes attachment payloads. Set false to declare
+                that this route does not accept MTOM at all; a SOAP-bearing
+                multipart then returns 415. Package framing is STRICT because
+                the parser decides which bytes are the envelope: delimiter LINES
+                are recognized only at the body start or immediately after a
+                CRLF with exact CRLF framing and no transport padding, and the
+                `--boundary` token may appear nowhere else (a padded, LF-ended,
+                or `--boundaryX` line, a token opened by a bare LF or CR, or a
+                token mid-line in the preamble, a part, or the epilogue refuses
+                the package); exactly one close-delimiter is required; the
+                package Content-Type must not carry an RFC 2231 extended or
+                continuation form (`boundary*`, `type*0`, `start*`, ...) of
+                boundary/type/start; part headers must be US-ASCII with no
+                obsolete folding, must be well-formed `token: value` pairs, and
+                may carry at most one Content-Type / Content-ID /
+                Content-Transfer-Encoding each; Content-ID values must be
+                package-unique (ignoring ASCII case and a leading `cid:`) and
+                nonblank, while a Content-ID or `start` carrying `%`, `+`, or
+                embedded whitespace is refused (a percent-decoding backend
+                would resolve it to a different part); and the root part must
+                declare a SOAP/XOP essence and must not declare a re-encoding
+                Content-Transfer-Encoding (anything other than 7bit/8bit/binary).
+                The whole package is
+                framed and every part parsed before a root is selected, so no
+                later ambiguity is missed by an early return. Bounds are
+                fail-closed (at most 64 parts; at most 8 KiB and 32 header lines
+                per part). MUST NOT be explicitly
                 true when x509_signature.enabled is true — that pairing is
                 refused at admission, and XOP representations (multipart/related
                 and bare application/xop+xml) return 415 under an enabled
