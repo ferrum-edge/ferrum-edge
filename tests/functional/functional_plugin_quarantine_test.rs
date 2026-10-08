@@ -48,6 +48,10 @@ const MALFORMED_STDOUT_LOGGING: &str = r#"{"filtr":{}}"#;
 const PROXY_ID: &str = "quarantine-proxy";
 const LISTEN_PATH: &str = "/quarantine";
 const CONSUMER_ID: &str = "quarantine-consumer";
+/// A consumer whose `hmac_auth` credential makes every change to it escalate
+/// to an authoritative full reload: HMAC secrets are rehydrated only by a full
+/// load, while other consumer changes apply incrementally (issue #6060).
+const FULL_RELOAD_CONSUMER_ID: &str = "quarantine-full-reload-trigger";
 const KEY_AUTH_PLUGIN_ID: &str = "quarantine-key-auth";
 const STDOUT_PLUGIN_ID: &str = "quarantine-stdout-logging";
 
@@ -88,16 +92,17 @@ async fn store_plugin_config(pool: &Pool<Sqlite>, plugin_config_id: &str, config
     );
 }
 
-/// Seed a `consumer` change so the next poll escalates to an authoritative FULL
-/// reload (`IncrementalFullReloadRequired::for_consumer_changes`) instead of a
-/// point-loaded delta. A direct SQL row rewrite records no change of its own,
-/// and the full-reload path is the one issue #4624 is about.
+/// Seed a change to the `hmac_auth` trigger consumer so the next poll escalates
+/// to an authoritative FULL reload (`IncrementalFullReloadRequired`) instead of
+/// a point-loaded delta. A direct SQL row rewrite records no change of its own,
+/// and the full-reload path is the one issue #4624 is about. Requires
+/// [`provision_full_reload_trigger_consumer`].
 async fn seed_full_reload_change(pool: &Pool<Sqlite>) {
     sqlx::query(
         "INSERT INTO config_changes (namespace, resource_type, resource_id, operation, created_at) \
          VALUES ('ferrum', 'consumer', ?, 'upsert', ?)",
     )
-    .bind(CONSUMER_ID)
+    .bind(FULL_RELOAD_CONSUMER_ID)
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await
@@ -107,6 +112,38 @@ async fn seed_full_reload_change(pool: &Pool<Sqlite>) {
 // ============================================================================
 // Admin API helpers
 // ============================================================================
+
+/// Create the `hmac_auth` consumer that [`seed_full_reload_change`] targets.
+async fn provision_full_reload_trigger_consumer(gateway: &TestGateway) {
+    let client = reqwest::Client::new();
+    let auth = gateway.auth_header();
+    let response = client
+        .post(gateway.admin_url("/consumers"))
+        .header("Authorization", &auth)
+        .json(&json!({"id": FULL_RELOAD_CONSUMER_ID, "username": FULL_RELOAD_CONSUMER_ID}))
+        .send()
+        .await
+        .expect("create hmac_auth trigger consumer");
+    assert!(
+        response.status().is_success(),
+        "create hmac_auth trigger consumer failed: {}",
+        response.status()
+    );
+    let response = client
+        .put(gateway.admin_url(&format!(
+            "/consumers/{FULL_RELOAD_CONSUMER_ID}/credentials/hmac_auth"
+        )))
+        .header("Authorization", &auth)
+        .json(&json!([{"secret": "quarantine-full-reload-trigger-hmac-secret-0123456789"}]))
+        .send()
+        .await
+        .expect("add hmac_auth credential");
+    assert!(
+        response.status().is_success(),
+        "add hmac_auth credential failed: {}",
+        response.status()
+    );
+}
 
 /// Create the proxy, consumer + key credential, the attached `key_auth` row,
 /// and (optionally) a global `stdout_logging` row.
@@ -574,6 +611,7 @@ async fn hot_reload_preserves_fail_closed_plugin_and_quarantines_only_optional_r
         .expect("start gateway");
 
     provision_enforced_proxy(&gateway, backend_port, true).await;
+    provision_full_reload_trigger_consumer(&gateway).await;
     wait_for_proxy_status(&gateway, None, 401).await;
 
     assert_eq!(
