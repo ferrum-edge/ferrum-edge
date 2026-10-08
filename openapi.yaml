@@ -23289,7 +23289,7 @@ components:
               consumer_header_claim:
                 type: string
                 pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-                description: Per-provider override for X-Authenticated-Identity claim (falls back to global); a dot path with no empty segments
+                description: Per-provider override for X-Authenticated-Identity claim (falls back to global, then to this provider's effective consumer_identity_claim); a dot path with no empty segments
               claim_headers:
                 type: object
                 additionalProperties:
@@ -23442,7 +23442,7 @@ components:
         consumer_header_claim:
           type: string
           pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-          description: JWT claim for X-Authenticated-Identity header (default same as consumer_identity_claim); a dot path with no empty segments
+          description: JWT claim for X-Authenticated-Identity header (defaults to each provider's effective consumer_identity_claim); a dot path with no empty segments
         claim_headers:
           type: object
           additionalProperties:

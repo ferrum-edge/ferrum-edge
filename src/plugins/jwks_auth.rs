@@ -139,8 +139,8 @@ pub struct JwksAuth {
     /// JWT claim used as the external authenticated identity (default: `"sub"`).
     consumer_identity_claim: String,
     /// JWT claim value sent as `X-Authenticated-Identity` to the backend.
-    /// Defaults to `consumer_identity_claim` if not set separately.
-    consumer_header_claim: String,
+    /// When unset, each provider uses its effective identity claim.
+    consumer_header_claim: Option<String>,
     claim_headers: Vec<ClaimHeaderMapping>,
     claim_headers_separator: String,
     /// Complete gateway-owned destination set across the plugin-level mappings
@@ -509,8 +509,11 @@ impl JwksAuth {
             optional_claim_path(config_obj, "consumer_identity_claim", "sub")?;
         let global_require_exp = optional_bool(config_obj, "require_exp")?.unwrap_or(true);
         let consumer_header_claim = match config_obj.get("consumer_header_claim") {
-            Some(value) => parse_claim_path_value("consumer_header_claim", value, "jwks_auth")?,
-            None => consumer_identity_claim.clone(),
+            Some(value) => {
+                let claim = parse_claim_path_value("consumer_header_claim", value, "jwks_auth")?;
+                Some(claim)
+            }
+            None => None,
         };
         let claim_headers = parse_claim_headers(
             config_obj,
@@ -1090,7 +1093,8 @@ impl JwksAuth {
         let effective_header_claim = provider
             .consumer_header_claim
             .as_deref()
-            .unwrap_or(&self.consumer_header_claim);
+            .or(self.consumer_header_claim.as_deref())
+            .unwrap_or(effective_identity_claim);
 
         let identity = nonblank_identity(extract_claim_string(claims, effective_identity_claim));
         let header_value = if effective_header_claim == effective_identity_claim {

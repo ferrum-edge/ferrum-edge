@@ -2599,7 +2599,7 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim used as the external authenticated identity (default: `"sub"`) |
-| `consumer_header_claim` | String | Global JWT display claim for `X-Authenticated-Identity` (default: same as `consumer_identity_claim`) |
+| `consumer_header_claim` | String | Global JWT display claim for `X-Authenticated-Identity` (default: each provider's effective `consumer_identity_claim`, so a provider identity override also selects its display claim) |
 | `claim_headers` | Object | Global claim-to-header mappings used when the matched provider has no provider override |
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
