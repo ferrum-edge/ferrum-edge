@@ -2105,17 +2105,8 @@ impl LdapAuth {
         // A directory username is not a Consumer credential binding. Until
         // mappings can name the directory authority explicitly, keep the
         // verified principal external.
-        let consumer = None;
-
-        if let Some(ref consumer) = consumer {
-            debug!(
-                "ldap_auth: mapped LDAP user '{}' to consumer '{}'",
-                username, consumer.username
-            );
-        }
-
         VerifyOutcome::success(
-            consumer,
+            None,
             Some(username.to_string()),
             Some(username.to_string()),
         )

@@ -3992,8 +3992,7 @@ impl SoapWsSecurity {
             .attribute("ID")
             .or_else(|| assertion_node.attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
-        self.claim_saml_assertion(&issuer, assertion_id, name_id)
-            .await?;
+        self.claim_saml_assertion(&issuer, assertion_id, &name_id).await?;
 
         debug!("soap_ws_security: SAML assertion validated successfully");
         Ok(name_id)
