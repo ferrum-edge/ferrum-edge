@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A remaining fallback now logs its reason (for example
   `change-log batch over the cap`).
 
+### Security
+
+- **Update `quinn-proto` to 0.11.19** (issue #6113). The newer release counts
+  zero-length QUIC datagrams toward the receive-buffer bound. Ferrum's HTTP/3
+  frontend has QUIC DATAGRAM receive disabled.
+
 ### Changed
 
 - **Vendored h2 moves to 0.4.20** (issue #6062). `vendor/h2-0.4.20-ferrum-patched/`
