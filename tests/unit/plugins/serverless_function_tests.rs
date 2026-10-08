@@ -7069,10 +7069,7 @@ fn test_ambient_aws_credentials_refuse_a_region_outside_the_aws_partitions() {
             serving.contains(AMBIENT_OPT_IN),
             "region={region}, got: {serving}"
         );
-        assert!(
-            !serving.contains(region),
-            "region={region}, got: {serving}"
-        );
+        assert!(!serving.contains(region), "region={region}, got: {serving}");
     }
 
     // A partition without public endpoints is reachable only deliberately.
