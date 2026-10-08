@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.15] - 2026-10-08
 
 Release prepared on **2026-10-08 UTC** from main
-`97cf0066a07d94665234ee9ed373fb831a04441f`. Namespace isolation for Gateway API,
+`71fb4c4bd838b0bc8b80a7022201d713381f8571`. Namespace isolation for Gateway API,
 DestinationRule and Admin API TLS references, mesh CONNECT authorization,
 per-flavor route admission, external identity headers, plugin-config
 environment references, HTTP/3 CONNECT-UDP and WebSocket method policy, IPv6
@@ -58,8 +58,9 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   `admin` tokens are unaffected.
 - **BREAKING — HTTP/3 CONNECT-UDP tunnels are bounded per client**
   (issue #6098). Each RFC 9298 tunnel now also takes a per-client slot,
-  keyed on the resolved client IP with IPv6 sources grouped by `/64`, held for
-  the tunnel's lifetime and released when it closes. The new
+  keyed on the resolved client IP with IPv6 sources grouped by
+  `FERRUM_PER_IP_IPV6_PREFIX` (default `/64`; #6100), held for the tunnel's
+  lifetime and released when it closes. The new
   `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (default `32`, `0` disables)
   sits under the process-wide `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS`, so one
   client can no longer occupy every tunnel slot. Over the cap the request is

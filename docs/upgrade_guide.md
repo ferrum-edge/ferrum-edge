@@ -29,7 +29,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main
-`97cf0066a07d94665234ee9ed373fb831a04441f`. All previously released breaking
+`71fb4c4bd838b0bc8b80a7022201d713381f8571`. All previously released breaking
 identifiers and guidance below remain applicable. CP/DP must run the same
 build; the ConfigSync protocol revision stays `3`. 0.9.15 adds no core schema
 change; a changed baseline in any later release still requires a fresh
@@ -343,7 +343,7 @@ Enable per-pod host routes in the CNI (for example Cilium
 
 **CONNECT-UDP tunnels are bounded per client.** With
 `FERRUM_HTTP3_CONNECT_UDP_ENABLED=true`, a single resolved client (IPv4
-address, or IPv6 `/64`) may hold at most
+address, or IPv6 prefix of `FERRUM_PER_IP_IPV6_PREFIX`, default `/64`) may hold at most
 `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` concurrent tunnels (default
 `32`); further tunnels from that client receive `503`. If a legitimate client
 or a NAT/egress address in front of many clients needs more, raise the value
