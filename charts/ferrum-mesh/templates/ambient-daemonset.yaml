@@ -98,9 +98,10 @@
        host sysfs (`veth::discover_dedicated_veth_for_pod_ip`), never from the
        cgroup mount or a pod's own /proc or sysfs view. The setns placements and
        the cleanup still read cgroup.procs to find a live pod PID. The
-       node-agent DaemonSet needs neither hostPID nor SYS_ADMIN for any of this:
-       it publishes the registry from the API server and host cgroup tree and
-       never enters a pod netns. The tools-capable image is selected separately
+       node-agent DaemonSet needs neither hostPID nor SYS_ADMIN for any of this
+       (SYS_ADMIN only via the kernel 5.7 `dropCapSysAdmin=false` back-compat
+       grant): it publishes the registry from the API server and host cgroup
+       tree and never enters a pod netns. The tools-capable image is selected separately
        below (`-ebpf-tools` for the Ambient UDP lifecycle and NodeWaypoint UDP
        listeners, distroless `-ebpf` otherwise); do not conflate the two — they
        have different security contracts. */ -}}

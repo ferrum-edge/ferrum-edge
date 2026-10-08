@@ -1049,6 +1049,27 @@ def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
     print("mesh node-waypoint eBPF capabilities ok")
 
 
+def validate_node_waypoint_kernel57_sys_admin(results_dir: Path) -> None:
+    # Issue #6112: dropCapSysAdmin=false is the only remaining node-agent
+    # SYS_ADMIN grant (kernel 5.7.x BPF back-compat). Pin that it still works
+    # in node_waypoint mode and still renders no pod-scoped hostPID.
+    rendered = require_capture(
+        results_dir, "mesh-node-waypoint-kernel57-sys-admin.yaml"
+    ).read_text(encoding="utf-8")
+    node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    _unquoted_cap(node_agent, "SYS_ADMIN", "node-agent (dropCapSysAdmin=false)")
+    for cap in ("BPF", "NET_ADMIN", "PERFMON"):
+        _unquoted_cap(node_agent, cap, "node-agent (dropCapSysAdmin=false)")
+    forbid_text(
+        node_agent,
+        "hostPID:",
+        "node-agent hostPID granted",
+        "the kernel 5.7 dropCapSysAdmin=false grant adds SYS_ADMIN only; the "
+        "node-agent must still render no hostPID",
+    )
+    print("mesh node-waypoint kernel 5.7 SYS_ADMIN back-compat ok")
+
+
 def validate_udp_cleanup_upgrade(results_dir: Path) -> None:
     rendered = require_capture(
         results_dir, "udp-placement-pod-host-cleanup.yaml"
@@ -1131,6 +1152,7 @@ def main() -> int:
     validate_mapped_admin_and_probe_source(results_dir)
     validate_admin_env_override(results_dir)
     validate_node_waypoint_ebpf_caps(results_dir)
+    validate_node_waypoint_kernel57_sys_admin(results_dir)
     validate_udp_cleanup_upgrade(results_dir)
     validate_image_pull_secrets(results_dir)
     print("mesh production-readiness ok")

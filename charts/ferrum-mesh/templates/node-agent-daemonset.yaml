@@ -8,8 +8,10 @@
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $addPerfmon := true -}}
 {{- if hasKey $sec "addCapPerfmon" }}{{ $addPerfmon = get $sec "addCapPerfmon" }}{{ end -}}
-{{- $dropSysAdmin := false -}}
-{{- if hasKey $sec "dropCapSysAdmin" }}{{ $dropSysAdmin = get $sec "dropCapSysAdmin" }}{{ end -}}
+{{- /* Secure default: only an explicit dropCapSysAdmin=false grants SYS_ADMIN.
+       A missing or null key (or a nulled security block) keeps it dropped. */ -}}
+{{- $dropSysAdmin := true -}}
+{{- if and (hasKey $sec "dropCapSysAdmin") (kindIs "bool" (get $sec "dropCapSysAdmin")) }}{{ $dropSysAdmin = get $sec "dropCapSysAdmin" }}{{ end -}}
 {{- $caps := list "BPF" "NET_ADMIN" -}}
 {{- if $addPerfmon }}{{ $caps = append $caps "PERFMON" }}{{ end -}}
 {{- /* SYS_ADMIN is only the kernel < 5.8 BPF back-compat grant

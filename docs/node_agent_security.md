@@ -177,9 +177,9 @@ capability traces to a specific kernel API used by the code.
 
 | Capability | Required for | Kernel API | Code site |
 |---|---|---|---|
-| `CAP_BPF` | Loading BPF programs and creating BPF maps. Available on kernel **≥ 5.8** — split out of `CAP_SYS_ADMIN`. | `bpf(BPF_PROG_LOAD)`, `bpf(BPF_MAP_CREATE)`, `bpf(BPF_*_ELEM)` | `AyaEbpfBackend::load_programs` (aya `EbpfLoader`) in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); map updates in [`src/ebpf/maps.rs`](../src/ebpf/maps.rs) |
+| `CAP_BPF` | Loading BPF programs and creating BPF maps. Available on kernel **≥ 5.8** — split out of `CAP_SYS_ADMIN`. | `bpf(BPF_PROG_LOAD)`, `bpf(BPF_MAP_CREATE)`, `bpf(BPF_BTF_LOAD)`, `bpf(BPF_*_ELEM)` | `AyaEbpfBackend::load_programs` (aya `EbpfLoader`, including BTF load) in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); map updates in [`src/ebpf/maps.rs`](../src/ebpf/maps.rs) |
 | `CAP_NET_ADMIN` | Attaching BPF programs to cgroups (`BPF_PROG_ATTACH` for `BPF_CGROUP_INET_*`/`BPF_CGROUP_SOCK_OPS` types); attaching tc classifiers (incl. the opt-in `ferrum_tc_ingress_redirect` on node capture interfaces); managing host veth qdiscs; the Ferrum-owned `ip rule`/`ip route` policy route for redirect local delivery; binding the single `IP_TRANSPARENT` inbound capture listener (no other listener is transparent); iptables/ip6tables NAT rules on the fallback path. | `bpf(BPF_PROG_ATTACH)` for cgroup hooks; `tc` netlink (`RTM_NEWTFILTER`); `iptables-restore`/`ip6tables` syscalls. | `attach_cgroup`, `attach_tc`, `attach_sock_ops` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); `execute_iptables_commands` in [`src/modes/node_agent.rs`](../src/modes/node_agent.rs) |
-| `CAP_PERFMON` | Reading BPF program / map info from the kernel (BTF, prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)`, `bpf(BPF_BTF_LOAD)` | `aya::Ebpf::load` BTF resolution; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
+| `CAP_PERFMON` | Reading BPF program / map info from the kernel (prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. Loading BTF (`BPF_BTF_LOAD`) is gated by `CAP_BPF`, not `CAP_PERFMON`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)` | Program/map info queries; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
 | `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8** only. The chart drops `SYS_ADMIN` in every proxy mode, `node_waypoint` included (`nodeAgent.security.dropCapSysAdmin=true`, the default; set it `false` on kernels < 5.8). `node_waypoint` used to add it so veth discovery could `setns()` into pod network namespaces; veth resolution now reads only host route tables and host sysfs, and the operations `node_waypoint` adds (SOCK_OPS cgroup attach, the tc ingress redirect, sock_ops map pinning) need only `CAP_BPF` + `CAP_NET_ADMIN`, the same as `local_pod`'s cgroup/tc attach and orig-dst map pinning. | Older-kernel BPF operations. | Same as `CAP_BPF` / `CAP_PERFMON` |
 | `CAP_SYS_PTRACE` | NodeWaypoint ambient proxy only. With `hostPID: true`, Linux still applies `ptrace_may_access` checks to `/proc/{pid}/ns/net`; workloads running with different UIDs or dumpability can otherwise return `EACCES` before the proxy can enter the pod netns. This is not used for `PTRACE_ATTACH`. | `stat`/`open` of `/proc/{pid}/ns/net` for enrolled pod PIDs. | `netns_inode_for_cgroup` and `NetnsGuard::enter` in [`src/proxy/netns_capture.rs`](../src/proxy/netns_capture.rs) |
 
@@ -299,8 +299,8 @@ an `ip rule`, and an `ip route` in the host namespace, and still binds
 Treat a compromised proxy in this placement as able to rewrite host netfilter
 state, exactly as in the default placement.
 
-Dropping `hostPID` means the pod's own `/proc` view is unavailable, so interface
-resolution falls through to the host route table for **both** address families
+The host route table is the only interface resolver; no pod `/proc` or sysfs
+view is consulted. Resolution reads it for **both** address families
 (`/proc/net/route` and `/proc/net/ipv6_route`). That parsing is treated as
 hostile input: bounded reads, strict field decoding, and only an unambiguous
 `RTF_UP` host route (`/32` or `/128`), followed by a sysfs check that the device
@@ -636,9 +636,12 @@ levels and node-agent compatibility:
 - **`restricted`** — **incompatible**. Disallows `CAP_NET_ADMIN`,
   `hostNetwork`, and `runAsUser: 0`. The node agent needs
   all three. Do not label the namespace `pod-security.kubernetes.io/enforce: restricted`.
-- **`baseline`** — **partially compatible.** Baseline allows `CAP_NET_ADMIN`
-  and a configurable capability set but **disallows `hostNetwork`**.
-  The node-agent namespace cannot use baseline either.
+- **`baseline`** — **incompatible.** Baseline disallows `hostNetwork` and
+  permits only a fixed add-list of capabilities (`AUDIT_WRITE`, `CHOWN`,
+  `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `MKNOD`, `NET_BIND_SERVICE`,
+  `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID`, `SYS_CHROOT`), so it rejects
+  adding `NET_ADMIN`, `BPF`, and `PERFMON`. The node-agent namespace cannot
+  use baseline either.
 - **`privileged`** — compatible. This is what most operators end up with
   for any DaemonSet that touches the kernel.
 
