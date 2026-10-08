@@ -6221,8 +6221,8 @@ async fn test_malformed_supported_content_encoding_stays_in_fingerprint() {
 #[tokio::test]
 async fn test_brotli_large_window_encoding_is_refused_for_fingerprinting() {
     let plugin = make_plugin(json!({}));
-    let body = [0x11, 0x1e, 0, 0, 0, 0, 0, 0];
-    let mut ctx = body_ctx("POST", "/api/orders", &body);
+    let body: &'static [u8] = &[0x11, 0x1e, 0, 0, 0, 0, 0, 0];
+    let mut ctx = body_ctx("POST", "/api/orders", body);
     let mut headers = keyed_headers("large-window-br-key", "api.example", body.len());
     headers.insert("content-encoding".to_string(), "br".to_string());
 
