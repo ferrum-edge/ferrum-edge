@@ -974,8 +974,7 @@ fn every_admission_gating_plugin_marks_the_flavor_views_it_cannot_run_on() {
                 Some("p1"),
             )],
         );
-        let cache = PluginCache::new(&config)
-            .unwrap_or_else(|error| panic!("{row}: {error:?}"));
+        let cache = PluginCache::new(&config).unwrap_or_else(|error| panic!("{row}: {error:?}"));
         assert!(
             cache
                 .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http)

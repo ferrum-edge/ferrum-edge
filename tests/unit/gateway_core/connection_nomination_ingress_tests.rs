@@ -152,7 +152,10 @@ fn forwarding_fields_survive_their_own_nomination() {
         "x-forwarded-port",
         "cf-connecting-ip",
     ] {
-        assert!(headers.contains_key(name), "`{name}` must survive its nomination");
+        assert!(
+            headers.contains_key(name),
+            "`{name}` must survive its nomination"
+        );
     }
     assert!(!headers.contains_key("x-other"));
     assert!(
