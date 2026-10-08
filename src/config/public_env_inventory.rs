@@ -681,9 +681,13 @@ pub fn is_recognized_ferrum_setting(key: &str) -> bool {
     if crate::plugins::utils::plugin_secret_env::is_plugin_secret_env_name(key) {
         return true;
     }
-    // Preserve the documented dynamic transcript sink-secret namespace.
+    // Preserve the documented dynamic transcript sink-secret namespace, minus
+    // the external secret-source suffixes the startup resolver consumes.
     key.strip_prefix("FERRUM_TRANSCRIPT_SINK_SECRET_")
         .is_some_and(|name| {
+            if crate::plugins::utils::plugin_secret_env::has_external_secret_suffix(name) {
+                return false;
+            }
             let mut bytes = name.bytes();
             bytes
                 .next()

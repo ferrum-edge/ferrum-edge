@@ -509,6 +509,7 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         "LIGHTSTEP_TOKEN",
         "FERRUM_PLUGIN_SECRET_",
         "FERRUM_PLUGIN_SECRET_lowercase",
+        "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN_FILE",
     ] {
         for key in ["access_token_env", "accessTokenEnv"] {
             cases.push((

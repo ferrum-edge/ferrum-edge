@@ -37935,6 +37935,7 @@ components:
                       password_ref:
                         type: string
                         minLength: 1
+                        maxLength: 256
                         pattern: '\S'
               - anyOf:
                   - required: [clickhouse]
@@ -38099,6 +38100,7 @@ components:
               description: Optional ClickHouse HTTP Basic username. `null` is accepted and means unset.
             password_ref:
               type: [string, "null"]
+              maxLength: 256
               pattern: '^\s*(?:FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*)?\s*$'
               description: |
                 Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable

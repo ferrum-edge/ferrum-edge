@@ -6831,9 +6831,11 @@ config:
   providers:
     - name: openai
       provider_type: openai
-      api_key: ${OPENAI_API_KEY}
+      api_key: "sk-..."
       model_patterns: ["gpt-*"]
 ```
+
+`ai_federation` does **not** expand `${...}` references in `api_key`, so supply the literal credential as shown (unlike [`ai_stream_router`](#ai_stream_router), whose `api_key` accepts a whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference).
 
 With it enabled, `before_proxy` claims the streaming request, commits exactly one provider, and rewrites the routing decision through `RequestContext.route_override_*` so the **normal proxy dispatch path** relays the provider's SSE incrementally. On a proxy with backend-path policy, this hook runs in the deferred pass only after the effective target path is authorized; provider I/O still waits for finalized request egress after all final-body policy. Time to first token, client-disconnect cancellation, byte budgets, retained-response ceilings, and shutdown accounting all come from the shared streaming response machinery rather than a plugin-private relay; the plugin itself creates no queues, channels, or detached tasks.
 

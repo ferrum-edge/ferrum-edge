@@ -19,9 +19,14 @@
 //! The namespace is under `FERRUM_`, so startup external-secret resolution
 //! applies: `FERRUM_PLUGIN_SECRET_<NAME>_FILE` / `_VAULT` / `_AWS` / `_AZURE` /
 //! `_GCP` materialize `FERRUM_PLUGIN_SECRET_<NAME>` before any plugin reads it.
+//! Those suffixed source keys are therefore not themselves referenceable: a
+//! config must name the materialized base `<NAME>`, never the `_FILE` / `_VAULT`
+//! locator, which would send a path or locator string instead of the secret.
 //!
 //! Diagnostics never echo the referenced name or its value: a hostile config
 //! can put an arbitrary string in the reference field.
+
+use crate::secrets::EXTERNAL_SECRET_SUFFIXES;
 
 /// Prefix every plugin-config environment reference must carry.
 pub const PLUGIN_SECRET_ENV_PREFIX: &str = "FERRUM_PLUGIN_SECRET_";
@@ -29,9 +34,23 @@ pub const PLUGIN_SECRET_ENV_PREFIX: &str = "FERRUM_PLUGIN_SECRET_";
 /// Upper bound on a reference name, checked before any byte walk.
 pub const MAX_PLUGIN_SECRET_ENV_NAME_BYTES: usize = 256;
 
+/// True when `name` ends in one of the external secret-source suffixes
+/// (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`).
+///
+/// Startup secret resolution consumes those suffixed keys to materialize the
+/// base variable, so a reference must name the base, never the source key.
+pub fn has_external_secret_suffix(name: &str) -> bool {
+    EXTERNAL_SECRET_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(*suffix))
+}
+
 /// True when `name` is an admissible plugin-config environment reference.
 pub fn is_plugin_secret_env_name(name: &str) -> bool {
     if name.len() > MAX_PLUGIN_SECRET_ENV_NAME_BYTES {
+        return false;
+    }
+    if has_external_secret_suffix(name) {
         return false;
     }
     let Some(suffix) = name.strip_prefix(PLUGIN_SECRET_ENV_PREFIX) else {

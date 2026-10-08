@@ -189,6 +189,10 @@ fn transcript_sink_secret_namespace_has_canonical_inventory_surface() {
         ferrum_conf_assignment_keys(FERRUM_CONF).contains(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
         "ferrum.conf needs a `{TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV} = ...` template assignment"
     );
+    assert!(
+        !is_recognized_ferrum_setting("FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN_FILE"),
+        "settings-file parsing must refuse a secret-source suffix in the transcript namespace"
+    );
 }
 
 /// The dynamic plugin-config secret namespace likewise has no fixed key set.
@@ -233,6 +237,10 @@ fn plugin_secret_namespace_has_canonical_inventory_surface() {
     assert!(
         !is_recognized_ferrum_setting("FERRUM_PLUGIN_SECRET_lower"),
         "settings-file parsing must use the resolver's name grammar"
+    );
+    assert!(
+        !is_recognized_ferrum_setting("FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD_FILE"),
+        "settings-file parsing must refuse a secret-source suffix in the plugin namespace"
     );
 }
 

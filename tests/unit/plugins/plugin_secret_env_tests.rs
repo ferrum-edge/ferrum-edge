@@ -33,6 +33,14 @@ const REFUSED_NAMES: &[&str] = &[
     "FERRUM_PLUGIN_SECRET_lowercase",
     "FERRUM_PLUGIN_SECRET_HAS SPACE",
     "FERRUM_PLUGIN_SECRET_TRAILING-DASH",
+    // External secret-source suffixes are consumed by startup resolution to
+    // materialize the base variable; a config must reference the base, never
+    // the `_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` locator.
+    "FERRUM_PLUGIN_SECRET_DEMO_FILE",
+    "FERRUM_PLUGIN_SECRET_DEMO_VAULT",
+    "FERRUM_PLUGIN_SECRET_DEMO_AWS",
+    "FERRUM_PLUGIN_SECRET_DEMO_AZURE",
+    "FERRUM_PLUGIN_SECRET_DEMO_GCP",
 ];
 
 #[test]
@@ -57,6 +65,30 @@ fn namespace_admits_only_uppercase_plugin_secret_names() {
     }
     let oversized = format!("{PLUGIN_SECRET_ENV_PREFIX}{}", "A".repeat(256));
     assert!(!is_plugin_secret_env_name(&oversized));
+}
+
+/// The external secret-source suffixes the startup resolver consumes are not
+/// themselves admissible references: naming `FERRUM_PLUGIN_SECRET_X_FILE`
+/// would send the file path/locator, not the secret. The diagnostic must name
+/// the field and namespace without echoing the reference.
+#[test]
+fn namespace_refuses_external_secret_source_suffixes_without_echoing_them() {
+    for name in [
+        "FERRUM_PLUGIN_SECRET_DEMO_FILE",
+        "FERRUM_PLUGIN_SECRET_DEMO_VAULT",
+        "FERRUM_PLUGIN_SECRET_DEMO_AWS",
+        "FERRUM_PLUGIN_SECRET_DEMO_AZURE",
+        "FERRUM_PLUGIN_SECRET_DEMO_GCP",
+    ] {
+        assert!(!is_plugin_secret_env_name(name), "{name} must be refused");
+        let error = validate_plugin_secret_env_name("demo: `secret_ref`", name)
+            .expect_err("a source-suffix reference must be refused");
+        assert!(error.contains("demo: `secret_ref`"), "{error}");
+        assert!(error.contains("FERRUM_PLUGIN_SECRET_<NAME>"), "{error}");
+        assert!(!error.contains(name), "diagnostic echoed the reference: {error}");
+    }
+    // The materialized base name is the admitted reference.
+    assert!(is_plugin_secret_env_name("FERRUM_PLUGIN_SECRET_DEMO"));
 }
 
 #[test]

@@ -546,12 +546,21 @@ fn conf_file_recognizes_inventory_and_rejects_unknown_keys_without_values() {
         assert!(!error.contains("private-fixture-value"));
     }
     for suffix in ferrum_edge::secrets::EXTERNAL_SECRET_SUFFIXES {
-        let key = format!("FERRUM_ADMIN_HTTP_PORT{suffix}");
-        let error = ConfFile::parse(&format!("{key}=private-fixture-reference"))
-            .expect_err("suffix belongs in the environment");
-        assert!(error.contains(&key));
-        assert!(error.contains("environment-only"));
-        assert!(!error.contains("private-fixture-reference"));
+        // The fixed inventory and both dynamic secret namespaces reject the
+        // external secret-source suffixes in a settings file: resolution reads
+        // them from the environment only, and a config must name the base.
+        for base in [
+            "FERRUM_ADMIN_HTTP_PORT",
+            "FERRUM_PLUGIN_SECRET_CUSTOM_42",
+            "FERRUM_TRANSCRIPT_SINK_SECRET_CUSTOM_42",
+        ] {
+            let key = format!("{base}{suffix}");
+            let error = ConfFile::parse(&format!("{key}=private-fixture-reference"))
+                .expect_err("suffix belongs in the environment");
+            assert!(error.contains(&key), "{error}");
+            assert!(error.contains("environment-only"), "{error}");
+            assert!(!error.contains("private-fixture-reference"), "{error}");
+        }
     }
     for key in [
         "FERRUM_DNS_RESOLVER_HOSTS_FILE",
