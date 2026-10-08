@@ -268,12 +268,18 @@ where
 
     /// Closes the connection by transitioning to a GOAWAY state
     /// iff there are no streams or references
-    pub fn maybe_close_connection_if_no_streams(&mut self) {
+    ///
+    /// FERRUM PATCH (h2-004): returns whether streams or references were
+    /// held, from the same read that decided not to close, so the caller's
+    /// post-poll recheck cannot miss a last handle dropped after this read.
+    pub fn maybe_close_connection_if_no_streams(&mut self) -> bool {
         // If we poll() and realize that there are no streams or references
         // then we can close the connection by transitioning to GOAWAY
-        if !self.inner.streams.has_streams_or_other_references() {
+        let has_streams_or_refs = self.inner.streams.has_streams_or_other_references();
+        if !has_streams_or_refs {
             self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
         }
+        has_streams_or_refs
     }
 
     /// Checks if there are any streams

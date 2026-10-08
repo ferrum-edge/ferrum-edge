@@ -28,6 +28,7 @@ FERRUM_PATCHES = (
     "docs/upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch",
     "docs/upstream-h2-patches/002-runtime-data-frame-budget/h2-runtime-data-frame-budget.patch",
     "docs/upstream-h2-patches/003-assigned-send-capacity/h2-assigned-send-capacity.patch",
+    "docs/upstream-h2-patches/004-client-close-wakeup/h2-client-close-wakeup.patch",
 )
 VENDOR_MANIFEST = "vendor/VENDOR_INTEGRITY.sha256"
 VENDORED_H2 = 'h2 = { path = "' + FERRUM_VENDOR + '" }\n'

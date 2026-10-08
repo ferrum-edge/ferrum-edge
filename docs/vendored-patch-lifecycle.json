@@ -939,7 +939,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The runtime-budget patch must also retire before removing the vendored crate.",
+        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The runtime-budget, assigned-send-capacity and client close-wakeup patches must also retire before removing the vendored crate.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -1011,6 +1011,36 @@
         "vendor/h2-0.4.19-ferrum-patched (share::ferrum_assigned_capacity_tests)",
         "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests::a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer, a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer)",
         "tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs (vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads)"
+      ]
+    },
+    {
+      "id": "h2-004-client-close-wakeup",
+      "label": "h2 client connection closes when its last handle drops mid-poll",
+      "crate": "h2",
+      "vendored_version": "0.4.19",
+      "vendor_path": "vendor/h2-0.4.19-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/004-client-close-wakeup/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "The client Connection future read whether streams or handles were held twice per poll: once to decide the idle close and once for the post-poll recheck. A last SendRequest dropped between the two reads found no parked waker and was missed by both, so an idle client connection with no keepalive stayed open until the peer wrote or closed (#6052). The close decision and the recheck now share one read.",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "hyperium/h2",
+        "pr_number": 956,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "An h2 release containing hyperium/h2#956 (first released in h2 0.4.20) is adopted, or Ferrum stops using h2.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": "Upstream fixed the same race independently in hyperium/h2#956 (merged 2026-09-09, released in h2 0.4.20 on 2026-10-06) by taking the snapshot before the close check. h2 0.4.20 also contains hyperium/h2#965 (patch 002)."
+        }
+      },
+      "regression_tests": [
+        "vendor/h2-0.4.19-ferrum-patched (client::ferrum_client_close_wakeup_tests)"
       ]
     }
   ]

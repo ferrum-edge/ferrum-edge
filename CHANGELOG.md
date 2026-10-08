@@ -26,6 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second at 500 KiB and 1 MiB (Intel Xeon 6973P-C and AMD EPYC 7763) and was
   within noise at 10 KiB and 70 KiB.
 
+### Fixed
+
+- **An idle HTTP/2 client connection closes when its last handle drops
+  mid-poll** (issue #6052). The vendored h2 client `Connection` read whether
+  any stream or handle was still held twice per poll: once to decide whether
+  to close, and again for the recheck after polling. A last `SendRequest`
+  dropped between the two reads found no parked waker, so neither the drop
+  nor the poll woke the connection again. A hyper-driven backend HTTP/2
+  connection, which pings only while streams are open, could then keep its
+  socket and driver task (already evicted from the pool) until the peer wrote
+  or closed; the HBONE pool's default 30 s PING keepalive bounded it there to
+  about one interval. The close decision and the
+  recheck now use one read. Carried as vendored h2 patch
+  `h2-004-client-close-wakeup`
+  (`docs/upstream-h2-patches/004-client-close-wakeup/`) until Ferrum adopts
+  h2 0.4.20, which fixes the same race (hyperium/h2#956).
+
 ## [0.9.14] - 2026-10-07
 
 Release prepared on **2026-10-07 UTC** from main

@@ -724,11 +724,14 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # tracks the problem as hyperium/h2#902, with a frame-queue fix in PR
 # hyperium/h2#903.
 #
-# Retirement plan: retire both h2 patches before dropping the vendored crate.
-# An adopted h2 release must batch DATA frames into one write (hyperium/h2#903
-# or an equivalent) AND update the automatic DATA-frame budget with runtime
-# target window changes (hyperium/h2#965 or an equivalent). Alternatively,
-# Ferrum must stop using h2.
+# Retirement plan: retire all four h2 patches before dropping the vendored
+# crate. An adopted h2 release must batch DATA frames into one write
+# (hyperium/h2#903 or an equivalent), update the automatic DATA-frame budget
+# with runtime target window changes (hyperium/h2#965 or an equivalent),
+# expose a stream's assigned send window (h2 patch 003, or retire it with
+# Hyper patch 005), AND close an idle client connection whose last handle
+# drops mid-poll (hyperium/h2#956, h2 0.4.20). Alternatively, Ferrum must stop
+# using h2.
 # Then remove the `h2` line below (here, in `tests/performance/mesh/Cargo.toml`
 # and in `fuzz/Cargo.toml`), drop `vendor/h2-0.4.19-ferrum-patched/`, and update
 # the three lockfiles and the drift manifest. See
