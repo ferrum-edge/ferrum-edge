@@ -1423,11 +1423,221 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
     );
 }
 
+/// `POST /batch` and conditional restore persist a proxy-scoped plugin
+/// config's implied association with its `proxy_id` inside the same
+/// transaction on every backend (issue #4611). The runtime only applies a
+/// config the proxy lists, so a batched proxy-scoped auth plugin that SQL
+/// attaches but MongoDB does not would be silently unenforced on MongoDB.
+async fn assert_batch_proxy_scoped_plugin_association_parity(db: &dyn DatabaseBackend) {
+    use ferrum_edge::_test_support::{
+        AtomicBatchFault, AtomicBatchPhase, set_atomic_batch_fault_for_test,
+    };
+    use ferrum_edge::config::db_backend::{
+        AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
+        NamespaceConfigAdmissionLeaseRef,
+    };
+    use ferrum_edge::config::types::{PluginConfig, Proxy};
+
+    let namespace = format!("batch-assoc-{}", uuid::Uuid::new_v4());
+    let proxy = |id: &str, plugins: &[&str]| -> Proxy {
+        serde_json::from_value(json!({
+            "namespace": namespace,
+            "id": id,
+            "listen_path": format!("/{id}"),
+            "backend_scheme": "http",
+            "backend_host": "backend.internal",
+            "backend_port": 8080,
+            "plugins": plugins
+                .iter()
+                .map(|plugin| json!({ "plugin_config_id": plugin }))
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    };
+    let plugin = |id: &str, scope: &str, proxy_id: Option<&str>| -> PluginConfig {
+        serde_json::from_value(json!({
+            "namespace": namespace,
+            "id": id,
+            "plugin_name": "key_auth",
+            "config": {},
+            "scope": scope,
+            "proxy_id": proxy_id,
+        }))
+        .unwrap()
+    };
+    let associations = |proxy: Option<Proxy>| -> Vec<String> {
+        let mut ids: Vec<String> = proxy
+            .expect("proxy exists")
+            .plugins
+            .into_iter()
+            .map(|association| association.plugin_config_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let batch = |proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>| {
+        let namespace = namespace.as_str();
+        async move {
+            let graph = AtomicBatchGraph {
+                namespace,
+                consumers: &[],
+                upstreams: &[],
+                proxies: &proxies,
+                plugin_configs: &plugin_configs,
+                admission_lease: None,
+            };
+            db.batch_create_config_graph_atomically(&graph, &BatchConfigWriteMode::Admission)
+                .await
+        }
+    };
+
+    // The 2026-10-07 reproduction: a proxy listing only its group config plus
+    // a proxy-scoped config targeting it in the same graph. A proxy that
+    // already lists its own proxy-scoped config gains no duplicate.
+    batch(
+        vec![proxy("p6", &["group-b"]), proxy("p7", &["local-p7"])],
+        vec![
+            plugin("group-b", "proxy_group", None),
+            plugin("local-p6", "proxy", Some("p6")),
+            plugin("local-p7", "proxy", Some("p7")),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p6").await.unwrap()),
+        ["group-b", "local-p6"]
+    );
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p7").await.unwrap()),
+        ["local-p7"]
+    );
+
+    // Attaching to an existing proxy outside the graph also records that
+    // proxy's config change, so incremental polling republishes it.
+    let before = db.latest_change_sequence(&namespace).await.unwrap();
+    batch(Vec::new(), vec![plugin("late-p6", "proxy", Some("p6"))])
+        .await
+        .unwrap();
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p6").await.unwrap()),
+        ["group-b", "late-p6", "local-p6"]
+    );
+    let delta = db
+        .load_incremental_config(&namespace, before)
+        .await
+        .unwrap();
+    let republished = delta
+        .added_or_modified_proxies
+        .iter()
+        .find(|proxy| proxy.id == "p6")
+        .expect("the attached proxy is republished by incremental polling");
+    assert!(
+        republished
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == "late-p6")
+    );
+
+    // The per-family path used by non-conditional restore and import
+    // (`persist_payload_resources`) attaches the same way.
+    db.batch_create_plugin_configs(
+        &[plugin("family-p7", "proxy", Some("p7"))],
+        &BatchConfigWriteMode::Admission,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p7").await.unwrap()),
+        ["family-p7", "local-p7"]
+    );
+
+    // An abort at the final gate rolls the attachment back with the config.
+    set_atomic_batch_fault_for_test(
+        &namespace,
+        Some(AtomicBatchFault::new(AtomicBatchPhase::Commit, 0)),
+    );
+    let faulted = batch(Vec::new(), vec![plugin("faulted-p6", "proxy", Some("p6"))]).await;
+    set_atomic_batch_fault_for_test(&namespace, None);
+    assert!(faulted.is_err());
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p6").await.unwrap()),
+        ["group-b", "late-p6", "local-p6"]
+    );
+    assert!(
+        db.get_plugin_config(&namespace, "faulted-p6")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A proxy-scoped config naming a missing proxy fails the whole graph on
+    // every backend (SQL through the `proxy_plugins` foreign key).
+    assert!(
+        batch(Vec::new(), vec![plugin("orphan", "proxy", Some("missing"))])
+            .await
+            .is_err()
+    );
+    assert!(
+        db.get_plugin_config(&namespace, "orphan")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Conditional restore replays the same graph writer: a restored
+    // proxy-scoped config is attached even when the restored proxy omits it.
+    let expected = db
+        .load_conditional_namespace_snapshot(&namespace)
+        .await
+        .unwrap()
+        .digest()
+        .unwrap();
+    let owner = uuid::Uuid::new_v4().to_string();
+    let generation = db
+        .try_acquire_namespace_config_admission_lease(&namespace, &owner)
+        .await
+        .unwrap()
+        .unwrap();
+    let proxies = [proxy("p6", &[])];
+    let plugin_configs = [plugin("local-p6", "proxy", Some("p6"))];
+    let restore = ConditionalNamespaceRestore {
+        graph: AtomicBatchGraph {
+            namespace: &namespace,
+            consumers: &[],
+            upstreams: &[],
+            proxies: &proxies,
+            plugin_configs: &plugin_configs,
+            admission_lease: Some(NamespaceConfigAdmissionLeaseRef {
+                owner: &owner,
+                generation,
+            }),
+        },
+        expected,
+        api_specs: &[],
+        gateway_trust_bundles: None,
+    };
+    db.restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap();
+    assert_eq!(
+        associations(db.get_proxy(&namespace, "p6").await.unwrap()),
+        ["local-p6"]
+    );
+    assert!(db.get_proxy(&namespace, "p7").await.unwrap().is_none());
+    assert!(
+        db.release_namespace_config_admission_lease(&namespace, &owner)
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transaction() {
     let dir = TempDir::new().unwrap();
     let (db, url) = make_store_with_url(&dir).await;
     assert_transaction_precondition(db.as_ref()).await;
+    assert_batch_proxy_scoped_plugin_association_parity(db.as_ref()).await;
     assert_sql_deployment_raw_preservation(db.clone(), "sqlite", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
@@ -2411,6 +2621,7 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     .unwrap();
     db.run_migrations().await.unwrap();
     assert_transaction_precondition(&db).await;
+    assert_batch_proxy_scoped_plugin_association_parity(&db).await;
     let db = Arc::new(db);
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
@@ -2450,6 +2661,7 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
         .await
         .unwrap();
     assert_transaction_precondition(&db).await;
+    assert_batch_proxy_scoped_plugin_association_parity(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "postgres", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
@@ -2478,6 +2690,7 @@ async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
         .await
         .unwrap();
     assert_transaction_precondition(&db).await;
+    assert_batch_proxy_scoped_plugin_association_parity(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "mysql", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
