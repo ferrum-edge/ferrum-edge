@@ -1,11 +1,10 @@
 //! Tests for request_termination plugin
 
 use ferrum_edge::_test_support::{
-    normalize_reject_response, set_request_http_flavor_for_test,
-    set_request_wire_protocol_for_test,
+    normalize_reject_response, set_request_http_flavor_for_test, set_request_wire_protocol_for_test,
 };
-use ferrum_edge::config::types::HttpWireTransport;
 use ferrum_edge::HttpFlavor;
+use ferrum_edge::config::types::HttpWireTransport;
 use ferrum_edge::plugins::request_termination::{
     REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
 };

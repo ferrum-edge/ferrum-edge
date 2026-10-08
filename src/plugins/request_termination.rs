@@ -524,15 +524,17 @@ impl Plugin for RequestTermination {
             return PluginResult::Continue;
         }
 
-        // H2/H3 WebSocket Extended CONNECT treats a 2xx as tunnel establishment.
-        // Never reinterpret a canned ordinary body as WebSocket bytes.
+        // Classic CONNECT and H2/H3 WebSocket Extended CONNECT treat a 2xx as
+        // tunnel establishment. Never reinterpret a canned ordinary body as
+        // tunnel bytes — fail closed with a non-success rejection instead.
         let is_extended_connect_websocket =
             matches!(ctx.request_http_flavor(), HttpFlavor::WebSocket)
                 && matches!(
                     ctx.request_wire_transport(),
                     Some(HttpWireTransport::Http2 | HttpWireTransport::Http3)
                 );
-        let (status_code, body, content_type) = if is_extended_connect_websocket
+        let is_tunnel = ctx.method.eq_ignore_ascii_case("CONNECT") || is_extended_connect_websocket;
+        let (status_code, body, content_type) = if is_tunnel
             && (200..300).contains(&self.status_code)
         {
             (
