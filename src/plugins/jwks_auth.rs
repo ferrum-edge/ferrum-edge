@@ -1242,6 +1242,14 @@ impl JwksAuth {
         let Some(domain) = provider.dpop_replay_domain.as_ref() else {
             return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
         };
+        let Some(issuer) = extract_claim_string(claims, "iss") else {
+            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+        };
+        let Some(token_identity) = extract_claim_string(claims, "sub")
+            .or_else(|| extract_claim_string(claims, "client_id"))
+        else {
+            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+        };
         let Some(host) = ctx
             .headers
             .get("host")
@@ -1261,6 +1269,7 @@ impl JwksAuth {
             proof: &proof,
             access_token: token,
             access_token_claims: claims,
+            token_principal: &[issuer.as_bytes(), token_identity.as_bytes()],
             method: &ctx.method,
             htu: &htu,
             clock_skew: provider.dpop_clock_skew,

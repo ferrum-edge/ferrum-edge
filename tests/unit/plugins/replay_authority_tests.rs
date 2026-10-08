@@ -78,6 +78,41 @@ async fn process_lane_reserves_replay_capacity_for_other_principals() {
     );
 }
 
+#[tokio::test]
+async fn dpop_capacity_is_charged_to_token_principal_across_proof_keys() {
+    let policy = "dpop-token-principal-quota-regression";
+    let authority = process_authority(policy, 8);
+    let replay_domain = domain(policy);
+
+    for (jkt, jti) in [
+        (b"key-a".as_slice(), b"proof-1".as_slice()),
+        (b"key-b".as_slice(), b"proof-2".as_slice()),
+    ] {
+        let marker = replay_domain.marker_with_principal(
+            &[jkt, jti],
+            &[b"issuer", b"service-account"],
+        );
+        assert_eq!(authority.admit(&marker).await, ReplayAdmission::Admitted);
+    }
+    let over_quota = replay_domain.marker_with_principal(
+        &[b"key-c", b"proof-3"],
+        &[b"issuer", b"service-account"],
+    );
+    assert_eq!(
+        authority.admit(&over_quota).await,
+        ReplayAdmission::CapacityRefused
+    );
+
+    let other_principal = replay_domain.marker_with_principal(
+        &[b"key-d", b"proof-4"],
+        &[b"issuer", b"another-service-account"],
+    );
+    assert_eq!(
+        authority.admit(&other_principal).await,
+        ReplayAdmission::Admitted
+    );
+}
+
 /// The shared authority may admit only on Redis's exact successful `SET NX`
 /// reply. A RESP string with any other contents is semantically malformed and
 /// cannot prove that the marker was persisted.

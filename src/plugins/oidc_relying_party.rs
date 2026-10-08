@@ -2543,7 +2543,7 @@ impl OidcRelyingParty {
         name == self.session.cookie_name
             || name
                 .strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
-                .is_some_and(|suffix| suffix.starts_with('_'))
+                .is_some_and(is_derived_correlation_cookie_suffix)
     }
 
     fn correlation_cookie_name(&self, state: &str) -> String {
@@ -2577,11 +2577,7 @@ impl OidcRelyingParty {
             .filter_map(|segment| segment.trim().split_once('=').map(|(name, _)| name.trim()))
             .filter(|name| {
                 name.strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
-                    .is_some_and(|suffix| {
-                        suffix.len() == 65
-                            && suffix.starts_with('_')
-                            && suffix[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
+                    .is_some_and(is_derived_correlation_cookie_suffix)
             })
             .map(str::to_string)
             .collect()
@@ -3511,6 +3507,14 @@ fn derived_cookie_name(prefix: &str, context_seed: &[u8; 32]) -> String {
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(context_seed);
     let suffix: String = encoded.chars().take(12).collect();
     format!("{prefix}_{suffix}")
+}
+
+fn is_derived_correlation_cookie_suffix(suffix: &str) -> bool {
+    suffix.len() == 13
+        && suffix.starts_with('_')
+        && suffix[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn behavior_usize(
@@ -6266,7 +6270,7 @@ mod tests {
         );
         assert!(ctx.authenticated_identity_header.is_none());
         assert_eq!(
-            ctx.backend_consumer_username(),
+            ctx.backend_authenticated_identity(),
             Some(" accepted@example.com ")
         );
 

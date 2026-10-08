@@ -3226,9 +3226,7 @@ fn test_one_principal_cannot_consume_the_other_replay_capacity() {
 
     assert!(harness.claim_for_principal("a-1", "principal-a").is_ok());
     assert!(harness.claim_for_principal("a-2", "principal-a").is_ok());
-    assert!(harness
-        .claim_for_principal("a-3", "principal-a")
-        .is_err());
+    assert!(harness.claim_for_principal("a-3", "principal-a").is_err());
     assert!(harness.claim_for_principal("b-1", "principal-b").is_ok());
 }
 

@@ -1321,7 +1321,13 @@ fn unique_ldap_attribute_value(
 }
 
 fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String> {
-    const KNOWN_KEYS: [&str; 20] = [
+    if config.contains_key("consumer_mapping") {
+        return Err(
+            "ldap_auth: `consumer_mapping` was removed; see the upgrade guide".to_string(),
+        );
+    }
+
+    const KNOWN_KEYS: &[&str] = &[
         "ldap_url",
         "bind_dn_template",
         "search_base_dn",

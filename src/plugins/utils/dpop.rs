@@ -56,6 +56,10 @@ pub struct DpopVerifyInput<'a> {
     pub proof: &'a str,
     pub access_token: &'a str,
     pub access_token_claims: &'a Value,
+    /// Verified issuer and token subject/client identity used for the
+    /// per-principal capacity quota. This is separate from the proof key,
+    /// which clients may rotate across otherwise equivalent tokens.
+    pub token_principal: &'a [&'a [u8]],
     pub method: &'a str,
     pub htu: &'a str,
     pub clock_skew: Duration,
@@ -161,10 +165,13 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
 
     // Every cryptographic and claim check has passed. The marker binds the
     // provider's protection domain to the proof's key thumbprint and `jti`;
-    // neither the thumbprint nor the `jti` survives this call.
-    Ok(input
-        .domain
-        .marker(&[jkt.as_bytes(), claims.jti.as_bytes()]))
+    // capacity is charged to the verified token principal so key rotation
+    // cannot evade the per-principal quota. None of these values survive this
+    // call except as digests.
+    Ok(input.domain.marker_with_principal(
+        &[jkt.as_bytes(), claims.jti.as_bytes()],
+        input.token_principal,
+    ))
 }
 
 pub fn canonical_htu(scheme: &str, host: &str, path: &str) -> Option<String> {

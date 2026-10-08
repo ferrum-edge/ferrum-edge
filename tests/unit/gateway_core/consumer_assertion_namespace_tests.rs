@@ -137,9 +137,9 @@ fn ingress_materialization_drops_every_client_consumer_assertion() {
 }
 
 #[test]
-fn raw_grpc_merge_base_drops_client_consumer_namespace_but_keeps_gateway_username() {
+fn raw_grpc_merge_base_forwards_unmapped_external_identity_without_consumer_username() {
     // Native gRPC / direct-H2 / mesh replay use the raw inbound map as their
-    // merge base; the materialized view carries only the gateway assertion.
+    // merge base; unmapped identities remain in the dedicated gateway header.
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/grpc".parse().unwrap());
     headers.insert("x-consumer-role", "admin".parse().unwrap());
@@ -149,22 +149,13 @@ fn raw_grpc_merge_base_drops_client_consumer_namespace_but_keeps_gateway_usernam
     headers.insert("x-authenticated-identity", "forged".parse().unwrap());
     let mut proxy_headers = HashMap::new();
     proxy_headers.insert("content-type".to_string(), "application/grpc".to_string());
-    proxy_headers.insert("x-consumer-username".to_string(), "alice".to_string());
     proxy_headers.insert("x-authenticated-identity".to_string(), "alice".to_string());
 
     merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
 
     assert!(headers.get("x-consumer-role").is_none());
     assert!(headers.get("x-consumer-groups").is_none());
-    assert_eq!(
-        headers
-            .get_all("x-consumer-username")
-            .iter()
-            .map(|value| value.to_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["alice"],
-        "only the gateway-asserted username may reach the backend"
-    );
+    assert!(headers.get("x-consumer-username").is_none());
     assert_eq!(
         headers.get("content-type").and_then(|v| v.to_str().ok()),
         Some("application/grpc")

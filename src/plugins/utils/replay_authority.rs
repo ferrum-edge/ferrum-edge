@@ -112,6 +112,11 @@
 //! server that cannot prove `maxmemory == 0` or `maxmemory_policy == noeviction`,
 //! so `SET … NX EX` cannot silently recreate a still-live marker after Redis
 //! evicted it. Durability and failover remain operator-owned.
+//!
+//! Process lanes enforce a one-quarter per-principal share of the configured
+//! marker ceiling. Shared Redis scopes do not have per-principal quotas: one
+//! principal can still fill a shared store and make claims fail closed for
+//! everyone under `maxmemory`/`noeviction`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -313,11 +318,23 @@ impl ReplayDomain {
 
     /// Derive the marker for one proof identity inside this domain.
     ///
-    /// `parts` are the credential-adjacent components that identify the proof
-    /// (for DPoP the JWK thumbprint and the `jti`; for HMAC v2 the consumer
-    /// identity and the client nonce). They are consumed here and never
-    /// retained: only the resulting digest leaves this function.
+    /// `parts` are the components that identify the proof (for DPoP the JWK
+    /// thumbprint and the `jti`; for HMAC v2 the consumer identity and client
+    /// nonce). They are consumed here and never retained: only the resulting
+    /// digest leaves this function.
     pub fn marker(&self, parts: &[&[u8]]) -> ReplayMarker {
+        let principal = parts.first().copied().unwrap_or_default();
+        self.marker_with_principal(parts, &[principal])
+    }
+
+    /// Derive a proof marker while assigning its capacity quota to an explicit
+    /// verified principal. DPoP uses this so changing proof keys cannot mint
+    /// fresh per-principal replay capacity for the same token holder.
+    pub fn marker_with_principal(
+        &self,
+        parts: &[&[u8]],
+        principal_parts: &[&[u8]],
+    ) -> ReplayMarker {
         let mut hasher = PartitionHasher::new("ferrum-edge/replay-authority/marker/v1");
         hasher.nested("marker.domain", &self.digest);
         hasher.count("marker.parts", parts.len());
@@ -326,7 +343,10 @@ impl ReplayDomain {
         }
         let mut principal_hasher =
             PartitionHasher::new("ferrum-edge/replay-authority/principal/v1");
-        principal_hasher.field("principal", parts.first().copied().unwrap_or_default());
+        principal_hasher.count("principal.parts", principal_parts.len());
+        for part in principal_parts {
+            principal_hasher.field("principal.part", part);
+        }
         ReplayMarker {
             digest: hasher.digest(),
             principal_digest: principal_hasher.digest(),
