@@ -5382,6 +5382,7 @@ async fn handle_h3_request(
         .keys()
         .any(|k| crate::proxy::headers::is_gateway_assertion_header(k));
     if ctx.backend_consumer_username().is_some()
+        || ctx.backend_authenticated_identity().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion
     {

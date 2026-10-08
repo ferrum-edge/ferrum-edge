@@ -136,11 +136,11 @@ pub struct JwksAuth {
     global_scope_claim: String,
     /// Global default: JWT claim path containing roles (default: `"roles"`).
     global_role_claim: String,
-    /// JWT claim used for ConsumerIndex lookup and rate-limit key (default: `"sub"`).
+    /// JWT claim used as the external authenticated identity (default: `"sub"`).
     consumer_identity_claim: String,
-    /// JWT claim value sent as `X-Consumer-Username` header to the backend.
-    /// Defaults to `consumer_identity_claim` if not set separately.
-    consumer_header_claim: String,
+    /// JWT claim value sent as `X-Authenticated-Identity` to the backend.
+    /// When unset, each provider uses its effective identity claim.
+    consumer_header_claim: Option<String>,
     claim_headers: Vec<ClaimHeaderMapping>,
     claim_headers_separator: String,
     /// Complete gateway-owned destination set across the plugin-level mappings
@@ -509,8 +509,11 @@ impl JwksAuth {
             optional_claim_path(config_obj, "consumer_identity_claim", "sub")?;
         let global_require_exp = optional_bool(config_obj, "require_exp")?.unwrap_or(true);
         let consumer_header_claim = match config_obj.get("consumer_header_claim") {
-            Some(value) => parse_claim_path_value("consumer_header_claim", value, "jwks_auth")?,
-            None => consumer_identity_claim.clone(),
+            Some(value) => {
+                let claim = parse_claim_path_value("consumer_header_claim", value, "jwks_auth")?;
+                Some(claim)
+            }
+            None => None,
         };
         let claim_headers = parse_claim_headers(
             config_obj,
@@ -1081,7 +1084,7 @@ impl JwksAuth {
         &self,
         claims: &Value,
         provider: &JwksProvider,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
         let effective_identity_claim = provider
             .consumer_identity_claim
@@ -1090,7 +1093,8 @@ impl JwksAuth {
         let effective_header_claim = provider
             .consumer_header_claim
             .as_deref()
-            .unwrap_or(&self.consumer_header_claim);
+            .or(self.consumer_header_claim.as_deref())
+            .unwrap_or(effective_identity_claim);
 
         let identity = nonblank_identity(extract_claim_string(claims, effective_identity_claim));
         let header_value = if effective_header_claim == effective_identity_claim {
@@ -1099,29 +1103,16 @@ impl JwksAuth {
             extract_claim_string_exact(claims, effective_header_claim).or_else(|| identity.clone())
         };
 
-        let consumer = if let Some(ref id) = identity {
-            match consumer_index.find_by_identity(id) {
-                Some(consumer) => {
-                    debug!(
-                        "jwks_auth: identified consumer '{}' via configured identity claim",
-                        consumer.username
-                    );
-                    Some(consumer)
-                }
-                None => {
-                    debug!(
-                        "jwks_auth: no consumer mapping found for configured identity claim — using external principal"
-                    );
-                    None
-                }
-            }
-        } else {
+        if identity.is_none() {
             warn!(
                 "jwks_auth: token valid but claim '{}' not present",
                 effective_identity_claim
             );
-            None
-        };
+        }
+
+        // External claims are scoped to the provider that verified them. The
+        // process-wide Consumer username index is not a provider mapping.
+        let consumer = None;
 
         VerifyOutcome::success(consumer, identity, header_value)
             .with_credential_deadline(credential_deadline_from_claims(claims, 0))
@@ -1255,6 +1246,14 @@ impl JwksAuth {
         let Some(domain) = provider.dpop_replay_domain.as_ref() else {
             return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
         };
+        let Some(issuer) = extract_claim_string(claims, "iss") else {
+            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+        };
+        let Some(token_identity) = extract_claim_string(claims, "sub")
+            .or_else(|| extract_claim_string(claims, "client_id"))
+        else {
+            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+        };
         let Some(host) = ctx
             .headers
             .get("host")
@@ -1274,6 +1273,7 @@ impl JwksAuth {
             proof: &proof,
             access_token: token,
             access_token_claims: claims,
+            token_principal: &[issuer.as_bytes(), token_identity.as_bytes()],
             method: &ctx.method,
             htu: &htu,
             clock_skew: provider.dpop_clock_skew,

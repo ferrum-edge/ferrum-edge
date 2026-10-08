@@ -444,7 +444,7 @@ fn test_cache_ttl_config() {
 }
 
 #[test]
-fn test_consumer_mapping_disabled() {
+fn test_consumer_mapping_flag_is_rejected() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -454,7 +454,7 @@ fn test_consumer_mapping_disabled() {
         }),
         http_client(),
     );
-    assert!(plugin.is_ok());
+    assert!(plugin.is_err());
 }
 
 #[test]
@@ -1188,7 +1188,6 @@ async fn test_direct_bind_dials_fresh_screened_ipv4_answer() {
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
             "canonical_identity_attribute": "uid",
             "allow_plaintext": true,
-            "consumer_mapping": false
         }),
         http_client_with_dns(dns.addr, production_egress_policy(), None),
     )
@@ -1219,7 +1218,6 @@ async fn test_direct_bind_dials_fresh_screened_ipv6_answer() {
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
             "canonical_identity_attribute": "uid",
             "allow_plaintext": true,
-            "consumer_mapping": false
         }),
         http_client_with_dns(dns.addr, production_egress_policy(), None),
     )
@@ -1556,7 +1554,6 @@ async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
             "ldap_url": format!("ldaps://directory.test:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
             "canonical_identity_attribute": "uid",
-            "consumer_mapping": false,
             "connect_timeout_seconds": 2
         }),
         http_client_with_dns(
@@ -1740,7 +1737,6 @@ async fn test_search_bind_uses_canonical_entry_identity() {
             "canonical_identity_attribute": "uid",
             "service_account_dn": "cn=admin,dc=example,dc=com",
             "service_account_password": "service-secret",
-            "consumer_mapping": false
         }),
         http_client(),
     )
@@ -1815,7 +1811,6 @@ async fn test_direct_bind_login_variants_share_one_canonical_identity() {
             "ldap_url": format!("ldap://127.0.0.1:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
             "canonical_identity_attribute": "uid",
-            "consumer_mapping": false
         }),
         http_client(),
     )
@@ -1908,7 +1903,6 @@ async fn test_direct_bind_without_a_canonical_value_fails_closed() {
             "ldap_url": format!("ldap://127.0.0.1:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
             "canonical_identity_attribute": "uid",
-            "consumer_mapping": false
         }),
         http_client(),
     )
@@ -2118,7 +2112,6 @@ async fn assert_search_bind_group_checks_use_canonical_identity(
         "service_account_password": "service-secret",
         "group_base_dn": "ou=groups,dc=example,dc=com",
         "required_groups": ["gateway-admins"],
-        "consumer_mapping": false
     });
     if let Some(group_filter) = custom_group_filter {
         config["group_filter"] = json!(group_filter);
@@ -2584,7 +2577,6 @@ fn test_full_ad_config() {
             "group_attribute": "cn",
             "cache_ttl_seconds": 300,
             "connect_timeout_seconds": 3,
-            "consumer_mapping": true
         }),
         http_client(),
     );
@@ -3089,7 +3081,6 @@ async fn test_service_account_bind_carries_the_configured_password_verbatim() {
         "canonical_identity_attribute": "uid",
         "service_account_dn": "cn=admin,dc=example,dc=com",
         "service_account_password": "  padded-secret  ",
-        "consumer_mapping": false
     });
     let plugin = LdapAuth::new(&config, http_client()).expect("valid search-bind config");
     let mut ctx = make_ctx();
@@ -3165,7 +3156,6 @@ async fn assert_dn_fallback_group_result(
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_attribute": "sAMAccountName",
             "required_groups": [required_group],
-            "consumer_mapping": false
         }),
         http_client(),
     )

@@ -1798,7 +1798,7 @@ keeps unauthenticated requests eligible for an immediate `401` without body
 collection while still making the bounded body available to OPA's `authorize`
 callback on HTTP/1.1, HTTP/2, and HTTP/3.
 
-After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. The whole `x-consumer-*` request-header namespace is gateway-owned: client-supplied names beneath it are dropped when headers are materialized, before any plugin runs, and plugin-authored names beneath it are scrubbed from the outbound map before these two are written back, on every protocol path. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
+After all plugin phases complete, the gateway injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) only for a mapped Consumer. Unmapped external identities use the gateway-owned `X-Authenticated-Identity` header. The whole `x-consumer-*` request-header namespace and `x-authenticated-identity` are gateway-owned: client-supplied values are dropped when headers are materialized, before any plugin runs, and plugin-authored values are scrubbed from the outbound map before verified identity assertions are written back, on every protocol path.
 
 ### Rate limiting runs after auth (priority 2900)
 

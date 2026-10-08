@@ -897,11 +897,7 @@ fn test_identity_collision_same_username() {
     let c2 = make_consumer_with_jwt("c2", "shared-name");
     let index = ConsumerIndex::new(&[c1, c2]);
 
-    let found = index.find_by_identity("shared-name").unwrap();
-    assert_eq!(
-        found.id, "c2",
-        "Last consumer with colliding username wins in identity index"
-    );
+    assert!(index.find_by_identity("shared-name").is_none());
     // Each consumer's id is still unique in the identity index
     assert_eq!(index.find_by_identity("c1").unwrap().id, "c1");
     assert_eq!(index.find_by_identity("c2").unwrap().id, "c2");
@@ -914,11 +910,7 @@ fn test_custom_id_collision_across_consumers() {
     let c2 = make_consumer("c2", "bob", Some("key-b"), Some("shared-custom"));
     let index = ConsumerIndex::new(&[c1, c2]);
 
-    let found = index.find_by_identity("shared-custom").unwrap();
-    assert_eq!(
-        found.id, "c2",
-        "Last consumer with colliding custom_id wins"
-    );
+    assert!(index.find_by_identity("shared-custom").is_none());
     // Original consumers still accessible by their unique IDs
     assert_eq!(index.find_by_identity("c1").unwrap().id, "c1");
     assert_eq!(index.find_by_identity("c2").unwrap().id, "c2");
@@ -958,7 +950,7 @@ fn test_apply_delta_remove_collision_winner_restores_shadowed_consumer() {
 
     assert_eq!(index.find_by_api_key("shared-key").unwrap().id, "c2");
     assert_eq!(index.find_by_username("shared-user").unwrap().id, "c2");
-    assert_eq!(index.find_by_identity("shared-custom").unwrap().id, "c2");
+    assert!(index.find_by_identity("shared-custom").is_none());
     assert_eq!(index.find_by_mtls_identity("CN=shared").unwrap().id, "c2");
 
     index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c2")], &[]);

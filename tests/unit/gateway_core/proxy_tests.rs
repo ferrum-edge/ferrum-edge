@@ -3354,7 +3354,7 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
 }
 
 #[test]
-fn test_request_context_backend_consumer_username_prefers_consumer_then_header_then_identity() {
+fn test_request_context_separates_consumer_username_from_external_identity() {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -3363,13 +3363,18 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
     assert_eq!(ctx.backend_consumer_username(), None);
 
     ctx.authenticated_identity = Some("external-user".to_string());
-    assert_eq!(ctx.backend_consumer_username(), Some("external-user"));
+    assert_eq!(ctx.backend_consumer_username(), None);
+    assert_eq!(ctx.backend_authenticated_identity(), Some("external-user"));
 
     ctx.authenticated_identity_header = Some("user@example.com".to_string());
-    assert_eq!(ctx.backend_consumer_username(), Some("user@example.com"));
+    assert_eq!(ctx.backend_consumer_username(), None);
+    assert_eq!(
+        ctx.backend_authenticated_identity(),
+        Some("user@example.com")
+    );
 
     ctx.authenticated_identity_header = Some("   ".to_string());
-    assert_eq!(ctx.backend_consumer_username(), Some("external-user"));
+    assert_eq!(ctx.backend_authenticated_identity(), Some("external-user"));
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
         labels: Default::default(),
@@ -3383,6 +3388,7 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
         updated_at: Utc::now(),
     }));
     assert_eq!(ctx.backend_consumer_username(), Some("mapped-consumer"));
+    assert_eq!(ctx.backend_authenticated_identity(), None);
     assert_eq!(ctx.backend_consumer_custom_id(), Some("custom-123"));
 }
 

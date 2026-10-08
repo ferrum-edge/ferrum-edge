@@ -104,7 +104,8 @@ define_header_name_set! {
 }
 
 /// Returns `true` for the gateway-owned consumer assertion namespace
-/// (`x-consumer-*`, ASCII case-insensitive, `_` equivalent to `-`).
+/// (`x-consumer-*`, ASCII case-insensitive, `_` equivalent to `-`) and for
+/// `x-authenticated-identity`.
 ///
 /// This is the single source of truth for the namespace. Every name under the
 /// prefix is gateway-owned: a client-supplied `X-Consumer-Role` or
@@ -122,12 +123,13 @@ define_header_name_set! {
 /// `HTTP_X_CONSUMER_*` variable, so an underscore spelling would otherwise
 /// reach the backend as the gateway's assertion.
 ///
-/// Allocation-free: one bounded 11-byte compare that folds ASCII case and
-/// normalises `_` to `-`, so it is safe to call per header on the hot path
-/// with lowercase or mixed-case names.
+/// Allocation-free: one bounded compare that folds ASCII case and normalises
+/// `_` to `-`, so it is safe to call per header on the hot path with lowercase
+/// or mixed-case names.
 #[inline]
 pub fn is_consumer_assertion_header(name: &str) -> bool {
-    has_backend_folded_prefix(name, b"x-consumer-")
+    field_names_equivalent_for_backends(name, "x-authenticated-identity")
+        || has_backend_folded_prefix(name, b"x-consumer-")
 }
 
 /// Returns `true` for the gateway's route path-param captures

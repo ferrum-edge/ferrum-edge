@@ -112,6 +112,11 @@
 //! server that cannot prove `maxmemory == 0` or `maxmemory_policy == noeviction`,
 //! so `SET … NX EX` cannot silently recreate a still-live marker after Redis
 //! evicted it. Durability and failover remain operator-owned.
+//!
+//! Process lanes enforce a one-quarter per-principal share of the configured
+//! marker ceiling. Shared Redis scopes do not have per-principal quotas: one
+//! principal can still fill a shared store and make claims fail closed for
+//! everyone under `maxmemory`/`noeviction`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -313,19 +318,43 @@ impl ReplayDomain {
 
     /// Derive the marker for one proof identity inside this domain.
     ///
-    /// `parts` are the credential-adjacent components that identify the proof
-    /// (for DPoP the JWK thumbprint and the `jti`; for HMAC v2 the consumer
-    /// identity and the client nonce). They are consumed here and never
-    /// retained: only the resulting digest leaves this function.
+    /// `parts` are the components that identify the proof (for DPoP the JWK
+    /// thumbprint and the `jti`; for HMAC v2 the consumer identity and client
+    /// nonce). They are consumed here and never retained: only the resulting
+    /// digest leaves this function.
+    ///
+    /// The first part is the principal charged for the process lane's
+    /// per-principal quota, so a caller must put a verified principal there
+    /// (HMAC v2 passes the consumer id). A caller whose first part is not a
+    /// principal must use [`Self::marker_with_principal`] instead.
     pub fn marker(&self, parts: &[&[u8]]) -> ReplayMarker {
+        let principal = parts.first().copied().unwrap_or_default();
+        self.marker_with_principal(parts, &[principal])
+    }
+
+    /// Derive a proof marker while assigning its capacity quota to an explicit
+    /// verified principal. DPoP uses this so changing proof keys cannot mint
+    /// fresh per-principal replay capacity for the same token holder.
+    pub fn marker_with_principal(
+        &self,
+        parts: &[&[u8]],
+        principal_parts: &[&[u8]],
+    ) -> ReplayMarker {
         let mut hasher = PartitionHasher::new("ferrum-edge/replay-authority/marker/v1");
         hasher.nested("marker.domain", &self.digest);
         hasher.count("marker.parts", parts.len());
         for part in parts {
             hasher.field("marker.part", part);
         }
+        let mut principal_hasher =
+            PartitionHasher::new("ferrum-edge/replay-authority/principal/v1");
+        principal_hasher.count("principal.parts", principal_parts.len());
+        for part in principal_parts {
+            principal_hasher.field("principal.part", part);
+        }
         ReplayMarker {
             digest: hasher.digest(),
+            principal_digest: principal_hasher.digest(),
         }
     }
 
@@ -354,6 +383,7 @@ impl ReplayDomain {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ReplayMarker {
     digest: [u8; 32],
+    principal_digest: [u8; 32],
 }
 
 impl std::fmt::Debug for ReplayMarker {
@@ -420,8 +450,10 @@ impl ReplayAdmission {
 /// Shared by every plugin generation that resolves the same domain, so an
 /// equivalent reload inherits live markers instead of starting empty.
 pub struct ProcessReplayLane {
-    /// Marker digest → expiry in monotonic milliseconds since process start.
-    entries: DashMap<[u8; 32], u64>,
+    /// Marker digest → expiry and opaque principal digest.
+    entries: DashMap<[u8; 32], ProcessReplayEntry>,
+    /// Retained marker count by opaque principal digest.
+    principal_counts: DashMap<[u8; 32], AtomicUsize>,
     entry_count: AtomicUsize,
     /// Highest expiry ever written. Reading it is how lane reclamation proves
     /// "no live marker remains" without scanning the map.
@@ -449,10 +481,17 @@ pub struct ProcessReplayLane {
     prune_lock: Mutex<()>,
 }
 
+#[derive(Clone, Copy)]
+struct ProcessReplayEntry {
+    expires_at_millis: u64,
+    principal_digest: [u8; 32],
+}
+
 impl ProcessReplayLane {
     fn new(shard_amount: usize) -> Arc<Self> {
         Arc::new(Self {
             entries: DashMap::with_shard_amount(shard_amount),
+            principal_counts: DashMap::with_shard_amount(shard_amount),
             entry_count: AtomicUsize::new(0),
             newest_expiry_millis: AtomicU64::new(0),
             earliest_expiry_millis: AtomicU64::new(u64::MAX),
@@ -479,15 +518,36 @@ impl ProcessReplayLane {
         max_entries: usize,
         now_millis: u64,
     ) -> ReplayAdmission {
+        self.admit_for_principal_at(
+            marker,
+            &marker.principal_digest,
+            retention,
+            max_entries,
+            now_millis,
+        )
+    }
+
+    pub fn admit_for_principal_at(
+        &self,
+        marker: &ReplayMarker,
+        principal_digest: &[u8; 32],
+        retention: Duration,
+        max_entries: usize,
+        now_millis: u64,
+    ) -> ReplayAdmission {
         let retention_millis = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
         let expires_at = now_millis.saturating_add(retention_millis);
+        let principal_limit = max_entries.div_ceil(4).max(1);
         let mut key = marker.digest;
         let mut pruned = false;
 
         loop {
             match self.entries.entry(key) {
                 Entry::Occupied(mut existing) => {
-                    if *existing.get() > now_millis {
+                    if existing.get().expires_at_millis > now_millis {
+                        return ReplayAdmission::Replay;
+                    }
+                    if existing.get().principal_digest != *principal_digest {
                         return ReplayAdmission::Replay;
                     }
                     // Expired: in-place refresh is a *new* use of this proof.
@@ -496,10 +556,20 @@ impl ProcessReplayLane {
                     // lane over-full would otherwise admit above the new limit
                     // by recycling the occupied slot without consulting
                     // `max_entries`. The stored expiry only ever moves forward.
-                    if self.entry_count.load(Ordering::Acquire) <= max_entries {
-                        let refreshed = (*existing.get()).max(expires_at);
+                    let principal_count = self
+                        .principal_counts
+                        .get(principal_digest)
+                        .map(|count| count.load(Ordering::Acquire))
+                        .unwrap_or(0);
+                    if self.entry_count.load(Ordering::Acquire) <= max_entries
+                        && principal_count <= principal_limit
+                    {
+                        let refreshed = existing.get().expires_at_millis.max(expires_at);
                         self.begin_expiry_write();
-                        existing.insert(refreshed);
+                        existing.insert(ProcessReplayEntry {
+                            expires_at_millis: refreshed,
+                            principal_digest: *principal_digest,
+                        });
                         self.finish_expiry_write(refreshed);
                         return ReplayAdmission::Admitted;
                     }
@@ -509,15 +579,22 @@ impl ProcessReplayLane {
                     // never evict a live marker.
                 }
                 Entry::Vacant(vacant) => {
-                    if self.try_reserve_slot(max_entries) {
+                    if !self.try_reserve_principal(principal_digest, principal_limit) {
+                        key = vacant.into_key();
+                    } else if self.try_reserve_slot(max_entries) {
                         self.begin_expiry_write();
-                        vacant.insert(expires_at);
+                        vacant.insert(ProcessReplayEntry {
+                            expires_at_millis: expires_at,
+                            principal_digest: *principal_digest,
+                        });
                         self.finish_expiry_write(expires_at);
                         return ReplayAdmission::Admitted;
+                    } else {
+                        self.release_principal(principal_digest);
+                        // Do not walk other shards while holding a vacant-entry
+                        // guard: the prune below touches every shard.
+                        key = vacant.into_key();
                     }
-                    // Do not walk other shards while holding a vacant-entry
-                    // guard: the prune below touches every shard.
-                    key = vacant.into_key();
                 }
             }
 
@@ -612,6 +689,27 @@ impl ProcessReplayLane {
             .is_ok()
     }
 
+    fn try_reserve_principal(&self, principal: &[u8; 32], limit: usize) -> bool {
+        match self.principal_counts.entry(*principal) {
+            Entry::Occupied(count) => count
+                .get()
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < limit).then_some(current + 1)
+                })
+                .is_ok(),
+            Entry::Vacant(slot) => {
+                slot.insert(AtomicUsize::new(1));
+                true
+            }
+        }
+    }
+
+    fn release_principal(&self, principal: &[u8; 32]) {
+        self.principal_counts.remove_if(principal, |_, count| {
+            count.fetch_sub(1, Ordering::AcqRel) == 1
+        });
+    }
+
     /// Reclaim **expired** entries only. Returns how many were reclaimed.
     ///
     /// Serialized by [`Self::prune_lock`] so a burst of saturated requests pays
@@ -644,7 +742,7 @@ impl ProcessReplayLane {
         let mut expired: Vec<[u8; 32]> = Vec::new();
         let mut live_min = u64::MAX;
         for entry in self.entries.iter() {
-            let expires_at = *entry.value();
+            let expires_at = entry.value().expires_at_millis;
             if expires_at <= now_millis {
                 expired.push(*entry.key());
             } else {
@@ -658,15 +756,16 @@ impl ProcessReplayLane {
             // and removing it then would drop a live claim.
             match self
                 .entries
-                .remove_if(&key, |_, expires_at| *expires_at <= now_millis)
+                .remove_if(&key, |_, entry| entry.expires_at_millis <= now_millis)
             {
-                Some(_) => {
+                Some((_, entry)) => {
                     self.entry_count.fetch_sub(1, Ordering::AcqRel);
+                    self.release_principal(&entry.principal_digest);
                     reclaimed += 1;
                 }
                 None => {
                     if let Some(current) = self.entries.get(&key) {
-                        live_min = live_min.min(*current);
+                        live_min = live_min.min(current.expires_at_millis);
                     }
                 }
             }
@@ -722,13 +821,17 @@ impl ProcessReplayLane {
         let expires_at = now_millis.saturating_add(retention_millis);
         match self.entries.entry(marker.digest) {
             Entry::Occupied(mut existing) => {
-                if *existing.get() > now_millis {
+                if existing.get().expires_at_millis > now_millis {
                     return Err(ReplayAdmission::Replay);
                 }
                 if self.entry_count.load(Ordering::Acquire) <= max_entries {
-                    let refreshed = (*existing.get()).max(expires_at);
+                    let refreshed = existing.get().expires_at_millis.max(expires_at);
+                    let principal_digest = existing.get().principal_digest;
                     self.begin_expiry_write();
-                    existing.insert(refreshed);
+                    existing.insert(ProcessReplayEntry {
+                        expires_at_millis: refreshed,
+                        principal_digest,
+                    });
                     self.publish_written_expiry(refreshed);
                     return Ok(HeldExpiryWrite {
                         lane: self,
@@ -738,15 +841,24 @@ impl ProcessReplayLane {
                 Err(ReplayAdmission::CapacityRefused)
             }
             Entry::Vacant(vacant) => {
+                if !self
+                    .try_reserve_principal(&marker.principal_digest, max_entries.div_ceil(4).max(1))
+                {
+                    return Err(ReplayAdmission::CapacityRefused);
+                }
                 if self.try_reserve_slot(max_entries) {
                     self.begin_expiry_write();
-                    vacant.insert(expires_at);
+                    vacant.insert(ProcessReplayEntry {
+                        expires_at_millis: expires_at,
+                        principal_digest: marker.principal_digest,
+                    });
                     self.publish_written_expiry(expires_at);
                     return Ok(HeldExpiryWrite {
                         lane: self,
                         finished: false,
                     });
                 }
+                self.release_principal(&marker.principal_digest);
                 Err(ReplayAdmission::CapacityRefused)
             }
         }

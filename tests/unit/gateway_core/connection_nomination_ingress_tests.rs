@@ -233,7 +233,7 @@ fn non_ascii_connection_value_is_dropped() {
 fn gateway_assertions_survive_the_backend_hop_by_hop_strip() {
     let mut raw = header_map(&[
         ("host", "api.example.test"),
-        ("connection", "close, x-consumer-username, x-tenant-id"),
+        ("connection", "close, x-authenticated-identity, x-tenant-id"),
         ("x-tenant-id", "tenant-b"),
         ("authorization", "Bearer tenant-a-token"),
     ]);
@@ -255,7 +255,7 @@ fn gateway_assertions_survive_the_backend_hop_by_hop_strip() {
     refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
 
     let listed = parse_connection_listed_from_str_map(&outbound);
-    for assertion in ["x-consumer-username", "x-tenant-id"] {
+    for assertion in ["x-authenticated-identity", "x-tenant-id"] {
         assert!(
             !listed.iter().any(|name| name == assertion),
             "the residual Connection list must not name `{assertion}`: {listed:?}"
@@ -271,7 +271,7 @@ fn gateway_assertions_survive_the_backend_hop_by_hop_strip() {
     }
     strip_backend_request_headers(&mut wire);
 
-    assert_eq!(wire.get("x-consumer-username").unwrap(), "alice");
+    assert_eq!(wire.get("x-authenticated-identity").unwrap(), "alice");
     assert_eq!(wire.get("x-tenant-id").unwrap(), "tenant-a");
     assert!(!wire.contains_key(CONNECTION));
 }

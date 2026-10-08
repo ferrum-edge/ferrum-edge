@@ -23294,7 +23294,7 @@ components:
               consumer_header_claim:
                 type: string
                 pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-                description: Per-provider override for consumer header claim (falls back to global); a dot path with no empty segments
+                description: Per-provider override for X-Authenticated-Identity claim (falls back to global, then to this provider's effective consumer_identity_claim); a dot path with no empty segments
               claim_headers:
                 type: object
                 additionalProperties:
@@ -23307,7 +23307,8 @@ components:
                   empty, or wrong-type claim leaves the header absent instead of
                   forwarding client-supplied input.
                   Destinations in the gateway-owned `x-consumer-*` consumer
-                  assertion namespace are rejected at config load.
+                  assertion namespace and `x-authenticated-identity` are
+                  rejected at config load.
               claim_headers_separator:
                 type: string
                 minLength: 1
@@ -23446,7 +23447,7 @@ components:
         consumer_header_claim:
           type: string
           pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-          description: JWT claim for X-Consumer-Username header (default same as consumer_identity_claim); a dot path with no empty segments
+          description: JWT claim for X-Authenticated-Identity header (defaults to each provider's effective consumer_identity_claim); a dot path with no empty segments
         claim_headers:
           type: object
           additionalProperties:
@@ -23459,7 +23460,8 @@ components:
             claim leaves the header absent instead of forwarding client-supplied
             input.
             Destinations in the gateway-owned `x-consumer-*` consumer
-            assertion namespace are rejected at config load.
+            assertion namespace and `x-authenticated-identity` are rejected
+            at config load.
         claim_headers_separator:
           type: string
           default: ","
@@ -23835,7 +23837,7 @@ components:
                 type: string
                 pattern: '^[^.]+(\.[^.]+)*$'
                 description: >-
-                  Per-provider override of the global X-Consumer-Username
+                  Per-provider override of the global X-Authenticated-Identity
                   display claim path.
               claim_headers:
                 type: object
@@ -23854,7 +23856,8 @@ components:
                   claim leaves the header absent instead of forwarding client-supplied
                   input.
                   Destinations in the gateway-owned `x-consumer-*` consumer
-                  assertion namespace are rejected at config load.
+                  assertion namespace and `x-authenticated-identity` are
+                  rejected at config load.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -23880,8 +23883,8 @@ components:
           type: string
           pattern: '^[^.]+(\.[^.]+)*$'
           description: >-
-            Claim used for X-Consumer-Username when no consumer maps. Defaults
-            to the effective consumer_identity_claim.
+            Claim used for X-Authenticated-Identity when no Consumer maps.
+            Defaults to the effective consumer_identity_claim.
 
     OidcRelyingPartyConfig:
       type: object
@@ -24060,7 +24063,8 @@ components:
                   wrong-type claim leaves the header absent instead of forwarding
                   client-supplied input.
                   Destinations in the gateway-owned `x-consumer-*` consumer
-                  assertion namespace are rejected at config load.
+                  assertion namespace and `x-authenticated-identity` are
+                  rejected at config load.
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -24534,10 +24538,6 @@ components:
           minimum: 1
           maximum: 1000000
           description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan."
-        consumer_mapping:
-          type: boolean
-          default: true
-          description: "Whether to map LDAP user to a gateway Consumer"
         hide_credentials:
           type: boolean
           default: true

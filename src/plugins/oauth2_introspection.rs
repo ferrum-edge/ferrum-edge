@@ -95,7 +95,8 @@ pub struct Oauth2Introspection {
     global_scope_claim: String,
     global_role_claim: String,
     consumer_identity_claim: String,
-    consumer_header_claim: String,
+    /// Unset means each provider displays its effective identity claim.
+    consumer_header_claim: Option<String>,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
     request_headers_to_redact: Vec<String>,
@@ -263,9 +264,11 @@ impl Oauth2Introspection {
         )?;
         let consumer_header_claim = match config_obj.get("consumer_header_claim") {
             Some(value) => {
-                parse_claim_path_value("consumer_header_claim", value, "oauth2_introspection")?
+                let claim =
+                    parse_claim_path_value("consumer_header_claim", value, "oauth2_introspection")?;
+                Some(claim)
             }
-            None => consumer_identity_claim.clone(),
+            None => None,
         };
 
         let global_identity_claim = consumer_identity_claim.as_str();
@@ -944,7 +947,8 @@ impl Oauth2Introspection {
         let header_claim = provider
             .consumer_header_claim
             .as_deref()
-            .unwrap_or(&self.consumer_header_claim);
+            .or(self.consumer_header_claim.as_deref())
+            .unwrap_or(identity_claim);
         let identity = nonblank_identity(extract_claim_string(claims, identity_claim));
         let header_value = if header_claim == identity_claim {
             identity.clone()
@@ -972,13 +976,13 @@ impl Oauth2Introspection {
     fn resolve_identity(
         &self,
         authorization: &CachedAuthorization,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
         let identity = authorization.identity.as_deref().map(str::to_string);
         let header_value = authorization.identity_header.as_deref().map(str::to_string);
-        let consumer = identity
-            .as_deref()
-            .and_then(|id| consumer_index.find_by_identity(id));
+        // Provider claims do not implicitly resolve through the global
+        // Consumer username index.
+        let consumer = None;
         VerifyOutcome::success(consumer, identity, header_value)
     }
 

@@ -3230,6 +3230,21 @@ fn test_nonce_replay_detected_via_direct_api() {
 }
 
 #[test]
+fn test_one_principal_cannot_consume_the_other_replay_capacity() {
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 8 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    assert!(harness.claim_for_principal("a-1", "principal-a").is_ok());
+    assert!(harness.claim_for_principal("a-2", "principal-a").is_ok());
+    assert!(harness.claim_for_principal("a-3", "principal-a").is_err());
+    assert!(harness.claim_for_principal("b-1", "principal-b").is_ok());
+}
+
+#[test]
 fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
     // Once the fixed retention horizon has elapsed, the atomic entry path must
     // refresh inserted_at instead of treating reuse as a live replay. This
