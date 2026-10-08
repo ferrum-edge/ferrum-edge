@@ -1540,37 +1540,111 @@ struct ResourceSample {
     client_cpu_seconds: Option<f64>,
     /// Host 1-minute load average: sustained contention from other processes.
     host_load_1m: Option<f64>,
+    /// Host-wide cumulative CPU ticks `(busy, total)` across every core.
+    host_cpu_ticks: Option<(u64, u64)>,
 }
 
 /// With `FERRUM_RELOAD_WAIT_FOR_QUIET_HOST=1`, wait (up to 10 min) before a
-/// change until the host 1-minute load average is below 30% of the CPU count,
-/// so another build on a shared machine does not land inside the measurement.
-/// Returns the seconds waited.
+/// change until host-wide CPU over a 3-second window is below 30% of the CPU
+/// count, so another build on a shared machine does not land inside the
+/// measurement. Busy CPU is measured directly rather than through the 1-minute
+/// load average, which still carries the previous change's own load for a
+/// minute or two after it ends. Returns the seconds waited.
 async fn wait_for_quiet_host() -> f64 {
     if std::env::var("FERRUM_RELOAD_WAIT_FOR_QUIET_HOST").as_deref() != Ok("1") {
         return 0.0;
     }
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
-    let threshold = cpus * 0.3;
+    let threshold = logical_cpus() * 0.3;
     let started = Instant::now();
+    let mut busy = None;
     while started.elapsed() < Duration::from_secs(600) {
-        match host_load_average_1m() {
-            Some(load) if load >= threshold => {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
+        let before = host_cpu_ticks();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        busy = before
+            .zip(host_cpu_ticks())
+            .and_then(|(a, b)| host_busy_cores(a, b));
+        match busy {
+            Some(cores) if cores >= threshold => {}
             _ => break,
         }
     }
     let waited = started.elapsed().as_secs_f64();
     if waited >= 5.0 {
         println!(
-            "  waited {:.0}s for host load (1m) below {:.1}; now {}",
+            "  waited {:.0}s for host CPU below {:.1} cores; now {}",
             waited,
             threshold,
-            fmt_opt(host_load_average_1m(), 1)
+            fmt_opt(busy, 1)
         );
     }
     waited
+}
+
+fn logical_cpus() -> f64 {
+    std::thread::available_parallelism().map_or(1, |n| n.get()) as f64
+}
+
+/// Host-wide cumulative CPU ticks `(busy, total)` summed over every core.
+fn host_cpu_ticks() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let fields: Vec<u64> = stat
+            .lines()
+            .next()?
+            .split_whitespace()
+            .skip(1)
+            .take(8)
+            .map(|v| v.parse().ok())
+            .collect::<Option<_>>()?;
+        // user nice system idle iowait irq softirq steal
+        let idle = fields.get(3)? + fields.get(4)?;
+        let total: u64 = fields.iter().sum();
+        Some((total - idle, total))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // libSystem's host port accessor (`libc` deprecates its binding in
+        // favour of the `mach2` crate; this test needs only this one symbol).
+        unsafe extern "C" {
+            fn mach_host_self() -> libc::mach_port_t;
+        }
+        static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+        // SAFETY: mach_host_self has no preconditions; the port is reused.
+        let host = *HOST.get_or_init(|| unsafe { mach_host_self() });
+        let mut info = libc::host_cpu_load_info {
+            cpu_ticks: [0; libc::CPU_STATE_MAX as usize],
+        };
+        let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+        // SAFETY: `info` is a host_cpu_load_info and `count` is its size in
+        // natural_t units, as HOST_CPU_LOAD_INFO requires.
+        let status = unsafe {
+            libc::host_statistics(
+                host,
+                libc::HOST_CPU_LOAD_INFO,
+                (&mut info as *mut libc::host_cpu_load_info).cast(),
+                &mut count,
+            )
+        };
+        if status != libc::KERN_SUCCESS {
+            return None;
+        }
+        let ticks = info.cpu_ticks.map(u64::from);
+        let idle = ticks[libc::CPU_STATE_IDLE as usize];
+        let total: u64 = ticks.iter().sum();
+        Some((total - idle, total))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Cores busy host-wide between two `host_cpu_ticks` samples.
+fn host_busy_cores(before: (u64, u64), after: (u64, u64)) -> Option<f64> {
+    let total = after.1.checked_sub(before.1)?;
+    let busy = after.0.checked_sub(before.0)?;
+    (total > 0).then(|| busy as f64 / total as f64 * logical_cpus())
 }
 
 fn host_load_average_1m() -> Option<f64> {
@@ -1610,6 +1684,7 @@ fn start_resource_sampler(
                 rss_bytes,
                 client_cpu_seconds,
                 host_load_1m: host_load_average_1m(),
+                host_cpu_ticks: host_cpu_ticks(),
             });
         }
         samples
@@ -1628,6 +1703,8 @@ struct SecondPoint {
     gateway_rss_mib: Option<f64>,
     load_generator_cpu_cores: Option<f64>,
     host_load_1m: Option<f64>,
+    /// Host busy cores minus the gateway and this test process.
+    other_cpu_cores: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -1734,9 +1811,27 @@ fn phase_stats(
     }
 }
 
+/// Per-interval CPU used by every other process on the host: host-wide busy
+/// cores minus the gateway's and this test process's (load generator + echo
+/// backend) over the same one-second interval.
+fn other_cpu_series(samples: &[ResourceSample]) -> Vec<(f64, f64)> {
+    samples
+        .windows(2)
+        .filter_map(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let dt = b.t_secs - a.t_secs;
+            let host = host_busy_cores(a.host_cpu_ticks?, b.host_cpu_ticks?)?;
+            let own = (b.cpu_seconds? - a.cpu_seconds?) / dt
+                + (b.client_cpu_seconds? - a.client_cpu_seconds?) / dt;
+            Some((b.t_secs, (host - own).max(0.0)))
+        })
+        .collect()
+}
+
 fn second_points(buckets: &[LoadBucket], samples: &[ResourceSample]) -> Vec<SecondPoint> {
     let cores = cpu_cores_series(samples);
     let client_cores = cores_series(samples, |s| s.client_cpu_seconds);
+    let other_cores = other_cpu_series(samples);
     buckets
         .iter()
         .enumerate()
@@ -1764,6 +1859,10 @@ fn second_points(buckets: &[LoadBucket], samples: &[ResourceSample]) -> Vec<Seco
                     .iter()
                     .find(|s| in_second(s.t_secs))
                     .and_then(|s| s.host_load_1m),
+                other_cpu_cores: other_cores
+                    .iter()
+                    .find(|(s, _)| in_second(*s))
+                    .map(|(_, c)| *c),
             }
         })
         .collect()
@@ -1781,6 +1880,10 @@ struct ReloadWaveResult {
     resources: usize,
     /// Seconds spent waiting for a quiet host before this change (opt-in).
     quiet_wait_secs: f64,
+    /// Cores other processes used during the change window (host busy CPU
+    /// minus the gateway and this test process): mean and worst second.
+    other_cpu_cores_mean: Option<f64>,
+    other_cpu_cores_peak: Option<f64>,
     /// Seconds from load start: write began, write finished, apply confirmed,
     /// new routes probed live.
     write_start_secs: f64,
@@ -1958,35 +2061,28 @@ async fn measure_change_under_load(
             fmt_opt(s.gateway_rss_mib_peak, 0)
         );
     }
-    // The load average counts this test's own demand too (gateway + load
-    // generator), so subtract their measured CPU before blaming other processes.
-    let own_cores = |from: f64, to: f64| {
-        let in_phase = |t: f64| t > from && t <= to;
-        let mean = |series: Vec<(f64, f64)>| {
-            let v: Vec<f64> = series
-                .into_iter()
-                .filter(|(t, _)| in_phase(*t))
-                .map(|(_, c)| c)
-                .collect();
-            (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
-        };
-        mean(cpu_cores_series(&samples)).unwrap_or(0.0)
-            + mean(cores_series(&samples, |s| s.client_cpu_seconds)).unwrap_or(0.0)
-    };
-    let other_load = samples
-        .iter()
-        .filter(|s| s.t_secs > RELOAD_WARMUP_SECS as f64)
-        .filter_map(|s| s.host_load_1m)
-        .reduce(f64::max)
-        .map(|load| load - own_cores(RELOAD_WARMUP_SECS as f64, lv + RELOAD_POST_SECS as f64));
+    // Other processes' CPU, measured per second over the change window (host
+    // busy cores minus this test's gateway and load generator), so both a
+    // sustained competing build and a short burst inside the apply are seen.
+    let other_cores: Vec<f64> = other_cpu_series(&samples)
+        .into_iter()
+        .filter(|(t, _)| *t > ws && *t <= lv.ceil())
+        .map(|(_, c)| c)
+        .collect();
+    let other_cpu_cores_mean = (!other_cores.is_empty())
+        .then(|| other_cores.iter().sum::<f64>() / other_cores.len() as f64);
+    let other_cpu_cores_peak = other_cores.iter().copied().reduce(f64::max);
     println!(
-        "  host load (1m) beyond this test's own CPU: {}",
-        fmt_opt(other_load, 1)
+        "  other processes' CPU during the change: mean {} cores, peak {} cores",
+        fmt_opt(other_cpu_cores_mean, 1),
+        fmt_opt(other_cpu_cores_peak, 1)
     );
-    if other_load.is_some_and(|load| load > 2.0) {
+    if other_cpu_cores_mean.is_some_and(|c| c > 2.0)
+        || other_cpu_cores_peak.is_some_and(|c| c > 4.0)
+    {
         println!(
-            "  WARNING: other processes kept more than 2 cores busy during this change; \
-             its numbers are noisy"
+            "  WARNING: other processes used more than 2 cores on average (or 4 in one \
+             second) during this change; its numbers are noisy"
         );
     }
     if steady.rps > 0.0 && (change.worst_second_rps as f64) < steady.rps * 0.5 {
@@ -2013,6 +2109,8 @@ async fn measure_change_under_load(
         proxies_after: all_entries.len(),
         resources: (batch_end - batch_start) * (3 + consumers_per_proxy),
         quiet_wait_secs,
+        other_cpu_cores_mean,
+        other_cpu_cores_peak,
         write_start_secs: ws,
         write_end_secs: we,
         applied_secs: ap,

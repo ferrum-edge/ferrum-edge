@@ -91,7 +91,9 @@ apply cursor, proves the new routes are live, and measures 10 s more. Three kind
 The two small changes run after the initial wave and after every full wave.
 
 Every second records successful requests, p50/p99, errors, gateway CPU
-(cores), gateway RSS, load-generator CPU, and the host 1-minute load average.
+(cores), gateway RSS, load-generator CPU, the host 1-minute load average, and
+the CPU every other process used (host-wide busy cores minus the gateway and
+this test process).
 Each change reports four phases: `steady`; `change` (admin writes + apply +
 convergence); `apply` (from the last admin write to the confirmed apply, i.e.
 the reload alone); and `post`.
@@ -100,9 +102,9 @@ the reload alone); and `post`.
 route-miss 404), which checks that an atomic config swap never drops or stalls
 existing routes. Degradation is reported, not asserted, because it depends on
 the host: a warning prints when a second during the change runs below 50% of
-steady RPS, when its p99 exceeds 10× steady p99, or when the host load average
-minus this test's own measured CPU (gateway + load generator) exceeds 2 cores
-(other processes competed and the numbers are noisy).
+steady RPS, when its p99 exceeds 10× steady p99, or when other processes used
+more than 2 cores on average (or 4 in any one second) during the change (they
+competed for CPU and the numbers are noisy).
 
 ```bash
 cargo build --release --bin ferrum-edge
@@ -110,8 +112,8 @@ FERRUM_RELOAD_RESULTS_JSON=reload-under-load.json \
 cargo test --profile ci-release --test functional_tests -- --ignored --nocapture \
   --exact functional::functional_scale_perf_test::test_scale_reload_under_load
 
-# On a shared machine, wait (up to 10 min) before each change until the host
-# 1-minute load average is below 30% of the CPU count
+# On a shared machine, wait (up to 10 min) before each change until host-wide
+# CPU over 3 seconds is below 30% of the CPU count
 FERRUM_RELOAD_WAIT_FOR_QUIET_HOST=1 FERRUM_RELOAD_RESULTS_JSON=reload-under-load.json \
 cargo test --profile ci-release --test functional_tests -- --ignored --nocapture \
   --exact functional::functional_scale_perf_test::test_scale_reload_under_load
@@ -125,7 +127,7 @@ The JSON contains every phase plus the full per-second series for charting.
 Admin writes run inside the gateway process, so the `change` phase includes the
 CPU cost of handling those writes as well as the reload; `apply` isolates the
 reload. Run it on a quiet machine: another build or test competing for CPU shows
-up as dips with *low* gateway CPU and a high host load average.
+up as dips with *low* gateway CPU and high other-process CPU.
 
 ## How to Run
 
