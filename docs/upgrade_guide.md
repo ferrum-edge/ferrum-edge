@@ -26,40 +26,6 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased changes after 0.9.15
-
-**Backend TLS live reload goes ahead past a destination that fails to build
-(issue [#6105](https://github.com/ferrum-edge/ferrum-edge/issues/6105)).** With
-`FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` (the default), a reload used to be
-refused as soon as one destination's backend TLS could not build: every
-destination kept its previously loaded material and a rotated CRL did not take
-effect. Each destination is now validated on its own. One that fails is logged
-as a warning and skipped, and the reload goes ahead for the others.
-
-What happens to the skipped destination depends on its transport:
-
-- **HTTP-family backends (HTTP/1.1, HTTP/2, gRPC, HTTP/3, `wss://` WebSocket)
-  and DTLS backends** do not keep their old material. The reload drains every
-  backend client pool and TLS config cache and bumps the DTLS config epoch, so
-  the destination's new TLS connections fail until its material is fixed.
-  Established connections finish on the config they opened with.
-- **TCP+TLS stream listeners** cache their backend TLS config when the listener
-  starts. When only the destination's own certificate, key, or CA content was
-  rewritten in place (same sources, same backend routing, same CRL) and the new
-  content is invalid, the previous listener keeps serving with its previous
-  material. `/overload` reports it in `bind_failures` with the
-  `backend_tls_rotation_invalid` kind, and the next reconcile retries. When the
-  same reload also changed the CRL, the listener does not keep its old config,
-  because that config still checks against the previous revocation list. The
-  listener stops, its port stays closed until the material is fixed, and
-  `bind_failures` reports it with the `backend_tls_invalid` kind.
-
-After rotating backend certificates, check the reload log line
-(`failed_backend_tls_configs`), the per-destination warnings, and the new
-`ferrum_backend_tls_reload_validation_failures_total{kind}` counter (`kind` is
-`proxy`, `route_dispatch_rule`, or `route_dispatch_config`). A CRL file that
-fails to load still refuses the whole reload, as before.
-
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main

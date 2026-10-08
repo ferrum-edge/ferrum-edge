@@ -41,52 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` (default 256), so a
   client that overruns `max_concurrent_streams` that many times on one
   connection receives `GOAWAY(ENHANCE_YOUR_CALM)`.
-- **Refused DestinationRule TLS files are an explicit refusal** (issue #6105).
-  When a data plane refuses a tenant DestinationRule's local TLS file (missing
-  on the node, or resolving outside `FERRUM_MESH_TENANT_TLS_FILE_ROOTS`), the
-  destination's backend TLS is now marked refused instead of being replaced
-  with unloadable PEM. The shared backend TLS builder, the backend DTLS builder
-  and the health-check probe builders check the marker before anything else,
-  so `FERRUM_TLS_NO_VERIFY`, the global CA, and the global client
-  certificate/key pair still cannot stand in for the refused material. The
-  marker is part of every backend TLS pool and config-cache key. The reqwest,
-  direct HTTP/2, gRPC (TLS only), HTTP/3, and `wss://` WebSocket pools check it
-  at their entry point, before any pool lookup or TLS build queue work, so
-  traffic to a refused destination never takes a slot in the bounded TLS build
-  queue. The new `ferrum_backend_tls_refusals_total{surface}` counter records
-  each refusal (`slice_apply`, `client_build`, `dtls_build`, `health_probe`).
-  `slice_apply` counts once per refused upstream per slice apply;
-  `client_build` counts refused build attempts and so scales with traffic.
-  Admin and config views show a refused upstream with empty `backend_tls_*`
-  fields, the same as an upstream without backend TLS; use the warning and
-  this counter to find refused destinations. For upstreams whose targets all
-  ride HBONE or Sidecar mesh-mTLS, the warning now says traffic continues over
-  the gateway mesh identity, because those transports never read backend TLS
-  material.
-
-### Fixed
-
-- **Backend TLS live reload no longer stops at the first destination that
-  fails to build** (issue #6105). With `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`
-  on, one destination whose backend TLS could not build refused the whole
-  reload, so no destination on the node picked up rotated material or a new
-  CRL (including the mesh inbound CRL set). Validation is now per destination:
-  a failing destination is logged and skipped, refused destinations are
-  counted without a build, and the reload goes ahead for the rest. The reload
-  log line reports validated, refused and failed counts, and the new
-  `ferrum_backend_tls_reload_validation_failures_total{kind}` counter (`proxy`,
-  `route_dispatch_rule`, `route_dispatch_config`) counts each skipped
-  destination. A CRL file that fails to load still refuses the reload.
-
-  A skipped HTTP-family, `wss://`, or DTLS destination fails closed: its pools
-  and TLS config caches are drained, so its new TLS connections fail until the
-  material is fixed. A TCP+TLS stream listener whose own material was rewritten
-  in place to invalid content keeps its previous listener and material
-  (`backend_tls_rotation_invalid`) only when its TLS sources, backend routing,
-  and the gateway CRL are unchanged. When the same reload changed the CRL, the
-  listener is stopped and its port stays closed until the material is fixed
-  (`backend_tls_invalid`), so it never keeps checking against the replaced
-  CRL.
 
 ## [0.9.15] - 2026-10-08
 
