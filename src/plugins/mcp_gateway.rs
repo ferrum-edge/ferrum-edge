@@ -2591,8 +2591,7 @@ impl McpGateway {
                 .session_store
                 .iter()
                 .filter(|entry| {
-                    !self.session_is_expired(entry.value())
-                        && entry.value().principal == principal
+                    !self.session_is_expired(entry.value()) && entry.value().principal == principal
                 })
                 .map(|entry| (entry.value().last_seen, entry.key().clone()))
                 .collect();
@@ -9719,10 +9718,9 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
                 .to_string(),
         );
     }
-    let max_sessions_per_principal = usize::try_from(max_sessions_per_principal)
-        .map_err(|_| {
-            "mcp_gateway: `sessions.max_sessions_per_principal` is too large".to_string()
-        })?;
+    let max_sessions_per_principal = usize::try_from(max_sessions_per_principal).map_err(|_| {
+        "mcp_gateway: `sessions.max_sessions_per_principal` is too large".to_string()
+    })?;
     let downstream_session_header =
         optional_string_from_object(sessions, "downstream_session_header")?
             .unwrap_or_else(|| "mcp-session-id".to_string());

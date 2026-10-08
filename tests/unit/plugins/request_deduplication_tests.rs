@@ -6227,7 +6227,9 @@ async fn test_brotli_large_window_encoding_is_refused_for_fingerprinting() {
     headers.insert("content-encoding".to_string(), "br".to_string());
 
     match plugin.before_proxy(&mut ctx, &mut headers).await {
-        PluginResult::Reject { status_code, body, .. } => {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 400);
             assert!(body.contains("encoding"));
         }

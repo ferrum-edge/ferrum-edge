@@ -334,8 +334,7 @@ impl RateLimiting {
             None | Some(Value::Null) => 64,
             Some(value) => {
                 let prefix = value.as_u64().ok_or_else(|| {
-                    "rate_limiting: `ipv6_prefix` must be an integer from 1 through 128"
-                        .to_string()
+                    "rate_limiting: `ipv6_prefix` must be an integer from 1 through 128".to_string()
                 })?;
                 u8::try_from(prefix)
                     .ok()
