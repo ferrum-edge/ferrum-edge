@@ -1230,7 +1230,7 @@ the lookup instead of becoming an unscreened dial.
 | Bound | Source |
 | --- | --- |
 | Concurrent tunnels | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` (503 over the limit) |
-| Concurrent tunnels per client | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (503 over the limit; IPv6 grouped by `/64`, held for the tunnel lifetime) |
+| Concurrent tunnels per client | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (503 over the limit; IPv6 grouped by `FERRUM_PER_IP_IPV6_PREFIX`, default `/64`, held for the tunnel lifetime) |
 | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS`, which also raises the frontend QUIC idle floor (below) |
 | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped at the RFC 9298 §5 ceiling of 65527 |
 | DATAGRAM capsule length | payload ceiling + 8 bytes of Context ID slack |
