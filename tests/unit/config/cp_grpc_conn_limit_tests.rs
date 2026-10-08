@@ -231,6 +231,17 @@ fn ipv6_per_ip_cap_groups_the_default_prefix_and_folds_mapped_ipv4() {
         ConnRejectReason::MaxConnectionsPerIp
     );
 }
+
+#[test]
+fn ipv6_per_ip_cap_can_use_host_prefix_accounting() {
+    let limiter = Arc::new(ConnLimiter::new_with_ipv6_prefix(0, 1, 128));
+    let _first = limiter
+        .try_acquire("2001:db8:abcd:12::1".parse().expect("IPv6 address"))
+        .expect("first IPv6 host admitted");
+    let _second = limiter
+        .try_acquire("2001:db8:abcd:12::ffff".parse().expect("IPv6 address"))
+        .expect("a distinct IPv6 host has a separate cap");
+}
 // ============================================================================
 // RFC 9298 CONNECT-UDP session admission shares the same ceiling contract
 // ============================================================================

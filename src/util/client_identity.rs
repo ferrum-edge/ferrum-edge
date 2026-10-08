@@ -78,8 +78,18 @@ pub fn canonical_ip_string(ip: IpAddr) -> String {
 /// Render an IP address for a per-client quota key, folding IPv6 addresses to
 /// the configured network prefix while keeping IPv4 host keys unchanged.
 pub fn rate_limit_ip_string(ip: IpAddr, ipv6_prefix: u8) -> String {
-    match canonical_ip(ip) {
+    match rate_limit_ip(ip, ipv6_prefix) {
         IpAddr::V4(ip) => ipv4_string(ip),
+        IpAddr::V6(ip) => ip.to_string(),
+    }
+}
+
+/// Mask an IP address to its per-client quota key without allocating.
+/// IPv4-mapped IPv6 addresses fold to IPv4, which remains host-keyed.
+#[inline]
+pub fn rate_limit_ip(ip: IpAddr, ipv6_prefix: u8) -> IpAddr {
+    match canonical_ip(ip) {
+        IpAddr::V4(ip) => IpAddr::V4(ip),
         IpAddr::V6(ip) => {
             let prefix = ipv6_prefix.min(128);
             let mut octets = ip.octets();
@@ -94,7 +104,7 @@ pub fn rate_limit_ip_string(ip: IpAddr, ipv6_prefix: u8) -> String {
                 whole_bytes + 1
             };
             octets[zero_from..].fill(0);
-            Ipv6Addr::from(octets).to_string()
+            IpAddr::V6(Ipv6Addr::from(octets))
         }
     }
 }

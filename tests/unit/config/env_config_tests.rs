@@ -15,6 +15,25 @@ use ferrum_edge::ebpf::NodeAgentProxyMode;
 // (see tests/unit/env_lock.rs).
 use crate::unit::env_lock::with_env_vars;
 
+#[test]
+fn gateway_per_ip_ipv6_prefix_is_limited_to_one_through_128() {
+    for prefix in [1, 64, 128] {
+        let config = EnvConfig {
+            per_ip_ipv6_prefix: prefix,
+            ..Default::default()
+        };
+        assert!(config.validate_per_ip_ipv6_prefix().is_ok());
+    }
+
+    for prefix in [0, 129, u8::MAX] {
+        let config = EnvConfig {
+            per_ip_ipv6_prefix: prefix,
+            ..Default::default()
+        };
+        assert!(config.validate_per_ip_ipv6_prefix().is_err());
+    }
+}
+
 /// A Workload API socket path whose every directory component the production
 /// socket contract admits on this host.
 ///

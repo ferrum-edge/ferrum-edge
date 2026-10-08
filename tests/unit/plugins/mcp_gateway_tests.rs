@@ -12236,8 +12236,8 @@ async fn principal_at_its_session_cap_replaces_only_its_own_oldest_session() {
     assert_session_refused(reuse_session_as(&plugin, &alice_old, alice).await);
     let alice = caller_as_consumer(tools_list_body(5), "consumer-a", "alice");
     assert_tools_listed(reuse_session_as(&plugin, &alice_new, alice).await);
-    let bob = caller_as_consumer(tools_list_body(6), "consumer-b", "bob");
-    assert_tools_listed(reuse_session_as(&plugin, &bob, bob).await);
+    let bob_caller = caller_as_consumer(tools_list_body(6), "consumer-b", "bob");
+    assert_tools_listed(reuse_session_as(&plugin, &bob, bob_caller).await);
 }
 
 #[tokio::test]

@@ -16351,9 +16351,10 @@ fn start_mesh_admin_listeners(
     let admin_state_for_https = admin_state.clone();
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
     // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
-    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new_with_ipv6_prefix(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
+        env_config.per_ip_ipv6_prefix,
     ));
 
     // Validate admin HTTPS TLS material BEFORE spawning any admin listener so a

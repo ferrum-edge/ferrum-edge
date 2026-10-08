@@ -484,7 +484,7 @@ impl GrpcMethodRouter {
         );
         key.push_str("grpc_method:");
         key.push_str(kind);
-        key.push_str(identity);
+        key.push_str(&identity);
         key.push(':');
         key.push_str(method_path);
         key

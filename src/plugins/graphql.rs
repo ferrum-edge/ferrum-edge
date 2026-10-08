@@ -517,7 +517,7 @@ impl GraphqlPlugin {
         );
         key.push_str("gql:");
         key.push_str(identity_kind);
-        key.push_str(identity);
+        key.push_str(&identity);
         key.push(':');
         key.push_str(kind);
         key.push(':');

@@ -545,8 +545,28 @@ impl AppProbeAdmission {
         max_active_probes: usize,
         overload: Option<Arc<crate::overload::OverloadState>>,
     ) -> Self {
+        Self::new_with_ipv6_prefix(
+            max_connections,
+            max_connections_per_ip,
+            max_active_probes,
+            overload,
+            64,
+        )
+    }
+
+    pub fn new_with_ipv6_prefix(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        max_active_probes: usize,
+        overload: Option<Arc<crate::overload::OverloadState>>,
+        ipv6_prefix: u8,
+    ) -> Self {
         Self {
-            limiter: Arc::new(ConnLimiter::new(max_connections, max_connections_per_ip)),
+            limiter: Arc::new(ConnLimiter::new_with_ipv6_prefix(
+                max_connections,
+                max_connections_per_ip,
+                ipv6_prefix,
+            )),
             budget: Arc::new(AppProbeBudget::new(max_active_probes)),
             overload,
             rejected_overload: AtomicU64::new(0),
@@ -558,11 +578,12 @@ impl AppProbeAdmission {
         env_config: &crate::config::EnvConfig,
         overload: Option<Arc<crate::overload::OverloadState>>,
     ) -> Self {
-        Self::new(
+        Self::new_with_ipv6_prefix(
             env_config.mesh_app_probe_max_connections,
             env_config.mesh_app_probe_max_connections_per_ip,
             env_config.mesh_app_probe_max_active_probes,
             overload,
+            env_config.per_ip_ipv6_prefix,
         )
     }
 

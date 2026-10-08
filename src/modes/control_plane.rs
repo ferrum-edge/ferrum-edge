@@ -2460,9 +2460,10 @@ pub async fn run(
     let reserved_ports = env_config.reserved_gateway_ports();
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
     // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
-    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new_with_ipv6_prefix(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
+        env_config.per_ip_ipv6_prefix,
     ));
     // Start durable audit delivery now (issue #2421): discovery, adoption of
     // records abandoned by a prior process generation, and replay must not wait
@@ -2703,9 +2704,10 @@ pub async fn run(
         // listener, the TLS/mTLS accept loop, and every certificate-reload
         // generation, so the cap is a property of the CP gRPC surface rather
         // than of one listener instance or one certificate.
-        let grpc_conn_limiter = Arc::new(ConnLimiter::new(
+        let grpc_conn_limiter = Arc::new(ConnLimiter::new_with_ipv6_prefix(
             env_config.cp_grpc_max_connections,
             env_config.cp_grpc_max_connections_per_ip,
+            env_config.per_ip_ipv6_prefix,
         ));
         crate::plugins::prometheus_metrics::global_registry()
             .set_cp_grpc_conn_metrics(Arc::clone(&grpc_conn_limiter));

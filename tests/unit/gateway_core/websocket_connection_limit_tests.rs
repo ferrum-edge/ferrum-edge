@@ -220,7 +220,14 @@ fn per_ip_slot_groups_ipv6_addresses_by_the_default_prefix() {
         Err(PerIpLimitExceeded)
     ));
     drop(first);
-    assert!(counts.is_empty());
+    assert_eq!(counts.len(), 1);
+    assert_eq!(
+        counts
+            .get("2001:db8:abcd:12::")
+            .expect("zero-count entry remains until the sweeper runs")
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[test]
@@ -240,6 +247,7 @@ fn per_ip_stream_admission_enforces_its_configured_max() {
     let admission = PerIpStreamAdmission {
         counts: Some(Arc::new(dashmap::DashMap::new())),
         max: 2,
+        ipv6_prefix: 64,
     };
     let _a = admission
         .try_acquire("198.51.100.12")
@@ -256,4 +264,21 @@ fn per_ip_stream_admission_enforces_its_configured_max() {
         ),
         "the third concurrent acquisition must be refused"
     );
+}
+
+#[test]
+fn per_ip_stream_admission_uses_configured_ipv6_prefix() {
+    let admission = PerIpStreamAdmission {
+        counts: Some(Arc::new(dashmap::DashMap::new())),
+        max: 1,
+        ipv6_prefix: 128,
+    };
+    let _first = admission
+        .try_acquire("2001:db8:abcd:12::1")
+        .expect("first host admitted")
+        .expect("guard");
+    let _second = admission
+        .try_acquire("2001:db8:abcd:12::ffff")
+        .expect("a different IPv6 host has its own cap")
+        .expect("guard");
 }

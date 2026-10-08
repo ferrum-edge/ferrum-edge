@@ -354,15 +354,15 @@ impl BodyValidator {
             optional_bool(config, "protobuf_reject_unknown_fields")?.unwrap_or(false);
         let grpc_max_decompressed_size_bytes =
             match optional_usize(config, "grpc_max_decompressed_size_bytes")? {
-            Some(0) => {
-                return Err(
-                    "body_validator: `grpc_max_decompressed_size_bytes` must be greater than zero"
-                        .to_string(),
-                );
-            }
-            Some(limit) => limit,
-            None => default_grpc_max_decompressed_size_bytes(),
-        };
+                Some(0) => {
+                    return Err(
+                        "body_validator: `grpc_max_decompressed_size_bytes` must be greater than zero"
+                            .to_string(),
+                    );
+                }
+                Some(limit) => limit,
+                None => default_grpc_max_decompressed_size_bytes(),
+            };
 
         let has_protobuf_request_validation = protobuf_targets.has_request();
         let has_protobuf_response_validation = protobuf_targets.has_response();
