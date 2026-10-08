@@ -10863,13 +10863,13 @@ impl ProxyState {
     /// [`PerIpRequestGuard`] / [`PerIpConnectionGuard`], but this sweep catches
     /// edge cases (e.g., task cancellation without guard drop).
     ///
-    /// Returns `Some(JoinHandle)` when either per-IP map is enabled so the
-    /// caller can join the task during the background-task drain phase of
-    /// graceful shutdown. Returns `None` when both
-    /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` and
-    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` and both stream-listener
-    /// per-source caps are `0` (no tracking, no task to spawn). The task exits
-    /// cleanly on `shutdown_rx` change so it doesn't wedge shutdown — consistent with `start_backend_capability_refresh_task`,
+    /// Returns `Some(JoinHandle)` when any per-IP request, WebSocket,
+    /// CONNECT-UDP, TCP, or UDP tracking map is enabled so the caller can join
+    /// the task during the background-task drain phase of graceful shutdown.
+    /// Returns `None` when all of those per-source caps are disabled (no
+    /// tracking, no task to spawn). The task exits cleanly on `shutdown_rx`
+    /// change so it doesn't wedge shutdown — consistent with
+    /// `start_backend_capability_refresh_task`,
     /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
     /// metrics monitors.
     pub fn start_per_ip_cleanup_task(

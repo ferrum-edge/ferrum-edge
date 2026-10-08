@@ -59,7 +59,7 @@
 //! | Bound | Source |
 //! |---|---|
 //! | Concurrent sessions | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` |
-//! | Concurrent sessions per client | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`, IPv6 grouped by [`CONNECT_UDP_PER_CLIENT_IPV6_PREFIX`] |
+//! | Concurrent sessions per client | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`, IPv6 grouped by `FERRUM_PER_IP_IPV6_PREFIX` |
 //! | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS`, which also raises the frontend QUIC idle floor (see [`crate::http3::config::Http3ServerConfig::frontend_idle_timeout`]) |
 //! | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped by the RFC 9298 §5 ceiling of 65527 |
 //! | DATAGRAM capsule length | payload ceiling + [`CAPSULE_FRAMING_SLACK_BYTES`] |
@@ -1691,15 +1691,6 @@ enum ClientRelayStep {
     SocketUnusable,
 }
 
-/// IPv6 prefix length that groups CONNECT-UDP sources for the per-client
-/// tunnel cap (`FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`).
-///
-/// One IPv6 subscriber allocation is conventionally a `/64`, so per-address
-/// keys would let a single client rotate source addresses to mint a fresh
-/// budget for every tunnel. IPv4 (including IPv4-mapped IPv6) stays
-/// per-address.
-pub const CONNECT_UDP_PER_CLIENT_IPV6_PREFIX: u8 = 64;
-
 /// Key one resolved client identity for the per-client CONNECT-UDP tunnel cap.
 ///
 /// IPv4 and IPv4-mapped IPv6 render as the canonical IPv4 address. Native IPv6
@@ -1725,13 +1716,14 @@ pub fn connect_udp_client_key(client_ip: &str, ipv6_prefix: u8) -> String {
 /// Admit one CONNECT-UDP tunnel for `client_ip` against the per-client budget.
 ///
 /// `counts == None` or `max == 0` means the cap is disabled (`Ok(None)`). The
-/// source is grouped by [`connect_udp_client_key`] with
-/// [`CONNECT_UDP_PER_CLIENT_IPV6_PREFIX`]. The returned guard releases the
-/// slot on drop, so the caller must hold it for the tunnel's whole lifetime —
-/// past the per-IP *request* guard, which ends when the 200 is committed.
+/// source is grouped by [`connect_udp_client_key`] with `ipv6_prefix`, shared
+/// with the other per-IP limits. The returned guard releases the slot on drop,
+/// so the caller must hold it for the tunnel's whole lifetime — past the
+/// per-IP *request* guard, which ends when the 200 is committed.
 pub fn try_acquire_connect_udp_client_slot(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     client_ip: &str,
+    ipv6_prefix: u8,
     max: u64,
 ) -> Result<Option<crate::proxy::PerIpConnectionGuard>, crate::proxy::PerIpLimitExceeded> {
     let Some(counts) = counts else {
@@ -1740,7 +1732,7 @@ pub fn try_acquire_connect_udp_client_slot(
     if max == 0 {
         return Ok(None);
     }
-    let key = connect_udp_client_key(client_ip, CONNECT_UDP_PER_CLIENT_IPV6_PREFIX);
+    let key = connect_udp_client_key(client_ip, ipv6_prefix);
     crate::proxy::try_acquire_per_ip_slot(Some(counts), &key, max)
 }
 
@@ -2093,6 +2085,7 @@ pub(crate) async fn handle_h3_connect_udp(
     let client_tunnel_guard = match try_acquire_connect_udp_client_slot(
         state.per_ip_connect_udp_sessions.as_ref(),
         &ctx.client_ip,
+        state.per_ip_ipv6_prefix,
         state.http3_connect_udp_max_sessions_per_ip,
     ) {
         Ok(guard) => guard,
