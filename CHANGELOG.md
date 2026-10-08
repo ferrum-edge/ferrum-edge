@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composed gRPC-Web view keeps every HTTP plugin and is unaffected. See
   [Upgrade notes](docs/upgrade_guide.md#unreleased).
 - **Gateway-asserted request headers are applied after the client's
-  `Connection` nominations are resolved.** HTTP/1.1 and HTTP/3 ingress now
+  `Connection` nominations are resolved** (#6090). HTTP/1.1 and HTTP/3 ingress now
   remove the fields a client's `Connection` header nominates before any plugin
   runs, and rewrite `Connection` to keep only the `close` option and request
   hop-by-hop names. The backend boundary's hop-by-hop strip can therefore no
@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Expect` keep their values for routing and framing. HTTP/2 rejects
   `Connection` and is unchanged.
 - **`claim_headers` destinations and `x-geo-country` treat `_` as `-` when
-  removing client values**, as the `x-consumer-*` namespace already does.
+  removing client values** (#6090), as the `x-consumer-*` namespace already
+  does.
   CGI-style backends (Rack, WSGI, PHP-FPM) fold both spellings onto one
   variable, so they now see only the gateway's value.
 
