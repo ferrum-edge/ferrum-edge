@@ -686,7 +686,7 @@ impl CpGrpcAdmissionController {
         node_id: &str,
     ) -> Result<CpGrpcStreamPermit, CpGrpcAdmissionRejection> {
         self.validate_node_id(node_id)?;
-        let principal = principal_key(subject);
+        let principal = authenticated_principal_key(namespace, subject);
         let node_key = node_state_key(namespace, &principal, node_id);
         let mut permit = self.reserve_stream(namespace, &principal)?;
         permit.register_node(&node_key)?;
@@ -947,6 +947,19 @@ pub fn validate_node_id(node_id: &str, max_bytes: usize) -> Result<(), CpGrpcAdm
 /// subject adversarially.
 pub fn principal_key(subject: &str) -> String {
     domain_digest(b"xds-principal", subject, PRINCIPAL_KEY_DIGEST_LEN)
+}
+
+/// Stable key for a principal within its authenticated tenant namespace.
+/// The same subject may be chosen independently by credentials in different
+/// namespaces, so namespace is part of both the quota and mutable-state key.
+pub fn authenticated_principal_key(namespace: &str, subject: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cp-principal");
+    hasher.update([0xff]);
+    hasher.update(namespace.len().to_be_bytes());
+    hasher.update(namespace.as_bytes());
+    hasher.update(subject.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Redacted, non-reversible stand-in for a client-supplied identifier

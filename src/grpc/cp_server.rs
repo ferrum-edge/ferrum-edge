@@ -45,7 +45,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, interval_at};
 use tokio_stream::StreamExt;
@@ -86,6 +86,7 @@ use crate::modes::mesh::slice::{
 /// Application-level ConfigSync heartbeat interval (matches DP silence budget).
 pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
+static LAST_TENANT_SUBSCRIPTION_REJECTION_LOG: AtomicU64 = AtomicU64::new(0);
 
 /// Project this subscriber's namespace view of Gateway frontend TLS.
 ///
@@ -672,17 +673,34 @@ impl CpGrpcServer {
         node_id: &str,
         namespace: &str,
         result: &'static str,
-        reason: &str,
+        _reason: &str,
     ) {
         match result {
             "success" => info!(
                 audit.event = "tenant_subscription",
                 surface, node_id, namespace, result, "Tenant subscription accepted"
             ),
-            _ => warn!(
-                audit.event = "tenant_subscription",
-                surface, node_id, namespace, result, reason, "Tenant subscription rejected"
-            ),
+            _ => {
+                if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                    let now = elapsed.as_secs();
+                    let last = LAST_TENANT_SUBSCRIPTION_REJECTION_LOG.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) >= 60
+                        && LAST_TENANT_SUBSCRIPTION_REJECTION_LOG
+                            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        warn!(
+                            audit.event = "tenant_subscription",
+                            surface,
+                            node_id = "",
+                            namespace = "",
+                            result,
+                            reason = "request refused",
+                            "Tenant subscription rejected"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -968,6 +986,15 @@ impl CpGrpcServer {
         let mut visible_namespaces =
             Self::mesh_visible_namespaces(mesh, request, allow_cross_namespace_mesh_visibility);
         Self::constrain_visible_namespaces_to_scope(&mut visible_namespaces, scope);
+        mesh.virtual_service_cors_policies.retain(|policy| {
+            visible_namespaces.contains(&policy.namespace)
+                && Self::namespace_allowed_by_scope(&policy.namespace, scope)
+                && bearer_namespaces
+                    .is_none_or(|allowed| allowed.contains(&policy.namespace))
+                && crate::modes::mesh::config::virtual_service_cors_policy_exported_to_namespace(
+                    policy, namespace,
+                )
+        });
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
         // namespace this CP is allowed to serve. An explicit bearer claim
@@ -2409,8 +2436,8 @@ impl ConfigSync for CpGrpcServer {
                 let req = request.get_ref();
                 Self::audit_tenant_subscription(
                     "ConfigSync.GetFullConfig",
-                    &req.node_id,
-                    &req.namespace,
+                    "",
+                    "",
                     "failure",
                     status.message(),
                 );
@@ -2421,6 +2448,18 @@ impl ConfigSync for CpGrpcServer {
 
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;
+        if req.node_id.trim() != identity.subject {
+            Self::audit_tenant_subscription(
+                "ConfigSync.GetFullConfig",
+                "",
+                "",
+                "failure",
+                "node_id does not match authenticated subject",
+            );
+            return Err(Status::permission_denied(
+                "GetFullConfig node_id must match the authenticated JWT subject",
+            ));
+        }
         Self::check_config_sync_build(
             "ConfigSync.GetFullConfig",
             &req.node_id,
@@ -2451,6 +2490,25 @@ impl ConfigSync for CpGrpcServer {
             );
             return Err(status);
         }
+        let _admission_permit = match self.admission.reserve_native_stream(
+            &req.namespace,
+            &identity.subject,
+            &req.node_id,
+        ) {
+            Ok(permit) => permit,
+            Err(rejection) => {
+                record_native_rejection(CpGrpcStreamSurface::ConfigSync, rejection);
+                let status = rejection.into_native_status();
+                Self::audit_tenant_subscription(
+                    "ConfigSync.GetFullConfig",
+                    "",
+                    "",
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
         let config = self.config.load_full();
         let (filtered, trust_bundles_json) =
             Self::filter_config_and_trust_for_scope(config.as_ref(), &req.namespace, &self.scope)

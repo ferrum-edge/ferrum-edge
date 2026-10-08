@@ -517,6 +517,7 @@ impl MeshSliceDriftRegistry {
     ) -> Result<String, MeshSliceDriftAdmitError> {
         self.open_session_inner(
             node_id,
+            node_id,
             namespace,
             connected_at,
             desired_version,
@@ -539,10 +540,37 @@ impl MeshSliceDriftRegistry {
         scope: CpScope,
         bearer_namespaces: Option<HashSet<String>>,
     ) -> Result<String, MeshSliceDriftAdmitError> {
+        self.open_projected_session_scoped(
+            node_id,
+            node_id,
+            namespace,
+            connected_at,
+            initial_slice,
+            request,
+            scope,
+            bearer_namespaces,
+        )
+    }
+
+    /// Open a production session under an opaque namespace-bound principal
+    /// key while retaining the authenticated subject for the admin view.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_projected_session_scoped(
+        &self,
+        node_id: &str,
+        registry_key: &str,
+        namespace: &str,
+        connected_at: DateTime<Utc>,
+        initial_slice: &MeshSlice,
+        request: MeshSliceRequest,
+        scope: CpScope,
+        bearer_namespaces: Option<HashSet<String>>,
+    ) -> Result<String, MeshSliceDriftAdmitError> {
         validate_projection_context(&request, &scope, bearer_namespaces.as_ref())?;
         let digest = slice_content_digest(initial_slice)?;
         self.open_session_inner(
             node_id,
+            registry_key,
             namespace,
             connected_at,
             Some(initial_slice.version.as_str()),
@@ -558,6 +586,7 @@ impl MeshSliceDriftRegistry {
     fn open_session_inner(
         &self,
         node_id: &str,
+        registry_key: &str,
         namespace: &str,
         connected_at: DateTime<Utc>,
         desired_version: Option<&str>,
@@ -571,7 +600,7 @@ impl MeshSliceDriftRegistry {
         }
         let session_token = Uuid::new_v4().simple().to_string();
         let mut state = self.state_locked();
-        if !state.entries.contains_key(node_id)
+        if !state.entries.contains_key(registry_key)
             && state.entries.len() >= self.max_entries
             && !evict_oldest_disconnected(&mut state.entries)
         {
@@ -579,7 +608,7 @@ impl MeshSliceDriftRegistry {
         }
         let now = connected_at;
         state.entries.insert(
-            node_id.to_string(),
+            registry_key.to_string(),
             LiveEntry {
                 node_id: node_id.to_string(),
                 namespace: namespace.to_string(),
