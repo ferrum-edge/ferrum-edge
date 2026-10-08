@@ -191,6 +191,247 @@ fn a_principal_at_its_share_may_reuse_its_own_expired_marker() {
     );
 }
 
+/// The same proof (one marker digest) charged to `principal`.
+fn proof_for(sub: &str, proof: &str, principal: &str) -> ReplayMarker {
+    domain(sub).marker_with_principal(&[b"key", proof.as_bytes()], &[principal.as_bytes()])
+}
+
+/// An expired marker still stored under another principal is a new use of the
+/// proof, not a replay (issue #6106). It is re-admitted under the presenting
+/// principal and its quota charge moves with it: the previous principal's
+/// share is released and the new principal's share is charged.
+#[test]
+fn an_expired_marker_is_readmitted_under_a_new_principal_and_moves_its_charge() {
+    let sub = "principal-move-admit";
+    // A cap of 8 gives each principal a share of 2.
+    let authority = process_authority(sub, 8);
+    let lane = process_lane(&authority).expect("process lane");
+    let now = monotonic_millis();
+    let later = now + 1_000;
+    let proof_a = proof_for(sub, "proof", "principal-a");
+    let proof_b = proof_for(sub, "proof", "principal-b");
+    let other_a = proof_for(sub, "other-a", "principal-a");
+    let next_a = proof_for(sub, "next-a", "principal-a");
+    let extra_a = proof_for(sub, "extra-a", "principal-a");
+    let other_b = proof_for(sub, "other-b", "principal-b");
+    let extra_b = proof_for(sub, "extra-b", "principal-b");
+    assert_eq!(proof_a.digest(), proof_b.digest());
+
+    assert_eq!(
+        admit_process_at(&authority, &proof_a, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &other_a, later),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(lane.principal_entries_for_tests(&proof_a), 2);
+
+    // `proof` has expired; `other-a` is still live.
+    let after_first_expires = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&authority, &proof_b, after_first_expires),
+        Some(ReplayAdmission::Admitted),
+        "an expired marker stored under another principal must be re-admitted"
+    );
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_a),
+        1,
+        "the previous principal's charge must be released"
+    );
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_b),
+        1,
+        "the presenting principal must be charged"
+    );
+    assert_eq!(lane.retained_entries(), 2, "the move refreshes in place");
+
+    // The refreshed marker is live again for every principal.
+    assert_eq!(
+        admit_process_at(&authority, &proof_b, after_first_expires),
+        Some(ReplayAdmission::Replay)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &proof_a, after_first_expires),
+        Some(ReplayAdmission::Replay)
+    );
+
+    // The released share is usable again, and both shares still bound.
+    assert_eq!(
+        admit_process_at(&authority, &next_a, after_first_expires),
+        Some(ReplayAdmission::Admitted),
+        "the previous principal regains the share the move released"
+    );
+    assert_eq!(
+        admit_process_at(&authority, &extra_a, after_first_expires),
+        Some(ReplayAdmission::CapacityRefused)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &other_b, after_first_expires),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &extra_b, after_first_expires),
+        Some(ReplayAdmission::CapacityRefused),
+        "the moved marker must count against the new principal's share"
+    );
+    assert_eq!(lane.principal_entries_for_tests(&proof_a), 2);
+    assert_eq!(lane.principal_entries_for_tests(&proof_b), 2);
+    assert_eq!(lane.retained_entries(), 4);
+}
+
+/// A move the new principal's share cannot absorb is refused without evicting
+/// any of that principal's live markers. Reclaiming the expired marker returns
+/// its previous principal's charge, so neither principal leaks quota.
+#[test]
+fn a_move_refused_by_the_new_principals_share_evicts_nothing_and_leaks_nothing() {
+    let sub = "principal-move-refused";
+    let authority = process_authority(sub, 8);
+    let lane = process_lane(&authority).expect("process lane");
+    let now = monotonic_millis();
+    let later = now + 1_000;
+    let proof_a = proof_for(sub, "proof", "principal-a");
+    let proof_b = proof_for(sub, "proof", "principal-b");
+    let first_b = proof_for(sub, "first-b", "principal-b");
+    let second_b = proof_for(sub, "second-b", "principal-b");
+
+    assert_eq!(
+        admit_process_at(&authority, &proof_a, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    for marker in [&first_b, &second_b] {
+        assert_eq!(
+            admit_process_at(&authority, marker, later),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+
+    let after_first_expires = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&authority, &proof_b, after_first_expires),
+        Some(ReplayAdmission::CapacityRefused),
+        "a principal at its share cannot take over another principal's expired marker"
+    );
+    for marker in [&first_b, &second_b] {
+        assert_eq!(
+            admit_process_at(&authority, marker, after_first_expires),
+            Some(ReplayAdmission::Replay),
+            "a refused move must never evict a live marker"
+        );
+    }
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_a),
+        0,
+        "reclaiming the expired marker must release its previous principal's charge"
+    );
+    assert_eq!(lane.principal_entries_for_tests(&proof_b), 2);
+    assert_eq!(lane.retained_entries(), 2);
+
+    assert_eq!(
+        admit_process_at(&authority, &proof_a, after_first_expires),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(lane.principal_entries_for_tests(&proof_a), 1);
+}
+
+/// The held-write path refreshes an expired marker under the presenting
+/// principal too, moving the charge exactly like ordinary admission.
+#[test]
+fn held_expiry_refresh_moves_an_expired_marker_to_the_presenting_principal() {
+    const CAP: usize = 8;
+    let sub = "principal-move-held";
+    let authority = process_authority(sub, CAP);
+    let lane = process_lane(&authority).expect("process lane");
+    let now = monotonic_millis();
+    let after_expiry = now + RETENTION.as_millis() as u64 + 1;
+    let proof_a = proof_for(sub, "proof", "principal-a");
+    let proof_b = proof_for(sub, "proof", "principal-b");
+    let first_b = proof_for(sub, "first-b", "principal-b");
+    let second_b = proof_for(sub, "second-b", "principal-b");
+
+    assert_eq!(
+        admit_process_at(&authority, &proof_a, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    lane.admit_at_holding_expiry_write_for_tests(&proof_b, RETENTION, CAP, after_expiry)
+        .expect("an expired marker must be refreshed for the presenting principal")
+        .finish();
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_a),
+        0,
+        "the held refresh must release the previous principal's charge"
+    );
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_b),
+        1,
+        "the held refresh must charge the presenting principal"
+    );
+    assert_eq!(lane.retained_entries(), 1);
+    assert_eq!(
+        admit_process_at(&authority, &proof_a, after_expiry),
+        Some(ReplayAdmission::Replay)
+    );
+
+    assert_eq!(
+        admit_process_at(&authority, &first_b, after_expiry),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        admit_process_at(&authority, &second_b, after_expiry),
+        Some(ReplayAdmission::CapacityRefused),
+        "the moved marker must count against the new principal's share"
+    );
+}
+
+/// The held-write path enforces the presenting principal's share when it
+/// moves an expired marker, and keeps the previous charge when it refuses.
+#[test]
+fn held_expiry_refresh_respects_the_presenting_principals_share() {
+    const CAP: usize = 8;
+    let sub = "principal-move-held-refused";
+    let authority = process_authority(sub, CAP);
+    let lane = process_lane(&authority).expect("process lane");
+    let now = monotonic_millis();
+    let later = now + 1_000;
+    let proof_a = proof_for(sub, "proof", "principal-a");
+    let proof_b = proof_for(sub, "proof", "principal-b");
+    let first_b = proof_for(sub, "first-b", "principal-b");
+    let second_b = proof_for(sub, "second-b", "principal-b");
+
+    assert_eq!(
+        admit_process_at(&authority, &proof_a, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    for marker in [&first_b, &second_b] {
+        assert_eq!(
+            admit_process_at(&authority, marker, later),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+
+    let after_first_expires = now + RETENTION.as_millis() as u64 + 1;
+    let refused = lane.admit_at_holding_expiry_write_for_tests(
+        &proof_b,
+        RETENTION,
+        CAP,
+        after_first_expires,
+    );
+    assert_eq!(refused.err(), Some(ReplayAdmission::CapacityRefused));
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_a),
+        1,
+        "a refused move keeps the previous principal's charge with the entry"
+    );
+    assert_eq!(lane.principal_entries_for_tests(&proof_b), 2);
+    assert_eq!(lane.retained_entries(), 3);
+
+    lane.admit_at_holding_expiry_write_for_tests(&proof_a, RETENTION, CAP, after_first_expires)
+        .expect("the owning principal may still refresh its own expired marker")
+        .finish();
+    assert_eq!(lane.principal_entries_for_tests(&proof_a), 1);
+    assert_eq!(lane.retained_entries(), 3);
+}
+
 /// Concurrent claims by one principal reserve its share atomically: exactly
 /// the share is admitted however the claims interleave, while the lane itself
 /// still has room.

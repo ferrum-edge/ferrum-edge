@@ -42,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client that overruns `max_concurrent_streams` that many times on one
   connection receives `GOAWAY(ENHANCE_YOUR_CALM)`.
 
+### Fixed
+
+- **Expired replay markers are re-admitted under a new principal** (issue
+  #6106). In process-scoped replay stores, an expired marker still stored under
+  a different principal was answered as a replay. It is now re-admitted under
+  the presenting principal, and the quota charge moves: the previous
+  principal's share is released and the new principal's share is charged. A new
+  principal already at its share is refused, and live markers are still never
+  evicted.
+
 ## [0.9.15] - 2026-10-08
 
 Release prepared on **2026-10-08 UTC** from main

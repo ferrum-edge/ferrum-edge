@@ -23864,8 +23864,14 @@ components:
                 type: string
                 pattern: '^[^.]+(\.[^.]+)*$'
                 description: >-
-                  Per-provider override of the global X-Authenticated-Identity
-                  display claim path.
+                  Per-provider X-Authenticated-Identity display claim path.
+                  The display claim is resolved in this order: this provider's
+                  consumer_header_claim, then the plugin-level
+                  consumer_header_claim, then this provider's effective
+                  consumer_identity_claim (its own consumer_identity_claim,
+                  else the plugin-level consumer_identity_claim). When the
+                  selected display claim is absent or not a string, the header
+                  carries the authenticated identity value instead.
               claim_headers:
                 type: object
                 propertyNames:
