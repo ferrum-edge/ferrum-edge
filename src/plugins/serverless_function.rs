@@ -37,7 +37,7 @@
 //! | `aws_access_key_id` | `AWS_ACCESS_KEY_ID` |
 //! | `aws_secret_access_key` | `AWS_SECRET_ACCESS_KEY` |
 //! | `aws_function_name` | `AWS_LAMBDA_FUNCTION_NAME` |
-//! | `aws_session_token` | `AWS_SESSION_TOKEN` |
+//! | `aws_session_token` | `AWS_SESSION_TOKEN`, only when the key pair also resolved from the environment |
 //! | `azure_function_key` | `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` |
 //! | `gcp_bearer_token` | `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` |
 //!
@@ -51,13 +51,16 @@
 //! The AWS fallbacks are the process's own cloud identity, not a value the
 //! config author supplied. When any of `aws_access_key_id`,
 //! `aws_secret_access_key`, or `aws_session_token` resolves from the
-//! environment, the effective Lambda endpoint (derived from `aws_region`, or
-//! overridden by `aws_endpoint_url` / `AWS_LAMBDA_ENDPOINT_URL`) must be an
-//! official AWS Lambda endpoint for the configured region — see
-//! [`crate::plugins::utils::ambient_cloud_credentials`]. Admission refuses any
-//! other endpoint, and the invocation re-checks it fail closed. A config that
-//! carries its own key pair may target any valid endpoint (LocalStack, a mock),
-//! and `allow_custom_endpoint_with_ambient_credentials: true` deliberately lifts
+//! environment, `aws_region` must be a commercial, GovCloud, or China region,
+//! and a config-chosen Lambda endpoint (the host derived from `aws_region`, or
+//! the `aws_endpoint_url` override) must be an official AWS Lambda endpoint for
+//! that region — see [`crate::plugins::utils::ambient_cloud_credentials`].
+//! Admission refuses anything else, and the invocation re-checks the endpoint
+//! fail closed. An `AWS_LAMBDA_ENDPOINT_URL` override (used only when the
+//! config sets no `aws_endpoint_url`) is set by the same environment owner as
+//! the credentials and is trusted like them. A config that carries its own key
+//! pair may target any valid endpoint (LocalStack, a mock), and
+//! `allow_custom_endpoint_with_ambient_credentials: true` deliberately lifts
 //! the scope for a private endpoint (issue #6111).
 //!
 //! These env vars may themselves be resolved by the gateway's external secret
@@ -104,7 +107,8 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use url::{Host, Url};
 
 use super::utils::ambient_cloud_credentials::{
-    ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS, AmbientAwsEndpointScope, AwsService,
+    ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS, AmbientAwsEndpointScope, AwsCredentialSources,
+    AwsService, aws_partition_dns_suffix, is_aws_region,
 };
 use super::utils::aws_sigv4;
 use super::utils::query::{QueryAmbiguity, canonical_query_for_policy, has_valid_percent_triplets};
@@ -640,23 +644,13 @@ impl ServerlessFunction {
                     // Shape-only admission cannot see a serving node's
                     // environment, but a row without its own key pair signs
                     // with the process credentials wherever it is served, so
-                    // a config-chosen endpoint is screened here as well
-                    // (issue #6111). The serving node re-checks the effective
-                    // endpoint below once every value is resolved.
+                    // the config-chosen region and endpoint are screened here
+                    // as well (issue #6111). The serving node re-checks the
+                    // effective values below once every one is resolved.
                     if credentials == CredentialAdmission::Deferred
                         && !allow_custom_endpoint_with_ambient_credentials
-                        && let Some(endpoint) = optional_config_string(config, "aws_endpoint_url")?
                     {
-                        let ambient_fields = ambient_aws_credential_fields(config, false);
-                        if !ambient_fields.is_empty() {
-                            let scope = match optional_config_string(config, "aws_region")? {
-                                Some(region) => {
-                                    AmbientAwsEndpointScope::new(AwsService::Lambda, &region)
-                                }
-                                None => AmbientAwsEndpointScope::any_region(AwsService::Lambda),
-                            };
-                            ensure_ambient_lambda_endpoint(&scope, &endpoint, &ambient_fields)?;
-                        }
+                        screen_shape_only_ambient_lambda_config(config)?;
                     }
 
                     // Node-local credential resolution. Under
@@ -700,8 +694,21 @@ impl ServerlessFunction {
                     // rather than only to the config literal (issue #5181).
                     validate_aws_function_name(&function_name)?;
 
-                    let session_token = optional_config_string(config, "aws_session_token")?
-                        .or_else(|| env_non_empty("AWS_SESSION_TOKEN"));
+                    // Where each credential came from decides whether the
+                    // endpoint is scoped below (issue #6111). An STS session
+                    // token is bound to its access key, so the environment
+                    // token only completes an environment key pair.
+                    let mut credential_sources = configured_aws_credential_sources(config);
+                    let session_token = optional_config_string(config, "aws_session_token")?;
+                    let session_token = match session_token {
+                        Some(token) => Some(token),
+                        None if credential_sources.may_use_environment_session_token() => {
+                            let token = env_non_empty("AWS_SESSION_TOKEN");
+                            credential_sources.session_token_from_env = token.is_some();
+                            token
+                        }
+                        None => None,
+                    };
 
                     let qualifier = optional_config_string(config, "aws_qualifier")?;
                     if let Some(ref qualifier) = qualifier {
@@ -719,8 +726,10 @@ impl ServerlessFunction {
                     // value — e.g. `localhost:4566` without a scheme, or
                     // `tcp://…` — surfaces as a deterministic startup/config
                     // error instead of a per-request invoke failure later.
-                    let endpoint_override = optional_config_string(config, "aws_endpoint_url")?
-                        .or_else(|| env_non_empty("AWS_LAMBDA_ENDPOINT_URL"));
+                    let endpoint_override = optional_config_string(config, "aws_endpoint_url")?;
+                    let endpoint_from_env = endpoint_override.is_none();
+                    let endpoint_override =
+                        endpoint_override.or_else(|| env_non_empty("AWS_LAMBDA_ENDPOINT_URL"));
                     if let Some(ref endpoint) = endpoint_override {
                         validate_aws_endpoint_url(endpoint)?;
                     }
@@ -764,14 +773,15 @@ impl ServerlessFunction {
                     }
 
                     // Process-environment credentials may only be signed for
-                    // an official Lambda endpoint of the configured region,
-                    // whichever source chose the endpoint: the derived host
-                    // (a hostile `aws_region` is interpolated into it), the
-                    // config override, or `AWS_LAMBDA_ENDPOINT_URL`
-                    // (issue #6111).
-                    let ambient_fields =
-                        ambient_aws_credential_fields(config, session_token.is_some());
-                    let ambient_endpoint_scope = if ambient_fields.is_empty() {
+                    // an official Lambda endpoint of the configured region
+                    // when the config chose the endpoint: the derived host (a
+                    // hostile `aws_region` is interpolated into it) or the
+                    // `aws_endpoint_url` override (issue #6111). An endpoint
+                    // from `AWS_LAMBDA_ENDPOINT_URL` is chosen by the same
+                    // environment owner as the credentials, so it is trusted
+                    // like them. The region is screened either way, so the
+                    // serving node and shape-only admission agree.
+                    let ambient_endpoint_scope = if !credential_sources.is_ambient() {
                         None
                     } else if allow_custom_endpoint_with_ambient_credentials {
                         info!(
@@ -779,9 +789,17 @@ impl ServerlessFunction {
                         );
                         None
                     } else {
-                        let scope = AmbientAwsEndpointScope::new(AwsService::Lambda, &region);
-                        ensure_ambient_lambda_endpoint(&scope, &url, &ambient_fields)?;
-                        Some(scope)
+                        ensure_ambient_lambda_region(&region, credential_sources)?;
+                        if endpoint_from_env && endpoint_override.is_some() {
+                            info!(
+                                "serverless_function: process-environment AWS credentials are sent to the `AWS_LAMBDA_ENDPOINT_URL` endpoint set in the same environment"
+                            );
+                            None
+                        } else {
+                            let scope = AmbientAwsEndpointScope::new(AwsService::Lambda, &region);
+                            ensure_ambient_lambda_endpoint(&scope, &url, credential_sources)?;
+                            Some(scope)
+                        }
                     };
 
                     let aws_cfg = AwsLambdaConfig {
@@ -1240,24 +1258,61 @@ fn config_string_present(config: &Value, field: &str) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
-/// AWS credential fields this row resolves from the process environment
-/// rather than from its own config (issue #6111). `session_token_resolved`
-/// reports whether a session token is in effect at all; shape-only admission
-/// passes `false` because it cannot see the serving node's environment.
-fn ambient_aws_credential_fields(
-    config: &Value,
-    session_token_resolved: bool,
-) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    for field in ["aws_access_key_id", "aws_secret_access_key"] {
-        if !config_string_present(config, field) {
-            fields.push(field);
-        }
+/// The AWS key pair fields this row leaves to the process environment (issue
+/// #6111). The session token is never marked here: it only falls back to the
+/// environment once the key pair actually resolved from it.
+fn configured_aws_credential_sources(config: &Value) -> AwsCredentialSources {
+    AwsCredentialSources {
+        access_key_id_from_env: !config_string_present(config, "aws_access_key_id"),
+        secret_access_key_from_env: !config_string_present(config, "aws_secret_access_key"),
+        session_token_from_env: false,
     }
-    if session_token_resolved && !config_string_present(config, "aws_session_token") {
-        fields.push("aws_session_token");
+}
+
+/// Shape-only (CP/admin) screen of a Lambda row that relies on process
+/// credentials (issue #6111).
+///
+/// The admitting node cannot see a serving node's environment, but a row that
+/// omits its key pair signs with the process credentials wherever it is
+/// served, so the region and endpoint the config itself chooses are screened
+/// here. Without a configured region the serving node supplies one, so the
+/// endpoint is pinned to the service and to a well-formed region only.
+fn screen_shape_only_ambient_lambda_config(config: &Value) -> Result<(), String> {
+    let sources = configured_aws_credential_sources(config);
+    if !sources.is_ambient() {
+        return Ok(());
     }
-    fields
+    let region = optional_config_string(config, "aws_region")?;
+    if let Some(region) = region.as_deref() {
+        ensure_ambient_lambda_region(region, sources)?;
+    }
+    if let Some(endpoint) = optional_config_string(config, "aws_endpoint_url")? {
+        let scope = match region.as_deref() {
+            Some(region) => AmbientAwsEndpointScope::new(AwsService::Lambda, region),
+            None => AmbientAwsEndpointScope::any_region(AwsService::Lambda),
+        };
+        ensure_ambient_lambda_endpoint(&scope, &endpoint, sources)?;
+    }
+    Ok(())
+}
+
+/// Refuse a region outside the modelled AWS partitions for a row that signs
+/// with process credentials. The diagnostic never echoes the region.
+fn ensure_ambient_lambda_region(
+    region: &str,
+    credential_sources: AwsCredentialSources,
+) -> Result<(), String> {
+    if is_aws_region(region) {
+        return Ok(());
+    }
+    Err(format!(
+        "serverless_function: {} resolved from the process environment, so `aws_region` must be \
+         a commercial, GovCloud, or China AWS region (for example `us-east-1`, `us-gov-west-1`, \
+         or `cn-north-1`); set the AWS credentials in the plugin config, or set \
+         `{ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS}: true` to use the process credentials \
+         with another partition or a private endpoint deliberately",
+        credential_sources.ambient_field_list()
+    ))
 }
 
 /// Refuse a Lambda endpoint outside the ambient-credential scope.
@@ -1268,26 +1323,25 @@ fn ambient_aws_credential_fields(
 fn ensure_ambient_lambda_endpoint(
     scope: &AmbientAwsEndpointScope,
     endpoint: &str,
-    ambient_fields: &[&'static str],
+    credential_sources: AwsCredentialSources,
 ) -> Result<(), String> {
     if let Ok(url) = Url::parse(endpoint)
         && scope.permits_url(&url)
     {
         return Ok(());
     }
-    let fields = ambient_fields
-        .iter()
-        .map(|field| format!("`{field}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
     Err(format!(
-        "serverless_function: {fields} resolved from the process environment, so the Lambda \
-         endpoint must be an official AWS Lambda endpoint for the configured region \
-         (`https://lambda[-fips].<region>.amazonaws.com[.cn]`, \
+        "serverless_function: {} resolved from the process environment, so the Lambda endpoint \
+         must be an official AWS Lambda endpoint for the configured region over HTTPS on the \
+         default port (`https://lambda[-fips].<region>.amazonaws.com`, \
          `https://lambda[-fips].<region>.api.aws`, or an interface VPC endpoint \
-         `https://vpce-<id>.lambda.<region>.vpce.amazonaws.com`); set the AWS credentials \
-         in the plugin config, or set `{ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS}: true` \
-         to send the process credentials to this endpoint deliberately"
+         `https://vpce-<id>[-<az>].lambda[-fips].<region>.vpce.amazonaws.com`, where `<region>` \
+         is a commercial or GovCloud region; a `cn-*` region uses `amazonaws.com.cn` and the \
+         dual-stack `api.amazonwebservices.com.cn` instead); set the AWS credentials in the \
+         plugin config, or set \
+         `{ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS}: true` to send the process \
+         credentials to this endpoint deliberately",
+        credential_sources.ambient_field_list()
     ))
 }
 
@@ -1442,24 +1496,6 @@ fn gcp_authorization_header_value(token: &str) -> Result<HeaderValue, String> {
     value.push_str("Bearer ");
     value.push_str(token);
     credential_header_value("gcp_bearer_token", &value)
-}
-
-/// DNS suffix of the AWS partition a region belongs to.
-///
-/// The regional Lambda endpoint is `lambda.<region>.<suffix>`. Only the China
-/// partition uses a suffix other than `amazonaws.com`: Beijing (`cn-north-1`)
-/// and Ningxia (`cn-northwest-1`) publish `lambda.<region>.amazonaws.com.cn`,
-/// so deriving the commercial suffix there targets a hostname that is not the
-/// service (issue #5180). GovCloud (`us-gov-*`) regions are ordinary
-/// `amazonaws.com` hosts and need no special case. The air-gapped ISO
-/// partitions (`us-iso-*`, `us-isob-*`, `eu-isoe-*`, `us-isof-*`) are NOT
-/// derived — those deployments must set `aws_endpoint_url` explicitly.
-fn aws_partition_dns_suffix(region: &str) -> &'static str {
-    if region.starts_with("cn-") {
-        "amazonaws.com.cn"
-    } else {
-        "amazonaws.com"
-    }
 }
 
 /// Validate a function URL (Azure/GCP `function_url`).
