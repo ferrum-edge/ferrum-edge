@@ -639,6 +639,9 @@ struct GatewayApiStatusIndexes<'a> {
     /// Gateway's `allowedRoutes`, or one that produced no live configuration,
     /// must not make Ferrum claim the policy is effective anywhere.
     effective_backend_services: HashSet<(&'a str, &'a str)>,
+    /// The translation's selector-less Service EndpointSlice verdicts, so
+    /// `ResolvedRefs` reports exactly the backendRefs translation refused.
+    selectorless_endpoints: &'a crate::config_sources::k8s::backend_ref::SelectorlessEndpointGuard,
 }
 
 impl<'a> GatewayApiStatusIndexes<'a> {
@@ -844,6 +847,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             has_any_service,
             conflicts_by_loser,
             effective_backend_services,
+            selectorless_endpoints: &translation.selectorless_endpoints,
         }
     }
 }
@@ -3971,6 +3975,7 @@ fn route_unresolved_backend_ref_reason(
         services_by_ns_name: &indexes.services_by_ns_name,
         service_imports_by_ns_name: &indexes.service_imports_by_ns_name,
         has_any_service: indexes.has_any_service,
+        selectorless_endpoints: indexes.selectorless_endpoints,
     };
 
     for backend_ref in route
@@ -4036,6 +4041,8 @@ fn api_group(api_version: &str) -> &str {
 }
 
 fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
+    use crate::config_sources::k8s::backend_ref::message_is_selectorless_endpoint_refusal;
+
     match error {
         K8sTranslateError::InvalidResource { message, .. } => {
             message.contains("ReferenceGrant")
@@ -4046,6 +4053,7 @@ fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
                 || crate::config_sources::k8s::backend_ref::message_is_unsupported_backend_protocol(
                     message,
                 )
+                || message_is_selectorless_endpoint_refusal(message)
         }
         K8sTranslateError::Unsupported(_) => false,
     }

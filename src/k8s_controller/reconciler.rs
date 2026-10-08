@@ -215,6 +215,9 @@ pub struct ReconcilerConfig {
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub pod_discovery_enabled: bool,
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`; see
+    /// [`crate::config_sources::k8s::K8sTranslationOptions::allow_selectorless_external_endpoints`].
+    pub allow_selectorless_external_endpoints: bool,
     pub gateway_api_data_plane_service_namespace: Option<String>,
     pub gateway_api_data_plane_service_name: Option<String>,
     pub gateway_api_status_address: Option<String>,
@@ -348,6 +351,8 @@ async fn run_reconcile_loop(
             watch_namespaces: reconciler_config.watch_namespaces.clone(),
             trust_domain: trust_domain.clone(),
             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+            allow_selectorless_external_endpoints: reconciler_config
+                .allow_selectorless_external_endpoints,
             gateway_api_data_plane_service_namespace: reconciler_config
                 .gateway_api_data_plane_service_namespace
                 .clone(),
@@ -396,6 +401,8 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        allow_selectorless_external_endpoints: reconciler_config
+                            .allow_selectorless_external_endpoints,
                         gateway_api_data_plane_service_namespace: reconciler_config
                             .gateway_api_data_plane_service_namespace
                             .clone(),
@@ -441,6 +448,8 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        allow_selectorless_external_endpoints: reconciler_config
+                            .allow_selectorless_external_endpoints,
                         gateway_api_data_plane_service_namespace: reconciler_config
                             .gateway_api_data_plane_service_namespace
                             .clone(),
@@ -636,6 +645,7 @@ struct ReconcileContext {
     watch_namespaces: Vec<String>,
     trust_domain: TrustDomain,
     pod_discovery_enabled: bool,
+    allow_selectorless_external_endpoints: bool,
     gateway_api_data_plane_service_namespace: Option<String>,
     gateway_api_data_plane_service_name: Option<String>,
     gateway_api_status_address: Option<String>,
@@ -1142,6 +1152,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_source_namespaces(source_namespaces)
         .with_pod_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
+        .with_selectorless_external_endpoints_allowed(ctx.allow_selectorless_external_endpoints)
         .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced)
         .with_mesh_overlay_authority(ctx.mesh_overlay_authority)
         .with_node_waypoint_inventory(ctx.node_waypoint_inventory.clone());

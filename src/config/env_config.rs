@@ -2774,6 +2774,12 @@ pub struct EnvConfig {
     /// false for one release; when true, CP also watches core resources and
     /// derives mesh services/workloads from ready pods.
     pub k8s_pod_discovery_enabled: bool,
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. Let a Gateway API
+    /// backendRef to a selector-less Service in the route's own namespace
+    /// reach EndpointSlice IPs that are not Pod IPs (an external database or
+    /// VM). Never admits another namespace's Pods, FQDN endpoints, or
+    /// loopback/link-local/unspecified/multicast addresses. Default: false.
+    pub k8s_allow_selectorless_external_endpoints: bool,
     /// Namespace where the Ferrum K8s controller and ambient NodeWaypoint
     /// DaemonSet are installed. Defaults to `FERRUM_NAMESPACE`; Helm sets it
     /// to `.Release.Namespace` so managed workload namespace overrides do not
@@ -4283,6 +4289,7 @@ impl Default for EnvConfig {
             node_agent_cni_socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
+            k8s_allow_selectorless_external_endpoints: false,
             k8s_controller_namespace: "ferrum".to_string(),
             k8s_node_locality_enabled: false,
             k8s_watch_namespaces: Vec::new(),
@@ -4931,6 +4938,7 @@ impl EnvConfig {
             node_agent_cni_socket_path: String = "FERRUM_NODE_AGENT_CNI_SOCKET_PATH" => "/var/run/ferrum/node-agent-cni.sock".to_string();
             k8s_controller_namespace: String = "FERRUM_K8S_CONTROLLER_NAMESPACE" => namespace.clone();
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
+            k8s_allow_selectorless_external_endpoints: bool = "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
@@ -5835,6 +5843,7 @@ impl EnvConfig {
             node_agent_cni_socket_path,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
+            k8s_allow_selectorless_external_endpoints,
             k8s_controller_namespace,
             k8s_node_locality_enabled,
             k8s_watch_namespaces,

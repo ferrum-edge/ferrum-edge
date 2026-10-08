@@ -1500,9 +1500,16 @@ async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend
             }),
         );
         route.api_version = "gateway.networking.k8s.io/v1".into();
-        let mut translated =
-            translate_k8s_objects(&[service, slice, route], options_for_namespace("default"))
-                .expect("translate manual endpoint route");
+        // The backendRef guard admits a selector-less Service's endpoints
+        // only when they are Pods of its namespace (issue #6108); this Pod
+        // owns the loopback address the local backend listens on.
+        let mut pod = object("Pod", "default", "manual-0", json!({}));
+        pod.status = json!({"phase": "Running", "podIP": "127.0.0.1"});
+        let mut translated = translate_k8s_objects(
+            &[service, slice, route, pod],
+            options_for_namespace("default"),
+        )
+        .expect("translate manual endpoint route");
         assert_eq!(translated.config.proxies.len(), 1);
         assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
         assert_eq!(translated.config.proxies[0].backend_port, backend_port);

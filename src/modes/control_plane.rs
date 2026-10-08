@@ -2998,6 +2998,8 @@ pub async fn run(
             watch_mesh_config: env_config.k8s_watch_mesh_config,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
+            allow_selectorless_external_endpoints: env_config
+                .k8s_allow_selectorless_external_endpoints,
             watch_node_locality: env_config.k8s_node_locality_enabled,
             gateway_api_data_plane_service_namespace: env_config
                 .gateway_api_data_plane_service_namespace

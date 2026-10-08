@@ -26,6 +26,34 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.15
+
+**Gateway API backendRefs to selector-less Services reach only Pods of the
+Service's namespace (#6108).** A backendRef to a Service without
+`spec.selector` is now admitted only when every endpoint in its
+EndpointSlices is the IP of an observed Pod in the Service's namespace (and of
+no other namespace's Pod). Anything else is refused: HTTPRoute and GRPCRoute
+answer that backend's share of traffic fail-closed, TCPRoute/TLSRoute/UDPRoute
+reject the route, and status reports `ResolvedRefs=False` / `RefNotPermitted`
+with a matching controller translation warning. Before upgrading, check:
+
+- selector-less Services that front an external host (a database or VM IP).
+  Set `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true` on the control
+  plane to admit endpoint IPs that no observed Pod claims, for routes in the
+  same namespace as the Service. A ReferenceGrant-admitted cross-namespace
+  reference never benefits from it, and FQDN endpoints and loopback,
+  link-local, unspecified, multicast and broadcast addresses stay refused;
+- selector-less Services whose EndpointSlices name Pods in another namespace,
+  or Pods outside the controller's Pod watch scope (`FERRUM_K8S_WATCH_NAMESPACES`).
+  Move the backendRef to a Service in the Pods' namespace, behind a
+  ReferenceGrant if the route lives elsewhere;
+- find candidates with
+  `kubectl get svc -A -o json | jq -r '.items[] | select(.spec.type != "ExternalName" and (.spec.selector // {} | length) == 0) | "\(.metadata.namespace)/\(.metadata.name)"'`.
+
+The check runs only with pod discovery, which supplies the Pod inventory.
+With `FERRUM_K8S_POD_DISCOVERY_ENABLED=false` the controller keeps admitting
+such backendRefs and logs that they were not verified.
+
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main

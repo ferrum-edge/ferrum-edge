@@ -52,6 +52,18 @@ fn object(api_version: &str, kind: &str, name: &str, namespace: &str, spec: Valu
     }
 }
 
+/// A Pod in `default` owning `127.0.0.1`, where the test backends listen.
+///
+/// The fixtures route through selector-less Services with manual
+/// EndpointSlices, and the backendRef guard admits only endpoints that are
+/// Pods of the Service's namespace (issue #6108). A real cluster never
+/// reports a loopback Pod IP, so this exists only to reach a local backend.
+fn loopback_backend_pod(name: &str) -> K8sObject {
+    let mut pod = object("v1", "Pod", name, "default", json!({}));
+    pod.status = json!({"phase": "Running", "podIP": "127.0.0.1"});
+    pod
+}
+
 fn route_status_update() -> GatewayApiStatusUpdate {
     GatewayApiStatusUpdate {
         api_version: "gateway.networking.k8s.io/v1".to_string(),
@@ -2911,6 +2923,7 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
         service,
         endpoints,
+        loopback_backend_pod("api-0"),
         object(
             "gateway.networking.k8s.io/v1",
             "HTTPRoute",
@@ -3030,6 +3043,7 @@ fn route_filter_cluster_objects(
         cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
         service,
         endpoints,
+        loopback_backend_pod("api-0"),
     ]
 }
 
@@ -4115,7 +4129,8 @@ fn scripted_service_objects(
         .metadata
         .labels
         .insert("kubernetes.io/service-name".to_string(), name.to_string());
-    vec![service, endpoints]
+    let pod = loopback_backend_pod(&format!("{name}-0"));
+    vec![service, endpoints, pod]
 }
 
 /// A backend that holds every request for `delay` before answering `200 pong`.
