@@ -19,8 +19,9 @@ use crate::unit::env_lock::EnvGuard;
 /// Reader/writer discipline for this file's process-global provider credentials.
 ///
 /// `ServerlessFunction::new` resolves an absent credential from the process
-/// environment (`AWS_*`, `AZURE_FUNCTIONS_KEY`,
-/// `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`), so almost every construction below is
+/// environment (`AWS_*`, `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY`,
+/// `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`), so almost every
+/// construction below is
 /// an environment READ. A test that publishes a fixture value therefore has to
 /// exclude every other test in this file, not merely the other writers: owning
 /// the environment lock orders writers against each other while an unlocked
@@ -92,7 +93,7 @@ fn expect_err(result: Result<ServerlessFunction, String>) -> String {
 
 /// Every process-global variable `ServerlessFunction::new` can resolve a
 /// provider credential or endpoint from.
-const PROVIDER_ENV_VARS: [&str; 9] = [
+const PROVIDER_ENV_VARS: [&str; 11] = [
     "AWS_DEFAULT_REGION",
     "AWS_REGION",
     "AWS_ACCESS_KEY_ID",
@@ -100,6 +101,10 @@ const PROVIDER_ENV_VARS: [&str; 9] = [
     "AWS_SESSION_TOKEN",
     "AWS_LAMBDA_FUNCTION_NAME",
     "AWS_LAMBDA_ENDPOINT_URL",
+    "FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY",
+    "FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN",
+    // Former ambient fallbacks: kept in the cleared set so the regression
+    // below can prove they are no longer read.
     "AZURE_FUNCTIONS_KEY",
     "GCP_CLOUD_FUNCTIONS_BEARER_TOKEN",
 ];
@@ -5441,7 +5446,7 @@ fn test_aws_region_falls_back_to_aws_region_env() {
 #[serial(serverless_env)]
 fn test_azure_function_key_falls_back_to_env() {
     let env = cleared_provider_env();
-    env.set("AZURE_FUNCTIONS_KEY", "env-azure-key");
+    env.set("FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY", "env-key");
 
     let result = ServerlessFunction::new(
         &json!({
@@ -5451,7 +5456,7 @@ fn test_azure_function_key_falls_back_to_env() {
         default_client(),
     );
 
-    env.unset("AZURE_FUNCTIONS_KEY");
+    env.unset("FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY");
 
     assert!(result.is_ok());
 }
@@ -5460,7 +5465,10 @@ fn test_azure_function_key_falls_back_to_env() {
 #[serial(serverless_env)]
 fn test_gcp_bearer_token_falls_back_to_env() {
     let env = cleared_provider_env();
-    env.set("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN", "ya29.env-token");
+    env.set(
+        "FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN",
+        "ya29.env-token",
+    );
 
     let result = ServerlessFunction::new(
         &json!({
@@ -5470,9 +5478,92 @@ fn test_gcp_bearer_token_falls_back_to_env() {
         default_client(),
     );
 
-    env.unset("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN");
+    env.unset("FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN");
 
     assert!(result.is_ok());
+}
+
+/// Invoke one credential-less Azure and one credential-less GCP `pre_proxy`
+/// function against `function_url`, in that order.
+async fn invoke_azure_and_gcp_pre_proxy(function_url: &str) {
+    for provider in ["azure_functions", "gcp_cloud_functions"] {
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": provider,
+                "function_url": function_url,
+                "mode": "pre_proxy",
+                "timeout_ms": 5000
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+        let mut headers = HashMap::new();
+        let _ = plugin.finalized_egress(&mut ctx, &mut headers).await;
+    }
+}
+
+/// The Azure function key and GCP bearer token are sent to the config-chosen
+/// `function_url`, so the implicit environment fallback must never pick up an
+/// ambient cloud variable: only the `FERRUM_PLUGIN_SECRET_*` namespace, which
+/// the environment owner populates deliberately, feeds it.
+#[tokio::test]
+#[serial(serverless_env)]
+async fn test_ambient_cloud_function_credentials_are_never_sent() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let env = cleared_provider_env();
+    env.set("AZURE_FUNCTIONS_KEY", "ambient-azure-key");
+    env.set("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN", "ambient-gcp-token");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let function_url = format!("{}/func", server.uri());
+    invoke_azure_and_gcp_pre_proxy(&function_url).await;
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2, "both functions must be invoked");
+    for request in &requests {
+        assert!(
+            request.headers.get("x-functions-key").is_none(),
+            "an ambient AZURE_FUNCTIONS_KEY must not be sent"
+        );
+        assert!(
+            request.headers.get("authorization").is_none(),
+            "an ambient GCP_CLOUD_FUNCTIONS_BEARER_TOKEN must not be sent"
+        );
+    }
+
+    env.set(
+        "FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY",
+        "namespaced-azure-key",
+    );
+    env.set(
+        "FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN",
+        "namespaced-gcp-token",
+    );
+    invoke_azure_and_gcp_pre_proxy(&function_url).await;
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 4);
+    let header = |index: usize, name: &str| {
+        requests[index]
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    assert_eq!(
+        header(2, "x-functions-key").as_deref(),
+        Some("namespaced-azure-key")
+    );
+    assert_eq!(
+        header(3, "authorization").as_deref(),
+        Some("Bearer namespaced-gcp-token")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6564,7 +6655,8 @@ fn test_ordinary_credential_headers_are_accepted() {
 /// configured one (issue #5189).
 ///
 /// Asserted over the source rather than by publishing a malformed value.
-/// `AZURE_FUNCTIONS_KEY` and `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` are
+/// `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and
+/// `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` are
 /// process-global, and EVERY credential-less construction in this test binary
 /// resolves them — including sibling files this file's `serverless_env` gate
 /// cannot reach (`plugin_cache_tests`, `request_deduplication_tests`,
@@ -6591,14 +6683,14 @@ fn test_environment_resolved_credentials_are_validated_too() {
         .next()
         .expect("azure provider arm must remain bounded");
     let azure_fallback = azure
-        .find("env_non_empty(\"AZURE_FUNCTIONS_KEY\")")
+        .find("env_non_empty(AZURE_FUNCTIONS_KEY_ENV)")
         .expect("azure key must keep its environment fallback");
     let azure_validated = azure
         .find("credential_header_value(\"azure_function_key\",")
         .expect("azure key must be validated as a header value");
     assert!(
         azure_fallback < azure_validated,
-        "the AZURE_FUNCTIONS_KEY fallback must merge before admission validates the key"
+        "the Azure function-key fallback must merge before admission validates the key"
     );
 
     let gcp = source
@@ -6609,14 +6701,14 @@ fn test_environment_resolved_credentials_are_validated_too() {
         .next()
         .expect("gcp provider arm must remain bounded");
     let gcp_fallback = gcp
-        .find("env_non_empty(\"GCP_CLOUD_FUNCTIONS_BEARER_TOKEN\")")
+        .find("env_non_empty(GCP_BEARER_TOKEN_ENV)")
         .expect("gcp token must keep its environment fallback");
     let gcp_validated = gcp
         .find("gcp_authorization_header_value(&token)")
         .expect("gcp token must be validated as an assembled header value");
     assert!(
         gcp_fallback < gcp_validated,
-        "the GCP_CLOUD_FUNCTIONS_BEARER_TOKEN fallback must merge before admission"
+        "the GCP bearer-token fallback must merge before admission"
     );
 
     let assembler = source

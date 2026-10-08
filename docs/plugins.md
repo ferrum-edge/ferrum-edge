@@ -4688,7 +4688,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `provider` | String | (required) | `"azure_functions"` |
 | `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
-| `azure_function_key` | String | — | Function key for auth. Falls back to `AZURE_FUNCTIONS_KEY` env var. The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
+| `azure_function_key` | String | — | Function key for auth. Falls back to the `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` env var (never the ambient `AZURE_FUNCTIONS_KEY`, because the key is sent to the config-chosen `function_url`). The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
 
 **GCP Cloud Functions** — calls the HTTPS trigger URL:
 
@@ -4696,7 +4696,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `provider` | String | (required) | `"gcp_cloud_functions"` |
 | `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
-| `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var. The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
+| `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to the `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var (never the ambient `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`). The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
 
 #### Common Parameters
 
@@ -4861,7 +4861,7 @@ If request deduplication acquired an idempotency key earlier in the chain, each 
 
 #### Environment Variable Fallback
 
-Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.).
+Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.). The Azure function key and GCP bearer token are sent to the config-chosen `function_url`, so their fallbacks are confined to the [plugin-secret namespace](configuration.md): `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`. The ambient `AZURE_FUNCTIONS_KEY` / `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` variables are never read.
 
 #### Example: AWS Lambda pre-proxy enrichment
 
@@ -6832,9 +6832,11 @@ config:
   providers:
     - name: openai
       provider_type: openai
-      api_key: ${OPENAI_API_KEY}
+      api_key: "sk-..."
       model_patterns: ["gpt-*"]
 ```
+
+`ai_federation` does **not** expand `${...}` references in `api_key`, so supply the literal credential as shown (unlike [`ai_stream_router`](#ai_stream_router), whose `api_key` accepts a whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference).
 
 With it enabled, `before_proxy` claims the streaming request, commits exactly one provider, and rewrites the routing decision through `RequestContext.route_override_*` so the **normal proxy dispatch path** relays the provider's SSE incrementally. On a proxy with backend-path policy, this hook runs in the deferred pass only after the effective target path is authorized; provider I/O still waits for finalized request egress after all final-body policy. Time to first token, client-disconnect cancellation, byte budgets, retained-response ceilings, and shutdown accounting all come from the shared streaming response machinery rather than a plugin-private relay; the plugin itself creates no queues, channels, or detached tasks.
 
@@ -7061,13 +7063,13 @@ config:
     - name: openai
       provider_type: openai
       endpoint: https://api.openai.com/v1/chat/completions
-      api_key: ${OPENAI_API_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_OPENAI_API_KEY}
       model_patterns: ["gpt-*", "o*"]
       priority: 1
     - name: anthropic
       provider_type: anthropic
       endpoint: https://api.anthropic.com/v1/messages
-      api_key: ${ANTHROPIC_API_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_ANTHROPIC_API_KEY}
       model_patterns: ["claude-*"]
       priority: 2
       anthropic_version: "2023-06-01"
@@ -7091,7 +7093,7 @@ config:
 | `name` | String | — | **Required**, non-empty, unique within the instance. Surfaced as `ai_stream_router.provider`. |
 | `provider_type` | String | — | **Required**. One of `openai`, `openai_compatible`, `anthropic`, `google_gemini`. |
 | `endpoint` | String | — | **Required** absolute `https://` URL (or `http://` with `allow_plaintext`). May carry a literal `{model}` path placeholder and its own query string. A literal-IP host is checked against the gateway backend egress policy at admission, and an explicit port `0` is rejected (an outbound destination cannot use port zero). |
-| `api_key` | String | — | **Required**, non-empty. A `${ENV_VAR}` reference is resolved from the process environment. The resolved value must be a valid HTTP header value, so a stray newline is a configuration error rather than a `502` on every request. |
+| `api_key` | String | — | **Required**, non-empty. A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference is resolved from the process environment at construction; a `${...}` reference to any other variable (including every other `FERRUM_*` setting) is refused at admission, and an unset or empty referenced variable fails construction. The resolved value must be a valid HTTP header value, so a stray newline is a configuration error rather than a `502` on every request. |
 | `model_patterns` | Array | — | **Required**, 1–128 globs matched against the request `model`. Each glob is 1–256 ASCII bytes containing only letters, digits, `.`, `_`, `:`, `/`, `+`, `-`, and `*`, with no `..` sequence; unsupported wildcards such as `?` or `[` fail admission. `*` is the only wildcard, never consumes a URL-structural separator (`/`, `?`, `#`, `&`, `\`) or whitespace, and the pattern is anchored at both ends — so `*mini` matches `model-mini` and `mini-mini` alike, and never matches `mini-pro`. |
 | `priority` | Integer | provider index + 1 | Lower is matched first. Must be at least `1` and fit in a `u32`. |
 | `allow_plaintext` | Boolean | `false` | Required opt-in for an `http://` endpoint: plaintext provider egress is rejected at admission without it. It has no effect on an `https` endpoint and does not relax runtime TLS or FIPS policy. Use it only for an internal, same-trust-domain provider. |
@@ -7110,7 +7112,7 @@ config:
       provider_type: openai_compatible
       endpoint: http://vllm.internal.svc.cluster.local:8000/v1/chat/completions
       allow_plaintext: true
-      api_key: ${INTERNAL_VLLM_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_INTERNAL_VLLM_KEY}
       model_patterns: ["llama-*", "mistral-*"]
 ```
 
@@ -7254,7 +7256,7 @@ Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy 
 | `provider.type` | string | required | `openai_compatible_embeddings` |
 | `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint. Literal IP hosts are checked against `FERRUM_BACKEND_ALLOW_IPS`; DNS hostnames participate in startup warmup and are checked by the shared plugin HTTP client at request time |
 | `provider.model` | string | optional | Embedding model name |
-| `provider.api_key_env` | string | optional | Environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
+| `provider.api_key_env` | string | optional | Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Any other variable (including every other `FERRUM_*` setting) is refused at admission. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
 | `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
 | `builtins.*` | bool/object | all enabled when `builtins` is omitted | Built-in packs. Boolean shorthand enables/disables a pack; object form supports `enabled`, `examples_mode`, and `examples` |
 | `extraction.request_json_paths` | string[] | all supported request paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported request paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected request fields |
@@ -7411,7 +7413,7 @@ config:
     type: openai_compatible_embeddings
     endpoint: http://localhost:8081/v1/embeddings
     model: text-embedding-3-small
-    api_key_env: EMBEDDING_API_KEY
+    api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
     request_timeout_ms: 5000
 ```
 
@@ -7426,7 +7428,7 @@ config:
     type: openai_compatible_embeddings
     endpoint: http://localhost:8081/v1/embeddings
     model: text-embedding-3-small
-    api_key_env: EMBEDDING_API_KEY
+    api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
 ```
 
 **HR assistant allowlist:**
@@ -9636,7 +9638,7 @@ Direct providers use these envelopes (they are different from Istio's name-only 
 | `opentelemetry` | `endpoint` string | OTLP/HTTP JSON; supply the complete `/v1/traces` URL. |
 | `zipkin` | `url` string | Zipkin v2 JSON; supply the complete `/api/v2/spans` URL. |
 | `datadog` | `agent_url` string | Optional `service` string or null overrides the span service name; the exporter appends `/v0.3/traces` if needed. |
-| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
+| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `access_token_env` must name a `FERRUM_PLUGIN_SECRET_<NAME>` variable (any other variable is refused at admission, even while span reporting is disabled). `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
 
 Provider objects require `kind` and `config`; unknown nested keys are ignored. Active endpoint URLs must be absolute HTTP(S), have a host, and contain no embedded credentials. Lightstep's variable must be readable and its value valid for the bearer header.
 

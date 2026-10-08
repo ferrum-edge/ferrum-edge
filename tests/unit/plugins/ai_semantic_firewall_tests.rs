@@ -1804,7 +1804,7 @@ async fn validation_succeeds_without_api_key_env_secret() {
         "provider": {
             "type": "openai_compatible_embeddings",
             "endpoint": "http://127.0.0.1:9/v1/embeddings",
-            "api_key_env": "FERRUM_EDGE_AI_SEMANTIC_FIREWALL_DEFINITELY_MISSING_KEY"
+            "api_key_env": "FERRUM_PLUGIN_SECRET_AI_SEMANTIC_FIREWALL_MISSING_KEY"
         },
         "builtins": {"prompt_injection": true}
     });
@@ -5716,7 +5716,7 @@ async fn response_only_stream_detection_does_not_govern_unrelated_requests() {
 
 #[tokio::test]
 async fn successful_api_key_resolution_is_cached_per_plugin_instance() {
-    const ENV_NAME: &str = "FERRUM_EDGE_TEST_SEMANTIC_FIREWALL_CACHED_KEY_2255";
+    const ENV_NAME: &str = "FERRUM_PLUGIN_SECRET_TEST_SEMANTIC_FIREWALL_CACHED_KEY_2255";
     unsafe { std::env::set_var(ENV_NAME, "cache-me") };
 
     let server = MockServer::start().await;

@@ -1058,7 +1058,7 @@ extensionProviders:
 - name: lightstep-prod
   lightstep:
     service: collector.lightstep.svc.cluster.local
-    accessTokenEnv: LIGHTSTEP_ACCESS_TOKEN
+    accessTokenEnv: FERRUM_PLUGIN_SECRET_LIGHTSTEP_ACCESS_TOKEN
 "#,
         );
 
@@ -1066,7 +1066,7 @@ extensionProviders:
             parsed.registry.tracing_provider("lightstep-prod"),
             Some(&TracingProvider::Lightstep {
                 collector_url: "https://collector.lightstep.svc.cluster.local:443".to_string(),
-                access_token_env: "LIGHTSTEP_ACCESS_TOKEN".to_string(),
+                access_token_env: "FERRUM_PLUGIN_SECRET_LIGHTSTEP_ACCESS_TOKEN".to_string(),
             })
         );
     }

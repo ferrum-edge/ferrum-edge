@@ -11756,7 +11756,7 @@ mod tests {
                         "providers": [{
                             "name": "lightstep",
                             "collectorUrl": "https://ingest.lightstep.com:443",
-                            "accessTokenEnv": "LIGHTSTEP_ACCESS_TOKEN"
+                            "accessTokenEnv": "FERRUM_PLUGIN_SECRET_LIGHTSTEP"
                         }]
                     }]
                 }),
@@ -11777,11 +11777,11 @@ mod tests {
                 access_token_env,
             } => {
                 assert_eq!(collector_url, "https://ingest.lightstep.com:443");
-                assert_eq!(access_token_env, "LIGHTSTEP_ACCESS_TOKEN");
+                assert_eq!(access_token_env, "FERRUM_PLUGIN_SECRET_LIGHTSTEP");
                 let debug = format!("{provider:?}");
-                assert!(debug.contains("LIGHTSTEP_ACCESS_TOKEN"));
+                assert!(debug.contains("FERRUM_PLUGIN_SECRET_LIGHTSTEP"));
                 let serialized = serde_json::to_string(provider).expect("provider serializes");
-                assert!(serialized.contains("LIGHTSTEP_ACCESS_TOKEN"));
+                assert!(serialized.contains("FERRUM_PLUGIN_SECRET_LIGHTSTEP"));
                 assert!(!serialized.contains("secret-token"));
             }
             other => panic!("expected Lightstep, got {other:?}"),

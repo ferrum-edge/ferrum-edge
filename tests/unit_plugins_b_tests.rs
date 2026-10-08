@@ -58,6 +58,7 @@ mod unit {
         mod plugin_doc_parity_tests;
         mod plugin_http_client_tests;
         mod plugin_integration_tests;
+        mod plugin_secret_env_tests;
         mod plugin_trigger_carrier_tests;
         mod plugin_trigger_gate_tests;
         mod plugin_unknown_key_registry_tests;

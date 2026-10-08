@@ -990,6 +990,15 @@ on a native-gRPC request.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
 - Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`stdout_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
 - Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup.
+- A plugin config field that names a process environment variable (credential
+  or URL) resolves it ONLY through `plugins::utils::plugin_secret_env`
+  (`FERRUM_PLUGIN_SECRET_<NAME>`), shape-checked in the constructor so
+  admission refuses any other name with a 400 before anything is read. Never
+  `std::env::var` a config-supplied name, and never add an implicit ambient
+  fallback for a credential sent to a config-chosen endpoint. Add each new
+  field to `ENV_REFERENCE_FIELDS` in
+  `tests/unit/plugins/plugin_secret_env_tests.rs`. `ai_transcript_audit`'s
+  `${secret:NAME}` keeps its own `FERRUM_TRANSCRIPT_SINK_SECRET_*` namespace.
 - Shared entrypoint is `plugins::validate_plugin_config(name, config)`.
 - CP admission runs the SAME construction gate over every enabled plugin config
   before a snapshot or delta can be accepted and broadcast

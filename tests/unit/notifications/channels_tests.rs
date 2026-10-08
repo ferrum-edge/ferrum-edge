@@ -918,7 +918,7 @@ async fn non_success_status_errors_include_redacted_url_for_all_channels() {
 #[test]
 fn env_var_resolution_for_webhook_url() {
     // Use a unique env var name so tests don't collide.
-    let var = "FERRUM_TEST_NOTIFICATIONS_SLACK_WEBHOOK_URL";
+    let var = "FERRUM_PLUGIN_SECRET_TEST_NOTIFICATIONS_SLACK_WEBHOOK_URL";
     // SAFETY: tests are single-threaded per file by default; setting a
     // unique env var name avoids interfering with other tests.
     unsafe {
@@ -947,7 +947,7 @@ fn env_var_resolution_fails_when_unset() {
         "ops",
         &json!({
             "type": "slack",
-            "webhook_url_env": "FERRUM_TEST_DEFINITELY_UNSET_XYZ_123",
+            "webhook_url_env": "FERRUM_PLUGIN_SECRET_TEST_DEFINITELY_UNSET_XYZ_123",
         }),
     )
     .unwrap_err();
@@ -955,8 +955,32 @@ fn env_var_resolution_fails_when_unset() {
 }
 
 #[test]
+fn env_var_references_outside_the_plugin_secret_namespace_are_refused() {
+    // Gateway-owned secrets must never be resolvable from channel config, even
+    // when they are set in this process.
+    let var = "FERRUM_ADMIN_JWT_SECRET";
+    for config in [
+        json!({"type": "slack", "webhook_url_env": var}),
+        json!({"type": "teams", "webhook_url_env": var}),
+        json!({"type": "discord", "webhook_url_env": var}),
+        json!({"type": "webhook", "url_env": var}),
+        json!({"type": "slack", "webhook_url_env": "PATH"}),
+    ] {
+        let err = match config["type"].as_str() {
+            Some("slack") => SlackChannel::new("ops", &config).map(|_| ()),
+            Some("teams") => TeamsChannel::new("ops", &config).map(|_| ()),
+            Some("discord") => DiscordChannel::new("ops", &config).map(|_| ()),
+            _ => WebhookChannel::new("ops", &config).map(|_| ()),
+        }
+        .unwrap_err();
+        assert!(err.contains("FERRUM_PLUGIN_SECRET_<NAME>"), "got: {err}");
+        assert!(!err.contains(var) && !err.contains("PATH"), "got: {err}");
+    }
+}
+
+#[test]
 fn explicit_webhook_url_takes_precedence_over_env_var() {
-    let var = "FERRUM_TEST_BOTH_WEBHOOK_URL";
+    let var = "FERRUM_PLUGIN_SECRET_TEST_BOTH_WEBHOOK_URL";
     unsafe {
         std::env::set_var(var, "https://hooks.slack.com/from-env");
     }

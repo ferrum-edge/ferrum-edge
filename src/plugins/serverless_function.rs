@@ -38,8 +38,13 @@
 //! | `aws_secret_access_key` | `AWS_SECRET_ACCESS_KEY` |
 //! | `aws_function_name` | `AWS_LAMBDA_FUNCTION_NAME` |
 //! | `aws_session_token` | `AWS_SESSION_TOKEN` |
-//! | `azure_function_key` | `AZURE_FUNCTIONS_KEY` |
-//! | `gcp_bearer_token` | `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` |
+//! | `azure_function_key` | `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` |
+//! | `gcp_bearer_token` | `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` |
+//!
+//! The Azure and GCP credentials are sent to the config-chosen `function_url`,
+//! so their fallbacks live in the `FERRUM_PLUGIN_SECRET_*` namespace: only a
+//! value the environment owner explicitly placed there can be sent, never an
+//! ambient cloud or gateway secret.
 //!
 //! These env vars may themselves be resolved by the gateway's external secret
 //! resolution system (Vault, AWS Secrets Manager, etc.) via the `_VAULT`,
@@ -729,7 +734,7 @@ impl ServerlessFunction {
                     })?;
 
                     let key = optional_config_string(config, "azure_function_key")?
-                        .or_else(|| env_non_empty("AZURE_FUNCTIONS_KEY"));
+                        .or_else(|| env_non_empty(AZURE_FUNCTIONS_KEY_ENV));
                     if config["azure_function_key"]
                         .as_str()
                         .filter(|s| !s.is_empty())
@@ -737,7 +742,7 @@ impl ServerlessFunction {
                         && key.is_some()
                     {
                         info!(
-                            "serverless_function: azure_function_key resolved from AZURE_FUNCTIONS_KEY env var"
+                            "serverless_function: azure_function_key resolved from {AZURE_FUNCTIONS_KEY_ENV} env var"
                         );
                     }
 
@@ -754,7 +759,7 @@ impl ServerlessFunction {
                     })?;
 
                     let token = optional_config_string(config, "gcp_bearer_token")?
-                        .or_else(|| env_non_empty("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN"));
+                        .or_else(|| env_non_empty(GCP_BEARER_TOKEN_ENV));
                     if config["gcp_bearer_token"]
                         .as_str()
                         .filter(|s| !s.is_empty())
@@ -762,7 +767,7 @@ impl ServerlessFunction {
                         && token.is_some()
                     {
                         info!(
-                            "serverless_function: gcp_bearer_token resolved from GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var"
+                            "serverless_function: gcp_bearer_token resolved from {GCP_BEARER_TOKEN_ENV} env var"
                         );
                     }
 
@@ -1139,6 +1144,15 @@ fn optional_config_string(config: &Value, key: &str) -> Result<Option<String>, S
         Some(_) => Err(format!("serverless_function: `{key}` must be a string")),
     }
 }
+
+/// Environment fallback for `azure_function_key`. The key is sent to the
+/// config-chosen `function_url`, so the fallback is confined to the
+/// plugin-secret namespace rather than an ambient cloud variable.
+const AZURE_FUNCTIONS_KEY_ENV: &str = "FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY";
+
+/// Environment fallback for `gcp_bearer_token`, confined to the plugin-secret
+/// namespace for the same reason as [`AZURE_FUNCTIONS_KEY_ENV`].
+const GCP_BEARER_TOKEN_ENV: &str = "FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN";
 
 fn env_non_empty(env_var: &str) -> Option<String> {
     std::env::var(env_var).ok().filter(|s| !s.is_empty())
