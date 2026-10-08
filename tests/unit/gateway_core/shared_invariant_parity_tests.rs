@@ -3120,3 +3120,90 @@ fn every_dispatcher_refuses_a_flavor_view_that_omits_route_admission_policy() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket Extended CONNECT: 0-RTT gate and session logs use the wire method
+// ---------------------------------------------------------------------------
+//
+// Route `allowed_methods` and plugin method policy evaluate an RFC 8441 /
+// RFC 9220 WebSocket as `GET`, the method of the backend handshake. The
+// replayable request is still a `CONNECT` stream, so the
+// `FERRUM_TLS_EARLY_DATA_METHODS` gate must match `CONNECT` on both
+// dispatchers (issue #6107), and the WebSocket session log records keep the
+// wire method too.
+
+#[test]
+fn h3_early_data_method_gate_runs_before_the_websocket_get_rewrite() {
+    let text = source("src/http3/server.rs");
+    let body = item_body(&text, "async fn handle_h3_request(", "\n}\n");
+    let gate_needle = "if is_early_data && !state.early_data_methods.contains(&method) {";
+    let rewrite_needle = "method = \"GET\".to_string();";
+    assert_eq!(
+        body.matches(gate_needle).count(),
+        1,
+        "native H3 must check the 0-RTT method allowlist exactly once"
+    );
+    assert_eq!(
+        body.matches(rewrite_needle).count(),
+        1,
+        "native H3 must rewrite the WebSocket policy method exactly once"
+    );
+    let gate = body.find(gate_needle).unwrap_or(usize::MAX);
+    let rewrite = body.find(rewrite_needle).unwrap_or(0);
+    assert!(
+        gate < rewrite,
+        "native H3 must gate 0-RTT on the wire method before rewriting a WebSocket to `GET`"
+    );
+}
+
+#[test]
+fn h1_h2_early_data_method_gate_matches_the_wire_method() {
+    let text = source("src/proxy/mod.rs");
+    let body = item_body(&text, "async fn handle_proxy_request_inner(", "\n}\n");
+    let rewrite_needle = "method = \"GET\".to_string();";
+    let wire_needle = "let wire_method = req.method().as_str();";
+    let gate_needle = "!state.early_data_methods.contains(wire_method)";
+    for needle in [rewrite_needle, wire_needle, gate_needle] {
+        assert_eq!(
+            body.matches(needle).count(),
+            1,
+            "H1/H2: `src/proxy/mod.rs` must contain `{needle}` exactly once"
+        );
+    }
+    assert!(
+        !body.contains("early_data_methods.contains(&method)"),
+        "H1/H2 must not gate 0-RTT on the policy method, which is `GET` for an RFC 8441 WebSocket"
+    );
+    let rewrite = body.find(rewrite_needle).unwrap_or(usize::MAX);
+    let wire = body.find(wire_needle).unwrap_or(0);
+    let gate = body.find(gate_needle).unwrap_or(0);
+    assert!(
+        rewrite < wire && wire < gate,
+        "H1/H2 must read the wire method from the request, not the normalized binding"
+    );
+}
+
+#[test]
+fn extended_connect_websocket_session_logs_record_the_wire_method() {
+    let proxy = source("src/proxy/mod.rs");
+    for needle in [
+        "let ws_method = if is_h2_websocket { \"CONNECT\" } else { \"GET\" };",
+        "let ws_err_method = if is_h2_websocket { \"CONNECT\" } else { \"GET\" };",
+    ] {
+        assert_eq!(
+            proxy.matches(needle).count(),
+            1,
+            "H1/H2 WebSocket session records must log `{needle}`"
+        );
+    }
+    let h3 = source("src/http3/websocket.rs");
+    assert_eq!(
+        h3.matches("http_method: \"CONNECT\".to_string(),").count(),
+        3,
+        "H3 WebSocket session meta, upgrade summary, and backend-error summary must log CONNECT"
+    );
+    assert!(
+        !h3.contains("http_method: \"GET\""),
+        "H3 WebSocket session records must not log the policy method"
+    );
+}

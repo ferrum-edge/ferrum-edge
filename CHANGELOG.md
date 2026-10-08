@@ -66,6 +66,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the new-claim path while the store is over either cap, or while the lowered
   cap leaves the presenting principal above its share. That path refuses
   rather than evicting a live claim. This matches the replay authority.
+- **BREAKING — HTTP/2 WebSocket early data is gated on the wire method
+  `CONNECT`** (issue #6107). An RFC 8441 Extended CONNECT WebSocket carrying
+  `Early-Data: 1` was checked against `FERRUM_TLS_EARLY_DATA_METHODS` after
+  its method was normalized to `GET`, while HTTP/3 checked `CONNECT`. Both now
+  check `CONNECT`, so an allowlist of `GET` alone answers it `425 Too Early`.
+  Route and plugin method policy still see `GET`. The default (unset, no
+  early-data method gate) is unaffected; on HTTP/2 the gate applies to
+  requests that carry `Early-Data: 1`. Listing `CONNECT` also admits mesh
+  HBONE CONNECT in early data, as before.
+
+### Documentation
+
+- WebSocket session log records on HTTP/2 and HTTP/3 carry the wire method
+  `CONNECT`; `docs/plugins.md` and `docs/http3.md` said `GET` (issue #6107).
+- `FERRUM_PER_IP_IPV6_PREFIX` notes that IPv4 clients behind NAT64/SIIT share
+  one IPv6 prefix budget, and `ferrum.conf` no longer describes a fixed `/64`
+  for the CONNECT-UDP per-client cap (issue #6107).
 
 ## [0.9.15] - 2026-10-08
 

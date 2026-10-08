@@ -3310,10 +3310,10 @@ pub struct EnvConfig {
     pub http3_connect_udp_max_sessions: usize,
     /// Maximum concurrent RFC 9298 CONNECT-UDP tunnels per resolved client
     /// (default 32). `0` disables the per-client cap. IPv4 is keyed per
-    /// address; IPv6 sources in one
-    /// [`crate::http3::connect_udp::CONNECT_UDP_PER_CLIENT_IPV6_PREFIX`]
-    /// network share a budget. The slot is held for the tunnel's lifetime, so
-    /// one client cannot occupy every `http3_connect_udp_max_sessions` slot.
+    /// address; IPv6 sources in one [`Self::per_ip_ipv6_prefix`] network
+    /// (`FERRUM_PER_IP_IPV6_PREFIX`, default `/64`) share a budget. The slot is
+    /// held for the tunnel's lifetime, so one client cannot occupy every
+    /// `http3_connect_udp_max_sessions` slot.
     pub http3_connect_udp_max_sessions_per_ip: u64,
     /// Seconds a CONNECT-UDP tunnel may carry no datagram in either direction
     /// before it is closed (default 120). RFC 9298 §3.2 recommends that a UDP
@@ -3823,6 +3823,8 @@ pub struct EnvConfig {
     pub max_concurrent_requests_per_ip: u64,
     /// IPv6 prefix for gateway-wide per-IP caps (FERRUM_PER_IP_IPV6_PREFIX).
     /// IPv4 clients always use their full address. Default: 64. Range: 1..=128.
+    /// IPv4 clients translated by NAT64/SIIT arrive as IPv6 (for example
+    /// `64:ff9b::/96`) and therefore share one prefix budget.
     pub per_ip_ipv6_prefix: u8,
     /// Interval in seconds between cleanup sweeps for per-IP request and
     /// WebSocket-session counters. Removes entries where the active count has

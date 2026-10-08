@@ -2,7 +2,9 @@
 //!
 //! `FERRUM_TLS_EARLY_DATA_METHODS` is parsed in config tests, but the live
 //! gateway path also needs coverage because H1/H2 requests are rejected before
-//! routing when a replay-unsafe method arrives with `Early-Data: 1`.
+//! routing when a replay-unsafe method arrives with `Early-Data: 1`. An RFC 8441
+//! Extended CONNECT WebSocket is gated on its wire method `CONNECT`, not on the
+//! `GET` that route and plugin method policy see (issue #6107).
 
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -186,6 +188,79 @@ async fn functional_early_data_h2_enforces_configured_methods() {
         h.hits(),
         0,
         "rejected H2 early-data POST must not reach backend"
+    );
+}
+
+/// Send one RFC 8441 Extended CONNECT WebSocket carrying `Early-Data: 1` over
+/// h2c and return its response status.
+async fn send_h2_websocket_early_data(h: &EarlyDataHarness) -> http::StatusCode {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let port = h.gateway.proxy_port;
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("connect to gateway proxy port");
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+        .await
+        .expect("H2 handshake");
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{port}/early"))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .header("Early-Data", "1")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build H2 Extended CONNECT request");
+    let response = tokio::time::timeout(Duration::from_secs(10), sender.send_request(request))
+        .await
+        .expect("H2 Extended CONNECT response in time")
+        .expect("H2 Extended CONNECT response");
+    connection_task.abort();
+    response.status()
+}
+
+/// Route method policy sees an H2 WebSocket as `GET`, but its replayable
+/// early data is a `CONNECT` stream. A `GET`-only allowlist must refuse it
+/// before any backend dial, matching HTTP/3.
+#[ignore]
+#[tokio::test]
+async fn functional_early_data_h2_websocket_is_gated_on_the_wire_method() {
+    let h = EarlyDataHarness::new(Some("GET")).await;
+    assert_eq!(
+        send_h2_websocket_early_data(&h).await,
+        http::StatusCode::TOO_EARLY,
+        "a GET-only allowlist must not admit an H2 Extended CONNECT WebSocket"
+    );
+    assert_eq!(
+        h.hits(),
+        0,
+        "a refused early-data WebSocket must not reach the backend"
+    );
+}
+
+/// Listing `CONNECT` is the operator opt-in for WebSocket upgrades in early
+/// data: the request passes the 0-RTT gate and reaches the backend.
+#[ignore]
+#[tokio::test]
+async fn functional_early_data_h2_websocket_is_admitted_when_connect_is_listed() {
+    let h = EarlyDataHarness::new(Some("GET,CONNECT")).await;
+    let status = send_h2_websocket_early_data(&h).await;
+    assert_ne!(
+        status,
+        http::StatusCode::TOO_EARLY,
+        "listing CONNECT must admit an H2 Extended CONNECT WebSocket in early data"
+    );
+    assert!(
+        h.hits() >= 1,
+        "an admitted early-data WebSocket must reach the backend handshake (status {status})"
     );
 }
 
