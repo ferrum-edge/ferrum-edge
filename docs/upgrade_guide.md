@@ -29,7 +29,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main
-`71fb4c4bd838b0bc8b80a7022201d713381f8571`. All previously released breaking
+`b4f3b39863c4aeb1e32431cdc0d8b983d9ac1c07`. All previously released breaking
 identifiers and guidance below remain applicable. CP/DP must run the same
 build; the ConfigSync protocol revision stays `3`. 0.9.15 adds no core schema
 change; a changed baseline in any later release still requires a fresh

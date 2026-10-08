@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.15] - 2026-10-08
 
 Release prepared on **2026-10-08 UTC** from main
-`71fb4c4bd838b0bc8b80a7022201d713381f8571`. Namespace isolation for Gateway API,
+`b4f3b39863c4aeb1e32431cdc0d8b983d9ac1c07`. Namespace isolation for Gateway API,
 DestinationRule and Admin API TLS references, mesh CONNECT authorization,
 per-flavor route admission, external identity headers, plugin-config
 environment references, HTTP/3 CONNECT-UDP and WebSocket method policy, IPv6
@@ -413,6 +413,11 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
 
 ### Documentation
 
+- **Document the adaptive HTTP/2 window deadlock risk** (#6101). Wherever
+  `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` (global or per proxy) is described, the docs
+  now warn that the adaptive window can permanently stall a connection carrying
+  large bodies in both directions (upstream hyperium/h2#975). The option stays off
+  by default.
 - **Vendored sqlx patch 002 records its upstream fix** (issue #6021, #6061).
   launchbadge/sqlx#4359 fixes the reversed REAL/DOUBLE typed-NULL arms on
   SQLx `main`; no SQLx release carries it yet, so the vendored patch and its
