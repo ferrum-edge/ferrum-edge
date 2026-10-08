@@ -3471,6 +3471,15 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // The WebSocket backend handshake is a GET. Keep route and plugin policy
+    // aligned with the method the backend receives, matching the H2 Extended
+    // CONNECT path. Plain CONNECT and CONNECT-UDP keep CONNECT; the 0-RTT
+    // allowlist above still gates the wire method.
+    if http_flavor == HttpFlavor::WebSocket {
+        method = "GET".to_string();
+        ctx.method = method.clone();
+    }
+
     // Set the early data flag on the request context for plugin visibility.
     ctx.is_early_data = is_early_data;
 
