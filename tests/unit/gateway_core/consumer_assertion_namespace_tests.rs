@@ -108,7 +108,10 @@ fn ingress_materialization_drops_every_client_consumer_assertion() {
     raw.insert("X-Consumer-Username", "forged".parse().unwrap());
     raw.insert("x-consumer-custom-id", "forged-id".parse().unwrap());
     raw.insert("x-authenticated-identity", "forged".parse().unwrap());
-    raw.insert("X_Authenticated_Identity", "forged-underscore".parse().unwrap());
+    raw.insert(
+        "X_Authenticated_Identity",
+        "forged-underscore".parse().unwrap(),
+    );
     raw.insert("x_consumer_role", "admin".parse().unwrap());
     raw.insert("X_Consumer-Groups", "admins".parse().unwrap());
     raw.insert("x-consumers-note", "ordinary".parse().unwrap());
@@ -167,7 +170,9 @@ fn raw_grpc_merge_base_drops_client_consumer_namespace_but_keeps_gateway_usernam
         Some("application/grpc")
     );
     assert_eq!(
-        headers.get("x-authenticated-identity").and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-authenticated-identity")
+            .and_then(|v| v.to_str().ok()),
         Some("alice")
     );
 }
@@ -212,7 +217,10 @@ fn post_plugin_refresh_keeps_external_identity_separate_from_consumer_assertions
 
     assert!(consumer_namespace_keys(&headers).is_empty());
     assert!(headers.get("x-consumer-username").is_none());
-    assert_eq!(headers.get("x-authenticated-identity").map(String::as_str), Some("alice"));
+    assert_eq!(
+        headers.get("x-authenticated-identity").map(String::as_str),
+        Some("alice")
+    );
     assert_eq!(
         headers.get("x-request-id").map(String::as_str),
         Some("req-1")

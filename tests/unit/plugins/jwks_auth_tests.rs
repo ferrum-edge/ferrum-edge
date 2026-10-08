@@ -2509,7 +2509,10 @@ async fn test_jwks_auth_maps_subject_to_custom_id() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_none());
-    assert_eq!(ctx.backend_authenticated_identity(), Some("idp-subject-12345"));
+    assert_eq!(
+        ctx.backend_authenticated_identity(),
+        Some("idp-subject-12345")
+    );
 }
 
 // ─── Scope/Role Claim-Based Authorization ──────────────────────────────

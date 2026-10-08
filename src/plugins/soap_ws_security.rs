@@ -1125,8 +1125,7 @@ impl NonceReplayState {
             };
             retained_key_bytes = total;
         }
-        retained_key_bytes == self.retained_key_bytes
-            && principal_counts == self.principal_counts
+        retained_key_bytes == self.retained_key_bytes && principal_counts == self.principal_counts
     }
 
     fn allocate_age_key(&mut self, now: Instant) -> Option<NonceAgeKey> {
@@ -2964,11 +2963,7 @@ impl SoapWsSecurity {
         self.check_nonce_replay_for_principal(nonce, nonce)
     }
 
-    fn check_nonce_replay_for_principal(
-        &self,
-        nonce: &str,
-        principal: &str,
-    ) -> Result<(), String> {
+    fn check_nonce_replay_for_principal(&self, nonce: &str, principal: &str) -> Result<(), String> {
         self.check_nonce_replay_at(nonce, principal, Instant::now())
     }
 
@@ -2983,11 +2978,7 @@ impl SoapWsSecurity {
             return Err(Self::nonce_too_long());
         }
         let principal_digest = sha256_array(principal.as_bytes());
-        self.check_replay_claim_at(
-            &nonce_process_claim_key(nonce),
-            &principal_digest,
-            now,
-        )
+        self.check_replay_claim_at(&nonce_process_claim_key(nonce), &principal_digest, now)
     }
 
     /// Process-local single-use claim for an already-namespaced key.
@@ -3076,12 +3067,8 @@ impl SoapWsSecurity {
             .copied()
             .unwrap_or(0)
             >= principal_limit
-            && Self::prune_expired_prefix_for_quota_locked(
-                &mut state,
-                retention_seconds,
-                now,
-            )
-            .is_err()
+            && Self::prune_expired_prefix_for_quota_locked(&mut state, retention_seconds, now)
+                .is_err()
         {
             return Err(Self::nonce_state_saturated_after_unlock(state));
         }
@@ -3333,7 +3320,8 @@ impl SoapWsSecurity {
         issuer: &str,
         assertion_id: &str,
     ) -> Result<(), String> {
-        self.claim_saml_assertion(issuer, assertion_id, issuer).await
+        self.claim_saml_assertion(issuer, assertion_id, issuer)
+            .await
     }
 
     /// The TTL a shared (Redis) claim is written with, without needing a live
@@ -4004,7 +3992,8 @@ impl SoapWsSecurity {
             .attribute("ID")
             .or_else(|| assertion_node.attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
-        self.claim_saml_assertion(&issuer, assertion_id, name_id).await?;
+        self.claim_saml_assertion(&issuer, assertion_id, name_id)
+            .await?;
 
         debug!("soap_ws_security: SAML assertion validated successfully");
         Ok(name_id)

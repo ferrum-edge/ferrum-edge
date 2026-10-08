@@ -816,10 +816,9 @@ impl ProcessReplayLane {
                 Err(ReplayAdmission::CapacityRefused)
             }
             Entry::Vacant(vacant) => {
-                if !self.try_reserve_principal(
-                    &marker.principal_digest,
-                    max_entries.div_ceil(4).max(1),
-                ) {
+                if !self
+                    .try_reserve_principal(&marker.principal_digest, max_entries.div_ceil(4).max(1))
+                {
                     return Err(ReplayAdmission::CapacityRefused);
                 }
                 if self.try_reserve_slot(max_entries) {

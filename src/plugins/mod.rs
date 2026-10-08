@@ -6955,8 +6955,7 @@ impl RequestContext {
 
     /// Return the external identity for its distinct backend header.
     pub fn backend_authenticated_identity(&self) -> Option<&str> {
-        if self.suppresses_backend_consumer_identity_headers()
-            || self.identified_consumer.is_some()
+        if self.suppresses_backend_consumer_identity_headers() || self.identified_consumer.is_some()
         {
             return None;
         }

@@ -479,7 +479,6 @@ impl LdapAuth {
             ));
         }
 
-
         // Basic credentials are a reusable directory password, typically the
         // user's corporate password. Removing them from the backend request by
         // default keeps them inside the gateway trust boundary; `key_auth`

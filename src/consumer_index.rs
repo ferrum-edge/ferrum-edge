@@ -579,9 +579,9 @@ impl ConsumerIndex {
                 Some(consumer.id.as_str()),
                 consumer.custom_id.as_deref(),
             ]
-                .into_iter()
-                .flatten()
-                .any(|identity| identity_keys.contains(identity))
+            .into_iter()
+            .flatten()
+            .any(|identity| identity_keys.contains(identity))
             {
                 Self::insert_jwt_identities(identity, consumer);
             }

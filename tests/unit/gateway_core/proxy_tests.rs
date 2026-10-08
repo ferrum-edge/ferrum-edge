@@ -3368,7 +3368,10 @@ fn test_request_context_separates_consumer_username_from_external_identity() {
 
     ctx.authenticated_identity_header = Some("user@example.com".to_string());
     assert_eq!(ctx.backend_consumer_username(), None);
-    assert_eq!(ctx.backend_authenticated_identity(), Some("user@example.com"));
+    assert_eq!(
+        ctx.backend_authenticated_identity(),
+        Some("user@example.com")
+    );
 
     ctx.authenticated_identity_header = Some("   ".to_string());
     assert_eq!(ctx.backend_authenticated_identity(), Some("external-user"));
