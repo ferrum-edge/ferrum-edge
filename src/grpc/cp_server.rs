@@ -716,12 +716,16 @@ impl CpGrpcServer {
         result: &'static str,
         reason: &str,
     ) {
+        // Record the bounded values as `&str` so the text formatter quotes
+        // them and the JSON formatter stores the plain string.
+        let node_id = bounded_log_value(node_id);
+        let namespace = bounded_log_value(namespace);
         match result {
             "success" => info!(
                 audit.event = "tenant_subscription",
                 surface,
-                node_id = %bounded_log_value(node_id),
-                namespace = %bounded_log_value(namespace),
+                node_id = node_id.as_str(),
+                namespace = namespace.as_str(),
                 result,
                 "Tenant subscription accepted"
             ),
@@ -749,8 +753,8 @@ impl CpGrpcServer {
                         warn!(
                             audit.event = "tenant_subscription",
                             surface,
-                            node_id = %bounded_log_value(node_id),
-                            namespace = %bounded_log_value(namespace),
+                            node_id = node_id.as_str(),
+                            namespace = namespace.as_str(),
                             result,
                             reason,
                             suppressed_count = suppressed,

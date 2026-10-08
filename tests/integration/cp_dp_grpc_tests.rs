@@ -6257,8 +6257,10 @@ fn native_prefill(
         Rejection::NamespaceStreams => admission
             .reserve_native_stream("ferrum", "other", "other")
             .unwrap(),
+        // The per-principal budget is keyed by (namespace, subject), so the
+        // prefill must hold the same subject in the caller's namespace.
         Rejection::PrincipalStreams => admission
-            .reserve_native_stream("other", "native-node", "other")
+            .reserve_native_stream("ferrum", "native-node", "other")
             .unwrap(),
         Rejection::NodeStreams => admission
             .reserve_native_stream("ferrum", "native-node", "native-node")
@@ -6304,6 +6306,16 @@ async fn native_rpcs_enforce_every_layer_before_snapshot_or_stream_allocation() 
             assert_eq!(harness.mesh_tx.receiver_count(), 0);
             assert!(harness.dp_registry.is_empty());
             assert!(harness.mesh_registry.is_empty());
+            if rejection == Rejection::PrincipalStreams {
+                // The same subject in another namespace is a different
+                // principal and must not draw on the saturated budget.
+                let other_namespace = harness
+                    .admission
+                    .reserve_native_stream("other", "native-node", "other")
+                    .expect("a subject's principal budget must be scoped to its namespace");
+                drop(other_namespace);
+                wait_for_shared_active_streams(&harness.admission, 1).await;
+            }
             drop(held);
             wait_for_shared_active_streams(&harness.admission, 0).await;
         }
