@@ -1,6 +1,8 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index c04742d..e541cf1 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -162,3 +162,9 @@
+@@ -162,3 +162,9 @@ impl<T, F: FnMut(&mut Context<'_>) -> Poll<T>> Future for PollFn<F> {
          (self.0)(cx)
      }
  }
@@ -10,9 +12,11 @@
 +pub fn ferrum_guard_snapshot() -> String {
 +    proto::guard_snapshot()
 +}
+diff --git a/src/proto/mod.rs b/src/proto/mod.rs
+index 5e3b4f4..cf7d80f 100644
 --- a/src/proto/mod.rs
 +++ b/src/proto/mod.rs
-@@ -10,6 +10,7 @@
+@@ -10,6 +10,7 @@ pub(crate) use self::connection::{Config, Connection, DataFrameBudget};
  pub use self::error::{Error, Initiator};
  pub(crate) use self::peer::{Dyn as DynPeer, Peer};
  pub(crate) use self::ping_pong::UserPings;
@@ -20,9 +24,11 @@
  pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
  pub(crate) use self::streams::{Open, PollReset, Prioritized};
  
+diff --git a/src/proto/streams/counts.rs b/src/proto/streams/counts.rs
+index f74aa14..bcaa7b6 100644
 --- a/src/proto/streams/counts.rs
 +++ b/src/proto/streams/counts.rs
-@@ -31,7 +31,6 @@
+@@ -31,7 +31,6 @@ impl Budget {
          self.max = max;
      }
  
@@ -30,7 +36,7 @@
      fn available(&self) -> usize {
          self.max.saturating_sub(self.spent)
      }
-@@ -43,6 +42,8 @@
+@@ -43,6 +42,8 @@ pub(super) struct Counts {
      /// inc / dec.
      peer: peer::Dyn,
  
@@ -39,7 +45,7 @@
      /// Maximum number of locally initiated streams
      max_send_streams: usize,
  
-@@ -91,7 +92,11 @@
+@@ -91,7 +92,11 @@ pub(super) struct Counts {
  impl Counts {
      /// Create a new `Counts` using the provided configuration values.
      pub fn new(peer: peer::Dyn, config: &Config) -> Self {
@@ -52,7 +58,7 @@
              peer,
              max_send_streams: config.initial_max_send_streams,
              num_send_streams: 0,
-@@ -106,6 +111,30 @@
+@@ -106,6 +111,30 @@ impl Counts {
              data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
              data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
              num_recv_empty_data_frames: 0,
@@ -83,7 +89,7 @@
          }
      }
  
-@@ -140,9 +169,13 @@
+@@ -140,10 +169,14 @@ impl Counts {
      /// Releases the framing overhead of a DATA frame that is no longer
      /// buffered internally.
      pub fn release_data_frame(&mut self, payload_len: usize) {
@@ -91,12 +97,15 @@
          if payload_len != 0 && payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
              self.data_frame_budget
                  .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len);
-+        }
+         }
 +        if let Some(observation) = &mut self.observation {
 +            observation.inc(13, (self.data_frame_budget.available() - before) as u64);
-         }
++        }
      }
  
+     /// Returns true when the next opened stream will reach capacity of outbound streams
+diff --git a/src/proto/streams/mod.rs b/src/proto/streams/mod.rs
+index 8db59ab..4e06bfd 100644
 --- a/src/proto/streams/mod.rs
 +++ b/src/proto/streams/mod.rs
 @@ -1,6 +1,7 @@
@@ -107,30 +116,32 @@
  mod prioritize;
  mod recv;
  mod send;
-@@ -13,6 +14,7 @@
+@@ -13,6 +14,7 @@ mod streams;
  pub(crate) use self::prioritize::Prioritized;
  pub(crate) use self::recv::Open;
  pub(crate) use self::send::PollReset;
 +pub(crate) use self::streams::guard_snapshot;
- pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
+ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
  
  use self::buffer::Buffer;
+diff --git a/src/proto/streams/recv.rs b/src/proto/streams/recv.rs
+index bf4d53d..84d60cb 100644
 --- a/src/proto/streams/recv.rs
 +++ b/src/proto/streams/recv.rs
-@@ -115,6 +115,12 @@
-             is_push_enabled: config.local_push_enabled,
-             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
+@@ -113,6 +113,12 @@ impl Recv {
          }
-+    }
-+
+     }
+ 
 +    pub(super) fn guard_window(&self, observation: &mut super::guard_observe::Observation) {
 +        observation.wire_window = self.flow.window_size();
 +        observation.byte_available = self.flow.available().into();
 +        observation.in_flight = self.in_flight_data;
-     }
- 
++    }
++
      /// Returns the initial receive window size
-@@ -916,6 +922,11 @@
+     pub fn init_window_sz(&self) -> WindowSize {
+         self.init_window_sz
+@@ -914,6 +920,11 @@ impl Recv {
                      "recv_reset; remotely-reset pending-accept streams reached limit ({:?})",
                      counts.max_remote_reset_streams(),
                  );
@@ -142,7 +153,7 @@
                  return Err(Error::library_go_away_data(
                      Reason::ENHANCE_YOUR_CALM,
                      "too_many_resets",
-@@ -965,8 +976,16 @@
+@@ -963,9 +974,17 @@ impl Recv {
          let mut to_release: WindowSize = 0;
          while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
              if let Event::Data(data) = &event {
@@ -150,30 +161,33 @@
                  if data.is_budgeted {
 +                    if let Some(observation) = &mut counts.observation { observation.inc(12, 1); }
                      counts.release_data_frame(data.payload.len());
-+                }
+                 }
 +                let after = counts.guard_state()[1];
 +                if let Some(observation) = &mut counts.observation {
 +                    self.guard_window(observation);
 +                    observation.transition(3, [u32::from(stream.id) as u64, data.payload.len() as u64,
 +                        0, u64::from(!data.is_budgeted), 0], [before, after], u8::from(data.is_budgeted));
-                 }
++                }
                  to_release = to_release
                      .saturating_add(data.payload.len() as WindowSize)
-@@ -980,6 +999,11 @@
-         if to_release > 0 {
+                     .min(stream.in_flight_recv_data);
+@@ -979,6 +998,11 @@ impl Recv {
              stream.in_flight_recv_data -= to_release;
              self.release_connection_capacity(to_release, task);
-+        }
+         }
 +        let credit = counts.guard_state()[1];
 +        if let Some(observation) = &mut counts.observation {
 +            self.guard_window(observation);
 +            observation.window_transition(7, credit);
-         }
++        }
      }
  
+     /// Get the max ID of streams we can receive.
+diff --git a/src/proto/streams/streams.rs b/src/proto/streams/streams.rs
+index 7776c70..d4e143b 100644
 --- a/src/proto/streams/streams.rs
 +++ b/src/proto/streams/streams.rs
-@@ -12,8 +12,76 @@
+@@ -12,9 +12,77 @@ use http::{HeaderMap, Request, Response};
  use std::task::{Context, Poll, Waker};
  use tokio::io::AsyncWrite;
  
@@ -181,7 +195,7 @@
 +use std::sync::{Arc, Mutex, Weak};
 +use std::sync::atomic::{AtomicU64, Ordering};
  use std::{fmt, io};
-+
+ 
 +// Temporary diagnostic registry: weak handles only, never a connection owner.
 +static REGISTRY: Mutex<Vec<Weak<Mutex<Inner>>>> = Mutex::new(Vec::new());
 +static REGISTRY_VERSION: AtomicU64 = AtomicU64::new(0);
@@ -248,10 +262,11 @@
 +    tracing::debug!(target: TARGET, parent: None, "H2_GUARD_FENCE_V2 {}", fields);
 +    format!("# H2_GUARD_ACK_V2 {}\n", fields)
 +}
- 
++
  #[derive(Debug)]
  pub(crate) struct Streams<B, P>
-@@ -126,6 +194,12 @@
+ where
+@@ -136,6 +204,12 @@ where
              .recv
              .set_target_connection_window(size, &mut me.actions.task)?;
          me.counts.set_target_connection_window_size(size);
@@ -264,7 +279,7 @@
          Ok(())
      }
  
-@@ -178,6 +255,8 @@
+@@ -181,6 +255,8 @@ where
      pub fn clear_expired_reset_streams(&mut self) {
          let mut me = self.inner.lock().unwrap();
          let me = &mut *me;
@@ -273,7 +288,7 @@
          me.actions
              .recv
              .clear_expired_reset_streams(&mut me.store, &mut me.counts);
-@@ -197,7 +276,18 @@
+@@ -200,7 +276,18 @@ where
  
              let status = {
                  let mut me = self.inner.lock().unwrap();
@@ -293,7 +308,7 @@
  
                  // Register the task while holding the same lock used to
                  // observe that all pending frames have been buffered. A
-@@ -260,7 +350,18 @@
+@@ -263,7 +350,18 @@ where
          let mut me = self.inner.lock().unwrap();
          let me = &mut *me;
  
@@ -313,7 +328,7 @@
      }
  
      pub fn send_request(
-@@ -397,7 +498,16 @@
+@@ -401,7 +499,16 @@ impl<B> DynStreams<'_, B> {
  
      pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
          let mut me = self.inner.lock().unwrap();
@@ -331,7 +346,7 @@
      }
  
      pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
-@@ -451,10 +561,22 @@
+@@ -456,10 +563,22 @@ impl<B> DynStreams<'_, B> {
      }
  }
  
@@ -356,7 +371,7 @@
              actions: Actions {
                  recv: Recv::new(peer, &config),
                  send: Send::new(&config),
-@@ -463,7 +585,17 @@
+@@ -468,7 +587,17 @@ impl Inner {
              },
              store: Store::new(),
              refs: 1,
@@ -375,7 +390,7 @@
      }
  
      fn recv_headers<B>(
-@@ -596,10 +728,17 @@
+@@ -610,10 +739,17 @@ impl Inner {
          frame: frame::Data,
      ) -> Result<(), Error> {
          let id = frame.stream_id();
@@ -393,7 +408,7 @@
                  // The GOAWAY process has begun. All streams with a greater ID
                  // than specified as part of GOAWAY should be ignored.
                  if id > self.actions.recv.max_stream_id() {
-@@ -644,14 +783,31 @@
+@@ -656,14 +792,31 @@ impl Inner {
              let sz = frame.flow_controlled_len();
              let is_end_stream = frame.is_end_stream();
              let payload_len = frame.payload().len();
@@ -426,7 +441,7 @@
              }
  
              // Any stream error after receiving a DATA frame means
-@@ -661,6 +817,11 @@
+@@ -673,6 +826,11 @@ impl Inner {
                  actions
                      .recv
                      .release_connection_capacity(sz as WindowSize, &mut None);
@@ -436,9 +451,9 @@
 +                    observation.window_transition(7, credit);
 +                }
              }
-             actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+             actions.reset_on_recv_stream_err_deferred(send_buffer, stream, counts, res)
          })
-@@ -1522,8 +1683,16 @@
+@@ -1546,9 +1704,17 @@ impl OpaqueStreamRef {
              .poll_data(cx, &mut stream)
              .map(|result| match result {
                  Some(Ok(data)) => {
@@ -446,16 +461,17 @@
                      if data.is_budgeted {
 +                        if let Some(observation) = &mut me.counts.observation { observation.inc(11, 1); }
                          me.counts.release_data_frame(data.payload.len());
-+                    }
+                     }
 +                    let after = me.counts.guard_state()[1];
 +                    if let Some(observation) = &mut me.counts.observation {
 +                        me.actions.recv.guard_window(observation);
 +                        observation.transition(2, [u32::from(stream.id) as u64, data.payload.len() as u64,
 +                            0, u64::from(!data.is_budgeted), 0], [before, after], u8::from(data.is_budgeted));
-                     }
++                    }
                      Some(Ok(data.payload))
                  }
-@@ -1565,9 +1734,13 @@
+                 Some(Err(err)) => Some(Err(err)),
+@@ -1589,9 +1755,13 @@ impl OpaqueStreamRef {
  
          let mut stream = me.store.resolve(self.key);
  
@@ -472,7 +488,7 @@
      }
  
      /// Clear the receive queue and set the status to no longer receive data frames.
-@@ -1742,6 +1915,11 @@
+@@ -1766,6 +1936,11 @@ impl Actions {
                          "locally-reset streams reached limit ({:?})",
                          counts.max_local_error_resets().unwrap(),
                      );
@@ -484,7 +500,7 @@
                      return Err(crate::proto::error::GoAway {
                          reason: Reason::ENHANCE_YOUR_CALM,
                          debug_data: "too_many_internal_resets".into(),
-@@ -1790,6 +1968,11 @@
+@@ -1829,6 +2004,11 @@ impl Actions {
                      "reset_on_recv_stream_err; locally-reset streams reached limit ({:?})",
                      counts.max_local_error_resets().unwrap(),
                  );
@@ -496,7 +512,7 @@
                  Err(Error::library_go_away_data(
                      Reason::ENHANCE_YOUR_CALM,
                      "too_many_internal_resets",
-@@ -1841,3 +2024,7 @@
+@@ -1880,3 +2060,7 @@ impl Actions {
          self.send.clear_queues(store, counts);
      }
  }

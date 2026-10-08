@@ -1,11 +1,11 @@
 {
   "schema": 1,
   "name": "h2",
-  "version": "0.4.19",
-  "url": "https://static.crates.io/crates/h2/h2-0.4.19.crate",
-  "sha256": "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16",
-  "revision": "d57d1b852fec9dda6d42d3454502006d52104da8",
-  "patch_sha256": "08f0da5f6f3ea423ae546badca486fda059f46a851bfdaeb1fa3fc320419451b",
+  "version": "0.4.20",
+  "url": "https://static.crates.io/crates/h2/h2-0.4.20.crate",
+  "sha256": "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118",
+  "revision": "b0e890842ac16d3c76836fd4fcc06421acb15fa7",
+  "patch_sha256": "a66d2d1c4267216b35032ed9f7fc6c7d109bdef5c4f09ef46d6adb52044e3476",
   "files": {
     "src/lib.rs": {
       "before": "c8680fc4eb13ccb4ce944716042bd33c6554677cf8261c371442f91fbee352e0",
@@ -20,21 +20,21 @@
       "after": "c8caf8e45e985ae07497547f117bfa7f84280bb011fe4d2e5470d2ffe511e01c"
     },
     "src/proto/streams/mod.rs": {
-      "before": "49a9d42775813e08ae6318441314c3a4dca58a345a04b73275cd9755e348a621",
-      "after": "1fad4e03b3a268c47c37236d6c5c04cffba59518f11a096033901b9f8d3fa3d4"
+      "before": "79b2b497bed11ea75997a02c8c626ba270e1520273ee677e944475d2fc8e594f",
+      "after": "3bf934231cc86af0ca792a2231a8b611a32b1e1cfe5450940bf6ca8eca096f61"
     },
     "src/proto/streams/recv.rs": {
-      "before": "fed37fe0528eadc27acdbaea7f2367e1ebc88c45de1a5739b446142c610badf4",
-      "after": "c58c186df6564e29c97e7160917fd52384aee52b159543128bb31e4b50931009"
+      "before": "f8a3d085c88d117f510478c194e7c9375fde89033f0bfead9cc6805d6da3ffab",
+      "after": "938647ce5937258e4b0d3d3658852edb416ef006c11a1892021963f19268e794"
     },
     "src/proto/streams/streams.rs": {
-      "before": "a190b0afaa8dd6c8a36743561dc72eec936d38f6e67e2c24c59ad447dc4d4d0b",
-      "after": "c3884c013aa397704b329cf9e124d2b792d9df6065e97fec3f582e4a12aa527a"
+      "before": "4018a22be3b807e87bab359775453a59e4f44c3329297f3ce7f961d3fd826e69",
+      "after": "aad77952aa934da7c8606ff1914cb99568a5abebf884ea9095b7de20b69a0f61"
     }
   },
   "assets": {
     "observer.rs": "23b0d7a833e12538e3516e21b12312e27bf0a53a9b4635579397cc944e6ad1b1",
-    "guard_tests.rs": "0b83f5cd9af4bde1b6b86e359319db4f8281297801e0cdec00fe3df8e410074e",
+    "guard_tests.rs": "294f3e0ce044bcd28cb38fc8d77b73a0156ba56d9624cd8019823b09067e5acc",
     "metrics-hook.txt": "c3e18b33e790351221a7383fd83e7bfa53b59a96b26e7b434a565d714454d539"
   },
   "context_files": {

@@ -13,7 +13,7 @@ mod streams;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
-pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
+pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
 
 use self::buffer::Buffer;
 use self::counts::Counts;
@@ -80,7 +80,7 @@ pub struct Config {
     pub local_max_error_reset_streams: Option<usize>,
 
     /// Connection-level budget policy for DATA framing overhead.
-    pub data_frame_budget: DataFrameBudget,
+    pub(crate) data_frame_budget: DataFrameBudget,
 }
 
 trait DebugStructExt<'a, 'b> {

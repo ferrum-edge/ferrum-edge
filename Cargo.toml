@@ -714,7 +714,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # API, and update the three lockfiles and the drift manifest. See
 # `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md`.
 #
-# We also carry a vendored copy of h2 0.4.19 whose frame writer copies DATA
+# We also carry a vendored copy of h2 0.4.20 whose frame writer copies DATA
 # payloads into its write buffer, up to about 64 KiB, instead of holding one
 # DATA frame at a time (issue #5588). Stock h2 wrote every DATA frame with its
 # own `writev`, and over TLS a maximum-size frame (16 KiB payload plus 9-byte
@@ -724,16 +724,14 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # tracks the problem as hyperium/h2#902, with a frame-queue fix in PR
 # hyperium/h2#903.
 #
-# Retirement plan: retire all four h2 patches before dropping the vendored
-# crate. An adopted h2 release must batch DATA frames into one write
-# (hyperium/h2#903 or an equivalent), update the automatic DATA-frame budget
-# with runtime target window changes (hyperium/h2#965 or an equivalent),
-# expose a stream's assigned send window (h2 patch 003, or retire it with
-# Hyper patch 005), AND close an idle client connection whose last handle
-# drops mid-poll (hyperium/h2#956, h2 0.4.20). Alternatively, Ferrum must stop
-# using h2.
+# Retirement plan: retire both h2 patches before dropping the vendored crate.
+# An adopted h2 release must batch DATA frames into one write
+# (hyperium/h2#903 or an equivalent) AND expose a stream's assigned send window
+# (h2 patch 003, or retire it with Hyper patch 005). Alternatively, Ferrum must
+# stop using h2. (h2 0.4.20 retired the runtime-budget and client close-wakeup
+# patches: hyperium/h2#965 and #956.)
 # Then remove the `h2` line below (here, in `tests/performance/mesh/Cargo.toml`
-# and in `fuzz/Cargo.toml`), drop `vendor/h2-0.4.19-ferrum-patched/`, and update
+# and in `fuzz/Cargo.toml`), drop `vendor/h2-0.4.20-ferrum-patched/`, and update
 # the three lockfiles and the drift manifest. See
 # `docs/upstream-h2-patches/001-coalesce-data-frame-writes/README.md`.
 [patch.crates-io]
@@ -746,4 +744,4 @@ tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
 hyper-util = { path = "vendor/hyper-util-0.1.21-ferrum-patched" }
 hyper = { path = "vendor/hyper-1.10.0-ferrum-patched" }
-h2 = { path = "vendor/h2-0.4.19-ferrum-patched" }
+h2 = { path = "vendor/h2-0.4.20-ferrum-patched" }

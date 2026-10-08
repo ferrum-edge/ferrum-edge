@@ -24,6 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A remaining fallback now logs its reason (for example
   `change-log batch over the cap`).
 
+### Changed
+
+- **Vendored h2 moves to 0.4.20** (issue #6062). `vendor/h2-0.4.20-ferrum-patched/`
+  replaces the 0.4.19 fork. Two Ferrum patches retire because upstream now
+  contains them:
+  - the runtime small-DATA-frame budget (`h2-002`, hyperium/h2#965);
+  - the client close-wakeup race (`h2-004`, hyperium/h2#956).
+
+  The DATA-frame write coalescing (`h2-001`) and the assigned-send-capacity
+  accessor (`h2-003`, read by Hyper patch 005) are re-applied unchanged.
+  0.4.20 also brings upstream protocol hardening and HPACK/locking performance
+  work: GOAWAY stream-id validation, `:status` enforcement, duplicate
+  `content-length` rejection, refused-stream and push-promise accounting.
+  Refused streams now count toward
+  `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` (default 256), so a
+  client that overruns `max_concurrent_streams` that many times on one
+  connection receives `GOAWAY(ENHANCE_YOUR_CALM)`.
+
 ## [0.9.15] - 2026-10-08
 
 Release prepared on **2026-10-08 UTC** from main

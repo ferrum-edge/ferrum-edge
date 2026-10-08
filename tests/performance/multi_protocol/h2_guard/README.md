@@ -16,12 +16,10 @@ it did not capture live successful backend histories or establish a repair.
 The ordinary Cargo manifests, lockfiles, vendored inventory and published
 images continue to use the existing dependency graph. `prepare.py` requires a
 GitHub-hosted Linux runner, copies the checkout into a new temporary directory,
-verifies the immutable h2 0.4.19 archive/revision, applies Ferrum's vendored
-h2 patches (`docs/upstream-h2-patches/001-coalesce-data-frame-writes/`,
-`docs/upstream-h2-patches/002-runtime-data-frame-budget/`,
-`docs/upstream-h2-patches/003-assigned-send-capacity/` and
-`docs/upstream-h2-patches/004-client-close-wakeup/`) without fuzz and
-requires every `src/` file to match `vendor/h2-0.4.19-ferrum-patched`'s
+verifies the immutable h2 0.4.20 archive/revision, applies Ferrum's vendored
+h2 patches (`docs/upstream-h2-patches/001-coalesce-data-frame-writes/` and
+`docs/upstream-h2-patches/003-assigned-send-capacity/`) without fuzz and
+requires every `src/` file to match `vendor/h2-0.4.20-ferrum-patched`'s
 drift-manifest hash, so the observed crate is the h2 the gateway ships. It then
 verifies every observer preimage, applies the reviewed observer patch without
 fuzz, verifies postimages and injected assets, and selects the result only in

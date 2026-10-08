@@ -42,9 +42,9 @@ Two details decide when this happens:
 An h2 0.4.16+ receiver (tonic, axum, hyper) charges every non-final DATA frame
 under 256 bytes against a connection-wide budget. It answers an exhausted
 budget with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")`, which fails
-every stream on the connection. Ferrum's own receiver has
-[h2 patch 002](../../upstream-h2-patches/002-runtime-data-frame-budget/README.md);
-unpatched backends and clients do not. The old 1 KiB gate never fully covered
+every stream on the connection. Ferrum's own receiver runs h2 0.4.20, whose
+budget follows runtime window changes (hyperium/h2#965, formerly Ferrum h2
+patch 002); older backends and clients may not. The old 1 KiB gate never fully covered
 this either: it applied only to the first frame of each chunk, and h2 cut the
 rest of the chunk from later increments.
 
@@ -242,7 +242,7 @@ vendored h2:
 
 ```bash
 cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_h2_small_window_coalescing \
-  --config 'patch.crates-io.h2.path="vendor/h2-0.4.19-ferrum-patched"'
+  --config 'patch.crates-io.h2.path="vendor/h2-0.4.20-ferrum-patched"'
 ```
 
 `test_grpc_h2c_upload_coalesces_small_connection_window_increments` in

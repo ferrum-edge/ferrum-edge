@@ -1380,7 +1380,7 @@ PYEOF
         if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
             local source_identity
             source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
-            if [ "$source_identity" != "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16" ]; then
+            if [ "$source_identity" != "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118" ]; then
                 echo "[experiment] image is not the pinned guard diagnostic build" >&2
                 exit 2
             fi
