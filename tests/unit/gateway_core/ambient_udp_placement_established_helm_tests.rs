@@ -951,8 +951,16 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
          and claiming a single-object restriction Kubernetes does not provide \
          is worse than documenting the runtime binding"
     );
+    let nodes_binding = rbac
+        .split("\n---\n")
+        .find(|document| {
+            document.contains("kind: ClusterRoleBinding")
+                && document.contains("name: ferrum-mesh-ambient-{{ .Release.Name }}")
+        })
+        .expect("ambient-rbac.yaml must bind the nodes ClusterRole");
+    let ambient_subject = "name: ferrum-mesh-ambient\n    namespace: {{ .Release.Namespace }}";
     assert!(
-        nodes_rbac.contains("name: ferrum-mesh-ambient\n    namespace: {{ .Release.Namespace }}",),
+        nodes_binding.contains(ambient_subject),
         "the grant must bind the ambient DaemonSet's own service account"
     );
     assert!(
