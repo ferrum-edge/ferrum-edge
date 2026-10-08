@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Bound per-client plugin state and compressed request fingerprinting.** IP-based rate limiters now group IPv6 addresses by a `/64` prefix (configurable in `rate_limiting`), aggregate MCP session admission evicts only the caller’s own oldest session and refuses admission at global capacity, and request deduplication refuses invalid or over-limit Brotli bodies using a strict-window decoder.
+- **Bound per-client plugin state and compressed request fingerprinting** (#6079). IP-based rate limiters now group IPv6 addresses by a `/64` prefix (configurable in `rate_limiting`), aggregate MCP session admission evicts only the caller’s own oldest session and refuses admission at global capacity, and request deduplication refuses invalid or over-limit Brotli bodies using a strict-window decoder.
 
 ### Performance
 
