@@ -30,7 +30,7 @@ on:
         default: "100"
         type: string
       payload_size:
-        description: "Payload size in bytes (UDP uses 2048 regardless)"
+        description: "Payload size in bytes (UDP legs cap at 2048)"
         required: false
         default: "10240"
         type: string
@@ -63,7 +63,9 @@ jobs:
   benchmark:
     name: Multi-Protocol Benchmark
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The default release profile is a fat-LTO, codegen-units=1 build; leave
+    # room for it before the protocol runs.
+    timeout-minutes: 180
     permissions:
       contents: read
 

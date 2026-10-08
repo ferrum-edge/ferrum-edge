@@ -70,7 +70,7 @@ done
 
 # Provenance manifest: everything needed to judge or reproduce the numbers.
 python3 - "$OUT/manifest.json" "$PROJECT_ROOT" "$STARTED_UTC" <<PYEOF
-import json, os, platform, subprocess, sys
+import datetime, json, os, platform, subprocess, sys
 out, root, started = sys.argv[1:]
 def run(*cmd, cwd=None):
     try:
@@ -101,6 +101,19 @@ def os_name():
     if platform.system() == "Darwin":
         return f"macOS {platform.mac_ver()[0]} ({platform.machine()})"
     return f"{platform.system()} {platform.release()} ({platform.machine()})"
+# With --skip-build the binaries may predate HEAD: record when each was built
+# and flag any older than the recorded commit, so the bundle cannot silently
+# attribute an older build's numbers to this commit.
+commit_time = run("git", "log", "-1", "--format=%ct", cwd=root)
+binaries = {}
+stale = []
+for rel in ("target/release/ferrum-edge",
+            "tests/performance/multi_protocol/target/release/proto_bench",
+            "tests/performance/multi_protocol/target/release/proto_backend"):
+    mtime = os.path.getmtime(os.path.join(root, rel))
+    binaries[rel] = datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if commit_time and mtime < int(commit_time):
+        stale.append(rel)
 version_raw = run(os.path.join(root, "target/release/ferrum-edge"), "version", "--json")
 try:
     version = json.loads(version_raw).get("version") if version_raw else None
@@ -116,6 +129,8 @@ manifest = {
     },
     "gateway_version": version,
     "build_profile": "release",
+    "binaries_built_utc": binaries,
+    "binaries_older_than_commit": stale,
     "toolchain": run("rustc", "--version"),
     "environment": {
         "os": os_name(),
@@ -140,6 +155,10 @@ with open(out, "w") as f:
     json.dump(manifest, f, indent=2)
     f.write("\n")
 PYEOF
+
+if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["binaries_older_than_commit"] else 1)' "$OUT/manifest.json"; then
+    echo "WARNING: release binaries predate the recorded commit (see binaries_older_than_commit in manifest.json); rebuild without --skip-build before publishing." >&2
+fi
 
 FAILURES=0
 

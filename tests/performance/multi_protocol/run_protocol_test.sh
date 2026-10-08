@@ -134,9 +134,10 @@ binary_is_fresh() {
     local binary="$1"
     local src_dir="$2"
     [ -f "$binary" ] || return 1
-    # If any .rs or .toml file is newer than the binary, it's stale
+    # If any Rust, TOML (manifests, .cargo/config.toml), lock, or .proto file
+    # is newer than the binary, it's stale
     local newer
-    newer=$(find "$src_dir" \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -newer "$binary" -print -quit 2>/dev/null)
+    newer=$(find "$src_dir" \( -name '*.rs' -o -name '*.toml' -o -name 'Cargo.lock' -o -name '*.proto' \) -newer "$binary" -print -quit 2>/dev/null)
     [ -z "$newer" ]
 }
 
@@ -163,10 +164,13 @@ build() {
     local need_gateway=true
     local need_bench=true
 
-    # The gateway build reads src/, the root manifests, build.rs and proto/;
-    # the bench crate keeps proto_bench.rs/proto_backend.rs at its root.
+    # The gateway build reads src/, the root manifests, build.rs, proto/, the
+    # patched crates in vendor/, and .cargo/config.toml; the bench crate keeps
+    # proto_bench.rs/proto_backend.rs at its root.
     if binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/src" \
         && binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/proto" \
+        && binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/vendor" \
+        && binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/.cargo" \
         && manifest_is_fresh "$gateway_bin" "$PROJECT_ROOT"; then
         need_gateway=false
     fi
@@ -405,25 +409,25 @@ stop_envoy() {
     sleep 1
 }
 
-# Cumulative user+system CPU seconds of a PID (all threads), or empty.
+# Cumulative user+system CPU seconds of a PID (all threads), or empty. `ps`
+# runs from the shell so the Python helpers never spawn a process.
 proc_cpu_seconds() {
-    python3 - "$1" <<'PYEOF' 2>/dev/null
-import os, subprocess, sys
-pid = sys.argv[1]
-try:
-    with open(f"/proc/{pid}/stat") as f:
-        fields = f.read().rsplit(")", 1)[1].split()
-    print((int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"))
-except OSError:
-    # macOS: cputime is [[DD-]HH:]MM:SS.ss with 10 ms resolution.
-    raw = subprocess.run(["ps", "-o", "cputime=", "-p", pid],
-                         capture_output=True, text=True, check=True).stdout.strip()
+    local pid="$1"
+    if [ -r "/proc/$pid/stat" ]; then
+        python3 -c 'import os, sys
+fields = open(sys.argv[1]).read().rsplit(")", 1)[1].split()
+print((int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"))' "/proc/$pid/stat" 2>/dev/null
+    else
+        # macOS: cputime is [[DD-]HH:]MM:SS.ss with 10 ms resolution.
+        ps -o cputime= -p "$pid" 2>/dev/null | python3 -c 'import sys
+raw = sys.stdin.read().strip()
+if raw:
     days, _, clock = raw.rpartition("-")
     seconds = 0.0
     for part in clock.split(":"):
         seconds = seconds * 60 + float(part)
-    print(seconds + int(days or 0) * 86400)
-PYEOF
+    print(seconds + int(days or 0) * 86400)' 2>/dev/null
+    fi
 }
 
 BENCH_ORDER="${BENCH_ORDER:-gateway-first}"

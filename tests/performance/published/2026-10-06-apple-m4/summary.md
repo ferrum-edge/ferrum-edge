@@ -62,4 +62,3 @@ One connection: RPS is bounded by round-trip latency, so read `Added p50` (the t
 | TCP + TLS | 32,094 | 62,505 | 49% | 30 µs | 47 µs | 15 µs | 10 µs | 0.7% | 0 | — |
 | UDP | 34,322 | 69,440 | 51% | 27 µs | 43 µs | 14 µs | 12 µs | 0.1% | 0 | — |
 | UDP + DTLS | 29,874 | 56,321 | 47% | 32 µs | 47 µs | 15 µs | 14 µs | 0.4% | 0 | — |
-

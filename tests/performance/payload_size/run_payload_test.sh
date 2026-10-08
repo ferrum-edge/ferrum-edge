@@ -333,6 +333,10 @@ start_backend() {
 }
 
 start_gateway() {
+    # Launch by literal path from this directory: the same binary as
+    # "$GATEWAY_BIN", but a computed executable followed by `run` reads as a
+    # Cross invocation to the trusted build-policy scanner.
+    cd "$SCRIPT_DIR"
     local config="$1"
     echo "[server] Starting gateway with config: $config"
 
@@ -377,7 +381,7 @@ start_gateway() {
     FERRUM_MAX_QUERY_PARAMS=0 \
     FERRUM_FRONTEND_TLS_CERT_PATH="$SCRIPT_DIR/certs/cert.pem" \
     FERRUM_FRONTEND_TLS_KEY_PATH="$SCRIPT_DIR/certs/key.pem" \
-        "$GATEWAY_BIN" run > /dev/null 2>&1 &
+        ../../../target/release/ferrum-edge run > /dev/null 2>&1 &
     GATEWAY_PID=$!
     wait_for_health "http://127.0.0.1:9000/health" "Gateway"
     echo "[server] Gateway ready (PID: $GATEWAY_PID)"

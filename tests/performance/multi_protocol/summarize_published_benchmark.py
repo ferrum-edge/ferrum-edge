@@ -196,6 +196,11 @@ def render_markdown(manifest, summary):
         f"- Host: {env.get('cpu', 'unknown')}, {env.get('logical_cpus', '?')} logical CPUs, "
         f"{env.get('memory_gib', '?')} GiB, {env.get('os', 'unknown')}",
         f"- Load average at start: {env.get('load_average', 'unknown')}",
+    ]
+    if manifest.get("binaries_older_than_commit"):
+        lines.append("- **Warning:** binaries predate the commit above: "
+                     + ", ".join(f"`{path}`" for path in manifest["binaries_older_than_commit"]))
+    lines += [
         f"- Runs per row: {args.get('runs')} (leg order alternates gateway-first / direct-first)",
         "- Topology: proto_bench → ferrum-edge → proto_backend on one host over loopback; "
         "the direct leg is proto_bench → proto_backend with the same client protocol.",
@@ -261,7 +266,7 @@ def summarize(out):
     (out / "summary.json").write_text(json.dumps(document, indent=2, allow_nan=False) + "\n")
     # Every raw leg report, so the summary can be re-derived without the logs.
     (out / "samples.json").write_text(json.dumps(samples, separators=(",", ":"), allow_nan=False) + "\n")
-    (out / "summary.md").write_text(render_markdown(manifest, summary) + "\n")
+    (out / "summary.md").write_text(render_markdown(manifest, summary).rstrip("\n") + "\n")
     return document
 
 
