@@ -30,8 +30,8 @@ use ferrum_edge::plugins::utils::redis_rate_limiter::{
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayMarker,
     ReplayScope, SharedReplayAuthorityHealth, admit_process_at, counters, monotonic_millis,
-    process_lane, process_lane_registered_for_tests, process_max_entries, shared_authority_degraded,
-    shared_health_snapshot, validate_scope_backend,
+    process_lane, process_lane_registered_for_tests, process_max_entries,
+    shared_authority_degraded, shared_health_snapshot, validate_scope_backend,
 };
 
 use super::redis_resp::{TIME_CMD, host_clock_time_reply};
