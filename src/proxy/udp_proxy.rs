@@ -2109,6 +2109,12 @@ fn resolve_udp_session_epoch_view(
                     listen_port
                 ));
             }
+            super::sni::DtlsSniResult::Malformed => {
+                return Err(anyhow::anyhow!(
+                    "Dropping malformed DTLS ClientHello on port {}",
+                    listen_port
+                ));
+            }
         }
     } else {
         None

@@ -32745,6 +32745,21 @@ async fn handle_proxy_request_inner(
 
     let mut method = req.method().as_str().to_owned();
     let inbound_version = req.version();
+    if inbound_version == hyper::Version::HTTP_11
+        && method != "GET"
+        && crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::WebSocket
+    {
+        record_request(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
+        return Ok(build_method_not_allowed_response_with_allow(
+            r#"{"error":"WebSocket upgrades require GET"}"#,
+            "GET",
+        ));
+    }
+    if is_h2_websocket_connect(&req) {
+        // The WebSocket backend handshake is a GET. Keep route and plugin
+        // policy aligned with the method the backend receives.
+        method = "GET".to_string();
+    }
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
     // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
     // byte-stream `is_hbone_connect` (different wire marker). EITHER shape is a
@@ -52692,10 +52707,14 @@ fn build_response_with_gateway_error(
 }
 
 fn build_method_not_allowed_response(body: &str) -> Response<ProxyBody> {
+    build_method_not_allowed_response_with_allow(body, PROTOCOL_LEVEL_405_ALLOW)
+}
+
+fn build_method_not_allowed_response_with_allow(body: &str, allow: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
         .header("Content-Type", "application/json")
-        .header("Allow", PROTOCOL_LEVEL_405_ALLOW)
+        .header("Allow", allow)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(

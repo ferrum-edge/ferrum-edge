@@ -47,8 +47,10 @@ async fn opa_policy_denial_applies_to_http_websocket_upgrade_and_grpc() {
         .expect("plain HTTP request completes");
     assert_eq!(plain.status(), StatusCode::FORBIDDEN);
 
+    // WebSocket upgrades must be GET; a non-GET upgrade is refused before
+    // plugins run, so the OPA denial is exercised with a valid handshake.
     let websocket_upgrade = client
-        .post(gateway.proxy_url("/x"))
+        .get(gateway.proxy_url("/x"))
         .header("connection", "upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-key", WS_KEY)
