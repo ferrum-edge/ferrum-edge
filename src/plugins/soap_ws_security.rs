@@ -1135,6 +1135,45 @@ impl NonceReplayState {
             .is_some_and(|entry| entry.age_key == *age_key)
     }
 
+    fn principal_count(&self, principal: &[u8; 32]) -> usize {
+        self.principal_counts.get(principal).copied().unwrap_or(0)
+    }
+
+    /// Move one retained entry's quota charge from `from` to `to` (two
+    /// different principals). The new principal is charged first, bounded by
+    /// `principal_limit`, and only then is the previous principal's charge
+    /// released. Returns `Ok(false)` without changing anything when `to` is
+    /// already at its share, and `Err(())` on accounting drift.
+    fn move_principal_charge(
+        &mut self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        principal_limit: usize,
+    ) -> Result<bool, ()> {
+        let charged = self.principal_count(to);
+        if charged >= principal_limit {
+            return Ok(false);
+        }
+        let Some(charged) = charged.checked_add(1) else {
+            return Err(());
+        };
+        let Some(released) = self
+            .principal_counts
+            .get(from)
+            .copied()
+            .and_then(|count| count.checked_sub(1))
+        else {
+            return Err(());
+        };
+        self.principal_counts.insert(*to, charged);
+        if released == 0 {
+            self.principal_counts.remove(from);
+        } else {
+            self.principal_counts.insert(*from, released);
+        }
+        Ok(true)
+    }
+
     fn remove_age_entry(&mut self, age_key: &NonceAgeKey) -> Result<(), ()> {
         let Some(nonce) = self.age_index.get(age_key) else {
             return Err(());
@@ -2933,8 +2972,13 @@ impl SoapWsSecurity {
     /// insert/refresh, and byte accounting share one mutex held only for those
     /// security-state updates, so concurrent fresh claims cannot all observe
     /// room and then overshoot either hard cap. Same-key races resolve under
-    /// the lock: an in-TTL hit is a replay (no reservation); an expired hit
-    /// refreshes the same shared key in place without changing count/bytes.
+    /// the lock: an in-TTL hit is a replay (no reservation) whichever principal
+    /// presents it; an expired hit refreshes the same shared key in place
+    /// without changing count/bytes. An expired hit stored under a different
+    /// principal moves its quota charge to the presenting principal (charged
+    /// first, within its share, then the previous charge is released); when
+    /// the presenting principal is at its share the stale entry is reclaimed
+    /// and the claim takes the fresh-insert path instead.
     /// Lock poison, checked-arithmetic failure, or map/index drift all fail
     /// closed with the fixed saturation class and never recover through the
     /// poisoned state.
@@ -3009,6 +3053,7 @@ impl SoapWsSecurity {
             return Err(Self::nonce_state_saturated_after_unlock(state));
         }
 
+        let principal_limit = self.max_nonce_cache_size.div_ceil(4).max(1);
         // Same-key path first: replay / in-place refresh must not consume a new
         // entry or byte reservation, and must not be rejected as saturated
         // merely because the cache is otherwise full.
@@ -3016,13 +3061,7 @@ impl SoapWsSecurity {
             .cache
             .get(nonce)
             .map(|entry| (entry.age_key, entry.principal_digest));
-        let existing_age_key = existing_entry.map(|(age_key, _)| age_key);
-        if let Some(age_key) = existing_age_key {
-            if existing_entry
-                .is_some_and(|(_, existing_principal)| existing_principal != *principal_digest)
-            {
-                return Err(REPLAY_DETECTED_MESSAGE.to_string());
-            }
+        if let Some((age_key, existing_principal)) = existing_entry {
             let indexed_nonce_matches = state
                 .age_index
                 .get(&age_key)
@@ -3030,32 +3069,59 @@ impl SoapWsSecurity {
             if !indexed_nonce_matches {
                 return Err(Self::nonce_state_saturated_after_unlock(state));
             }
+            // A live claim is a replay whichever principal presents it.
             if Self::nonce_age_seconds(now, age_key.0) < retention_seconds {
                 return Err(REPLAY_DETECTED_MESSAGE.to_string());
             }
 
-            let Some(new_age_key) = state.allocate_age_key(now) else {
-                return Err(Self::nonce_state_saturated_after_unlock(state));
+            // Expired: re-admission is a *new* use of this nonce, charged to
+            // the presenting principal even when the stale entry is still
+            // stored under another one. The new principal is charged first,
+            // bounded by its share, and only then is the previous principal's
+            // charge released. A new principal already at its share instead
+            // reclaims the stale entry (it is expired, so maintenance could
+            // remove it anyway) and takes the fresh-claim path below, which
+            // reclaims only expired entries and otherwise fails closed.
+            let refresh_in_place = if existing_principal == *principal_digest {
+                true
+            } else {
+                match state.move_principal_charge(
+                    &existing_principal,
+                    principal_digest,
+                    principal_limit,
+                ) {
+                    Ok(moved) => moved,
+                    Err(()) => return Err(Self::nonce_state_saturated_after_unlock(state)),
+                }
             };
-            let shared_nonce = match state.age_index.remove(&age_key) {
-                Some(shared_nonce) => shared_nonce,
-                None => return Err(Self::nonce_state_saturated_after_unlock(state)),
-            };
-            if state
-                .age_index
-                .insert(new_age_key, Arc::clone(&shared_nonce))
-                .is_some()
-            {
+            if refresh_in_place {
+                let Some(new_age_key) = state.allocate_age_key(now) else {
+                    return Err(Self::nonce_state_saturated_after_unlock(state));
+                };
+                let shared_nonce = match state.age_index.remove(&age_key) {
+                    Some(shared_nonce) => shared_nonce,
+                    None => return Err(Self::nonce_state_saturated_after_unlock(state)),
+                };
+                if state
+                    .age_index
+                    .insert(new_age_key, Arc::clone(&shared_nonce))
+                    .is_some()
+                {
+                    return Err(Self::nonce_state_saturated_after_unlock(state));
+                }
+                let Some(entry) = state.cache.get_mut(shared_nonce.as_ref()) else {
+                    return Err(Self::nonce_state_saturated_after_unlock(state));
+                };
+                entry.age_key = new_age_key;
+                entry.principal_digest = *principal_digest;
+                return Ok(());
+            }
+            if state.remove_age_entry(&age_key).is_err() {
                 return Err(Self::nonce_state_saturated_after_unlock(state));
             }
-            let Some(entry) = state.cache.get_mut(shared_nonce.as_ref()) else {
-                return Err(Self::nonce_state_saturated_after_unlock(state));
-            };
-            entry.age_key = new_age_key;
-            return Ok(());
+            state.last_expired_removals += 1;
         }
 
-        let principal_limit = self.max_nonce_cache_size.div_ceil(4).max(1);
         if state
             .principal_counts
             .get(principal_digest)
@@ -3224,6 +3290,32 @@ impl SoapWsSecurity {
         principal: &str,
     ) -> Result<(), String> {
         self.check_nonce_replay_for_principal(nonce, principal)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn check_nonce_replay_for_principal_at_for_tests(
+        &self,
+        nonce: &str,
+        principal: &str,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.check_nonce_replay_at(nonce, principal, now)
+    }
+
+    /// Retained claims charged to `principal`, including expired ones
+    /// maintenance has not yet reclaimed (test support).
+    #[allow(dead_code)]
+    pub(crate) fn nonce_principal_entries_for_tests(
+        &self,
+        principal: &str,
+    ) -> Result<usize, String> {
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay observation is process-scope only".to_string());
+        };
+        let state = replay_state
+            .lock()
+            .map_err(|_| "soap_ws_security: nonce replay observation unavailable".to_string())?;
+        Ok(state.principal_count(&sha256_array(principal.as_bytes())))
     }
 
     #[allow(dead_code)]

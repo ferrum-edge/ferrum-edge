@@ -4048,6 +4048,26 @@ pub mod _test_support {
             self.plugin.check_nonce_replay_at_for_tests(nonce, now)
         }
 
+        pub fn claim_for_principal_at(
+            &self,
+            nonce: &str,
+            principal: &str,
+            elapsed: std::time::Duration,
+        ) -> Result<(), String> {
+            let now = self
+                .epoch
+                .checked_add(elapsed)
+                .ok_or_else(|| "soap nonce test clock overflow".to_string())?;
+            self.plugin
+                .check_nonce_replay_for_principal_at_for_tests(nonce, principal, now)
+        }
+
+        /// Retained claims charged to `principal`, expired ones included until
+        /// maintenance reclaims them.
+        pub fn principal_entries(&self, principal: &str) -> Result<usize, String> {
+            self.plugin.nonce_principal_entries_for_tests(principal)
+        }
+
         pub fn snapshot(&self) -> Result<SoapNonceReplaySnapshotForTest, String> {
             let snapshot = self.plugin.nonce_replay_observation_for_tests()?;
             Ok(SoapNonceReplaySnapshotForTest {

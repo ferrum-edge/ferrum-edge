@@ -863,7 +863,8 @@ impl ProcessReplayLane {
     ///
     /// Test support for the exact prune-vs-writer interleaving: the caller
     /// holds the returned guard across prune publication, then releases it.
-    /// Does not take `prune_lock` and does not scan. A full lane returns
+    /// Does not take `prune_lock` and does not scan. A full lane, or a
+    /// presenting principal at its share, returns
     /// [`ReplayAdmission::CapacityRefused`] rather than pruning.
     #[allow(dead_code)] // exercised by external unit tests
     pub fn admit_at_holding_expiry_write_for_tests(

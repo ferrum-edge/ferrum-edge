@@ -45,12 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Expired replay markers are re-admitted under a new principal** (issue
-  #6106). In process-scoped replay stores, an expired marker still stored under
-  a different principal was answered as a replay. It is now re-admitted under
-  the presenting principal, and the quota charge moves: the previous
-  principal's share is released and the new principal's share is charged. A new
-  principal already at its share is refused, and live markers are still never
-  evicted.
+  #6106). In process-scoped replay stores (the replay authority's process lanes,
+  where `jwks_auth` DPoP proofs can reach this case, and the `soap_ws_security`
+  `replay_scope: process` nonce / SAML assertion-id store), an expired marker
+  still stored under a different principal was answered as a replay. It is now
+  re-admitted under the presenting principal, and the quota charge moves: the
+  new principal's share is charged and then the previous principal's charge is
+  released. A new principal already at its share is refused, and live markers
+  are still never evicted.
 
 ## [0.9.15] - 2026-10-08
 

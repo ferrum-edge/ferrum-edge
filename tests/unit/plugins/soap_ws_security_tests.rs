@@ -3283,6 +3283,160 @@ fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
     );
 }
 
+const REPLAY_MESSAGE: &str = "WS-Security: nonce replay detected";
+const SATURATED_MESSAGE: &str = "WS-Security: replay protection state is at capacity";
+
+fn principal_nonce_harness() -> SoapNonceReplayHarness {
+    // A cap of 8 gives each principal a share of 2.
+    SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 8 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap()
+}
+
+/// An expired nonce still stored under another principal is a new use, not a
+/// replay (issue #6106). It is re-admitted under the presenting principal and
+/// its quota charge moves: the new principal's share is charged and the
+/// previous principal's charge is released. A live nonce is a replay for every
+/// principal.
+#[test]
+fn test_expired_nonce_is_readmitted_under_a_new_principal_and_moves_its_charge() {
+    let harness = principal_nonce_harness();
+    let still_live = Duration::from_secs(CLAIM_RETENTION_SECONDS - 1);
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", still_live),
+        Err(REPLAY_MESSAGE.to_string()),
+        "a live nonce is a replay whichever principal presents it"
+    );
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", expired),
+        Ok(()),
+        "an expired nonce stored under another principal must be re-admitted"
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 0);
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 1);
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 1, "the move refreshes in place");
+    assert_eq!(snapshot.age_index_entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+
+    // The refreshed claim is live again for both principals.
+    for principal in ["principal-a", "principal-b"] {
+        assert_eq!(
+            harness.claim_for_principal_at("shared", principal, expired),
+            Err(REPLAY_MESSAGE.to_string())
+        );
+    }
+
+    // The released share is usable again, and both shares still bound.
+    for nonce in ["a-1", "a-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-a", expired)
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        harness.claim_for_principal_at("a-3", "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string())
+    );
+    assert!(
+        harness
+            .claim_for_principal_at("b-1", "principal-b", expired)
+            .is_ok()
+    );
+    assert_eq!(
+        harness.claim_for_principal_at("b-2", "principal-b", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "the moved nonce must count against the new principal's share"
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 2);
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 2);
+}
+
+/// A move the new principal's share cannot absorb is refused without evicting
+/// any of that principal's live nonces. Reclaiming the expired claim returns
+/// the previous principal's charge, so neither principal leaks quota.
+#[test]
+fn test_expired_nonce_move_refused_at_the_new_principals_share_evicts_nothing() {
+    let harness = principal_nonce_harness();
+    let later = Duration::from_secs(1);
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    for nonce in ["b-1", "b-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-b", later)
+                .is_ok()
+        );
+    }
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a principal at its share cannot take over another principal's expired nonce"
+    );
+    for nonce in ["b-1", "b-2"] {
+        assert_eq!(
+            harness.claim_for_principal_at(nonce, "principal-b", expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused move must never evict a live nonce"
+        );
+    }
+    assert_eq!(
+        harness.principal_entries("principal-a").unwrap(),
+        0,
+        "reclaiming the expired nonce must release its previous principal's charge"
+    );
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 2);
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-a", expired),
+        Ok(())
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 1);
+}
+
+/// A principal at its share may still refresh its own expired nonce: the
+/// in-place refresh reuses the existing charge.
+#[test]
+fn test_principal_at_its_share_may_refresh_its_own_expired_nonce() {
+    let harness = principal_nonce_harness();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    for nonce in ["a-1", "a-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-a", Duration::ZERO)
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        harness.claim_for_principal_at("a-1", "principal-a", expired),
+        Ok(())
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 2);
+    assert_eq!(harness.snapshot().unwrap().entry_count, 2);
+}
+
 // ── X.509 signature verification — end-to-end roundtrip ─────────────────────
 //
 // PR #844 fixed `cert.public_key().raw` → `cert.public_key().subject_public_key.data`

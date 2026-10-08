@@ -428,6 +428,139 @@ fn held_expiry_refresh_respects_the_presenting_principals_share() {
     assert_eq!(lane.retained_entries(), 3);
 }
 
+/// Concurrent presentations of one expired marker under different principals
+/// have exactly one winner. The winner refreshes the marker under the entry's
+/// shard guard, so every later claimant sees a live marker and gets `Replay`,
+/// and exactly one quota charge remains, held by the winner.
+#[test]
+fn concurrent_moves_of_one_expired_marker_have_exactly_one_winner() {
+    const WORKERS: usize = 16;
+    let sub = "principal-move-concurrent";
+    // A cap of 64 gives each principal a share of 16, so no claimant can be
+    // refused by its share and every loser must be a replay.
+    let authority = Arc::new(process_authority(sub, 64));
+    let lane = process_lane(&authority).expect("process lane");
+    let now = monotonic_millis();
+    let after_expiry = now + RETENTION.as_millis() as u64 + 1;
+    let principals: Vec<String> = (0..WORKERS).map(|i| format!("principal-{i}")).collect();
+    let original = proof_for(sub, "proof", &principals[0]);
+
+    assert_eq!(
+        admit_process_at(&authority, &original, now),
+        Some(ReplayAdmission::Admitted)
+    );
+
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let workers: Vec<_> = principals
+        .iter()
+        .cloned()
+        .map(|principal| {
+            let authority = Arc::clone(&authority);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let marker = proof_for(sub, "proof", &principal);
+                barrier.wait();
+                let outcome = admit_process_at(&authority, &marker, after_expiry);
+                (principal, outcome)
+            })
+        })
+        .collect();
+
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker should not panic"))
+        .collect();
+    for (principal, outcome) in &outcomes {
+        assert!(
+            matches!(outcome, Some(ReplayAdmission::Admitted | ReplayAdmission::Replay)),
+            "every losing claim must be a replay ({principal}): {outcome:?}"
+        );
+    }
+    let winners: Vec<&String> = outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome == Some(ReplayAdmission::Admitted))
+        .map(|(principal, _)| principal)
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one concurrent claim may win");
+    assert_eq!(lane.retained_entries(), 1);
+
+    let mut total = 0;
+    for principal in &principals {
+        let charged = lane.principal_entries_for_tests(&proof_for(sub, "proof", principal));
+        let expected = usize::from(principal == winners[0]);
+        assert_eq!(
+            charged,
+            expected,
+            "only the winner may hold the marker's charge ({principal})"
+        );
+        total += charged;
+    }
+    assert_eq!(total, 1, "the marker carries exactly one quota charge");
+}
+
+/// The lowered-cap guard also applies to a move: an authority whose cap is
+/// below the lane's retained count must not refresh another principal's
+/// expired marker in place. The claim falls back to the expired-only prune and
+/// a fresh reservation, which the lowered cap refuses, and no live marker is
+/// evicted.
+#[test]
+fn a_move_through_a_lowered_cap_is_not_refreshed_in_place() {
+    let sub = "principal-move-lowered-cap";
+    let now = monotonic_millis();
+    let later = now + 1_000;
+    let proof_a = proof_for(sub, "proof", "principal-a");
+    let proof_b = proof_for(sub, "proof", "principal-b");
+    let second = lane_marker(sub, "second");
+    let third = lane_marker(sub, "third");
+
+    let original = process_authority(sub, 8);
+    assert_eq!(
+        admit_process_at(&original, &proof_a, now),
+        Some(ReplayAdmission::Admitted)
+    );
+    for marker in [&second, &third] {
+        assert_eq!(
+            admit_process_at(&original, marker, later),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    drop(original);
+
+    let lowered = process_authority(sub, 2);
+    let lane = process_lane(&lowered).expect("shared lane");
+    assert_eq!(lane.retained_entries(), 3);
+    // `proof` has expired; `second` and `third` remain live and already fill
+    // the replacement cap of 2.
+    let after_first_expires = now + RETENTION.as_millis() as u64 + 1;
+    assert_eq!(
+        admit_process_at(&lowered, &proof_b, after_first_expires),
+        Some(ReplayAdmission::CapacityRefused),
+        "a move must not bypass a lowered cap while live markers remain"
+    );
+    for marker in [&second, &third] {
+        assert_eq!(
+            admit_process_at(&lowered, marker, after_first_expires),
+            Some(ReplayAdmission::Replay),
+            "live markers must not be evicted to recycle an expired occupied key"
+        );
+    }
+    assert_eq!(
+        lane.retained_entries(),
+        2,
+        "the expired marker is pruned rather than refreshed in place"
+    );
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_a),
+        0,
+        "pruning the expired marker must release its previous principal's charge"
+    );
+    assert_eq!(
+        lane.principal_entries_for_tests(&proof_b),
+        0,
+        "a refused claim must not leave a charge on the presenting principal"
+    );
+}
+
 /// Concurrent claims by one principal reserve its share atomically: exactly
 /// the share is admitted however the claims interleave, while the lane itself
 /// still has room.

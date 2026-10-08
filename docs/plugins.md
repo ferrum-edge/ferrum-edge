@@ -3400,7 +3400,7 @@ As a runtime backstop for every other transform (including custom plugins), an i
 | `saml.allowed_subject_confirmation_methods` | String[] | `["urn:oasis:names:tc:SAML:2.0:cm:bearer"]` | Accepted `SubjectConfirmation/@Method` URIs. Only `bearer` is implemented; `holder-of-key` is rejected at admission because the confirmation key is not bound to the message signature |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
 | `nonce.replay_scope` | String | *(required for PasswordDigest and for SAML)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
-| `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; in process scope one principal may retain at most one quarter of this ceiling (rounded up, minimum one). A full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
+| `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; in process scope one principal may retain at most one quarter of this ceiling (rounded up, minimum one). An expired nonce presented again by a different principal is re-admitted under that principal, moving its quota charge (refused only if the new principal is already at its share). A full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
 | `nonce.max_total_cache_bytes` | u64 | `67108864` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
 
