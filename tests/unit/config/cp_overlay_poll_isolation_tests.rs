@@ -759,7 +759,9 @@ fn reconcile_refuses_a_translation_with_duplicate_resource_ids() {
     drain(&mut mesh_rx);
 
     let mut duplicated = k8s_translation(2);
-    duplicated.proxies.push(make_proxy("gwapi-route-2", "ferrum"));
+    duplicated
+        .proxies
+        .push(make_proxy("gwapi-route-2", "ferrum"));
     harness.publish_reconcile(&duplicated, &managed);
 
     assert_eq!(

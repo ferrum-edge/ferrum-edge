@@ -29310,8 +29310,14 @@ mod tests {
     fn assert_backend_tls_fails_closed(upstream: &Upstream) {
         for (field, value) in [
             ("ca", upstream.backend_tls_server_ca_cert_path.as_deref()),
-            ("client cert", upstream.backend_tls_client_cert_path.as_deref()),
-            ("client key", upstream.backend_tls_client_key_path.as_deref()),
+            (
+                "client cert",
+                upstream.backend_tls_client_cert_path.as_deref(),
+            ),
+            (
+                "client key",
+                upstream.backend_tls_client_key_path.as_deref(),
+            ),
         ] {
             assert_eq!(
                 value,

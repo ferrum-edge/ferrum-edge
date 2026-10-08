@@ -31,11 +31,7 @@ fn roots(paths: &[&str]) -> Vec<PathBuf> {
 #[test]
 fn own_namespace_secrets_inline_pem_and_system_roots_are_admitted() {
     assert_eq!(
-        check(
-            "k8s://tenant-a/client-tls#tls.crt",
-            MaterialKind::Cert,
-            &[]
-        ),
+        check("k8s://tenant-a/client-tls#tls.crt", MaterialKind::Cert, &[]),
         Ok(())
     );
     assert_eq!(

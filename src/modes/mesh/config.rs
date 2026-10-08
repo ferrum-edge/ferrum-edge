@@ -8254,13 +8254,9 @@ fn validate_destination_rule_tls_reference_scope(
     errors: &mut Vec<String>,
 ) {
     for (field, value, kind) in destination_rule_tls_references(dr) {
-        if let Some(error) = destination_rule_tls_reference_error(
-            &field,
-            value,
-            kind,
-            &dr.namespace,
-            root_namespace,
-        ) {
+        if let Some(error) =
+            destination_rule_tls_reference_error(&field, value, kind, &dr.namespace, root_namespace)
+        {
             errors.push(error);
         }
     }
