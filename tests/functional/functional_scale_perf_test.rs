@@ -76,6 +76,15 @@ struct ScalePerfHarness {
     db_label: String,
 }
 
+/// Spotlight skips directories ending in `.noindex`; indexing the growing
+/// SQLite file otherwise competes with the gateway for CPU on macOS.
+fn harness_temp_dir() -> std::io::Result<TempDir> {
+    tempfile::Builder::new()
+        .prefix("ferrum-scale-")
+        .suffix(".noindex")
+        .tempdir()
+}
+
 impl ScalePerfHarness {
     async fn new_sqlite() -> Result<Self, Box<dyn std::error::Error>> {
         const MAX_ATTEMPTS: u32 = 3;
@@ -103,7 +112,7 @@ impl ScalePerfHarness {
     }
 
     async fn try_new_sqlite() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = harness_temp_dir()?;
         let db_path = temp_dir.path().join("scale_test.db");
         let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
         Self::try_start(temp_dir, "sqlite", &db_url, "SQLite", None).await
@@ -135,7 +144,7 @@ impl ScalePerfHarness {
     }
 
     async fn try_new_postgres(db_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = harness_temp_dir()?;
         Self::try_start(temp_dir, "postgres", db_url, "PostgreSQL", None).await
     }
 
@@ -171,7 +180,7 @@ impl ScalePerfHarness {
         db_url: &str,
         mongo_database: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = harness_temp_dir()?;
         Self::try_start(temp_dir, "mongodb", db_url, "MongoDB", Some(mongo_database)).await
     }
 
@@ -202,9 +211,12 @@ impl ScalePerfHarness {
         // Start echo backend
         start_echo_backend(backend_port).await?;
 
-        // Build gateway (release mode for meaningful perf numbers)
+        // Build gateway (release mode for meaningful perf numbers). Build only
+        // the gateway binary, exactly as the documented prebuild does: a plain
+        // `cargo build --release` covers a different target set, so it redid
+        // the whole fat-LTO release build inside the measured test.
         let build_status = Command::new("cargo")
-            .args(["build", "--release"])
+            .args(["build", "--release", "--bin", "ferrum-edge"])
             .status()?;
         if !build_status.success() {
             return Err("Failed to build ferrum-edge".into());
@@ -472,6 +484,8 @@ async fn create_batch(
     // (epoch-major), so keeping the max makes the final cursor cover every
     // chunk in the wave.
     let mut last_cursor: Option<BatchApplyCursor> = None;
+    // Per-resource-type admin write time, to localize slow provisioning.
+    let phase_timer = Instant::now();
     for chunk in all_consumers.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "consumers": chunk });
         let cursor = post_admin_batch(
@@ -484,7 +498,9 @@ async fn create_batch(
         .await?;
         last_cursor = last_cursor.max(cursor);
     }
+    let consumers_secs = phase_timer.elapsed().as_secs_f64();
 
+    let phase_timer = Instant::now();
     for chunk in all_proxies.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "proxies": chunk });
         let cursor = post_admin_batch(
@@ -497,7 +513,9 @@ async fn create_batch(
         .await?;
         last_cursor = last_cursor.max(cursor);
     }
+    let proxies_secs = phase_timer.elapsed().as_secs_f64();
 
+    let phase_timer = Instant::now();
     for chunk in all_plugins.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "plugin_configs": chunk });
         let cursor = post_admin_batch(
@@ -510,6 +528,13 @@ async fn create_batch(
         .await?;
         last_cursor = last_cursor.max(cursor);
     }
+    println!(
+        "  Admin writes: consumers {:.1}s, proxies {:.1}s, plugin configs {:.1}s ({} per request)",
+        consumers_secs,
+        proxies_secs,
+        phase_timer.elapsed().as_secs_f64(),
+        API_BATCH_CHUNK
+    );
 
     Ok((entries, last_cursor))
 }
@@ -1298,4 +1323,1000 @@ async fn test_scale_perf_30k_proxies_mongodb() {
         .expect("Failed to create MongoDB test harness");
 
     run_scale_perf_test(&harness).await;
+}
+
+// ── Reload under load ────────────────────────────────────────────────────────
+//
+// The scale test above measures steady-state throughput *between* config waves.
+// This variant keeps traffic flowing against every already-live proxy while the
+// next wave is written through the admin API and hot-applied, and records a
+// per-second series of throughput, latency, errors, gateway CPU, and gateway
+// RSS. Any non-2xx or transport error from a previously-live proxy fails the
+// test: an atomic config swap must never drop or stall routes that already
+// exist.
+
+/// Discarded traffic before each wave's steady baseline.
+const RELOAD_WARMUP_SECS: u64 = 5;
+/// Steady baseline measured immediately before each wave is provisioned.
+const RELOAD_STEADY_SECS: u64 = 10;
+/// Measured after the new wave is live, still under the same load.
+const RELOAD_POST_SECS: u64 = 10;
+/// Proxies in each small change applied after every wave. A 12,000-resource
+/// wave exceeds the poller's 10,000-row change-log limit and forces a full
+/// rebuild. Small changes come in two kinds: with new consumers (any consumer
+/// change also forces a full reload, by design) and proxies-only (new proxies
+/// whose plugins admit existing consumers), which takes the incremental path.
+const RELOAD_SMALL_CHANGE_PROXIES: usize = 100;
+/// Index bases for small-change proxies, clear of every wave's range.
+const RELOAD_SMALL_WITH_CONSUMERS_BASE: usize = 1_000_000;
+const RELOAD_SMALL_PROXIES_ONLY_BASE: usize = 2_000_000;
+
+/// Create proxies `batch_start..batch_end` with key_auth + access_control that
+/// admit existing first-wave consumers (`user-<k>` / `reuse[k]`'s key), so
+/// the change carries no consumer rows. Returns the new entries.
+async fn create_proxy_only_batch(
+    client: &reqwest::Client,
+    admin_url: &str,
+    auth_header: &str,
+    backend_port: u16,
+    batch_start: usize,
+    batch_end: usize,
+    reuse: &[(String, String)],
+) -> Result<(Vec<(String, String)>, Option<BatchApplyCursor>), Box<dyn std::error::Error>> {
+    let mut entries = Vec::with_capacity(batch_end - batch_start);
+    let mut proxies = Vec::with_capacity(batch_end - batch_start);
+    let mut plugins = Vec::with_capacity((batch_end - batch_start) * 2);
+    for (k, i) in (batch_start..batch_end).enumerate() {
+        let (_, api_key) = &reuse[k % reuse.len()];
+        let proxy_id = format!("proxy-{i}");
+        let listen_path = format!("/svc/{i}");
+        proxies.push(json!({
+            "id": proxy_id,
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+        }));
+        plugins.push(json!({
+            "id": format!("keyauth-{i}"),
+            "plugin_name": "key_auth",
+            "scope": "proxy",
+            "proxy_id": proxy_id,
+            "enabled": true,
+            "config": { "key_location": "header:X-API-Key" }
+        }));
+        plugins.push(json!({
+            "id": format!("acl-{i}"),
+            "plugin_name": "access_control",
+            "scope": "proxy",
+            "proxy_id": proxy_id,
+            "enabled": true,
+            "config": { "allowed_consumers": [format!("user-{}", k % reuse.len())] }
+        }));
+        entries.push((listen_path, api_key.clone()));
+    }
+    let mut last_cursor: Option<BatchApplyCursor> = None;
+    for chunk in proxies.chunks(API_BATCH_CHUNK) {
+        let body = json!({ "proxies": chunk });
+        let cursor =
+            post_admin_batch(client, admin_url, auth_header, &body, "Batch proxy create").await?;
+        last_cursor = last_cursor.max(cursor);
+    }
+    for chunk in plugins.chunks(API_BATCH_CHUNK) {
+        let body = json!({ "plugin_configs": chunk });
+        let cursor =
+            post_admin_batch(client, admin_url, auth_header, &body, "Batch plugin create").await?;
+        last_cursor = last_cursor.max(cursor);
+    }
+    Ok((entries, last_cursor))
+}
+
+/// Per-second load bucket. Latency samples are successful requests only.
+#[derive(Default)]
+struct LoadBucket {
+    ok: u64,
+    errors: u64,
+    not_found: u64,
+    latencies_us: Vec<u32>,
+}
+
+impl LoadBucket {
+    fn absorb(&mut self, other: LoadBucket) {
+        self.ok += other.ok;
+        self.errors += other.errors;
+        self.not_found += other.not_found;
+        self.latencies_us.extend(other.latencies_us);
+    }
+}
+
+/// Closed-loop load against a fixed set of live proxies, bucketed per second
+/// from `started`.
+struct LiveLoad {
+    stop: Arc<AtomicBool>,
+    handles: Vec<tokio::task::JoinHandle<Vec<LoadBucket>>>,
+}
+
+fn start_live_load(
+    proxy_base_url: &str,
+    entries: Arc<Vec<(String, String)>>,
+    concurrency: usize,
+    started: Instant,
+) -> LiveLoad {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handles = (0..concurrency)
+        .map(|worker_id| {
+            let stop = stop.clone();
+            let entries = entries.clone();
+            let base_url = proxy_base_url.to_string();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .pool_max_idle_per_host(10)
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .unwrap();
+                let mut buckets: Vec<LoadBucket> = Vec::new();
+                let mut idx = worker_id % entries.len();
+                while !stop.load(Ordering::Relaxed) {
+                    let (path, key) = &entries[idx];
+                    let req_start = Instant::now();
+                    // Success and latency cover the whole body: a reload that
+                    // truncates or stalls a response after its headers must
+                    // count as an error, not as a served request.
+                    let result = match client
+                        .get(format!("{base_url}{path}"))
+                        .header("X-API-Key", key.as_str())
+                        .send()
+                        .await
+                    {
+                        Ok(response) => {
+                            let status = response.status();
+                            response.bytes().await.map(|_| status)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let latency_us = req_start.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                    let second = started.elapsed().as_secs() as usize;
+                    if buckets.len() <= second {
+                        buckets.resize_with(second + 1, LoadBucket::default);
+                    }
+                    let bucket = &mut buckets[second];
+                    match result {
+                        Ok(status) if status.is_success() => {
+                            bucket.ok += 1;
+                            bucket.latencies_us.push(latency_us);
+                        }
+                        Ok(status) if status == reqwest::StatusCode::NOT_FOUND => {
+                            bucket.errors += 1;
+                            bucket.not_found += 1;
+                        }
+                        _ => bucket.errors += 1,
+                    }
+                    idx = (idx + concurrency) % entries.len();
+                    if idx == worker_id % entries.len() {
+                        idx = (idx + 1) % entries.len();
+                    }
+                }
+                buckets
+            })
+        })
+        .collect();
+    LiveLoad { stop, handles }
+}
+
+impl LiveLoad {
+    async fn finish(self) -> Vec<LoadBucket> {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut merged: Vec<LoadBucket> = Vec::new();
+        for handle in self.handles {
+            let Ok(buckets) = handle.await else { continue };
+            if merged.len() < buckets.len() {
+                merged.resize_with(buckets.len(), LoadBucket::default);
+            }
+            for (slot, bucket) in merged.iter_mut().zip(buckets) {
+                slot.absorb(bucket);
+            }
+        }
+        merged
+    }
+}
+
+/// Resident set size of a process in bytes.
+fn process_rss_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let kib: u64 = String::from_utf8(output.stdout).ok()?.trim().parse().ok()?;
+        Some(kib * 1024)
+    }
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+struct ResourceSample {
+    t_secs: f64,
+    cpu_seconds: Option<f64>,
+    rss_bytes: Option<u64>,
+    /// This test process (load generator + echo backend): CPU seconds.
+    client_cpu_seconds: Option<f64>,
+    /// Host 1-minute load average: sustained contention from other processes.
+    host_load_1m: Option<f64>,
+    /// Host-wide cumulative CPU ticks `(busy, total)` across every core.
+    host_cpu_ticks: Option<(u64, u64)>,
+}
+
+/// With `FERRUM_RELOAD_WAIT_FOR_QUIET_HOST=1`, wait (up to 10 min) before a
+/// change until host-wide CPU over a 3-second window is below 30% of the CPU
+/// count, so another build on a shared machine does not land inside the
+/// measurement. Busy CPU is measured directly rather than through the 1-minute
+/// load average, which still carries the previous change's own load for a
+/// minute or two after it ends. Returns the seconds waited.
+async fn wait_for_quiet_host() -> f64 {
+    if std::env::var("FERRUM_RELOAD_WAIT_FOR_QUIET_HOST").as_deref() != Ok("1") {
+        return 0.0;
+    }
+    let threshold = logical_cpus() * 0.3;
+    let started = Instant::now();
+    let mut busy = None;
+    while started.elapsed() < Duration::from_secs(600) {
+        let before = host_cpu_ticks();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        busy = before
+            .zip(host_cpu_ticks())
+            .and_then(|(a, b)| host_busy_cores(a, b));
+        match busy {
+            Some(cores) if cores >= threshold => {}
+            _ => break,
+        }
+    }
+    let waited = started.elapsed().as_secs_f64();
+    if waited >= 5.0 {
+        println!(
+            "  waited {:.0}s for host CPU below {:.1} cores; now {}",
+            waited,
+            threshold,
+            fmt_opt(busy, 1)
+        );
+    }
+    waited
+}
+
+fn logical_cpus() -> f64 {
+    std::thread::available_parallelism().map_or(1, |n| n.get()) as f64
+}
+
+/// Host-wide cumulative CPU ticks `(busy, total)` summed over every core.
+fn host_cpu_ticks() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let fields: Vec<u64> = stat
+            .lines()
+            .next()?
+            .split_whitespace()
+            .skip(1)
+            .take(8)
+            .map(|v| v.parse().ok())
+            .collect::<Option<_>>()?;
+        // user nice system idle iowait irq softirq steal
+        let idle = fields.get(3)? + fields.get(4)?;
+        let total: u64 = fields.iter().sum();
+        Some((total - idle, total))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // libSystem's host port accessor (`libc` deprecates its binding in
+        // favour of the `mach2` crate; this test needs only this one symbol).
+        unsafe extern "C" {
+            fn mach_host_self() -> libc::mach_port_t;
+        }
+        static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+        // SAFETY: mach_host_self has no preconditions; the port is reused.
+        let host = *HOST.get_or_init(|| unsafe { mach_host_self() });
+        let mut info = libc::host_cpu_load_info {
+            cpu_ticks: [0; libc::CPU_STATE_MAX as usize],
+        };
+        let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+        // SAFETY: `info` is a host_cpu_load_info and `count` is its size in
+        // natural_t units, as HOST_CPU_LOAD_INFO requires.
+        let status = unsafe {
+            libc::host_statistics(
+                host,
+                libc::HOST_CPU_LOAD_INFO,
+                (&mut info as *mut libc::host_cpu_load_info).cast(),
+                &mut count,
+            )
+        };
+        if status != libc::KERN_SUCCESS {
+            return None;
+        }
+        let ticks = info.cpu_ticks.map(u64::from);
+        let idle = ticks[libc::CPU_STATE_IDLE as usize];
+        let total: u64 = ticks.iter().sum();
+        Some((total - idle, total))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Cores busy host-wide between two `host_cpu_ticks` samples.
+fn host_busy_cores(before: (u64, u64), after: (u64, u64)) -> Option<f64> {
+    let total = after.1.checked_sub(before.1)?;
+    let busy = after.0.checked_sub(before.0)?;
+    (total > 0).then(|| busy as f64 / total as f64 * logical_cpus())
+}
+
+fn host_load_average_1m() -> Option<f64> {
+    let mut loads = [0f64; 3];
+    // SAFETY: `loads` has room for the three values requested.
+    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
+    (n >= 1).then_some(loads[0])
+}
+
+/// Samples gateway CPU and RSS once per second until stopped.
+fn start_resource_sampler(
+    pid: u32,
+    started: Instant,
+    stop: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<Vec<ResourceSample>> {
+    tokio::spawn(async move {
+        let mut samples = Vec::new();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        while !stop.load(Ordering::Relaxed) {
+            tick.tick().await;
+            let t_secs = started.elapsed().as_secs_f64();
+            let self_pid = std::process::id();
+            let (cpu_seconds, rss_bytes, client_cpu_seconds) =
+                tokio::task::spawn_blocking(move || {
+                    (
+                        process_cpu_seconds(pid),
+                        process_rss_bytes(pid),
+                        process_cpu_seconds(self_pid),
+                    )
+                })
+                .await
+                .unwrap_or((None, None, None));
+            samples.push(ResourceSample {
+                t_secs,
+                cpu_seconds,
+                rss_bytes,
+                client_cpu_seconds,
+                host_load_1m: host_load_average_1m(),
+                host_cpu_ticks: host_cpu_ticks(),
+            });
+        }
+        samples
+    })
+}
+
+/// One row of the per-second series.
+#[derive(serde::Serialize)]
+struct SecondPoint {
+    t: usize,
+    ok: u64,
+    errors: u64,
+    p50_us: Option<u32>,
+    p99_us: Option<u32>,
+    gateway_cpu_cores: Option<f64>,
+    gateway_rss_mib: Option<f64>,
+    load_generator_cpu_cores: Option<f64>,
+    host_load_1m: Option<f64>,
+    /// Host busy cores minus the gateway and this test process.
+    other_cpu_cores: Option<f64>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct PhaseStats {
+    secs: usize,
+    rps: f64,
+    p50_us: u32,
+    p99_us: u32,
+    max_us: u32,
+    errors: u64,
+    not_found: u64,
+    worst_second_rps: u64,
+    worst_second_p99_us: u32,
+    gateway_cpu_cores_mean: Option<f64>,
+    gateway_cpu_cores_peak: Option<f64>,
+    gateway_rss_mib_peak: Option<f64>,
+    /// Highest host 1-minute load average seen in the phase.
+    host_load_1m_peak: Option<f64>,
+}
+
+fn percentile(sorted: &[u32], q: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+}
+
+fn cpu_cores_series(samples: &[ResourceSample]) -> Vec<(f64, f64)> {
+    cores_series(samples, |s| s.cpu_seconds)
+}
+
+fn cores_series(
+    samples: &[ResourceSample],
+    cpu: impl Fn(&ResourceSample) -> Option<f64>,
+) -> Vec<(f64, f64)> {
+    samples
+        .windows(2)
+        .filter_map(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let dt = b.t_secs - a.t_secs;
+            Some((b.t_secs, (cpu(b)? - cpu(a)?) / dt))
+        })
+        .collect()
+}
+
+/// Stats over whole seconds `[from, to)` of the series.
+fn phase_stats(
+    buckets: &[LoadBucket],
+    samples: &[ResourceSample],
+    from: usize,
+    to: usize,
+) -> PhaseStats {
+    let to = to.min(buckets.len());
+    let window = buckets.get(from..to).unwrap_or_default();
+    if window.is_empty() {
+        return PhaseStats::default();
+    }
+    let mut latencies: Vec<u32> = window
+        .iter()
+        .flat_map(|b| b.latencies_us.iter().copied())
+        .collect();
+    latencies.sort_unstable();
+    let ok: u64 = window.iter().map(|b| b.ok).sum();
+    let worst_second_p99_us = window
+        .iter()
+        .map(|b| {
+            let mut l = b.latencies_us.clone();
+            l.sort_unstable();
+            percentile(&l, 0.99)
+        })
+        .max()
+        .unwrap_or(0);
+    let in_phase = |t: f64| t > from as f64 && t <= to as f64;
+    let cores: Vec<f64> = cpu_cores_series(samples)
+        .into_iter()
+        .filter(|(t, _)| in_phase(*t))
+        .map(|(_, c)| c)
+        .collect();
+    let rss_peak = samples
+        .iter()
+        .filter(|s| in_phase(s.t_secs))
+        .filter_map(|s| s.rss_bytes)
+        .max()
+        .map(|b| b as f64 / 1_048_576.0);
+    PhaseStats {
+        secs: window.len(),
+        rps: ok as f64 / window.len() as f64,
+        p50_us: percentile(&latencies, 0.50),
+        p99_us: percentile(&latencies, 0.99),
+        max_us: latencies.last().copied().unwrap_or(0),
+        errors: window.iter().map(|b| b.errors).sum(),
+        not_found: window.iter().map(|b| b.not_found).sum(),
+        worst_second_rps: window.iter().map(|b| b.ok).min().unwrap_or(0),
+        worst_second_p99_us,
+        gateway_cpu_cores_mean: (!cores.is_empty())
+            .then(|| cores.iter().sum::<f64>() / cores.len() as f64),
+        gateway_cpu_cores_peak: cores.iter().copied().reduce(f64::max),
+        gateway_rss_mib_peak: rss_peak,
+        host_load_1m_peak: samples
+            .iter()
+            .filter(|s| in_phase(s.t_secs))
+            .filter_map(|s| s.host_load_1m)
+            .reduce(f64::max),
+    }
+}
+
+/// Per-interval CPU used by every other process on the host: host-wide busy
+/// cores minus the gateway's and this test process's (load generator + echo
+/// backend) over the same one-second interval.
+fn other_cpu_series(samples: &[ResourceSample]) -> Vec<(f64, f64)> {
+    samples
+        .windows(2)
+        .filter_map(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let dt = b.t_secs - a.t_secs;
+            let host = host_busy_cores(a.host_cpu_ticks?, b.host_cpu_ticks?)?;
+            let own = (b.cpu_seconds? - a.cpu_seconds?) / dt
+                + (b.client_cpu_seconds? - a.client_cpu_seconds?) / dt;
+            Some((b.t_secs, (host - own).max(0.0)))
+        })
+        .collect()
+}
+
+fn second_points(buckets: &[LoadBucket], samples: &[ResourceSample]) -> Vec<SecondPoint> {
+    let cores = cpu_cores_series(samples);
+    let client_cores = cores_series(samples, |s| s.client_cpu_seconds);
+    let other_cores = other_cpu_series(samples);
+    buckets
+        .iter()
+        .enumerate()
+        .map(|(t, b)| {
+            let mut l = b.latencies_us.clone();
+            l.sort_unstable();
+            let in_second = |s: f64| s > t as f64 && s <= (t + 1) as f64;
+            SecondPoint {
+                t,
+                ok: b.ok,
+                errors: b.errors,
+                p50_us: (!l.is_empty()).then(|| percentile(&l, 0.50)),
+                p99_us: (!l.is_empty()).then(|| percentile(&l, 0.99)),
+                gateway_cpu_cores: cores.iter().find(|(s, _)| in_second(*s)).map(|(_, c)| *c),
+                gateway_rss_mib: samples
+                    .iter()
+                    .find(|s| in_second(s.t_secs))
+                    .and_then(|s| s.rss_bytes)
+                    .map(|b| b as f64 / 1_048_576.0),
+                load_generator_cpu_cores: client_cores
+                    .iter()
+                    .find(|(s, _)| in_second(*s))
+                    .map(|(_, c)| *c),
+                host_load_1m: samples
+                    .iter()
+                    .find(|s| in_second(s.t_secs))
+                    .and_then(|s| s.host_load_1m),
+                other_cpu_cores: other_cores
+                    .iter()
+                    .find(|(s, _)| in_second(*s))
+                    .map(|(_, c)| *c),
+            }
+        })
+        .collect()
+}
+
+#[derive(serde::Serialize)]
+struct ReloadWaveResult {
+    /// `"full"`: 3k proxies + consumers. `"small+consumers"`: 100 proxies +
+    /// consumers (consumer changes force a full reload). `"small-proxies"`: 100
+    /// proxies admitting existing consumers (incremental reload path).
+    kind: &'static str,
+    proxies_before: usize,
+    proxies_after: usize,
+    /// Admin resources written (consumer + proxy + two plugin configs per proxy).
+    resources: usize,
+    /// Seconds spent waiting for a quiet host before this change (opt-in).
+    quiet_wait_secs: f64,
+    /// Cores other processes used during the change window (host busy CPU
+    /// minus the gateway and this test process): mean and worst second.
+    other_cpu_cores_mean: Option<f64>,
+    other_cpu_cores_peak: Option<f64>,
+    /// Seconds from load start: write began, write finished, apply confirmed,
+    /// new routes probed live.
+    write_start_secs: f64,
+    write_end_secs: f64,
+    applied_secs: f64,
+    live_secs: f64,
+    steady: PhaseStats,
+    /// Admin writes + apply + convergence, under load.
+    change: PhaseStats,
+    /// Only the reload: from the last admin write to confirmed apply.
+    apply: PhaseStats,
+    post: PhaseStats,
+    series: Vec<SecondPoint>,
+}
+
+/// Write one wave, then prove it is applied and routable. Returns the new
+/// entries and the (write end, applied, live) instants.
+async fn provision_wave(
+    harness: &ScalePerfHarness,
+    client: &reqwest::Client,
+    auth_header: &str,
+    all_entries: &mut Vec<(String, String)>,
+    batch_start: usize,
+    batch_end: usize,
+    reuse_consumers: Option<Vec<(String, String)>>,
+) -> (Instant, Instant, Instant) {
+    let (new_entries, cursor) = match reuse_consumers {
+        Some(reuse) => {
+            create_proxy_only_batch(
+                client,
+                &harness.admin_base_url,
+                auth_header,
+                harness.backend_port,
+                batch_start,
+                batch_end,
+                &reuse,
+            )
+            .await
+        }
+        None => {
+            create_batch(
+                client,
+                &harness.admin_base_url,
+                auth_header,
+                harness.backend_port,
+                batch_start,
+                batch_end,
+            )
+            .await
+        }
+    }
+    .expect("Failed to create batch");
+    let written = Instant::now();
+    if let Some(cursor) = cursor {
+        wait_for_batch_apply_cursor(
+            client,
+            &harness.admin_base_url,
+            auth_header,
+            cursor,
+            "the reload-under-load harness",
+        )
+        .await
+        .unwrap_or_else(|error| panic!("Wave {batch_start}..{batch_end} never applied: {error}"));
+    }
+    let applied = Instant::now();
+    let first_new = all_entries.len();
+    all_entries.extend(new_entries);
+    let sample_indices = convergence_sample_indices(first_new, all_entries.len());
+    wait_for_scale_config_convergence(
+        client,
+        &harness.proxy_base_url,
+        all_entries,
+        &sample_indices,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("Wave {batch_start}..{batch_end} never converged: {error}"));
+    (written, applied, Instant::now())
+}
+
+fn fmt_ms(us: u32) -> String {
+    format!("{:.1}", us as f64 / 1000.0)
+}
+
+fn fmt_opt(v: Option<f64>, digits: usize) -> String {
+    v.map(|v| format!("{v:.digits$}"))
+        .unwrap_or_else(|| "n/a".into())
+}
+
+/// Hold load on every live proxy while `batch_start..batch_end` is written and
+/// applied, and measure steady / change / apply / post phases.
+#[allow(clippy::too_many_arguments)]
+async fn measure_change_under_load(
+    harness: &ScalePerfHarness,
+    client: &reqwest::Client,
+    auth_header: &str,
+    pid: u32,
+    all_entries: &mut Vec<(String, String)>,
+    kind: &'static str,
+    batch_start: usize,
+    batch_end: usize,
+) -> ReloadWaveResult {
+    let reuse_consumers =
+        (kind == "small-proxies").then(|| all_entries[..RELOAD_SMALL_CHANGE_PROXIES].to_vec());
+    let consumers_per_proxy = if reuse_consumers.is_some() { 0 } else { 1 };
+    let quiet_wait_secs = wait_for_quiet_host().await;
+    let live = Arc::new(all_entries.clone());
+    let proxies_before = live.len();
+    println!(
+        "\n--- {} change: +{} proxies under load ({} live proxies, concurrency {}) ---",
+        kind,
+        batch_end - batch_start,
+        proxies_before,
+        CONCURRENCY
+    );
+    let started = Instant::now();
+    let sampler_stop = Arc::new(AtomicBool::new(false));
+    let sampler = start_resource_sampler(pid, started, sampler_stop.clone());
+    let load = start_live_load(&harness.proxy_base_url, live, CONCURRENCY, started);
+
+    tokio::time::sleep(Duration::from_secs(RELOAD_WARMUP_SECS + RELOAD_STEADY_SECS)).await;
+    let write_start = Instant::now();
+    let (written, applied, live_at) = provision_wave(
+        harness,
+        client,
+        auth_header,
+        all_entries,
+        batch_start,
+        batch_end,
+        reuse_consumers,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(RELOAD_POST_SECS)).await;
+    let buckets = load.finish().await;
+    sampler_stop.store(true, Ordering::Relaxed);
+    let samples = sampler.await.unwrap_or_default();
+
+    let at = |i: Instant| i.duration_since(started).as_secs_f64();
+    let (ws, we, ap, lv) = (at(write_start), at(written), at(applied), at(live_at));
+    let steady_from = RELOAD_WARMUP_SECS as usize;
+    let steady = phase_stats(&buckets, &samples, steady_from, ws.floor() as usize);
+    let change = phase_stats(&buckets, &samples, ws.floor() as usize, lv.ceil() as usize);
+    let apply = phase_stats(&buckets, &samples, we.floor() as usize, ap.ceil() as usize);
+    let post = phase_stats(
+        &buckets,
+        &samples,
+        lv.ceil() as usize,
+        lv.ceil() as usize + RELOAD_POST_SECS as usize - 1,
+    );
+    println!(
+        "  write {:.1}s, apply {:.1}s, live after {:.1}s",
+        we - ws,
+        ap - we,
+        lv - ap
+    );
+    println!(
+        "  {:<8} {:>9} {:>9} {:>8} {:>8} {:>9} {:>7} {:>9} {:>9}",
+        "phase", "rps", "worst/s", "p50 ms", "p99 ms", "worst p99", "errors", "cpu peak", "rss MiB"
+    );
+    for (name, s) in [
+        ("steady", &steady),
+        ("change", &change),
+        ("apply", &apply),
+        ("post", &post),
+    ] {
+        println!(
+            "  {:<8} {:>9.0} {:>9} {:>8} {:>8} {:>9} {:>7} {:>9} {:>9}",
+            name,
+            s.rps,
+            s.worst_second_rps,
+            fmt_ms(s.p50_us),
+            fmt_ms(s.p99_us),
+            fmt_ms(s.worst_second_p99_us),
+            s.errors,
+            fmt_opt(s.gateway_cpu_cores_peak, 2),
+            fmt_opt(s.gateway_rss_mib_peak, 0)
+        );
+    }
+    // Other processes' CPU, measured per second over the change window (host
+    // busy cores minus this test's gateway and load generator), so both a
+    // sustained competing build and a short burst inside the apply are seen.
+    let other_cores: Vec<f64> = other_cpu_series(&samples)
+        .into_iter()
+        .filter(|(t, _)| *t > ws && *t <= lv.ceil())
+        .map(|(_, c)| c)
+        .collect();
+    let other_cpu_cores_mean = (!other_cores.is_empty())
+        .then(|| other_cores.iter().sum::<f64>() / other_cores.len() as f64);
+    let other_cpu_cores_peak = other_cores.iter().copied().reduce(f64::max);
+    println!(
+        "  other processes' CPU during the change: mean {} cores, peak {} cores",
+        fmt_opt(other_cpu_cores_mean, 1),
+        fmt_opt(other_cpu_cores_peak, 1)
+    );
+    if other_cpu_cores_mean.is_some_and(|c| c > 2.0)
+        || other_cpu_cores_peak.is_some_and(|c| c > 4.0)
+    {
+        println!(
+            "  WARNING: other processes used more than 2 cores on average (or 4 in one \
+             second) during this change; its numbers are noisy"
+        );
+    }
+    if steady.rps > 0.0 && (change.worst_second_rps as f64) < steady.rps * 0.5 {
+        println!("  WARNING: a second during the change ran below 50% of steady RPS");
+    }
+    if steady.p99_us > 0 && change.worst_second_p99_us > steady.p99_us * 10 {
+        println!("  WARNING: a second during the change had p99 above 10x steady p99");
+    }
+    let total_errors: u64 = buckets.iter().map(|b| b.errors).sum();
+    assert_eq!(
+        total_errors,
+        0,
+        "{} request(s) to already-live proxies failed while a {} change of {} proxies \
+         was applied at {} proxies ({} route-miss 404s)",
+        total_errors,
+        kind,
+        batch_end - batch_start,
+        proxies_before,
+        buckets.iter().map(|b| b.not_found).sum::<u64>()
+    );
+    ReloadWaveResult {
+        kind,
+        proxies_before,
+        proxies_after: all_entries.len(),
+        resources: (batch_end - batch_start) * (3 + consumers_per_proxy),
+        quiet_wait_secs,
+        other_cpu_cores_mean,
+        other_cpu_cores_peak,
+        write_start_secs: ws,
+        write_end_secs: we,
+        applied_secs: ap,
+        live_secs: lv,
+        steady,
+        change,
+        apply,
+        post,
+        series: second_points(&buckets, &samples),
+    }
+}
+
+async fn run_reload_under_load_test(harness: &ScalePerfHarness, total_proxies: usize) {
+    let pid = harness
+        .gateway_process
+        .as_ref()
+        .map(Child::id)
+        .expect("gateway process");
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(20)
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("admin client");
+    let token = harness.generate_token().expect("Failed to generate JWT");
+    let auth_header = format!("Bearer {token}");
+    let mut all_entries: Vec<(String, String)> = Vec::with_capacity(total_proxies);
+
+    println!(
+        "\n--- Initial wave: proxies 0 to {} (no load) ---",
+        BATCH_SIZE - 1
+    );
+    provision_wave(
+        harness,
+        &client,
+        &auth_header,
+        &mut all_entries,
+        0,
+        BATCH_SIZE,
+        None,
+    )
+    .await;
+
+    // After the initial wave and after every full wave: one small change with
+    // new consumers, then one proxies-only small change; then the next wave.
+    let mut waves: Vec<ReloadWaveResult> = Vec::new();
+    let mut with_consumers_next = RELOAD_SMALL_WITH_CONSUMERS_BASE;
+    let mut proxies_only_next = RELOAD_SMALL_PROXIES_ONLY_BASE;
+    let mut batch_start = BATCH_SIZE;
+    loop {
+        for (kind, next) in [
+            ("small+consumers", &mut with_consumers_next),
+            ("small-proxies", &mut proxies_only_next),
+        ] {
+            let end = *next + RELOAD_SMALL_CHANGE_PROXIES;
+            waves.push(
+                measure_change_under_load(
+                    harness,
+                    &client,
+                    &auth_header,
+                    pid,
+                    &mut all_entries,
+                    kind,
+                    *next,
+                    end,
+                )
+                .await,
+            );
+            *next = end;
+            write_reload_results(harness, total_proxies, &waves, false);
+        }
+        if batch_start >= total_proxies {
+            break;
+        }
+        waves.push(
+            measure_change_under_load(
+                harness,
+                &client,
+                &auth_header,
+                pid,
+                &mut all_entries,
+                "full",
+                batch_start,
+                batch_start + BATCH_SIZE,
+            )
+            .await,
+        );
+        write_reload_results(harness, total_proxies, &waves, false);
+        batch_start += BATCH_SIZE;
+    }
+
+    println!("\n\n======================================================================");
+    println!("  RELOAD UNDER LOAD SUMMARY ({})", harness.db_label);
+    println!("======================================================================");
+    println!(
+        "{:<22} {:>7} {:>8} {:>8} {:>8} {:>7} {:>8} {:>7} {:>7} {:>7} {:>7}",
+        "Change",
+        "live",
+        "steady",
+        "change",
+        "worst/s",
+        "p99 ms",
+        "worst99",
+        "apply s",
+        "cpu pk",
+        "rss pk",
+        "errors"
+    );
+    for w in &waves {
+        println!(
+            "{:<22} {:>7} {:>8.0} {:>8.0} {:>8} {:>7} {:>8} {:>7.1} {:>7} {:>7} {:>7}",
+            format!("{} +{}", w.kind, w.proxies_after - w.proxies_before),
+            w.proxies_before,
+            w.steady.rps,
+            w.change.rps,
+            w.change.worst_second_rps,
+            fmt_ms(w.steady.p99_us),
+            fmt_ms(w.change.worst_second_p99_us),
+            w.applied_secs - w.write_end_secs,
+            fmt_opt(w.change.gateway_cpu_cores_peak, 2),
+            fmt_opt(w.change.gateway_rss_mib_peak, 0),
+            w.change.errors + w.post.errors + w.steady.errors
+        );
+    }
+
+    write_reload_results(harness, total_proxies, &waves, true);
+}
+
+/// Write `FERRUM_RELOAD_RESULTS_JSON` (after every change, so an interrupted run
+/// keeps the changes it finished).
+fn write_reload_results(
+    harness: &ScalePerfHarness,
+    total_proxies: usize,
+    waves: &[ReloadWaveResult],
+    complete: bool,
+) {
+    let Ok(path) = std::env::var("FERRUM_RELOAD_RESULTS_JSON") else {
+        return;
+    };
+    let document = json!({
+        "test": "tests/functional/functional_scale_perf_test.rs::test_scale_reload_under_load",
+        "database": harness.db_label,
+        "complete": complete,
+        "finished_utc": Utc::now().to_rfc3339(),
+        "git_commit": Command::new("git").args(["rev-parse", "HEAD"]).output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
+        "batch_size": BATCH_SIZE,
+        "small_change_proxies": RELOAD_SMALL_CHANGE_PROXIES,
+        "total_proxies": total_proxies,
+        "concurrency": CONCURRENCY,
+        "warmup_secs": RELOAD_WARMUP_SECS,
+        "steady_secs": RELOAD_STEADY_SECS,
+        "post_secs": RELOAD_POST_SECS,
+        "changes": waves,
+    });
+    let written = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&document).unwrap_or_default() + "\n",
+    );
+    match (written, complete) {
+        (Ok(()), true) => println!("Wrote reload results to {path}"),
+        (Ok(()), false) => {}
+        (Err(error), _) => eprintln!("Could not write {path}: {error}"),
+    }
+}
+
+/// `FERRUM_SCALE_TOTAL_PROXIES` shortens a local run (a multiple of the batch
+/// size, at least two batches); the default is the full 30k.
+fn reload_total_proxies() -> usize {
+    let total = std::env::var("FERRUM_SCALE_TOTAL_PROXIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(TOTAL_PROXIES);
+    assert!(
+        total >= 2 * BATCH_SIZE && total.is_multiple_of(BATCH_SIZE),
+        "FERRUM_SCALE_TOTAL_PROXIES must be a multiple of {BATCH_SIZE} and at least {}",
+        2 * BATCH_SIZE
+    );
+    total
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_scale_reload_under_load() {
+    let total = reload_total_proxies();
+    println!("\n============================================================");
+    println!("  Reload Under Load (SQLite): waves of {BATCH_SIZE} up to {total} proxies");
+    println!(
+        "  Load: {CONCURRENCY} workers on every live proxy | {RELOAD_WARMUP_SECS}s warmup, \
+         {RELOAD_STEADY_SECS}s steady, change, {RELOAD_POST_SECS}s post"
+    );
+    println!("============================================================\n");
+    let harness = ScalePerfHarness::new_sqlite()
+        .await
+        .expect("Failed to create test harness");
+    run_reload_under_load_test(&harness, total).await;
 }
