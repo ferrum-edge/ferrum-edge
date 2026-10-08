@@ -130,8 +130,9 @@ up as dips with *low* gateway CPU and a high host load average.
 ## How to Run
 
 ```bash
-# Release build (the harness also runs `cargo build --release` itself and falls
-# back to a debug binary with a warning; debug numbers are not meaningful)
+# Release build (the harness also runs `cargo build --release --bin ferrum-edge`
+# itself, a no-op after this, and falls back to a debug binary with a warning;
+# debug numbers are not meaningful)
 cargo build --release --bin ferrum-edge
 
 # SQLite variant (no external dependencies). `--exact` keeps the filter from

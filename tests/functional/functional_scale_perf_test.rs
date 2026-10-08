@@ -211,9 +211,12 @@ impl ScalePerfHarness {
         // Start echo backend
         start_echo_backend(backend_port).await?;
 
-        // Build gateway (release mode for meaningful perf numbers)
+        // Build gateway (release mode for meaningful perf numbers). Build only
+        // the gateway binary, exactly as the documented prebuild does: a plain
+        // `cargo build --release` covers a different target set, so it redid
+        // the whole fat-LTO release build inside the measured test.
         let build_status = Command::new("cargo")
-            .args(["build", "--release"])
+            .args(["build", "--release", "--bin", "ferrum-edge"])
             .status()?;
         if !build_status.success() {
             return Err("Failed to build ferrum-edge".into());
@@ -1677,8 +1680,8 @@ fn phase_stats(
     from: usize,
     to: usize,
 ) -> PhaseStats {
-    let to = to.min(buckets.len()).max(from);
-    let window = &buckets[from.min(to)..to];
+    let to = to.min(buckets.len());
+    let window = buckets.get(from..to).unwrap_or_default();
     if window.is_empty() {
         return PhaseStats::default();
     }
