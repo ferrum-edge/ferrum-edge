@@ -3062,3 +3062,68 @@ async fn ai_rate_limiter_is_never_installed_on_native_grpc_across_config_paths()
     );
     assert_ai_rate_limiter_http_only(&dp_state, "ai-proxy", "data plane incremental apply");
 }
+
+/// With duplicate API keys already stored (full loads only warn), a consumer
+/// delta must leave every key on the consumer a full rebuild of the same
+/// snapshot would choose, both when the shadowed consumer changes unrelated
+/// metadata and when the current winner is deleted.
+#[tokio::test]
+async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
+    let keyed = |id: &str| {
+        let mut consumer = test_consumer(id, &format!("user-{id}"));
+        consumer.credentials.insert(
+            "keyauth".to_string(),
+            serde_json::json!([{ "key": "shared-key" }]),
+        );
+        consumer
+    };
+    let mut config = GatewayConfig {
+        consumers: vec![keyed("a"), keyed("b")],
+        ..Default::default()
+    };
+    config.normalize_fields();
+    let state = proxy_state_with_config(config);
+    let full_build_winner = |state: &ProxyState| {
+        ferrum_edge::ConsumerIndex::new(&state.config.load().consumers)
+            .find_by_api_key("shared-key")
+            .map(|consumer| consumer.id.clone())
+    };
+    let live_winner = |state: &ProxyState| {
+        state
+            .consumer_index
+            .find_by_api_key("shared-key")
+            .map(|consumer| consumer.id.clone())
+    };
+    assert_eq!(live_winner(&state), full_build_winner(&state));
+
+    // Unrelated metadata change on the shadowed consumer.
+    let shadowed = if live_winner(&state).as_deref() == Some("a") {
+        "b"
+    } else {
+        "a"
+    };
+    let mut relabeled = keyed(shadowed);
+    relabeled
+        .labels
+        .insert("tier".to_string(), "gold".to_string());
+    relabeled.updated_at = Utc::now() + chrono::Duration::seconds(1);
+    let mut delta = empty_delta_at(Utc::now());
+    delta.added_or_modified_consumers = vec![relabeled];
+    let _ = state.apply_incremental(delta).await;
+    assert_eq!(
+        live_winner(&state),
+        full_build_winner(&state),
+        "a metadata-only update must not move a shared API key"
+    );
+
+    // Deleting the current winner hands the key to the remaining consumer.
+    let winner = live_winner(&state).expect("winner");
+    let mut delta = empty_delta_at(Utc::now() + chrono::Duration::seconds(2));
+    delta.removed_consumer_ids = vec![NamespacedResourceId::new(
+        ferrum_edge::config::types::default_namespace(),
+        winner.clone(),
+    )];
+    let _ = state.apply_incremental(delta).await;
+    assert_eq!(live_winner(&state), full_build_winner(&state));
+    assert!(live_winner(&state).is_some_and(|id| id != winner));
+}

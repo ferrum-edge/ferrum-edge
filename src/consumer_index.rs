@@ -168,12 +168,26 @@ impl ConsumerIndex {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
             return;
         }
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.store_inner(Self::build_delta_inner(
+            &self.load_inner(),
+            added,
+            removed_ids,
+            modified,
+        ));
+    }
 
-        // Load the current snapshot and clone its fields for patching
-        let current = match &self.inner {
-            ConsumerIndexStorage::Shared(shared) => shared.load_full(),
-            ConsumerIndexStorage::Snapshot(inner) => Arc::clone(inner),
-        };
+    /// The index `current` becomes after applying a consumer delta, without
+    /// publishing it. Patches clones of `current`'s maps and shares every
+    /// unchanged `Arc<Consumer>`, so a small delta does not re-clone and
+    /// re-index every consumer the way [`Self::build_inner`] does
+    /// (issue #6060).
+    pub(crate) fn build_delta_inner(
+        current: &ConsumerIndexInner,
+        added: &[Consumer],
+        removed_ids: &[crate::config::db_backend::NamespacedResourceId],
+        modified: &[Consumer],
+    ) -> Arc<ConsumerIndexInner> {
         let mut keyauth = current.keyauth_index.clone();
         let mut basic = current.basic_index.clone();
         let mut identity = current.identity_index.clone();
@@ -357,8 +371,7 @@ impl ConsumerIndex {
         let jwt_count = (current.jwt_credential_count as isize + jwt_delta).max(0) as usize;
         let hmac_count = (current.hmac_credential_count as isize + hmac_delta).max(0) as usize;
 
-        // Single atomic swap — readers see old or new, never a partial state.
-        self.store_inner(Arc::new(ConsumerIndexInner {
+        Arc::new(ConsumerIndexInner {
             keyauth_index: keyauth,
             basic_index: basic,
             identity_index: identity,
@@ -368,7 +381,7 @@ impl ConsumerIndex {
             all_consumers: Arc::new(all),
             jwt_credential_count: jwt_count,
             hmac_credential_count: hmac_count,
-        }));
+        })
     }
 
     /// Number of indexed entries (for testing).

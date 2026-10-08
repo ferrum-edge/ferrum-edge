@@ -86,6 +86,10 @@ pub trait CpFullLoadSource: Send + Sync {
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
     async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error>;
+
+    /// See [`DatabaseBackend::forget_consumer_quarantine_state`]: a loaded
+    /// snapshot the CP rejects never goes live (issue #6060).
+    fn forget_consumer_quarantine_state(&self, _namespace: &str) {}
 }
 
 #[async_trait::async_trait]
@@ -107,6 +111,10 @@ where
 
     async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
         DatabaseBackend::latest_global_change_sequence(self).await
+    }
+
+    fn forget_consumer_quarantine_state(&self, namespace: &str) {
+        DatabaseBackend::forget_consumer_quarantine_state(self, namespace);
     }
 }
 
@@ -759,7 +767,9 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
         let config = db
             .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
             .await?;
-        let mut config = prepare_cp_full_snapshot(config)?;
+        let mut config = prepare_cp_full_snapshot(config).inspect_err(|_| {
+            db.forget_consumer_quarantine_state(ns);
+        })?;
         // `mesh` is owned by the K8s overlay slot, never by a DB snapshot; the
         // publication step re-merges it (#2982).
         config.mesh = None;
@@ -784,6 +794,7 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
                     acc.apply_success(ns, next);
                 }
                 Err(error) => {
+                    db.forget_consumer_quarantine_state(ns);
                     error!(
                         namespace = %sanitize_startup_scalar(ns),
                         error = %sanitize_startup_cause(&error, &[]),
@@ -814,6 +825,14 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
     }
 
     acc.finish(previous, last_hard_error)
+}
+
+/// A loaded snapshot that will not publish must not leave its namespace marked
+/// free of consumer quarantine (issue #6060).
+fn forget_consumer_quarantine_states<B: CpFullLoadSource + ?Sized>(db: &B, namespaces: &[String]) {
+    for namespace in namespaces {
+        db.forget_consumer_quarantine_state(namespace);
+    }
 }
 
 /// Pure accumulator for multi-namespace CP full loads. `load_full_config_multi`
@@ -1118,13 +1137,20 @@ async fn load_full_config_multi_with_sequence(
             failed_namespaces: Vec::new(),
         }
     } else {
-        load_full_config_multi(db, &load_namespaces, previous).await?
+        load_full_config_multi(db, &load_namespaces, previous)
+            .await
+            .inspect_err(|_| forget_consumer_quarantine_states(db, &load_namespaces))?
     };
 
     // The same whole-store rule applies after resource loading when the
     // snapshot will publish a global revision. An unsequenced `All` snapshot
     // preserves the per-namespace LKG continuation contract.
     if publishes_store_global_revision {
+        // Nothing below publishes, so no namespace loaded here may keep the
+        // clean consumer-quarantine state its load recorded (issue #6060).
+        if !outcome.failed_namespaces.is_empty() || !outcome.rejected_namespaces.is_empty() {
+            forget_consumer_quarantine_states(db, &load_namespaces);
+        }
         if !outcome.failed_namespaces.is_empty() {
             anyhow::bail!(
                 "CP All-scope full reload could not refresh every namespace; retaining the prior \

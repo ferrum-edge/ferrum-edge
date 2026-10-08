@@ -8338,6 +8338,16 @@ fn spawn_backend_svid_rotation_task(
     })
 }
 
+/// Whether no two consumers share a key the `ConsumerIndex` maps (identity or
+/// credential). A full build resolves a shared key by snapshot order (last
+/// wins); a patched index cannot replay that order, so a modified or removed
+/// consumer could move a shared API key to a different consumer. Full loads
+/// only warn on pre-existing duplicate credentials, so check before patching.
+fn consumer_index_keys_unique(config: &GatewayConfig) -> bool {
+    config.validate_unique_consumer_identities().is_ok()
+        && config.validate_unique_consumer_credentials().is_ok()
+}
+
 impl ProxyState {
     /// The bounded aggregation window for response coalescing on the
     /// reqwest-backed streaming path, or `None` when the operator has not
@@ -13287,7 +13297,17 @@ impl ProxyState {
             rebuild_globals,
             country_mmdb_load_mode,
         )?;
-        let consumer_inner = if consumer_changed {
+        let consumer_inner = if consumer_changed
+            && consumer_index_keys_unique(&current.config)
+            && consumer_index_keys_unique(new_config)
+        {
+            ConsumerIndex::build_delta_inner(
+                &current.consumer_index,
+                &delta.added_consumers,
+                &delta.removed_consumer_ids,
+                &delta.modified_consumers,
+            )
+        } else if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
         } else {
             Arc::clone(&current.consumer_index)

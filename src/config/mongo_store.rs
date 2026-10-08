@@ -1184,6 +1184,9 @@ mod inner {
         /// CLI > env > conf-file > default precedence and could protect the
         /// wrong namespaces.
         protected_namespaces: Vec<String>,
+        /// Namespaces whose last published full load quarantined no consumer,
+        /// so consumer changes can ride the incremental delta (issue #6060).
+        consumer_quarantine: Arc<crate::config::db_backend::ConsumerQuarantineTracker>,
     }
 
     impl MongoStore {
@@ -1276,6 +1279,9 @@ mod inner {
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+                consumer_quarantine: Arc::new(
+                    crate::config::db_backend::ConsumerQuarantineTracker::default(),
+                ),
             })
         }
 
@@ -1919,6 +1925,9 @@ mod inner {
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(false)),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+                consumer_quarantine: Arc::new(
+                    crate::config::db_backend::ConsumerQuarantineTracker::default(),
+                ),
             })
         }
 
@@ -9638,7 +9647,8 @@ mod inner {
             // directly. First-loaded consumer wins; the
             // `consumer_identity_index` collection prevents NEW collisions
             // from being committed, this guard covers pre-existing rows.
-            for message in config.quarantine_colliding_consumer_identities() {
+            let identity_quarantined = config.quarantine_colliding_consumer_identities();
+            for message in &identity_quarantined {
                 error!(
                     "MongoDB config: {}",
                     crate::startup::sanitize_startup_cause(message, &[])
@@ -9650,12 +9660,15 @@ mod inner {
             // secrets before this snapshot can publish or broadcast. Admin
             // write-time validation rejects new violations; this guard covers
             // stored rows.
-            for message in config.quarantine_invalid_hmac_credentials() {
+            let hmac_quarantined = config.quarantine_invalid_hmac_credentials();
+            for message in &hmac_quarantined {
                 error!(
                     "MongoDB config: {}",
                     crate::startup::sanitize_startup_cause(message, &[])
                 );
             }
+            let consumer_quarantine_active =
+                !identity_quarantined.is_empty() || !hmac_quarantined.is_empty();
 
             // Serving-mode repairability (issue #4526), parity with the SQL
             // loader: quarantine stored plugin rows the shared construction
@@ -9730,6 +9743,10 @@ mod inner {
             // Backup export keeps them so restore can recreate managed state.
             if !matches!(purpose, FullConfigLoadPurpose::BackupExport) {
                 crate::config::db_loader::strip_api_spec_id_from_runtime_config(&mut config);
+                // Only a load that reached here can be published, and only
+                // runtime and control-plane loads seed a poller (issue #6060).
+                self.consumer_quarantine
+                    .record_full_load(namespace, consumer_quarantine_active);
             }
 
             Ok(config)
@@ -9939,6 +9956,10 @@ mod inner {
             self.load_policy_graph_neighborhood(namespace, scope).await
         }
 
+        fn forget_consumer_quarantine_state(&self, namespace: &str) {
+            self.consumer_quarantine.forget(namespace);
+        }
+
         async fn count_namespace_resources(
             &self,
             namespace: &str,
@@ -10106,7 +10127,12 @@ mod inner {
                 );
             }
 
-            if !consumer_ops.is_empty() {
+            // Consumer changes ride the delta only while the published
+            // consumer set has nothing quarantined; otherwise a delete or
+            // update may have to rehydrate a stripped credential (issue #6060).
+            if !consumer_ops.is_empty()
+                && !self.consumer_quarantine.allows_consumer_deltas(namespace)
+            {
                 return Err(anyhow::Error::new(
                     crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
                         namespace,
@@ -10180,6 +10206,18 @@ mod inner {
                 let mut consumer = doc_to_consumer(doc)?;
                 consumer.normalize_fields();
                 added_or_modified_consumers.push(consumer);
+            }
+            // An upsert carrying a credential that quarantine judges across
+            // consumers can only be decided by a full load.
+            if added_or_modified_consumers
+                .iter()
+                .any(crate::config::db_backend::consumer_change_requires_authoritative_reload)
+            {
+                return Err(anyhow::Error::new(
+                    crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                        namespace,
+                    ),
+                ));
             }
             let loaded_consumer_ids: HashSet<String> = added_or_modified_consumers
                 .iter()
@@ -19164,6 +19202,9 @@ mod inner {
                     false,
                 )),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+                consumer_quarantine: Arc::new(
+                    crate::config::db_backend::ConsumerQuarantineTracker::default(),
+                ),
             }
         }
 
