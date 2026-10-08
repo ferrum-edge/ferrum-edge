@@ -3767,6 +3767,9 @@ pub struct EnvConfig {
     /// Uses the same client IP resolution as trusted proxy XFF walk.
     /// Default: 0 (disabled). When exceeded, returns 429 Too Many Requests.
     pub max_concurrent_requests_per_ip: u64,
+    /// IPv6 prefix for gateway-wide per-IP caps (FERRUM_PER_IP_IPV6_PREFIX).
+    /// IPv4 clients always use their full address. Default: 64. Range: 1..=128.
+    pub per_ip_ipv6_prefix: u8,
     /// Interval in seconds between cleanup sweeps for per-IP request and
     /// WebSocket-session counters. Removes entries where the active count has
     /// dropped to zero. Relevant when `max_concurrent_requests_per_ip > 0`
@@ -4444,6 +4447,7 @@ impl Default for EnvConfig {
             max_connections: 100_000,
             max_requests: 0,
             max_concurrent_requests_per_ip: 0,
+            per_ip_ipv6_prefix: 64,
             per_ip_cleanup_interval_seconds: 60,
             max_concurrent_fault_delays: DEFAULT_MAX_CONCURRENT_FAULT_DELAYS,
             circuit_breaker_cache_max_entries: 10_000,
@@ -5972,6 +5976,7 @@ impl EnvConfig {
             max_connections,
             max_requests,
             max_concurrent_requests_per_ip,
+            per_ip_ipv6_prefix,
             per_ip_cleanup_interval_seconds,
             max_concurrent_fault_delays,
             circuit_breaker_cache_max_entries,

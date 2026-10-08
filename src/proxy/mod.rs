@@ -5366,12 +5366,7 @@ impl PerIpStreamAdmission {
         &self,
         ip: &str,
     ) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
-        try_acquire_per_ip_slot_with_prefix(
-            self.counts.as_ref(),
-            ip,
-            self.max,
-            self.ipv6_prefix,
-        )
+        try_acquire_per_ip_slot_with_prefix(self.counts.as_ref(), ip, self.max, self.ipv6_prefix)
     }
 }
 
@@ -15122,7 +15117,9 @@ pub fn try_acquire_per_ip_websocket_session(
     try_acquire_per_ip_slot(counts, ip, max)
 }
 
-fn try_acquire_per_ip_websocket_session_with_prefix(
+/// Same as [`try_acquire_per_ip_websocket_session`], but groups IPv6 sources by
+/// the configured `FERRUM_PER_IP_IPV6_PREFIX` instead of the fixed /64.
+pub fn try_acquire_per_ip_websocket_session_with_prefix(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
     max: u64,
@@ -33215,7 +33212,7 @@ async fn handle_proxy_request_inner(
                 &ctx.client_ip,
                 state.per_ip_ipv6_prefix,
             )
-                .unwrap_or_else(|| ctx.client_ip.clone())
+            .unwrap_or_else(|| ctx.client_ip.clone())
         } else {
             ctx.client_ip.clone()
         };

@@ -494,9 +494,7 @@ impl Plugin for UdpRateLimiting {
             Arc::clone(&ctx.client_ip)
         } else {
             crate::util::client_identity::parse_canonical_client_ip(ctx.client_ip.as_ref())
-                .map(|ip| {
-                    Arc::from(crate::util::client_identity::rate_limit_ip_string(ip, 64))
-                })
+                .map(|ip| Arc::from(crate::util::client_identity::rate_limit_ip_string(ip, 64)))
                 .unwrap_or_else(|| Arc::clone(&ctx.client_ip))
         };
 

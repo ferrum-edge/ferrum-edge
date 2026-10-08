@@ -274,7 +274,7 @@ impl ConnLimiter {
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         };
         let per_ip_tracked = if self.max_connections_per_ip > 0 {
-            match self.per_ip_active.entry(per_ip_key.clone()) {
+            match self.per_ip_active.entry(per_ip_key) {
                 Entry::Occupied(mut occ) => {
                     if (*occ.get() as usize) >= self.max_connections_per_ip {
                         // `global` drops here, releasing the global slot.

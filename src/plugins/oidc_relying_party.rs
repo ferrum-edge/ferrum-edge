@@ -2232,11 +2232,7 @@ impl OidcRelyingParty {
             .unwrap_or_else(|| ctx.client_ip.clone()),
             expires_at: Instant::now() + self.behavior.state_ttl,
         };
-        insert_pending_flow_or_use_sealed_cookie(
-            &self.session.state_cache,
-            state.clone(),
-            flow,
-        )?;
+        insert_pending_flow_or_use_sealed_cookie(&self.session.state_cache, state.clone(), flow)?;
         Ok(CreatedFlow {
             state,
             code_verifier,
@@ -5514,11 +5510,7 @@ mod tests {
         .expect("a full optional cache must not refuse the sealed flow");
 
         assert!(cache.entries.contains_key("cached-state"));
-        assert!(
-            cache
-                .admit_callback("sealed-only-state", &[8; 32])
-                .is_ok()
-        );
+        assert!(cache.admit_callback("sealed-only-state", &[8; 32]).is_ok());
     }
 
     #[test]

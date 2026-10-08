@@ -661,10 +661,11 @@ pub(crate) async fn handle_h3_websocket(
     // Per-source session bound. Same key and 503 shape as the H1/H2 path.
     // Held for the session lifetime below (moved past the request-guard
     // drop at the upgrade boundary).
-    let per_ip_ws_guard = match crate::proxy::try_acquire_per_ip_websocket_session(
+    let per_ip_ws_guard = match crate::proxy::try_acquire_per_ip_websocket_session_with_prefix(
         state.per_ip_websocket_sessions.as_ref(),
         &ctx.client_ip,
         state.websocket_max_connections_per_ip,
+        state.per_ip_ipv6_prefix,
     ) {
         Ok(guard) => guard,
         Err(_) => {

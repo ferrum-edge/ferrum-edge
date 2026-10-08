@@ -3424,8 +3424,11 @@ async fn handle_h3_request(
     // Per-IP concurrent request limiting (same as HTTP/1.1 and HTTP/2 paths).
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
         let per_ip_key = if ctx.client_ip.contains(':') {
-            crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
-                .unwrap_or_else(|| ctx.client_ip.clone())
+            crate::util::client_identity::rate_limit_client_ip_string(
+                &ctx.client_ip,
+                state.per_ip_ipv6_prefix,
+            )
+            .unwrap_or_else(|| ctx.client_ip.clone())
         } else {
             ctx.client_ip.clone()
         };

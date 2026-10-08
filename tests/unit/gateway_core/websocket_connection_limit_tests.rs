@@ -3,7 +3,8 @@ use std::sync::atomic::Ordering;
 
 use ferrum_edge::proxy::{
     PerIpLimitExceeded, PerIpStreamAdmission, try_acquire_per_ip_slot,
-    try_acquire_per_ip_websocket_session, try_acquire_websocket_connection_permit,
+    try_acquire_per_ip_websocket_session, try_acquire_per_ip_websocket_session_with_prefix,
+    try_acquire_websocket_connection_permit,
 };
 
 #[test]
@@ -114,6 +115,30 @@ fn per_ip_websocket_session_slot_is_reusable_after_release() {
         .unwrap()
         .expect("released slot should be reusable");
     drop(reused);
+}
+
+#[test]
+fn per_ip_websocket_session_uses_configured_ipv6_prefix() {
+    let counts = Arc::new(dashmap::DashMap::new());
+    let _first =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "2001:db8::1", 1, 128)
+            .expect("first host admitted")
+            .expect("guard");
+    let _second =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "2001:db8::2", 1, 128)
+            .expect("a /128 prefix gives each IPv6 host its own cap")
+            .expect("guard");
+    assert_eq!(counts.len(), 2);
+
+    let grouped = Arc::new(dashmap::DashMap::new());
+    let _held =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&grouped), "2001:db8::1", 1, 64)
+            .expect("first host admitted")
+            .expect("guard");
+    assert!(matches!(
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&grouped), "2001:db8::2", 1, 64),
+        Err(PerIpLimitExceeded)
+    ));
 }
 
 // ── Generalised per-source slot (issue #4544) ────────────────────────────────
