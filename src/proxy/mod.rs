@@ -13578,9 +13578,13 @@ impl ProxyState {
             };
             let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
             let lb_inner = LoadBalancerCache::build_inner(&new_config);
-            let staged_config = Arc::new(new_config.clone());
+            // Publish the candidate itself, not a second full copy of it: a
+            // whole-config clone here held three generations of the config at
+            // once during every reload (issue #6058).
+            let staged_config = Arc::new(new_config);
+            let new_config: &GatewayConfig = &staged_config;
             let published = match self.publish_request_epoch_with_gateway_trust(
-                &new_config,
+                new_config,
                 explicit_trust,
                 |_| {
                     Ok(Some(StagedRequestEpoch {
@@ -13660,7 +13664,7 @@ impl ProxyState {
                 self.adaptive_buffer.prune_missing(&active_proxies);
             }
 
-            warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+            warn_if_h3_backend_tls_policy_incompatible(new_config, self.tls_policy.as_deref());
             self.spawn_backend_capability_refresh();
 
             // Wake external config watchers (Gateway API listener lifecycle).
@@ -13724,12 +13728,16 @@ impl ProxyState {
         // `FnOnce` closures even though they never run concurrently.
         let route_changed = std::cell::Cell::new(false);
         let proxy_plugin_rebuild_count = std::cell::Cell::new(0usize);
-        let staged_config = Arc::new(new_config.clone());
+        // Publish the candidate itself, not a second full copy of it: a
+        // whole-config clone here held three generations of the config at
+        // once during every reload (issue #6058).
+        let staged_config = Arc::new(new_config);
+        let new_config: &GatewayConfig = &staged_config;
         let publish_result = self.publish_request_epoch_with_gateway_trust(
-            &new_config,
+            new_config,
             explicit_trust,
             |current| {
-                let delta = ConfigDelta::compute(&current.config, &new_config);
+                let delta = ConfigDelta::compute(&current.config, new_config);
                 if delta.is_empty() {
                     // ConfigDelta does not represent node-local plugin-file
                     // contents or the mesh block. Claim an accepted MMDB
@@ -13740,7 +13748,7 @@ impl ProxyState {
                     let country_mmdb_plugin_cache =
                         self.plugin_cache.build_country_mmdb_reload_inner(
                             &current.plugin_cache,
-                            &new_config,
+                            new_config,
                             matches!(
                                 self.env_config.mode,
                                 crate::config::env_config::OperatingMode::DataPlane
@@ -13769,9 +13777,9 @@ impl ProxyState {
                     // route-held `Arc<Proxy>` values stay stale until an
                     // unrelated event (#3243).
                     let projected_routes_changed =
-                        Self::projected_route_proxy_content_changed(&current.config, &new_config);
+                        Self::projected_route_proxy_content_changed(&current.config, new_config);
                     let mut projected_lb_modified =
-                        Self::projected_dr_dispatch_changed_upstreams(&current.config, &new_config);
+                        Self::projected_dr_dispatch_changed_upstreams(&current.config, new_config);
                     let projected_lb_changed = !projected_lb_modified.is_empty();
                     if !mesh_changed
                         && !gateway_trust_changed
@@ -13813,7 +13821,7 @@ impl ProxyState {
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
                         route_table: if rebuild_routes {
-                            RouterCache::build_route_table_snapshot(&new_config)
+                            RouterCache::build_route_table_snapshot(new_config)
                         } else {
                             Arc::clone(&current.route_table)
                         },
@@ -13823,7 +13831,7 @@ impl ProxyState {
                         load_balancer: if projected_lb_changed {
                             LoadBalancerCache::build_delta_inner(
                                 &current.load_balancer,
-                                &new_config,
+                                new_config,
                                 &[],
                                 &[],
                                 &projected_lb_modified,
@@ -13845,7 +13853,7 @@ impl ProxyState {
                 };
                 let staged = self.stage_incremental_request_epoch(
                     current,
-                    &new_config,
+                    new_config,
                     Arc::clone(&staged_config),
                     &delta,
                     country_mmdb_load_mode,
@@ -13864,7 +13872,7 @@ impl ProxyState {
             Ok(None) => {
                 debug!("Config poll: candidate valid but unchanged, skipping update");
                 // Still update loaded_at timestamp
-                self.config.store(Arc::new(new_config));
+                self.config.store(Arc::clone(&staged_config));
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
@@ -13935,7 +13943,7 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        self.prune_stale_target_health(&new_config);
+        self.prune_stale_target_health(new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -13992,7 +14000,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
-        warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        warn_if_h3_backend_tls_policy_incompatible(new_config, self.tls_policy.as_deref());
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed.
@@ -14444,12 +14452,16 @@ impl ProxyState {
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
         // a plain `let mut bool`.
         let route_changed = std::cell::Cell::new(false);
-        let staged_config = Arc::new(new_config.clone());
+        // Publish the candidate itself, not a second full copy of it: a
+        // whole-config clone here held three generations of the config at
+        // once during every reload (issue #6058).
+        let staged_config = Arc::new(new_config);
+        let new_config: &GatewayConfig = &staged_config;
         let publish_result = self.publish_request_epoch_with_gateway_trust(
-            &new_config,
+            new_config,
             explicit_trust,
             |current| {
-                let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
+                let delta = crate::config_delta::ConfigDelta::compute(&current.config, new_config);
                 if delta.is_empty() {
                     // A concurrent writer can make the prospective delta above
                     // disappear after its off-thread MMDB generation was
@@ -14457,7 +14469,7 @@ impl ProxyState {
                     // leaving it unowned or retaining stale geo readers.
                     let plugin_cache = self.plugin_cache.build_country_mmdb_reload_inner(
                         &current.plugin_cache,
-                        &new_config,
+                        new_config,
                         false,
                     )?;
                     // Gateway listener TLS classification and other projected
@@ -14467,8 +14479,8 @@ impl ProxyState {
                     // unchanged; publish the new table before waking the
                     // listener manager.
                     let rebuild_routes =
-                        Self::projected_route_proxy_content_changed(&current.config, &new_config)
-                            || Self::mesh_route_table_inputs_changed(&current.config, &new_config);
+                        Self::projected_route_proxy_content_changed(&current.config, new_config)
+                            || Self::mesh_route_table_inputs_changed(&current.config, new_config);
                     if plugin_cache.is_none() && !rebuild_routes {
                         return Ok(None);
                     }
@@ -14476,7 +14488,7 @@ impl ProxyState {
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
                         route_table: if rebuild_routes {
-                            RouterCache::build_route_table_snapshot(&new_config)
+                            RouterCache::build_route_table_snapshot(new_config)
                         } else {
                             Arc::clone(&current.route_table)
                         },
@@ -14490,7 +14502,7 @@ impl ProxyState {
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
-                    &new_config,
+                    new_config,
                     Arc::clone(&staged_config),
                     &delta,
                     crate::plugin_cache::CountryMmdbLoadMode::PreloadedOnly,
@@ -14551,7 +14563,7 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        self.prune_stale_target_health(&new_config);
+        self.prune_stale_target_health(new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -14606,7 +14618,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
-        warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        warn_if_h3_backend_tls_policy_incompatible(new_config, self.tls_policy.as_deref());
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
