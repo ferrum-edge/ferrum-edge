@@ -125,7 +125,8 @@ fn response(s: &mut Streams<Bytes, client::Peer>) -> StreamRef<Bytes> {
         frame::Pseudo::response(http::StatusCode::OK),
         HeaderMap::new(),
     );
-    s.as_dyn().recv_headers(headers).unwrap();
+    let outcome = s.as_dyn().recv_headers(headers).unwrap();
+    assert!(matches!(outcome, RecvOutcome::Processed), "{outcome:?}");
     assert!(matches!(
         stream.opaque.poll_response(&Context::from_waker(&noop_waker())),
         Poll::Ready(Ok(_))

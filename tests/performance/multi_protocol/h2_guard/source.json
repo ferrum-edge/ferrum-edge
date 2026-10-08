@@ -34,7 +34,7 @@
   },
   "assets": {
     "observer.rs": "23b0d7a833e12538e3516e21b12312e27bf0a53a9b4635579397cc944e6ad1b1",
-    "guard_tests.rs": "0b83f5cd9af4bde1b6b86e359319db4f8281297801e0cdec00fe3df8e410074e",
+    "guard_tests.rs": "294f3e0ce044bcd28cb38fc8d77b73a0156ba56d9624cd8019823b09067e5acc",
     "metrics-hook.txt": "c3e18b33e790351221a7383fd83e7bfa53b59a96b26e7b434a565d714454d539"
   },
   "context_files": {
