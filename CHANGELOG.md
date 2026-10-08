@@ -117,9 +117,9 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   `Connection` nominations are resolved** (#6090). HTTP/1.1 and HTTP/3 ingress
   now remove the fields a client's `Connection` header nominates before any
   plugin runs, and rewrite `Connection` to keep only the `close` option and
-  request hop-by-hop names. The backend boundary's hop-by-hop strip can
-  therefore no longer remove consumer identity, `claim_headers`, GeoIP,
-  path-param, or transformer headers that the gateway adds. `Host`,
+  request hop-by-hop names. Consumer identity, `claim_headers`, GeoIP,
+  path-param, and transformer headers that the gateway adds reach the backend
+  as the gateway set them. `Host`,
   `Content-Length`, and `Expect` keep their values for routing and framing, and
   the forwarding fields (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, and the
   configured `FERRUM_REAL_IP_HEADER`) keep theirs for trusted-proxy client-IP
@@ -127,23 +127,21 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   such a request now gets `401`. HTTP/2 rejects `Connection` and is unchanged.
 - **`claim_headers` destinations, `x-geo-country`, and `x-path-param-*`
   treat `_` as `-` when removing client values** (#6090), as the
-  `x-consumer-*` namespace already does. CGI-style backends (Rack, WSGI,
-  PHP-FPM) fold both spellings onto one variable, so they now see only the
-  gateway's value.
+  `x-consumer-*` namespace already does, so backends see only the gateway's
+  value.
 - **BREAKING — plugin-config environment references are confined to
   `FERRUM_PLUGIN_SECRET_<NAME>`** (issue #6086). Plugin config fields that
   name a process environment variable now resolve only the dedicated
   `FERRUM_PLUGIN_SECRET_<NAME>` namespace (`<NAME>` uppercase
   `[A-Z_][A-Z0-9_]*`), through one shared resolver: `api_chargeback_sink`
-  `clickhouse.password_ref` (previously any `FERRUM_*` name),
-  `ai_semantic_firewall` `provider.api_key_env`, `ai_stream_router`
-  `api_key: "${...}"`, `workload_metrics` Lightstep `access_token_env` /
-  `accessTokenEnv` (including Istio Telemetry translation), and `proxy_alerts`
-  channel `webhook_url_env` / `url_env` / `username_env` / `password_env`
-  (previously any variable). Any other name — including gateway-owned settings
-  such as `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_DB_URL` — is refused at
-  plugin-config admission (Admin API `400`, file-mode / `ferrum-edge validate`
-  failure) before anything is read. The `serverless_function` Azure/GCP
+  `clickhouse.password_ref`, `ai_semantic_firewall` `provider.api_key_env`,
+  `ai_stream_router` `api_key: "${...}"`, `workload_metrics` Lightstep
+  `access_token_env` / `accessTokenEnv` (including Istio Telemetry
+  translation), and `proxy_alerts` channel `webhook_url_env` / `url_env` /
+  `username_env` / `password_env`. Any name outside the namespace, including
+  other `FERRUM_*` settings, is refused at plugin-config admission (Admin API
+  `400`, file-mode / `ferrum-edge validate` failure) before anything is read.
+  The `serverless_function` Azure/GCP
   credential fallbacks now read `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and
   `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` instead of the
   ambient `AZURE_FUNCTIONS_KEY` / `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`. An empty
@@ -173,8 +171,8 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   `ferrum-mesh` ServiceAccount with `ferrum-mesh-control-plane`,
   `ferrum-mesh-ambient`, `ferrum-mesh-east-west`, `ferrum-mesh-injector`, and
   `ferrum-mesh-ca`. Only the control plane keeps the cluster-wide controller
-  permissions, and the gateway, injector, and CA identities do not mount API
-  tokens. The Ambient proxy has no Secret access by default: list each
+  permissions, and the east-west gateway, injector, and CA identities do not
+  mount API tokens. The Ambient proxy has no Secret access by default: list each
   `k8s://` TLS-source Secret in `ambient.tlsSecretRefs`, which renders a
   namespaced Role restricted by `resourceNames`. NodeWaypoint discovery trusts
   only Ambient pods running as `ferrum-mesh-ambient`, and with SPIRE `k8s:sa`
@@ -204,10 +202,9 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   transport padding (a trailing space or tab), an LF terminator, or trailing
   characters (`--boundaryX`), a boundary opened by a bare LF or CR, and a
   boundary in the middle of a line (in the preamble, inside the envelope or an
-  attachment, or in the epilogue) used to be skipped as payload; each now gets
-  the existing `400` malformed-encoding refusal. The root part is now always
-  the first part: when `start` is supplied it must name the first part, where
-  the gateway used to validate whichever part `start` named. `Content-ID`
+  attachment, or in the epilogue) each get the existing `400`
+  malformed-encoding refusal. The root part is always the first part: when
+  `start` is supplied it must name the first part. `Content-ID`
   uniqueness and `start` matching ignore ASCII case and a leading `cid:`; a
   `Content-ID` or `start` carrying `%`, `+`, or embedded whitespace is refused;
   and a package `Content-Type` carrying an RFC 2231 extended or continuation
@@ -218,7 +215,11 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
   occurs in the content, are unaffected.
 - **Bound and scope control plane configuration responses** (#6078). Unary
   full-config requests now hold namespace and principal admission through
-  response delivery and are rate limited per authenticated principal. Mesh
+  response delivery and are rate limited per authenticated principal.
+  `GetFullConfig` now requires `node_id` to equal the JWT subject, as
+  `Subscribe` already did, and refuses a mismatch with `PERMISSION_DENIED`;
+  first-party data planes do not call it, so only external tooling that does
+  is affected. Mesh
   CORS policy snapshots are filtered by namespace visibility and `exportTo`,
   native admission and mesh registries distinguish equal subjects across
   namespaces, and rejected subscription logs use bounded identifiers and
@@ -231,8 +232,9 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
     `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`,
     `FERRUM_TCP_MAX_CONNECTIONS_PER_IP`, `FERRUM_UDP_MAX_SESSIONS_PER_IP`,
     `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`,
-    `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP` and
-    `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP`) use the new
+    `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`,
+    `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP` and, since #6099/#6100,
+    `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`) use the new
     `FERRUM_PER_IP_IPV6_PREFIX` (default `64`; `128` restores per-address
     accounting);
   - `rate_limiting` IP keys default to an IPv6 `/64`, set per policy with the
@@ -243,8 +245,9 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
     quotas and `oidc_relying_party` pending-login source quotas use a fixed
     `/64` with no override.
 
-  IPv6 clients in one `/64` now share a budget, and IPv6 quota keys change, so
-  old and new IPv6 counters (local and Redis) do not overlap during rollout.
+  By default IPv6 clients in one `/64` now share a budget, and IPv6 quota keys
+  change, so old and new IPv6 counters (local and Redis) do not overlap during
+  rollout.
   MCP aggregate sessions now have a default cap of 128 per authenticated
   principal (`sessions.max_sessions_per_principal`); at that cap the
   principal's own oldest session is replaced, and when the global store is
@@ -366,7 +369,7 @@ upgrading operators, backends, plugin configs, charts or contract consumers.
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already
-  covers.** Hyper patch 005 (#6033/#6036) split every body chunk larger than
+  covers** (#6055). Hyper patch 005 (#6033/#6036) split every body chunk larger than
   `SendStream::capacity()` so h2 could not cut tiny DATA frames from small
   window increments. But `capacity()` is also capped by h2's per-stream send
   buffer (400 KiB by default on the frontend server), and the backend pool's default 1 MiB maximum

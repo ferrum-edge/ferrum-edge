@@ -65,8 +65,8 @@ Before rolling out, check:
   `sa/ferrum-mesh`, and node agents on CNIs without per-pod host routes
   (#6096);
 - HTTP/3 CONNECT-UDP clients that hold more than 32 tunnels from one address
-  or IPv6 `/64`, and H3 WebSocket routes or policies that match `CONNECT`
-  (#6098);
+  or one `FERRUM_PER_IP_IPV6_PREFIX` IPv6 prefix (default `/64`), and H3
+  WebSocket routes or policies that match `CONNECT` (#6098);
 - IPv6 per-source caps and IP-keyed plugin quotas, which now group a `/64` by
   default, aggregate MCP session caps, and `body_validator` configs that set
   `grpc_max_decompressed_size_bytes: 0` (#6079);
@@ -76,6 +76,8 @@ Before rolling out, check:
   DTLS passthrough clients that send a malformed ClientHello SNI (#6080);
 - HTTP/3 deployments that see bursts of first-time clients, which may now pay
   one Retry round trip, and peers that send QUIC DATAGRAM frames (#6085);
+- external tooling that calls the unary ConfigSync `GetFullConfig`, which now
+  requires `node_id` to equal the JWT subject (#6078);
 - MongoDB deployments that created proxy-scoped plugin configs through
   `POST /batch`, restore or import before 0.9.15 (#6065, #6070).
 
@@ -125,8 +127,8 @@ outside its own namespace. Before rolling out, check:
   gateway's own ServiceAccount. Do not give a Ferrum tenant namespace the name
   of a Kubernetes namespace that tenant should not read (for example
   `kube-system` or a platform namespace).
-- **Generated ids of cross-namespace HTTPRoutes and GRPCRoutes** now end in
-  `__<digest>`. Nothing needs to change in Kubernetes, but dashboards, alerts
+- **Generated ids of cross-namespace HTTPRoutes, GRPCRoutes and UDPRoutes**
+  now end in `__<digest>` (TCPRoute/TLSRoute already followed this rule). Nothing needs to change in Kubernetes, but dashboards, alerts
   or log queries that match these proxy, upstream or plugin ids by exact value
   must be updated. Same-namespace routes keep their ids.
 - **Duplicate `(namespace, id)` resources are refused.** The control plane
@@ -226,14 +228,14 @@ file mode and `ferrum-edge validate` fail, and existing database rows are
 quarantined as unconstructible (optional plugins such as `proxy_alerts` and
 `workload_metrics` are omitted with a warning instead). Affected fields:
 
-| Plugin | Field | Before | After |
-|---|---|---|---|
-| `api_chargeback_sink` | `clickhouse.password_ref` | any `FERRUM_*` name | `FERRUM_PLUGIN_SECRET_<NAME>` |
-| `ai_semantic_firewall` | `provider.api_key_env` | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
-| `ai_stream_router` | `providers[].api_key: "${...}"` | any name | `${FERRUM_PLUGIN_SECRET_<NAME>}` |
-| `workload_metrics` | Lightstep `access_token_env` / `accessTokenEnv` (also Istio `Telemetry` / `meshConfig.extensionProviders`) | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
-| `proxy_alerts` | channel `webhook_url_env`, `url_env`, `username_env`, `password_env` | any name | `FERRUM_PLUGIN_SECRET_<NAME>` |
-| `serverless_function` | implicit Azure / GCP credential fallback | `AZURE_FUNCTIONS_KEY`, `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` | `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY`, `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` |
+| Plugin | Field | Accepted reference |
+|---|---|---|
+| `api_chargeback_sink` | `clickhouse.password_ref` | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `ai_semantic_firewall` | `provider.api_key_env` | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `ai_stream_router` | `providers[].api_key: "${...}"` | `${FERRUM_PLUGIN_SECRET_<NAME>}` |
+| `workload_metrics` | Lightstep `access_token_env` / `accessTokenEnv` (also Istio `Telemetry` / `meshConfig.extensionProviders`) | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `proxy_alerts` | channel `webhook_url_env`, `url_env`, `username_env`, `password_env` | `FERRUM_PLUGIN_SECRET_<NAME>` |
+| `serverless_function` | implicit Azure / GCP credential fallback | `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY`, `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` (replacing `AZURE_FUNCTIONS_KEY`, `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`) |
 
 An unset **or empty** referenced variable now fails the plugin where it
 resolves instead of sending an empty credential.
@@ -253,8 +255,7 @@ Before upgrading:
 3. Run `ferrum-edge validate` against file-mode configs.
 
 Only place a value in this namespace when every principal allowed to write
-plugin configs may use it: a plugin can send it to an endpoint its config
-chooses.
+plugin configs may be trusted with it.
 
 ### External authentication identity headers (issue [#6082](https://github.com/ferrum-edge/ferrum-edge/issues/6082))
 
@@ -292,7 +293,8 @@ gateway (`ferrum-mesh-east-west`), injector (`ferrum-mesh-injector`), and CA
 (`ferrum-mesh-ca`); the shared `ferrum-mesh` ServiceAccount is removed. Upgrade
 the chart to roll these workloads onto their new identities. Only the
 control-plane account keeps the cluster-wide controller permissions. The
-gateway, injector, and CA accounts do not mount API tokens automatically.
+east-west gateway, injector, and CA accounts do not mount API tokens
+automatically.
 
 - **Ambient Secret access is opt-in.** By default the Ambient account cannot
   read any Secret. If Ambient `k8s://<namespace>/<name>` TLS sources reference
@@ -369,8 +371,10 @@ per-address.
   `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`,
   `FERRUM_TCP_MAX_CONNECTIONS_PER_IP`, `FERRUM_UDP_MAX_SESSIONS_PER_IP`,
   `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`,
-  `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`, and
-  `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP`) group IPv6 addresses by the
+  `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`,
+  `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP`, and the CONNECT-UDP
+  per-client cap `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (#6098))
+  group IPv6 addresses by the
   new `FERRUM_PER_IP_IPV6_PREFIX` (default `64`). Set it to `128` for per-host
   accounting. In Kubernetes clusters where pods on a node share a `/64` pod
   CIDR, the default groups those pods under one cap; choose `128` if that
@@ -384,8 +388,8 @@ per-address.
   `tcp_connection_throttle` IP keys, `mcp_gateway` anonymous session quotas,
   and `oidc_relying_party` pending-login source quotas.
 
-IPv6 clients that share a `/64` now share one budget, so review IPv6 limits
-for clients behind a shared prefix. IPv6 quota keys change, so old and new
+By default, IPv6 clients that share a `/64` now share one budget, so review
+IPv6 limits for clients behind a shared prefix. IPv6 quota keys change, so old and new
 IPv6 counters (local and in Redis) do not overlap during rollout; expect each
 IPv6 client's window to restart once.
 
@@ -403,8 +407,8 @@ rollout.
 
 ### MTOM package framing (#6077)
 
-`soap_ws_security` now refuses, with `400`, MTOM/XOP packages that a backend
-parser could frame differently from the gateway:
+`soap_ws_security` now refuses, with `400`, MTOM/XOP packages that are not
+strictly framed:
 
 - the `--boundary` token may appear only as an exact CRLF delimiter line at
   the start of the body or immediately after a CRLF. A padded (trailing space
@@ -413,7 +417,7 @@ parser could frame differently from the gateway:
   the envelope or an attachment, or in the epilogue) are refused;
 - the root part is always the first part. When the package `Content-Type`
   supplies `start`, it must name the first part; a package whose `start`
-  names a later part is refused, where it used to be validated on that part;
+  names a later part is refused;
 - a `Content-ID` or `start` carrying `%`, `+`, or embedded whitespace is
   refused, and `Content-ID` uniqueness and `start` matching ignore ASCII case
   and a leading `cid:`;
@@ -441,6 +445,15 @@ the 0.5-RTT early-response path. The listener and backend pools no longer
 advertise QUIC DATAGRAM; a peer that sends a DATAGRAM frame is closed with
 `PROTOCOL_VIOLATION`. See
 [QUIC address validation](http3.md#quic-address-validation-and-handshake-admission).
+
+### ConfigSync `GetFullConfig` node identity (#6078)
+
+The unary `ConfigSync.GetFullConfig` RPC now requires the request `node_id` to
+equal the authenticated JWT subject, as `Subscribe` already did, and answers a
+mismatch with `PERMISSION_DENIED`. It is also rate limited per authenticated
+principal. First-party data planes use `Subscribe` and are unaffected; update
+external tooling that calls `GetFullConfig` to send its JWT subject as
+`node_id` and to avoid polling it in a tight loop.
 
 ### MongoDB proxy-scoped plugin attachments (#6065, issue [#6070](https://github.com/ferrum-edge/ferrum-edge/issues/6070))
 
