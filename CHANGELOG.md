@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — HTTP/3 CONNECT-UDP tunnels are bounded per client**
+  (issue #6098). Each RFC 9298 tunnel now also takes a per-client slot,
+  keyed on the resolved client IP with IPv6 sources grouped by `/64`, held for
+  the tunnel's lifetime and released when it closes. The new
+  `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (default `32`, `0` disables)
+  sits under the process-wide `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS`, so one
+  client can no longer occupy every tunnel slot. Over the cap the request is
+  refused with `503` before any socket is created.
+- **BREAKING — HTTP/3 WebSocket Extended CONNECT is evaluated as `GET`**
+  (issue #6098). Route `allowed_methods`, `mesh_authz` `:method`, and `opa`
+  `input.method` now see `GET` — the method of the backend WebSocket
+  handshake — for an H3 `:protocol=websocket` request, matching HTTP/1.1
+  Upgrade and HTTP/2 Extended CONNECT. Plain CONNECT and CONNECT-UDP keep
+  `CONNECT`, and the `FERRUM_TLS_EARLY_DATA_METHODS` 0-RTT gate still matches
+  the wire method.
 - **BREAKING — mesh CONNECT relays are authorized on transport attributes
   only** (issue #6081). A byte-stream or datagram HBONE CONNECT, including a
   bare authenticated HTTP/2 CONNECT on the Sidecar inbound listener, relays

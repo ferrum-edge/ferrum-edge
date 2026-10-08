@@ -28,6 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased changes after 0.9.14
 
+**HTTP/3 CONNECT-UDP tunnels are bounded per client (#6098).** With
+`FERRUM_HTTP3_CONNECT_UDP_ENABLED=true`, a single resolved client (IPv4
+address, or IPv6 `/64`) may hold at most
+`FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` concurrent tunnels (default
+`32`); further tunnels from that client receive `503`. If a legitimate client
+or a NAT/egress address in front of many clients needs more, raise the value
+(or set `0` to disable the per-client cap) before upgrading. Preserve the
+client address through `FERRUM_TRUSTED_PROXIES` rather than disabling the cap
+when a load balancer fronts the gateway.
+
+**HTTP/3 WebSocket method policy sees `GET` (#6098).** An H3 Extended CONNECT
+WebSocket is now evaluated as `GET` by route `allowed_methods`, `mesh_authz`
+`:method`, and `opa` `input.method`, as HTTP/1.1 and HTTP/2 WebSocket already
+are. A WebSocket route whose `allowed_methods` lists `CONNECT` but not `GET`
+now refuses H3 WebSocket with `405`; list `GET` instead. Policies that matched
+`CONNECT` to identify H3 WebSocket should match `GET` (plain CONNECT and
+CONNECT-UDP are unchanged).
+
 **Mesh CONNECT relays are authorized on transport attributes only (#6081).**
 An HBONE byte-stream or datagram CONNECT — the Ambient / waypoint `:15008`
 transport, and a bare authenticated HTTP/2 CONNECT on the Sidecar `:15006`
