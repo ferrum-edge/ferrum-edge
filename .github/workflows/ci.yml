@@ -4288,6 +4288,19 @@ jobs:
             --set ambient.probes.startup.override.exec.command[0]=/bin/startup-amb \
             --set controlPlane.probes.startup.override.exec.command[0]=/bin/startup-cp \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-startup-overrides.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.tlsSecretRefs[0].namespace=edge \
+            --set ambient.tlsSecretRefs[0].name=edge-frontend \
+            --set ambient.tlsSecretRefs[1].namespace=edge \
+            --set ambient.tlsSecretRefs[1].name=edge-frontend-ca \
+            --set ambient.tlsSecretRefs[2].namespace=ferrum \
+            --set ambient.tlsSecretRefs[2].name=mesh-dtls \
+            --set ambient.tlsSecretRefs[3].namespace=edge \
+            --set ambient.tlsSecretRefs[3].name=edge-frontend \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-ambient-tls-secret-refs.yaml"
           python3 -I .github/scripts/verify_mesh_workload_probes.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
           # Mesh production-readiness (#4266/#4267/#4288): helm stays in this

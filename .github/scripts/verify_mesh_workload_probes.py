@@ -623,7 +623,317 @@ def validate_startup_overrides(results_dir: Path, expectations: dict) -> None:
                 "Liveness lost computed handler after startup override",
                 f"{name} livenessProbe must remain health --live",
             )
+    validate_service_account_isolation(rendered)
     print("mesh probe startup overrides ok")
+
+
+def validate_service_account_isolation(rendered: str) -> None:
+    expected_accounts = {
+        "ferrum-mesh-control-plane": "ferrum-mesh-control-plane",
+        "ferrum-mesh-ambient": "ferrum-mesh-ambient",
+        "ferrum-mesh-east-west": "ferrum-mesh-east-west",
+        "ferrum-mesh-injector": "ferrum-mesh-injector",
+        "ferrum-mesh-ca": "ferrum-mesh-ca",
+    }
+    workloads = {
+        "ferrum-mesh-control-plane": ("Deployment", "ferrum-mesh-control-plane"),
+        "ferrum-mesh-ambient": ("DaemonSet", "ferrum-mesh-ambient"),
+        "ferrum-mesh-east-west": ("Deployment", "ferrum-mesh-east-west"),
+        "ferrum-mesh-injector": ("Deployment", "ferrum-mesh-injector"),
+        "ferrum-mesh-ca": ("Deployment", "ferrum-mesh-ca"),
+    }
+    for component, account in expected_accounts.items():
+        kind, workload_name = workloads[component]
+        workload = resource_document(rendered, workload_name, kind)
+        pod_spec = re.search(r"(?ms)^    spec:\n(?P<body>.*?)(?=^  [^ ]|\Z)", workload)
+        if pod_spec is None or not re.search(
+            rf"(?m)^      serviceAccountName:\s*{re.escape(account)}\s*$",
+            pod_spec.group("body"),
+        ):
+            fail(
+                "Mesh workload ServiceAccount is shared",
+                f"{workload_name} must use {account}",
+            )
+        service_account = resource_document(rendered, account, "ServiceAccount")
+        if account != "ferrum-mesh-control-plane" and not re.search(
+            r"(?m)^automountServiceAccountToken:\s*false\s*$", service_account
+        ):
+            fail(
+                "Mesh workload token automount enabled",
+                f"{account} must disable automatic token mounting",
+            )
+
+    resource_document(rendered, "ferrum-mesh-control-plane-ferrum", "ClusterRoleBinding")
+    validate_secret_grants(rendered, ambient_secret_refs={})
+
+
+CONTROL_PLANE_ACCOUNT = "ferrum-mesh-control-plane"
+AMBIENT_ACCOUNT = "ferrum-mesh-ambient"
+AMBIENT_TLS_SECRET_ROLE = "ferrum-mesh-ambient-tls-secrets-ferrum"
+SECRET_READ_VERBS = {"get", "list", "watch", "*"}
+
+
+def document_field(doc: str, path: str) -> str | None:
+    """Return a scalar `child` from a top-level `parent` mapping block."""
+
+    parent, child = path.split(".")
+    match = re.search(rf"(?m)^{re.escape(parent)}:\n(?P<body>(?:^[ ]+.*\n?)*)", doc)
+    if match is None:
+        return None
+    field = re.search(
+        rf"(?m)^  {re.escape(child)}:\s*(?P<value>\S+)\s*$", match.group("body")
+    )
+    return field.group("value").strip("\"'") if field else None
+
+
+def yaml_list_field(block: str, key: str) -> list[str] | None:
+    """Read a flow (`key: [a, b]`) or block-sequence string list for `key`."""
+
+    flow = re.search(
+        rf"(?m)^(?P<indent>[ ]*)(?:- )?{re.escape(key)}:\s*\[(?P<items>[^\]]*)\]\s*$",
+        block,
+    )
+    if flow is not None:
+        return [
+            item.strip().strip("\"'")
+            for item in flow.group("items").split(",")
+            if item.strip()
+        ]
+    header = re.search(
+        rf"(?m)^(?P<prefix>[ ]*(?:- )?){re.escape(key)}:\s*$", block
+    )
+    if header is None:
+        return None
+    column = len(header.group("prefix"))
+    items: list[str] = []
+    for line in block[header.end() :].splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent <= column and not stripped.startswith("- "):
+            break
+        if not stripped.startswith("- ") or indent < column:
+            break
+        items.append(stripped[2:].strip().strip("\"'"))
+    return items
+
+
+def rbac_rules(doc: str) -> list[str]:
+    match = re.search(r"(?m)^rules:\n(?P<body>(?:^[ ]+.*\n?|^\n)*)", doc)
+    if match is None:
+        return []
+    return [
+        "  - " + rule
+        for rule in re.split(r"(?m)^  - ", match.group("body"))[1:]
+        if rule.strip()
+    ]
+
+
+def binding_subjects(doc: str) -> list[tuple[str, str]]:
+    match = re.search(r"(?m)^subjects:\n(?P<body>(?:^[ ]+.*\n?)*)", doc)
+    if match is None:
+        return []
+    subjects = []
+    for entry in re.split(r"(?m)^  - ", match.group("body"))[1:]:
+        kind = re.search(r"(?m)^(?:kind:|    kind:)\s*(\S+)", entry)
+        name = re.search(r"(?m)^(?:name:|    name:)\s*(\S+)", entry)
+        subjects.append(
+            (kind.group(1) if kind else "", name.group(1) if name else "")
+        )
+    return subjects
+
+
+def secret_read_rules(doc: str) -> list[list[str] | None]:
+    """Return the `resourceNames` of every rule that can read core Secrets.
+
+    `None` marks a rule with no `resourceNames`, which reads every Secret in
+    its scope (the namespace for a Role, the cluster for a ClusterRole).
+    """
+
+    grants: list[list[str] | None] = []
+    for rule in rbac_rules(doc):
+        groups = yaml_list_field(rule, "apiGroups") or []
+        resources = yaml_list_field(rule, "resources") or []
+        verbs = yaml_list_field(rule, "verbs") or []
+        if not ({"", "*"} & set(groups)):
+            continue
+        if not ({"secrets", "*"} & set(resources)):
+            continue
+        if not (SECRET_READ_VERBS & set(verbs)):
+            continue
+        grants.append(yaml_list_field(rule, "resourceNames"))
+    return grants
+
+
+def validate_secret_grants(
+    rendered: str, ambient_secret_refs: dict[str, list[str]]
+) -> None:
+    """No data-plane identity may read Secrets beyond explicit resourceNames.
+
+    Only the control plane may hold namespace- or cluster-wide Secret reads.
+    Ambient may read exactly the `ambient.tlsSecretRefs` Secrets, through
+    namespaced Roles with `resourceNames`, and nothing by default.
+    """
+
+    documents = split_documents(rendered)
+    roles: dict[tuple[str, str, str], list[list[str] | None]] = {}
+    for doc in documents:
+        kind = re.search(r"(?m)^kind:\s*(\S+)\s*$", doc)
+        if kind is None or kind.group(1) not in {"Role", "ClusterRole"}:
+            continue
+        name = document_field(doc, "metadata.name") or ""
+        namespace = (
+            document_field(doc, "metadata.namespace") or ""
+            if kind.group(1) == "Role"
+            else ""
+        )
+        roles[(kind.group(1), name, namespace)] = secret_read_rules(doc)
+
+    ambient_grants: dict[str, set[str]] = {}
+    for doc in documents:
+        kind = re.search(r"(?m)^kind:\s*(\S+)\s*$", doc)
+        if kind is None or kind.group(1) not in {"RoleBinding", "ClusterRoleBinding"}:
+            continue
+        binding = document_field(doc, "metadata.name") or ""
+        binding_namespace = (
+            document_field(doc, "metadata.namespace") or ""
+            if kind.group(1) == "RoleBinding"
+            else ""
+        )
+        role_kind = document_field(doc, "roleRef.kind") or ""
+        role_name = document_field(doc, "roleRef.name") or ""
+        role_namespace = binding_namespace if role_kind == "Role" else ""
+        grants = roles.get((role_kind, role_name, role_namespace), [])
+        subjects = binding_subjects(doc)
+        if binding == "ferrum-mesh-control-plane-ferrum" and subjects != [
+            ("ServiceAccount", CONTROL_PLANE_ACCOUNT)
+        ]:
+            fail(
+                "Control-plane permissions bound to wrong identity",
+                "the cluster-wide controller role must target only the control-plane account",
+            )
+        if not grants:
+            continue
+        for subject_kind, subject_name in subjects:
+            if subject_kind == "ServiceAccount" and subject_name == CONTROL_PLANE_ACCOUNT:
+                continue
+            if any(names is None or not names for names in grants):
+                scope = (
+                    "cluster-wide"
+                    if kind.group(1) == "ClusterRoleBinding"
+                    else f"namespace-wide in {binding_namespace}"
+                )
+                fail(
+                    "Data-plane identity can read Secrets broadly",
+                    f"{subject_kind}/{subject_name} reads Secrets {scope} via {binding}",
+                )
+            if subject_kind != "ServiceAccount" or subject_name != AMBIENT_ACCOUNT:
+                fail(
+                    "Unexpected Secret access",
+                    f"{subject_kind}/{subject_name} must not read Secrets ({binding})",
+                )
+            if kind.group(1) != "RoleBinding":
+                fail(
+                    "Ambient Secret access not namespaced",
+                    f"{binding} must be a RoleBinding restricted by resourceNames",
+                )
+            granted = ambient_grants.setdefault(binding_namespace, set())
+            for names in grants:
+                granted.update(names or [])
+
+    expected = {
+        namespace: set(names) for namespace, names in ambient_secret_refs.items()
+    }
+    if ambient_grants != expected:
+        fail(
+            "Ambient Secret access does not match ambient.tlsSecretRefs",
+            f"rendered {sorted((ns, sorted(n)) for ns, n in ambient_grants.items())}, "
+            f"expected {sorted((ns, sorted(n)) for ns, n in expected.items())}",
+        )
+    for doc in documents:
+        if not re.search(r"(?m)^kind:\s*Role\s*$", doc):
+            continue
+        if document_field(doc, "metadata.name") != AMBIENT_TLS_SECRET_ROLE:
+            continue
+        namespace = document_field(doc, "metadata.namespace")
+        for rule in rbac_rules(doc):
+            names = yaml_list_field(rule, "resourceNames")
+            if sorted(yaml_list_field(rule, "verbs") or []) != ["get", "list", "watch"]:
+                fail(
+                    "Ambient Secret verbs drifted",
+                    f"{AMBIENT_TLS_SECRET_ROLE} in {namespace} must grant exactly "
+                    "get/list/watch",
+                )
+            if not names or sorted(names) != sorted(expected.get(namespace or "", set())):
+                fail(
+                    "Ambient Secret access not restricted by resourceNames",
+                    f"{AMBIENT_TLS_SECRET_ROLE} in {namespace} must list exactly the "
+                    "ambient.tlsSecretRefs Secrets of that namespace",
+                )
+
+
+def validate_ambient_tls_secret_refs(results_dir: Path, expectations: dict) -> None:
+    captures = expectations["captures"]
+    rendered = require_capture(
+        results_dir, captures["ambient_tls_secret_refs"]
+    ).read_text(encoding="utf-8")
+    validate_secret_grants(
+        rendered,
+        ambient_secret_refs={
+            "edge": ["edge-frontend", "edge-frontend-ca"],
+            "ferrum": ["mesh-dtls"],
+        },
+    )
+    print("mesh ambient TLS Secret refs ok")
+
+
+def validate_node_waypoint_service_account_trust() -> None:
+    source = (REPO_ROOT / "src/config_sources/k8s/core.rs").read_text(encoding="utf-8")
+    constant = re.search(
+        r'(?m)^const NODE_WAYPOINT_SERVICE_ACCOUNT: &str = "(?P<name>[^"]+)";$', source
+    )
+    if constant is None or constant.group("name") != AMBIENT_ACCOUNT:
+        fail(
+            "NodeWaypoint discovery trusts a different identity",
+            f"NODE_WAYPOINT_SERVICE_ACCOUNT must equal the chart's {AMBIENT_ACCOUNT}",
+        )
+    daemonset = (REPO_ROOT / "charts/ferrum-mesh/templates/ambient-daemonset.yaml").read_text(
+        encoding="utf-8"
+    )
+    if not re.search(
+        rf"(?m)^      serviceAccountName: {re.escape(AMBIENT_ACCOUNT)}$", daemonset
+    ):
+        fail(
+            "NodeWaypoint discovery trusts a different identity",
+            f"the Ambient DaemonSet must run as {AMBIENT_ACCOUNT}",
+        )
+
+
+def validate_host_veth_source_usage() -> None:
+    veth = (REPO_ROOT / "src/ebpf/veth.rs").read_text(encoding="utf-8")
+    for removed in (
+        "discover_veth_for_pod(",
+        "discover_veth_for_pod_ip(",
+        "discover_veth_for_pod_ip6(",
+    ):
+        if removed in veth:
+            fail(
+                "Shared or pod-visible veth resolver reintroduced",
+                f"src/ebpf/veth.rs must not define {removed.rstrip('(')}",
+            )
+    sources = {
+        REPO_ROOT / "src/proxy/node_waypoint_udp_identity.rs": "discover_dedicated_veth_for_pod_ip",
+        REPO_ROOT / "src/proxy/host_udp_capture.rs": "discover_dedicated_veth_for_pod_ip",
+        REPO_ROOT / "src/modes/node_agent.rs": "discover_dedicated_veth_for_pod(",
+    }
+    for path, resolver in sources.items():
+        source = path.read_text(encoding="utf-8")
+        if resolver not in source:
+            fail(
+                "Host route ownership lookup missing",
+                f"{path.relative_to(REPO_ROOT)} must resolve from a dedicated pod host route",
+            )
 
 
 def main(argv: list[str]) -> int:
@@ -664,6 +974,9 @@ def main(argv: list[str]) -> int:
     validate_node_agent_https_collision_policy(results_dir, expectations)
     validate_node_waypoint_ambient(results_dir, expectations)
     validate_startup_overrides(results_dir, expectations)
+    validate_ambient_tls_secret_refs(results_dir, expectations)
+    validate_node_waypoint_service_account_trust()
+    validate_host_veth_source_usage()
     return 0
 
 

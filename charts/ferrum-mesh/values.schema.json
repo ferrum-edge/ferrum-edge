@@ -535,6 +535,30 @@
             }
           }
         },
+        "tlsSecretRefs": {
+          "type": "array",
+          "description": "Kubernetes Secrets the Ambient proxy may read for k8s:// TLS sources. Empty by default, which grants the Ambient ServiceAccount no Secret access. Each entry renders a namespaced Role restricted by resourceNames with get/list/watch.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "namespace",
+              "name"
+            ],
+            "properties": {
+              "namespace": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                "maxLength": 63
+              },
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+                "maxLength": 253
+              }
+            }
+          }
+        },
         "spire": {
           "type": "object",
           "additionalProperties": false,

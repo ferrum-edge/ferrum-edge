@@ -97,7 +97,7 @@ fn node_waypoint_pod(node_name: &str, ip: &str, ready: bool, hbone_port: u16) ->
         "ferrum-system",
         &format!("ferrum-node-waypoint-{node_name}"),
         json!({
-            "serviceAccountName": "ferrum-mesh",
+            "serviceAccountName": "ferrum-mesh-ambient",
             "nodeName": node_name,
             "hostNetwork": true,
             "containers": [{
@@ -371,7 +371,7 @@ fn k8s_pod_discovery_resolves_node_waypoint_downward_api_spiffe_id() {
     push_pod_env(
         &mut waypoint,
         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)",
     );
 
     let translation = translate_k8s_objects(
@@ -399,7 +399,7 @@ fn k8s_pod_discovery_resolves_node_waypoint_downward_api_spiffe_id() {
 
     assert_eq!(
         node_waypoint.spiffe_id.as_str(),
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a"
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a"
     );
     assert_eq!(node_waypoint.node_name.as_deref(), Some("node-a"));
 }
@@ -410,7 +410,8 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
     // with a ServiceAccount and no Service. Issue #4274's per-assertor grant
     // is derived from Workload.node_waypoint bindings, so identity-only
     // sources must carry the same per-node SVID as service-backed destinations.
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
     let dest_spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
     let mut source = object(
@@ -514,7 +515,8 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
 
 #[test]
 fn k8s_pod_discovery_does_not_grant_unenrolled_identity_only_sources() {
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
     let mut source = object(
         "Pod",
@@ -574,7 +576,8 @@ fn k8s_pod_discovery_does_not_grant_unenrolled_identity_only_sources() {
 
 #[test]
 fn k8s_pod_discovery_does_not_grant_identity_only_sources_in_excluded_namespaces() {
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/monitoring/sa/frontend";
     let mut source = object(
         "Pod",
@@ -633,7 +636,7 @@ fn k8s_pod_discovery_does_not_recursively_expand_node_waypoint_spiffe_env() {
     push_pod_env(
         &mut waypoint,
         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_NODE_NAME_ALIAS)",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/$(FERRUM_NODE_NAME_ALIAS)",
     );
 
     let translation = translate_k8s_objects(
@@ -1208,6 +1211,51 @@ fn k8s_pod_discovery_rejects_untrusted_node_waypoint_looking_pods() {
 }
 
 #[test]
+fn k8s_pod_discovery_trusts_only_the_ambient_service_account_for_node_waypoints() {
+    let spiffe_id = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
+    let node_waypoint_for = |service_account: &str| {
+        let mut waypoint =
+            node_waypoint_pod_with_spiffe("node-a", "192.0.2.10", true, 15008, spiffe_id);
+        waypoint.spec["serviceAccountName"] = json!(service_account);
+        let translation = translate_k8s_objects(
+            &[
+                node("node-a", "node-uid-a"),
+                service(),
+                ready_pod(),
+                endpoint_slice(),
+                waypoint,
+            ],
+            options(),
+        )
+        .expect("K8s core translation succeeds");
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh config")
+            .workloads
+            .iter()
+            .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+            .expect("reviews workload")
+            .node_waypoint
+            .clone()
+    };
+
+    let trusted = node_waypoint_for("ferrum-mesh-ambient").expect("trusted");
+    assert_eq!(trusted.address, "192.0.2.10");
+    assert_eq!(trusted.spiffe_id.as_str(), spiffe_id);
+
+    // The previous shared chart identity and the control-plane identity both
+    // run in the waypoint namespace, but neither runs the NodeWaypoint.
+    for service_account in ["ferrum-mesh", "ferrum-mesh-control-plane", "default"] {
+        assert!(
+            node_waypoint_for(service_account).is_none(),
+            "{service_account} must not be trusted as a NodeWaypoint identity"
+        );
+    }
+}
+
+#[test]
 fn k8s_pod_discovery_rejects_ambient_controller_namespace_pods() {
     let mut ambient = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
     ambient.metadata.uid = "ambient-pod-uid".to_string();
@@ -1358,7 +1406,7 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
     push_pod_env(
         &mut waypoint,
         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)",
     );
 
     let translation = translate_k8s_objects(

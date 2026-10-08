@@ -13,6 +13,7 @@ use crate::fips::approved::Sha256;
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
 use futures_util::future::BoxFuture;
+use kube::runtime::WatchStreamExt;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{oneshot, watch};
@@ -680,10 +681,14 @@ async fn run_k8s_secret_watch(
     let secrets: kube::Api<k8s_openapi::api::core::v1::Secret> =
         kube::Api::namespaced(client, &target.namespace);
     let field_selector = format!("metadata.name={}", target.name);
+    // `watcher()` yields errors without pausing. A Secret this identity may
+    // not list or watch (403) would otherwise relist as fast as the task is
+    // polled, so back off like the controller watchers do.
     let stream = kube::runtime::watcher::watcher(
         secrets,
         kube::runtime::watcher::Config::default().fields(&field_selector),
-    );
+    )
+    .default_backoff();
     tokio::pin!(stream);
     let mut initialized = false;
 

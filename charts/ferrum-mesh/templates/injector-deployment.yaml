@@ -32,7 +32,7 @@ spec:
         app.kubernetes.io/name: ferrum-mesh-injector
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
-      serviceAccountName: ferrum-mesh
+      serviceAccountName: ferrum-mesh-injector
       {{- include "ferrum-mesh.imagePullSecrets" . }}
       terminationGracePeriodSeconds: {{ .Values.injector.terminationGracePeriodSeconds }}
 {{- include "ferrum-mesh.renderTopologySpreadConstraints" (dict

@@ -431,6 +431,14 @@ ambient:
   # freshly written per-node exemption.
   udpNodePreflight:
     enabled: true
+  # Kubernetes Secrets the Ambient proxy may read for `k8s://<namespace>/<name>`
+  # TLS sources, as `{namespace, name}` entries. Empty by default: the Ambient
+  # ServiceAccount then has no Secret access at all. Each listed Secret gets a
+  # namespaced Role restricted by `resourceNames` with get/list/watch (the
+  # reload watcher lists and watches the one named Secret). Never list the
+  # control-plane credential Secrets here; the Ambient token is present on every
+  # node.
+  tlsSecretRefs: []
   spire:
     # Mount a SPIRE Agent Workload API socket and configure mesh mode to fetch
     # its runtime X.509-SVID from SPIRE. Requires workloadSpiffeId; NodeWaypoint

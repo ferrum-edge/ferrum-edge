@@ -177,6 +177,6 @@ roleRef:
   name: ferrum-mesh-control-plane-{{ .Release.Name }}
 subjects:
   - kind: ServiceAccount
-    name: ferrum-mesh
+    name: ferrum-mesh-control-plane
     namespace: {{ .Release.Namespace }}
 {{- end }}

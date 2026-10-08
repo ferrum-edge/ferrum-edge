@@ -100,14 +100,9 @@ jobs:
           echo '{"schema_version":1,"points":[]}' > tests/performance/ci_results/h1_tls_post_history.json
           # Manual dispatches do not publish the trends alias, so walk the
           # recent successful runs until one carries it.
-          prior_runs="$(gh run list \
-            --workflow h1-tls-post-regression.yml \
-            --branch main \
-            --status success \
-            --limit 10 \
-            --json databaseId,headSha \
-            --jq "map(select(.headSha != \"${CURRENT_SHA}\")) | .[].databaseId" \
-            || true)"
+          python3 -I .github/scripts/latest_trusted_scheduled_runs.py --self-test
+          prior_runs="$(python3 -I .github/scripts/latest_trusted_scheduled_runs.py \
+            --workflow h1-tls-post-regression.yml --current-sha "$CURRENT_SHA" --limit 100)"
           loaded=false
           for prior_run in ${prior_runs}; do
             rm -rf /tmp/prior-trends

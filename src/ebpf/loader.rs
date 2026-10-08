@@ -18,15 +18,15 @@ use std::os::fd::AsFd;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::maps::SockHash;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
+use aya::programs::cgroup_sock_addr::CgroupSockAddrLink;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::sock_ops::SockOpsLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::tc::{SchedClassifierLink, SchedClassifierLinkId};
+use aya::programs::tc::SchedClassifierLink;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-// `Link` is the trait that owns `SchedClassifierLink::detach`; the
-// ingress-redirect teardown owns its links rather than tracking link ids, so it
-// calls that method directly.
+// `Link` is the trait that owns `SchedClassifierLink::detach` and
+// `CgroupSockAddrLink::detach`; the ingress-redirect and per-pod teardowns own
+// their links rather than tracking link ids, so they call that method directly.
 use aya::programs::{
     CgroupAttachMode, CgroupSockAddr, Link, SchedClassifier, SkSkb, SockOps, TcAttachType,
 };
@@ -69,10 +69,27 @@ const TC_PROGRAM: &str = super::BPF_PROGRAM_TC_INBOUND;
 const INGRESS_REDIRECT_PROGRAM: &str = super::BPF_PROGRAM_TC_INGRESS_REDIRECT;
 
 /// Tracks per-pod attachment state for cleanup.
+///
+/// The links are owned, taken out of each program's link map right after
+/// attach. A link id is only a key into that map: dropping it forgets the
+/// attachment while the program stays on the pod cgroup and veth until the
+/// whole `Ebpf` object is dropped, so a removed or un-meshed pod would stay
+/// captured and guarded. Owned links are detached explicitly by
+/// `detach_pod`, and their own `Drop` is the final best-effort detach.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[derive(Default)]
 struct PodLinks {
-    cgroup_link_ids: Vec<CgroupSockAddrLinkId>,
-    tc_link_ids: Vec<SchedClassifierLinkId>,
+    cgroup_links: Vec<CgroupSockAddrLink>,
+    tc_links: Vec<PodTcLink>,
+}
+
+/// One per-pod tc classifier attachment, with the interface it is attached to
+/// so a failed detach can rebuild a retryable handle from its netlink filter
+/// identity, as [`IngressRedirectLink`] does.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+struct PodTcLink {
+    iface: String,
+    link: SchedClassifierLink,
 }
 
 /// One node-level tc ingress-redirect classifier attachment.
@@ -320,15 +337,20 @@ impl EbpfBackend for AyaEbpfBackend {
         let link_id = prog
             .attach(cgroup_fd.as_fd(), CgroupAttachMode::Single)
             .map_err(|e| format!("Failed to attach '{program}' to '{cgroup_path}': {e}"))?;
+        // `take_link` can only fail for an id `attach` did not just return. The
+        // link then stays owned by the program and is detached with `Ebpf`.
+        let link = prog.take_link(link_id).map_err(|e| {
+            format!(
+                "Attached '{program}' to '{cgroup_path}' but could not take ownership of its \
+                 link: {e}"
+            )
+        })?;
 
-        let links = self
-            .pod_links
+        self.pod_links
             .entry(pod_uid.to_string())
-            .or_insert_with(|| PodLinks {
-                cgroup_link_ids: Vec::new(),
-                tc_link_ids: Vec::new(),
-            });
-        links.cgroup_link_ids.push(link_id);
+            .or_default()
+            .cgroup_links
+            .push(link);
 
         debug!(program, cgroup_path, "BPF cgroup program attached");
         Ok(())
@@ -358,15 +380,22 @@ impl EbpfBackend for AyaEbpfBackend {
                 direction.as_str()
             )
         })?;
+        let link = prog.take_link(link_id).map_err(|e| {
+            format!(
+                "Attached '{program}' to '{iface}' {} but could not take ownership of its link: \
+                 {e}",
+                direction.as_str()
+            )
+        })?;
 
-        let links = self
-            .pod_links
+        self.pod_links
             .entry(pod_uid.to_string())
-            .or_insert_with(|| PodLinks {
-                cgroup_link_ids: Vec::new(),
-                tc_link_ids: Vec::new(),
+            .or_default()
+            .tc_links
+            .push(PodTcLink {
+                iface: iface.to_string(),
+                link,
             });
-        links.tc_link_ids.push(link_id);
 
         debug!(
             program,
@@ -378,9 +407,65 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn detach_pod(&mut self, pod_uid: &str) -> Result<(), String> {
-        self.pod_links.remove(pod_uid);
-        debug!(pod_uid, "BPF programs detached for pod");
-        Ok(())
+        let Some(links) = self.pod_links.remove(pod_uid) else {
+            return Ok(());
+        };
+
+        // Detach every link, collecting failures instead of returning on the
+        // first one, so each remaining attachment still gets its attempt.
+        let mut errors = Vec::new();
+        for link in links.cgroup_links {
+            // A failed cgroup detach consumes the link and leaves no handle to
+            // retry with. It is reported; the attachment cannot outlive the pod
+            // cgroup it is bound to.
+            if let Err(e) = link.detach() {
+                errors.push(format!("cgroup program: {e}"));
+            }
+        }
+        let mut retained = Vec::new();
+        for PodTcLink { iface, link } in links.tc_links {
+            // Capture the netlink filter identity before `detach` consumes the
+            // link, so a failure can be retried.
+            let rebuild = match (link.attach_type(), link.priority(), link.handle()) {
+                (Ok(attach_type), Ok(priority), Ok(handle)) => {
+                    Some((attach_type, priority, handle))
+                }
+                // A TCX fd link, whose detach is infallible.
+                _ => None,
+            };
+            let Err(e) = link.detach() else {
+                continue;
+            };
+            // Rebuilding fails when the interface no longer exists, and the
+            // kernel removed its filters with the device. Anything that still
+            // resolves keeps a handle and is reported, so the removal retries.
+            let rebuilt = rebuild.and_then(|(attach_type, priority, handle)| {
+                SchedClassifierLink::attached(&iface, attach_type, priority, handle).ok()
+            });
+            if let Some(link) = rebuilt {
+                errors.push(format!("{iface}: {e}"));
+                retained.push(PodTcLink { iface, link });
+            }
+        }
+        if !retained.is_empty() {
+            self.pod_links.insert(
+                pod_uid.to_string(),
+                PodLinks {
+                    cgroup_links: Vec::new(),
+                    tc_links: retained,
+                },
+            );
+        }
+
+        if errors.is_empty() {
+            debug!(pod_uid, "BPF programs detached for pod");
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to detach BPF programs for pod: {}",
+                errors.join(", ")
+            ))
+        }
     }
 
     fn update_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {

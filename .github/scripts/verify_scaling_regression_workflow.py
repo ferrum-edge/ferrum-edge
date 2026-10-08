@@ -49,6 +49,7 @@ REQUIRED_LATEST_RUN_SELF_TESTS = (
     "exact current run success",
     "exact current run failure",
     "missing head_branch is not on main",
+    "dispatched main run closes",
 )
 PUBLISHER_QUEUE_MODE = "queue: max"
 
@@ -275,6 +276,14 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require('if head_branch != "main"' in production, "missing head_branch must fail closed", failures)
+    require(
+        'TRUSTED_RUN_EVENTS = ("schedule", "workflow_dispatch")' in production,
+        "signal history must admit only scheduled and dispatched runs",
+        failures,
+    )
+    require('entry.get("event") != event' in production, "signal history must reject other events", failures)
+    require('head_repository.get("full_name") != repo' in production, "signal history must reject fork repositories", failures)
+    require('entry.get("path") != f".github/workflows/{WORKFLOW_FILE}"' in production, "signal history must pin the workflow path", failures)
     require("def public_issue_reason" in production, "signal must sanitize public issue reasons", failures)
     require(
         "close_blocked_by_recorded_generation" in production,
@@ -584,6 +593,13 @@ history API failure
 exact current run success
 exact current run failure
 missing head_branch is not on main
+fork run is not trusted
+pull request run is not trusted
+dispatched main run closes
+TRUSTED_RUN_EVENTS = ("schedule", "workflow_dispatch")
+entry.get("event") != event
+head_repository.get("full_name") != repo
+entry.get("path") != f".github/workflows/{WORKFLOW_FILE}"
 """
     signal_failures: list[str] = []
     validate_signal_text(good_signal, signal_failures)
