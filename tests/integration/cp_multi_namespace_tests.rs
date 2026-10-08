@@ -986,25 +986,27 @@ async fn get_full_config_applies_native_stream_admission() {
 
 #[test]
 fn config_sync_projection_excludes_other_namespaces_virtual_service_cors() {
-    let mut mesh = MeshConfig::default();
-    mesh.virtual_service_cors_policies = vec![
-        serde_json::from_value(json!({
-            "name": "private-prod-policy",
-            "namespace": "prod",
-            "host": "api.prod.svc.cluster.local",
-            "export_to": ["*"],
-            "cors": { "allowed_origins": [{ "exact": "https://prod.example" }] }
-        }))
-        .expect("prod CORS policy fixture must deserialize"),
-        serde_json::from_value(json!({
-            "name": "private-staging-policy",
-            "namespace": "staging",
-            "host": "api.staging.svc.cluster.local",
-            "export_to": ["*"],
-            "cors": { "allowed_origins": [{ "exact": "https://staging.example" }] }
-        }))
-        .expect("staging CORS policy fixture must deserialize"),
-    ];
+    let mesh = MeshConfig {
+        virtual_service_cors_policies: vec![
+            serde_json::from_value(json!({
+                "name": "private-prod-policy",
+                "namespace": "prod",
+                "host": "api.prod.svc.cluster.local",
+                "export_to": ["*"],
+                "cors": { "allowed_origins": [{ "exact": "https://prod.example" }] }
+            }))
+            .expect("prod CORS policy fixture must deserialize"),
+            serde_json::from_value(json!({
+                "name": "private-staging-policy",
+                "namespace": "staging",
+                "host": "api.staging.svc.cluster.local",
+                "export_to": ["*"],
+                "cors": { "allowed_origins": [{ "exact": "https://staging.example" }] }
+            }))
+            .expect("staging CORS policy fixture must deserialize"),
+        ],
+        ..Default::default()
+    };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
         ..Default::default()
