@@ -2206,12 +2206,3 @@ after rollout for saturation, oversize, writer, flush, and drain failures.
 ### Logging Metadata Redaction
 
 Transaction metadata is redacted at serialization time before any built-in logger sink writes it. Keys matching built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, or `token` now serialize as `[REDACTED]`; use `FERRUM_LOG_REDACT_METADATA_KEYS` to add operator-specific substrings. The in-memory metadata map is unchanged for plugin logic.
-
-
-### Per-source quota grouping and MCP session caps
-
-Gateway-wide `FERRUM_*_PER_IP` limits group native IPv6 addresses by `FERRUM_PER_IP_IPV6_PREFIX` (default `/64`); IPv4 remains per-address, including IPv4-mapped IPv6. Set the prefix to `128` for per-host accounting. In Kubernetes clusters where pods on a node share a `/64` pod CIDR, the default groups those pods under one cap; choose `128` if that node-wide grouping is not intended. IP-keyed plugin quotas keep their existing behavior, including the `rate_limiting` plugin's `ipv6_prefix` option.
-
-`body_validator` now rejects `grpc_max_decompressed_size_bytes: 0`; set a positive limit or omit the field to use its default.
-
-Aggregate MCP sessions now default to at most 128 live sessions per authenticated principal. Anonymous session quota buckets use the resolved client `/64`. When a caller reaches its own cap, its oldest session is replaced; when the global session store is full and that caller has no session to replace, initialization is refused rather than evicting another caller's live session. Review `sessions.max_sessions` and `sessions.max_sessions_per_principal` against expected concurrency before rollout.
