@@ -14,7 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can read Secrets only in its release namespace, and gateway, injector, and CA
   workloads use tokenless identities. Upgrade guidance is in
   [upgrade_guide.md](docs/upgrade_guide.md#helm-chart-workload-serviceaccounts).
-  (PR pending.)
+  (#6084)
+- **Resolve mesh capture interfaces from host routes keyed by pod IP.**
+  Capture ownership no longer relies on interface metadata visible inside an
+  enrolled pod. IPv4 and IPv6 node-agent lookups use host route data. (#6084)
+- **Use only repository-owned scheduled runs for trend history and CI signals.**
+  Fork-originated runs and other events cannot supply the scaling signal or
+  rolling performance history. (#6084)
 
 ### Performance
 
