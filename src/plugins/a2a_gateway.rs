@@ -1283,6 +1283,13 @@ impl Plugin for A2aGateway {
         HTTP_GRPC_PROTOCOLS
     }
 
+    /// A deny policy refuses REST-binding paths by method, and a WebSocket
+    /// upgrade to such a path would skip this plugin, so it gates admission.
+    /// An observability-only configuration refuses nothing.
+    fn gates_request_admission(&self) -> bool {
+        self.enabled && self.policy_requires_inspection()
+    }
+
     fn modifies_request_headers(&self) -> bool {
         self.enabled && self.detection.strip_accept_encoding
     }

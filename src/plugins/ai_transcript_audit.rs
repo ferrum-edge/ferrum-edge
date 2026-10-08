@@ -8260,8 +8260,11 @@ fn push_literal_segment(
 ///
 /// The only secret syntax is `${secret:NAME}`, which resolves
 /// `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` at activation. `NAME` is uppercase
-/// `[A-Z_][A-Z0-9_]*`. Any other `${...}` form — including a bare
-/// `${SOME_VAR}` process-environment reference — is a hard error, so unrelated
+/// `[A-Z_][A-Z0-9_]*` and must name the materialized base, not an external
+/// secret-source key: a `NAME` ending in `_FILE` / `_VAULT` / `_AWS` / `_AZURE`
+/// / `_GCP` is refused because startup resolution consumes those suffixed keys.
+/// Any other `${...}` form — including a bare `${SOME_VAR}`
+/// process-environment reference — is a hard error, so unrelated
 /// environment secrets can never be interpolated and a malformed reference can
 /// never be silently emitted as literal text.
 fn parse_header_template(template: &str, display_name: &str) -> Result<Vec<HeaderSegment>, String> {
@@ -8290,6 +8293,14 @@ fn parse_header_template(template: &str, display_name: &str) -> Result<Vec<Heade
                 "ai_transcript_audit: `sink.custom_headers` key {display_name:?} secret reference name \
                  {suffix:?} must be uppercase [A-Z_][A-Z0-9_]* (it resolves \
                  `{SINK_SECRET_ENV_PREFIX}NAME`)"
+            ));
+        }
+        if crate::plugins::utils::plugin_secret_env::has_external_secret_suffix(suffix) {
+            return Err(format!(
+                "ai_transcript_audit: `sink.custom_headers` key {display_name:?} secret reference name \
+                 {suffix:?} must not end in an external secret-source suffix (_FILE, _VAULT, _AWS, \
+                 _AZURE, _GCP); reference the materialized base name \
+                 `{SINK_SECRET_ENV_PREFIX}NAME` instead"
             ));
         }
         segments.push(HeaderSegment::Secret(format!(

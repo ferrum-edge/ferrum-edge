@@ -2087,6 +2087,9 @@ impl Plugin for PluginInstanceWrapper {
     fn is_auth_plugin(&self) -> bool {
         self.inner.is_auth_plugin()
     }
+    fn gates_request_admission(&self) -> bool {
+        self.inner.gates_request_admission()
+    }
     fn has_execution_trigger(&self) -> bool {
         self.trigger.is_some() || self.inner.has_execution_trigger()
     }
@@ -4867,6 +4870,14 @@ impl PluginCapabilities {
     /// such a plugin skip the pass entirely — no extra scan or hook call on the
     /// ordinary hot path.
     pub const ENFORCES_FINAL_BACKEND_HEADER_POLICY: u32 = 1 << 17;
+    /// This client-selected flavor view (native gRPC or WebSocket) omits a
+    /// request-admission instance (`Plugin::gates_request_admission`) that the
+    /// same chain's HTTP view runs. The request dispatchers refuse such a
+    /// request before any plugin runs: the flavor is chosen by client headers,
+    /// so serving it would let the client switch the route's authentication or
+    /// admission policy off. Never set on the HTTP view or the composed
+    /// gRPC-Web view, which keeps every HTTP plugin.
+    pub const OMITS_ROUTE_ADMISSION_POLICY: u32 = 1 << 18;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -5324,9 +5335,30 @@ fn log_undeclared_early_route_bound_plugin(proxy_id: Option<&str>, plugins: &[Ar
     );
 }
 
+/// Whether the client-selectable `proto` view of `plugins` drops an
+/// admission-gating instance that the HTTP view of the same chain runs.
+///
+/// Native gRPC and WebSocket are selected per request from client headers on
+/// any HTTP-family route, so a policy that only declares HTTP would otherwise
+/// be switched off by the client. Stream protocols are selected by listener,
+/// never by the client, and the HTTP view is the reference, so neither is
+/// marked.
+fn view_omits_route_admission_policy(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> bool {
+    matches!(proto, ProxyProtocol::Grpc | ProxyProtocol::WebSocket)
+        && plugins.iter().any(|plugin| {
+            let protocols = plugin.supported_protocols();
+            plugin.gates_request_admission()
+                && protocols.contains(&ProxyProtocol::Http)
+                && !protocols.contains(&proto)
+        })
+}
+
 fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> ProtocolEntry {
     let filtered = filter_for_protocol(plugins, proto);
-    let phase = build_phase_data(&filtered);
+    let mut phase = build_phase_data(&filtered);
+    if view_omits_route_admission_policy(plugins, proto) {
+        phase.capabilities.0 |= PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY;
+    }
     ProtocolEntry {
         plugins: filtered,
         phase,

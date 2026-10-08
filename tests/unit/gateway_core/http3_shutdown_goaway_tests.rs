@@ -67,16 +67,29 @@ fn connection_guard_is_constructed_once_in_the_spawn_wrapper() {
         .count();
     assert_eq!(
         guard_constructions, 1,
-        "exactly one ConnectionGuard::new in server.rs, inside run_h3_connection_with_guard"
+        "exactly one ConnectionGuard::new in server.rs, inside H3ConnectionAccounting"
     );
     let helper = src
-        .split("pub(crate) async fn run_h3_connection_with_guard")
+        .split("pub(crate) struct H3ConnectionAccounting")
         .nth(1)
-        .expect("run_h3_connection_with_guard must exist")
+        .expect("H3ConnectionAccounting must exist")
         .split("async fn complete_h3_handshake")
         .next()
         .expect("bounded guard helper");
-    assert!(helper.contains("ConnectionGuard::new(&overload)"));
+    let charge = helper
+        .split("fn charge_connection_budget(&mut self)")
+        .nth(1)
+        .expect("the single charge site must exist");
+    assert!(
+        charge.contains("if self.conn_guard.is_none()")
+            && charge.contains("ConnectionGuard::new(&self.overload)"),
+        "the accounting must hold at most one ConnectionGuard"
+    );
+    assert!(
+        helper.contains("pub(crate) async fn run_h3_connection_with_guard")
+            && helper.contains("H3ConnectionAccounting::admit(overload, handshake_permit)"),
+        "the spawn wrapper must own the connection's accounting"
+    );
     assert!(
         !helper.contains("fetch_sub"),
         "the helper must not decrement by hand; Drop is the only release"

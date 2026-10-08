@@ -2189,6 +2189,22 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error>;
 
+    /// Load only the policy-graph neighborhood `scope` names: the proxies a
+    /// plugin-graph write affects, the plugin configs they are associated
+    /// with, every global, and every instance of a namespace-wide plugin type
+    /// (issue #6056). The result must equal
+    /// [`PolicyGraphScope::restrict`](crate::config::policy_graph_scope::PolicyGraphScope::restrict)
+    /// applied to [`Self::load_namespace_policy_graph`]; the default does
+    /// exactly that, and backends override it with targeted queries so the
+    /// cost follows the write rather than the namespace.
+    async fn load_namespace_policy_neighborhood(
+        &self,
+        namespace: &str,
+        scope: &crate::config::policy_graph_scope::PolicyGraphScope,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        Ok(scope.restrict(self.load_namespace_policy_graph(namespace).await?))
+    }
+
     /// Count namespace resources on the authoritative primary without
     /// deserializing rows/documents.
     async fn count_namespace_resources(

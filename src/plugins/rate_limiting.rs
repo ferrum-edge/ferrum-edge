@@ -1109,6 +1109,10 @@ impl Plugin for RateLimiting {
         }
     }
 
+    fn gates_request_admission(&self) -> bool {
+        true
+    }
+
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.limiter.tracked_keys_count())
     }

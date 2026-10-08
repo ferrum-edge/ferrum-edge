@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — mesh CONNECT relays are authorized on transport attributes
+  only** (issue #6081). A byte-stream or datagram HBONE CONNECT, including a
+  bare authenticated HTTP/2 CONNECT on the Sidecar inbound listener, relays
+  the traffic inside the tunnel as opaque bytes. `mesh_authz` used to judge
+  such a relay as an HTTP request whose method was `CONNECT`, path `/` and
+  host the CONNECT authority, so an `AuthorizationPolicy` with L7 fields was
+  matched against the tunnel's own pseudo-headers rather than the requests
+  inside it. A relay is now authorized as a Layer-4 session, following
+  Istio's non-HTTP-port semantics: method, path, host, header,
+  `requestPrincipals`, and `when: request.headers[...]` / `request.auth.*`
+  attributes are unobservable, so a DENY rule ignores them and still matches
+  on its remaining constraints, an ALLOW or AUDIT rule that needs one never
+  matches, and a matched CUSTOM rule refuses the relay instead of asking the
+  provider about the CONNECT. An L7 rule that selects a workload reached over
+  HBONE now applies to the whole tunnel; scope it with `to.operation.ports`.
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

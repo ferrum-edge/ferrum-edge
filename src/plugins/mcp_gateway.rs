@@ -6961,6 +6961,10 @@ impl Plugin for McpGateway {
         HTTP_ONLY_PROTOCOLS
     }
 
+    fn gates_request_admission(&self) -> bool {
+        self.enabled
+    }
+
     /// The public-URI/name rewrite this plugin applies to `resources/read`,
     /// `tools/call`, and `prompts/get` results is **not** a function of static
     /// configuration, so it cannot be reduced to a construction-time digest.

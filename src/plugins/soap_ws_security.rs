@@ -430,11 +430,6 @@ const MAX_MULTIPART_BOUNDARY_BYTES: usize = 70;
 /// this count and [`MAX_MULTIPART_PART_HEADER_BYTES`] so neither a few enormous
 /// lines nor very many tiny ones can drive unbounded work.
 const MAX_MULTIPART_PART_HEADERS: usize = 32;
-/// Delimiter-line candidates examined across one package. Every candidate that
-/// is rejected as payload advances the scan by at least `2 + boundary.len()`
-/// bytes, so this is a belt-and-braces ceiling on an adversarial package that
-/// embeds boundary-shaped bytes throughout its attachments.
-const MAX_MULTIPART_DELIMITER_CANDIDATES: usize = 4_096;
 
 // ── Configuration admission bounds ──────────────────────────────────────────
 
@@ -4598,6 +4593,9 @@ fn classify_soap_media_type(
         next_content_type_parameter(rest).map_err(|_| MediaTypeRejection::MalformedMediaType)?
     {
         rest = next;
+        if is_extended_parameter_for(name, MTOM_PACKAGE_PARAMETERS) {
+            return Err(MediaTypeRejection::MalformedMultipartPackaging);
+        }
         if name.eq_ignore_ascii_case("boundary") {
             if boundary.replace(value.to_string()).is_some() {
                 return Err(MediaTypeRejection::MalformedMultipartPackaging);
@@ -4635,6 +4633,24 @@ fn classify_soap_media_type(
         return Err(MediaTypeRejection::MalformedMultipartPackaging);
     }
     Ok(Some(SoapMediaClass::Mtom { boundary, start }))
+}
+
+/// The `multipart/related` parameters that decide how an MTOM package is
+/// framed and which part is its root.
+const MTOM_PACKAGE_PARAMETERS: &[&str] = &["boundary", "type", "start"];
+
+/// Whether `name` is an RFC 2231 extended or continuation form (`name*`,
+/// `name*0`, `name*0*`, ...) of one of `bases`, compared case-insensitively.
+///
+/// Ferrum reads only the plain form, while parsers that implement RFC 2231
+/// decode the extended form and let it replace or supply the plain value. A
+/// request carrying one would be framed, typed, or rooted differently by such
+/// a backend, so it is refused rather than ignored.
+fn is_extended_parameter_for(name: &str, bases: &[&str]) -> bool {
+    let Some((base, _)) = name.split_once('*') else {
+        return false;
+    };
+    bases.iter().any(|known| base.eq_ignore_ascii_case(known))
 }
 
 /// RFC 2046 `bcharsnospace` plus space. The caller separately rejects a final
@@ -5405,6 +5421,14 @@ impl Plugin for SoapWsSecurity {
 
     fn is_auth_plugin(&self) -> bool {
         self.establishes_identity()
+    }
+
+    /// Every constructed instance enforces: construction refuses a policy with
+    /// no security feature, so a timestamp-only (freshness) policy and a
+    /// `strict` content-type policy refuse requests too, even though they
+    /// establish no identity and are not auth plugins.
+    fn gates_request_admission(&self) -> bool {
+        true
     }
 
     fn needs_request_body_bytes(&self) -> bool {
@@ -7173,6 +7197,15 @@ struct MtomPart<'a> {
     body: &'a [u8],
 }
 
+impl MtomPart<'_> {
+    /// Whether this part's `Content-ID` matches `id` under [`content_ids_match`].
+    fn content_id_matches(&self, id: &str) -> bool {
+        self.content_id
+            .as_deref()
+            .is_some_and(|own| content_ids_match(own, id))
+    }
+}
+
 /// A recognized boundary delimiter *line*.
 struct MtomDelimiter {
     /// Offset of the first `-` of `--boundary`.
@@ -7183,17 +7216,19 @@ struct MtomDelimiter {
     closing: bool,
 }
 
-/// Classify what follows `--boundary` on a candidate delimiter line.
+/// Classify what follows `--boundary` on a line it opens.
 ///
 /// Returns how many bytes the line occupies after the boundary token plus
-/// whether this is the closing delimiter, or `None` when the candidate is not a
-/// delimiter line at all — in which case those bytes are payload and the scan
-/// continues past them.
+/// whether this is the closing delimiter, or `None` when anything else follows
+/// the token. The caller refuses the whole package on `None`; the line is never
+/// skipped as payload.
 ///
 /// Framing is exact CRLF and nothing else. RFC 2046 transport padding is
-/// deliberately *not* accepted: a padded delimiter is precisely the construct
-/// one parser treats as framing and another as payload, and rejecting it fails
-/// closed instead of choosing a reading the backend may not share.
+/// deliberately *not* accepted, on a part delimiter or on the close-delimiter:
+/// a padded line is precisely the construct one parser treats as framing and
+/// another as payload. Skipping it would frame the package from a later
+/// delimiter while a padding-tolerant backend frames it from this one, so it
+/// fails closed instead of choosing a reading the backend may not share.
 fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
     let Some(after_dashes) = rest.strip_prefix(b"--") else {
         // A part delimiter line ends in exactly CRLF and nothing else.
@@ -7210,76 +7245,72 @@ fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
     None
 }
 
-/// A bounded, line-anchored scanner over one package's delimiter lines.
+/// A line-anchored scanner over one package's delimiter lines.
 ///
 /// A delimiter line exists only at the very start of the body or immediately
-/// after a CRLF. That anchoring is what makes an embedded `--boundary`
-/// substring inside a preamble, a header value, or an attachment payload inert
-/// here — exactly as it is inert for a conforming backend parser. An unanchored
-/// byte-substring search would instead let an attacker plant a fake part inside
-/// a payload and have Ferrum validate it while the backend consumed the real
-/// root part (GHSA-435h-f785-wmm4).
+/// after a CRLF, and the boundary token may appear nowhere else. An unanchored
+/// byte-substring search would let an attacker plant a fake part inside a
+/// payload and have Ferrum validate it while the backend consumed the real
+/// root part (GHSA-435h-f785-wmm4). Skipping a mid-line token as payload is
+/// not safe either: several widely deployed parsers find the first delimiter
+/// without requiring it to open a line, or match the token inside a part
+/// body, so a mid-line token in the preamble or in a part frames a different
+/// root for them than CRLF framing does.
+///
+/// Every boundary token is therefore decided, never skipped. After CRLF (or at
+/// the body start) it must be an exact delimiter line; anywhere else —
+/// mid-line, or opened by a bare LF or a bare CR — it refuses the package.
+/// RFC 2046 already requires generators to choose a boundary that does not
+/// occur in the encapsulated material, and generated boundaries (random UUIDs
+/// or hex) never do in practice.
 struct MtomScanner<'a> {
     bytes: &'a [u8],
     dash_boundary: Vec<u8>,
-    crlf_dash_boundary: Vec<u8>,
-    /// Delimiter-line candidates examined so far, across the whole package.
-    candidates: usize,
 }
 
 impl<'a> MtomScanner<'a> {
     fn new(bytes: &'a [u8], boundary: &str) -> Self {
-        let dash_boundary = format!("--{boundary}").into_bytes();
-        let mut crlf_dash_boundary = Vec::with_capacity(dash_boundary.len() + 2);
-        crlf_dash_boundary.extend_from_slice(b"\r\n");
-        crlf_dash_boundary.extend_from_slice(&dash_boundary);
         Self {
             bytes,
-            dash_boundary,
-            crlf_dash_boundary,
-            candidates: 0,
+            dash_boundary: format!("--{boundary}").into_bytes(),
         }
     }
 
     /// The next delimiter line at or after `from`, or `Ok(None)` when the
     /// package has none left.
-    fn next_from(&mut self, from: usize) -> Result<Option<MtomDelimiter>, SoapBodyDecodeError> {
-        let mut search = from;
-        loop {
-            let line_start = if search == 0 && self.bytes.starts_with(&self.dash_boundary) {
-                0
-            } else {
-                let Some(tail) = self.bytes.get(search..) else {
-                    return Ok(None);
-                };
-                match find_subslice(tail, &self.crlf_dash_boundary) {
-                    // The line starts *after* the CRLF that introduces it.
-                    Some(offset) => search + offset + 2,
-                    None => return Ok(None),
-                }
-            };
-            self.candidates += 1;
-            if self.candidates > MAX_MULTIPART_DELIMITER_CANDIDATES {
-                return Err(SoapBodyDecodeError::MalformedEncoding);
-            }
-            let after_boundary = line_start + self.dash_boundary.len();
-            let rest = self
-                .bytes
-                .get(after_boundary..)
-                .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-            if let Some((tail_len, closing)) = mtom_delimiter_tail(rest) {
-                return Ok(Some(MtomDelimiter {
-                    line_start,
-                    next: after_boundary + tail_len,
-                    closing,
-                }));
-            }
-            // Boundary-shaped bytes that are not a delimiter line. Skip past
-            // them and keep scanning; they belong to whatever part is being
-            // framed. `dash_boundary` is at least three bytes, so the scan
-            // always advances.
-            search = after_boundary;
+    ///
+    /// Fails closed on the first boundary token that is not an exact delimiter
+    /// line: a padded or otherwise non-CRLF tail, a token that does not open a
+    /// line, or a line opened by a bare LF or bare CR. Each call stops at the
+    /// first token it finds, so the work across a whole package is one forward
+    /// pass bounded by the part ceiling.
+    fn next_from(&self, from: usize) -> Result<Option<MtomDelimiter>, SoapBodyDecodeError> {
+        let Some(tail) = self.bytes.get(from..) else {
+            return Ok(None);
+        };
+        let Some(offset) = find_subslice(tail, &self.dash_boundary) else {
+            return Ok(None);
+        };
+        let line_start = from + offset;
+        let before = self
+            .bytes
+            .get(..line_start)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        if !before.is_empty() && !before.ends_with(b"\r\n") {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
         }
+        let after_boundary = line_start + self.dash_boundary.len();
+        let rest = self
+            .bytes
+            .get(after_boundary..)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        let (tail_len, closing) =
+            mtom_delimiter_tail(rest).ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        Ok(Some(MtomDelimiter {
+            line_start,
+            next: after_boundary + tail_len,
+            closing,
+        }))
     }
 
     /// Whether the boundary token occurs anywhere in `bytes[from..]`, anchored
@@ -7364,7 +7395,7 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
     let content_id = match content_id_raw {
         Some(raw) => {
             let normalized = normalize_content_id(raw);
-            if normalized.is_empty() {
+            if normalized.is_empty() || content_id_has_decoding_ambiguity(&normalized) {
                 return Err(SoapBodyDecodeError::MalformedEncoding);
             }
             Some(normalized)
@@ -7394,33 +7425,41 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
 /// about which bytes are the envelope (GHSA-435h-f785-wmm4):
 ///
 /// * Delimiter lines are recognized only at the body start or immediately after
-///   a CRLF, with exact CRLF framing and no transport padding.
-/// * Exactly one close-delimiter must be present, and the epilogue after it
-///   must not contain the boundary token at all.
+///   a CRLF, with exact CRLF framing and no transport padding. The boundary
+///   token may appear nowhere else in the package: a padded or non-CRLF tail, a
+///   token in the middle of a line (in the preamble, a part, or the epilogue),
+///   or a line opened by a bare LF or bare CR refuses the package.
+/// * Exactly one close-delimiter must be present.
 /// * Part headers are strict: US-ASCII, no obsolete folding, well-formed field
 ///   names, and at most one `Content-Type` / `Content-ID` /
 ///   `Content-Transfer-Encoding` per part.
-/// * `Content-ID` values are unique across the package (RFC 2387).
-/// * The root is the part whose `Content-ID` matches `start`, or the first part
-///   when `start` is absent — and with `start` supplied exactly one part may
-///   match.
+/// * `Content-ID` values are unique across the package (RFC 2387), compared
+///   ASCII-case-insensitively and with any `cid:` prefix ignored. A value
+///   carrying `%`, `+`, or embedded whitespace is refused, because a backend
+///   that percent-decodes ids would resolve it to a different part than
+///   byte-exact matching does.
+/// * The root is the first part. When `start` is supplied it must name that
+///   first part, so a parser that resolves `start` and one that always takes
+///   the first part agree.
 /// * The root part must itself declare a SOAP/XOP infoset and must not declare
 ///   a re-encoding `Content-Transfer-Encoding`.
 ///
-/// Every other shape — no parts, no matching root, LF-only framing, a missing
-/// or malformed closure, a part header block over its byte/line ceiling, more
-/// than [`MAX_MULTIPART_PARTS`] parts, or more than
-/// [`MAX_MULTIPART_DELIMITER_CANDIDATES`] boundary-shaped candidates — fails
-/// closed.
+/// Every other shape — no parts, a `start` that does not name the first part,
+/// LF-only or padded framing, a missing or malformed closure, a part header
+/// block over its byte/line ceiling, or more than [`MAX_MULTIPART_PARTS`]
+/// parts — fails closed.
 fn extract_mtom_root_part<'a>(
     bytes: &'a [u8],
     boundary: &str,
     start: Option<&str>,
 ) -> Result<MtomRootPart<'a>, SoapBodyDecodeError> {
-    let mut scanner = MtomScanner::new(bytes, boundary);
+    let scanner = MtomScanner::new(bytes, boundary);
 
     // Anything before the first delimiter line is the RFC 2046 preamble, which
-    // every conforming parser ignores; it is skipped rather than inspected.
+    // every conforming parser ignores. It is skipped rather than inspected,
+    // except that any boundary token inside it is refused by the scanner: a
+    // parser that finds the first delimiter without requiring it to open a
+    // line would frame its first part there.
     let first = scanner
         .next_from(0)?
         .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
@@ -7461,36 +7500,35 @@ fn extract_mtom_root_part<'a>(
     }
 
     // RFC 2387 requires package-unique Content-IDs. Two parts claiming one id
-    // let the gateway and the backend resolve `start` to different envelopes.
+    // let the gateway and the backend resolve `start` to different envelopes,
+    // and so do two ids that only a case-insensitive or `cid:`-stripping
+    // comparison would equate.
     for (index, part) in parts.iter().enumerate() {
         let Some(id) = part.content_id.as_deref() else {
             continue;
         };
-        if parts[..index]
-            .iter()
-            .any(|earlier| earlier.content_id.as_deref() == Some(id))
-        {
+        let earlier = &parts[..index];
+        if earlier.iter().any(|other| other.content_id_matches(id)) {
             return Err(SoapBodyDecodeError::MalformedEncoding);
         }
     }
 
-    let root = match start {
-        Some(start) => {
-            let mut matching = parts
-                .iter()
-                .filter(|part| part.content_id.as_deref() == Some(start));
-            let Some(selected) = matching.next() else {
-                return Err(SoapBodyDecodeError::MalformedEncoding);
-            };
-            if matching.next().is_some() {
-                return Err(SoapBodyDecodeError::MalformedEncoding);
-            }
-            selected
-        }
-        None => parts
-            .first()
-            .ok_or(SoapBodyDecodeError::MalformedEncoding)?,
+    // The root is the first part. Some parsers resolve `start`, others ignore
+    // it and take the first part, so a `start` naming any other part would let
+    // the two select different envelopes. Ids are unique under the same
+    // comparison, so the first part is the only one `start` can match.
+    let Some(root) = parts.first() else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
     };
+    if let Some(start) = start {
+        // A `%`/`+`/whitespace-bearing `start` is decoded differently by a
+        // backend that percent-decodes ids, so the part it selects cannot be
+        // proven to be the first part Ferrum selects. Only a plain value is
+        // compared.
+        if content_id_has_decoding_ambiguity(start) || !root.content_id_matches(start) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+    }
 
     // The root part must itself declare a SOAP/XOP infoset. A root part
     // labelled `application/octet-stream` is the same client-selected
@@ -7518,6 +7556,40 @@ fn extract_mtom_root_part<'a>(
         body: root.body,
         content_type: root_content_type.to_string(),
     })
+}
+
+/// Whether two normalized `Content-ID` / `start` values could name the same
+/// part for some backend parser.
+///
+/// RFC 2392 leaves the domain half case-insensitive and parsers differ on the
+/// local half, and some strip a `cid:` URL scheme before comparing. The widest
+/// reading is used: ASCII case is ignored and a leading `cid:` is dropped from
+/// either side. It is an equivalence, so uniqueness under it leaves at most one
+/// part that any of those comparisons can select.
+fn content_ids_match(left: &str, right: &str) -> bool {
+    strip_cid_scheme(left).eq_ignore_ascii_case(strip_cid_scheme(right))
+}
+
+fn strip_cid_scheme(id: &str) -> &str {
+    id.get(..4)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("cid:"))
+        .and_then(|_| id.get(4..))
+        .unwrap_or(id)
+}
+
+/// Whether a normalized `Content-ID` / `start` value carries a character a
+/// percent-decoding backend would reinterpret.
+///
+/// Some stacks (for example JAX-WS's mimepull) look the id up exactly and, on
+/// a miss, retry after a `URLDecoder` pass that maps `%XX` escapes and `+` to a
+/// space. Ferrum's comparison is byte-exact apart from ASCII case folding and a
+/// `cid:` prefix, so a `%`, `+`, or embedded whitespace lets the two select
+/// different parts — the same gateway/backend split a duplicate id produces.
+/// Generated MTOM ids are plain tokens, so a value carrying one is refused
+/// rather than compared.
+fn content_id_has_decoding_ambiguity(id: &str) -> bool {
+    id.bytes()
+        .any(|byte| matches!(byte, b'%' | b'+') || byte.is_ascii_whitespace())
 }
 
 /// The strict MTOM package parser, reached through the lib target's
@@ -7566,6 +7638,11 @@ fn parse_content_type_charset(
     let mut rest = skip_content_type_media_type(content_type)?;
     while let Some((name, value, next)) = next_content_type_parameter(rest)? {
         rest = next;
+        // An RFC 2231 `charset*` is a second, differently decoded charset
+        // declaration for any parser that honors it.
+        if is_extended_parameter_for(name, &["charset"]) {
+            return Err(SoapBodyDecodeError::ConflictingCharset);
+        }
         if !name.eq_ignore_ascii_case("charset") {
             continue;
         }

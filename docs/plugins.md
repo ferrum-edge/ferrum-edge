@@ -1441,7 +1441,8 @@ latency fields remain `-1.0`; a configured target in such a record is not proof
 that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
 phase or gateway admission gate that rejected the request. Possible values
 include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
-`grpc_backend_error`, and `websocket_backend_error`. Gateway-generated gRPC
+`route_protocol_admission`, `grpc_backend_error`, and
+`websocket_backend_error`. Gateway-generated gRPC
 errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
 sinks can distinguish gRPC failures even though the downstream HTTP status is
 `200`.
@@ -1454,6 +1455,7 @@ Terminal transaction logging is independent of ordinary request hooks:
 | --- | --- | --- | --- |
 | Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
 | Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
+| Matched proxy whose native-gRPC or WebSocket plugin view omits an HTTP-only authentication or admission plugin (see [Protocol Support](plugin_execution_order.md#protocol-support)) | 403 (native gRPC: trailers-only `PERMISSION_DENIED`) | Emitted once with `rejection_phase: "route_protocol_admission"` | Not run |
 | Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
@@ -3330,16 +3332,17 @@ Media types are parsed **structurally** — `type/subtype` plus RFC 9110 paramet
 | `strict` *(default)* | Every request on this proxy is a governed SOAP request. A missing Content-Type returns `415`, an unsupported media type returns `415`, and a malformed one returns `400` — all before backend dispatch. |
 | `mixed_route` | Only requests whose media type is a recognized SOAP representation are governed; everything else passes through the SOAP policy. This is the explicit opt-out for proxies that intentionally serve mixed traffic. A malformed media-type label still fails closed in this mode, because an unparsable label cannot be proven non-SOAP. With an identity-establishing configuration the pass-through still reaches the authentication chain and is answered `401` — see [Phase, identity, and composition](#phase-identity-and-composition). |
 
-Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the gateway locates the root part (by `start`, else the first part), validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
+Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the root part is the first part (when `start` is supplied it must name that part), the gateway validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
 
 **MTOM package framing is strict, because the parser decides which bytes are the envelope.** Any package shape a conforming backend parser would frame differently is a gateway/backend representation split, so it fails closed rather than being resolved by a rule the backend need not share. The whole package is framed and every part parsed *before* a root is selected, so no ambiguity later in the package is missed by an early return. Specifically:
 
-- Boundary delimiter *lines* are recognized only at the start of the body or immediately after a CRLF, with exact CRLF framing and no RFC 2046 transport padding. A `--boundary` sequence anywhere else — in the preamble, in a header value, inside an attachment payload, inside the envelope itself — is payload, exactly as it is for a conforming parser.
-- Exactly one close-delimiter (`--boundary--`) must be present, and the epilogue after it must not contain the boundary token at all.
+- Boundary delimiter *lines* are recognized only at the start of the body or immediately after a CRLF, with exact CRLF framing and no RFC 2046 transport padding, and the `--boundary` token may appear nowhere else in the package. One with anything other than exact CRLF (or `--` then CRLF, or end of body, for the close-delimiter) after it — transport padding such as a trailing space or tab, a bare LF terminator, or further characters such as `--boundaryX` — refuses the package. So does a `--boundary` opened by a bare LF or bare CR, or one in the middle of a line: in the preamble, inside the envelope, inside an attachment payload, or in the epilogue. Parsers differ on all of these — some accept transport padding or LF-only line endings, some find the first delimiter without requiring it to open a line, some match the token inside a part body — so skipping any of them as payload could validate a different root than the backend executes. RFC 2046 already requires a generator to choose a boundary that does not occur in the encapsulated material, and the random boundaries MTOM stacks generate never do in practice.
+- Exactly one close-delimiter (`--boundary--`) must be present.
+- The package `Content-Type` must not carry an RFC 2231 extended or continuation form (`boundary*`, `boundary*0`, `type*`, `start*`, ...) of `boundary`, `type`, or `start`; such a request is refused with `400`. Parsers that implement RFC 2231 decode those forms and let them replace or supply the plain value, so the backend would frame, type, or root the package differently. An extended `charset*` on a SOAP `Content-Type` is likewise refused as a conflicting charset declaration.
 - Part headers must be US-ASCII with exact CRLF line endings, must not use obsolete folded continuation lines, must be well-formed `token: value` pairs, and may carry at most one `Content-Type`, one `Content-ID`, and one `Content-Transfer-Encoding` each.
-- `Content-ID` values must be unique across the package (RFC 2387) and must not be blank. When `start` is supplied, exactly one part may match it.
+- `Content-ID` values must be unique across the package (RFC 2387) and must not be blank. Uniqueness and `start` matching ignore ASCII case and a leading `cid:`, the widest comparison a backend may apply. A `Content-ID` or `start` carrying `%`, `+`, or embedded whitespace is refused instead: a backend that percent-decodes ids (`%XX` escapes, `+` as space) would resolve it to a different part than byte-exact matching does. When `start` is supplied it must name the **first** part: some parsers resolve `start` and others always take the first part as the root, and requiring both to agree keeps them on one envelope.
 - The root part must itself declare a SOAP/XOP essence and must not declare a re-encoding `Content-Transfer-Encoding` (anything other than `7bit`/`8bit`/`binary`).
-- Bounds are fail-closed: at most 64 parts, at most 8 KiB and 32 lines of headers per part, and a ceiling on boundary-shaped candidates examined per package.
+- Bounds are fail-closed: at most 64 parts and at most 8 KiB and 32 lines of headers per part.
 
 **X.509 signatures and MTOM/XOP are mutually exclusive.** Ferrum implements no WS-Security attachment-signature transform, so for a XOP representation the digest it verifies covers the `xop:Include` element rather than the attachment octets that element stands for — an attacker-selected attachment present during validation would never be detected. When `x509_signature.enabled` is `true`, MTOM/XOP `multipart/related` **and** bare `application/xop+xml` are therefore refused with `415` before dispatch, and an explicit `content_type.allow_mtom: true` alongside an enabled `x509_signature` is refused at config admission. `username_token` and `saml` keep accepting MTOM/XOP: those mechanisms authenticate *who sent the message*, and neither claims integrity over attachment octets.
 
@@ -4300,7 +4303,7 @@ config:
 - **Recognition matches `mcp_gateway`.** The body is read after it is buffered, in `before_proxy` (the plugin's `on_request_received` / `authorize` charges do not run in this mode). Member names are decoded before comparison (an escaped `"m\u0065thod"` is `method`), the media types are the ones the gateway admits (`application/json`, `application/json-rpc`, any `+json`, or no `Content-Type`), and a batch is read within fixed recognizer bounds of 32 members, 1 MiB, and 256 KiB per member. Raising `mcp_gateway.validation.max_batch_items`, `max_batch_bytes`, or `max_batch_item_bytes` above these bounds means the limiter refuses larger batches with JSON-RPC `-32600`. A body with duplicate member names, or a batch past those bounds, is refused with JSON-RPC `-32600` instead of being counted one way here and parsed another way downstream. Any in-scope POST with non-identity `Content-Encoding` is refused with `-32017`, even when its body has no `tools/call`, because its body cannot be inspected; earlier request decompression removes the encoding and keeps normal recognition. `endpoint_path`, when set, narrows which POSTs are in scope. Ordinary JSON traffic that cannot spell `tools/call` is answered by a byte scan without parsing, and with `endpoint_path` set no other path is buffered at all.
 - **Placement.** The charge runs at priority 2900, before `mcp_gateway` (2992): every `tools/call` attempt counts, including one the gateway then refuses (unknown or ungranted tool, invalid arguments, an aggregate batch member answered `-32009`). To count only calls the gateway admitted, give the instance a `priority_override` above 2992.
 - **Refusal is a JSON-RPC error on HTTP `200`.** An exceeded budget answers `{"jsonrpc":"2.0","id":<the call's id>,"error":{"code":-32015,"message":"MCP tool-call rate limit exceeded"}}` with `Content-Type: application/json` and, with `expose_headers`, the usual `x-ratelimit-limit` / `x-ratelimit-remaining: 0` / `x-ratelimit-window`. A batch gets one error per request-form member (by its own id; an id longer than 4096 bytes is answered with `id: null`), and a refused request with no request-form member gets one error with `id: null`. HTTP `200` is deliberate and matches `mcp_gateway`, which answers every JSON-RPC error on `200`: MCP streamable HTTP clients resolve the pending request from a JSON-RPC error on a 2xx response and surface its code and message to the agent, while a `429` POST response is raised as a transport failure that loses both. A state-capacity refusal also answers `-32015`; a fail-closed Redis outage (`redis_failure_policy: fail_closed`) answers `-32016` (`MCP tool-call rate limit unavailable`) with no rate-limit headers. Because the refusal rides HTTP `200`, status-code metrics do not see it; `ferrum_rate_limit_exceeded_total` and the `ratelimit_mcp_tool_calls` metadata (the number of charges the request carried) do.
-- **Scope.** The mode is HTTP-only (a stream, WebSocket, or gRPC request has no `tools/call` to count) and changes the limiter's local-state identity, so switching an instance between request counting and tool-call counting never reuses a live budget.
+- **Scope.** The mode is HTTP-only (a stream, WebSocket, or gRPC request has no `tools/call` to count) and changes the limiter's local-state identity, so switching an instance between request counting and tool-call counting never reuses a live budget. A native-gRPC or WebSocket request on a route with a tool-call limiter is refused with `403` / `PERMISSION_DENIED` (see [Protocol Support](plugin_execution_order.md#protocol-support)).
 
 **Counter storage** (`sync_mode`): only `local` and `redis` are supported. There is intentionally no database-backed counter policy; database writes on the hot path are non-performant and can cause operational issues.
 
@@ -4689,7 +4692,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `provider` | String | (required) | `"azure_functions"` |
 | `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
-| `azure_function_key` | String | — | Function key for auth. Falls back to `AZURE_FUNCTIONS_KEY` env var. The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
+| `azure_function_key` | String | — | Function key for auth. Falls back to the `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` env var (never the ambient `AZURE_FUNCTIONS_KEY`, because the key is sent to the config-chosen `function_url`). The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
 
 **GCP Cloud Functions** — calls the HTTPS trigger URL:
 
@@ -4697,7 +4700,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `provider` | String | (required) | `"gcp_cloud_functions"` |
 | `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
-| `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var. The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
+| `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to the `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var (never the ambient `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`). The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
 
 #### Common Parameters
 
@@ -4862,7 +4865,7 @@ If request deduplication acquired an idempotency key earlier in the chain, each 
 
 #### Environment Variable Fallback
 
-Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.).
+Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.). The Azure function key and GCP bearer token are sent to the config-chosen `function_url`, so their fallbacks are confined to the [plugin-secret namespace](configuration.md): `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`. The ambient `AZURE_FUNCTIONS_KEY` / `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` variables are never read.
 
 #### Example: AWS Lambda pre-proxy enrichment
 
@@ -6833,9 +6836,11 @@ config:
   providers:
     - name: openai
       provider_type: openai
-      api_key: ${OPENAI_API_KEY}
+      api_key: "sk-..."
       model_patterns: ["gpt-*"]
 ```
+
+`ai_federation` does **not** expand `${...}` references in `api_key`, so supply the literal credential as shown (unlike [`ai_stream_router`](#ai_stream_router), whose `api_key` accepts a whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference).
 
 With it enabled, `before_proxy` claims the streaming request, commits exactly one provider, and rewrites the routing decision through `RequestContext.route_override_*` so the **normal proxy dispatch path** relays the provider's SSE incrementally. On a proxy with backend-path policy, this hook runs in the deferred pass only after the effective target path is authorized; provider I/O still waits for finalized request egress after all final-body policy. Time to first token, client-disconnect cancellation, byte budgets, retained-response ceilings, and shutdown accounting all come from the shared streaming response machinery rather than a plugin-private relay; the plugin itself creates no queues, channels, or detached tasks.
 
@@ -7062,13 +7067,13 @@ config:
     - name: openai
       provider_type: openai
       endpoint: https://api.openai.com/v1/chat/completions
-      api_key: ${OPENAI_API_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_OPENAI_API_KEY}
       model_patterns: ["gpt-*", "o*"]
       priority: 1
     - name: anthropic
       provider_type: anthropic
       endpoint: https://api.anthropic.com/v1/messages
-      api_key: ${ANTHROPIC_API_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_ANTHROPIC_API_KEY}
       model_patterns: ["claude-*"]
       priority: 2
       anthropic_version: "2023-06-01"
@@ -7092,7 +7097,7 @@ config:
 | `name` | String | — | **Required**, non-empty, unique within the instance. Surfaced as `ai_stream_router.provider`. |
 | `provider_type` | String | — | **Required**. One of `openai`, `openai_compatible`, `anthropic`, `google_gemini`. |
 | `endpoint` | String | — | **Required** absolute `https://` URL (or `http://` with `allow_plaintext`). May carry a literal `{model}` path placeholder and its own query string. A literal-IP host is checked against the gateway backend egress policy at admission, and an explicit port `0` is rejected (an outbound destination cannot use port zero). |
-| `api_key` | String | — | **Required**, non-empty. A `${ENV_VAR}` reference is resolved from the process environment. The resolved value must be a valid HTTP header value, so a stray newline is a configuration error rather than a `502` on every request. |
+| `api_key` | String | — | **Required**, non-empty. A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference is resolved from the process environment at construction; a `${...}` reference to any other variable (including every other `FERRUM_*` setting) is refused at admission, and an unset or empty referenced variable fails construction. The resolved value must be a valid HTTP header value, so a stray newline is a configuration error rather than a `502` on every request. |
 | `model_patterns` | Array | — | **Required**, 1–128 globs matched against the request `model`. Each glob is 1–256 ASCII bytes containing only letters, digits, `.`, `_`, `:`, `/`, `+`, `-`, and `*`, with no `..` sequence; unsupported wildcards such as `?` or `[` fail admission. `*` is the only wildcard, never consumes a URL-structural separator (`/`, `?`, `#`, `&`, `\`) or whitespace, and the pattern is anchored at both ends — so `*mini` matches `model-mini` and `mini-mini` alike, and never matches `mini-pro`. |
 | `priority` | Integer | provider index + 1 | Lower is matched first. Must be at least `1` and fit in a `u32`. |
 | `allow_plaintext` | Boolean | `false` | Required opt-in for an `http://` endpoint: plaintext provider egress is rejected at admission without it. It has no effect on an `https` endpoint and does not relax runtime TLS or FIPS policy. Use it only for an internal, same-trust-domain provider. |
@@ -7111,7 +7116,7 @@ config:
       provider_type: openai_compatible
       endpoint: http://vllm.internal.svc.cluster.local:8000/v1/chat/completions
       allow_plaintext: true
-      api_key: ${INTERNAL_VLLM_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_INTERNAL_VLLM_KEY}
       model_patterns: ["llama-*", "mistral-*"]
 ```
 
@@ -7255,7 +7260,7 @@ Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy 
 | `provider.type` | string | required | `openai_compatible_embeddings` |
 | `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint. Literal IP hosts are checked against `FERRUM_BACKEND_ALLOW_IPS`; DNS hostnames participate in startup warmup and are checked by the shared plugin HTTP client at request time |
 | `provider.model` | string | optional | Embedding model name |
-| `provider.api_key_env` | string | optional | Environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
+| `provider.api_key_env` | string | optional | Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Any other variable (including every other `FERRUM_*` setting) is refused at admission. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
 | `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
 | `builtins.*` | bool/object | all enabled when `builtins` is omitted | Built-in packs. Boolean shorthand enables/disables a pack; object form supports `enabled`, `examples_mode`, and `examples` |
 | `extraction.request_json_paths` | string[] | all supported request paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported request paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected request fields |
@@ -7412,7 +7417,7 @@ config:
     type: openai_compatible_embeddings
     endpoint: http://localhost:8081/v1/embeddings
     model: text-embedding-3-small
-    api_key_env: EMBEDDING_API_KEY
+    api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
     request_timeout_ms: 5000
 ```
 
@@ -7427,7 +7432,7 @@ config:
     type: openai_compatible_embeddings
     endpoint: http://localhost:8081/v1/embeddings
     model: text-embedding-3-small
-    api_key_env: EMBEDDING_API_KEY
+    api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
 ```
 
 **HR assistant allowlist:**
@@ -7799,7 +7804,7 @@ Rate-limits consumers by LLM token consumption instead of request count. The lim
 
 Supports both regular JSON and streaming responses. A JSON usage document is read from the collected response body; a streaming response is metered **incrementally**, without buffering (see **Streaming token accounting** below). When `ai_token_metrics` is active on a buffered response, tokens are read from its metadata instead.
 
-**This plugin is HTTP-only.** Native gRPC is not supported and the plugin is not registered for the `Grpc` protocol view, so it can never be attached to native gRPC AI traffic as an enforcement control. The entire accounting lifecycle — prompt estimation, pre-reservation, and post-response reconciliation — is defined over bare JSON request bodies and JSON/SSE response bodies; native gRPC carries length-prefixed, optionally compressed protobuf frames with no gateway-known usage schema, and no explicitly configured descriptor-based usage extraction exists. Because gRPC is never pinned in proxy configuration — a single `http`/`https` proxy serves REST, gRPC, and WebSocket by per-request content-type detection — the declared protocol set *is* the admission boundary: `PluginCache` builds one plugin list per protocol, and the admin API, file mode, CP validation, and DP full/incremental config application all go through that same shared build, so none of them installs this limiter on the native gRPC view.
+**This plugin is HTTP-only.** Native gRPC is not supported and the plugin is not registered for the `Grpc` protocol view, so it can never be attached to native gRPC AI traffic as an enforcement control. The entire accounting lifecycle — prompt estimation, pre-reservation, and post-response reconciliation — is defined over bare JSON request bodies and JSON/SSE response bodies; native gRPC carries length-prefixed, optionally compressed protobuf frames with no gateway-known usage schema, and no explicitly configured descriptor-based usage extraction exists. Because gRPC is never pinned in proxy configuration — a single `http`/`https` proxy serves REST, gRPC, and WebSocket by per-request content-type detection — the declared protocol set *is* the admission boundary: `PluginCache` builds one plugin list per protocol, and the admin API, file mode, CP validation, and DP full/incremental config application all go through that same shared build, so none of them installs this limiter on the native gRPC view. Because this limiter is admission policy, a native-gRPC or WebSocket request on a route that carries it is refused with `403` / `PERMISSION_DENIED` rather than served unmetered (see [Protocol Support](plugin_execution_order.md#protocol-support)).
 
 **gRPC-Web is also unsupported.** gRPC-Web rides the HTTP (and composed H3 gRPC-Web) view, so the plugin can still observe it, and it explicitly stays out of the way: framed `application/grpc-web*` bodies — including the `+json` variants that otherwise satisfy the JSON content-type screen — are never buffered, never classified as a JSON AI request, and never parsed as a JSON usage document on the response side. Such traffic is left as ordinary non-AI traffic rather than being charged zero tokens against a budget or turned into a 502 by `on_unmetered_response`. Ordinary HTTP JSON and SSE AI traffic is unaffected.
 
@@ -7922,7 +7927,7 @@ config:
 
 Scans AI/LLM request bodies for PII and either rejects, redacts, or warns.
 
-This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-decoding contract, so the plugin is not registered for the gRPC protocol view and must not be treated as a fail-closed PII control for unary or streaming native gRPC traffic. Request buffering is only enabled for matching JSON `POST` requests when the plugin has at least one valid pattern to scan. Ordinary scan modes skip gRPC-Web framed bodies. In `scan_fields: mcp_arguments`, `+json` gRPC-Web media types are accepted only when the body is bare JSON. Framed payloads, including `application/grpc-web-text+json`, fail JSON parsing and pass uninspected; `mcp_gateway` refuses them. A body that fails the whole-document parse but looks like a JSON document that may still carry a `tools/call` is refused instead (see **Unparseable bodies** under `mcp_arguments` below).
+This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-decoding contract, so the plugin is not registered for the gRPC protocol view and must not be treated as a fail-closed PII control for unary or streaming native gRPC traffic. A native-gRPC or WebSocket request on a route that carries the shield is refused with `403` / `PERMISSION_DENIED` rather than served uninspected (see [Protocol Support](plugin_execution_order.md#protocol-support)). Request buffering is only enabled for matching JSON `POST` requests when the plugin has at least one valid pattern to scan. Ordinary scan modes skip gRPC-Web framed bodies. In `scan_fields: mcp_arguments`, `+json` gRPC-Web media types are accepted only when the body is bare JSON. Framed payloads, including `application/grpc-web-text+json`, fail JSON parsing and pass uninspected; `mcp_gateway` refuses them. A body that fails the whole-document parse but looks like a JSON document that may still carry a `tools/call` is refused instead (see **Unparseable bodies** under `mcp_arguments` below).
 
 **Method scope is one decision.** Buffering, `before_proxy`, the request-body transform, and final validation all apply the same bare-JSON `POST` scope. Another body plugin can force a request onto the buffered path, and the shared transform loop then visits every body-modifying plugin regardless of which one asked for the buffer — so without a method check on the transform itself, adding an unrelated body rule to a route would silently extend the shield's redaction to methods the same shield configuration otherwise leaves untouched. The context-free `transform_request_body` compatibility API proves that scope from an explicit `:method` pseudo-header and declines when it cannot.
 
@@ -9637,7 +9642,7 @@ Direct providers use these envelopes (they are different from Istio's name-only 
 | `opentelemetry` | `endpoint` string | OTLP/HTTP JSON; supply the complete `/v1/traces` URL. |
 | `zipkin` | `url` string | Zipkin v2 JSON; supply the complete `/api/v2/spans` URL. |
 | `datadog` | `agent_url` string | Optional `service` string or null overrides the span service name; the exporter appends `/v0.3/traces` if needed. |
-| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
+| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `access_token_env` must name a `FERRUM_PLUGIN_SECRET_<NAME>` variable (any other variable is refused at admission, even while span reporting is disabled). `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
 
 Provider objects require `kind` and `config`; unknown nested keys are ignored. Active endpoint URLs must be absolute HTTP(S), have a host, and contain no embedded credentials. Lightstep's variable must be readable and its value valid for the bearer header.
 

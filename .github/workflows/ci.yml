@@ -1257,6 +1257,7 @@ jobs:
               integration::admin_backend_egress_policy_tests
               integration::admin_batch_atomicity_tests
               integration::admin_batch_reference_check_tests
+              integration::admin_plugin_graph_scope_tests
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
               integration::admin_metrics_tls_inventory_snapshot_tests
@@ -1362,6 +1363,7 @@ jobs:
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
+              integration::http3_quic_admission_tests
               integration::mesh_h3_plain_ws_bridge_tests
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests

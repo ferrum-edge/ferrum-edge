@@ -291,7 +291,21 @@ impl Plugin for ExamplePlugin {
     // fn is_auth_plugin(&self) -> bool {
     //     // Return `true` if this plugin participates in the authentication phase.
     //     // This lets the gateway include it in auth mode (Single/Multi) logic.
+    //     // An auth plugin that keeps the HTTP-only `supported_protocols()`
+    //     // default makes the gateway refuse gRPC and WebSocket requests on
+    //     // its routes; declare those protocols if the plugin handles them.
     //     false
+    // }
+    //
+    // fn gates_request_admission(&self) -> bool {
+    //     // Return `true` if this plugin refuses requests its routes must not
+    //     // serve. Like an auth plugin, it then makes the gateway refuse a
+    //     // client-selected gRPC or WebSocket request it does not support.
+    //     // Defaults to `is_auth_plugin()`, so a plugin that enforces policy
+    //     // but is not an auth plugin, and keeps the HTTP-only protocol
+    //     // default, must return `true` here or gRPC and WebSocket requests
+    //     // skip it silently.
+    //     self.is_auth_plugin()
     // }
     //
     // fn requires_response_body_buffering(&self) -> bool {

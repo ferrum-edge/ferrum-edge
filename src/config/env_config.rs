@@ -3303,6 +3303,13 @@ pub struct EnvConfig {
     /// via black-hole detection if a smaller MTU is required. Legal range:
     /// [1200, 65527] (quinn's accepted bounds).
     pub http3_initial_mtu: u16,
+    /// Concurrent QUIC handshakes each HTTP/3 frontend listener runs for
+    /// clients whose source address has not been validated (default: 1024).
+    /// Those handshakes are held in this budget rather than the shared
+    /// overload connection budget until they complete; further unvalidated
+    /// Initials are answered with a stateless QUIC Retry. `0` sends a Retry to
+    /// every unvalidated client.
+    pub http3_max_unvalidated_handshakes: usize,
 
     // Connection pool warmup
     /// Pre-establish backend connections at startup (default: true).
@@ -4352,6 +4359,8 @@ impl Default for EnvConfig {
                 crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES,
             h3_request_body_drain_ms: 50,
             http3_initial_mtu: 1500,
+            http3_max_unvalidated_handshakes:
+                crate::http3::address_validation::H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT,
             pool_warmup_enabled: true,
             pool_http1_direct: true,
             pool_warmup_concurrency: 500,
@@ -5001,6 +5010,7 @@ impl EnvConfig {
             http3_connect_udp_max_datagram_bytes: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES" => crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES, clamp(1usize, crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
+            http3_max_unvalidated_handshakes: usize = "FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES" => crate::http3::address_validation::H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT;
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
             pool_http1_direct: bool = "FERRUM_POOL_HTTP1_DIRECT" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
@@ -5876,6 +5886,7 @@ impl EnvConfig {
             http3_connect_udp_max_datagram_bytes,
             h3_request_body_drain_ms,
             http3_initial_mtu,
+            http3_max_unvalidated_handshakes,
             pool_warmup_enabled,
             pool_http1_direct,
             pool_warmup_concurrency,

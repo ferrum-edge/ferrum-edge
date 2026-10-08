@@ -3526,6 +3526,16 @@ pub struct RequestContext {
     /// path could not resolve one; the guard then admits no own-pod
     /// destination and falls back to the termination inventory alone.
     pub mesh_inbound_terminator_ip: Option<std::net::IpAddr>,
+    /// Whether this request is a mesh CONNECT (byte-stream or datagram HBONE)
+    /// whose payload the proxy relays opaquely instead of parsing.
+    ///
+    /// The CONNECT's own method, path, authority, headers and request
+    /// credentials describe the tunnel, not the application requests written
+    /// into it, so `mesh_authz` must treat every HTTP-only attribute as
+    /// unobservable for it. Set by the proxy from the request's wire shape
+    /// before any plugin runs; it can only be set, never cleared, so no plugin
+    /// can return a relay to ordinary HTTP evaluation.
+    hbone_connect_relay: bool,
     /// Set exactly once by `run_finalized_request_egress_hooks` when the
     /// finalized-request-egress phase has run for this request. The phase is
     /// reachable from several dispatch ladders (H1/H2 terminal preparation,
@@ -4165,6 +4175,7 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
             mesh_inbound_terminator_ip: None,
+            hbone_connect_relay: false,
             finalized_request_egress_dispatched: false,
         }
     }
@@ -5780,6 +5791,7 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
             mesh_inbound_terminator_ip: self.mesh_inbound_terminator_ip,
+            hbone_connect_relay: self.hbone_connect_relay,
             // The finalized-request-egress phase always runs against the REAL
             // request context (mirror admission leases, mirror result
             // receivers, and serverless terminate provenance all live there and
@@ -6550,12 +6562,13 @@ impl RequestContext {
     ///
     /// Covers the whole gateway-owned `x-consumer-*` namespace
     /// ([`crate::proxy::headers::is_consumer_assertion_header`]), the private
-    /// GeoIP result, and route path-param captures. `name` is expected to be
-    /// lowercase (the `HeaderName` form).
+    /// GeoIP result, and route path-param captures
+    /// ([`crate::proxy::headers::is_path_param_assertion_header`]). Each treats
+    /// `_` as `-`, the folding CGI-style backends apply.
     #[inline]
     pub fn is_reserved_gateway_assertion_header(name: &str) -> bool {
         crate::proxy::headers::is_gateway_assertion_header(name)
-            || name.starts_with("x-path-param-")
+            || crate::proxy::headers::is_path_param_assertion_header(name)
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
@@ -6909,6 +6922,18 @@ impl RequestContext {
     /// authorization-lifetime authentication predicate.
     pub fn has_certificate_spiffe_principal(&self) -> bool {
         self.peer_spiffe_certificate_principal
+    }
+
+    /// Whether this request is a mesh CONNECT whose payload is relayed
+    /// opaquely (see the `hbone_connect_relay` field).
+    pub fn is_hbone_connect_relay(&self) -> bool {
+        self.hbone_connect_relay
+    }
+
+    /// Mark this request as a mesh CONNECT whose payload is relayed opaquely.
+    /// There is deliberately no way to clear the mark.
+    pub fn mark_hbone_connect_relay(&mut self) {
+        self.hbone_connect_relay = true;
     }
 
     /// Admit a certificate-derived peer SPIFFE principal together with the
@@ -12124,6 +12149,25 @@ pub trait Plugin: Any + Send + Sync {
     /// basic_auth, hmac_auth) override this to return `true`.
     fn is_auth_plugin(&self) -> bool {
         false
+    }
+
+    /// Returns `true` if this instance is request-admission policy a route
+    /// relies on: authentication, or a control that refuses requests the route
+    /// must not serve (schema validation, abuse and quota limits, AI request
+    /// guardrails).
+    ///
+    /// The client chooses the request flavor (native gRPC by `Content-Type`,
+    /// WebSocket by upgrade headers), and each flavor runs only the plugins
+    /// whose [`Self::supported_protocols`] include it. When a flavor's view
+    /// omits an instance like this that the route's HTTP view runs, the plugin
+    /// cache marks that view and the proxy refuses the request rather than
+    /// dispatching it without the policy.
+    ///
+    /// Defaults to [`Self::is_auth_plugin`], so every authentication plugin —
+    /// including a custom one that keeps the HTTP-only protocol default —
+    /// participates without opting in.
+    fn gates_request_admission(&self) -> bool {
+        self.is_auth_plugin()
     }
 
     /// Cache-build diagnostic: whether this instance has an execution trigger.

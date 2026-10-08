@@ -3884,6 +3884,13 @@ fn unrelated_process_env_cannot_be_referenced_in_sink_headers() {
         "${secret:}",
         "${secret:HAS SPACE}",
         "${secret:9LEADING_DIGIT}",
+        // External secret-source suffixes are consumed by startup resolution;
+        // the reference must name the materialized base, not the locator.
+        "${secret:AUDIT_TOKEN_FILE}",
+        "${secret:AUDIT_TOKEN_VAULT}",
+        "${secret:AUDIT_TOKEN_AWS}",
+        "${secret:AUDIT_TOKEN_AZURE}",
+        "${secret:AUDIT_TOKEN_GCP}",
         "Bearer ${secret:UNCLOSED",
     ] {
         let result = AiTranscriptAudit::new(&cfg(hostile), client.clone());
