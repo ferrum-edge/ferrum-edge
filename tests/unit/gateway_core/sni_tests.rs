@@ -133,7 +133,8 @@ fn build_dtls_client_hello_without_sni() -> Vec<u8> {
     record.truncate(69);
     record[67..69].copy_from_slice(&0u16.to_be_bytes());
     let handshake_len = (record.len() - 13 - 12) as u32;
-    record[11..13].copy_from_slice(&((record.len() - 13) as u16).to_be_bytes());
+    let body_len = (record.len() - 13) as u16;
+    record[11..13].copy_from_slice(&body_len.to_be_bytes());
     record[14..17].copy_from_slice(&handshake_len.to_be_bytes()[1..]);
     record[22..25].copy_from_slice(&handshake_len.to_be_bytes()[1..]);
     record
