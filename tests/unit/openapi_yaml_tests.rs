@@ -7424,7 +7424,7 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         "docs/plugins.md body_validator section missing `grpc_max_decompressed_size_bytes`"
     );
     for contract in [
-        "`0` disables the decompressed cap",
+        "zero is rejected so compressed input is always bounded",
         "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
         "parses as an unsigned integer",
         "10 MiB",
