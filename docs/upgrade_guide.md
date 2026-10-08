@@ -26,63 +26,6 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased
-
-**gRPC and WebSocket requests are refused on routes whose authentication or
-admission plugins only run on HTTP** (issue
-[#6087](https://github.com/ferrum-edge/ferrum-edge/issues/6087)). A native gRPC
-or WebSocket request now gets `403`
-(`{"error":"Request protocol not permitted on this route"}`) or trailers-only
-`PERMISSION_DENIED` when its flavor's plugin view would omit a plugin that
-gates admission on the route's HTTP view. These requests used to run without
-that plugin. Before rolling out, check routes (and global plugin sets) that
-carry any of the following and also serve native gRPC or WebSocket clients:
-
-- `soap_ws_security` in any configuration, including a timestamp-only
-  (freshness) policy or `strict` media-type governance without identity;
-- a custom authentication plugin that keeps the HTTP-only
-  `supported_protocols()` default;
-- `openapi_validator` in `block` mode, `mcp_gateway`,
-  `request_deduplication` with `enforce_required`, `ai_prompt_shield`,
-  `ai_rate_limiter`, `ai_tool_governor`, `ai_semantic_firewall`, or
-  `rate_limiting` with `mcp_tool_calls`;
-- `graphql` with any protection rule (native gRPC only; it runs on
-  WebSocket);
-- `a2a_gateway` with a deny policy (WebSocket only; it runs on gRPC).
-
-Serve that gRPC or WebSocket traffic from a separate route without those
-plugins, or authenticate it with a plugin that supports the flavor (every other
-built-in authentication plugin does). Refusals are logged with
-`rejection_phase: "route_protocol_admission"`. gRPC-Web is unaffected. In mesh
-mode, a live HBONE tunnel admitted on a gRPC-classified view is revoked
-(`authorization_denied`) when a reload adds such a plugin to its route.
-
-**Custom plugins must declare how they relate to gRPC and WebSocket.** Only
-authentication plugins participate by default
-(`gates_request_admission()` defaults to `is_auth_plugin()`). A custom plugin
-that refuses requests a route must not serve (in `authorize`, `before_proxy`,
-or any other hook) but is not an authentication plugin, and that keeps the
-HTTP-only `supported_protocols()` default, is still skipped silently on native
-gRPC and WebSocket requests. Such a plugin must either list the flavors it
-handles in `supported_protocols()` or return `true` from
-`Plugin::gates_request_admission()` so the gateway refuses the flavors it
-cannot run on. Custom authentication plugins that handle gRPC or WebSocket
-should list those protocols in `supported_protocols()`.
-
-**A client's `Connection` nominations are resolved at ingress.** On HTTP/1.1
-and HTTP/3, the fields a client's `Connection` header names are removed before
-any plugin runs, instead of only at the backend boundary. A client that sends
-`Connection: authorization` (to keep its token away from the backend) now has
-that credential removed before authentication and gets `401` on an
-authenticated route; send the credential without nominating it, and let the
-route strip it with a request transformer if the backend must not see it.
-`Host`, `Content-Length`, `Expect`, and the forwarding fields
-(`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, and the configured
-`FERRUM_REAL_IP_HEADER`) are never removed this way, so trusted-proxy
-client-IP resolution is unchanged. Client spellings of `claim_headers`
-destinations, `x-geo-country`, and `x-path-param-*` that use `_` for `-` are
-now removed too.
-
 ## Upgrading to 0.9.14
 
 0.9.14 (2026-10-07 UTC) is cut from main
