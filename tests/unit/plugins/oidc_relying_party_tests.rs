@@ -2327,13 +2327,16 @@ async fn pending_login_admission_is_bounded_globally_across_sources() {
             .await,
         Some(302),
     );
+    // The local pending-flow cache stays bounded, but a full cache no longer
+    // refuses logins: the sealed cookie carries the whole flow, so another
+    // source still gets its redirect instead of a global 503.
     let mut distributed = html_ctx();
     distributed.client_ip = "192.0.2.99".to_string();
     assert_reject(
         plugin
             .authenticate(&mut distributed, &ConsumerIndex::new(&[]))
             .await,
-        Some(503),
+        Some(302),
     );
 }
 
