@@ -7495,6 +7495,7 @@ fn validate_mesh_config_internal(
             &dr.export_to,
             &mut errors,
         );
+        validate_destination_rule_tls_reference_scope(dr, istio_root_namespace, &mut errors);
         // Validate top-level trafficPolicy boundary fields (outlier-detection
         // ranges, client-TLS mode/cert consistency) that the K8s translator
         // enforces but the native/file/xDS slice path otherwise skips.
@@ -8130,6 +8131,95 @@ fn validate_mesh_outlier_detection(
         errors.push(format!(
             "{context}.max_ejection_percent: must be from 0 to 100"
         ));
+    }
+}
+
+/// Refuse a DestinationRule client-TLS material reference that would have the
+/// proxy resolve material outside the rule's own namespace.
+///
+/// The proxy resolves `caCertificates` / `clientCertificate` / `privateKey`
+/// with its OWN identity (Kubernetes ServiceAccount, cloud credentials, managed
+/// store), so a rule authored in a tenant namespace may name only inline PEM,
+/// `system://`, a local file, or a `k8s://` Secret in its own namespace. Rules
+/// in the mesh root namespace are mesh-operator policy and are exempt. Shared
+/// by the Kubernetes translator and native/file/xDS slice validation so both
+/// boundaries reach the same verdict.
+pub(crate) fn destination_rule_tls_reference_error(
+    field: &str,
+    value: &str,
+    kind: crate::tls::source::MaterialKind,
+    rule_namespace: &str,
+    root_namespace: &str,
+) -> Option<String> {
+    let root_namespace = root_namespace.trim();
+    if !root_namespace.is_empty() && rule_namespace == root_namespace {
+        return None;
+    }
+    match crate::tls::source::check_namespace_scoped_material_reference(
+        value,
+        kind,
+        rule_namespace,
+        true,
+    ) {
+        Ok(()) => None,
+        Err(refusal) => Some(format!("{field}: {}", refusal.reason())),
+    }
+}
+
+fn validate_destination_rule_tls_reference_scope(
+    dr: &MeshDestinationRule,
+    root_namespace: &str,
+    errors: &mut Vec<String>,
+) {
+    let context = format!("MeshDestinationRule {:?}", dr.name);
+    let mut policies: Vec<(String, &MeshTrafficPolicy)> = Vec::new();
+    if let Some(policy) = dr.traffic_policy.as_ref() {
+        policies.push((format!("{context}.traffic_policy"), policy));
+    }
+    for (port, policy) in &dr.port_level_settings {
+        let label = format!("{context}.port_level_settings[\"{port}\"]");
+        policies.push((label, policy));
+    }
+    for (index, subset) in dr.subsets.iter().enumerate() {
+        if let Some(policy) = subset.traffic_policy.as_ref() {
+            let label = format!("{context}.subsets[{index}].traffic_policy");
+            policies.push((label, policy));
+        }
+    }
+    for (policy_context, policy) in policies {
+        let Some(tls) = policy.tls.as_ref() else {
+            continue;
+        };
+        let material = [
+            (
+                "ca_certificates",
+                tls.ca_certificates.as_deref(),
+                crate::tls::source::MaterialKind::CaBundle,
+            ),
+            (
+                "client_certificate",
+                tls.client_certificate.as_deref(),
+                crate::tls::source::MaterialKind::Cert,
+            ),
+            (
+                "private_key",
+                tls.private_key.as_deref(),
+                crate::tls::source::MaterialKind::Key,
+            ),
+        ];
+        for (field, value, kind) in material {
+            if let Some(value) = value
+                && let Some(error) = destination_rule_tls_reference_error(
+                    &format!("{policy_context}.tls.{field}"),
+                    value,
+                    kind,
+                    &dr.namespace,
+                    root_namespace,
+                )
+            {
+                errors.push(error);
+            }
+        }
     }
 }
 

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — cross-namespace HTTPRoute/GRPCRoute resources keep distinct
+  ids** (issue #6092). A route materialized in its parent Gateway's namespace
+  now gets proxy, upstream and derived plugin ids bound to its full source
+  identity (`<readable id>__<digest>`), so two tenants whose namespace and
+  route names dash-join to the same string no longer share, replace or extend
+  each other's proxy, upstream or dispatch plugins. Routes in their own
+  namespace keep the readable id. A second route object that derives an id
+  another route already owns is refused and its claim is reported in Route
+  status. Data planes now refuse a ConfigSync snapshot that carries two
+  resources with one `(namespace, id)`.
+- **BREAKING — Gateway API backendRefs refuse `type: ExternalName` Services**
+  (issue #6092). An ExternalName Service is a DNS alias that can name any
+  host, including another namespace's Service or the gateway's own loopback,
+  without any ReferenceGrant being consulted. HTTPRoute/GRPCRoute refuse the
+  backend fail-closed, TCPRoute/TLSRoute/UDPRoute refuse the route, and status
+  reports `ResolvedRefs=False` / `UnsupportedProtocol`.
+- **BREAKING — DestinationRule TLS material stays in the rule's namespace**
+  (issue #6092). `trafficPolicy.tls` `caCertificates`, `clientCertificate` and
+  `privateKey` (top level, `portLevelSettings`, and subsets) in any namespace
+  other than the mesh root namespace may name only inline PEM, `system://`, a
+  local file, or a `k8s://` Secret in the rule's own namespace. Other
+  namespaces' Secrets and `vault`, `aws`, `azure`, `gcp`, `managed`, `acme` and
+  `pkcs11` sources are refused at Kubernetes translation and at
+  native/file/xDS slice validation. Root-namespace rules are unchanged.
+- **BREAKING — namespace-scoped operators cannot point backend TLS outside
+  their namespace** (issue #6092). Where the admin `ns` claim is enforced, an
+  `operator` creating or updating a proxy or upstream may introduce only inline
+  PEM, `system://`, or a `k8s://` Secret in the addressed namespace in
+  `backend_tls_client_cert_path`, `backend_tls_client_key_path` and
+  `backend_tls_server_ca_cert_path`. Any other reference is refused with `400`
+  before the material is loaded, so the answer no longer depends on whether
+  the material exists. A value already stored on the resource is left alone,
+  and `admin` tokens are unaffected.
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

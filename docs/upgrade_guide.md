@@ -26,6 +26,45 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Upgrading to the next release (unreleased)
+
+Namespace-scoped configuration can no longer reach material or backends
+outside its own namespace (issue
+[#6092](https://github.com/ferrum-edge/ferrum-edge/issues/6092)). Before
+rolling out, check:
+
+- **Gateway API backendRefs to `type: ExternalName` Services.** They are now
+  refused (`ResolvedRefs=False` / `UnsupportedProtocol`): HTTPRoute and
+  GRPCRoute answer that backend's share of traffic fail-closed, and
+  TCPRoute/TLSRoute/UDPRoute reject the route. Find them with
+  `kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="ExternalName")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'`
+  and replace each with a selector Service, or a selector-less Service with an
+  EndpointSlice you own, in the route's namespace (or a cross-namespace Service
+  authorized by a ReferenceGrant).
+- **Istio DestinationRules with client TLS material.** Outside the mesh root
+  namespace, `caCertificates`, `clientCertificate` and `privateKey` may name
+  only inline PEM, `system://`, a local file, or a `k8s://` Secret in the
+  rule's own namespace. A rule that names another namespace's Secret or a
+  `vault://`, `aws://`, `azure://`, `gcp://`, `managed://`, `acme://` or
+  `pkcs11://` source now fails translation (`FerrumAccepted=False`) and native,
+  file and xDS slice validation. Copy the Secret into the rule's namespace, or
+  move the rule into the mesh root namespace if it is platform policy.
+- **Namespace-scoped Admin API operators.** Where the `ns` claim is enforced
+  (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, or a multi-namespace control
+  plane), an `operator` token can set `backend_tls_client_cert_path`,
+  `backend_tls_client_key_path` and `backend_tls_server_ca_cert_path` only to
+  inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace.
+  Automation that writes file paths or secret-manager references with operator
+  tokens must use an `admin` token instead. Values already stored on a
+  resource keep working and survive unrelated updates.
+- **Generated ids of cross-namespace HTTPRoutes and GRPCRoutes** now end in
+  `__<digest>`. Nothing needs to change in Kubernetes, but dashboards, alerts
+  or log queries that match these proxy, upstream or plugin ids by exact value
+  must be updated. Same-namespace routes keep their ids.
+- **Data planes refuse ConfigSync snapshots with duplicate `(namespace, id)`
+  resources** and keep serving their last accepted configuration. Run the
+  control plane and data planes on the same build, as always.
+
 ## Upgrading to 0.9.14
 
 0.9.14 (2026-10-07 UTC) is cut from main

@@ -969,6 +969,11 @@ pub(crate) struct K8sAccumulator {
     /// not shift. Gateway API `BackendTLSPolicy` is the only consumer here, and
     /// it needs the transport — TLS must never be originated to a UDP port.
     service_port_specs: HashMap<String, HashMap<String, ServicePortIndex>>,
+    /// `(namespace, name)` of every collected `type: ExternalName` Service.
+    /// Gateway API backendRefs refuse them: the DNS alias they publish can
+    /// name any host — another namespace's Service or the gateway's own
+    /// loopback — without any ReferenceGrant being consulted.
+    external_name_services: HashSet<(String, String)>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
@@ -999,6 +1004,12 @@ pub(crate) struct K8sAccumulator {
     /// route or listener.
     pub(crate) gateway_api_route_proxy_attachments:
         HashMap<NamespacedResourceId, Vec<GatewayApiRouteAttachment>>,
+    /// The route object that first derived each HTTPRoute/GRPCRoute proxy id
+    /// and upstream id. Ids are bound to their source route, so a second route
+    /// object deriving the same `(namespace, id)` is refused instead of
+    /// replacing, merging into, or attaching plugins to the owner's resource.
+    pub(crate) gateway_api_route_proxy_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
+    pub(crate) gateway_api_route_upstream_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
     /// Live materialization credit per attachment: the proxies that currently
     /// serve that exact claim. A merged claim is credited to the proxy it
     /// collapsed into, so withdrawing that proxy withdraws the merged claim
@@ -1088,6 +1099,7 @@ impl K8sAccumulator {
             service_ports: HashMap::new(),
             service_import_ports: HashMap::new(),
             service_port_specs: HashMap::new(),
+            external_name_services: HashSet::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
@@ -1097,6 +1109,8 @@ impl K8sAccumulator {
             gateway_api_route_proxy_listeners: HashMap::new(),
             gateway_api_refused_route_slots: HashSet::new(),
             gateway_api_route_proxy_attachments: HashMap::new(),
+            gateway_api_route_proxy_owners: HashMap::new(),
+            gateway_api_route_upstream_owners: HashMap::new(),
             gateway_api_materialized_route_attachments: HashMap::new(),
             gateway_api_refused_route_attachments: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
@@ -1150,6 +1164,12 @@ impl K8sAccumulator {
             .and_then(|by_svc| by_svc.get(service))
             .and_then(|ports| ports.get(port_name))
             .copied()
+    }
+
+    /// Whether the collected Service `namespace/service` is `type: ExternalName`.
+    pub(crate) fn service_is_external_name(&self, namespace: &str, service: &str) -> bool {
+        self.external_name_services
+            .contains(&(namespace.to_string(), service.to_string()))
     }
 
     pub(crate) fn service_exists(&self, namespace: &str, service: &str) -> bool {
@@ -1502,6 +1522,45 @@ impl K8sAccumulator {
             .collect();
         self.gateway_api_route_proxy_attachments
             .insert(proxy_key, attachments);
+    }
+
+    /// Claim a route proxy id for `route`. `false` when a different route
+    /// object already derived the same `(namespace, id)`.
+    pub(crate) fn claim_gateway_api_route_proxy(
+        &mut self,
+        key: &NamespacedResourceId,
+        route: &K8sObject,
+    ) -> bool {
+        claim_route_resource_owner(&mut self.gateway_api_route_proxy_owners, key, route)
+    }
+
+    /// Claim a route upstream id for `route`. `false` when a different route
+    /// object already derived the same `(namespace, id)`.
+    pub(crate) fn claim_gateway_api_route_upstream(
+        &mut self,
+        key: &NamespacedResourceId,
+        route: &K8sObject,
+    ) -> bool {
+        claim_route_resource_owner(&mut self.gateway_api_route_upstream_owners, key, route)
+    }
+
+    /// Report the `(route, parentRef, listener)` claims of a route proxy that
+    /// was refused before it was built, so Route status cannot claim them.
+    pub(crate) fn record_gateway_api_refused_route_claims(
+        &mut self,
+        route: &K8sObject,
+        parent_refs: &[String],
+        listener: Option<&GatewayApiListenerKey>,
+    ) {
+        let route_key = K8sResourceKey::from_object(route);
+        for parent_ref in parent_refs {
+            self.gateway_api_refused_route_attachments
+                .insert(GatewayApiRouteAttachment {
+                    route: route_key.clone(),
+                    parent_ref: parent_ref.clone(),
+                    listener: listener.cloned(),
+                });
+        }
     }
 
     /// The claims one route proxy was built to materialize, cloned so the
@@ -2271,6 +2330,11 @@ pub(crate) fn collect_service(
                 truncated: port_specs_truncated,
             },
         );
+    if backend_ref::service_object_is_external_name(object) {
+        let namespace = object.metadata.namespace.clone();
+        let name = object.metadata.name.clone();
+        acc.external_name_services.insert((namespace, name));
+    }
 
     // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
     // annotation routes through the named waypoint. We append the binding
@@ -4041,6 +4105,20 @@ pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &st
         format!("{prefix}-{namespace}-{name}-{suffix}")
     }
     .replace(['/', '.'], "-")
+}
+
+fn claim_route_resource_owner(
+    owners: &mut HashMap<NamespacedResourceId, K8sResourceKey>,
+    key: &NamespacedResourceId,
+    route: &K8sObject,
+) -> bool {
+    if let Some(owner) = owners.get(key) {
+        return owner.kind == route.kind
+            && owner.namespace == route.metadata.namespace
+            && owner.name == route.metadata.name;
+    }
+    owners.insert(key.clone(), K8sResourceKey::from_object(route));
+    true
 }
 
 /// Build a `(namespace, id)` ownership key, failing closed on empty components.

@@ -33,6 +33,7 @@ use crate::config::types::{
     RedactionRendering, Upstream, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+use crate::tls::source::{MaterialKind, check_namespace_scoped_material_reference};
 
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
@@ -2466,6 +2467,12 @@ pub(crate) trait AdminResource:
     /// Default is a no-op.
     fn set_actor(&mut self, _actor: &str) {}
 
+    /// TLS material references this resource asks the gateway to resolve, as
+    /// `(field, value, field kind)`. Default: none.
+    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+        Vec::new()
+    }
+
     /// Re-read the committed record after a successful create/update and use
     /// THAT as both the success response body and the audit after-image.
     ///
@@ -3681,6 +3688,14 @@ impl AdminResource for Upstream {
         Some(&mut self.labels)
     }
 
+    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+        backend_tls_material_references(
+            self.backend_tls_client_cert_path.as_deref(),
+            self.backend_tls_client_key_path.as_deref(),
+            self.backend_tls_server_ca_cert_path.as_deref(),
+        )
+    }
+
     fn restore_absent_update_fields(
         &mut self,
         existing: &Self,
@@ -4650,6 +4665,14 @@ impl AdminResource for Proxy {
 
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
+    }
+
+    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+        backend_tls_material_references(
+            self.backend_tls_client_cert_path.as_deref(),
+            self.backend_tls_client_key_path.as_deref(),
+            self.backend_tls_server_ca_cert_path.as_deref(),
+        )
     }
 
     const RESOURCE_NAME: &'static str = "proxy";
@@ -5655,6 +5678,76 @@ fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
     })
 }
 
+fn backend_tls_material_references<'a>(
+    client_cert_path: Option<&'a str>,
+    client_key_path: Option<&'a str>,
+    server_ca_path: Option<&'a str>,
+) -> Vec<(&'static str, &'a str, MaterialKind)> {
+    let candidates = [
+        (
+            "backend_tls_client_cert_path",
+            client_cert_path,
+            MaterialKind::Cert,
+        ),
+        (
+            "backend_tls_client_key_path",
+            client_key_path,
+            MaterialKind::Key,
+        ),
+        (
+            "backend_tls_server_ca_cert_path",
+            server_ca_path,
+            MaterialKind::CaBundle,
+        ),
+    ];
+    let mut references = Vec::new();
+    for (field, value, kind) in candidates {
+        if let Some(value) = value {
+            references.push((field, value, kind));
+        }
+    }
+    references
+}
+
+/// Refuse a TLS material reference a namespace-scoped operator introduces
+/// when it would have the gateway resolve material outside that namespace.
+///
+/// The gateway (and every data plane that later loads the resource) resolves
+/// these references with its OWN identity, and admission loads them on write.
+/// Where the `ns` claim is an authorization boundary, an `operator` may
+/// therefore name only inline PEM, `system://`, or a `k8s://` Secret in the
+/// addressed namespace. The check never resolves the reference, so its answer
+/// does not depend on whether the material exists. A reference already stored
+/// on the resource is left alone, so an unrelated update does not fail on
+/// material an `admin` configured.
+fn tls_reference_refusal<R: AdminResource>(
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    resource: &R,
+    existing: Option<&R>,
+) -> Option<Response<Full<Bytes>>> {
+    if !state.admin_require_namespace_claim || actor.role == AdminRole::Admin {
+        return None;
+    }
+    let stored = existing
+        .map(|existing| existing.tls_material_references())
+        .unwrap_or_default();
+    for (field, value, kind) in resource.tls_material_references() {
+        if stored.contains(&(field, value, kind)) {
+            continue;
+        }
+        let verdict = check_namespace_scoped_material_reference(value, kind, namespace, false);
+        if let Err(refusal) = verdict {
+            return Some(super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("`{field}`: {}", refusal.reason())}),
+            ));
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_write<R: AdminResource>(
     state: &AdminState,
@@ -5804,6 +5897,12 @@ async fn handle_write<R: AdminResource>(
     resource.normalize();
     resource.set_namespace(namespace.to_string());
     resource.set_actor(&actor.sub);
+
+    // Before `validate`, which loads the referenced material.
+    let refusal = tls_reference_refusal(state, actor, namespace, &resource, existing.as_ref());
+    if let Some(response) = refusal {
+        return Ok(response);
+    }
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(validation_error) = resource.validate(&validation_ctx) {

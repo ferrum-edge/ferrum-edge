@@ -1874,7 +1874,7 @@ fn translate_traffic_policy(
 
     let tls = value
         .get("tls")
-        .map(|tls| translate_client_tls_settings(object, tls))
+        .map(|tls| translate_client_tls_settings(object, tls, &acc.options.istio_root_namespace))
         .transpose()?;
 
     Ok(MeshTrafficPolicy {
@@ -2634,6 +2634,7 @@ fn is_valid_failover_region(raw: &str) -> bool {
 fn translate_client_tls_settings(
     object: &K8sObject,
     value: &Value,
+    root_namespace: &str,
 ) -> Result<MeshTrafficPolicyTls, K8sTranslateError> {
     let mode_raw = string_field(value, "mode").unwrap_or("SIMPLE");
     let mode = match mode_raw {
@@ -2723,6 +2724,39 @@ fn translate_client_tls_settings(
     for (field, value, kind) in client_material {
         if let Some(value) = value
             && let Err(error) = validate_tls_material_source_field(field, value, kind)
+        {
+            return Err(invalid_resource(object, error));
+        }
+    }
+    // The proxy resolves this material with its own identity, so a rule in a
+    // tenant namespace may not name another namespace's Secret or a store only
+    // the gateway can read.
+    let referenced_material = [
+        (
+            "trafficPolicy.tls.caCertificates",
+            ca_certificates.as_deref(),
+            crate::tls::source::MaterialKind::CaBundle,
+        ),
+        (
+            "trafficPolicy.tls.clientCertificate",
+            client_certificate.as_deref(),
+            crate::tls::source::MaterialKind::Cert,
+        ),
+        (
+            "trafficPolicy.tls.privateKey",
+            private_key.as_deref(),
+            crate::tls::source::MaterialKind::Key,
+        ),
+    ];
+    for (field, value, kind) in referenced_material {
+        if let Some(value) = value
+            && let Some(error) = crate::modes::mesh::config::destination_rule_tls_reference_error(
+                field,
+                value,
+                kind,
+                &object.metadata.namespace,
+                root_namespace,
+            )
         {
             return Err(invalid_resource(object, error));
         }

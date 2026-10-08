@@ -933,6 +933,86 @@ pub fn load_material_blocking_with(
     }
 }
 
+/// Why a TLS material reference was refused for a namespace-scoped author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopedMaterialReferenceRefusal {
+    /// A `k8s://` reference naming a Secret outside the owning namespace, or
+    /// one that does not parse as a Kubernetes Secret reference at all.
+    ForeignNamespaceSecret,
+    /// A store the gateway reaches with its own credentials (`vault`, `aws`,
+    /// `azure`, `gcp`, `managed`, `acme`, `pkcs11`).
+    GatewayCredentialStore,
+    /// A path (or `file://`) on the gateway's own filesystem.
+    GatewayLocalFile,
+}
+
+impl ScopedMaterialReferenceRefusal {
+    /// Fixed operator-facing reason. Never carries the configured value.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::ForeignNamespaceSecret => {
+                "a Kubernetes Secret reference must name a Secret in the namespace of the \
+                 resource that references it"
+            }
+            Self::GatewayCredentialStore => {
+                "secret-manager, managed, ACME, and PKCS#11 stores are read with the gateway \
+                 credentials and are not available to namespace-scoped configuration"
+            }
+            Self::GatewayLocalFile => {
+                "files on the gateway filesystem are not available to namespace-scoped \
+                 configuration"
+            }
+        }
+    }
+}
+
+/// Decide whether a TLS material reference authored inside `owner_namespace`
+/// may be resolved by the gateway on that author's behalf.
+///
+/// The gateway resolves every reference with its OWN identity — its Kubernetes
+/// ServiceAccount, cloud credentials, managed store, and filesystem — so a
+/// reference written by a namespace tenant must not reach material outside that
+/// tenant's namespace. Admitted: inline PEM, the `system://` trust-root
+/// sentinel, and `k8s://<owner_namespace>/…`. Local files are admitted only
+/// when `allow_local_files` is set (the caller decides whose filesystem a path
+/// names). Every other scheme is refused.
+///
+/// This is a static check: it never resolves the reference, so its verdict
+/// cannot disclose whether the referenced material exists.
+pub fn check_namespace_scoped_material_reference(
+    value: &str,
+    kind: MaterialKind,
+    owner_namespace: &str,
+    allow_local_files: bool,
+) -> Result<(), ScopedMaterialReferenceRefusal> {
+    let uri = match CertSource::parse(value, kind) {
+        CertSource::InlinePem(_) => return Ok(()),
+        CertSource::Path(_) if allow_local_files => return Ok(()),
+        CertSource::Path(_) => return Err(ScopedMaterialReferenceRefusal::GatewayLocalFile),
+        CertSource::Uri(uri) => uri,
+    };
+    match uri.scheme {
+        SourceScheme::System => Ok(()),
+        SourceScheme::File if allow_local_files => Ok(()),
+        SourceScheme::File => Err(ScopedMaterialReferenceRefusal::GatewayLocalFile),
+        SourceScheme::K8sSecret => match K8sSecretReference::parse(&uri, kind) {
+            Ok(reference)
+                if !owner_namespace.is_empty() && reference.namespace == owner_namespace =>
+            {
+                Ok(())
+            }
+            _ => Err(ScopedMaterialReferenceRefusal::ForeignNamespaceSecret),
+        },
+        SourceScheme::Vault
+        | SourceScheme::Aws
+        | SourceScheme::Azure
+        | SourceScheme::Gcp
+        | SourceScheme::Acme
+        | SourceScheme::Managed
+        | SourceScheme::Pkcs11 => Err(ScopedMaterialReferenceRefusal::GatewayCredentialStore),
+    }
+}
+
 /// Reject explicit material selectors in a source reference that contradict
 /// the material kind its configured field expects (issue #5959).
 ///

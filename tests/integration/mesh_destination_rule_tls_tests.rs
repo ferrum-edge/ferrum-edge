@@ -898,6 +898,88 @@ fn dr_tls_translation_rejects_client_material_selectors_of_the_wrong_kind() {
 }
 
 #[test]
+fn dr_tls_translation_refuses_material_outside_the_rule_namespace() {
+    // The proxy resolves DestinationRule TLS material with its own identity,
+    // so a tenant rule must not name another namespace's Secret or a store
+    // only the gateway's credentials can read.
+    let cases = [
+        (
+            "k8s://egress/partner-mtls#tls.crt",
+            "k8s://egress/partner-mtls#tls.key",
+            "trafficPolicy.tls.clientCertificate",
+            "namespace of the resource",
+        ),
+        (
+            "k8s://default/client-tls#tls.crt",
+            "vault://secret/data/partner#tls.key",
+            "trafficPolicy.tls.privateKey",
+            "secret-manager",
+        ),
+        (
+            "managed://certificates/partner#cert",
+            "k8s://default/client-tls#tls.key",
+            "trafficPolicy.tls.clientCertificate",
+            "secret-manager",
+        ),
+    ];
+    for (client_certificate, private_key, field, reason) in cases {
+        let err = translate_k8s_objects(
+            &[istio_object(
+                "DestinationRule",
+                "partner",
+                serde_json::json!({
+                    "host": "partner.example.com",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "clientCertificate": client_certificate,
+                            "privateKey": private_key
+                        }
+                    }
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect_err("material outside the rule namespace must be refused");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(field) && rendered.contains(reason),
+            "{field} must be refused ({reason:?}), got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("partner-mtls") && !rendered.contains("secret/data"),
+            "the refusal must not echo the reference, got: {rendered}"
+        );
+    }
+
+    let root_rule = |namespace: &str| {
+        let mut rule = istio_object(
+            "DestinationRule",
+            "partner",
+            serde_json::json!({
+                "host": "partner.example.com",
+                "trafficPolicy": {
+                    "tls": {
+                        "mode": "MUTUAL",
+                        "clientCertificate": "k8s://egress/partner-mtls#tls.crt",
+                        "privateKey": "vault://secret/data/partner#tls.key"
+                    }
+                }
+            }),
+        );
+        rule.metadata.namespace = namespace.to_string();
+        rule
+    };
+    // Mesh-operator policy in the root namespace keeps operator-chosen stores.
+    let options = k8s_options()
+        .with_source_namespaces(vec!["default".to_string(), "istio-system".to_string()]);
+    let translated = translate_k8s_objects(&[root_rule("istio-system")], options)
+        .expect("root-namespace DestinationRule keeps operator-chosen material");
+    let mesh = translated.config.mesh.as_ref().expect("mesh present");
+    assert_eq!(mesh.destination_rules.len(), 1);
+}
+
+#[test]
 fn dr_subset_istio_mutual_without_runtime_svid_fails_closed() {
     // GAP-3B fail-closed regression guard: a subset configured for
     // `ISTIO_MUTUAL` without SVID material must REJECT the slice, not

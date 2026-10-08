@@ -206,30 +206,63 @@ pub(crate) fn checked_backend_namespace(
             )
         })?;
 
-    if backend_namespace == object.metadata.namespace {
-        return Ok((backend_kind, backend_namespace.to_string()));
-    }
-
-    if acc.reference_grant_allows(
-        &object.metadata.namespace,
-        api_group(&object.api_version),
-        from_kind,
-        backend_namespace,
-        backend_kind.group(),
-        backend_kind.kind(),
-        string_field(backend_ref, "name"),
-    ) {
-        Ok((backend_kind, backend_namespace.to_string()))
-    } else {
-        Err(invalid_resource(
+    let backend_name = string_field(backend_ref, "name");
+    if backend_namespace != object.metadata.namespace
+        && !acc.reference_grant_allows(
+            &object.metadata.namespace,
+            api_group(&object.api_version),
+            from_kind,
+            backend_namespace,
+            backend_kind.group(),
+            backend_kind.kind(),
+            backend_name,
+        )
+    {
+        return Err(invalid_resource(
             object,
             format!(
                 "{from_kind} backendRef to {} in namespace {backend_namespace:?} requires a \
                  matching ReferenceGrant",
                 backend_kind.kind()
             ),
-        ))
+        ));
     }
+
+    // An ExternalName Service is a DNS alias that can name any host — another
+    // namespace's Service or the gateway's own loopback — so dialing it would
+    // bypass the ReferenceGrant boundary above. Gateway API guidance is that
+    // implementations should not support it; refuse it fail-closed.
+    if backend_kind == BackendKind::Service
+        && let Some(name) = backend_name
+        && acc.service_is_external_name(backend_namespace, name)
+    {
+        return Err(invalid_resource(
+            object,
+            external_name_backend_message(backend_namespace, name),
+        ));
+    }
+
+    Ok((backend_kind, backend_namespace.to_string()))
+}
+
+/// Whether a core/v1 Service object is `type: ExternalName`.
+pub(crate) fn service_object_is_external_name(object: &K8sObject) -> bool {
+    string_field(&object.spec, "type") == Some("ExternalName")
+}
+
+fn external_name_backend_message(namespace: &str, name: &str) -> String {
+    format!(
+        "backendRef Service {namespace:?}/{name:?} has type ExternalName, which is not a \
+         supported backend (unsupported protocol)"
+    )
+}
+
+/// Stable classification of the ExternalName refusal. Kept disjoint from the
+/// unsupported-kind predicate; folded into
+/// [`message_is_unsupported_backend_protocol`] so `ResolvedRefs` reports
+/// `UnsupportedProtocol` and never `BackendNotFound`.
+pub(crate) fn message_is_external_name_backend(message: &str) -> bool {
+    message.contains("backendRef Service") && message.contains("has type ExternalName")
 }
 
 fn api_group(api_version: &str) -> &str {
@@ -362,9 +395,10 @@ pub(crate) fn service_import_port_error_message(
 }
 
 pub(crate) fn message_is_unsupported_backend_protocol(message: &str) -> bool {
-    message.contains("backendRef ServiceImport")
-        && (message.contains("unsupported protocol")
-            || message.contains("does not expose a supported TCP port"))
+    message_is_external_name_backend(message)
+        || (message.contains("backendRef ServiceImport")
+            && (message.contains("unsupported protocol")
+                || message.contains("does not expose a supported TCP port")))
 }
 
 /// Materialize one authorized, port-resolved backend into route backends.
@@ -438,7 +472,8 @@ pub(crate) struct BackendRefStatusInventory<'a> {
 ///
 /// Returns `None` when the ref is resolved. Reasons match Gateway API
 /// `RouteConditionReason` vocabulary (`InvalidKind`, `RefNotPermitted`,
-/// `BackendNotFound`).
+/// `BackendNotFound`, `UnsupportedProtocol` — the last also for an
+/// `ExternalName` Service, which translation refuses).
 ///
 /// Kind capability uses the same Route-kind predicate as translation, so a
 /// present `ServiceImport` stays `InvalidKind` on UDPRoute. ReferenceGrant is
@@ -508,6 +543,9 @@ where
             else {
                 return Some("BackendNotFound");
             };
+            if service_object_is_external_name(service) {
+                return Some("UnsupportedProtocol");
+            }
             if !object_has_numeric_port(service, backend_port) {
                 return Some("BackendNotFound");
             }
