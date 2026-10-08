@@ -193,8 +193,11 @@ fn headless_ready_endpoint_slices_still_expand_to_pod_ip_and_target_port() {
     assert_eq!(proxy.backend_port, 3000);
 }
 
+/// An ExternalName Service is a DNS alias to an arbitrary host, so a
+/// backendRef to one would bypass the ReferenceGrant boundary. It is refused:
+/// the rule fails closed instead of dialing the alias.
 #[test]
-fn external_name_without_cluster_ip_keeps_service_port() {
+fn external_name_backend_is_refused_instead_of_dialed() {
     let result = translate_k8s_objects(
         &[
             service(
@@ -215,17 +218,24 @@ fn external_name_without_cluster_ip_keeps_service_port() {
         ],
         options(),
     )
-    .expect("ExternalName Service without ClusterIP should translate");
+    .expect("a refused ExternalName backend fails the rule closed, not the translation");
 
-    assert_eq!(result.config.proxies.len(), 1);
-    let proxy = &result.config.proxies[0];
-    assert_eq!(
-        proxy.backend_host,
-        "external-backend.default.svc.cluster.local"
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .all(|proxy| proxy.backend_host != "external-backend.default.svc.cluster.local"),
+        "an ExternalName Service must never become a dial target"
     );
-    assert_eq!(
-        proxy.backend_port, 8080,
-        "ExternalName DNS fallback must keep the declared Service port, not targetPort"
+    assert!(
+        result
+            .config
+            .upstreams
+            .iter()
+            .flat_map(|upstream| upstream.targets.iter())
+            .all(|target| target.host != "external-backend.default.svc.cluster.local"),
+        "an ExternalName Service must never become an upstream target"
     );
 }
 

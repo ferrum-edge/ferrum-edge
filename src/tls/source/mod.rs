@@ -933,6 +933,189 @@ pub fn load_material_blocking_with(
     }
 }
 
+/// Why a TLS material reference was refused for a namespace-scoped author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopedMaterialReferenceRefusal {
+    /// A `k8s://` reference naming a Secret outside the owning namespace, or
+    /// one that does not parse as a Kubernetes Secret reference at all.
+    ForeignNamespaceSecret,
+    /// A store the gateway reaches with its own credentials (`vault`, `aws`,
+    /// `azure`, `gcp`, `managed`, `acme`, `pkcs11`).
+    GatewayCredentialStore,
+    /// A path (or `file://`) on the gateway's own filesystem where the caller
+    /// admits no files (no tenant file roots configured).
+    GatewayLocalFile,
+    /// A path that is not absolute, contains `..`, or does not stay under one
+    /// of the configured tenant file roots (after symlink resolution, when
+    /// checked at load time).
+    FileOutsideTenantRoots,
+}
+
+impl ScopedMaterialReferenceRefusal {
+    /// Fixed operator-facing reason. Never carries the configured value.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::ForeignNamespaceSecret => {
+                "a Kubernetes Secret reference must name a Secret in the namespace of the \
+                 resource that references it"
+            }
+            Self::GatewayCredentialStore => {
+                "secret-manager, managed, ACME, and PKCS#11 stores are read with the gateway \
+                 credentials and are not available to namespace-scoped configuration"
+            }
+            Self::GatewayLocalFile => {
+                "files on the gateway filesystem are not available to namespace-scoped \
+                 configuration"
+            }
+            Self::FileOutsideTenantRoots => {
+                "a file must be an absolute path without `..` that stays, after symlink \
+                 resolution, under a directory listed in `FERRUM_MESH_TENANT_TLS_FILE_ROOTS`"
+            }
+        }
+    }
+}
+
+/// Decide whether a TLS material reference authored inside `owner_namespace`
+/// may be resolved by the gateway on that author's behalf.
+///
+/// The gateway resolves every reference with its OWN identity — its Kubernetes
+/// ServiceAccount, cloud credentials, managed store, and filesystem — so a
+/// reference written by a namespace tenant must not reach material outside that
+/// tenant's namespace. Admitted: inline PEM, the `system://` trust-root
+/// sentinel, `k8s://<owner_namespace>/…`, and a local file only when it is
+/// lexically contained in one of `tenant_file_roots` (see
+/// [`check_tenant_file_path`]). An empty `tenant_file_roots` admits no file.
+/// Every other scheme is refused.
+///
+/// This is a static check: it never resolves the reference, so its verdict
+/// cannot disclose whether the referenced material exists. The node that
+/// loads an admitted file re-checks it after symlink resolution with
+/// [`check_tenant_file_reference_resolved`].
+pub fn check_namespace_scoped_material_reference(
+    value: &str,
+    kind: MaterialKind,
+    owner_namespace: &str,
+    tenant_file_roots: &[PathBuf],
+) -> Result<(), ScopedMaterialReferenceRefusal> {
+    let uri = match CertSource::parse(value, kind) {
+        CertSource::InlinePem(_) => return Ok(()),
+        CertSource::Path(path) => return check_tenant_file_path(&path, tenant_file_roots),
+        CertSource::Uri(uri) => uri,
+    };
+    match uri.scheme {
+        SourceScheme::System => Ok(()),
+        SourceScheme::File => {
+            let path = uri_file_path(&uri.identifier).unwrap_or_default();
+            check_tenant_file_path(Path::new(&path), tenant_file_roots)
+        }
+        SourceScheme::K8sSecret => match K8sSecretReference::parse(&uri, kind) {
+            Ok(reference)
+                if !owner_namespace.is_empty() && reference.namespace == owner_namespace =>
+            {
+                Ok(())
+            }
+            _ => Err(ScopedMaterialReferenceRefusal::ForeignNamespaceSecret),
+        },
+        SourceScheme::Vault
+        | SourceScheme::Aws
+        | SourceScheme::Azure
+        | SourceScheme::Gcp
+        | SourceScheme::Acme
+        | SourceScheme::Managed
+        | SourceScheme::Pkcs11 => Err(ScopedMaterialReferenceRefusal::GatewayCredentialStore),
+    }
+}
+
+/// Lexical tenant-file admission: `path` must be absolute, contain no `..`
+/// component, and sit under one of `tenant_file_roots` (component-wise, so
+/// `/certs-other` is not under `/certs`). An empty root list admits nothing.
+pub fn check_tenant_file_path(
+    path: &Path,
+    tenant_file_roots: &[PathBuf],
+) -> Result<(), ScopedMaterialReferenceRefusal> {
+    if tenant_file_roots.is_empty() {
+        return Err(ScopedMaterialReferenceRefusal::GatewayLocalFile);
+    }
+    let has_parent_component = path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir));
+    let contained = path.is_absolute()
+        && !has_parent_component
+        && tenant_file_roots.iter().any(|root| path.starts_with(root));
+    if contained {
+        Ok(())
+    } else {
+        Err(ScopedMaterialReferenceRefusal::FileOutsideTenantRoots)
+    }
+}
+
+/// Load-time re-check of a tenant file reference on the node that reads it.
+///
+/// Non-file references pass (they were decided by
+/// [`check_namespace_scoped_material_reference`]). A file must pass the
+/// lexical check AND its symlink-resolved path must stay under the
+/// symlink-resolved form of one of `tenant_file_roots`, so a link planted
+/// inside a root cannot point the gateway at a file outside it. A path that
+/// cannot be resolved (missing, unreadable directory) is refused.
+pub fn check_tenant_file_reference_resolved(
+    value: &str,
+    kind: MaterialKind,
+    tenant_file_roots: &[PathBuf],
+) -> Result<(), ScopedMaterialReferenceRefusal> {
+    let Some(path) = CertSource::parse(value, kind).as_file_path() else {
+        return Ok(());
+    };
+    check_tenant_file_path(&path, tenant_file_roots)?;
+    let Ok(resolved) = std::fs::canonicalize(&path) else {
+        return Err(ScopedMaterialReferenceRefusal::FileOutsideTenantRoots);
+    };
+    let contained = tenant_file_roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| resolved.starts_with(&root));
+    if contained {
+        Ok(())
+    } else {
+        Err(ScopedMaterialReferenceRefusal::FileOutsideTenantRoots)
+    }
+}
+
+/// Immutable process snapshot of `FERRUM_MESH_TENANT_TLS_FILE_ROOTS`.
+///
+/// Installed from `EnvConfig` so the Kubernetes translator, mesh slice
+/// validation, and DestinationRule application share one validated value.
+/// Identical reinstall is accepted; a different value fails closed.
+static MESH_TENANT_TLS_FILE_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Install the validated tenant TLS file roots for this process.
+pub fn install_mesh_tenant_tls_file_roots(roots: Vec<PathBuf>) -> Result<(), String> {
+    let installed = MESH_TENANT_TLS_FILE_ROOTS.get_or_init(|| roots.clone());
+    if *installed == roots {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is already installed with a different value for this process",
+            crate::config::env_config::MESH_TENANT_TLS_FILE_ROOTS_KEY
+        ))
+    }
+}
+
+/// Effective tenant TLS file roots: the installed snapshot, or the shared
+/// parse of the configured value when none is installed yet. A malformed
+/// value admits no file here; `EnvConfig` refuses startup on the same value.
+pub fn effective_mesh_tenant_tls_file_roots() -> Vec<PathBuf> {
+    if let Some(roots) = MESH_TENANT_TLS_FILE_ROOTS.get() {
+        return roots.clone();
+    }
+    crate::config::env_config::parse_mesh_tenant_tls_file_roots(
+        crate::config::conf_file::resolve_ferrum_var(
+            crate::config::env_config::MESH_TENANT_TLS_FILE_ROOTS_KEY,
+        )
+        .as_deref(),
+    )
+    .unwrap_or_default()
+}
+
 /// Reject explicit material selectors in a source reference that contradict
 /// the material kind its configured field expects (issue #5959).
 ///

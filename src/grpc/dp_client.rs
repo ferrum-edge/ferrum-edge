@@ -2526,6 +2526,16 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     error!("Ignoring config update with invalid hosts");
                     return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
+                // Two resources sharing one `(namespace, id)` make every
+                // id-keyed runtime index ambiguous; refuse rather than let
+                // whichever entry is indexed last win.
+                if let Err(errors) = config.validate_unique_resource_ids() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));
+                    }
+                    error!("Ignoring config update with duplicate resource IDs");
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
+                }
                 if let Err(errors) = config.validate_regex_listen_paths() {
                     for msg in &errors {
                         error!("CP config rejected — {}", sanitize_startup_cause(msg, &[]));

@@ -2116,3 +2116,70 @@ fn udproute_is_wired_through_watch_translation_and_status() {
     assert!(GATEWAY_API_SRC.contains("\"UDP\" => vec![\"UDPRoute\"]"));
     assert!(STATUS_SRC.contains("(\"UDPRoute\", \"v1alpha2\") => \"udproutes\""));
 }
+
+#[test]
+fn udp_route_ids_follow_the_shared_l4_id_rule() {
+    // UDPRoute has no id exemption: like TCPRoute/TLSRoute it keeps the
+    // readable id in its own namespace and would get a source-bound id when
+    // materialized in a parent Gateway's namespace.
+    let udp_exemption = "scheme.is_udp() || config_namespace == object.metadata.namespace";
+    assert!(
+        !GATEWAY_API_SRC.contains(udp_exemption),
+        "UDPRoute proxy ids must not bypass the source-bound id rule"
+    );
+
+    let gateway_in = |namespace: &str, port: u16| {
+        let mut gateway = udp_gateway("edge", "dns", port);
+        gateway.metadata.namespace = namespace.to_string();
+        gateway
+    };
+    // `shop`/`checkout-api` and `shop-checkout`/`api` dash-join to the same
+    // readable id; each must still keep its own proxy.
+    let objects = [
+        gateway_class(),
+        gateway_in("shop", 15353),
+        gateway_in("shop-checkout", 15354),
+        udp_route_in(
+            "shop",
+            "checkout-api",
+            "2024-01-01T00:00:00Z",
+            attached_rule("edge", "dns", "coredns", 5353),
+        ),
+        udp_route_in(
+            "shop-checkout",
+            "api",
+            "2024-01-01T00:00:00Z",
+            attached_rule("edge", "dns", "coredns", 5353),
+        ),
+    ];
+    let namespaces = vec!["shop".to_string(), "shop-checkout".to_string()];
+    let options = options().with_source_namespaces(namespaces);
+
+    let result = translate_k8s_objects(&objects, options).expect("translation succeeds");
+
+    let keys: BTreeSet<(String, String)> = result
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| (proxy.namespace.clone(), proxy.id.clone()))
+        .collect();
+    assert_eq!(keys.len(), 2, "each UDPRoute keeps its own proxy: {keys:?}");
+    let listen_ports: BTreeSet<Option<u16>> = result
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.listen_port)
+        .collect();
+    assert_eq!(
+        listen_ports,
+        BTreeSet::from([Some(15353), Some(15354)]),
+        "neither route may replace the other's listener"
+    );
+    for proxy in &result.config.proxies {
+        assert!(
+            !proxy.id.contains("__"),
+            "an own-namespace UDPRoute keeps the readable id: {}",
+            proxy.id
+        );
+    }
+}

@@ -11,6 +11,7 @@ mod admin_metrics_contract_tests;
 mod admin_namespace_unserved_tests;
 mod admin_read_only_tests;
 mod admin_slowloris_tests;
+mod admin_tenant_tls_reference_tests;
 mod admin_tests;
 mod admin_validation_tests;
 mod api_specs_external_ref_tests;

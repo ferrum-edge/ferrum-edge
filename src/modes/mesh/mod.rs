@@ -10372,10 +10372,26 @@ fn synthesize_mesh_outbound_cors_plugins(
 /// DP subscribers, including native input that repeats one name for distinct
 /// host spellings. This order is an intra-tier tiebreak only; it is never
 /// cross-tier precedence.
+///
+/// A tenant rule's local TLS files are re-checked on this node only when the
+/// rule is applied to a local upstream; a refusal fails that rule's
+/// destinations closed (see [`fail_closed_upstream_backend_tls`]) and the rest
+/// of the slice still applies.
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
+) -> Result<(), anyhow::Error> {
+    let tenant_file_roots = crate::tls::source::effective_mesh_tenant_tls_file_roots();
+    apply_destination_rules_with_tenant_file_roots(config, runtime, mesh_slice, &tenant_file_roots)
+}
+
+/// [`apply_destination_rules`] against an explicit tenant TLS file root list.
+fn apply_destination_rules_with_tenant_file_roots(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+    tenant_file_roots: &[std::path::PathBuf],
 ) -> Result<(), anyhow::Error> {
     let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_destination_rules: Vec<&MeshDestinationRule> = mesh_slice
@@ -10588,6 +10604,11 @@ fn apply_destination_rules(
     // namespaces. Counted, then reported ONCE — a per-rule warning would be
     // per-reload × per-DP spam.
     let mut refused_out_of_lookup_path = 0usize;
+    // Upstreams governed by a tenant rule whose local TLS file did not resolve
+    // under a tenant file root on THIS node. Their backend TLS is replaced with
+    // unloadable material after every rule has applied, so those destinations
+    // fail closed while the rest of the slice applies.
+    let mut tls_file_refused_upstreams: HashSet<usize> = HashSet::new();
 
     for dr in sorted_destination_rules.iter().copied() {
         let mut matched_any_host = false;
@@ -10632,6 +10653,29 @@ fn apply_destination_rules(
             );
             continue;
         };
+
+        // Slice validation admitted this rule's local TLS files lexically.
+        // This node is about to project them onto its upstreams, so re-check
+        // each one after symlink resolution. Only rules that reach a local
+        // upstream are checked: a file's presence is per-node state, so one
+        // tenant's missing or escaping file must fail only the destinations
+        // that rule governs, never the whole slice.
+        let escape = crate::modes::mesh::config::destination_rule_tls_file_escape_error(
+            dr,
+            &mesh_slice.istio_root_namespace,
+            tenant_file_roots,
+        );
+        if let Some(error) = escape {
+            warn!(
+                rule_namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
+                rule = %sanitize_startup_scalar(dr.name.to_string()),
+                upstreams = matching_upstream_indices.len(),
+                reason = %sanitize_startup_scalar(error),
+                "DestinationRule local TLS file does not resolve under a tenant TLS file root \
+                 on this node; backend TLS for the destinations it governs fails closed"
+            );
+            tls_file_refused_upstreams.extend(matching_upstream_indices.iter().copied());
+        }
 
         let connect_timeout_ms = dr
             .traffic_policy
@@ -11118,7 +11162,60 @@ fn apply_destination_rules(
     // than whatever value a mid-loop pass would have observed.
     resolve_subset_traffic_policy(config, runtime)?;
 
+    // Runs after the subset pass so no scope (upstream, per-port, subset) can
+    // keep the refused rule's file reference or fall back to a weaker posture.
+    for &idx in &tls_file_refused_upstreams {
+        if let Some(upstream) = config.upstreams.get_mut(idx) {
+            fail_closed_upstream_backend_tls(upstream);
+        }
+    }
+
     Ok(())
+}
+
+/// PEM with no `CERTIFICATE` or `PRIVATE KEY` record. Every backend TLS build
+/// that reads it fails, deterministically and without touching the filesystem.
+const REFUSED_BACKEND_TLS_MATERIAL: &str =
+    "-----BEGIN FERRUM REFUSED TLS MATERIAL-----\n-----END FERRUM REFUSED TLS MATERIAL-----\n";
+
+/// Backend TLS slot that can never complete a handshake: CA, client
+/// certificate, and private key all name [`REFUSED_BACKEND_TLS_MATERIAL`], and
+/// verification stays on. The client pair is set (rather than cleared) so the
+/// global `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_KEY_PATH` pair cannot stand
+/// in for it, and it is loaded before verification is configured, so
+/// `FERRUM_TLS_NO_VERIFY` cannot bypass the refusal either.
+fn refused_backend_tls_config() -> BackendTlsConfig {
+    let mut slot = BackendTlsConfig::default_verify();
+    slot.client_cert_path = Some(REFUSED_BACKEND_TLS_MATERIAL.to_string());
+    slot.client_key_path = Some(REFUSED_BACKEND_TLS_MATERIAL.to_string());
+    slot.server_ca_cert_path = Some(REFUSED_BACKEND_TLS_MATERIAL.to_string());
+    slot
+}
+
+/// Fail an upstream's backend TLS closed at every scope (upstream, per-port,
+/// subset). Used when a DestinationRule's local TLS file is refused on this
+/// node: the destination must not fall back to the PeerAuthentication default,
+/// system roots, the global CA, or the gateway's own client certificate, so
+/// every TLS connection to it fails. Plaintext backends are unaffected because
+/// DestinationRule TLS never changes a backend's scheme.
+fn fail_closed_upstream_backend_tls(upstream: &mut Upstream) {
+    let refused = refused_backend_tls_config();
+    upstream.backend_tls_client_cert_path = refused.client_cert_path.clone();
+    upstream.backend_tls_client_key_path = refused.client_key_path.clone();
+    upstream.backend_tls_server_ca_cert_path = refused.server_ca_cert_path.clone();
+    upstream.backend_tls_verify_server_cert = refused.verify_server_cert;
+    upstream.backend_tls_sni = None;
+    upstream.backend_tls_san_allow_list.clear();
+    for port_override in upstream.port_overrides.values_mut() {
+        if port_override.tls.is_some() {
+            port_override.tls = Some(refused.clone());
+        }
+    }
+    for resolved in upstream.resolved_subset_tls.values_mut() {
+        if resolved.tls.is_some() {
+            resolved.tls = Some(refused.clone());
+        }
+    }
 }
 
 /// Compute each upstream's resolved subset overlay against the settled
@@ -29159,9 +29256,9 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Mutual,
-                        ca_certificates: Some("/etc/certs/ca.pem".to_string()),
-                        client_certificate: Some("/etc/certs/client.pem".to_string()),
-                        private_key: Some("/etc/certs/client.key".to_string()),
+                        ca_certificates: Some("k8s://default/reviews-tls#ca.crt".to_string()),
+                        client_certificate: Some("k8s://default/reviews-tls#tls.crt".to_string()),
+                        private_key: Some("k8s://default/reviews-tls#tls.key".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -29179,17 +29276,194 @@ mod tests {
         let upstream = &config.upstreams[0];
         assert_eq!(
             upstream.backend_tls_client_cert_path.as_deref(),
-            Some("/etc/certs/client.pem")
+            Some("k8s://default/reviews-tls#tls.crt")
         );
         assert_eq!(
             upstream.backend_tls_client_key_path.as_deref(),
-            Some("/etc/certs/client.key")
+            Some("k8s://default/reviews-tls#tls.key")
         );
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
-            Some("/etc/certs/ca.pem")
+            Some("k8s://default/reviews-tls#ca.crt")
         );
         assert!(upstream.backend_tls_verify_server_cert);
+    }
+
+    fn tenant_file_tls_destination_rule(name: &str, host: &str, ca: &str) -> MeshDestinationRule {
+        MeshDestinationRule {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            host: host.to_string(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some(ca.to_string()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
+        }
+    }
+
+    fn assert_backend_tls_fails_closed(upstream: &Upstream) {
+        for (field, value) in [
+            ("ca", upstream.backend_tls_server_ca_cert_path.as_deref()),
+            (
+                "client cert",
+                upstream.backend_tls_client_cert_path.as_deref(),
+            ),
+            (
+                "client key",
+                upstream.backend_tls_client_key_path.as_deref(),
+            ),
+        ] {
+            assert_eq!(
+                value,
+                Some(REFUSED_BACKEND_TLS_MATERIAL),
+                "{field} must name unloadable material, never a fallback"
+            );
+        }
+        assert!(upstream.backend_tls_verify_server_cert);
+        assert!(upstream.backend_tls_sni.is_none());
+        assert!(upstream.backend_tls_san_allow_list.is_empty());
+    }
+
+    #[test]
+    fn refused_backend_tls_material_never_loads() {
+        let slot = refused_backend_tls_config();
+        let material = slot.server_ca_cert_path.as_deref().expect("refused CA");
+        let ca = crate::tls::parse_pem_certificate_bundle(material.as_bytes(), "test", "inline");
+        assert!(ca.is_err(), "the refused CA must not parse");
+        let key = crate::tls::parse_pem_private_key(material.as_bytes(), "test", "inline");
+        assert!(key.is_err(), "the refused client key must not parse");
+        assert!(slot.verify_server_cert);
+    }
+
+    #[test]
+    fn dr_tls_missing_tenant_file_fails_only_its_destination_closed() {
+        // One tenant rule names a file that is absent on this node. The slice
+        // must still apply: the valid rule's destination keeps its TLS, and
+        // only the bad rule's destination fails closed.
+        let root = tempfile::tempdir().expect("tempdir");
+        let present = root.path().join("reviews-ca.pem");
+        std::fs::write(&present, "material").expect("write ca");
+        let missing = root.path().join("ratings-ca.pem");
+        let present = present.to_str().expect("utf-8 temp path").to_string();
+        let missing = missing.to_str().expect("utf-8 temp path").to_string();
+        let tenant_file_roots = vec![root.path().to_path_buf()];
+        let mut config = GatewayConfig {
+            proxies: vec![
+                destination_rule_test_proxy("p1", "u1"),
+                destination_rule_test_proxy("p2", "u2"),
+            ],
+            upstreams: vec![
+                destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local"),
+                destination_rule_test_upstream("u2", "ratings.default.svc.cluster.local"),
+            ],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![
+                tenant_file_tls_destination_rule(
+                    "reviews",
+                    "reviews.default.svc.cluster.local",
+                    &present,
+                ),
+                tenant_file_tls_destination_rule(
+                    "ratings",
+                    "ratings.default.svc.cluster.local",
+                    &missing,
+                ),
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules_with_tenant_file_roots(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &slice,
+            &tenant_file_roots,
+        )
+        .expect("one tenant's missing file must not refuse the slice");
+
+        let reviews = &config.upstreams[0];
+        assert_eq!(
+            reviews.backend_tls_server_ca_cert_path.as_deref(),
+            Some(present.as_str()),
+            "the valid rule's destination keeps its TLS"
+        );
+        assert!(reviews.backend_tls_client_cert_path.is_none());
+        assert!(reviews.backend_tls_verify_server_cert);
+
+        let ratings = &config.upstreams[1];
+        assert_backend_tls_fails_closed(ratings);
+        assert_ne!(
+            ratings.backend_tls_server_ca_cert_path.as_deref(),
+            Some(missing.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dr_tls_tenant_file_symlink_escaping_its_root_fails_the_destination_closed() {
+        // The link sits under the root, so the static check admits it; the
+        // per-upstream re-check resolves it and refuses. No scope may keep
+        // the escaping reference.
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let platform_ca = outside.path().join("platform-ca.pem");
+        std::fs::write(&platform_ca, "platform material").expect("write target");
+        let link = root.path().join("ca.pem");
+        std::os::unix::fs::symlink(&platform_ca, &link).expect("symlink");
+        let link = link.to_str().expect("utf-8 temp path").to_string();
+        let tenant_file_roots = vec![root.path().to_path_buf()];
+        let host = "reviews.default.svc.cluster.local";
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream("u1", host)],
+            ..GatewayConfig::default()
+        };
+        let mut rule = tenant_file_tls_destination_rule("reviews", host, &link);
+        rule.subsets = vec![MeshSubset {
+            name: "v1".to_string(),
+            labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some(link.clone()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+        }];
+        let slice = MeshSlice {
+            destination_rules: vec![rule],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules_with_tenant_file_roots(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &slice,
+            &tenant_file_roots,
+        )
+        .expect("an escaping tenant file fails its destination, not the slice");
+
+        let upstream = &config.upstreams[0];
+        assert_backend_tls_fails_closed(upstream);
+        let subset_tls = upstream
+            .resolved_subset_tls
+            .get("v1")
+            .and_then(|resolved| resolved.tls.as_ref())
+            .expect("v1 subset keeps a resolved TLS slot");
+        assert_eq!(
+            subset_tls.server_ca_cert_path.as_deref(),
+            Some(REFUSED_BACKEND_TLS_MATERIAL),
+            "the subset scope must fail closed too"
+        );
     }
 
     #[test]
@@ -29224,7 +29498,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         sni: Some("reviews.default.svc.cluster.local".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
@@ -29237,9 +29511,9 @@ mod tests {
                     traffic_policy: Some(MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Mutual,
-                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
-                            client_certificate: Some("/etc/certs/v1-client.pem".to_string()),
-                            private_key: Some("/etc/certs/v1-client.key".to_string()),
+                            ca_certificates: Some("k8s://default/v1-tls#ca.crt".to_string()),
+                            client_certificate: Some("k8s://default/v1-tls#tls.crt".to_string()),
+                            private_key: Some("k8s://default/v1-tls#tls.key".to_string()),
                             sni: Some("v1.reviews.mesh.internal".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
@@ -29258,7 +29532,7 @@ mod tests {
         // Upstream-level TLS reflects the top-level DR.tls.
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
-            Some("/etc/certs/upstream-ca.pem"),
+            Some("k8s://default/up-tls#ca.crt"),
             "upstream CA still reflects upstream-level DR.tls"
         );
         assert_eq!(
@@ -29277,16 +29551,16 @@ mod tests {
             .expect("v1 resolved tls is Some");
         assert_eq!(
             subset_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/v1-ca.pem"),
+            Some("k8s://default/v1-tls#ca.crt"),
             "subset overlay swaps the CA for v1 dispatch"
         );
         assert_eq!(
             subset_tls.client_cert_path.as_deref(),
-            Some("/etc/certs/v1-client.pem")
+            Some("k8s://default/v1-tls#tls.crt")
         );
         assert_eq!(
             subset_tls.client_key_path.as_deref(),
-            Some("/etc/certs/v1-client.key")
+            Some("k8s://default/v1-tls#tls.key")
         );
         assert_eq!(
             subset_tls.sni.as_deref(),
@@ -29523,7 +29797,7 @@ mod tests {
             MeshTrafficPolicy {
                 tls: Some(MeshTrafficPolicyTls {
                     mode: MtlsMode::Simple,
-                    ca_certificates: Some("/etc/certs/port-8080-ca.pem".to_string()),
+                    ca_certificates: Some("k8s://default/secure-8080-tls#ca.crt".to_string()),
                     sni: Some("port8080.secure.internal".to_string()),
                     ..MeshTrafficPolicyTls::default()
                 }),
@@ -29556,7 +29830,7 @@ mod tests {
             .expect("port 8080 resolved backend TLS");
         assert_eq!(
             tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/port-8080-ca.pem"),
+            Some("k8s://default/secure-8080-tls#ca.crt"),
             "per-port TLS resolves the CA for port 8080"
         );
         assert_eq!(tls.sni.as_deref(), Some("port8080.secure.internal"));
@@ -29662,7 +29936,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -29674,7 +29948,7 @@ mod tests {
                     traffic_policy: Some(MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Simple,
-                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
+                            ca_certificates: Some("k8s://default/v1-tls#ca.crt".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
                         ..MeshTrafficPolicy::default()
@@ -29694,12 +29968,12 @@ mod tests {
 
         assert_eq!(
             p1.resolved_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/upstream-ca.pem"),
+            Some("k8s://default/up-tls#ca.crt"),
             "proxy without upstream_subset gets upstream-level CA"
         );
         assert_eq!(
             p2.resolved_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/v1-ca.pem"),
+            Some("k8s://default/v1-tls#ca.crt"),
             "proxy with upstream_subset='v1' gets subset overlay CA"
         );
     }
@@ -29726,7 +30000,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -39572,7 +39846,7 @@ mod tests {
                     MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Simple,
-                            ca_certificates: Some("/etc/certs/primary-ca.pem".to_string()),
+                            ca_certificates: Some("k8s://default/primary-tls#ca.crt".to_string()),
                             sni: Some("primary.external.com".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
@@ -39607,7 +39881,7 @@ mod tests {
             .expect("service-port override carries resolved TLS policy");
         assert_eq!(
             tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/primary-ca.pem")
+            Some("k8s://default/primary-tls#ca.crt")
         );
         assert_eq!(tls.sni.as_deref(), Some("primary.external.com"));
     }

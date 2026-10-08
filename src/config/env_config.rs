@@ -295,6 +295,46 @@ pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, Str
     Ok(value.min(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
 }
 
+/// Settings key for the directories tenant DestinationRules may name TLS
+/// material files under.
+pub const MESH_TENANT_TLS_FILE_ROOTS_KEY: &str = "FERRUM_MESH_TENANT_TLS_FILE_ROOTS";
+
+/// Pure parse/validation for `FERRUM_MESH_TENANT_TLS_FILE_ROOTS`.
+///
+/// Comma-separated absolute directories; blank entries are ignored and an
+/// unset or blank value yields no roots (tenant DestinationRules may name no
+/// local file). Each entry must be absolute, contain no `..` component, and
+/// not be the filesystem root. Diagnostics name the entry position only.
+/// Used by [`EnvConfig`] and
+/// [`crate::tls::source::effective_mesh_tenant_tls_file_roots`].
+pub fn parse_mesh_tenant_tls_file_roots(
+    raw: Option<&str>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut roots = Vec::new();
+    let Some(raw) = raw else {
+        return Ok(roots);
+    };
+    for (index, entry) in raw.split(',').map(str::trim).enumerate() {
+        if entry.is_empty() {
+            continue;
+        }
+        let path = std::path::PathBuf::from(entry);
+        let has_parent_component = path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir));
+        if !path.is_absolute() || has_parent_component || path.parent().is_none() {
+            return Err(format!(
+                "{MESH_TENANT_TLS_FILE_ROOTS_KEY} entry {index} must be an absolute directory \
+                 without `..` components and must not be the filesystem root"
+            ));
+        }
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
 /// Settings key for the shared TLS state document byte ceiling.
 pub const TLS_STORE_MAX_DOCUMENT_BYTES_KEY: &str = "FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES";
 /// Default shared TLS state document byte ceiling (16 MiB).
@@ -5080,6 +5120,13 @@ impl EnvConfig {
                 crate::tls::source::MaterialError::InvalidSource { details, .. } => details,
                 other => other.to_string(),
             })?;
+
+        // Shared by the Kubernetes translator, mesh slice validation, and
+        // DestinationRule application, so install one process snapshot.
+        let mesh_tenant_tls_file_roots = parse_mesh_tenant_tls_file_roots(
+            resolve_var(conf, MESH_TENANT_TLS_FILE_ROOTS_KEY).as_deref(),
+        )?;
+        crate::tls::source::install_mesh_tenant_tls_file_roots(mesh_tenant_tls_file_roots)?;
 
         let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
             parse_tls_source_execution_policy(

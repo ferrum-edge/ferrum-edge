@@ -688,7 +688,7 @@ fn dr_traffic_policy_tls_simple() {
         "host": "echo.default.svc.cluster.local",
         "trafficPolicy": {"tls": {
             "mode": "SIMPLE",
-            "caCertificates": "/etc/ferrum/ca.pem",
+            "caCertificates": "k8s://default/echo-tls#ca.crt",
             "sni": "echo.example.com",
             "subjectAltNames": ["echo.example.com"]
         }}
@@ -696,7 +696,10 @@ fn dr_traffic_policy_tls_simple() {
     let tls = dr.traffic_policy.expect("traffic policy").tls.expect("tls");
     assert_eq!(tls.mode, MtlsMode::Simple);
     assert_eq!(tls.sni.as_deref(), Some("echo.example.com"));
-    assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/ferrum/ca.pem"));
+    assert_eq!(
+        tls.ca_certificates.as_deref(),
+        Some("k8s://default/echo-tls#ca.crt")
+    );
     assert_eq!(tls.subject_alt_names, vec!["echo.example.com".to_string()]);
 }
 
@@ -765,14 +768,17 @@ fn dr_port_level_tls() {
         "host": "secure.default.svc.cluster.local",
         "trafficPolicy": {
             "portLevelSettings": [
-                {"port": {"number": 8443}, "tls": {"mode": "SIMPLE", "caCertificates": "/etc/certs/ca.pem"}}
+                {"port": {"number": 8443}, "tls": {"mode": "SIMPLE", "caCertificates": "k8s://default/secure-tls#ca.crt"}}
             ]
         }
     }));
     let port = dr.port_level_settings.get(&8443).expect("port 8443 entry");
     let tls = port.tls.as_ref().expect("port 8443 tls translated");
     assert_eq!(tls.mode, MtlsMode::Simple);
-    assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+    assert_eq!(
+        tls.ca_certificates.as_deref(),
+        Some("k8s://default/secure-tls#ca.crt")
+    );
 }
 
 /// `subsets[]` with per-subset `trafficPolicy` → `SubsetDefinition` +
