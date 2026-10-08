@@ -133,7 +133,7 @@ fn ingress_materialization_drops_every_client_consumer_assertion() {
         ctx.headers.get("x-request-id").map(String::as_str),
         Some("req-1")
     );
-    assert!(ctx.headers.get("x-authenticated-identity").is_none());
+    assert!(!ctx.headers.contains_key("x-authenticated-identity"));
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn raw_grpc_merge_base_forwards_unmapped_external_identity_without_consumer_user
 
     assert!(headers.get("x-consumer-role").is_none());
     assert!(headers.get("x-consumer-groups").is_none());
-    assert!(headers.get("x-consumer-username").is_none());
+    assert!(!headers.contains_key("x-consumer-username"));
     assert_eq!(
         headers.get("content-type").and_then(|v| v.to_str().ok()),
         Some("application/grpc")
@@ -207,7 +207,7 @@ fn post_plugin_refresh_keeps_external_identity_separate_from_consumer_assertions
     refresh_backend_gateway_assertion_headers(&ctx, &mut headers);
 
     assert!(consumer_namespace_keys(&headers).is_empty());
-    assert!(headers.get("x-consumer-username").is_none());
+    assert!(!headers.contains_key("x-consumer-username"));
     assert_eq!(
         headers.get("x-authenticated-identity").map(String::as_str),
         Some("alice")
