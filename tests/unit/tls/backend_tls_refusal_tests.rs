@@ -346,8 +346,7 @@ async fn h2_and_grpc_pools_refuse_before_resolving_or_building() {
     let error = h2
         .get_sender(&refused)
         .await
-        .err()
-        .expect("a refused destination must not get an HTTP/2 sender");
+        .expect_err("a refused destination must not get an HTTP/2 sender");
     assert!(
         error.to_string().contains("refused"),
         "direct HTTP/2 must refuse before DNS: {error}"
@@ -364,8 +363,7 @@ async fn h2_and_grpc_pools_refuse_before_resolving_or_building() {
     let error = grpc
         .get_sender(&refused)
         .await
-        .err()
-        .expect("a refused destination must not get a gRPC sender");
+        .expect_err("a refused destination must not get a gRPC sender");
     assert!(
         error.to_string().contains("refused"),
         "gRPC over TLS must refuse before DNS: {error}"
@@ -388,20 +386,17 @@ async fn reqwest_h3_and_websocket_entry_points_refuse_without_caching() {
     let error = pool
         .get_client(&refused)
         .await
-        .err()
-        .expect("a refused destination must not get a reqwest client");
+        .expect_err("a refused destination must not get a reqwest client");
     assert!(error.to_string().contains("refused"), "got: {error}");
     let error = pool
         .get_tls_config_for_backend(&refused)
         .await
-        .err()
-        .expect("a refused destination must not get an HTTP/3 TLS config");
+        .expect_err("a refused destination must not get an HTTP/3 TLS config");
     assert!(error.to_string().contains("refused"), "got: {error}");
     let error = pool
         .get_websocket_tls_config_for_backend(&refused)
         .await
-        .err()
-        .expect("a refused destination must not get a WebSocket TLS config");
+        .expect_err("a refused destination must not get a WebSocket TLS config");
     assert!(error.to_string().contains("refused"), "got: {error}");
 
     assert_eq!(pool.pool_gauges().0, 0, "no reqwest client is pooled");
