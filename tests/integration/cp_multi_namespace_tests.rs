@@ -1006,7 +1006,7 @@ fn config_sync_projection_excludes_other_namespaces_virtual_service_cors() {
         .expect("staging CORS policy fixture must deserialize"),
     ];
     let config = GatewayConfig {
-        mesh: Some(mesh),
+        mesh: Some(Box::new(mesh)),
         ..Default::default()
     };
     let projected =
