@@ -1,0 +1,6 @@
+disallowed-methods = [
+    {
+        path = "brotli::Decompressor::new",
+        reason = "use the budget-charged strict decoder in plugins::charged_decode",
+    },
+]

@@ -1343,9 +1343,10 @@ async fn start_node_agent_admin_listeners(
     // default. Endpoint authentication and observability-detail tiers still
     // apply. See `decide_admin_bind_address`.
     let signals = AdminBindSignals::from_env();
-    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new_with_ipv6_prefix(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
+        env_config.per_ip_ipv6_prefix,
     ));
 
     // Validate admin HTTPS TLS material BEFORE spawning any admin listener so a

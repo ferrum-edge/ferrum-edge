@@ -6783,25 +6783,23 @@ fn parse_json_within_limit(body: &[u8]) -> Option<Value> {
 /// decompression bomb cannot blow up memory. Returns `None` for unsupported
 /// encodings, decode errors, or output past the limit.
 fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-    // A single encoding token only (the compression plugin emits exactly one).
-    let mut out = Vec::new();
-    let limit = MAX_PARSE_BYTES as u64;
-    match encoding.trim().to_ascii_lowercase().as_str() {
-        "gzip" | "x-gzip" => {
-            let mut reader = flate2::read::MultiGzDecoder::new(data).take(limit + 1);
-            reader.read_to_end(&mut out).ok()?;
-        }
-        "br" => {
-            let mut reader = brotli::Decompressor::new(data, 4096).take(limit + 1);
-            reader.read_to_end(&mut out).ok()?;
-        }
+    let coding = match encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => "gzip",
+        "br" => "br",
         _ => return None,
-    }
-    if out.len() as u64 > limit {
-        return None;
-    }
-    Some(out)
+    };
+    super::charged_decode::decode_charged_content_coding_chain(
+        &[coding.to_string()],
+        data,
+        super::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes: MAX_PARSE_BYTES,
+            max_cumulative_bytes: MAX_PARSE_BYTES,
+            max_codings: 1,
+            max_amplification_ratio: 0,
+        },
+        crate::proxy::response_buffer_budget::BudgetRef::global(),
+    )
+    .ok()
 }
 
 fn redacted_approval_url(parsed: &Url) -> String {

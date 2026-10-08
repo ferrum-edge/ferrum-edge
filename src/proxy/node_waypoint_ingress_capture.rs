@@ -269,11 +269,12 @@ pub fn build_capture_conn_limiter(state: &ProxyState) -> Arc<ConnLimiter> {
 /// The [`build_capture_conn_limiter`] body, taking only the configuration it
 /// actually reads so the sizing contract is testable without a `ProxyState`.
 pub fn capture_conn_limiter_from_env(env_config: &crate::config::EnvConfig) -> Arc<ConnLimiter> {
-    Arc::new(ConnLimiter::with_per_ip_shard_amount(
+    Arc::new(ConnLimiter::with_per_ip_shard_amount_and_ipv6_prefix(
         env_config.max_connections,
         // `usize` on 64-bit; a 32-bit build clamps rather than wrapping.
         usize::try_from(env_config.tcp_max_connections_per_ip).unwrap_or(usize::MAX),
         env_config.pool_shard_amount,
+        env_config.per_ip_ipv6_prefix,
     ))
 }
 

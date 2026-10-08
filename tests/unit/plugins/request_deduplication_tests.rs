@@ -6219,6 +6219,25 @@ async fn test_malformed_supported_content_encoding_stays_in_fingerprint() {
 }
 
 #[tokio::test]
+async fn test_brotli_large_window_encoding_is_refused_for_fingerprinting() {
+    let plugin = make_plugin(json!({}));
+    let body: &'static [u8] = &[0x11, 0x1e, 0, 0, 0, 0, 0, 0];
+    let mut ctx = body_ctx("POST", "/api/orders", body);
+    let mut headers = keyed_headers("large-window-br-key", "api.example", body.len());
+    headers.insert("content-encoding".to_string(), "br".to_string());
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("encoding"));
+        }
+        other => panic!("expected invalid Brotli to be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_reused_key_different_body_returns_409() {
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
     let mut first_headers = keyed_headers("body-key", "api.example", 11);

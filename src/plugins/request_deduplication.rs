@@ -3267,8 +3267,40 @@ fn request_body_digest(
                 decoded_body_digest_with_limit(&mut decoder, "gzip")
             }
             "br" => {
-                let mut decoder = brotli::Decompressor::new(body, 4096);
-                decoded_body_digest_with_limit(&mut decoder, "brotli")
+                let decoded = super::charged_decode::decode_charged_content_coding_chain(
+                    &["br".to_string()],
+                    body,
+                    super::utils::content_encoding::DecodeLimits {
+                        max_decoded_bytes: MAX_CANONICAL_DECODED_BODY_BYTES,
+                        max_cumulative_bytes: MAX_CANONICAL_DECODED_BODY_BYTES,
+                        max_codings: 1,
+                        max_amplification_ratio: 0,
+                    },
+                    crate::proxy::response_buffer_budget::BudgetRef::request_decode(),
+                );
+                match decoded {
+                    Ok(decoded) => {
+                        let mut hasher = Sha256::new();
+                        hasher.update(decoded);
+                        return Ok(format!("sha256-{}", hex::encode(hasher.finalize())));
+                    }
+                    Err(error) => {
+                        let (status_code, message) = match error {
+                            super::charged_decode::ChargedDecodeError::CapacityRefused => {
+                                (503, "Request decode capacity is temporarily unavailable")
+                            }
+                            _ => (
+                                400,
+                                "Request body encoding is invalid or exceeds fingerprint limits",
+                            ),
+                        };
+                        return Err(PluginResult::Reject {
+                            status_code,
+                            body: serde_json::json!({"error": message}).to_string(),
+                            headers: HashMap::new(),
+                        });
+                    }
+                }
             }
             _ => Err("unsupported body encoding".to_string()),
         };

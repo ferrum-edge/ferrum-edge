@@ -2298,6 +2298,7 @@ pub(crate) async fn dtls_pre_handshake_per_source_ip_admission_for_test(
     let admission = crate::proxy::PerIpStreamAdmission {
         counts: Some(Arc::new(DashMap::new())),
         max: max_per_source,
+        ipv6_prefix: 64,
     };
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await

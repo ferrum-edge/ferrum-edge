@@ -7934,22 +7934,23 @@ fn array_has_object_with_any(value: Option<&Value>, keys: &[&str]) -> bool {
 }
 
 fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-
-    let mut output = Vec::new();
-    let limit = MAX_INSPECTION_BODY_BYTES as u64;
-    match encoding.trim().to_ascii_lowercase().as_str() {
-        "gzip" | "x-gzip" => {
-            let mut reader = flate2::read::MultiGzDecoder::new(data).take(limit + 1);
-            reader.read_to_end(&mut output).ok()?;
-        }
-        "br" => {
-            let mut reader = brotli::Decompressor::new(data, 4096).take(limit + 1);
-            reader.read_to_end(&mut output).ok()?;
-        }
+    let coding = match encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => "gzip",
+        "br" => "br",
         _ => return None,
-    }
-    (output.len() <= MAX_INSPECTION_BODY_BYTES).then_some(output)
+    };
+    super::charged_decode::decode_charged_content_coding_chain(
+        &[coding.to_string()],
+        data,
+        super::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes: MAX_INSPECTION_BODY_BYTES,
+            max_cumulative_bytes: MAX_INSPECTION_BODY_BYTES,
+            max_codings: 1,
+            max_amplification_ratio: 0,
+        },
+        crate::proxy::response_buffer_budget::BudgetRef::global(),
+    )
+    .ok()
 }
 
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {

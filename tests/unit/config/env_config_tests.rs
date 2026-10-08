@@ -15,6 +15,25 @@ use ferrum_edge::ebpf::NodeAgentProxyMode;
 // (see tests/unit/env_lock.rs).
 use crate::unit::env_lock::with_env_vars;
 
+#[test]
+fn gateway_per_ip_ipv6_prefix_is_limited_to_one_through_128() {
+    for prefix in [1, 64, 128] {
+        let config = EnvConfig {
+            per_ip_ipv6_prefix: prefix,
+            ..Default::default()
+        };
+        assert!(config.validate_per_ip_ipv6_prefix().is_ok());
+    }
+
+    for prefix in [0, 129, u8::MAX] {
+        let config = EnvConfig {
+            per_ip_ipv6_prefix: prefix,
+            ..Default::default()
+        };
+        assert!(config.validate_per_ip_ipv6_prefix().is_err());
+    }
+}
+
 /// A Workload API socket path whose every directory component the production
 /// socket contract admits on this host.
 ///
@@ -4351,6 +4370,32 @@ fn test_env_config_max_concurrent_requests_per_ip_custom() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.max_concurrent_requests_per_ip, 100);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_per_ip_ipv6_prefix_default_and_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.per_ip_ipv6_prefix, 64);
+        },
+    );
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_PER_IP_IPV6_PREFIX", "128"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.per_ip_ipv6_prefix, 128);
+            assert!(config.validate_per_ip_ipv6_prefix().is_ok());
         },
     );
 }

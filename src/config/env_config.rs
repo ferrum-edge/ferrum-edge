@@ -3781,6 +3781,9 @@ pub struct EnvConfig {
     /// Uses the same client IP resolution as trusted proxy XFF walk.
     /// Default: 0 (disabled). When exceeded, returns 429 Too Many Requests.
     pub max_concurrent_requests_per_ip: u64,
+    /// IPv6 prefix for gateway-wide per-IP caps (FERRUM_PER_IP_IPV6_PREFIX).
+    /// IPv4 clients always use their full address. Default: 64. Range: 1..=128.
+    pub per_ip_ipv6_prefix: u8,
     /// Interval in seconds between cleanup sweeps for per-IP request and
     /// WebSocket-session counters. Removes entries where the active count has
     /// dropped to zero. Relevant when `max_concurrent_requests_per_ip > 0`
@@ -4461,6 +4464,7 @@ impl Default for EnvConfig {
             max_connections: 100_000,
             max_requests: 0,
             max_concurrent_requests_per_ip: 0,
+            per_ip_ipv6_prefix: 64,
             per_ip_cleanup_interval_seconds: 60,
             max_concurrent_fault_delays: DEFAULT_MAX_CONCURRENT_FAULT_DELAYS,
             circuit_breaker_cache_max_entries: 10_000,
@@ -5200,6 +5204,7 @@ impl EnvConfig {
             max_connections: usize = "FERRUM_MAX_CONNECTIONS" => 100_000usize;
             max_requests: usize = "FERRUM_MAX_REQUESTS" => 0usize;
             max_concurrent_requests_per_ip: u64 = "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP" => 0u64;
+            per_ip_ipv6_prefix: u8 = "FERRUM_PER_IP_IPV6_PREFIX" => 64u8;
             per_ip_cleanup_interval_seconds: u64 = "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS" => 60u64;
             max_concurrent_fault_delays: usize = "FERRUM_MAX_CONCURRENT_FAULT_DELAYS" => DEFAULT_MAX_CONCURRENT_FAULT_DELAYS;
             circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
@@ -5992,6 +5997,7 @@ impl EnvConfig {
             max_connections,
             max_requests,
             max_concurrent_requests_per_ip,
+            per_ip_ipv6_prefix,
             per_ip_cleanup_interval_seconds,
             max_concurrent_fault_delays,
             circuit_breaker_cache_max_entries,
@@ -7110,6 +7116,7 @@ impl EnvConfig {
         }
 
         self.validate_h3_connect_udp_limits()?;
+        self.validate_per_ip_ipv6_prefix()?;
         self.validate_h3_flow_control_windows()?;
         self.validate_mesh_app_probe_limits()?;
 
@@ -8639,6 +8646,16 @@ impl EnvConfig {
                  deliberately.",
                 self.cp_grpc_max_connections_per_ip, self.cp_grpc_max_connections
             ));
+        }
+        Ok(())
+    }
+
+    /// Validate the IPv6 grouping prefix used by gateway-wide per-IP caps.
+    pub fn validate_per_ip_ipv6_prefix(&self) -> Result<(), String> {
+        if !(1..=128).contains(&self.per_ip_ipv6_prefix) {
+            return Err(
+                "FERRUM_PER_IP_IPV6_PREFIX must be between 1 and 128 (inclusive)".to_string(),
+            );
         }
         Ok(())
     }

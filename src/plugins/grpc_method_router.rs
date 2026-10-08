@@ -10,6 +10,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -469,15 +470,21 @@ impl GrpcMethodRouter {
             .then(|| ctx.effective_identity())
             .flatten()
         {
-            Some(identity) => ("consumer:", identity),
-            None => ("ip:", ctx.client_ip.as_str()),
+            Some(identity) => ("consumer:", Cow::Borrowed(identity)),
+            None => (
+                "ip:",
+                Cow::Owned(
+                    crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                        .unwrap_or_else(|| ctx.client_ip.clone()),
+                ),
+            ),
         };
         let mut key = String::with_capacity(
             "grpc_method::".len() + kind.len() + identity.len() + method_path.len(),
         );
         key.push_str("grpc_method:");
         key.push_str(kind);
-        key.push_str(identity);
+        key.push_str(&identity);
         key.push(':');
         key.push_str(method_path);
         key

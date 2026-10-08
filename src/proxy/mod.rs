@@ -5344,12 +5344,24 @@ pub struct PerIpLimitExceeded;
 /// [`ProxyState::start_per_ip_cleanup_task`] so stale zero-count entries are
 /// swept. `Default` is the disabled dimension, which is what standalone/test
 /// listener constructors get.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PerIpStreamAdmission {
     /// `None` when the dimension is disabled (`max == 0` at startup).
     pub counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
     /// `0` = unlimited.
     pub max: u64,
+    /// IPv6 grouping prefix for this per-source cap.
+    pub ipv6_prefix: u8,
+}
+
+impl Default for PerIpStreamAdmission {
+    fn default() -> Self {
+        Self {
+            counts: None,
+            max: 0,
+            ipv6_prefix: 64,
+        }
+    }
 }
 
 impl PerIpStreamAdmission {
@@ -5361,7 +5373,7 @@ impl PerIpStreamAdmission {
         &self,
         ip: &str,
     ) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
-        try_acquire_per_ip_slot(self.counts.as_ref(), ip, self.max)
+        try_acquire_per_ip_slot_with_prefix(self.counts.as_ref(), ip, self.max, self.ipv6_prefix)
     }
 }
 
@@ -7125,6 +7137,8 @@ pub struct ProxyState {
     pub per_ip_request_counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
     /// Maximum concurrent requests per resolved client IP. 0 = disabled.
     pub max_concurrent_requests_per_ip: u64,
+    /// Prefix shared by gateway-wide IPv6 per-IP caps.
+    pub per_ip_ipv6_prefix: u8,
     /// Per-IP concurrently upgraded WebSocket session counters. Each resolved
     /// client IP gets an AtomicU64 tracking active sessions. `None` when
     /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` (disabled).
@@ -10114,6 +10128,7 @@ impl ProxyState {
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
         let websocket_max_connections_per_ip = env_config.websocket_max_connections_per_ip;
+        let per_ip_ipv6_prefix = env_config.per_ip_ipv6_prefix;
         let http3_connect_udp_max_sessions_per_ip =
             env_config.http3_connect_udp_max_sessions_per_ip;
         let mesh_egress_strip_baggage_keys =
@@ -10647,10 +10662,12 @@ impl ProxyState {
             PerIpStreamAdmission {
                 counts: per_ip_tcp_connections.clone(),
                 max: tcp_max_connections_per_ip,
+                ipv6_prefix: per_ip_ipv6_prefix,
             },
             PerIpStreamAdmission {
                 counts: per_ip_udp_sessions.clone(),
                 max: udp_max_sessions_per_ip,
+                ipv6_prefix: per_ip_ipv6_prefix,
             },
         );
         let hbone_admission_fence = Arc::new(hbone_admission_fence::HboneAdmissionFence::new(
@@ -10746,6 +10763,7 @@ impl ProxyState {
                 None
             },
             max_concurrent_requests_per_ip,
+            per_ip_ipv6_prefix,
             per_ip_websocket_sessions: if websocket_max_connections_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
                     pool_shard_amount,
@@ -15159,6 +15177,17 @@ pub fn try_acquire_per_ip_websocket_session(
     try_acquire_per_ip_slot(counts, ip, max)
 }
 
+/// Same as [`try_acquire_per_ip_websocket_session`], but groups IPv6 sources by
+/// the configured `FERRUM_PER_IP_IPV6_PREFIX` instead of the fixed /64.
+pub fn try_acquire_per_ip_websocket_session_with_prefix(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    ip: &str,
+    max: u64,
+    ipv6_prefix: u8,
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+    try_acquire_per_ip_slot_with_prefix(counts, ip, max, ipv6_prefix)
+}
+
 /// Try to admit one long-lived unit of work for `ip` against a per-source
 /// budget.
 ///
@@ -15177,20 +15206,35 @@ pub fn try_acquire_per_ip_slot(
     ip: &str,
     max: u64,
 ) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+    try_acquire_per_ip_slot_with_prefix(counts, ip, max, 64)
+}
+
+fn try_acquire_per_ip_slot_with_prefix(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    ip: &str,
+    max: u64,
+    ipv6_prefix: u8,
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
     let Some(counts) = counts else {
         return Ok(None);
     };
     if max == 0 {
         return Ok(None);
     }
+    let per_ip_key = if ip.contains(':') {
+        crate::util::client_identity::rate_limit_client_ip_string(ip, ipv6_prefix)
+            .unwrap_or_else(|| ip.to_string())
+    } else {
+        ip.to_string()
+    };
     let current = {
         let count = counts
-            .entry(ip.to_string())
+            .entry(per_ip_key.clone())
             .or_insert_with(|| AtomicU64::new(0));
         count.value().fetch_add(1, Ordering::Relaxed) + 1
     };
     let guard = PerIpConnectionGuard {
-        ip: ip.to_string(),
+        ip: per_ip_key,
         counts: counts.clone(),
     };
     if current > max {
@@ -15501,10 +15545,11 @@ async fn handle_websocket_request_authenticated(
     // which is released at the upgrade boundary so a long-lived session does
     // not block ordinary HTTP from the same IP. Keyed on `ctx.client_ip`
     // (socket peer, or forwarding headers only from a trusted proxy).
-    let per_ip_ws_guard = match try_acquire_per_ip_websocket_session(
+    let per_ip_ws_guard = match try_acquire_per_ip_websocket_session_with_prefix(
         state.per_ip_websocket_sessions.as_ref(),
         &ctx.client_ip,
         state.websocket_max_connections_per_ip,
+        state.per_ip_ipv6_prefix,
     ) {
         Ok(guard) => guard,
         Err(_) => {
@@ -33259,14 +33304,23 @@ async fn handle_proxy_request_inner(
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
     // covering all 30+ return paths without manual tracking.
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let per_ip_key = if ctx.client_ip.contains(':') {
+            crate::util::client_identity::rate_limit_client_ip_string(
+                &ctx.client_ip,
+                state.per_ip_ipv6_prefix,
+            )
+            .unwrap_or_else(|| ctx.client_ip.clone())
+        } else {
+            ctx.client_ip.clone()
+        };
         let current = {
             let count = counts
-                .entry(ctx.client_ip.clone())
+                .entry(per_ip_key.clone())
                 .or_insert_with(|| AtomicU64::new(0));
             count.value().fetch_add(1, Ordering::Relaxed) + 1
         };
         let guard = Some(PerIpRequestGuard {
-            ip: ctx.client_ip.clone(),
+            ip: per_ip_key,
             counts: counts.clone(),
         });
         if current > state.max_concurrent_requests_per_ip {

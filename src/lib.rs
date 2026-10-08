@@ -4,6 +4,8 @@
 //! functional tests, and custom plugins. The binary imports these shared modules
 //! and owns its startup pipeline, so library consumers do not compile CLI startup.
 
+#![deny(clippy::disallowed_methods)]
+
 /// The Ferrum Edge binary/crate version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
