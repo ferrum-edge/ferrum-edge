@@ -335,7 +335,7 @@ fn both_harnesses_route_every_batch_phase_through_the_shared_helper() {
 fn both_harnesses_gate_measurement_on_bounded_convergence_not_a_fixed_sleep() {
     // The red PostgreSQL legs of issue #4116 measured throughput while the
     // gateway was still executing the full reload that provisioning forced
-    // (`load_config_changes_after` bails past `CHANGE_LOG_BATCH_LIMIT`). Both
+    // (`load_config_changes_after` bails past `CHANGE_LOG_MAX_ROWS`). Both
     // harnesses detected the unroutable sample, printed a warning, slept a
     // fixed five seconds, and measured anyway. Convergence must be a gate, not
     // a warning.

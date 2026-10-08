@@ -87,7 +87,7 @@ apply cursor, proves the new routes are live, and measures 10 s more. Three kind
 
 | Kind | Change | Reload path |
 |---|---|---|
-| `full` | 3,000 proxies with new consumers (12,000 resources) | Full rebuild: exceeds the poller's 10,000-row change-log limit |
+| `full` | 3,000 proxies with new consumers (12,000 resources) | Incremental since issue #6058: the poller pages through the change log up to 100,000 rows (it was a full rebuild past the old 10,000-row limit) |
 | `small+consumers` | 100 proxies with new `key_auth` consumers (400 resources) | Incremental: consumer changes escalate to a full reload only while load-time quarantine is active or a changed consumer carries `hmac_auth` (issue #6060) |
 | `small-proxies` | 100 proxies whose plugins admit existing consumers (300 resources) | Incremental |
 

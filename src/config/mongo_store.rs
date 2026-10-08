@@ -137,7 +137,6 @@ mod inner {
     /// `maxAwaitTimeMS` for the config-change stream's `getMore`. Bounds how
     /// long one server-side await blocks; it does not delay event delivery.
     const CONFIG_CHANGE_STREAM_MAX_AWAIT: Duration = Duration::from_secs(10);
-    const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
     const MONGO_MIGRATION_LOCK_ID: &str = "global";
     const MONGO_MIGRATION_LEASE_DURATION: Duration = Duration::from_secs(120);
@@ -10069,6 +10068,9 @@ mod inner {
             let poll_timestamp = Utc::now();
             self.ensure_change_cursor_available(namespace, after_sequence)
                 .await?;
+            // The driver streams in server-sized batches, so one bounded cursor
+            // replaces SQL's paging (issue #6058).
+            let max_rows = crate::config::db_backend::change_log_max_rows(namespace);
             let mut cursor = self
                 .config_changes()
                 .find(doc! {
@@ -10076,7 +10078,7 @@ mod inner {
                     "sequence": { "$gt": after_sequence as i64 },
                 })
                 .sort(doc! { "sequence": 1 })
-                .limit(CHANGE_LOG_BATCH_LIMIT)
+                .limit(i64::try_from(max_rows).unwrap_or(i64::MAX))
                 .await?;
             let mut sequence_cursor = after_sequence;
             let mut proxy_ops = std::collections::HashMap::new();
@@ -10118,12 +10120,12 @@ mod inner {
             }
             self.ensure_change_cursor_available(namespace, after_sequence)
                 .await?;
-            if change_count >= CHANGE_LOG_BATCH_LIMIT as usize {
+            if change_count >= max_rows {
                 anyhow::bail!(
                     "MongoDB config change batch for namespace {:?} reached limit {}; forcing \
                      full reload",
                     namespace,
-                    CHANGE_LOG_BATCH_LIMIT
+                    max_rows
                 );
             }
 

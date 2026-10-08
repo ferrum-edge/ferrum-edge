@@ -6842,6 +6842,13 @@ pub mod _test_support {
         crate::config::namespace_registry::set_namespace_registry_fault(namespace, phase);
     }
 
+    /// Lower the incremental poll's change-row cap for one namespace so a
+    /// small fixture can saturate it and exercise the full-reload fallback.
+    /// `None` restores the default. Always clear it when the test finishes.
+    pub fn set_change_log_max_rows_for_test(namespace: &str, max_rows: Option<usize>) {
+        crate::config::db_backend::set_change_log_max_rows(namespace, max_rows);
+    }
+
     /// Shrink the per-chunk write size for one namespace so a small fixture can
     /// still cross a chunk boundary. `None` restores the backend default.
     pub fn set_atomic_batch_chunk_size_for_test(namespace: &str, chunk_size: Option<usize>) {

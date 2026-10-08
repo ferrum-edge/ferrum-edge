@@ -6937,36 +6937,48 @@ impl DatabaseStore {
         if after_sequence > i64::MAX as u64 {
             anyhow::bail!("config change cursor exceeds SQL BIGINT range");
         }
-        let rows = sqlx::query(
-            &self.q("SELECT sequence, resource_type, resource_id, operation \
-             FROM config_changes \
-             WHERE namespace = ? AND sequence > ? \
-             ORDER BY sequence ASC \
-             LIMIT ?"),
-        )
-        .bind(namespace)
-        .bind(after_sequence as i64)
-        .bind(Self::CHANGE_LOG_BATCH_LIMIT)
-        .fetch_all(&self.pool())
-        .await?;
-
-        if rows.len() >= Self::CHANGE_LOG_BATCH_LIMIT as usize {
-            anyhow::bail!(
-                "config change batch for namespace {:?} reached limit {}; forcing full reload",
-                namespace,
-                Self::CHANGE_LOG_BATCH_LIMIT
-            );
-        }
-
-        let mut changes = Vec::with_capacity(rows.len());
-        for row in rows {
-            let sequence: i64 = row.try_get("sequence")?;
-            changes.push(ConfigChangeRecord {
-                sequence: sequence.max(0) as u64,
-                resource_type: row.try_get("resource_type")?,
-                resource_id: row.try_get("resource_id")?,
-                operation: row.try_get("operation")?,
-            });
+        // Page by sequence so each query stays bounded while a large batch
+        // still applies as a delta; only a backlog past the cap falls back to
+        // a full reload (issue #6058).
+        let max_rows = crate::config::db_backend::change_log_max_rows(namespace);
+        let page_rows = crate::config::db_backend::CHANGE_LOG_PAGE_ROWS.min(max_rows);
+        let mut changes = Vec::new();
+        let mut page_after = after_sequence;
+        loop {
+            let rows = sqlx::query(&self.q(
+                "SELECT sequence, resource_type, resource_id, operation \
+                 FROM config_changes \
+                 WHERE namespace = ? AND sequence > ? \
+                 ORDER BY sequence ASC \
+                 LIMIT ?",
+            ))
+            .bind(namespace)
+            .bind(page_after as i64)
+            .bind(page_rows as i64)
+            .fetch_all(&self.pool())
+            .await?;
+            let page_len = rows.len();
+            for row in rows {
+                let sequence: i64 = row.try_get("sequence")?;
+                let sequence = sequence.max(0) as u64;
+                page_after = page_after.max(sequence);
+                changes.push(ConfigChangeRecord {
+                    sequence,
+                    resource_type: row.try_get("resource_type")?,
+                    resource_id: row.try_get("resource_id")?,
+                    operation: row.try_get("operation")?,
+                });
+            }
+            if changes.len() >= max_rows {
+                anyhow::bail!(
+                    "config change batch for namespace {:?} reached limit {}; forcing full reload",
+                    namespace,
+                    max_rows
+                );
+            }
+            if page_len < page_rows {
+                break;
+            }
         }
         Ok(changes)
     }
@@ -7377,7 +7389,6 @@ impl DatabaseStore {
     /// beyond this many ids the chunks are each ordered. Stays under SQLite's
     /// 32,766 and PostgreSQL/MySQL's 65,535 bind-parameter limits.
     const ORDERED_NEIGHBORHOOD_CHUNK_SIZE: usize = 10_000;
-    const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 
     /// Fallback page size used only when no runtime override has been set

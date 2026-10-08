@@ -1607,6 +1607,75 @@ impl IncrementalResult {
     }
 }
 
+/// `config_changes` rows one incremental-poll query reads. Paging keeps each
+/// query's memory bounded while a large batch still applies as a delta.
+pub const CHANGE_LOG_PAGE_ROWS: usize = 10_000;
+
+/// Change rows one incremental poll reads before it falls back to a full
+/// reload. Matches the per-namespace change-log retention (100,000 rows), so
+/// any backlog that is still retained applies as a delta. Below this, point-
+/// loading the changed resources is far cheaper than decoding, diffing and
+/// staging the whole namespace: one admin batch of a few thousand proxies with
+/// plugins already writes more than 10,000 rows, which used to force a full
+/// reload on every large write (issue #6058).
+pub const CHANGE_LOG_MAX_ROWS: usize = 100_000;
+
+static CHANGE_LOG_MAX_ROWS_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
+static CHANGE_LOG_MAX_ROWS_OVERRIDES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn change_log_max_rows_overrides()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, usize>> {
+    CHANGE_LOG_MAX_ROWS_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The change-row cap for `namespace`: [`CHANGE_LOG_MAX_ROWS`] unless a test
+/// lowered it. Production pays one relaxed load per poll.
+pub fn change_log_max_rows(namespace: &str) -> usize {
+    if !CHANGE_LOG_MAX_ROWS_OVERRIDDEN.load(Ordering::Acquire) {
+        return CHANGE_LOG_MAX_ROWS;
+    }
+    change_log_max_rows_overrides()
+        .get(namespace)
+        .copied()
+        .unwrap_or(CHANGE_LOG_MAX_ROWS)
+}
+
+/// Lower (or, with `None`, restore) the change-row cap for one namespace so a
+/// test can saturate an incremental poll without writing 100,000 rows.
+pub(crate) fn set_change_log_max_rows(namespace: &str, max_rows: Option<usize>) {
+    let mut overrides = change_log_max_rows_overrides();
+    match max_rows.filter(|rows| *rows > 0) {
+        Some(rows) => {
+            overrides.insert(namespace.to_string(), rows);
+        }
+        None => {
+            overrides.remove(namespace);
+        }
+    }
+    CHANGE_LOG_MAX_ROWS_OVERRIDDEN.store(!overrides.is_empty(), Ordering::Release);
+}
+
+/// Static category for an incremental poll that fell back to a full reload,
+/// safe to log: it classifies the loaders' own fallback errors without
+/// echoing database error text.
+pub fn incremental_fallback_reason(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("reached limit") {
+        "change-log batch over the cap"
+    } else if message.contains("behind retained sequence") {
+        "cursor behind the retained change log"
+    } else if message.contains("non-transactional config_changes") {
+        "standalone MongoDB change log"
+    } else {
+        "incremental load error"
+    }
+}
+
 /// Marker returned by an incremental loader when a consumer mutation must be
 /// applied from an authoritative full snapshot.
 ///
