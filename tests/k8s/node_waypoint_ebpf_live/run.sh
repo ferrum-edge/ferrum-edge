@@ -389,15 +389,19 @@ render_chart_assertions() {
     exit 1
   fi
   local ambient_ds node_agent_ds
-  ambient_ds="$(awk '
-    /name: ferrum-mesh-ambient/ { in_ambient = 1 }
-    in_ambient { print }
-    /name: ferrum-mesh-node-agent/ && in_ambient { exit }
+  # Select whole rendered documents by kind and metadata name: label lines
+  # such as `app.kubernetes.io/name: ferrum-mesh-node-agent` appear in other
+  # objects first and must not delimit the DaemonSet bodies.
+  ambient_ds="$(awk 'BEGIN { RS = "\n---" }
+    /kind: DaemonSet/ && /\n  name: ferrum-mesh-ambient\n/ { print }
   ' <<<"$rendered")"
-  node_agent_ds="$(awk '
-    /name: ferrum-mesh-node-agent/ { in_agent = 1 }
-    in_agent { print }
+  node_agent_ds="$(awk 'BEGIN { RS = "\n---" }
+    /kind: DaemonSet/ && /\n  name: ferrum-mesh-node-agent\n/ { print }
   ' <<<"$rendered")"
+  if [[ -z "$ambient_ds" || -z "$node_agent_ds" ]]; then
+    echo "NodeWaypoint eBPF render is missing the ambient or node-agent DaemonSet" >&2
+    exit 1
+  fi
   for cap in BPF PERFMON SYS_ADMIN; do
     if ! grep -q -- "- ${cap}" <<<"$ambient_ds" || ! grep -q -- "- ${cap}" <<<"$node_agent_ds"; then
       echo "NodeWaypoint eBPF render did not grant ${cap} to both proxy and node-agent" >&2
