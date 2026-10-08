@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now reserved for validated clients. The HTTP/3 listener and backend pools also
   stop advertising the QUIC DATAGRAM extension, which nothing in the gateway
   reads; a peer that sends a DATAGRAM frame anyway is closed with
-  `PROTOCOL_VIOLATION`. See [docs/http3.md](docs/http3.md#quic-address-validation-and-handshake-admission).
+  `PROTOCOL_VIOLATION`. Upgrade note: under handshake pressure, or with the
+  budget set to `0`, first-time clients pay one extra round trip, and clients
+  without a token no longer get the 0.5-RTT early-response path. See
+  [docs/http3.md](docs/http3.md#quic-address-validation-and-handshake-admission).
 
 ### Performance
 

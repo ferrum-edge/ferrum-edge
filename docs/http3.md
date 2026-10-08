@@ -1527,10 +1527,15 @@ whose address has not been validated, sized by
 [0-RTT](#0-rtt-tls-13-early-data)) is reserved for validated clients: an
 unvalidated client always completes the full 1-RTT handshake first, and any
 0-RTT request streams it sent are served after the handshake as 1-RTT
-(RFC 8470 §6.2). Retry tokens are minted by the listener's current QUIC server
-config, so a frontend TLS reload invalidates outstanding tokens; affected
-clients simply receive another Retry. The critical-overload refusal still runs
-before any of this.
+(RFC 8470 §3). Retry and address-validation tokens are sealed with a key
+generated when the listener's QUIC server config is built, so a frontend TLS
+reload invalidates outstanding tokens: for up to 15 seconds after a reload, a
+client that echoes a token from before the reload fails that connection
+attempt and must reconnect. Behind a load balancer that routes QUIC packets by
+connection ID rather than by client address, a client's echoed Retry token can
+reach a different replica, which cannot validate it; route QUIC by client
+address (or keep the unvalidated-handshake budget above the expected burst) in
+that topology. The critical-overload refusal still runs before any of this.
 
 ## QUIC DATAGRAM extension
 
