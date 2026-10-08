@@ -24,6 +24,7 @@ mod admin_namespace_crud_tests;
 mod admin_namespace_live_apply_tests;
 mod admin_node_waypoint_identities_tests;
 mod admin_observability_auth_tests;
+mod admin_plugin_graph_scope_tests;
 mod admin_runtime_metrics_tests;
 mod admin_upstream_proxy_sni_admission_tests;
 mod ai_stream_router_normalization_tests;
