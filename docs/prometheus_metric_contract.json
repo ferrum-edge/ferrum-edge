@@ -1050,6 +1050,19 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_backend_tls_refusals_total",
+    "type": "counter",
+    "help": "Backend TLS refusals for destinations whose DestinationRule TLS material this node refused, by surface.",
+    "labels": [
+      "surface",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_circuit_breaker_cache_admission_refused_total",
     "type": "counter",
     "help": "Requests refused a cached breaker because the shared breaker cache was at its admission ceiling; each one ran on a transient breaker whose failures never accumulate.",

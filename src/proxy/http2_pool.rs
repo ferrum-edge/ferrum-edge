@@ -603,7 +603,7 @@ impl Http2PoolManager {
                 let message = format!("Failed to build backend TLS config: {}", e);
                 let source = match e {
                     TlsError::Io { source, .. } => Some(InternalSource::Io(source)),
-                    TlsError::Pem { .. } | TlsError::Rustls(_) => {
+                    TlsError::Pem { .. } | TlsError::Rustls(_) | TlsError::Refused => {
                         Some(InternalSource::Message(message.clone()))
                     }
                 };
@@ -1551,7 +1551,7 @@ impl Http2PoolManager {
                 let message = format!("Failed to build backend TLS config: {}", e);
                 let source = match e {
                     TlsError::Io { source, .. } => Some(InternalSource::Io(source)),
-                    TlsError::Pem { .. } | TlsError::Rustls(_) => {
+                    TlsError::Pem { .. } | TlsError::Rustls(_) | TlsError::Refused => {
                         Some(InternalSource::Message(message.clone()))
                     }
                 };

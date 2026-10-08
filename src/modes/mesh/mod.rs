@@ -2958,6 +2958,7 @@ fn node_waypoint_udp_listener_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
@@ -3865,9 +3866,14 @@ fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
         normalized.updated_at = epoch;
         serde_json::to_value(&normalized).unwrap_or(serde_json::Value::Null)
     }
-    // The DR-derived `#[serde(skip)]` fallback overlay is invisible to the
-    // serialized comparison, so compare it explicitly first.
-    if a.dispatch_port_override_fallback != b.dispatch_port_override_fallback {
+    // The DR-derived `#[serde(skip)]` fallback overlay and backend TLS refusal
+    // marker are invisible to the serialized comparison, so compare them
+    // explicitly first. A refused upstream keeps no TLS material, so without
+    // the marker it would serialize exactly like one with no DestinationRule
+    // TLS at all.
+    if a.dispatch_port_override_fallback != b.dispatch_port_override_fallback
+        || a.backend_tls_refused != b.backend_tls_refused
+    {
         return false;
     }
     let a_value = content_value(a);
@@ -4812,6 +4818,7 @@ fn build_east_west_service_proxies_and_upstreams(
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: HashMap::new(),
+                backend_tls_refused: false,
                 dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: now,
@@ -7183,6 +7190,7 @@ fn mesh_ingress_unix_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
@@ -10172,6 +10180,7 @@ fn mesh_outbound_route_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         k8s_service_uid,
@@ -10605,9 +10614,9 @@ fn apply_destination_rules_with_tenant_file_roots(
     // per-reload × per-DP spam.
     let mut refused_out_of_lookup_path = 0usize;
     // Upstreams governed by a tenant rule whose local TLS file did not resolve
-    // under a tenant file root on THIS node. Their backend TLS is replaced with
-    // unloadable material after every rule has applied, so those destinations
-    // fail closed while the rest of the slice applies.
+    // under a tenant file root on THIS node. Their backend TLS is marked
+    // refused after every rule has applied, so every TLS build for those
+    // destinations fails while the rest of the slice applies.
     let mut tls_file_refused_upstreams: HashSet<usize> = HashSet::new();
 
     for dr in sorted_destination_rules.iter().copied() {
@@ -10666,14 +10675,45 @@ fn apply_destination_rules_with_tenant_file_roots(
             tenant_file_roots,
         );
         if let Some(error) = escape {
-            warn!(
-                rule_namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
-                rule = %sanitize_startup_scalar(dr.name.to_string()),
-                upstreams = matching_upstream_indices.len(),
-                reason = %sanitize_startup_scalar(error),
-                "DestinationRule local TLS file does not resolve under a tenant TLS file root \
-                 on this node; backend TLS for the destinations it governs fails closed"
-            );
+            // HBONE and Sidecar mesh-mTLS dispatch never reads backend TLS
+            // material: those transports run only for plaintext-scheme proxies
+            // and authenticate with the gateway SVID. Refusing the material
+            // therefore leaves their traffic on the mesh identity, so the
+            // warning must not claim it fails closed.
+            let mesh_transport_upstreams = matching_upstream_indices
+                .iter()
+                .filter(|&&idx| {
+                    config
+                        .upstreams
+                        .get(idx)
+                        .is_some_and(upstream_uses_mesh_transport)
+                })
+                .count();
+            let tls_upstreams = matching_upstream_indices.len() - mesh_transport_upstreams;
+            let reason = sanitize_startup_scalar(error);
+            if tls_upstreams > 0 {
+                warn!(
+                    rule_namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
+                    rule = %sanitize_startup_scalar(dr.name.to_string()),
+                    upstreams = tls_upstreams,
+                    reason = %reason,
+                    "DestinationRule local TLS file does not resolve under a tenant TLS file root \
+                     on this node; backend TLS for the destinations it governs is refused and \
+                     fails closed"
+                );
+            }
+            if mesh_transport_upstreams > 0 {
+                warn!(
+                    rule_namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
+                    rule = %sanitize_startup_scalar(dr.name.to_string()),
+                    upstreams = mesh_transport_upstreams,
+                    reason = %reason,
+                    "DestinationRule local TLS file does not resolve under a tenant TLS file root \
+                     on this node; its TLS material is refused, and traffic to the HBONE / \
+                     mesh-mTLS destinations it governs continues over the gateway mesh \
+                     identity, which never uses that material"
+                );
+            }
             tls_file_refused_upstreams.extend(matching_upstream_indices.iter().copied());
         }
 
@@ -11173,49 +11213,46 @@ fn apply_destination_rules_with_tenant_file_roots(
     Ok(())
 }
 
-/// PEM with no `CERTIFICATE` or `PRIVATE KEY` record. Every backend TLS build
-/// that reads it fails, deterministically and without touching the filesystem.
-const REFUSED_BACKEND_TLS_MATERIAL: &str =
-    "-----BEGIN FERRUM REFUSED TLS MATERIAL-----\n-----END FERRUM REFUSED TLS MATERIAL-----\n";
-
-/// Backend TLS slot that can never complete a handshake: CA, client
-/// certificate, and private key all name [`REFUSED_BACKEND_TLS_MATERIAL`], and
-/// verification stays on. The client pair is set (rather than cleared) so the
-/// global `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_KEY_PATH` pair cannot stand
-/// in for it, and it is loaded before verification is configured, so
-/// `FERRUM_TLS_NO_VERIFY` cannot bypass the refusal either.
-fn refused_backend_tls_config() -> BackendTlsConfig {
-    let mut slot = BackendTlsConfig::default_verify();
-    slot.client_cert_path = Some(REFUSED_BACKEND_TLS_MATERIAL.to_string());
-    slot.client_key_path = Some(REFUSED_BACKEND_TLS_MATERIAL.to_string());
-    slot.server_ca_cert_path = Some(REFUSED_BACKEND_TLS_MATERIAL.to_string());
-    slot
-}
-
 /// Fail an upstream's backend TLS closed at every scope (upstream, per-port,
 /// subset). Used when a DestinationRule's local TLS file is refused on this
 /// node: the destination must not fall back to the PeerAuthentication default,
-/// system roots, the global CA, or the gateway's own client certificate, so
-/// every TLS connection to it fails. Plaintext backends are unaffected because
-/// DestinationRule TLS never changes a backend's scheme.
+/// system roots, the global CA, or the gateway's own client certificate.
+///
+/// The refusal is explicit: every scope keeps no material and carries
+/// [`BackendTlsConfig::tls_refused`], which every backend TLS builder checks
+/// before it reads anything else, so neither `FERRUM_TLS_NO_VERIFY` nor the
+/// global CA / client pair can stand in for the refused material. The refusal
+/// covers every backend client build for the destination, including the shared
+/// HTTP client a plaintext-scheme proxy builds (it carries a TLS config even
+/// for `http` backends), because cached TLS configs are keyed without the
+/// scheme. HBONE and Sidecar mesh-mTLS dispatch never read this material, so
+/// traffic over those transports keeps the gateway mesh identity.
 fn fail_closed_upstream_backend_tls(upstream: &mut Upstream) {
-    let refused = refused_backend_tls_config();
-    upstream.backend_tls_client_cert_path = refused.client_cert_path.clone();
-    upstream.backend_tls_client_key_path = refused.client_key_path.clone();
-    upstream.backend_tls_server_ca_cert_path = refused.server_ca_cert_path.clone();
-    upstream.backend_tls_verify_server_cert = refused.verify_server_cert;
+    upstream.backend_tls_refused = true;
+    upstream.backend_tls_client_cert_path = None;
+    upstream.backend_tls_client_key_path = None;
+    upstream.backend_tls_server_ca_cert_path = None;
+    upstream.backend_tls_verify_server_cert = true;
     upstream.backend_tls_sni = None;
     upstream.backend_tls_san_allow_list.clear();
     for port_override in upstream.port_overrides.values_mut() {
         if port_override.tls.is_some() {
-            port_override.tls = Some(refused.clone());
+            port_override.tls = Some(BackendTlsConfig::refused());
         }
     }
     for resolved in upstream.resolved_subset_tls.values_mut() {
         if resolved.tls.is_some() {
-            resolved.tls = Some(refused.clone());
+            resolved.tls = Some(BackendTlsConfig::refused());
         }
     }
+    if let Some(fallback) = upstream.dispatch_port_override_fallback.as_mut()
+        && fallback.tls.is_some()
+    {
+        fallback.tls = Some(BackendTlsConfig::refused());
+    }
+    crate::tls::backend::record_backend_tls_refusal(
+        crate::tls::backend::BackendTlsRefusalSurface::SliceApply,
+    );
 }
 
 /// Compute each upstream's resolved subset overlay against the settled
@@ -12909,6 +12946,7 @@ fn build_egress_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
@@ -27987,6 +28025,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
@@ -29309,6 +29348,14 @@ mod tests {
     }
 
     fn assert_backend_tls_fails_closed(upstream: &Upstream) {
+        assert!(
+            upstream.backend_tls_refused,
+            "a refused destination must carry the explicit refusal marker"
+        );
+        assert!(
+            BackendTlsConfig::from_upstream(upstream).tls_refused,
+            "the marker must reach the resolved backend TLS config"
+        );
         for (field, value) in [
             ("ca", upstream.backend_tls_server_ca_cert_path.as_deref()),
             (
@@ -29320,11 +29367,7 @@ mod tests {
                 upstream.backend_tls_client_key_path.as_deref(),
             ),
         ] {
-            assert_eq!(
-                value,
-                Some(REFUSED_BACKEND_TLS_MATERIAL),
-                "{field} must name unloadable material, never a fallback"
-            );
+            assert_eq!(value, None, "{field} must not keep the refused reference");
         }
         assert!(upstream.backend_tls_verify_server_cert);
         assert!(upstream.backend_tls_sni.is_none());
@@ -29332,14 +29375,13 @@ mod tests {
     }
 
     #[test]
-    fn refused_backend_tls_material_never_loads() {
-        let slot = refused_backend_tls_config();
-        let material = slot.server_ca_cert_path.as_deref().expect("refused CA");
-        let ca = crate::tls::parse_pem_certificate_bundle(material.as_bytes(), "test", "inline");
-        assert!(ca.is_err(), "the refused CA must not parse");
-        let key = crate::tls::parse_pem_private_key(material.as_bytes(), "test", "inline");
-        assert!(key.is_err(), "the refused client key must not parse");
+    fn refused_backend_tls_config_carries_the_marker_and_no_material() {
+        let slot = BackendTlsConfig::refused();
+        assert!(slot.tls_refused);
         assert!(slot.verify_server_cert);
+        assert!(slot.server_ca_cert_path.is_none());
+        assert!(slot.client_cert_path.is_none());
+        assert!(slot.client_key_path.is_none());
     }
 
     #[test]
@@ -29459,10 +29501,10 @@ mod tests {
             .get("v1")
             .and_then(|resolved| resolved.tls.as_ref())
             .expect("v1 subset keeps a resolved TLS slot");
-        assert_eq!(
-            subset_tls.server_ca_cert_path.as_deref(),
-            Some(REFUSED_BACKEND_TLS_MATERIAL),
-            "the subset scope must fail closed too"
+        assert!(subset_tls.tls_refused, "the subset scope must fail closed too");
+        assert!(
+            subset_tls.server_ca_cert_path.is_none(),
+            "the subset scope must not keep the escaping reference"
         );
     }
 
@@ -33253,6 +33295,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: loaded_at,
@@ -33484,6 +33527,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
@@ -33966,6 +34010,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),

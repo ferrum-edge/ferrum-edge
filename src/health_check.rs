@@ -2730,7 +2730,10 @@ impl HealthChecker {
         use_tls: bool,
         dial_host_pin: Option<&str>,
     ) -> Option<Arc<reqwest::Client>> {
-        let has_tls_config = tls_config.client_cert_path.is_some()
+        // A refused destination carries no material but must still reach the
+        // TLS-aware builder, which refuses it, instead of the default client.
+        let has_tls_config = tls_config.tls_refused
+            || tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()
             || tls_config.server_ca_cert_path.is_some()
             || !tls_config.san_allow_list.is_empty()
@@ -3559,6 +3562,11 @@ async fn grpc_probe(
         }
     };
 
+    if use_tls && let Err(error) = refuse_probe_tls_if_refused(tls_config) {
+        debug!("gRPC health probe: {} for {}:{}", error, host, port);
+        return ProbeOutcome::failure(format!("grpc connect failed: {error}"));
+    }
+
     let skip_verify = use_tls
         && (!tls_config.verify_server_cert
             || (global_no_verify && tls_config.allows_global_no_verify()));
@@ -3948,6 +3956,11 @@ enum HealthCheckClientError {
     /// verifier (invalid entries or the inner webpki verifier failed to build).
     /// Fail closed: a probe that cannot pin identity must not dial unpinned.
     SanPinningUnavailable(String),
+    /// This node refused the upstream's backend TLS material
+    /// ([`BackendTlsConfig::tls_refused`]). Checked before anything else, so
+    /// neither no-verify nor the global CA / client pair builds a probe that
+    /// proxy traffic could never use.
+    BackendTlsRefused,
 }
 
 impl std::fmt::Display for HealthCheckClientError {
@@ -3975,6 +3988,9 @@ impl std::fmt::Display for HealthCheckClientError {
                 f,
                 "backend TLS SAN allow-list could not be applied ({details})"
             ),
+            Self::BackendTlsRefused => {
+                f.write_str("backend TLS for this upstream was refused on this node")
+            }
         }
     }
 }
@@ -4105,12 +4121,30 @@ struct HealthCheckClientIdentityPaths<'a> {
     key: &'a Option<String>,
 }
 
+/// Refuse a probe for an upstream whose backend TLS this node refused.
+///
+/// Every probe TLS builder calls this before it reads any material, so the
+/// refusal holds under `FERRUM_TLS_NO_VERIFY` and with a global CA / client
+/// pair configured, exactly as it does for proxy traffic.
+fn refuse_probe_tls_if_refused(
+    tls_config: &BackendTlsConfig,
+) -> Result<(), HealthCheckClientError> {
+    if tls_config.tls_refused {
+        crate::tls::backend::record_backend_tls_refusal(
+            crate::tls::backend::BackendTlsRefusalSurface::HealthProbe,
+        );
+        return Err(HealthCheckClientError::BackendTlsRefused);
+    }
+    Ok(())
+}
+
 /// Build the probe server verifier using the same wrapping the data path uses.
 fn build_probe_server_verifier(
     tls_config: &BackendTlsConfig,
     global_ca_path: Option<&str>,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> Result<ProbeServerVerifier, HealthCheckClientError> {
+    refuse_probe_tls_if_refused(tls_config)?;
     let root_store = if let Some(ca_path) = tls_config.effective_ca_source(global_ca_path) {
         load_probe_tls_root_store(ca_path, "Health check CA")
             .map_err(HealthCheckClientError::ExclusiveTrustUnavailable)?
@@ -4323,6 +4357,7 @@ fn build_health_check_client_with_tls(
     dial_host_pin: Option<&str>,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> Result<reqwest::Client, HealthCheckClientError> {
+    refuse_probe_tls_if_refused(tls_config)?;
     let skip_verify = !tls_config.verify_server_cert
         || (global_no_verify && tls_config.allows_global_no_verify());
 

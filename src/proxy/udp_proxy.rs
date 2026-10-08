@@ -1687,6 +1687,10 @@ struct BackendDtlsConfigCacheKey {
     client_key_path: Option<String>,
     server_ca_cert_path: Option<String>,
     verify_server_cert: bool,
+    /// A refused destination carries no material, so without this field its
+    /// key would equal an unconfigured destination's and reuse params built
+    /// before the refusal.
+    tls_refused: bool,
     tls_no_verify: bool,
     global_ca_bundle_path: Option<String>,
     san_allow_list: Vec<String>,
@@ -1707,6 +1711,7 @@ impl Hash for BackendDtlsConfigCacheKey {
         self.client_key_path.hash(state);
         self.server_ca_cert_path.hash(state);
         self.verify_server_cert.hash(state);
+        self.tls_refused.hash(state);
         self.tls_no_verify.hash(state);
         self.global_ca_bundle_path.hash(state);
         self.san_allow_list.hash(state);
@@ -1733,6 +1738,7 @@ fn backend_dtls_config_cache_key(
         client_key_path: proxy.resolved_tls.client_key_path.clone(),
         server_ca_cert_path: proxy.resolved_tls.server_ca_cert_path.clone(),
         verify_server_cert: proxy.resolved_tls.verify_server_cert,
+        tls_refused: proxy.resolved_tls.tls_refused,
         tls_no_verify,
         global_ca_bundle_path: global_ca_bundle_path.map(str::to_string),
         san_allow_list: proxy.resolved_tls.san_allow_list.clone(),

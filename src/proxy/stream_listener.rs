@@ -363,6 +363,11 @@ struct BackendTlsReloadKey {
     /// that pairs with invalid cert material still qualifies for the
     /// keep-old-listener path.
     crl_fingerprint: Option<String>,
+    /// [`crate::config::types::BackendTlsConfig::tls_refused`]: a refused
+    /// destination carries no material, so without this field its key would
+    /// equal an unconfigured destination's and the listener would keep the
+    /// `ClientConfig` it cached before the refusal.
+    tls_refused: bool,
 }
 
 /// Backend routing identity for a TCP+TLS stream proxy, captured at listener
@@ -483,6 +488,7 @@ impl BackendTlsReloadKey {
         // is fixed gateway config and only its *content* rotates, which is
         // exactly the in-place-rotation case this predicate exists to admit.
         self.verify_server_cert == other.verify_server_cert
+            && self.tls_refused == other.tls_refused
             && self.san_allow_list == other.san_allow_list
             && source_matches(&self.server_ca_cert, &other.server_ca_cert)
             && source_matches(&self.client_cert, &other.client_cert)
@@ -529,6 +535,7 @@ impl BackendTlsReloadKey {
             },
             san_allow_list: proxy.resolved_tls.san_allow_list.clone(),
             crl_fingerprint: crl_fingerprint.map(str::to_owned),
+            tls_refused: proxy.resolved_tls.tls_refused,
         }
     }
 }
@@ -4925,6 +4932,7 @@ mod tests {
                 client_key: None,
                 san_allow_list: san,
                 crl_fingerprint: None,
+                tls_refused: false,
             }
         }
 
@@ -4962,6 +4970,7 @@ mod tests {
             client_key: None,
             san_allow_list: vec![],
             crl_fingerprint: None,
+            tls_refused: false,
         };
         assert!(
             !original.same_tls_sources(&removed),

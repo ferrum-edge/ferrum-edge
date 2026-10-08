@@ -39,6 +39,9 @@ pub enum TlsError {
         details: String,
     },
     Rustls(String),
+    /// This node refused the destination's backend TLS material
+    /// ([`BackendTlsConfig::tls_refused`]), so no TLS client is built for it.
+    Refused,
 }
 
 impl std::fmt::Display for TlsError {
@@ -69,6 +72,9 @@ impl std::fmt::Display for TlsError {
                 }
             }
             Self::Rustls(details) => write!(f, "rustls: {details}"),
+            Self::Refused => {
+                f.write_str("backend TLS was refused for this destination on this node")
+            }
         }
     }
 }
@@ -113,8 +119,71 @@ impl TlsError {
                 details: details.clone(),
             },
             Self::Rustls(details) => Self::Rustls(details.clone()),
+            Self::Refused => Self::Refused,
         }
     }
+}
+
+/// Where a backend TLS refusal ([`BackendTlsConfig::tls_refused`]) was counted.
+///
+/// A closed set so `ferrum_backend_tls_refusals_total{surface}` has fixed
+/// cardinality: no destination, namespace, rule, or path ever becomes a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendTlsRefusalSurface {
+    /// Mesh slice apply marked one upstream's backend TLS refused (counted once
+    /// per refused upstream per apply).
+    SliceApply,
+    /// The shared backend TLS client builder refused a build (proxy pools,
+    /// capability probes, TCP+TLS stream listeners, live-reload validation).
+    ClientBuild,
+    /// The backend DTLS builder refused a build.
+    DtlsBuild,
+    /// A health-check probe client refused to build.
+    HealthProbe,
+}
+
+impl BackendTlsRefusalSurface {
+    pub const ALL: [Self; 4] = [
+        Self::SliceApply,
+        Self::ClientBuild,
+        Self::DtlsBuild,
+        Self::HealthProbe,
+    ];
+
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::SliceApply => "slice_apply",
+            Self::ClientBuild => "client_build",
+            Self::DtlsBuild => "dtls_build",
+            Self::HealthProbe => "health_probe",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::SliceApply => 0,
+            Self::ClientBuild => 1,
+            Self::DtlsBuild => 2,
+            Self::HealthProbe => 3,
+        }
+    }
+}
+
+static BACKEND_TLS_REFUSALS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Count one backend TLS refusal on `surface`.
+pub fn record_backend_tls_refusal(surface: BackendTlsRefusalSurface) {
+    BACKEND_TLS_REFUSALS[surface.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime refusal count for `surface`.
+pub fn backend_tls_refusal_count(surface: BackendTlsRefusalSurface) -> u64 {
+    BACKEND_TLS_REFUSALS[surface.index()].load(Ordering::Relaxed)
 }
 
 /// Map a TLS source executor failure (admission/run deadline or unavailable
@@ -1098,6 +1167,14 @@ pub fn append_backend_tls_pool_key_fields(
     buf.push_str(tls.san_allow_list_key_digest.as_deref().unwrap_or_default());
     buf.push('|');
     buf.push(if verify_server_cert { '1' } else { '0' });
+    // A refused destination carries no material, so without its own segment
+    // its key would equal an unconfigured destination's and could reuse a
+    // client built before the refusal. Appended only when set, so every other
+    // key is unchanged; the verify field is one character, so this segment
+    // cannot be produced by any non-refused key.
+    if tls.tls_refused {
+        buf.push_str("|tlsrefused");
+    }
     append_backend_svid_generation_key_field(buf, svid_generation);
 }
 
@@ -1419,7 +1496,21 @@ enum BackendClientAuth {
 }
 
 impl<'a> BackendTlsConfigBuilder<'a> {
+    /// Refuse a destination whose backend TLS this node refused.
+    ///
+    /// Runs before anything else on every build entry point, so the global CA,
+    /// the global client cert/key pair, and `FERRUM_TLS_NO_VERIFY` never get a
+    /// chance to stand in for the refused material.
+    pub fn check_refusal(&self) -> Result<(), TlsError> {
+        if self.proxy.resolved_tls.tls_refused {
+            record_backend_tls_refusal(BackendTlsRefusalSurface::ClientBuild);
+            return Err(TlsError::Refused);
+        }
+        Ok(())
+    }
+
     pub fn build_rustls(&self) -> Result<ClientConfig, TlsError> {
+        self.check_refusal()?;
         let builder = backend_client_config_builder(self.policy)
             .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
         self.build_rustls_with_builder(
@@ -1435,6 +1526,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
     /// policy is incompatible, fall back to rustls safe defaults for the QUIC
     /// builder only, then continue applying the normal verifier and mTLS logic.
     pub fn build_rustls_quic(&self) -> Result<ClientConfig, TlsError> {
+        self.check_refusal()?;
         let builder = match backend_client_config_builder(self.policy) {
             Ok(builder) => builder,
             Err(err) => {

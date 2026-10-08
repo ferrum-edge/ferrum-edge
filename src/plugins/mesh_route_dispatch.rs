@@ -730,6 +730,7 @@ impl From<RouteBackendTlsConfig> for BackendTlsConfig {
             sni: value.sni,
             san_allow_list: value.san_allow_list,
             san_allow_list_key_digest: None,
+            tls_refused: false,
         }
     }
 }

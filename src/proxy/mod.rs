@@ -7860,6 +7860,161 @@ fn prime_gateway_svid_rotation_baseline(
     Some((sources, tracker))
 }
 
+/// Outcome of validating every backend TLS destination before a backend TLS
+/// live reload (`FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`) publishes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BackendTlsValidationReport {
+    /// Destinations whose backend TLS built.
+    pub validated: usize,
+    /// Destinations whose backend TLS this node refused
+    /// ([`BackendTlsConfig::tls_refused`]). Already reported at slice apply,
+    /// so they are skipped without building or warning again.
+    pub refused: usize,
+    /// Destinations whose backend TLS could not build. Each is warned and
+    /// skipped; its TLS builds keep failing closed at dispatch until the
+    /// material is fixed, and every other destination still reloads.
+    pub failed: usize,
+}
+
+/// Gateway-wide inputs shared by every backend TLS validation build.
+#[derive(Clone, Copy)]
+pub struct BackendTlsValidationInputs<'a> {
+    pub policy: Option<&'a TlsPolicy>,
+    pub global_ca: Option<&'a Path>,
+    pub global_no_verify: bool,
+    pub global_client_cert: Option<&'a Path>,
+    pub global_client_key: Option<&'a Path>,
+    pub crls: &'a [rustls::pki_types::CertificateRevocationListDer<'static>],
+}
+
+impl<'a> BackendTlsValidationInputs<'a> {
+    fn builder<'b>(&self, proxy: &'b Proxy) -> BackendTlsConfigBuilder<'b>
+    where
+        'a: 'b,
+    {
+        BackendTlsConfigBuilder {
+            proxy,
+            policy: self.policy,
+            global_ca: self.global_ca,
+            global_no_verify: self.global_no_verify,
+            global_client_cert: self.global_client_cert,
+            global_client_key: self.global_client_key,
+            crls: self.crls,
+        }
+    }
+}
+
+/// Validate the backend TLS of every TLS-scheme proxy and every
+/// `mesh_route_dispatch` rule-level `backend_tls` in `config`, one destination
+/// at a time.
+///
+/// Never stops at the first failure: a destination whose material cannot build
+/// is warned and counted in [`BackendTlsValidationReport::failed`], and a
+/// refused destination is counted in [`BackendTlsValidationReport::refused`]
+/// without a build. Either way the remaining destinations are still validated,
+/// so a backend TLS live reload keeps reloading the others (issue #6105).
+pub fn validate_backend_tls_material_for_config(
+    config: &GatewayConfig,
+    inputs: BackendTlsValidationInputs<'_>,
+) -> BackendTlsValidationReport {
+    let mut report = BackendTlsValidationReport::default();
+    for proxy in config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy_backend_uses_tls(proxy))
+    {
+        if proxy.resolved_tls.tls_refused {
+            report.refused = report.refused.saturating_add(1);
+            continue;
+        }
+        match inputs.builder(proxy).build_rustls() {
+            Ok(_) => report.validated = report.validated.saturating_add(1),
+            Err(error) => {
+                report.failed = report.failed.saturating_add(1);
+                warn!(
+                    proxy_id = %crate::startup::sanitize_startup_scalar(&proxy.id),
+                    error = %crate::startup::sanitize_startup_cause(&error, &[]),
+                    "Backend TLS validation failed for this destination during backend TLS \
+                     reload; skipping it. Its TLS builds keep failing closed until the material \
+                     is fixed, and every other destination still reloads"
+                );
+            }
+        }
+    }
+    let proxy_map = config
+        .proxies
+        .iter()
+        .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
+        .collect::<HashMap<_, _>>();
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let dispatch_config = match MeshRouteDispatchConfig::from_value_normalized(&plugin.config) {
+            Ok(dispatch_config) => dispatch_config,
+            Err(error) => {
+                report.failed = report.failed.saturating_add(1);
+                warn!(
+                    plugin_id = %crate::startup::sanitize_startup_scalar(&plugin.id),
+                    error = %crate::startup::sanitize_startup_cause(&error, &[]),
+                    "mesh_route_dispatch config did not parse during backend TLS reload; \
+                     skipping its rule-level backend TLS"
+                );
+                continue;
+            }
+        };
+        let base_proxy = plugin
+            .proxy_id
+            .as_deref()
+            .and_then(|proxy_id| {
+                proxy_map
+                    .get(&(plugin.namespace.as_str(), proxy_id))
+                    .copied()
+            })
+            // Representative proxy used only to supply the ambient
+            // backend-TLS context for validating the rule's own material.
+            // Prefer one in the plugin's own namespace; fall back to any
+            // proxy so a global rule declared in a namespace that owns no
+            // proxies is still validated (it runs on every proxy anyway).
+            .or_else(|| {
+                config
+                    .proxies
+                    .iter()
+                    .find(|proxy| proxy.namespace == plugin.namespace)
+            })
+            .or_else(|| config.proxies.first());
+        let Some(base_proxy) = base_proxy else {
+            continue;
+        };
+        for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+            let Some(tls) = rule.destination.backend_tls.as_ref() else {
+                continue;
+            };
+            let mut validation_proxy = base_proxy.clone();
+            validation_proxy.id = format!(
+                "{}:mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls",
+                plugin.id
+            );
+            validation_proxy.backend_scheme = Some(BackendScheme::Https);
+            validation_proxy.resolved_tls = tls.clone();
+            match inputs.builder(&validation_proxy).build_rustls() {
+                Ok(_) => report.validated = report.validated.saturating_add(1),
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    warn!(
+                        plugin_id = %crate::startup::sanitize_startup_scalar(&plugin.id),
+                        rule = rule_idx,
+                        error = %crate::startup::sanitize_startup_cause(&error, &[]),
+                        "mesh_route_dispatch rule backend TLS validation failed during backend \
+                         TLS reload; skipping it. Every other destination still reloads"
+                    );
+                }
+            }
+        }
+    }
+    report
+}
+
 fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
     matches!(
         proxy.backend_scheme,
@@ -9608,16 +9763,11 @@ impl ProxyState {
     fn validate_backend_tls_material(
         &self,
         crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
-    ) -> Result<usize, anyhow::Error> {
+    ) -> BackendTlsValidationReport {
         let config = self.config.load_full();
-        let mut validated = 0usize;
-        for proxy in config
-            .proxies
-            .iter()
-            .filter(|proxy| proxy_backend_uses_tls(proxy))
-        {
-            BackendTlsConfigBuilder {
-                proxy,
+        validate_backend_tls_material_for_config(
+            &config,
+            BackendTlsValidationInputs {
                 policy: self.tls_policy.as_deref(),
                 global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
                 global_no_verify: self.env_config.tls_no_verify,
@@ -9632,98 +9782,8 @@ impl ProxyState {
                     .as_deref()
                     .map(Path::new),
                 crls,
-            }
-            .build_rustls()
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "backend TLS validation failed for proxy '{}': {}",
-                    proxy.id,
-                    error
-                )
-            })?;
-            validated = validated.saturating_add(1);
-        }
-        let proxy_map = config
-            .proxies
-            .iter()
-            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
-            .collect::<HashMap<_, _>>();
-        for plugin in &config.plugin_configs {
-            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-                continue;
-            }
-            let dispatch_config = MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "mesh_route_dispatch backend TLS validation failed for plugin '{}': {}",
-                        plugin.id,
-                        error
-                    )
-                })?;
-            let base_proxy = plugin
-                .proxy_id
-                .as_deref()
-                .and_then(|proxy_id| {
-                    proxy_map
-                        .get(&(plugin.namespace.as_str(), proxy_id))
-                        .copied()
-                })
-                // Representative proxy used only to supply the ambient
-                // backend-TLS context for validating the rule's own material.
-                // Prefer one in the plugin's own namespace; fall back to any
-                // proxy so a global rule declared in a namespace that owns no
-                // proxies is still validated (it runs on every proxy anyway).
-                .or_else(|| {
-                    config
-                        .proxies
-                        .iter()
-                        .find(|proxy| proxy.namespace == plugin.namespace)
-                })
-                .or_else(|| config.proxies.first());
-            let Some(base_proxy) = base_proxy else {
-                continue;
-            };
-            for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
-                let Some(tls) = rule.destination.backend_tls.as_ref() else {
-                    continue;
-                };
-                let mut validation_proxy = base_proxy.clone();
-                validation_proxy.id = format!(
-                    "{}:mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls",
-                    plugin.id
-                );
-                validation_proxy.backend_scheme = Some(BackendScheme::Https);
-                validation_proxy.resolved_tls = tls.clone();
-                BackendTlsConfigBuilder {
-                    proxy: &validation_proxy,
-                    policy: self.tls_policy.as_deref(),
-                    global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
-                    global_no_verify: self.env_config.tls_no_verify,
-                    global_client_cert: self
-                        .env_config
-                        .backend_tls_client_cert_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_client_key: self
-                        .env_config
-                        .backend_tls_client_key_path
-                        .as_deref()
-                        .map(Path::new),
-                    crls,
-                }
-                .build_rustls()
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "mesh_route_dispatch backend TLS validation failed for plugin '{}' rule {}: {}",
-                        plugin.id,
-                        rule_idx,
-                        error
-                    )
-                })?;
-                validated = validated.saturating_add(1);
-            }
-        }
-        Ok(validated)
+            },
+        )
     }
 
     fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
@@ -9731,7 +9791,10 @@ impl ProxyState {
             self.env_config.tls_crl_file_path.as_deref(),
             self.env_config.tls_crl_expiry_warning_days,
         )?;
-        let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
+        // Per-destination: a destination whose material cannot build is warned
+        // and skipped (it keeps failing closed at dispatch), so one broken or
+        // refused destination never stalls the reload for every other one.
+        let report = self.validate_backend_tls_material(active_crls.as_ref().as_slice());
         // Publish the admitted CRL generation before restarting health probes
         // so replacement tasks snapshot this exact generation. A refused
         // candidate never reaches this store, so previous verifiers,
@@ -9788,7 +9851,9 @@ impl ProxyState {
         });
 
         info!(
-            validated_backend_tls_configs = validated,
+            validated_backend_tls_configs = report.validated,
+            refused_backend_tls_configs = report.refused,
+            failed_backend_tls_configs = report.failed,
             "Backend TLS material reloaded; backend client pools and DTLS config caches were drained and stream listeners reconciled"
         );
         Ok(())
@@ -66177,6 +66242,7 @@ mod tests {
             sni: None,
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
+            tls_refused: false,
         };
 
         let sources = collect_backend_tls_watched_sources(&config, &env_config);
@@ -70814,6 +70880,7 @@ mod tests {
             sni: None,
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
+            tls_refused: false,
         };
 
         let now = chrono::Utc::now();
@@ -75150,6 +75217,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
@@ -75211,6 +75279,7 @@ mod tests {
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: HashMap::new(),
+                backend_tls_refused: false,
                 dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: chrono::Utc::now(),
@@ -75829,6 +75898,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: Some(UpstreamPortOverride {
                 max_retries: Some(2),
                 h2_max_concurrent_streams: Some(64),
@@ -75906,6 +75976,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: Some(UpstreamPortOverride {
                 // Top-level overlay: a CONFLICTING pending cap + retries (must NOT
                 // override the per-port values) and an inherited-only idleTimeout.

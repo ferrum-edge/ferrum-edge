@@ -26,6 +26,22 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.15
+
+**Backend TLS live reload goes ahead past a destination that fails to build
+(issue [#6105](https://github.com/ferrum-edge/ferrum-edge/issues/6105)).** With
+`FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` (the default), a reload used to be
+refused as soon as one destination's backend TLS could not build: every
+destination kept its previously loaded material and a rotated CRL did not take
+effect. Each destination is now validated on its own. One that fails is logged
+as a warning and skipped, and the reload goes ahead for the others.
+
+The skipped destination does not keep its old material. The reload drains every
+backend client pool and TLS config cache, so its new TLS connections fail until
+its material is fixed. After rotating backend certificates, check the reload
+log line (`failed_backend_tls_configs`) and the per-destination warnings. A CRL
+file that fails to load still refuses the whole reload, as before.
+
 ## Upgrading to 0.9.15
 
 0.9.15 (2026-10-08 UTC) is cut from main
