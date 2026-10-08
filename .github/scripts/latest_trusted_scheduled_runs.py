@@ -7,9 +7,12 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
+import urllib.error
+import urllib.request
 from typing import Any
+
+API_ROOT = "https://api.github.com"
 
 
 def select_runs(
@@ -126,18 +129,22 @@ def main(argv: list[str]) -> int:
     if not re.fullmatch(r"[0-9a-f]{40}", args.current_sha):
         raise SystemExit("--current-sha must be a full commit id")
     workflow_path = f".github/workflows/{args.workflow}"
-    endpoint = (
-        f"repos/{repository}/actions/workflows/{args.workflow}/runs"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", args.workflow):
+        raise SystemExit("--workflow must be a workflow file name")
+    url = (
+        f"{API_ROOT}/repos/{repository}/actions/workflows/{args.workflow}/runs"
         "?branch=main&event=schedule&per_page=100"
     )
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("X-GitHub-Api-Version", "2022-11-28")
+    request.add_header("User-Agent", "ferrum-edge-trusted-scheduled-runs")
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
     try:
-        response = subprocess.run(
-            ["gh", "api", endpoint],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        payload = json.loads(response.stdout)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
         selected = select_runs(
             payload,
             repository=repository,
@@ -145,7 +152,7 @@ def main(argv: list[str]) -> int:
             current_sha=args.current_sha,
             limit=args.limit,
         )
-    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError) as exc:
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         print(
             f"::warning::Could not load trusted scheduled-run history; starting fresh: {exc}",
             file=sys.stderr,
