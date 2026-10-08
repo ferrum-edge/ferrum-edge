@@ -5,8 +5,19 @@ use serde::Serialize;
 pub struct BenchMetrics {
     histogram: Histogram<u64>,
     pub total_requests: u64,
+    /// Every failed operation, including the setup failures and timeouts
+    /// counted separately below.
     pub total_errors: u64,
     pub total_bytes: u64,
+    /// TCP connect, TLS, or protocol handshakes that failed or timed out.
+    pub setup_errors: u64,
+    /// Setup steps or requests that exceeded the request timeout.
+    pub timeouts: u64,
+    /// Workers (one per unit of concurrency) that reached the measurement loop.
+    pub workers_measured: u64,
+    /// Workers that panicked or were cancelled at the drain deadline; their
+    /// samples are lost.
+    pub worker_failures: u64,
 }
 
 impl Default for BenchMetrics {
@@ -24,6 +35,10 @@ impl BenchMetrics {
             total_requests: 0,
             total_errors: 0,
             total_bytes: 0,
+            setup_errors: 0,
+            timeouts: 0,
+            workers_measured: 0,
+            worker_failures: 0,
         }
     }
 
@@ -39,12 +54,76 @@ impl BenchMetrics {
         self.total_errors += 1;
     }
 
+    /// Record a failed connect, TLS, or protocol handshake.
+    pub fn record_setup_error(&mut self) {
+        self.total_errors += 1;
+        self.setup_errors += 1;
+    }
+
+    /// Record a setup step that exceeded the request timeout.
+    pub fn record_setup_timeout(&mut self) {
+        self.record_setup_error();
+        self.timeouts += 1;
+    }
+
+    /// Record a request that exceeded the request timeout.
+    pub fn record_timeout(&mut self) {
+        self.total_errors += 1;
+        self.timeouts += 1;
+    }
+
+    /// Record that one worker reached the measurement loop.
+    pub fn mark_measuring(&mut self) {
+        self.workers_measured += 1;
+    }
+
+    /// Record a worker that panicked or never finished; its samples are lost.
+    pub fn record_worker_failure(&mut self) {
+        self.worker_failures += 1;
+    }
+
     /// Merge another metrics instance into this one.
     pub fn merge(&mut self, other: &BenchMetrics) {
         let _ = self.histogram.add(&other.histogram);
         self.total_requests += other.total_requests;
         self.total_errors += other.total_errors;
         self.total_bytes += other.total_bytes;
+        self.setup_errors += other.setup_errors;
+        self.timeouts += other.timeouts;
+        self.workers_measured += other.workers_measured;
+        self.worker_failures += other.worker_failures;
+    }
+
+    /// Why this run cannot stand as a measurement at `concurrency`; empty when
+    /// it can. A run is valid only when every worker measured, nothing failed
+    /// to set up, stalled, or was lost, and at least one request completed.
+    pub fn invalid_reasons(&self, concurrency: u64) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.setup_errors > 0 {
+            reasons.push(format!("{} setup failures", self.setup_errors));
+        }
+        if self.timeouts > 0 {
+            reasons.push(format!(
+                "{} operations exceeded the request timeout",
+                self.timeouts
+            ));
+        }
+        if self.worker_failures > 0 {
+            reasons.push(format!(
+                "{} workers panicked or were cancelled at the drain deadline",
+                self.worker_failures
+            ));
+        }
+        if self.workers_measured < concurrency {
+            reasons.push(format!(
+                "only {} of {concurrency} workers reached measurement",
+                self.workers_measured
+            ));
+        }
+        if self.total_requests == 0 {
+            reasons.push("no request completed".to_string());
+        }
+        reasons
     }
 
     /// Generate a wrk-like text report.
@@ -104,10 +183,11 @@ impl BenchMetrics {
              \x20    99%    {}\n\
              \n\
              \x20 {} requests in {:.2}s, {:.2}MB read\n\
-             \x20 Errors: {}\n\
+             \x20 Errors: {} (setup {}, timeouts {})\n\
+             \x20 Workers measured: {}/{concurrency}\n\
              \n\
              Requests/sec:  {:.2}\n\
-             Transfer/sec:      {:.2}MB",
+             Transfer/sec:      {:.2}MB{}",
             format_duration_us(avg),
             format_duration_us(stdev),
             format_duration_us(max),
@@ -120,8 +200,15 @@ impl BenchMetrics {
             duration_secs as f64,
             throughput_mb,
             self.total_errors,
+            self.setup_errors,
+            self.timeouts,
+            self.workers_measured,
             rps,
             throughput_per_sec,
+            match self.invalid_reasons(concurrency) {
+                reasons if reasons.is_empty() => String::new(),
+                reasons => format!("\n\nINVALID: {}", reasons.join("; ")),
+            },
         )
     }
 
@@ -144,6 +231,7 @@ impl BenchMetrics {
             0.0
         };
 
+        let invalid_reasons = self.invalid_reasons(concurrency);
         BenchReport {
             protocol: protocol.to_string(),
             content_type: String::new(),
@@ -163,6 +251,13 @@ impl BenchMetrics {
             p99_us: self.histogram.value_at_quantile(0.99),
             total_bytes: self.total_bytes,
             throughput_mbps,
+            setup_errors: self.setup_errors,
+            timeouts: self.timeouts,
+            workers_expected: concurrency,
+            workers_measured: self.workers_measured,
+            worker_failures: self.worker_failures,
+            valid: invalid_reasons.is_empty(),
+            invalid_reasons,
         }
     }
 }
@@ -188,6 +283,15 @@ pub struct BenchReport {
     pub p99_us: u64,
     pub total_bytes: u64,
     pub throughput_mbps: f64,
+    pub setup_errors: u64,
+    pub timeouts: u64,
+    pub workers_expected: u64,
+    pub workers_measured: u64,
+    pub worker_failures: u64,
+    /// False when the run cannot stand as a measurement at `concurrency`;
+    /// `invalid_reasons` says why.
+    pub valid: bool,
+    pub invalid_reasons: Vec<String>,
 }
 
 /// Format microseconds into a human-readable duration string.

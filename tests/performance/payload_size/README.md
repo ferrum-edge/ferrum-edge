@@ -96,6 +96,28 @@ tier or protocol group; run it explicitly with `bash run_payload_test.sh sse`.
 | `--json` | false | Machine-readable JSON output |
 | `--results-dir <DIR>` | ./results | Where to write JSON results |
 
+### Run validity
+
+`payload_bench` bounds every connection setup and every request, including its
+response body, by `--request-timeout <SECS>` (default 30). A request still
+running when `--duration` ends gets one more request timeout to finish. A
+worker still running after that is cancelled, so a stalled peer cannot hang
+the run.
+
+A run is **invalid** when any of these happen:
+
+- a setup fails or times out;
+- a request times out;
+- a worker panics or is cancelled;
+- fewer workers than `--concurrency` reach measurement;
+- no request completes.
+
+An invalid run still prints its report, with `"valid": false`, the
+`invalid_reasons`, and the `setup_errors`, `timeouts`, `workers_expected`,
+`workers_measured` and `worker_failures` counts. It then exits with status 2.
+`run_payload_test.sh` keeps that report, marks the row `INVALID`, and never
+declares a winner from an invalid run.
+
 ## Port conflicts and cleanup
 
 `run_payload_test.sh` requires `lsof` and refuses to start if any of its fixed

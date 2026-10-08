@@ -400,7 +400,11 @@ run_bench() {
     local json_flag="--json"
     local bench_ct="${ct%%:*}"
 
-    "$BENCH_BIN" "$bench_ct" \
+    # An invalid run exits 2 but still prints its report; keep it so the
+    # table and saved results show why. Only a run with no report at all falls
+    # back to the zero placeholder, which is itself marked invalid.
+    local result
+    result=$("$BENCH_BIN" "$bench_ct" \
         --target "$target" \
         --size "$size" \
         --duration "$DURATION" \
@@ -408,7 +412,17 @@ run_bench() {
         --size-label "$size" \
         $extra_flags \
         $json_flag \
-        2>/dev/null || echo '{"rps":0,"p50_us":0,"p99_us":0,"throughput_mbps":0,"total_errors":0}'
+        2>/dev/null) || true
+    if [ -n "$result" ]; then
+        echo "$result"
+    else
+        echo '{"rps":0,"p50_us":0,"p99_us":0,"throughput_mbps":0,"total_errors":0,"valid":false,"invalid_reasons":["payload_bench produced no report"]}'
+    fi
+}
+
+# Whether a bench report is a valid measurement (prints true/false).
+bench_valid() {
+    echo "$1" | python3 -c "import sys,json; print(str(json.load(sys.stdin).get('valid', False)).lower())" 2>/dev/null || echo "false"
 }
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
@@ -541,6 +555,7 @@ run_standard_test() {
             gw_p99=$(extract_json_field "$gw_result" "p99_us")
             gw_throughput=$(extract_json_field "$gw_result" "throughput_mbps")
             gw_errors=$(extract_json_field "$gw_result" "total_errors")
+            [ "$(bench_valid "$gw_result")" = true ] || gw_errors="$gw_errors INVALID"
 
             local direct_rps="N/A"
             local overhead="N/A"
@@ -645,7 +660,10 @@ run_envoy_comparison() {
             # ── Compare ──
             local winner="TIE"
             local overhead="0.0%"
-            if [ "$(echo "$fe_rps > $ev_rps" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+            if [ "$(bench_valid "$fe_result")" != true ] || [ "$(bench_valid "$ev_result")" != true ]; then
+                winner="INVALID"
+                overhead="N/A"
+            elif [ "$(echo "$fe_rps > $ev_rps" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
                 winner="FERRUM"
                 if [ "$(echo "$ev_rps > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
                     overhead=$(printf "+%.1f%%" "$(echo "(($fe_rps - $ev_rps) / $ev_rps) * 100" | bc -l 2>/dev/null || echo 0)")

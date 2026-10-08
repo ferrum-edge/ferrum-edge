@@ -1,8 +1,9 @@
 # Hosted execution gate for the multi-protocol benchmark harness's own tests.
 #
-# `tests/performance/multi_protocol/` is a standalone package with its own
-# manifest and lockfile rather than a workspace member, so nothing it contains
-# is ever built or run by the workspace `Tests` aggregate. Without this lane the
+# `tests/performance/multi_protocol/` and `tests/performance/payload_size/` are
+# standalone packages with their own manifests and lockfiles rather than
+# workspace members, so nothing they contain is ever built or run by the
+# workspace `Tests` aggregate. Without this lane the
 # harness's tests are documentation: the worker-accounting tests in
 # `tests/metrics_tests.rs` and the sample/scenario validity rules in
 # `tests/test_benchmark_validity.py` decide whether a benchmark observation may
@@ -81,6 +82,15 @@ jobs:
         run: |
           cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml \
             --locked --test metrics_tests
+
+      # `payload_bench` against controlled HTTP/2 peers: stalled setups,
+      # headers and bodies end as invalid runs instead of hanging, and setup
+      # failures are never a clean zero-work result (#6071, #6072).
+      - name: Run the payload bench completion-contract tests
+        if: always()
+        run: |
+          cargo test --manifest-path tests/performance/payload_size/Cargo.toml \
+            --locked --test bench_bounds_tests
 
       # Last, and unconditional, so a failed compile above still reports the
       # validity verdict instead of hiding it behind a skipped step.
