@@ -88,16 +88,12 @@ async fn dpop_capacity_is_charged_to_token_principal_across_proof_keys() {
         (b"key-a".as_slice(), b"proof-1".as_slice()),
         (b"key-b".as_slice(), b"proof-2".as_slice()),
     ] {
-        let marker = replay_domain.marker_with_principal(
-            &[jkt, jti],
-            &[b"issuer", b"service-account"],
-        );
+        let marker =
+            replay_domain.marker_with_principal(&[jkt, jti], &[b"issuer", b"service-account"]);
         assert_eq!(authority.admit(&marker).await, ReplayAdmission::Admitted);
     }
-    let over_quota = replay_domain.marker_with_principal(
-        &[b"key-c", b"proof-3"],
-        &[b"issuer", b"service-account"],
-    );
+    let over_quota = replay_domain
+        .marker_with_principal(&[b"key-c", b"proof-3"], &[b"issuer", b"service-account"]);
     assert_eq!(
         authority.admit(&over_quota).await,
         ReplayAdmission::CapacityRefused
