@@ -1363,6 +1363,7 @@ jobs:
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
+              integration::http3_quic_admission_tests
               integration::mesh_h3_plain_ws_bridge_tests
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests

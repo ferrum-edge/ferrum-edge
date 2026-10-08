@@ -2707,6 +2707,39 @@ fn test_http3_initial_mtu_from_env() {
 }
 
 #[test]
+fn test_http3_max_unvalidated_handshakes_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_max_unvalidated_handshakes, 1024);
+        },
+    );
+}
+
+/// `0` is accepted and means "send a Retry to every unvalidated client".
+#[test]
+fn test_http3_max_unvalidated_handshakes_from_env() {
+    for (raw, expected) in [("0", 0usize), ("64", 64usize)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES", raw),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.http3_max_unvalidated_handshakes, expected);
+            },
+        );
+    }
+}
+
+#[test]
 fn test_http3_initial_mtu_below_min_rejected() {
     with_env_vars(
         &[

@@ -81,6 +81,7 @@ mod hbone_inner_pool_tests;
 mod hbone_pool_width_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
+mod http3_quic_admission_tests;
 mod injector_admission_tests;
 mod k8s_controller_gateway_status_tests;
 mod k8s_controller_gatewayclass_authority_tests;
