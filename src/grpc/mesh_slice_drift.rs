@@ -583,6 +583,7 @@ impl MeshSliceDriftRegistry {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_session_inner(
         &self,
         node_id: &str,

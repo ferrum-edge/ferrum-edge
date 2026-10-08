@@ -568,6 +568,7 @@ impl MeshGrpcServer {
     /// config and every later update, exactly like a remote-discovery one-shot
     /// — instead of refusing the subscription. Diagnostics carry only the
     /// closed-set field label, never caller-supplied bytes.
+    #[allow(clippy::too_many_arguments)]
     fn open_drift_session(
         &self,
         node_id: &str,

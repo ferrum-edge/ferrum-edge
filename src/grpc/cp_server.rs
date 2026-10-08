@@ -107,7 +107,7 @@ fn bounded_log_value(value: &str) -> String {
             character.to_string()
         };
         if output.len().saturating_add(escaped.len()) > 128 {
-            output.push_str("…");
+            output.push('…');
             break;
         }
         output.push_str(&escaped);
