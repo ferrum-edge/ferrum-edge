@@ -119,7 +119,10 @@ fn refused_destination_errors_under_no_verify_with_a_global_ca_and_client_pair()
         "the HTTP/3 builder must refuse too"
     );
     assert!(
-        matches!(builder.build_rustls_for_reqwest(true), Err(TlsError::Refused)),
+        matches!(
+            builder.build_rustls_for_reqwest(true),
+            Err(TlsError::Refused)
+        ),
         "the reqwest builder must refuse too"
     );
     assert!(builder.build_reqwest().is_err());
@@ -150,7 +153,10 @@ fn refused_destination_errors_with_verification_on_and_a_global_ca() {
 fn refusal_error_names_no_material() {
     let rendered = TlsError::Refused.to_string();
     assert!(rendered.contains("refused"), "got: {rendered}");
-    assert!(!rendered.contains('/'), "the refusal must not echo a path: {rendered}");
+    assert!(
+        !rendered.contains('/'),
+        "the refusal must not echo a path: {rendered}"
+    );
 }
 
 #[test]
@@ -271,8 +277,14 @@ fn live_reload_validation_skips_a_failing_destination_and_validates_the_rest() {
         },
     );
 
-    assert_eq!(report.failed, 1, "the broken destination is skipped: {report:?}");
-    assert_eq!(report.refused, 1, "the refused destination is skipped: {report:?}");
+    assert_eq!(
+        report.failed, 1,
+        "the broken destination is skipped: {report:?}"
+    );
+    assert_eq!(
+        report.refused, 1,
+        "the refused destination is skipped: {report:?}"
+    );
     assert_eq!(
         report.validated, 1,
         "the destination after the failure is still validated: {report:?}"

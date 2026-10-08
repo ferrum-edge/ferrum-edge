@@ -29501,7 +29501,10 @@ mod tests {
             .get("v1")
             .and_then(|resolved| resolved.tls.as_ref())
             .expect("v1 subset keeps a resolved TLS slot");
-        assert!(subset_tls.tls_refused, "the subset scope must fail closed too");
+        assert!(
+            subset_tls.tls_refused,
+            "the subset scope must fail closed too"
+        );
         assert!(
             subset_tls.server_ca_cert_path.is_none(),
             "the subset scope must not keep the escaping reference"
