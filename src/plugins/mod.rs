@@ -3526,6 +3526,16 @@ pub struct RequestContext {
     /// path could not resolve one; the guard then admits no own-pod
     /// destination and falls back to the termination inventory alone.
     pub mesh_inbound_terminator_ip: Option<std::net::IpAddr>,
+    /// Whether this request is a mesh CONNECT (byte-stream or datagram HBONE)
+    /// whose payload the proxy relays opaquely instead of parsing.
+    ///
+    /// The CONNECT's own method, path, authority, headers and request
+    /// credentials describe the tunnel, not the application requests written
+    /// into it, so `mesh_authz` must treat every HTTP-only attribute as
+    /// unobservable for it. Set by the proxy from the request's wire shape
+    /// before any plugin runs; it can only be set, never cleared, so no plugin
+    /// can return a relay to ordinary HTTP evaluation.
+    hbone_connect_relay: bool,
     /// Set exactly once by `run_finalized_request_egress_hooks` when the
     /// finalized-request-egress phase has run for this request. The phase is
     /// reachable from several dispatch ladders (H1/H2 terminal preparation,
@@ -4165,6 +4175,7 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
             mesh_inbound_terminator_ip: None,
+            hbone_connect_relay: false,
             finalized_request_egress_dispatched: false,
         }
     }
@@ -5780,6 +5791,7 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
             mesh_inbound_terminator_ip: self.mesh_inbound_terminator_ip,
+            hbone_connect_relay: self.hbone_connect_relay,
             // The finalized-request-egress phase always runs against the REAL
             // request context (mirror admission leases, mirror result
             // receivers, and serverless terminate provenance all live there and
@@ -6909,6 +6921,18 @@ impl RequestContext {
     /// authorization-lifetime authentication predicate.
     pub fn has_certificate_spiffe_principal(&self) -> bool {
         self.peer_spiffe_certificate_principal
+    }
+
+    /// Whether this request is a mesh CONNECT whose payload is relayed
+    /// opaquely (see the `hbone_connect_relay` field).
+    pub fn is_hbone_connect_relay(&self) -> bool {
+        self.hbone_connect_relay
+    }
+
+    /// Mark this request as a mesh CONNECT whose payload is relayed opaquely.
+    /// There is deliberately no way to clear the mark.
+    pub fn mark_hbone_connect_relay(&mut self) {
+        self.hbone_connect_relay = true;
     }
 
     /// Admit a certificate-derived peer SPIFFE principal together with the

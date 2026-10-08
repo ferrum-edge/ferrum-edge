@@ -963,6 +963,40 @@ mod live_datapath {
     }
 
     #[tokio::test]
+    async fn a_connect_relay_is_refused_without_asking_the_provider() {
+        // The requests inside a relayed CONNECT are opaque bytes, so a
+        // delegation cannot judge them. Asking the provider about the CONNECT
+        // would authorize the tunnel, not the requests written into it, so a
+        // matched delegation refuses it outright.
+        let stub = start_status_stub(200).await;
+        let plugin = plugin(slice_json(stub.port, None, false)).expect("generation builds");
+        let mut ctx = ctx("/");
+        ctx.method = "CONNECT".to_string();
+        ctx.mark_hbone_connect_relay();
+        match plugin.authorize(&mut ctx).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+            other => panic!("a relayed CONNECT must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.metadata
+                .get("mesh_authz.ext_authz_outcome")
+                .map(String::as_str),
+            Some("unexecutable")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh_authz.deny_policy")
+                .map(String::as_str),
+            Some("custom:delegate-admin")
+        );
+        assert_eq!(
+            stub.calls.load(Ordering::SeqCst),
+            0,
+            "the provider must not be asked about the tunnel"
+        );
+    }
+
+    #[tokio::test]
     async fn a_denying_provider_rejects_in_the_authorize_phase() {
         let stub = start_status_stub(401).await;
         let plugin = plugin(slice_json(stub.port, None, false)).expect("generation builds");

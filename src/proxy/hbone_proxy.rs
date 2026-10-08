@@ -349,7 +349,13 @@ pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
     }
 }
 
+/// Tag a byte-stream HBONE CONNECT. Besides the metadata, this marks the
+/// request as an opaque relay so `mesh_authz` judges it on what the CONNECT
+/// can actually show (peer identity, destination, port) and never on its own
+/// method, path, authority or headers, which say nothing about the requests
+/// written into the tunnel.
 pub(super) fn tag_request_metadata(ctx: &mut RequestContext) {
+    ctx.mark_hbone_connect_relay();
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
     ctx.metadata.insert(
@@ -377,6 +383,7 @@ pub(super) use crate::modes::mesh::hbone::HBONE_DATAGRAM_METADATA_KEY;
 /// only observability reads; the relay-dispatch branch keys off
 /// `is_udp_hbone_connect` (the wire marker), not this metadata (codex r5 P1).
 pub(super) fn tag_udp_request_metadata(ctx: &mut RequestContext) {
+    ctx.mark_hbone_connect_relay();
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
     ctx.metadata.insert(
