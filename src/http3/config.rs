@@ -361,6 +361,13 @@ pub struct Http3ServerConfig {
     /// quinn uses path-MTU black-hole detection to back off if a smaller MTU
     /// is required. Default: 1500. Legal range: [1200, 65527].
     pub initial_mtu: u16,
+
+    /// Concurrent frontend QUIC handshakes the listener runs for clients whose
+    /// source address has not been validated
+    /// (`FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES`). Further unvalidated
+    /// Initials are answered with a stateless Retry; `0` sends a Retry to every
+    /// unvalidated client. See [`crate::http3::address_validation`].
+    pub max_unvalidated_handshakes: usize,
 }
 
 impl Http3ServerConfig {
@@ -378,6 +385,7 @@ impl Http3ServerConfig {
             backend_send_window: env.http3_backend_send_window,
             initial_mtu: env.http3_initial_mtu,
             handshake_timeout: Duration::from_secs(env.frontend_tls_handshake_timeout_seconds),
+            max_unvalidated_handshakes: env.http3_max_unvalidated_handshakes,
         }
     }
 
@@ -411,8 +419,57 @@ impl Default for Http3ServerConfig {
             // Default mirrors `EnvConfig::default().frontend_tls_handshake_timeout_seconds`
             // (10 seconds). `Duration::ZERO` here would silently disable the bound.
             handshake_timeout: Duration::from_secs(10),
+            max_unvalidated_handshakes:
+                crate::http3::address_validation::H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT,
         }
     }
+}
+
+/// Turn off the QUIC DATAGRAM extension (RFC 9221) on a transport config.
+///
+/// quinn enables DATAGRAM receive by default and advertises
+/// `max_datagram_frame_size` to every peer, yet nothing in Ferrum reads QUIC
+/// datagrams: the HTTP/3 profile never negotiates `SETTINGS_H3_DATAGRAM`, and
+/// RFC 9298 CONNECT-UDP carries HTTP Datagrams as capsules on the request
+/// stream. A receive queue nobody drains is retained until the connection
+/// closes, and QUIC flow control does not cover DATAGRAM frames. Disabling the
+/// extension stops advertising it, and quinn closes a connection whose peer
+/// sends a DATAGRAM frame anyway with `PROTOCOL_VIOLATION`.
+///
+/// Both the frontend listener and every backend pool connection install this.
+pub fn disable_quic_datagrams(transport_config: &mut quinn::TransportConfig) {
+    transport_config.datagram_receive_buffer_size(None);
+}
+
+/// Build the `quinn::TransportConfig` the HTTP/3 **frontend** listener installs.
+///
+/// Used at startup and on every frontend TLS reload, so the transport tuning
+/// for untrusted clients is derived in exactly one place.
+pub fn build_frontend_transport_config(
+    h3_config: &Http3ServerConfig,
+) -> Result<quinn::TransportConfig, anyhow::Error> {
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.initial_mtu(h3_config.initial_mtu);
+    transport_config.max_idle_timeout(Some(
+        h3_config
+            .frontend_idle_timeout
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
+    ));
+    transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
+
+    // QUIC flow-control tuning — conservative defaults for untrusted clients.
+    transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.stream_receive_window,
+        crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
+    ));
+    transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.receive_window,
+        crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
+    ));
+    transport_config.send_window(h3_config.send_window);
+    disable_quic_datagrams(&mut transport_config);
+    Ok(transport_config)
 }
 
 /// The QUIC transport parameters every HTTP/3 **backend** pool connection
@@ -486,6 +543,7 @@ impl H3BackendTransportParams {
         transport_config.receive_window(self.receive_window);
         transport_config.send_window(self.send_window);
         transport_config.max_idle_timeout(self.max_idle_timeout);
+        disable_quic_datagrams(transport_config);
     }
 }
 

@@ -509,3 +509,98 @@ fn every_backend_window_constant_has_a_runtime_consumer() {
         "H3_SEND_WINDOW_DEFAULT has no runtime consumer: {rendered}"
     );
 }
+
+/// quinn enables QUIC DATAGRAM receive by default. Pinned so the two
+/// assertions below cannot pass vacuously if that default ever changes.
+#[test]
+fn quinn_default_transport_enables_datagram_receive() {
+    let rendered = format!("{:?}", quinn::TransportConfig::default());
+    assert!(
+        rendered.contains("datagram_receive_buffer_size: Some("),
+        "quinn's default transport no longer enables DATAGRAM receive: {rendered}"
+    );
+}
+
+/// The frontend listener serves untrusted clients and never reads QUIC
+/// datagrams, so it must not advertise the extension: an undrained receive
+/// queue is retained for the connection's lifetime outside flow control.
+#[test]
+fn frontend_transport_config_disables_quic_datagrams() {
+    use ferrum_edge::http3::config::build_frontend_transport_config;
+
+    let transport = build_frontend_transport_config(&Http3ServerConfig::default())
+        .expect("buildable transport config");
+    let rendered = format!("{transport:?}");
+
+    assert!(
+        rendered.contains("datagram_receive_buffer_size: None"),
+        "frontend QUIC transport must disable DATAGRAM receive: {rendered}"
+    );
+}
+
+/// Backend pool connections share the parity: no H3 backend path reads QUIC
+/// datagrams either.
+#[test]
+fn backend_transport_config_disables_quic_datagrams() {
+    use ferrum_edge::http3::config::build_backend_transport_config;
+
+    let transport = build_backend_transport_config(&Http3ServerConfig::default())
+        .expect("buildable transport config");
+    let rendered = format!("{transport:?}");
+
+    assert!(
+        rendered.contains("datagram_receive_buffer_size: None"),
+        "backend QUIC transport must disable DATAGRAM receive: {rendered}"
+    );
+}
+
+/// The frontend transport builder still installs the configured untrusted-client
+/// tuning after moving out of the listener.
+#[test]
+fn frontend_transport_config_installs_the_configured_parameters() {
+    use ferrum_edge::http3::config::build_frontend_transport_config;
+
+    let config = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_idle_timeout: 45,
+        http3_max_streams: 250,
+        http3_stream_receive_window: 131_072,
+        http3_receive_window: 1_048_576,
+        http3_send_window: 524_288,
+        ..Default::default()
+    });
+
+    let transport = build_frontend_transport_config(&config).expect("buildable transport config");
+    let rendered = format!("{transport:?}");
+
+    for expected in [
+        "max_concurrent_bidi_streams: 250",
+        "max_idle_timeout: Some(45000)",
+        "stream_receive_window: 131072",
+        "receive_window: 1048576",
+        "send_window: 524288",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "frontend transport is missing `{expected}`: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn max_unvalidated_handshakes_flows_from_env_config() {
+    use ferrum_edge::http3::address_validation::H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT;
+
+    assert_eq!(
+        Http3ServerConfig::default().max_unvalidated_handshakes,
+        H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT
+    );
+    assert_eq!(
+        Http3ServerConfig::from_env_config(&EnvConfig::default()).max_unvalidated_handshakes,
+        H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT
+    );
+    let config = Http3ServerConfig::from_env_config(&EnvConfig {
+        http3_max_unvalidated_handshakes: 0,
+        ..Default::default()
+    });
+    assert_eq!(config.max_unvalidated_handshakes, 0);
+}

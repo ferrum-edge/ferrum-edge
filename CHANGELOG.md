@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **HTTP/3 validates QUIC client addresses before charging the shared
+  connection budget, and no longer advertises QUIC datagrams** (#PR_NUMBER).
+  Handshakes from clients whose source address has not been validated now run
+  inside a per-listener budget, `FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES`
+  (default `1024`), and count toward the overload connection budget only once
+  they complete. When that budget is full, further unvalidated clients receive
+  a stateless QUIC Retry and are admitted after echoing its token (one extra
+  round trip); `0` retries every unvalidated client. Clients holding a token
+  from an earlier connection are unaffected, and the 0.5-RTT early-data path is
+  now reserved for validated clients. The HTTP/3 listener and backend pools also
+  stop advertising the QUIC DATAGRAM extension, which nothing in the gateway
+  reads; a peer that sends a DATAGRAM frame anyway is closed with
+  `PROTOCOL_VIOLATION`. See [docs/http3.md](docs/http3.md#quic-address-validation-and-handshake-admission).
+
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already

@@ -1,5 +1,6 @@
 //! HTTP/3 (QUIC) server and client support for Ferrum Edge
 
+pub mod address_validation;
 pub mod client;
 pub mod config;
 pub mod connect_udp;
