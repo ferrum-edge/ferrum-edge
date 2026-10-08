@@ -163,7 +163,9 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   [`docs/node_agent_security.md`](node_agent_security.md): on kernel ≥ 5.8
 >   `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`; on the 5.7.x window `CAP_SYS_ADMIN`
 >   (+ `CAP_NET_ADMIN`), because `CAP_BPF`/`CAP_PERFMON` did not exist until 5.8.
->   The chart also adds `CAP_SYS_ADMIN` for `node_waypoint` mode. Enrollment does
+>   The chart adds `CAP_SYS_ADMIN` only for that window
+>   (`nodeAgent.security.dropCapSysAdmin=false`), in every proxy mode, and
+>   renders no `hostPID` for the node agent. Enrollment does
 >   not enter pod network namespaces: it resolves the host-side veth from an
 >   exact `/32` or `/128` host route to the pod address whose device is a
 >   dedicated host-side peer, and refuses a pod reachable only through a shared
@@ -327,8 +329,8 @@ ambient `FERRUM_MESH_TOPOLOGY=node_waypoint` requires
 `nodeAgent.proxyMode=node_waypoint`, and node-agent `proxyMode=node_waypoint`
 requires the matching ambient proxy.
 
-For NodeWaypoint, the ambient proxy also needs host access normally associated
-with the node-agent: `hostPID: true`, a read-only host cgroup mount, a read-only
+For NodeWaypoint, the ambient proxy needs host access the node-agent itself does
+not take: `hostPID: true`, a read-only host cgroup mount, a read-only
 host bpffs mount, and `BPF`/`PERFMON`/`SYS_ADMIN`/`SYS_PTRACE` capabilities.
 The proxy uses the cgroup mount plus host `/proc` to resolve each registered
 pod's live network namespace, `SYS_PTRACE` for the kernel's
@@ -481,12 +483,13 @@ both refused.
 This placement enters no namespace, so the host UDP path needs `NET_ADMIN` and
 the capture tools but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`; the chart
 narrows the ambient DaemonSet's capabilities accordingly while retaining its
-baseline `NET_RAW`. It keeps the registry hostPath and the read-only host cgroup
-mount (the enrolled-pod set and interface resolution use them), and falls back to
-the host route table keyed on the registry-published pod IP when host `/proc` is
-not shared — `/proc/net/route` for a v4 address and `/proc/net/ipv6_route` for a
-v6 one, so an **IPv6-only** enrolled pod resolves on this path too rather than
-being refused for want of an address it does not have. The fallback accepts only
+baseline `NET_RAW`. It keeps the registry hostPath (the enrolled-pod set and the
+registry-published pod addresses) and the read-only host cgroup mount, and
+resolves each pod's host-side interface only from the host route table keyed on
+the registry-published pod IP — `/proc/net/route` for a v4 address and
+`/proc/net/ipv6_route` for a v6 one, so an **IPv6-only** enrolled pod resolves on
+this path too rather than being refused for want of an address it does not have.
+A pod's own `/proc` or sysfs view is never consulted. The lookup accepts only
 an unambiguous `/32` or `/128` host route, and sysfs must identify the resolved
 device as a distinct peer rather than a self-linked bridge/uplink. A broader
 route through a shared bridge is refused because it is not per-pod interface

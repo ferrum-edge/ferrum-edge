@@ -1776,9 +1776,9 @@ impl HostUdpCaptureBackend for ProxyHostUdpBackend {
         // enrolled workload and cannot establish host-veth ownership.
         //
         // BOTH families are tried, and that is load-bearing rather than tidiness:
-        // on the intended deployment (no `hostPID`, so the cgroup/`/proc` view is
-        // unavailable) the route table is the ONLY resolver, so a v4-only
-        // fallback would refuse every IPv6-only enrolled pod while this path
+        // the route table is the ONLY resolver (no pod PID or per-pod `/proc`
+        // view is ever consulted), so a v4-only lookup would refuse every
+        // IPv6-only enrolled pod while this path
         // claims dual-stack support. v4 is tried first so a dual-stack pod keeps
         // resolving exactly as before.
         let name = target

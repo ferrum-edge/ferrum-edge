@@ -991,9 +991,32 @@ def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
     ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
     node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
     for name, doc in (("ambient", ambient), ("node-agent", node_agent)):
-        for cap in ("BPF", "PERFMON", "SYS_ADMIN"):
+        for cap in ("BPF", "PERFMON"):
             _unquoted_cap(doc, cap, name)
+    _unquoted_cap(ambient, "SYS_ADMIN", "ambient")
     _unquoted_cap(ambient, "SYS_PTRACE", "ambient")
+    _unquoted_cap(node_agent, "NET_ADMIN", "node-agent")
+    # Issue #6112: the node-agent resolves veths from host routes and host
+    # sysfs and never enters a pod netns, so NodeWaypoint must not widen it with
+    # SYS_ADMIN or pod-scoped hostPID. Only the ambient proxy keeps them.
+    if re.search(r'(?m)^\s*- "?SYS_ADMIN"?\s*$', node_agent):
+        fail(
+            "node-agent SYS_ADMIN granted",
+            "NodeWaypoint must not add SYS_ADMIN to the node-agent; it is only the "
+            "kernel < 5.8 dropCapSysAdmin=false back-compat grant",
+        )
+    forbid_text(
+        node_agent,
+        "hostPID:",
+        "node-agent hostPID granted",
+        "the node-agent reads no per-pod /proc state and must not render hostPID",
+    )
+    require_text(
+        ambient,
+        "hostPID: true",
+        "NodeWaypoint ambient hostPID missing",
+        "the NodeWaypoint proxy still enters pod netns and must keep hostPID",
+    )
     # This capture sets ambient.env.FERRUM_ADMIN_HTTP_PORT, so it also proves
     # the steady-state env loop does not re-emit what ferrum-mesh.adminEnv
     # rendered. Scoped past `containers:` so the one-shot preflight init

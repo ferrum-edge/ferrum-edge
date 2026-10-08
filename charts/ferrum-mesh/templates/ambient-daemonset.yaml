@@ -93,8 +93,14 @@
 {{- end -}}
 {{- /* Registry + host cgroup: needed by NodeWaypoint TCP, BOTH Ambient UDP
        placements, and the disabled stale-rule cleanup. The host placement uses
-       the registry for the enrolled-pod set and the cgroup mount to resolve each
-       pod's host-side interface. The tools-capable image is selected separately
+       the registry for the enrolled-pod set and each pod's published addresses;
+       it resolves the pod's host-side interface from an exact host route plus
+       host sysfs (`veth::discover_dedicated_veth_for_pod_ip`), never from the
+       cgroup mount or a pod's own /proc or sysfs view. The setns placements and
+       the cleanup still read cgroup.procs to find a live pod PID. The
+       node-agent DaemonSet needs neither hostPID nor SYS_ADMIN for any of this:
+       it publishes the registry from the API server and host cgroup tree and
+       never enters a pod netns. The tools-capable image is selected separately
        below (`-ebpf-tools` for the Ambient UDP lifecycle and NodeWaypoint UDP
        listeners, distroless `-ebpf` otherwise); do not conflate the two — they
        have different security contracts. */ -}}
