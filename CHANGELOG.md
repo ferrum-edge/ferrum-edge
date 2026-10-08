@@ -7,28 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **`soap_ws_security` frames MTOM packages so that lenient backend parsers
-  cannot select a different root part** (#6077). In an MTOM/XOP
-  `multipart/related` body the `--boundary` token may now appear only as an
-  exact CRLF delimiter line. Before this change, a delimiter line with RFC 2046
-  transport padding (a trailing space or tab), an LF terminator, or trailing
-  characters was skipped as payload, a boundary opened by a bare LF or CR was
-  ignored, and a boundary in the middle of a line (in the preamble or inside a
-  part) was treated as ordinary payload. Backend parsers that accept those
-  forms frame a part there, so the root part the gateway validated could differ
-  from the one the backend executed. These packages now get the existing `400`
-  malformed-encoding refusal. In addition, when `start` is supplied it must
-  name the first part, `Content-ID` uniqueness and `start` matching ignore
-  ASCII case and a leading `cid:`, a `Content-ID` or `start` carrying `%`, `+`,
-  or embedded whitespace is refused (a backend that percent-decodes ids would
-  resolve it to a different part), and a package `Content-Type` carrying an
-  RFC 2231 extended form of `boundary`, `type`, or `start` (for example
-  `boundary*=`) is refused with `400`. An RFC 2231 `charset*` on a SOAP
-  `Content-Type` is refused as a conflicting charset. Packages produced by
-  standard MTOM generators are unaffected.
-
 ### Performance
 
 - **HTTP/2 body pipes no longer split a chunk the peer's window already
