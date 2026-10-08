@@ -56,7 +56,7 @@ impl UnvalidatedHandshakeBudget {
     /// returned to the budget when it drops.
     pub fn try_acquire(self: &Arc<Self>) -> Option<UnvalidatedHandshakePermit> {
         self.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < self.limit).then_some(current + 1)
             })
             .ok()?;
