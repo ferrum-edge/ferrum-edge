@@ -2119,6 +2119,18 @@ impl HboneAdmissionFence {
         // nothing and keeps the reuse fold from resolving a second copy.
         let view = admitting_request_view(snapshot, epoch);
 
+        // The request path refuses a view that omits the route's admission
+        // policy before any plugin runs, ahead of the authorize chain. A reload
+        // that adds an HTTP-only admission plugin to this route therefore
+        // refuses the peer's next CONNECT on a gRPC-classified view, so the
+        // live tunnel must not outlive it. A capability bit read; no hook runs.
+        if view
+            .capabilities()
+            .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+        {
+            return Some(HboneRevocationReason::AuthorizationDenied);
+        }
+
         if self.authorize_chain_denies(snapshot, &view).await {
             return Some(HboneRevocationReason::AuthorizationDenied);
         }

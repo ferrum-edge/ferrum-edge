@@ -32,18 +32,20 @@ use crate::modes::mesh::slice::MeshSlice;
 /// that forgets to set it cannot accidentally widen HTTP-only conditions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MeshAuthzProtocol {
-    /// HTTP-family request: HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web,
-    /// WebSocket upgrades, and HTTP relayed inside a mesh/HBONE CONNECT.
-    /// Every documented attribute family is sourceable.
+    /// HTTP-family request: HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web, and
+    /// WebSocket upgrades. Every documented attribute family is sourceable.
     Http,
     /// Layer-4 connection or session: raw TCP, TLS passthrough, UDP, and DTLS
     /// — everything authorized through `Plugin::on_stream_connect`, which has
     /// no HTTP header map and no validated-JWT context at all. HTTP-family
-    /// attributes (`request.headers[...]`, `request.auth.*`) cannot be sourced.
+    /// attributes (method, path, host, `request.headers[...]`,
+    /// `request.auth.*`, request principals) cannot be sourced.
     ///
-    /// A mesh / HBONE CONNECT relay is deliberately NOT in this variant: it is
-    /// authorized on the request path, where Ferrum has parsed the CONNECT's
-    /// own header map and can genuinely source `request.headers[...]` from it.
+    /// A mesh / HBONE CONNECT relay (byte-stream or datagram) is in this
+    /// variant too, although it is authorized on the request path: the
+    /// CONNECT's own method, path, authority, headers and credentials describe
+    /// the tunnel, while the requests written into it are relayed as opaque
+    /// bytes and never parsed.
     #[default]
     L4,
 }

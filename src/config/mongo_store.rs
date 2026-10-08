@@ -1184,6 +1184,9 @@ mod inner {
         /// CLI > env > conf-file > default precedence and could protect the
         /// wrong namespaces.
         protected_namespaces: Vec<String>,
+        /// Namespaces whose last published full load quarantined no consumer,
+        /// so consumer changes can ride the incremental delta (issue #6060).
+        consumer_quarantine: Arc<crate::config::db_backend::ConsumerQuarantineTracker>,
     }
 
     impl MongoStore {
@@ -1276,6 +1279,9 @@ mod inner {
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+                consumer_quarantine: Arc::new(
+                    crate::config::db_backend::ConsumerQuarantineTracker::default(),
+                ),
             })
         }
 
@@ -1919,6 +1925,9 @@ mod inner {
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(false)),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+                consumer_quarantine: Arc::new(
+                    crate::config::db_backend::ConsumerQuarantineTracker::default(),
+                ),
             })
         }
 
@@ -2597,6 +2606,115 @@ mod inner {
                 )
             };
 
+            let mut candidate = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+                proxies,
+                plugin_configs,
+                loaded_at,
+                ..Default::default()
+            };
+            candidate.normalize_fields();
+            Ok(candidate)
+        }
+
+        /// Policy-graph neighborhood for plugin-graph admission (issue #6056):
+        /// the SQL loader's indexed point reads, expressed as `_id`,
+        /// `plugins.plugin_config_id`, `scope`, and `plugin_name` filters in one
+        /// snapshot transaction when a replica set provides one.
+        async fn load_policy_graph_neighborhood(
+            &self,
+            namespace: &str,
+            scope: &crate::config::policy_graph_scope::PolicyGraphScope,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            let loaded_at = Utc::now();
+            let scoped_proxy_ids: Vec<String> = scope.proxy_ids.iter().cloned().collect();
+            let changed_ids: Vec<&str> = scope
+                .changed_plugin_config_ids
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let proxy_filter = doc! {
+                "namespace": namespace,
+                "$or": [
+                    { "_id": { "$in": namespaced_doc_ids(namespace, &scoped_proxy_ids) } },
+                    { "plugins.plugin_config_id": { "$in": changed_ids } },
+                ],
+            };
+            let plugin_filter = |proxies: &[Proxy]| {
+                let mut ids: std::collections::BTreeSet<&str> = scope.named_plugin_config_ids();
+                ids.extend(
+                    proxies
+                        .iter()
+                        .flat_map(|proxy| proxy.plugins.iter())
+                        .map(|association| association.plugin_config_id.as_str()),
+                );
+                let ids: Vec<String> = ids
+                    .into_iter()
+                    .map(|id| namespaced_doc_id(namespace, id))
+                    .collect();
+                doc! {
+                    "namespace": namespace,
+                    "$or": [
+                        { "_id": { "$in": ids } },
+                        { "scope": "global" },
+                        { "plugin_name": {
+                            "$in": crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES.to_vec(),
+                        } },
+                    ],
+                }
+            };
+            let (mut proxies, mut plugin_configs) = if self.replica_set_configured() {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .read_concern(ReadConcern::snapshot())
+                    .write_concern(WriteConcern::majority())
+                    .await?;
+
+                let loaded = async {
+                    let proxies = self
+                        .find_proxies_opt_session(
+                            proxy_filter,
+                            Some((connection.as_ref(), &mut session)),
+                            true,
+                        )
+                        .await?;
+                    let plugin_configs = self
+                        .find_plugin_configs_opt_session(
+                            plugin_filter(&proxies),
+                            Some((connection.as_ref(), &mut session)),
+                            true,
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>((proxies, plugin_configs))
+                }
+                .await;
+
+                match loaded {
+                    Ok(resources) => {
+                        session.commit_transaction().await?;
+                        resources
+                    }
+                    Err(error) => {
+                        let _ = session.abort_transaction().await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                let proxies = self
+                    .find_proxies_opt_session(proxy_filter, None, true)
+                    .await?;
+                let plugin_configs = self
+                    .find_plugin_configs_opt_session(plugin_filter(&proxies), None, true)
+                    .await?;
+                (proxies, plugin_configs)
+            };
+
+            // Match the SQL loader's id order, which fixes stable tie order in
+            // plugin-chain composition.
+            proxies.sort_by(|left, right| left.id.cmp(&right.id));
+            plugin_configs.sort_by(|left, right| left.id.cmp(&right.id));
             let mut candidate = GatewayConfig {
                 version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
                 proxies,
@@ -9529,7 +9647,8 @@ mod inner {
             // directly. First-loaded consumer wins; the
             // `consumer_identity_index` collection prevents NEW collisions
             // from being committed, this guard covers pre-existing rows.
-            for message in config.quarantine_colliding_consumer_identities() {
+            let identity_quarantined = config.quarantine_colliding_consumer_identities();
+            for message in &identity_quarantined {
                 error!(
                     "MongoDB config: {}",
                     crate::startup::sanitize_startup_cause(message, &[])
@@ -9541,12 +9660,15 @@ mod inner {
             // secrets before this snapshot can publish or broadcast. Admin
             // write-time validation rejects new violations; this guard covers
             // stored rows.
-            for message in config.quarantine_invalid_hmac_credentials() {
+            let hmac_quarantined = config.quarantine_invalid_hmac_credentials();
+            for message in &hmac_quarantined {
                 error!(
                     "MongoDB config: {}",
                     crate::startup::sanitize_startup_cause(message, &[])
                 );
             }
+            let consumer_quarantine_active =
+                !identity_quarantined.is_empty() || !hmac_quarantined.is_empty();
 
             // Serving-mode repairability (issue #4526), parity with the SQL
             // loader: quarantine stored plugin rows the shared construction
@@ -9621,6 +9743,10 @@ mod inner {
             // Backup export keeps them so restore can recreate managed state.
             if !matches!(purpose, FullConfigLoadPurpose::BackupExport) {
                 crate::config::db_loader::strip_api_spec_id_from_runtime_config(&mut config);
+                // Only a load that reached here can be published, and only
+                // runtime and control-plane loads seed a poller (issue #6060).
+                self.consumer_quarantine
+                    .record_full_load(namespace, consumer_quarantine_active);
             }
 
             Ok(config)
@@ -9822,6 +9948,18 @@ mod inner {
             self.load_mtls_dns_policy_candidate(namespace).await
         }
 
+        async fn load_namespace_policy_neighborhood(
+            &self,
+            namespace: &str,
+            scope: &crate::config::policy_graph_scope::PolicyGraphScope,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            self.load_policy_graph_neighborhood(namespace, scope).await
+        }
+
+        fn forget_consumer_quarantine_state(&self, namespace: &str) {
+            self.consumer_quarantine.forget(namespace);
+        }
+
         async fn count_namespace_resources(
             &self,
             namespace: &str,
@@ -9989,7 +10127,12 @@ mod inner {
                 );
             }
 
-            if !consumer_ops.is_empty() {
+            // Consumer changes ride the delta only while the published
+            // consumer set has nothing quarantined; otherwise a delete or
+            // update may have to rehydrate a stripped credential (issue #6060).
+            if !consumer_ops.is_empty()
+                && !self.consumer_quarantine.allows_consumer_deltas(namespace)
+            {
                 return Err(anyhow::Error::new(
                     crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
                         namespace,
@@ -10063,6 +10206,18 @@ mod inner {
                 let mut consumer = doc_to_consumer(doc)?;
                 consumer.normalize_fields();
                 added_or_modified_consumers.push(consumer);
+            }
+            // An upsert carrying a credential that quarantine judges across
+            // consumers can only be decided by a full load.
+            if added_or_modified_consumers
+                .iter()
+                .any(crate::config::db_backend::consumer_change_requires_authoritative_reload)
+            {
+                return Err(anyhow::Error::new(
+                    crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                        namespace,
+                    ),
+                ));
             }
             let loaded_consumer_ids: HashSet<String> = added_or_modified_consumers
                 .iter()
@@ -17357,7 +17512,18 @@ mod inner {
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
             snapshot: bool,
         ) -> Result<Vec<Proxy>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
+            self.find_proxies_opt_session(doc! { "namespace": namespace }, session, snapshot)
+                .await
+        }
+
+        /// Decode every proxy document matching `filter`, which must carry the
+        /// namespace predicate.
+        async fn find_proxies_opt_session(
+            &self,
+            filter: Document,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
+        ) -> Result<Vec<Proxy>, anyhow::Error> {
             let mut proxies = Vec::new();
 
             if let Some((connection, s)) = session {
@@ -17441,7 +17607,18 @@ mod inner {
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
             snapshot: bool,
         ) -> Result<Vec<PluginConfig>, anyhow::Error> {
-            let filter = doc! { "namespace": namespace };
+            self.find_plugin_configs_opt_session(doc! { "namespace": namespace }, session, snapshot)
+                .await
+        }
+
+        /// Decode every plugin-config document matching `filter`, which must
+        /// carry the namespace predicate.
+        async fn find_plugin_configs_opt_session(
+            &self,
+            filter: Document,
+            session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
+        ) -> Result<Vec<PluginConfig>, anyhow::Error> {
             let mut plugin_configs = Vec::new();
 
             if let Some((connection, s)) = session {
@@ -19025,6 +19202,9 @@ mod inner {
                     false,
                 )),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+                consumer_quarantine: Arc::new(
+                    crate::config::db_backend::ConsumerQuarantineTracker::default(),
+                ),
             }
         }
 

@@ -31,6 +31,9 @@ use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
+use super::address_validation::{
+    IncomingAdmission, UnvalidatedHandshakeBudget, UnvalidatedHandshakePermit, classify_incoming,
+};
 use super::config::Http3ServerConfig;
 use super::peer_identity::{
     H3ConnectionIdentity, ZeroRttCompletion, quic_max_early_data_size, zero_rtt_admitted,
@@ -884,8 +887,6 @@ fn build_h3_quinn_server_config(
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.initial_mtu(h3_config.initial_mtu);
     // The FRONTEND idle timeout, which the RFC 9298 CONNECT-UDP profile raises
     // to at least its own tunnel idle bound when enabled: a tunnel carrying no
     // datagram generates no QUIC activity either, so a smaller connection idle
@@ -900,24 +901,7 @@ fn build_h3_quinn_server_config(
              tunnel idle timeout; a shorter connection idle limit would close idle tunnels first"
         );
     }
-    transport_config.max_idle_timeout(Some(
-        h3_config
-            .frontend_idle_timeout
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
-    ));
-    transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
-
-    // QUIC flow-control tuning — conservative defaults for untrusted clients.
-    transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
-        h3_config.stream_receive_window,
-        crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
-    ));
-    transport_config.receive_window(crate::http3::config::quic_varint_or_default(
-        h3_config.receive_window,
-        crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
-    ));
-    transport_config.send_window(h3_config.send_window);
+    let transport_config = crate::http3::config::build_frontend_transport_config(h3_config)?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     server_config.transport_config(Arc::new(transport_config));
@@ -1550,6 +1534,10 @@ pub async fn start_http3_listener_with_signal(
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
     let handshake_timeout = h3_config.handshake_timeout;
+    // One budget per listener for handshakes from unvalidated source addresses
+    // (`FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES`).
+    let unvalidated_handshakes =
+        UnvalidatedHandshakeBudget::new(h3_config.max_unvalidated_handshakes);
     // When client authentication is configured the 0.5-RTT accept path is
     // refused for every connection so peer identity is only ever read after
     // handshake completion (issue #2938).
@@ -1643,31 +1631,67 @@ pub async fn start_http3_listener_with_signal(
                             connecting.refuse();
                             continue;
                         }
+                        // QUIC address validation (RFC 9000 §8.1). An Initial's
+                        // source address can be forged, so a handshake for an
+                        // unvalidated source runs only inside the listener's
+                        // dedicated handshake budget; past it the source gets
+                        // a stateless Retry, which holds no connection state
+                        // and costs no TLS work.
+                        let handshake_permit = match classify_incoming(
+                            connecting.remote_address_validated(),
+                            connecting.may_retry(),
+                            &unvalidated_handshakes,
+                        ) {
+                            IncomingAdmission::Validated => None,
+                            IncomingAdmission::Unvalidated(permit) => Some(permit),
+                            IncomingAdmission::Retry => {
+                                // quinn mints the Retry token from the
+                                // endpoint's current server config. An Initial
+                                // queued before the listener was disabled is
+                                // refused instead, as `accept_h3_incoming`
+                                // would refuse it.
+                                if adopted_quic.load().is_none() {
+                                    connecting.refuse();
+                                } else if let Err(error) = connecting.retry() {
+                                    error.into_incoming().refuse();
+                                }
+                                continue;
+                            }
+                            IncomingAdmission::Refuse => {
+                                connecting.refuse();
+                                continue;
+                            }
+                        };
                         let state = Arc::clone(&state);
                         let adopted_quic = Arc::clone(&adopted_quic);
                         let conn_shutdown = shutdown_rx.clone();
                         let gateway_listener_identity = gateway_listener_identity.clone();
                         tokio::spawn(async move {
-                            // Exactly one ConnectionGuard per spawned Incoming.
-                            // `handle_h3_connection` never constructs another, so
-                            // handshake refuse, handshake timeout, GOAWAY drain,
-                            // peer reset, and deadline `endpoint.close` all
-                            // release the counter once through this Drop.
+                            // At most one ConnectionGuard per spawned Incoming,
+                            // owned by its `H3ConnectionAccounting`. Handshake
+                            // refuse, handshake timeout, GOAWAY drain, peer
+                            // reset, and deadline `endpoint.close` all release
+                            // the counter once through that Drop.
                             let overload = Arc::clone(&state.overload);
-                            run_h3_connection_with_guard(overload, async move {
-                                handle_h3_connection(
-                                    connecting,
-                                    state,
-                                    handshake_timeout,
-                                    frontend_listen_port,
-                                    frontend_destination_ip,
-                                    gateway_listener_identity,
-                                    client_auth_configured,
-                                    adopted_quic,
-                                    conn_shutdown,
-                                )
-                                .await
-                            })
+                            run_h3_connection_with_guard(
+                                overload,
+                                handshake_permit,
+                                |accounting| async move {
+                                    handle_h3_connection(
+                                        connecting,
+                                        accounting,
+                                        state,
+                                        handshake_timeout,
+                                        frontend_listen_port,
+                                        frontend_destination_ip,
+                                        gateway_listener_identity,
+                                        client_auth_configured,
+                                        adopted_quic,
+                                        conn_shutdown,
+                                    )
+                                    .await
+                                },
+                            )
                             .await;
                         });
                     }
@@ -1986,20 +2010,74 @@ fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer
     );
 }
 
-/// Hold exactly one [`crate::overload::ConnectionGuard`] for the lifetime of
-/// an H3 connection task (issue #4429).
+/// Shared overload accounting for one HTTP/3 connection task (issue #4429).
 ///
-/// The accept-loop spawn is the only constructor. Handshake refuse, handshake
-/// timeout, GOAWAY drain, peer reset, and deadline force-close all return
-/// through here so the overload counter cannot double-decrement or leak.
-pub(crate) async fn run_h3_connection_with_guard<F>(
+/// Holds at most one [`crate::overload::ConnectionGuard`], constructed in
+/// exactly one place ([`Self::charge_connection_budget`]). A connection from a
+/// validated source address is charged when the task starts. A connection from
+/// an unvalidated source instead holds an [`UnvalidatedHandshakePermit`] from
+/// the listener's dedicated handshake budget and is charged only once its
+/// handshake completes, so forged-source Initials can never consume the shared
+/// connection budget that drives overload shedding on every frontend.
+pub(crate) struct H3ConnectionAccounting {
     overload: Arc<crate::overload::OverloadState>,
-    fut: F,
+    conn_guard: Option<crate::overload::ConnectionGuard>,
+    handshake_permit: Option<UnvalidatedHandshakePermit>,
+}
+
+impl H3ConnectionAccounting {
+    fn admit(
+        overload: Arc<crate::overload::OverloadState>,
+        handshake_permit: Option<UnvalidatedHandshakePermit>,
+    ) -> Self {
+        let mut accounting = Self {
+            overload,
+            conn_guard: None,
+            handshake_permit,
+        };
+        if accounting.handshake_permit.is_none() {
+            accounting.charge_connection_budget();
+        }
+        accounting
+    }
+
+    /// Whether this connection's source address was validated before the
+    /// handshake began.
+    fn source_validated(&self) -> bool {
+        self.handshake_permit.is_none()
+    }
+
+    /// The handshake completed: release the unvalidated-handshake permit and
+    /// charge the shared connection budget. Idempotent.
+    fn handshake_completed(&mut self) {
+        self.charge_connection_budget();
+        self.handshake_permit = None;
+    }
+
+    fn charge_connection_budget(&mut self) {
+        if self.conn_guard.is_none() {
+            self.conn_guard = Some(crate::overload::ConnectionGuard::new(&self.overload));
+        }
+    }
+}
+
+/// Run one HTTP/3 connection task under its [`H3ConnectionAccounting`]
+/// (issue #4429).
+///
+/// The accept-loop spawn is the only caller. Handshake refuse, handshake
+/// timeout, GOAWAY drain, peer reset, and deadline force-close all return
+/// through here, and the accounting moves into the connection future, so the
+/// overload counter cannot double-decrement or leak.
+pub(crate) async fn run_h3_connection_with_guard<F, Fut>(
+    overload: Arc<crate::overload::OverloadState>,
+    handshake_permit: Option<UnvalidatedHandshakePermit>,
+    connection: F,
 ) where
-    F: std::future::Future<Output = Result<(), anyhow::Error>>,
+    F: FnOnce(H3ConnectionAccounting) -> Fut,
+    Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
-    let _conn_guard = crate::overload::ConnectionGuard::new(&overload);
-    if let Err(e) = fut.await {
+    let accounting = H3ConnectionAccounting::admit(overload, handshake_permit);
+    if let Err(e) = connection(accounting).await {
         debug!("HTTP/3 connection error: {}", e);
     }
 }
@@ -2194,6 +2272,7 @@ fn accept_h3_incoming(
 #[allow(clippy::too_many_arguments)]
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
+    mut accounting: H3ConnectionAccounting,
     state: Arc<ProxyState>,
     handshake_timeout: Duration,
     frontend_listen_port: Option<u16>,
@@ -2208,8 +2287,16 @@ async fn handle_h3_connection(
     // authentication: the 0.5-RTT accept path would materialize the connection
     // before the peer's certificate is known (issue #2938), and the TLS builder
     // disables client early data for the same listener posture.
+    //
+    // The 0.5-RTT path also materializes the connection before the handshake
+    // completes, so it is reserved for a source address that was validated
+    // before the handshake began: an unvalidated source completes the full
+    // 1-RTT handshake inside its handshake budget first, and is charged to the
+    // shared connection budget only then. Its 0-RTT request streams are still
+    // served, after the handshake, as 1-RTT (RFC 8470 §6.2).
     let early_data_enabled =
-        zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
+        zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured)
+            && accounting.source_validated();
 
     // The listener already stopped accepting, but this Incoming was queued
     // before `set_server_config(None)`. Refuse it so a mid-handshake drain
@@ -2322,6 +2409,9 @@ async fn handle_h3_connection(
         };
         complete_h3_handshake(connecting, handshake_timeout, &mut shutdown_rx).await?
     };
+    // Every branch above either completed the handshake or (0.5-RTT) admitted a
+    // validated source that was charged when its task started.
+    accounting.handshake_completed();
 
     let remote_addr = connection.remote_address();
     // Istio `destination.ip` input. A listener bound to a specific address
@@ -3083,8 +3173,17 @@ async fn handle_h3_request(
     // its plugin snapshot until the timer expires.
     ctx.peer_connection = Some(peer_connection);
 
-    // Store raw headers for deferred materialization.
-    ctx.set_raw_headers(req.headers().clone());
+    // Store raw headers for deferred materialization. HTTP/3 does not reject a
+    // `Connection` field, so resolve its nominations against the client's own
+    // fields before any plugin or gateway assertion can add a header that the
+    // backend-boundary hop-by-hop strip would otherwise remove. `req` keeps the
+    // wire block for the protocol-shape checks below.
+    let mut raw_headers = req.headers().clone();
+    crate::proxy::headers::confine_connection_nominated_request_headers(
+        &mut raw_headers,
+        state.env_config.real_ip_header.as_deref(),
+    );
+    ctx.set_raw_headers(raw_headers);
     crate::proxy::stamp_original_request_metadata(&mut ctx);
 
     // Validate URL length (path + query string)
@@ -3370,6 +3469,15 @@ async fn handle_h3_request(
         )
         .await?;
         return Ok(());
+    }
+
+    // The WebSocket backend handshake is a GET. Keep route and plugin policy
+    // aligned with the method the backend receives, matching the H2 Extended
+    // CONNECT path. Plain CONNECT and CONNECT-UDP keep CONNECT; the 0-RTT
+    // allowlist above still gates the wire method.
+    if http_flavor == HttpFlavor::WebSocket {
+        method = "GET".to_string();
+        ctx.method = method.clone();
     }
 
     // Set the early data flag on the request context for plugin visibility.
@@ -3844,6 +3952,43 @@ async fn handle_h3_request(
             .plugin_cache
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
+
+    // Same refusal as the H1/H2 dispatcher: a client-selected flavor whose
+    // view omits the route's authentication or admission policy is refused
+    // before any plugin runs.
+    if plugin_cache_view
+        .capabilities()
+        .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    {
+        debug!(
+            proxy_id = %proxy.id,
+            protocol = ?request_protocol,
+            "Rejected HTTP/3 request: route admission policy does not run on the requested protocol"
+        );
+        record_h3_flavor_aware_reject(&state, http_flavor, 403);
+        send_h3_error_flavor_aware_with_policy(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::FORBIDDEN,
+            crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY,
+            crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+            "Request protocol not permitted on this route",
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await?;
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        return Ok(());
+    }
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
@@ -5246,6 +5391,7 @@ async fn handle_h3_request(
         .keys()
         .any(|k| crate::proxy::headers::is_gateway_assertion_header(k));
     if ctx.backend_consumer_username().is_some()
+        || ctx.backend_authenticated_identity().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion
     {

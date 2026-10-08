@@ -491,13 +491,38 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
             "agent_url": "http://localhost:8126", "service": null
         }}),
         json!({"kind": "lightstep", "config": {
-            "collector_url": "https://example.com/v1/traces", "accessTokenEnv": "LIGHTSTEP_TOKEN"
+            "collector_url": "https://example.com/v1/traces",
+            "accessTokenEnv": "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN"
         }}),
     ] {
         cases.push((
             json!({"tracing_provider": selected, "span_reporting_disabled": true}),
             true,
         ));
+    }
+    // The Lightstep bearer token may only come from the plugin-secret
+    // namespace; any other variable (including gateway-owned `FERRUM_*`
+    // secrets) is refused at admission, even while span reporting is disabled.
+    for token_env in [
+        "FERRUM_ADMIN_JWT_SECRET",
+        "FERRUM_DB_URL",
+        "LIGHTSTEP_TOKEN",
+        "FERRUM_PLUGIN_SECRET_",
+        "FERRUM_PLUGIN_SECRET_lowercase",
+        "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN_FILE",
+    ] {
+        for key in ["access_token_env", "accessTokenEnv"] {
+            cases.push((
+                json!({
+                    "tracing_provider": {"kind": "lightstep", "config": {
+                        "collector_url": "https://example.com/v1/traces",
+                        key: token_env
+                    }},
+                    "span_reporting_disabled": true
+                }),
+                false,
+            ));
+        }
     }
     for (config, accepted) in cases {
         assert_eq!(validator.is_valid(&config), accepted, "schema: {config}");

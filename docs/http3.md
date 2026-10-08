@@ -20,6 +20,8 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
   - [Native gRPC terminal metadata](#native-grpc-terminal-metadata)
 - [WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)](#websocket-over-http3-rfc-9220-extended-connect)
 - [CONNECT-UDP over HTTP/3 (RFC 9298)](#connect-udp-over-http3-rfc-9298)
+- [QUIC address validation and handshake admission](#quic-address-validation-and-handshake-admission)
+- [QUIC DATAGRAM extension](#quic-datagram-extension)
 - [QUIC connection migration](#quic-connection-migration)
 - [Request-header arrival deadline (issue #4537)](#request-header-arrival-deadline-issue-4537)
 - [Header size limits](#header-size-limits)
@@ -929,8 +931,9 @@ This means every WebSocket plugin works on H3 sessions unchanged:
   CONNECT, and H3 Extended CONNECT identical completion accounting)
 - Connection-admission via `FERRUM_WEBSOCKET_MAX_CONNECTIONS` and `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` (shared with H1/H2)
 - All authentication, authorization, and `before_proxy` plugins (run BEFORE the bridge accepts the upgrade)
+- Method policy sees `GET`, the method of the backend WebSocket handshake: route `allowed_methods`, `mesh_authz` `:method`, and `opa` `input.method` evaluate an H3 Extended CONNECT exactly like an H1 `GET` Upgrade or an H2 Extended CONNECT. The `FERRUM_TLS_EARLY_DATA_METHODS` 0-RTT gate still matches the wire method (`CONNECT`); plain CONNECT and CONNECT-UDP keep `CONNECT`
 - Sticky-session cookies on the 200 response (same as H1/H2)
-- All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "CONNECT"`, mirroring the H2 Extended CONNECT path)
+- All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "GET"`, matching the H2 Extended CONNECT path)
 
 ### Frame masking — RFC 6455 §5.1 applies unchanged on HTTP/3
 
@@ -1022,9 +1025,12 @@ replay-safety policy.
 
 A request counts as early data only when the handshake was still pending
 when the accept loop checked it, right after accepting the request's stream.
-With early data enabled every H3 connection is taken through `into_0rtt()`,
-including clients that send no 0-RTT data at all, so the classification is
-made per stream, not per connection. Quinn processes no 1-RTT packet before
+With early data enabled every H3 connection from a validated source address is
+taken through `into_0rtt()`, including clients that send no 0-RTT data at all,
+so the classification is made per stream, not per connection. A client whose
+address is not yet validated completes the 1-RTT handshake first (see
+[QUIC address validation](#quic-address-validation-and-handshake-admission)),
+so its streams are all classified 1-RTT. Quinn processes no 1-RTT packet before
 the handshake completes, so a stream classified this way was opened by 0-RTT
 data. A request sent after the handshake — including one that arrives in the
 same flight as the client's `Finished`, the usual case for a resumed client
@@ -1224,6 +1230,7 @@ the lookup instead of becoming an unscreened dial.
 | Bound | Source |
 | --- | --- |
 | Concurrent tunnels | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` (503 over the limit) |
+| Concurrent tunnels per client | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` (503 over the limit; IPv6 grouped by `/64`, held for the tunnel lifetime) |
 | Idle lifetime | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS`, which also raises the frontend QUIC idle floor (below) |
 | Datagram payload | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES`, itself capped at the RFC 9298 §5 ceiling of 65527 |
 | DATAGRAM capsule length | payload ceiling + 8 bytes of Context ID slack |
@@ -1493,6 +1500,59 @@ closed. This is deliberately not general policy reauthentication.
   backend circuit breaker that does not govern the tunnel. The stream-end
   assertions distinguish a clean FIN from a reset; neither accepts "either".
 
+## QUIC address validation and handshake admission
+
+A QUIC Initial arrives over UDP, so its source address is unauthenticated until
+the peer proves it can receive packets there (RFC 9000 §8.1). Each H3 listener
+therefore keeps a dedicated, bounded budget of in-flight handshakes for clients
+whose address has not been validated, sized by
+`FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES` (default `1024`):
+
+- A client presenting a valid address-validation token — echoed from a Retry,
+  or a NEW_TOKEN token the listener issued on an earlier connection — is
+  validated. Its connection is charged to the shared overload connection budget
+  (`active_connections`, `FERRUM_MAX_CONNECTIONS`) from the start, as before.
+- An unvalidated client within the budget completes its handshake while
+  holding a slot in the handshake budget **instead of** the shared connection
+  budget, and is charged to the shared budget only once the handshake
+  completes. Forged-source Initials therefore cannot push the overload
+  manager's connection pressure tiers (keepalive disable / GOAWAY, then refusal
+  of new connections on every frontend).
+- Once the budget is full, further unvalidated Initials are answered with a
+  stateless QUIC Retry. A Retry holds no connection state and costs no TLS
+  work; a genuine client echoes the token after one extra round trip and is
+  admitted as validated, while a forged source never returns. An Initial that
+  already followed a Retry cannot be retried again and is refused if it is
+  still unvalidated.
+
+`0` sends a Retry to every unvalidated client. The 0.5-RTT accept path (see
+[0-RTT](#0-rtt-tls-13-early-data)) is reserved for validated clients: an
+unvalidated client always completes the full 1-RTT handshake first, and any
+0-RTT request streams it sent are served after the handshake as 1-RTT
+(RFC 8470 §3). Retry and address-validation tokens are sealed with a key
+generated when the listener's QUIC server config is built, so a frontend TLS
+reload invalidates outstanding tokens: for up to 15 seconds after a reload, a
+client that echoes a token from before the reload fails that connection
+attempt and must reconnect. Behind a load balancer that routes QUIC packets by
+connection ID rather than by client address, a client's echoed Retry token can
+reach a different replica, which cannot validate it; route QUIC by client
+address (or keep the unvalidated-handshake budget above the expected burst) in
+that topology. The critical-overload refusal still runs before any of this.
+
+## QUIC DATAGRAM extension
+
+Neither the H3 frontend listener nor the H3 backend pools enable the QUIC
+DATAGRAM extension (RFC 9221). The gateway never reads QUIC datagrams:
+`SETTINGS_H3_DATAGRAM` is never negotiated, and
+[CONNECT-UDP](#connect-udp-over-http3-rfc-9298) carries HTTP Datagrams as
+capsules on the request stream. Both transport configs therefore set no
+DATAGRAM receive buffer (`build_frontend_transport_config` /
+`build_backend_transport_config`), so `max_datagram_frame_size` is not
+advertised and a peer that sends a DATAGRAM frame anyway is closed with
+`PROTOCOL_VIOLATION`. An advertised but undrained datagram queue would be held
+for the whole connection, outside QUIC flow control and outside the
+per-connection receive windows.
+
 ## QUIC connection migration
 
 The H3 connection loop detects QUIC connection migration (RFC 9000 §9) — a client that changes its local address mid-connection (common on mobile network handoffs between Wi-Fi and cellular) continues the same connection with a new 4-tuple. The loop compares `quinn::Connection::remote_address()` against a cached `SocketAddr` before each request dispatch; the comparison is two integer fields (IP + port) so the zero-allocation path is the common case. The formatted IP string (`Arc<str>`) is only re-created when the address actually changes.
@@ -1671,6 +1731,7 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_ENABLE_HTTP3` | `false` | Enable the QUIC listener |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | `30` | QUIC idle timeout (seconds). `0` disables the idle timer (RFC 9000 §10.1). When `FERRUM_HTTP3_CONNECT_UDP_ENABLED=true` the **frontend** listener raises this to at least `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` (never lowers it, and never raises `0`); the raise is logged. H3 backend pools install this configured value on their own QUIC transport, and `0` leaves their idle timer disabled too. See [the tunnel/connection idle note](#the-tunnel-idle-timeout-and-the-quic-connection-idle-timeout). |
 | `FERRUM_HTTP3_MAX_STREAMS` | `1000` | Max concurrent streams per QUIC connection |
+| `FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES` | `1024` | In-flight QUIC handshakes per listener for clients whose source address is not yet validated; these are charged to the shared connection budget only once they complete. Further unvalidated Initials receive a stateless Retry; `0` retries every unvalidated client. See [QUIC address validation](#quic-address-validation-and-handshake-admission). |
 | `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `262,144` | **Frontend** per-stream QUIC flow-control window (256 KiB; raise for high-throughput workloads). Must be in `[1, 2^62-1]`. |
 | `FERRUM_HTTP3_RECEIVE_WINDOW` | `2,097,152` | **Frontend** connection-level QUIC flow-control window (2 MiB; raise for high-throughput workloads). Must be in `[1, 2^62-1]`. |
 | `FERRUM_HTTP3_SEND_WINDOW` | `2,097,152` | **Frontend** connection-level send window (2 MiB). Must be greater than 0. |
@@ -1686,6 +1747,7 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_WEBSOCKET_ENABLED` | `true` | Advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accept RFC 9220 Extended CONNECT WebSocket. See [WebSocket over HTTP/3](#websocket-over-http3-rfc-9220-extended-connect). |
 | `FERRUM_HTTP3_CONNECT_UDP_ENABLED` | `false` | Accept RFC 9298 UDP proxying Extended CONNECT (`:protocol=connect-udp`). Off by default; `501` while disabled. **Process-wide:** every H3 HTTP route whose routing and `allowed_methods` policy admits CONNECT can match a `/udp/host/port/` suffix — use a dedicated MASQUE route/host/path, authentication/authorization, and explicit method filters on routes that must not expose CONNECT. Requires a build target with a do-not-fragment socket option (Linux/Android, macOS) because RFC 9298 §3.1 forbids introducing IP fragmentation — elsewhere `true` is a startup validation error. CONNECT-UDP in TLS 1.3 early data is always `425`, even when `CONNECT` is in `FERRUM_TLS_EARLY_DATA_METHODS`. See [CONNECT-UDP over HTTP/3](#connect-udp-over-http3-rfc-9298). |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` | `256` | Maximum concurrent CONNECT-UDP tunnels for this process; `503` over the limit. `0` disables the limit. A value above the tokio semaphore permit ceiling is a startup validation error, never a silent clamp or a silent "unlimited". |
+| `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` | `32` | Maximum concurrent CONNECT-UDP tunnels per resolved client (IPv4 per address, IPv6 grouped by `/64`); `503` over the limit. The slot is held for the tunnel's lifetime and released on every close path. `0` disables the per-client cap. |
 | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | `120` | Seconds a tunnel may carry no datagram in either direction (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below. This value is also the floor for the frontend QUIC connection idle timeout while the profile is enabled, so the advertised tunnel lifetime is the one that actually holds. |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales every per-session buffer — see [Bounds and lifecycle](#bounds-and-lifecycle). |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |

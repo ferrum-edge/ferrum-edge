@@ -20,7 +20,7 @@ Reusable, plugin-agnostic notification infrastructure in `src/notifications/`. T
 - Channel name matches `[A-Za-z0-9_-]+`.
 - Unknown properties on a selected channel variant are rejected (including fields that belong only to a different channel type). Generic webhook `headers` remain an open string map.
 - `webhook_url` (Slack/Teams/Discord) and `url` (generic webhook) MUST be nonempty `http://` or `https://` with a host and no `user:pass@` userinfo segment. Empty strings, `ftp://`, and other schemes are rejected. The `email` channel takes a bare nonempty `smtp_host` instead — no scheme, port, path, or credentials in that field.
-- For each URL field there is a sibling `*_env` form (`webhook_url_env: "MY_ENV"`) that resolves via `std::env::var()` at construction. The env-var **name** must be nonempty; the named variable must be set and nonempty at construction. Combine with the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` env-var suffixes) to keep credentials out of config files.
+- For each URL field there is a sibling `*_env` form (`webhook_url_env: "FERRUM_PLUGIN_SECRET_SLACK_WEBHOOK"`) that resolves via `std::env::var()` at construction. The env-var **name** must be a `FERRUM_PLUGIN_SECRET_<NAME>` variable (`<NAME>` uppercase `[A-Z_][A-Z0-9_]*`): channel configs are plugin configs, so any other process variable — including every other `FERRUM_*` setting — is refused before it is read. The named variable must be set and nonempty at construction. Combine with the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` env-var suffixes) to keep credentials out of config files.
 - OpenAPI `ProxyAlertsConfig` encodes those nonempty / HTTP(S) / no-userinfo constraints with `minLength` and a URL pattern. `format: uri` / `format: email` are Draft 2020-12 annotations and are not by themselves the constructor grammar.
 - Dispatch slow-call/error logs redact endpoint paths, query strings, and userinfo because incoming webhook credentials commonly live inside the URL.
 - Response bodies are discarded after successful dispatches with a 1 MiB cap: responses advertising `Content-Length > 1 MiB` are rejected before any bytes are read, and otherwise the body is streamed and aborted once the running total crosses 1 MiB. Either path fails the send without buffering the whole body.
@@ -89,8 +89,8 @@ Renders `body_template` after `${var}` substitution and sends it with the config
   "smtp_port": 587,                    // optional; default 587 (starttls) / 465 (implicit_tls)
   "tls_mode": "starttls",              // optional; "starttls" | "implicit_tls" (default "starttls")
   "tls_server_name": "smtp.example.com", // optional; verified identity override, default smtp_host
-  "username_env": "FERRUM_ALERT_SMTP_USERNAME",  // optional; must be paired with password / password_env
-  "password_env": "FERRUM_ALERT_SMTP_PASSWORD",  // optional; must be paired with username / username_env
+  "username_env": "FERRUM_PLUGIN_SECRET_ALERT_SMTP_USERNAME",  // optional; must be paired with password / password_env
+  "password_env": "FERRUM_PLUGIN_SECRET_ALERT_SMTP_PASSWORD",  // optional; must be paired with username / username_env
   "from": "ferrum@example.com",
   "to": ["oncall@example.com"],
   "subject_template": "[${severity}] ${title}",  // optional
@@ -128,7 +128,7 @@ Bounds (all enforced, all fail closed or truncate visibly):
 
 Security notes:
 
-- Credentials resolve through the same inline / `*_env` convention as the other channels, so the gateway secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`) materializes them. They are never logged, never `Debug`-printed (the channel has a hand-written `Debug` impl), and never appear in an error.
+- Credentials resolve through the same inline / `*_env` convention as the other channels (`*_env` names are confined to `FERRUM_PLUGIN_SECRET_<NAME>`), so the gateway secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`) materializes them. They are never logged, never `Debug`-printed (the channel has a hand-written `Debug` impl), and never appear in an error.
 - Delivery errors are structured and carry only a phase plus the numeric SMTP reply code — server reply text is always withheld because it is untrusted and can be attacker-influenced. A reply that echoes the configured password, or either credential in its on-the-wire base64 form, aborts the session with a dedicated error. The plaintext AUTH username is deliberately not watched: it is usually the mailbox address and relays legitimately echo addresses in `MAIL FROM` / `RCPT TO` replies.
 - Multiline replies are parsed strictly: every line must repeat the same 3-digit code with a `-`/space separator, and a malformed, oversized, or truncated reply fails the send.
 - Every templated value that reaches a header has its control characters folded to spaces, and the body is base64-encoded, so neither header injection nor premature `DATA` termination is reachable from template variables.

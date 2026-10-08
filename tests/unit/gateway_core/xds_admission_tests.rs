@@ -13,7 +13,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use ferrum_edge::grpc::admission::{CP_GRPC_NEAR_CEILING_PERCENT, cp_grpc_budget_is_near_ceiling};
+use ferrum_edge::grpc::admission::{
+    CP_GRPC_NEAR_CEILING_PERCENT, authenticated_principal_key, cp_grpc_budget_is_near_ceiling,
+};
 use ferrum_edge::xds::admission::{
     DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS, DEFAULT_XDS_MAX_ACTIVE_NODES,
     DEFAULT_XDS_MAX_NODE_ID_BYTES, DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
@@ -373,6 +375,29 @@ fn principal_budget_saturates_before_the_node_ceiling() {
         controller
             .reserve_stream("ferrum", &principal_key("another-credential"))
             .is_ok()
+    );
+}
+
+#[test]
+fn same_xds_subject_has_independent_quota_per_namespace() {
+    let controller = controller(XdsAdmissionLimits {
+        max_total_streams: 10,
+        max_streams_per_namespace: 10,
+        max_streams_per_principal: 1,
+        max_streams_per_node: 10,
+        ..generous()
+    });
+    let subject = "shared-subject";
+    let tenant_a = authenticated_principal_key("tenant-a", subject);
+    let tenant_b = authenticated_principal_key("tenant-b", subject);
+
+    let _a = controller.reserve_stream("tenant-a", &tenant_a).unwrap();
+    let _b = controller.reserve_stream("tenant-b", &tenant_b).unwrap();
+    assert_eq!(
+        controller
+            .reserve_stream("tenant-a", &tenant_a)
+            .unwrap_err(),
+        XdsAdmissionRejection::PrincipalStreams
     );
 }
 

@@ -62,6 +62,7 @@ mod peer_auth_mtls_tests;
 mod plugin_migration_split_tests;
 mod plugin_migration_tests;
 mod plugin_trigger_tests;
+mod policy_graph_scope_tests;
 mod pool_config_tests;
 mod readme_license_tests;
 mod runtime_config_apply_tests;

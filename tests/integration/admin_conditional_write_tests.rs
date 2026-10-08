@@ -2735,6 +2735,10 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     assert_batch_proxy_scoped_plugin_association_parity(&db).await;
     assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
+    crate::integration::admin_plugin_graph_scope_tests::assert_policy_neighborhood_matches_restricted_graph(
+        db.as_ref(),
+    )
+    .await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
@@ -2742,6 +2746,26 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
         .await
         .unwrap()
         .database(&database);
+    let consumers_raw = raw.collection::<mongodb::bson::Document>("consumers");
+    crate::integration::consumer_delta_quarantine_tests::assert_consumer_delta_quarantine_contract(
+        db.as_ref(),
+        |namespace, id, secret| {
+            let consumers_raw = consumers_raw.clone();
+            async move {
+                let result = consumers_raw
+                    .update_one(
+                        mongodb::bson::doc! { "_id": format!("{namespace}:{id}") },
+                        mongodb::bson::doc! {
+                            "$set": { "credentials.hmac_auth": [{ "secret": secret }] },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.matched_count, 1);
+            }
+        },
+    )
+    .await;
     assert_mongo_orphaned_spec_refused(db.clone(), &raw).await;
     assert_mongo_deployment_raw_preservation(db.clone(), &raw).await;
     let locks = raw.collection::<mongodb::bson::Document>("config_admission_locks");
@@ -2777,6 +2801,23 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
     assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "postgres", &url).await;
+    crate::integration::consumer_delta_quarantine_tests::assert_consumer_delta_quarantine_contract(
+        db.as_ref(),
+        |namespace, id, secret| {
+            let store = db.clone();
+            async move {
+                crate::integration::consumer_delta_quarantine_tests::corrupt_sql_hmac_secret(
+                    &store, &namespace, &id, &secret,
+                )
+                .await
+            }
+        },
+    )
+    .await;
+    crate::integration::admin_plugin_graph_scope_tests::assert_policy_neighborhood_matches_restricted_graph(
+        db.as_ref(),
+    )
+    .await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
@@ -2807,6 +2848,23 @@ async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
     assert_batch_admission_sees_implied_proxy_associations(&db).await;
     let db = Arc::new(db);
     assert_sql_deployment_raw_preservation(db.clone(), "mysql", &url).await;
+    crate::integration::consumer_delta_quarantine_tests::assert_consumer_delta_quarantine_contract(
+        db.as_ref(),
+        |namespace, id, secret| {
+            let store = db.clone();
+            async move {
+                crate::integration::consumer_delta_quarantine_tests::corrupt_sql_hmac_secret(
+                    &store, &namespace, &id, &secret,
+                )
+                .await
+            }
+        },
+    )
+    .await;
+    crate::integration::admin_plugin_graph_scope_tests::assert_policy_neighborhood_matches_restricted_graph(
+        db.as_ref(),
+    )
+    .await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;

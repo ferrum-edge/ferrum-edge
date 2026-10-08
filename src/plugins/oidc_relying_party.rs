@@ -86,6 +86,7 @@ const STATE_EXPIRY_BUCKET_SECS: u64 = 1;
 const SESSION_PAYLOAD_VERSION: u8 = 2;
 const PENDING_FLOW_PAYLOAD_VERSION: u8 = 1;
 const MAX_PENDING_FLOW_ORIGINAL_URL_BYTES: usize = 2048;
+const MAX_PENDING_CORRELATION_COOKIES: usize = 2;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_USERINFO_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 256 * 1024;
@@ -2128,7 +2129,7 @@ impl OidcRelyingParty {
         Ok(claims_refreshed)
     }
 
-    fn resolve_identity(&self, claims: &Value, consumer_index: &ConsumerIndex) -> VerifyOutcome {
+    fn resolve_identity(&self, claims: &Value, _consumer_index: &ConsumerIndex) -> VerifyOutcome {
         let identity = nonblank_identity(extract_claim_string(
             claims,
             &self.provider.consumer_identity_claim,
@@ -2140,9 +2141,9 @@ impl OidcRelyingParty {
             extract_claim_string_exact(claims, &self.provider.consumer_header_claim)
                 .or_else(|| identity.clone())
         };
-        let consumer = identity
-            .as_deref()
-            .and_then(|id| consumer_index.find_by_identity(id));
+        // OIDC subjects are provider-scoped and never map through the global
+        // Consumer username index.
+        let consumer = None;
         VerifyOutcome::success(consumer, identity, header)
     }
 
@@ -2165,6 +2166,7 @@ impl OidcRelyingParty {
                     r#"{"error":"OIDC callback host does not match request host"}"#.to_string(),
                 );
             }
+            let pending_cookies = self.pending_correlation_cookie_names(ctx);
             let created = match self.create_flow(ctx) {
                 Ok(flow) => flow,
                 Err(body) => return reject(503, body),
@@ -2182,11 +2184,24 @@ impl OidcRelyingParty {
             };
             let correlation_cookie =
                 self.correlation_cookie(&created.state, &created.sealed_cookie);
-            let cookie = if clear {
-                join_set_cookies(correlation_cookie, self.clear_cookie())
-            } else {
-                correlation_cookie
-            };
+            let mut cookie = correlation_cookie;
+            if pending_cookies.len() >= MAX_PENDING_CORRELATION_COOKIES {
+                for stale_name in pending_cookies
+                    .iter()
+                    .take(pending_cookies.len() - MAX_PENDING_CORRELATION_COOKIES + 1)
+                {
+                    cookie = join_set_cookies(
+                        cookie,
+                        format!(
+                            "{stale_name}=; Max-Age=0; {}",
+                            self.session.correlation_cookie_attrs
+                        ),
+                    );
+                }
+            }
+            if clear {
+                cookie = join_set_cookies(cookie, self.clear_cookie());
+            }
             redirect(self.behavior.challenge_html_status, &location, Some(cookie))
         } else {
             let mut headers = HashMap::new();
@@ -2533,7 +2548,7 @@ impl OidcRelyingParty {
         name == self.session.cookie_name
             || name
                 .strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
-                .is_some_and(|suffix| suffix.starts_with('_'))
+                .is_some_and(is_derived_correlation_cookie_suffix)
     }
 
     fn correlation_cookie_name(&self, state: &str) -> String {
@@ -2556,6 +2571,21 @@ impl OidcRelyingParty {
             self.correlation_cookie_name(state),
             self.session.correlation_cookie_attrs
         )
+    }
+
+    fn pending_correlation_cookie_names(&self, ctx: &RequestContext) -> Vec<String> {
+        let Some(cookie) = ctx.headers.get("cookie") else {
+            return Vec::new();
+        };
+        cookie
+            .split(';')
+            .filter_map(|segment| segment.trim().split_once('=').map(|(name, _)| name.trim()))
+            .filter(|name| {
+                name.strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
+                    .is_some_and(is_derived_correlation_cookie_suffix)
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     fn callback_reject(
@@ -3500,6 +3530,14 @@ fn derived_cookie_name(prefix: &str, context_seed: &[u8; 32]) -> String {
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(context_seed);
     let suffix: String = encoded.chars().take(12).collect();
     format!("{prefix}_{suffix}")
+}
+
+fn is_derived_correlation_cookie_suffix(suffix: &str) -> bool {
+    suffix.len() == 13
+        && suffix.starts_with('_')
+        && suffix[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn behavior_usize(
@@ -6276,7 +6314,7 @@ mod tests {
         );
         assert!(ctx.authenticated_identity_header.is_none());
         assert_eq!(
-            ctx.backend_consumer_username(),
+            ctx.backend_authenticated_identity(),
             Some(" accepted@example.com ")
         );
 

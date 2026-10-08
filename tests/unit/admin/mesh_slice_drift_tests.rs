@@ -5,6 +5,7 @@ use std::sync::{Arc, Barrier};
 use arc_swap::ArcSwap;
 use chrono::{Duration, TimeZone, Utc};
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::grpc::admission::authenticated_principal_key;
 use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::mesh_slice_drift::{
     MESH_SLICE_DRIFT_MAX_ENTRIES, MESH_SLICE_DRIFT_MAX_NODE_ID_BYTES,
@@ -403,27 +404,66 @@ fn hard_cardinality_cap_is_serialized_under_concurrent_admission() {
 #[test]
 fn production_cap_evicts_only_a_disconnected_victim() {
     let registry = MeshSliceDriftRegistry::new();
-    let base = at(0);
-    let mut first_token = None;
+    let connected_at = at(0);
+    let namespace = "ferrum";
+    let scope = CpScope::Single(namespace.to_string());
+    let initial_slice = MeshSlice {
+        version: "v1".to_string(),
+        ..MeshSlice::default()
+    };
+    let mut disconnected = None;
     for index in 0..MESH_SLICE_DRIFT_MAX_ENTRIES {
+        let node_id = format!("dp-{index}");
+        let key = authenticated_principal_key(namespace, &node_id);
+        let request = MeshSliceRequest::from_native(
+            node_id.clone(),
+            namespace.to_string(),
+            String::new(),
+            std::collections::HashMap::new(),
+        );
         let token = registry
-            .open_session(&format!("dp-{index}"), "ferrum", base, Some("v1"))
-            .unwrap();
+            .open_projected_session_scoped(
+                &node_id,
+                &key,
+                namespace,
+                connected_at,
+                &initial_slice,
+                request,
+                scope.clone(),
+                None,
+            )
+            .expect("scoped projection session");
         if index == 0 {
-            first_token = Some(token);
+            disconnected = Some((key, token));
         }
     }
-    assert_eq!(
-        registry
-            .open_session("overflow", "ferrum", base, Some("v1"))
-            .unwrap_err(),
-        MeshSliceDriftAdmitError::CardinalityExceeded
+    let (key, token) = disconnected.expect("first entry");
+    registry.mark_disconnected(&key, &token, connected_at);
+    let node_id = "replacement";
+    let replacement_key = authenticated_principal_key(namespace, node_id);
+    let request = MeshSliceRequest::from_native(
+        node_id.to_string(),
+        namespace.to_string(),
+        String::new(),
+        std::collections::HashMap::new(),
     );
-    registry.mark_disconnected("dp-0", first_token.as_deref().unwrap(), base);
     registry
-        .open_session("replacement", "ferrum", base, Some("v1"))
-        .expect("disconnected eviction");
+        .open_projected_session_scoped(
+            node_id,
+            &replacement_key,
+            namespace,
+            connected_at + Duration::seconds(1),
+            &initial_slice,
+            request,
+            scope,
+            None,
+        )
+        .expect("disconnected scoped entry should be evicted");
     assert_eq!(registry.len(), MESH_SLICE_DRIFT_MAX_ENTRIES);
+    assert_eq!(
+        registry.snapshot().summary.tracked,
+        MESH_SLICE_DRIFT_MAX_ENTRIES
+    );
 }
 
 fn service(name: &str, namespace: &str) -> MeshService {

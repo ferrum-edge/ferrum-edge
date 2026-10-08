@@ -48,6 +48,10 @@ CP and DP communicate via the `ConfigSync` gRPC service defined in `proto/ferrum
 - **`Subscribe(SubscribeRequest) -> stream ConfigUpdate`** — Server-streaming RPC. The DP subscribes and receives an initial full config snapshot followed by streaming updates whenever the CP detects config changes.
 - **`GetFullConfig(FullConfigRequest) -> FullConfigResponse`** — Unary RPC for on-demand full config retrieval.
 
+Full-config requests share the CP's namespace, principal, node, and process admission budgets.
+Each authenticated principal may request at most one unary snapshot per second, and an admitted
+slot remains held until the encoded response body is dropped after delivery or cancellation.
+
 ### Configuration message size
 
 ConfigSync uses the same **16 MiB (16,777,216 byte)** message limit as the mesh

@@ -414,6 +414,7 @@ pub fn validate_composition(
         .iter()
         .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
+    let globals_by_name = config.enabled_global_plugin_configs_by_name();
 
     // Resolve each name the way the runtime merge does before deciding whether
     // the pair is actually effective together. Two properties of that merge are
@@ -452,15 +453,7 @@ pub fn validate_composition(
             })
             .collect();
         let effective: Vec<&PluginConfig> = if local.is_empty() {
-            config
-                .plugin_configs
-                .iter()
-                .filter(|plugin| {
-                    plugin.enabled
-                        && plugin.scope == PluginScope::Global
-                        && plugin.plugin_name == name
-                })
-                .collect()
+            globals_by_name.get(name).cloned().unwrap_or_default()
         } else {
             local
         };
@@ -3481,6 +3474,14 @@ impl Plugin for RequestDeduplication {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
+    }
+
+    /// With `enforce_required` the idempotency guarantee is admission policy
+    /// (requests without a usable key are refused), so a native gRPC or
+    /// WebSocket request, which this plugin never sees, must be refused rather
+    /// than served without it. Opportunistic deduplication refuses nothing.
+    fn gates_request_admission(&self) -> bool {
+        self.enforce_required
     }
 
     fn requires_response_body_buffering(&self) -> bool {

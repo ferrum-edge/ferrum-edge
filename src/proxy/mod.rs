@@ -278,6 +278,13 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Client-visible body (`403`, or gRPC `PERMISSION_DENIED`) for a request whose
+/// client-selected protocol flavor cannot run the route's authentication or
+/// admission policy
+/// ([`crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`]).
+pub(crate) const ROUTE_PROTOCOL_NOT_PERMITTED_BODY: &str =
+    r#"{"error":"Request protocol not permitted on this route"}"#;
+
 /// Precomputed circuit-breaker-open reject headers. Open-breaker 503s are
 /// still a reject path, but the map is rebuilt from this snapshot so the
 /// observability token is not `format!()`ed or assembled per request.
@@ -7112,6 +7119,13 @@ pub struct ProxyState {
     /// frontend. `None` when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS=0`
     /// (unlimited). Held for the tunnel lifetime, never on a datagram path.
     pub h3_connect_udp_sessions: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-client concurrent CONNECT-UDP tunnel counters, keyed by
+    /// `connect_udp::connect_udp_client_key` (IPv6 grouped by prefix). `None`
+    /// when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP=0` (disabled). Held
+    /// for the tunnel lifetime, never on a datagram path.
+    pub per_ip_connect_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Maximum concurrent CONNECT-UDP tunnels per resolved client. 0 = disabled.
+    pub http3_connect_udp_max_sessions_per_ip: u64,
     /// True only after the serving mode actually starts an H3 listener whose
     /// extended CONNECT/WebSocket support is enabled.
     ///
@@ -8343,6 +8357,16 @@ fn spawn_backend_svid_rotation_task(
             }
         }
     })
+}
+
+/// Whether no two consumers share a key the `ConsumerIndex` maps (identity or
+/// credential). A full build resolves a shared key by snapshot order (last
+/// wins); a patched index cannot replay that order, so a modified or removed
+/// consumer could move a shared API key to a different consumer. Full loads
+/// only warn on pre-existing duplicate credentials, so check before patching.
+fn consumer_index_keys_unique(config: &GatewayConfig) -> bool {
+    config.validate_unique_consumer_identities().is_ok()
+        && config.validate_unique_consumer_credentials().is_ok()
 }
 
 impl ProxyState {
@@ -10105,6 +10129,8 @@ impl ProxyState {
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
         let websocket_max_connections_per_ip = env_config.websocket_max_connections_per_ip;
         let per_ip_ipv6_prefix = env_config.per_ip_ipv6_prefix;
+        let http3_connect_udp_max_sessions_per_ip =
+            env_config.http3_connect_udp_max_sessions_per_ip;
         let mesh_egress_strip_baggage_keys =
             Arc::new(env_config.mesh_egress_strip_baggage_keys.clone());
         let pool_shard_amount =
@@ -10720,6 +10746,14 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             h3_connect_udp_sessions,
+            per_ip_connect_udp_sessions: if http3_connect_udp_max_sessions_per_ip > 0 {
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
+            } else {
+                None
+            },
+            http3_connect_udp_max_sessions_per_ip,
             h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
@@ -10823,7 +10857,8 @@ impl ProxyState {
 
     /// Start a background task that periodically removes stale zero-count
     /// entries from `per_ip_request_counts`, `per_ip_websocket_sessions`,
-    /// `per_ip_tcp_connections` and `per_ip_udp_sessions`.
+    /// `per_ip_connect_udp_sessions`, `per_ip_tcp_connections` and
+    /// `per_ip_udp_sessions`.
     /// Normally entries are cleaned via the RAII drop of
     /// [`PerIpRequestGuard`] / [`PerIpConnectionGuard`], but this sweep catches
     /// edge cases (e.g., task cancellation without guard drop).
@@ -10846,6 +10881,9 @@ impl ProxyState {
             maps.push(counts.clone());
         }
         if let Some(counts) = self.per_ip_websocket_sessions.as_ref() {
+            maps.push(counts.clone());
+        }
+        if let Some(counts) = self.per_ip_connect_udp_sessions.as_ref() {
             maps.push(counts.clone());
         }
         // Stream-listener per-source admission maps (issue #4544). Their
@@ -13298,7 +13336,17 @@ impl ProxyState {
             rebuild_globals,
             country_mmdb_load_mode,
         )?;
-        let consumer_inner = if consumer_changed {
+        let consumer_inner = if consumer_changed
+            && consumer_index_keys_unique(&current.config)
+            && consumer_index_keys_unique(new_config)
+        {
+            ConsumerIndex::build_delta_inner(
+                &current.consumer_index,
+                &delta.added_consumers,
+                &delta.removed_consumer_ids,
+                &delta.modified_consumers,
+            )
+        } else if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
         } else {
             Arc::clone(&current.consumer_index)
@@ -15527,6 +15575,13 @@ async fn handle_websocket_request_authenticated(
             username.to_string(),
         );
     }
+    if let Some(identity) = ctx.backend_authenticated_identity() {
+        push_forwardable_header_override(
+            &mut client_headers,
+            "x-authenticated-identity",
+            identity.to_string(),
+        );
+    }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
         push_forwardable_header_override(
             &mut client_headers,
@@ -17342,8 +17397,7 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
-/// Drop every gateway assertion (the whole `x-consumer-*` namespace plus
-/// `x-geo-country`), in any case variant, from a plugin-mutable header map.
+/// Drop every gateway assertion, in any case variant, from a plugin-mutable header map.
 fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));
 }
@@ -17351,8 +17405,8 @@ fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, Str
 /// Remove plugin-controlled gateway assertion headers and restore only the
 /// authenticated principal and private GeoIP lookup result for dispatch.
 ///
-/// Every `x-consumer-*` name is gateway-owned, so a plugin- or config-authored
-/// `x-consumer-role` is dropped here exactly like a forged
+/// Every `x-consumer-*` name and `x-authenticated-identity` are gateway-owned,
+/// so a plugin- or config-authored `x-consumer-role` is dropped here exactly
 /// `x-consumer-username`; only the authenticated `x-consumer-username` /
 /// `x-consumer-custom-id` are written back.
 ///
@@ -17364,16 +17418,22 @@ pub fn refresh_backend_gateway_assertion_headers(
     headers: &mut HashMap<String, String>,
 ) {
     let principal_username = ctx.backend_consumer_username().map(str::to_string);
+    let external_identity = ctx.backend_authenticated_identity().map(str::to_string);
     let principal_custom_id = principal_username
         .as_ref()
         .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
     let geo_country = ctx.backend_geo_country().map(str::to_string);
     let source_has_reserved_assertion = principal_username.is_none()
+        && external_identity.is_none()
         && geo_country.is_none()
         && headers
             .keys()
             .any(|name| headers_mod::is_gateway_assertion_header(name));
-    if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
+    if principal_username.is_none()
+        && external_identity.is_none()
+        && geo_country.is_none()
+        && !source_has_reserved_assertion
+    {
         return;
     }
 
@@ -17383,6 +17443,9 @@ pub fn refresh_backend_gateway_assertion_headers(
         if let Some(custom_id) = principal_custom_id {
             headers.insert("x-consumer-custom-id".to_string(), custom_id);
         }
+    }
+    if let Some(identity) = external_identity {
+        headers.insert("x-authenticated-identity".to_string(), identity);
     }
     if let Some(country) = geo_country {
         headers.insert("x-geo-country".to_string(), country);
@@ -32745,7 +32808,7 @@ fn boxed_handle_proxy_request_inner(
 /// function can attach the [`RequestGuard`] to the response body.
 #[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_inner(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
@@ -32763,6 +32826,21 @@ async fn handle_proxy_request_inner(
 
     let mut method = req.method().as_str().to_owned();
     let inbound_version = req.version();
+    if inbound_version == hyper::Version::HTTP_11
+        && method != "GET"
+        && crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::WebSocket
+    {
+        record_request(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
+        return Ok(build_method_not_allowed_response_with_allow(
+            r#"{"error":"WebSocket upgrades require GET"}"#,
+            "GET",
+        ));
+    }
+    if is_h2_websocket_connect(&req) {
+        // The WebSocket backend handshake is a GET. Keep route and plugin
+        // policy aligned with the method the backend receives.
+        method = "GET".to_string();
+    }
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
     // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
     // byte-stream `is_hbone_connect` (different wire marker). EITHER shape is a
@@ -32901,6 +32979,13 @@ async fn handle_proxy_request_inner(
         ));
     }
 
+    // Resolve the client's `Connection` nominations against the client's own
+    // fields before any plugin or gateway assertion can add a header that the
+    // backend-boundary hop-by-hop strip would otherwise remove.
+    headers_mod::confine_connection_nominated_request_headers(
+        req.headers_mut(),
+        state.env_config.real_ip_header.as_deref(),
+    );
     // Store raw headers for deferred materialization. The clone is a single
     // contiguous allocation (HeaderMap's internal Vec) — much cheaper than
     // N individual String allocations from the previous eager conversion.
@@ -33912,6 +33997,45 @@ async fn handle_proxy_request_inner(
     let initial_response_header_policy_plugins =
         plugin_cache_view.initial_response_header_policy_plugins();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
+
+    // The client selected this flavor (gRPC `Content-Type`, WebSocket upgrade)
+    // and its plugin view omits authentication or admission policy that the
+    // route's HTTP view runs. Refuse before any plugin runs instead of serving
+    // the route without that policy.
+    if plugin_cache_view
+        .capabilities()
+        .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            proxy_id = %proxy.id,
+            protocol = ?request_protocol,
+            "Rejected request: route admission policy does not run on the requested protocol"
+        );
+        let mut reject = normalize_reject_response(
+            StatusCode::FORBIDDEN,
+            Bytes::from_static(ROUTE_PROTOCOL_NOT_PERMITTED_BODY.as_bytes()),
+            &EMPTY_HEADERS,
+            is_grpc_request,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        record_status(&state, StatusCode::FORBIDDEN.as_u16());
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        return Ok(build_response_from_normalized_reject(reject));
+    }
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
     // Ordinary request hooks stay skipped, but terminal transaction logging
@@ -35175,6 +35299,7 @@ async fn handle_proxy_request_inner(
         .keys()
         .any(|name| headers_mod::is_gateway_assertion_header(name));
     if ctx.backend_consumer_username().is_some()
+        || ctx.backend_authenticated_identity().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion
     {
@@ -52673,10 +52798,14 @@ fn build_response_with_gateway_error(
 }
 
 fn build_method_not_allowed_response(body: &str) -> Response<ProxyBody> {
+    build_method_not_allowed_response_with_allow(body, PROTOCOL_LEVEL_405_ALLOW)
+}
+
+fn build_method_not_allowed_response_with_allow(body: &str, allow: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
         .header("Content-Type", "application/json")
-        .header("Allow", PROTOCOL_LEVEL_405_ALLOW)
+        .header("Allow", allow)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(

@@ -647,6 +647,48 @@ async fn claims_to_headers_and_forward_original_false_strip_authorization() {
     );
 }
 
+/// With no display claim configured, a provider identity override also
+/// selects the `X-Authenticated-Identity` value instead of the global default.
+#[tokio::test]
+async fn provider_identity_override_selects_the_default_display_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "global-username",
+            "sub": "provider-subject"
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "consumer_identity_claim": "sub"
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx("provider-identity-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("provider-subject")
+    );
+    assert_eq!(
+        ctx.authenticated_identity_header.as_deref(),
+        Some("provider-subject")
+    );
+}
+
 #[tokio::test]
 async fn principal_less_introspection_attempt_does_not_mutate_later_key_auth_request() {
     let server = MockServer::start().await;

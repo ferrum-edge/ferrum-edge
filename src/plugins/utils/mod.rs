@@ -35,6 +35,7 @@ pub mod log_schema;
 pub mod mcp_jsonrpc;
 pub mod metadata_redaction;
 pub mod openai_error;
+pub mod plugin_secret_env;
 pub mod policy_digest;
 pub mod query;
 pub mod rate_limit;

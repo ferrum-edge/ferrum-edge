@@ -352,7 +352,10 @@ pub fn apply_claim_headers_from_context(
 /// because the effective `before_proxy` map is not guaranteed to be all
 /// lowercase: hyper normalizes wire field names, but plugins and transformers
 /// insert operator-cased names, so a lowercase insert alone could leave an
-/// `X-Authenticated-Email` variant beside the gateway's value.
+/// `X-Authenticated-Email` variant beside the gateway's value. It also treats
+/// `_` as `-` ([`crate::proxy::headers::field_names_equivalent_for_backends`]):
+/// a client `X_Authenticated_Email` reaches a CGI-style backend as the same
+/// variable as the gateway's `x-authenticated-email`.
 fn sanitize_owned_claim_header_destinations(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
@@ -367,7 +370,7 @@ fn sanitize_owned_claim_header_destinations(
             !sanitized
                 .sanitized_claim_header_destinations
                 .contains(destination)
-                && name.eq_ignore_ascii_case(destination)
+                && crate::proxy::headers::field_names_equivalent_for_backends(name, destination)
         })
     });
     for destination in destinations.names() {

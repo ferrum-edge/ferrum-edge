@@ -10,8 +10,12 @@
 use std::collections::BTreeSet;
 
 use ferrum_edge::config::public_env_inventory::{
-    PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS, PUBLIC_FERRUM_ENV_SETTINGS,
+    PLUGIN_SECRET_EXAMPLE_ENV, PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS, PUBLIC_FERRUM_ENV_SETTINGS,
     TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV, is_public_ferrum_env_coverage_exempt,
+    is_recognized_ferrum_setting,
+};
+use ferrum_edge::plugins::utils::plugin_secret_env::{
+    PLUGIN_SECRET_ENV_PREFIX, is_plugin_secret_env_name,
 };
 
 /// Prefix of the dynamic `ai_transcript_audit` sink-secret namespace, mirrored
@@ -184,6 +188,59 @@ fn transcript_sink_secret_namespace_has_canonical_inventory_surface() {
     assert!(
         ferrum_conf_assignment_keys(FERRUM_CONF).contains(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
         "ferrum.conf needs a `{TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV} = ...` template assignment"
+    );
+    assert!(
+        !is_recognized_ferrum_setting("FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN_FILE"),
+        "settings-file parsing must refuse a secret-source suffix in the transcript namespace"
+    );
+}
+
+/// The dynamic plugin-config secret namespace likewise has no fixed key set.
+/// Pin its representative key so removing the namespace from the inventory —
+/// or dropping its docs row / `ferrum.conf` assignment — fails closed here,
+/// and so the settings-file recognizer and the plugin resolver agree on it.
+#[test]
+fn plugin_secret_namespace_has_canonical_inventory_surface() {
+    assert!(
+        PLUGIN_SECRET_EXAMPLE_ENV.starts_with(PLUGIN_SECRET_ENV_PREFIX),
+        "`{PLUGIN_SECRET_EXAMPLE_ENV}` must live under `{PLUGIN_SECRET_ENV_PREFIX}`"
+    );
+    assert!(
+        is_plugin_secret_env_name(PLUGIN_SECRET_EXAMPLE_ENV),
+        "the example key must be a name the plugin resolver admits"
+    );
+    assert!(
+        is_ferrum_env_key(PLUGIN_SECRET_EXAMPLE_ENV),
+        "the documented example key must be an exact-key form (no `<NAME>` placeholder), \
+         otherwise the docs/ferrum.conf extractors silently skip it"
+    );
+    assert!(
+        public_inventory().contains(PLUGIN_SECRET_EXAMPLE_ENV),
+        "`{PLUGIN_SECRET_EXAMPLE_ENV}` must stay in PUBLIC_FERRUM_ENV_SETTINGS"
+    );
+    assert!(
+        !is_public_ferrum_env_coverage_exempt(PLUGIN_SECRET_EXAMPLE_ENV),
+        "the plugin-secret namespace must keep real docs/template coverage"
+    );
+    assert!(
+        docs_table_keys(CONFIGURATION_MD).contains(PLUGIN_SECRET_EXAMPLE_ENV),
+        "docs/configuration.md needs a canonical `{PLUGIN_SECRET_EXAMPLE_ENV}` table row"
+    );
+    assert!(
+        ferrum_conf_assignment_keys(FERRUM_CONF).contains(PLUGIN_SECRET_EXAMPLE_ENV),
+        "ferrum.conf needs a `{PLUGIN_SECRET_EXAMPLE_ENV} = ...` template assignment"
+    );
+    assert!(
+        is_recognized_ferrum_setting("FERRUM_PLUGIN_SECRET_ANY_NAME_7"),
+        "settings-file parsing must recognize the whole namespace"
+    );
+    assert!(
+        !is_recognized_ferrum_setting("FERRUM_PLUGIN_SECRET_lower"),
+        "settings-file parsing must use the resolver's name grammar"
+    );
+    assert!(
+        !is_recognized_ferrum_setting("FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD_FILE"),
+        "settings-file parsing must refuse a secret-source suffix in the plugin namespace"
     );
 }
 

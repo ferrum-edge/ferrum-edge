@@ -19,6 +19,7 @@ use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
     SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
@@ -142,6 +143,10 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
 /// Bound the wire body before generic JSON deserialization so a compromised or
 /// faulty provider cannot force an unbounded allocation.
 const MAX_EMBEDDING_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Schema label for the provider credential reference in diagnostics.
+const API_KEY_ENV_FIELD: &str = "ai_semantic_firewall: `provider.api_key_env`";
+
 /// OpenAI-compatible embedding models are normally at most a few thousand
 /// dimensions. This deliberately generous ceiling bounds scalar allocation and
 /// normalization work while retaining compatibility with custom models.
@@ -531,8 +536,9 @@ struct ProviderConfig {
     /// Literal IPs are intentionally omitted because they require no lookup.
     warmup_hostname: Option<String>,
     model: Option<String>,
-    /// Name of the env var holding the provider API key. Resolved lazily at the
-    /// first embedding call rather than in `new()` so config validation (CP
+    /// Name of the `FERRUM_PLUGIN_SECRET_<NAME>` env var holding the provider
+    /// API key (shape-checked at construction). Resolved lazily at the first
+    /// embedding call rather than in `new()` so config validation (CP
     /// admin, `ferrum-edge validate`) does not require the live secret to be
     /// present in a process that never calls the provider.
     api_key_env: Option<String>,
@@ -1540,11 +1546,7 @@ impl FirewallEngine {
             let authorization = provider
                 .authorization_header
                 .get_or_try_init(|| async {
-                    let api_key = std::env::var(env_name).map_err(|_| {
-                        format!(
-                            "ai_semantic_firewall: provider.api_key_env {env_name:?} is set but not present in this process"
-                        )
-                    })?;
+                    let api_key = resolve_plugin_secret_env(API_KEY_ENV_FIELD, env_name)?;
                     Ok::<String, String>(format!("Bearer {api_key}"))
                 })
                 .await?;
@@ -2135,6 +2137,10 @@ impl Plugin for AiSemanticFirewall {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         HTTP_ONLY_PROTOCOLS
+    }
+
+    fn gates_request_admission(&self) -> bool {
+        true
     }
 
     fn enforces_finalized_request_policy(&self) -> bool {
@@ -3202,6 +3208,9 @@ fn parse_provider_config(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    if let Some(env_name) = api_key_env.as_deref() {
+        validate_plugin_secret_env_name(API_KEY_ENV_FIELD, env_name)?;
+    }
     // Resolve the API key lazily at the first embedding call (see `embed_texts`),
     // not here: `new()` runs during CP admin validation and `ferrum-edge
     // validate`, which must not require the live secret in a process that never

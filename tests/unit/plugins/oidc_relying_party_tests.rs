@@ -1875,6 +1875,43 @@ async fn browser_challenge_accepts_same_host_with_normalized_names_ips_and_ports
 }
 
 #[tokio::test]
+async fn browser_challenges_expire_old_pending_flow_cookies_at_the_per_browser_cap() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let first = issue_browser_challenge(&plugin).await;
+    let first_pair = cookie_pair(&first.cookie).to_string();
+
+    let mut second_ctx = html_ctx();
+    second_ctx
+        .headers
+        .insert("cookie".to_string(), first_pair.clone());
+    let second_headers = assert_callback_redirect(
+        plugin
+            .authenticate(&mut second_ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let second_cookie = second_headers
+        .get("set-cookie")
+        .expect("second flow cookie");
+    let second_pair = cookie_pair(second_cookie).to_string();
+
+    let mut third_ctx = html_ctx();
+    third_ctx
+        .headers
+        .insert("cookie".to_string(), format!("{first_pair}; {second_pair}"));
+    let third_headers = assert_callback_redirect(
+        plugin
+            .authenticate(&mut third_ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let set_cookie = third_headers.get("set-cookie").expect("third flow cookies");
+    assert!(set_cookie.contains("Max-Age=0"));
+    assert!(
+        set_cookie.lines().count() >= 2,
+        "the response expires an older pending flow and sets the new one: {set_cookie}"
+    );
+}
+
+#[tokio::test]
 async fn loopback_http_challenge_remains_available_on_the_same_host() {
     for (redirect_uri, request_host) in [
         ("http://localhost:3000/oauth/callback", "LOCALHOST:5173"),

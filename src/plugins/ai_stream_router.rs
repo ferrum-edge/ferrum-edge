@@ -228,6 +228,7 @@ use super::utils::content_encoding::{
     DecodeLimits, decode_content_encoding, parse_content_codings,
 };
 use super::utils::openai_error::openai_error_body;
+use super::utils::plugin_secret_env::resolve_plugin_secret_env;
 use super::utils::sse::{sse_event_end, sse_lines};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
@@ -867,7 +868,7 @@ impl AiStreamRouter {
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
             let parsed = parse_endpoint(&name, endpoint, allow_plaintext, &backend_allow_ips)?;
 
-            let api_key = config_or_env_str(pv, "api_key").ok_or(format!(
+            let api_key = config_or_env_str(pv, &name, "api_key")?.ok_or(format!(
                 "ai_stream_router: provider {name:?} missing `api_key`"
             ))?;
             // Header-value validity is a per-byte property, so proving the key
@@ -1224,9 +1225,9 @@ fn optional_string_vec(config: &Value, field: &str) -> Result<Option<Vec<String>
 /// control character was only discovered at dispatch: every request routed to
 /// that provider failed with a `502` the operator could not diagnose, while
 /// `ferrum-edge validate` reported the configuration as good (issue #5300).
-/// Screening the FINAL value here — after `${ENV_VAR}` resolution — turns an
-/// operator typo into a configuration error. The value itself is never echoed,
-/// because `api_key` is a live credential.
+/// Screening the FINAL value here — after `${FERRUM_PLUGIN_SECRET_<NAME>}`
+/// resolution — turns an operator typo into a configuration error. The value
+/// itself is never echoed, because `api_key` is a live credential.
 fn validate_provider_header_value(provider: &str, field: &str, value: &str) -> Result<(), String> {
     if reqwest::header::HeaderValue::from_str(value).is_err() {
         return Err(format!(
@@ -1236,20 +1237,29 @@ fn validate_provider_header_value(provider: &str, field: &str, value: &str) -> R
     Ok(())
 }
 
-/// Read a config string, resolving a `${ENV_VAR}` reference against the process
-/// environment.
-fn config_or_env_str(config: &Value, field: &str) -> Option<String> {
-    let raw = config.get(field).and_then(|v| v.as_str())?;
+/// Read a config string, resolving a whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}`
+/// reference against the process environment. A `${...}` reference to any
+/// other variable is refused before anything is read, so a config writer
+/// cannot direct an unrelated process secret to a provider endpoint it chose.
+fn config_or_env_str(
+    config: &Value,
+    provider: &str,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(raw) = config.get(field).and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
     if raw.is_empty() {
-        return None;
+        return Ok(None);
     }
     if let Some(var) = raw
         .strip_prefix("${")
         .and_then(|rest| rest.strip_suffix('}'))
     {
-        return std::env::var(var).ok().filter(|v| !v.is_empty());
+        let label = format!("ai_stream_router: provider {provider:?} `{field}`");
+        return resolve_plugin_secret_env(&label, var).map(Some);
     }
-    Some(raw.to_string())
+    Ok(Some(raw.to_string()))
 }
 
 // ---------------------------------------------------------------------------

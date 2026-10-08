@@ -2739,3 +2739,188 @@ fn functional_connect_udp_suite_covers_plain_grpc_content_type_rejection() {
         "functional_h3_connect_udp_unauthenticated_tunnels_are_untouched_by_the_contract"
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Per-client tunnel cap (`FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP`)
+// ---------------------------------------------------------------------------
+
+mod per_client_tunnel_cap {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use dashmap::DashMap;
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::http3::connect_udp::{
+        CONNECT_UDP_PER_CLIENT_IPV6_PREFIX, connect_udp_client_key,
+        try_acquire_connect_udp_client_slot,
+    };
+
+    fn counts() -> Arc<DashMap<String, AtomicU64>> {
+        Arc::new(DashMap::new())
+    }
+
+    fn live(counts: &DashMap<String, AtomicU64>, key: &str) -> u64 {
+        counts
+            .get(key)
+            .map_or(0, |count| count.value().load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn per_client_cap_is_on_by_default() {
+        let defaults = EnvConfig::default();
+        assert_eq!(defaults.http3_connect_udp_max_sessions_per_ip, 32);
+        assert!(
+            defaults.http3_connect_udp_max_sessions_per_ip
+                < defaults.http3_connect_udp_max_sessions as u64,
+            "one client must not be able to fill the process-wide budget by default"
+        );
+        assert_eq!(CONNECT_UDP_PER_CLIENT_IPV6_PREFIX, 64);
+    }
+
+    #[test]
+    fn client_key_keeps_ipv4_per_address_and_folds_mapped_ipv6() {
+        assert_eq!(connect_udp_client_key("198.51.100.7", 64), "198.51.100.7");
+        assert_eq!(
+            connect_udp_client_key("::ffff:198.51.100.7", 64),
+            "198.51.100.7",
+            "an IPv4-mapped peer is the same client as its IPv4 address"
+        );
+        assert_ne!(
+            connect_udp_client_key("198.51.100.7", 64),
+            connect_udp_client_key("198.51.100.8", 64)
+        );
+    }
+
+    #[test]
+    fn client_key_groups_ipv6_by_prefix() {
+        let a = connect_udp_client_key("2001:db8:1:2::1", 64);
+        let b = connect_udp_client_key("2001:db8:1:2:ffff:ffff:ffff:fffe", 64);
+        let other = connect_udp_client_key("2001:db8:1:3::1", 64);
+        assert_eq!(a, "2001:db8:1:2::");
+        assert_eq!(a, b, "addresses in one /64 must share a budget");
+        assert_ne!(a, other, "a different /64 is a different client");
+
+        assert_eq!(connect_udp_client_key("2001:db8::1", 128), "2001:db8::1");
+        assert_eq!(connect_udp_client_key("2001:db8::1", 0), "::");
+        assert_eq!(
+            connect_udp_client_key("[2001:db8:1:2::9]", 64),
+            "2001:db8:1:2::",
+            "bracketed literals are keyed like bare ones"
+        );
+        assert_eq!(connect_udp_client_key("not-an-ip", 64), "not-an-ip");
+    }
+
+    #[test]
+    fn per_client_cap_is_disabled_when_unconfigured() {
+        assert!(
+            try_acquire_connect_udp_client_slot(None, "198.51.100.1", 1)
+                .expect("disabled cap admits")
+                .is_none()
+        );
+        let counts = counts();
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 0)
+                .expect("zero cap admits")
+                .is_none()
+        );
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn per_client_cap_refuses_one_client_and_admits_another() {
+        let counts = counts();
+        let first = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 2)
+            .expect("first tunnel admitted")
+            .expect("cap is enabled");
+        let second = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 2)
+            .expect("second tunnel admitted")
+            .expect("cap is enabled");
+        assert_eq!(live(&counts, "198.51.100.1"), 2);
+
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 2).is_err(),
+            "a third concurrent tunnel from one client must be refused"
+        );
+        assert_eq!(
+            live(&counts, "198.51.100.1"),
+            2,
+            "a refused admission must not leak its increment"
+        );
+
+        let other = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.2", 2)
+            .expect("another client is independent")
+            .expect("cap is enabled");
+        assert_eq!(live(&counts, "198.51.100.2"), 1);
+
+        drop((first, second, other));
+    }
+
+    #[test]
+    fn per_client_slot_is_released_when_the_tunnel_closes() {
+        let counts = counts();
+        let tunnel = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 1)
+            .expect("first tunnel admitted");
+        assert!(try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 1).is_err());
+
+        drop(tunnel);
+        assert_eq!(live(&counts, "198.51.100.1"), 0);
+        let reopened = try_acquire_connect_udp_client_slot(Some(&counts), "198.51.100.1", 1)
+            .expect("closing a tunnel must release its slot");
+        assert!(reopened.is_some());
+    }
+
+    #[test]
+    fn per_client_cap_groups_ipv6_sources_by_slash_64() {
+        let counts = counts();
+        let held = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", 1)
+            .expect("first IPv6 tunnel admitted");
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::abcd", 1).is_err(),
+            "rotating addresses inside one /64 must not mint a fresh budget"
+        );
+        let neighbour = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:3::1", 1)
+            .expect("a different /64 is an independent client");
+        assert!(neighbour.is_some());
+        assert_eq!(live(&counts, "2001:db8:1:2::"), 1);
+
+        drop(held);
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::abcd", 1)
+                .expect("released slot is reusable by the same /64")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn handler_holds_the_per_client_slot_for_the_tunnel_lifetime() {
+        let squeezed = super::squeeze(super::connect_udp_handler_source());
+        let early = squeezed
+            .find("ifletSome(termination)=crate::proxy::auth_lifetime::expired_authorization(auth_deadline)")
+            .expect("early elapsed gate");
+        let client_slot = squeezed
+            .find("try_acquire_connect_udp_client_slot(state.per_ip_connect_udp_sessions.as_ref(),&ctx.client_ip,")
+            .expect("per-client slot keyed on the resolved client IP");
+        let permit = squeezed
+            .find("state.h3_connect_udp_sessions.as_ref()")
+            .expect("session permit");
+        let request_accounting_ends = squeezed
+            .find("drop(per_ip_guard);emit_session_summary(")
+            .expect("per-IP request accounting ends once the tunnel is established");
+        let relay = squeezed.find("letend=relay(").expect("tunnel relay");
+        let released = squeezed
+            .rfind("drop(client_tunnel_guard);")
+            .expect("per-client slot is released explicitly");
+        assert!(
+            early < client_slot && client_slot < permit,
+            "the per-client slot is taken after the expiry gate and before the session permit"
+        );
+        assert!(
+            request_accounting_ends < relay && relay < released,
+            "the per-client slot must outlive request accounting and the relay"
+        );
+        assert!(
+            !squeezed[request_accounting_ends..relay].contains("drop(client_tunnel_guard)"),
+            "the per-client slot must not be released at the upgrade boundary"
+        );
+    }
+}

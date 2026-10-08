@@ -1798,7 +1798,7 @@ keeps unauthenticated requests eligible for an immediate `401` without body
 collection while still making the bounded body available to OPA's `authorize`
 callback on HTTP/1.1, HTTP/2, and HTTP/3.
 
-After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. The whole `x-consumer-*` request-header namespace is gateway-owned: client-supplied names beneath it are dropped when headers are materialized, before any plugin runs, and plugin-authored names beneath it are scrubbed from the outbound map before these two are written back, on every protocol path. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
+After all plugin phases complete, the gateway injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) only for a mapped Consumer. Unmapped external identities use the gateway-owned `X-Authenticated-Identity` header. The whole `x-consumer-*` request-header namespace and `x-authenticated-identity` are gateway-owned: client-supplied values are dropped when headers are materialized, before any plugin runs, and plugin-authored values are scrubbed from the outbound map before verified identity assertions are written back, on every protocol path.
 
 ### Rate limiting runs after auth (priority 2900)
 
@@ -2003,6 +2003,33 @@ The default priority is `5000` (the Custom band), which runs after all transform
 ## Protocol Support
 
 Each plugin declares which proxy protocols it supports via `supported_protocols()`. The gateway skips plugins that don't support the current proxy's protocol — for example, CORS is never invoked for a TCP stream proxy.
+
+On an HTTP-family route the request's flavor is chosen by the client: a native
+gRPC `Content-Type` selects the `Grpc` view and upgrade headers select the
+`WebSocket` view. A flavor view may therefore never drop the route's
+request-admission policy. When the `Grpc` or `WebSocket` view of a chain omits
+an instance that its `Http` view runs and that declares
+`gates_request_admission()`, the gateway refuses the request before any plugin
+runs: `403` with `{"error":"Request protocol not permitted on this route"}`, or
+trailers-only `PERMISSION_DENIED` for native gRPC, logged with rejection phase
+`route_protocol_admission`. `gates_request_admission()` defaults to
+`is_auth_plugin()`, so every authentication plugin participates, including a
+custom one that keeps the HTTP-only default. A custom enforcement plugin that
+is not an authentication plugin must override `gates_request_admission()` or
+declare the flavors it supports; otherwise those flavors skip it. Among
+built-ins the refusal applies on both flavors to `soap_ws_security` in every
+configuration (timestamp-only included), `openapi_validator` in `block` mode,
+`mcp_gateway`, `request_deduplication` with `enforce_required`,
+`ai_prompt_shield`, `ai_rate_limiter`, `ai_tool_governor`,
+`ai_semantic_firewall`, and `rate_limiting` with `mcp_tool_calls`; to native
+gRPC for `graphql` with any protection rule (it runs on WebSocket); and to
+WebSocket for `a2a_gateway` with a deny policy (it runs on gRPC). Serve gRPC or
+WebSocket traffic from a separate route that does not carry those plugins, or
+use authentication that supports the flavor. The decision is a precomputed
+capability bit (`OMITS_ROUTE_ADMISSION_POLICY`), so the request path does no
+plugin scan, and the HBONE admission fence re-checks it on every reload, so a
+live tunnel admitted on a now-refused view is revoked. The composed gRPC-Web
+view below keeps every HTTP plugin and is never refused.
 
 Recognized H3 gRPC-Web requests retain the ordinary `Http` protocol view so HTTP-only validators, deduplication, and other guardrails keep running. At cache rebuild time the gateway composes `grpc_method_router` and `grpc_deadline` into that same priority-ordered view when those native-gRPC policies are configured. No other gRPC-only plugin is added, and each plugin instance appears at most once.
 

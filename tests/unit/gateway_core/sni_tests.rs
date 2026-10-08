@@ -128,6 +128,18 @@ fn build_dtls_client_hello(hostname: &str) -> Vec<u8> {
     record
 }
 
+fn build_dtls_client_hello_without_sni() -> Vec<u8> {
+    let mut record = build_dtls_client_hello("example.com");
+    record.truncate(69);
+    record[67..69].copy_from_slice(&0u16.to_be_bytes());
+    let handshake_len = (record.len() - 13 - 12) as u32;
+    let body_len = (record.len() - 13) as u16;
+    record[11..13].copy_from_slice(&body_len.to_be_bytes());
+    record[14..17].copy_from_slice(&handshake_len.to_be_bytes()[1..]);
+    record[22..25].copy_from_slice(&handshake_len.to_be_bytes()[1..]);
+    record
+}
+
 /// Read a 3-byte big-endian unsigned integer (mirrors `u24_to_usize` in `sni.rs`).
 fn u24(bytes: &[u8]) -> usize {
     ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | (bytes[2] as usize)
@@ -340,6 +352,30 @@ fn test_extract_sni_normalizes_uppercase_at_max_length_boundary() {
 fn test_extract_sni_from_dtls_rejects_oversized_hostname() {
     let hostname = "a".repeat(254);
     let data = build_dtls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_from_dtls_client_hello_without_extensions_block() {
+    let mut data = build_dtls_client_hello_without_sni();
+    data.drain(67..69);
+    let record_len = u16::from_be_bytes([data[11], data[12]]) as usize - 2;
+    data[11..13].copy_from_slice(&(record_len as u16).to_be_bytes());
+    let handshake_len = u24(&data[14..17]) - 2;
+    data[14..17].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
+    data[22..25].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
 
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
@@ -562,6 +598,48 @@ fn extract_dtls_sni_fails_closed_on_initial_fragment_without_sni() {
 }
 
 #[test]
+fn extract_dtls_sni_routes_initial_fragment_when_sni_is_complete() {
+    let hostname = "frag.example.com";
+    let mut full = build_dtls_client_hello(hostname);
+    // Append an unknown extension after SNI so this remains an initial
+    // fragment while carrying the complete SNI extension.
+    full.extend_from_slice(&[0x00, 0x15, 0x00, 0x01, 0x00]);
+    let ext_len = u16::from_be_bytes([full[67], full[68]]) as usize;
+    full[67..69].copy_from_slice(&((ext_len + 5) as u16).to_be_bytes());
+    let handshake_len = u24(&full[14..17]) + 5;
+    full[14..17].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
+    full[22..25].copy_from_slice(&[
+        (handshake_len >> 16) as u8,
+        (handshake_len >> 8) as u8,
+        handshake_len as u8,
+    ]);
+    let record_len = u16::from_be_bytes([full[11], full[12]]) as usize + 5;
+    full[11..13].copy_from_slice(&(record_len as u16).to_be_bytes());
+
+    let sni_end = full
+        .windows(hostname.len())
+        .position(|window| window == hostname.as_bytes())
+        .expect("hostname should be present in test ClientHello")
+        + hostname.len();
+    let fragment_len = sni_end - 25;
+    let mut fragment = full[..sni_end].to_vec();
+    fragment[22..25].copy_from_slice(&[
+        (fragment_len >> 16) as u8,
+        (fragment_len >> 8) as u8,
+        fragment_len as u8,
+    ]);
+    fragment[11..13].copy_from_slice(&((12 + fragment_len) as u16).to_be_bytes());
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&fragment),
+        DtlsSniResult::Hostname(hostname.to_string())
+    );
+}
+
+#[test]
 fn extract_dtls_sni_unfragmented_still_parses() {
     let data = build_dtls_client_hello("whole.example.com");
     assert_eq!(
@@ -611,14 +689,21 @@ fn test_extract_sni_from_dtls_case_normalized() {
 
 #[test]
 fn test_extract_sni_from_dtls_truncated() {
-    // Too short to be a DTLS handshake — not a continuation fragment, so it stays
-    // catch-all eligible (NoSni), preserving the historical no-SNI routing.
+    // A short handshake record is malformed and cannot select the catch-all.
     assert_eq!(
         extract_sni_from_dtls_client_hello(&[]),
-        DtlsSniResult::NoSni
+        DtlsSniResult::Malformed
     );
     assert_eq!(
         extract_sni_from_dtls_client_hello(&[0x16; 10]),
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_from_complete_dtls_client_hello_without_sni() {
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&build_dtls_client_hello_without_sni()),
         DtlsSniResult::NoSni
     );
 }
@@ -629,7 +714,7 @@ fn test_extract_sni_from_dtls_wrong_content_type() {
     data[0] = 0x17;
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        DtlsSniResult::NoSni
+        DtlsSniResult::Malformed
     );
 }
 
@@ -718,25 +803,52 @@ fn test_extract_sni_random_garbage_bytes() {
 
 #[test]
 fn test_extract_sni_dtls_oversized_cookie() {
-    // Malformed body (offset 0, so not a continuation fragment) → catch-all
-    // eligible NoSni, not InvalidFragment.
+    // A malformed ClientHello body cannot select the catch-all.
     let mut data = build_dtls_client_hello("example.com");
     data[60] = 0xFF;
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        DtlsSniResult::NoSni
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_unrepresentable_hostname() {
+    for hostname in ["tenant.example.com.", "tenant_name.example.com"] {
+        assert_eq!(
+            extract_sni_from_dtls_client_hello(&build_dtls_client_hello(hostname)),
+            DtlsSniResult::Malformed,
+            "unrepresentable SNI {hostname:?} must be refused"
+        );
+    }
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_malformed_sni_extension_lengths() {
+    let hostname = "tenant.example.com";
+    let mut data = build_dtls_client_hello(hostname);
+    let hostname_offset = data
+        .windows(hostname.len())
+        .position(|window| window == hostname.as_bytes())
+        .expect("hostname should be present in test ClientHello");
+    let list_len_offset = hostname_offset - 5;
+    let list_len = u16::from_be_bytes([data[list_len_offset], data[list_len_offset + 1]]);
+    data[list_len_offset..list_len_offset + 2]
+        .copy_from_slice(&list_len.saturating_add(1).to_be_bytes());
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::Malformed
     );
 }
 
 #[test]
 fn test_extract_sni_dtls_wrong_handshake_type() {
-    // Non-ClientHello handshake type → NoSni (catch-all eligible), matching the
-    // historical no-SNI routing; only a continuation fragment is InvalidFragment.
+    // Other handshake messages are not eligible to create a catch-all session.
     let mut data = build_dtls_client_hello("example.com");
     data[13] = 0x02;
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        DtlsSniResult::NoSni
+        DtlsSniResult::Malformed
     );
 }
 

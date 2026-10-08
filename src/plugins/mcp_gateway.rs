@@ -6988,6 +6988,10 @@ impl Plugin for McpGateway {
         HTTP_ONLY_PROTOCOLS
     }
 
+    fn gates_request_admission(&self) -> bool {
+        self.enabled
+    }
+
     /// The public-URI/name rewrite this plugin applies to `resources/read`,
     /// `tools/call`, and `prompts/get` results is **not** a function of static
     /// configuration, so it cannot be reduced to a construction-time digest.
@@ -10471,6 +10475,12 @@ pub fn validate_composition(
         .iter()
         .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
+    // Resolved once: scanning every plugin config per proxy made this
+    // O(proxies × plugin configs) on every reload (issue #6057).
+    let global_gateways: Vec<&PluginConfig> = config
+        .enabled_global_plugin_configs_by_name()
+        .remove("mcp_gateway")
+        .unwrap_or_default();
 
     let mut errors = Vec::new();
     for proxy in &config.proxies {
@@ -10500,15 +10510,7 @@ pub fn validate_composition(
             })
             .collect();
         let effective: Vec<&PluginConfig> = if local.is_empty() {
-            config
-                .plugin_configs
-                .iter()
-                .filter(|plugin| {
-                    plugin.enabled
-                        && plugin.scope == PluginScope::Global
-                        && plugin.plugin_name == "mcp_gateway"
-                })
-                .collect()
+            global_gateways.clone()
         } else {
             local
         };

@@ -12,7 +12,7 @@ pub(crate) struct ConsumerIndexInner {
     /// Separate indexes per credential type — avoids format!() allocation per lookup.
     keyauth_index: HashMap<String, Arc<Consumer>>,
     basic_index: HashMap<String, Arc<Consumer>>,
-    identity_index: HashMap<String, Arc<Consumer>>,
+    identity_index: HashMap<String, Option<Arc<Consumer>>>,
     /// Namespace-scoped identity index for HMAC authentication. HMAC secrets
     /// may be reused across namespaces, so the verifier must never resolve a
     /// signed identity through the process-global JWT/JWKS identity map.
@@ -47,7 +47,7 @@ enum ConsumerIndexStorage {
 struct IndexMaps {
     keyauth: HashMap<String, Arc<Consumer>>,
     basic: HashMap<String, Arc<Consumer>>,
-    identity: HashMap<String, Arc<Consumer>>,
+    identity: HashMap<String, Option<Arc<Consumer>>>,
     hmac_identity: HashMap<String, HashMap<String, Arc<Consumer>>>,
     mtls: HashMap<String, Arc<Consumer>>,
     mtls_dns: HashMap<String, Arc<Consumer>>,
@@ -126,7 +126,7 @@ impl ConsumerIndex {
         self.with_inner(|inner| inner.find_by_username(username))
     }
 
-    /// O(1) lookup by username or ID (for jwt_auth/jwks_auth claim matching). No allocation.
+    /// O(1) lookup by username or ID for `jwt_auth`. Ambiguous values return `None`.
     pub fn find_by_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
         self.with_inner(|inner| inner.find_by_identity(identity))
     }
@@ -168,12 +168,26 @@ impl ConsumerIndex {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
             return;
         }
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.store_inner(Self::build_delta_inner(
+            &self.load_inner(),
+            added,
+            removed_ids,
+            modified,
+        ));
+    }
 
-        // Load the current snapshot and clone its fields for patching
-        let current = match &self.inner {
-            ConsumerIndexStorage::Shared(shared) => shared.load_full(),
-            ConsumerIndexStorage::Snapshot(inner) => Arc::clone(inner),
-        };
+    /// The index `current` becomes after applying a consumer delta, without
+    /// publishing it. Patches clones of `current`'s maps and shares every
+    /// unchanged `Arc<Consumer>`, so a small delta does not re-clone and
+    /// re-index every consumer the way [`Self::build_inner`] does
+    /// (issue #6060).
+    pub(crate) fn build_delta_inner(
+        current: &ConsumerIndexInner,
+        added: &[Consumer],
+        removed_ids: &[crate::config::db_backend::NamespacedResourceId],
+        modified: &[Consumer],
+    ) -> Arc<ConsumerIndexInner> {
         let mut keyauth = current.keyauth_index.clone();
         let mut basic = current.basic_index.clone();
         let mut identity = current.identity_index.clone();
@@ -267,11 +281,7 @@ impl ConsumerIndex {
                 }
             }
             for key in &old_identity_keys {
-                if let Some(existing) = identity.get(key)
-                    && ids_to_remove.contains(&(existing.namespace.as_str(), existing.id.as_str()))
-                {
-                    identity.remove(key);
-                }
+                identity.remove(key);
             }
             for (namespace, key) in &old_hmac_identity_keys {
                 if let Some(namespace_index) = hmac_identity.get_mut(namespace)
@@ -345,11 +355,7 @@ impl ConsumerIndex {
                     mtls_dns.insert(id.to_ascii_lowercase(), Arc::clone(&arc_consumer));
                 }
             }
-            identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
-            identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
-            if let Some(ref custom_id) = consumer.custom_id {
-                identity.insert(custom_id.clone(), Arc::clone(&arc_consumer));
-            }
+            Self::insert_jwt_identities(&mut identity, &arc_consumer);
             Self::insert_hmac_identities(&mut hmac_identity, &arc_consumer);
         }
 
@@ -357,8 +363,7 @@ impl ConsumerIndex {
         let jwt_count = (current.jwt_credential_count as isize + jwt_delta).max(0) as usize;
         let hmac_count = (current.hmac_credential_count as isize + hmac_delta).max(0) as usize;
 
-        // Single atomic swap — readers see old or new, never a partial state.
-        self.store_inner(Arc::new(ConsumerIndexInner {
+        Arc::new(ConsumerIndexInner {
             keyauth_index: keyauth,
             basic_index: basic,
             identity_index: identity,
@@ -368,7 +373,7 @@ impl ConsumerIndex {
             all_consumers: Arc::new(all),
             jwt_credential_count: jwt_count,
             hmac_credential_count: hmac_count,
-        }));
+        })
     }
 
     /// Number of indexed entries (for testing).
@@ -464,28 +469,9 @@ impl ConsumerIndex {
                 }
             }
 
-            // Index by username and id (for jwt/jwks claim matching)
-            let prev = identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
-            if let Some(existing) = prev {
-                warn!(
-                    "Credential collision: identity '{}' for consumer '{}' overwrites consumer '{}'",
-                    consumer.username, consumer.id, existing.id
-                );
-            }
-            identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
-            if let Some(ref custom_id) = consumer.custom_id {
-                let prev = identity.insert(custom_id.clone(), Arc::clone(&arc_consumer));
-                if let Some(existing) = prev
-                    && existing.id != consumer.id
-                {
-                    error!(
-                        "IDENTITY COLLISION: custom_id '{}' for consumer '{}' overwrites consumer '{}'. \
-                         This will cause incorrect JWKS/JWT authentication. \
-                         Ensure custom_id values are unique across all consumers.",
-                        custom_id, consumer.id, existing.id
-                    );
-                }
-            }
+            // A collision is deliberately unresolvable rather than selecting
+            // the last Consumer inserted into the index.
+            Self::insert_jwt_identities(&mut identity, &arc_consumer);
             Self::insert_hmac_identities(&mut hmac_identity, &arc_consumer);
         }
 
@@ -526,12 +512,36 @@ impl ConsumerIndex {
         }
     }
 
+    fn insert_jwt_identities(
+        index: &mut HashMap<String, Option<Arc<Consumer>>>,
+        consumer: &Arc<Consumer>,
+    ) {
+        for identity in std::iter::once(consumer.username.as_str())
+            .chain(std::iter::once(consumer.id.as_str()))
+            .chain(consumer.custom_id.as_deref())
+        {
+            match index.entry(identity.to_string()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(Arc::clone(consumer)));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let same_consumer = entry.get().as_ref().is_some_and(|existing| {
+                        existing.namespace == consumer.namespace && existing.id == consumer.id
+                    });
+                    if !same_consumer {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn restore_shadowed_entries(
         all: &[Arc<Consumer>],
         keyauth: &mut HashMap<String, Arc<Consumer>>,
         basic: &mut HashMap<String, Arc<Consumer>>,
-        identity: &mut HashMap<String, Arc<Consumer>>,
+        identity: &mut HashMap<String, Option<Arc<Consumer>>>,
         hmac_identity: &mut HashMap<String, HashMap<String, Arc<Consumer>>>,
         mtls: &mut HashMap<String, Arc<Consumer>>,
         mtls_dns: &mut HashMap<String, Arc<Consumer>>,
@@ -577,16 +587,16 @@ impl ConsumerIndex {
                 basic.insert(consumer.username.clone(), Arc::clone(consumer));
             }
 
-            if identity_keys.contains(consumer.username.as_str()) {
-                identity.insert(consumer.username.clone(), Arc::clone(consumer));
-            }
-            if identity_keys.contains(consumer.id.as_str()) {
-                identity.insert(consumer.id.clone(), Arc::clone(consumer));
-            }
-            if let Some(custom_id) = consumer.custom_id.as_ref()
-                && identity_keys.contains(custom_id.as_str())
+            if [
+                Some(consumer.username.as_str()),
+                Some(consumer.id.as_str()),
+                consumer.custom_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|identity| identity_keys.contains(identity))
             {
-                identity.insert(custom_id.clone(), Arc::clone(consumer));
+                Self::insert_jwt_identities(identity, consumer);
             }
 
             if !consumer.credential_entries("hmac_auth").is_empty() {
@@ -645,9 +655,9 @@ impl ConsumerIndexInner {
         self.basic_index.get(username).cloned()
     }
 
-    /// O(1) lookup by username or ID (for jwt_auth/jwks_auth claim matching). No allocation.
+    /// O(1) lookup by username or ID for `jwt_auth`. Ambiguous values return `None`.
     pub fn find_by_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
-        self.identity_index.get(identity).cloned()
+        self.identity_index.get(identity).and_then(Clone::clone)
     }
 
     pub fn find_hmac_by_identity(&self, namespace: &str, identity: &str) -> Option<Arc<Consumer>> {

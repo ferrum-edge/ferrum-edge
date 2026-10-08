@@ -3210,7 +3210,8 @@ impl DtlsServer {
             match crate::proxy::sni::extract_sni_from_dtls_client_hello(&initial_packet) {
                 crate::proxy::sni::DtlsSniResult::Hostname(host) => Some(host),
                 crate::proxy::sni::DtlsSniResult::NoSni
-                | crate::proxy::sni::DtlsSniResult::InvalidFragment => None,
+                | crate::proxy::sni::DtlsSniResult::InvalidFragment
+                | crate::proxy::sni::DtlsSniResult::Malformed => None,
             };
 
         // The ingress interface half of the capture, for the source-attribution

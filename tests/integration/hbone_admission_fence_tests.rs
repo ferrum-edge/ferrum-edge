@@ -89,8 +89,8 @@ use ferrum_edge::identity::{
 };
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshExtAuthzProvider, MeshInboundRelayDestination, MeshInboundRelayHost,
-    MeshPolicy, MeshRelayEnrollmentEvidence, MtlsMode, OutboundTrafficPolicy, PolicyAction,
-    PolicyScope,
+    MeshPolicy, MeshRelayEnrollmentEvidence, MeshRule, MtlsMode, OutboundTrafficPolicy,
+    PolicyAction, PolicyScope, RequestMatch,
 };
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTrafficDirection, prepare_gateway_config_for_mesh,
@@ -887,6 +887,88 @@ impl AdmittedFixture {
     }
 }
 
+/// An `action: DENY` rule whose only match constraint is an L7 path. A relayed
+/// tunnel carries no parsed request, so the rule can only be satisfied through
+/// the relay's Layer-4 authorization: a DENY ignores HTTP-only fields and
+/// matches on its remaining constraints.
+fn deny_l7_path() -> MeshPolicy {
+    MeshPolicy {
+        name: "deny-l7-path".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: namespace_scope(),
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                paths: vec!["/admin/*".to_string()],
+                ..RequestMatch::default()
+            }],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+/// A real authenticated HBONE CONNECT through the production handler chain is
+/// refused at admission by an L7 DENY, and never becomes a tunnel.
+///
+/// The ALLOW admits the peer and the DENY carries only a path, so this only
+/// holds because the proxy marks the CONNECT as an opaque relay before the
+/// plugin chain runs. Without that mark the CONNECT would be judged as an HTTP
+/// request whose path does not reach the rule, and the ALLOW would admit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_l7_deny_refuses_a_real_hbone_connect_at_admission() {
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
+    let state = build_state(prepared_config(
+        Some(backend_addr.port()),
+        vec![allow_client(), deny_l7_path()],
+    ));
+    let (gateway_addr, shutdown_tx) =
+        start_inbound_gateway(state.clone(), hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let (response, _request_body) = send_connect(&mut sender, None).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an L7 DENY must refuse the relayed CONNECT at admission"
+    );
+    assert_eq!(
+        state.hbone_admission_fence.live_tunnels(),
+        0,
+        "a refused CONNECT must never become a tunnel"
+    );
+
+    let _ = shutdown_tx.send(true);
+    backend_handle.abort();
+    conn_task.abort();
+}
+
+/// The datagram tag has no live-policy fixture in this suite, so this pins that
+/// BOTH HBONE tag entry points mark the relay before they record it as HBONE.
+/// The end-to-end test above proves the byte-stream mark is reached through the
+/// production handler chain.
+#[test]
+fn both_hbone_tag_entry_points_mark_the_connect_relay() {
+    let proxy = include_str!("../../src/proxy/hbone_proxy.rs");
+    for function in ["fn tag_request_metadata", "fn tag_udp_request_metadata"] {
+        let start = proxy
+            .find(function)
+            .unwrap_or_else(|| panic!("{function} must exist"));
+        let body = &proxy[start..];
+        let mark = body
+            .find("ctx.mark_hbone_connect_relay();")
+            .unwrap_or_else(|| panic!("{function} must mark the relay"));
+        let protocol_tag = body
+            .find(".insert(\"request_protocol\"")
+            .unwrap_or_else(|| panic!("{function} must tag the request protocol"));
+        assert!(
+            mark < protocol_tag,
+            "{function} must mark the relay before it records HBONE metadata"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tightened_authorization_policy_revokes_live_tunnel_and_denies_the_next_connect() {
     let mut fx = admit_client_tunnel(vec![allow_client()]).await;
@@ -1487,6 +1569,77 @@ async fn an_authorization_denial_outranks_a_transport_mismatch_in_one_sweep() {
         fence.reevaluations() >= 1,
         "the authorize chain must actually have run for the live tunnel"
     );
+}
+
+/// A globally scoped, timestamp-only `soap_ws_security` row: HTTP-only
+/// admission policy that is not an auth plugin.
+fn http_only_admission_plugin() -> PluginConfig {
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-soap-freshness".to_string(),
+        plugin_name: "soap_ws_security".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        config: json!({
+            "timestamp": {
+                "require": true,
+                "max_age_seconds": 300,
+                "clock_skew_seconds": 300
+            },
+            "reject_missing_security_header": true
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// The request path refuses a client-selected flavor whose plugin view omits
+/// the route's admission policy before any plugin runs. A reload that adds an
+/// HTTP-only admission plugin therefore refuses the peer's next CONNECT on a
+/// gRPC-classified view, so a live tunnel admitted on that view is revoked
+/// rather than outliving the policy, under the authorize gate's reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_omits_admission_policy_from_the_admitting_view_revokes_the_tunnel() {
+    const APP_PORT: u16 = 8080;
+    let state = build_state(prepared_config(Some(APP_PORT), vec![allow_client()]));
+    let fence = &state.hbone_admission_fence;
+    let proxy = Arc::new(create_mesh_proxy(APP_PORT));
+    let mut snapshot = dual_gate_snapshot(proxy, fence.sweep_epoch());
+    snapshot.request_protocol = ProxyProtocol::Grpc;
+    let tunnel = fence.admit(snapshot);
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // Negative control: a generation that still admits the principal and adds
+    // no admission policy leaves the gRPC-classified tunnel live.
+    let completed_before = fence.sweeps_completed();
+    let outcome = state.update_config(prepared_config(
+        Some(APP_PORT),
+        vec![allow_client(), allow_other()],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_sweep_after(&state, completed_before).await;
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    let outcome = state.update_config(prepared_config_with(
+        Some(APP_PORT),
+        None,
+        vec![allow_client()],
+        vec![http_only_admission_plugin()],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::AuthorizationDenied)
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 1, 0, 0, 0, 0]);
 }
 
 /// Retirement and revocation are ONE compare-exchange against the same terminal

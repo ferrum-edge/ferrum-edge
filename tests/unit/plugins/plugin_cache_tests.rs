@@ -780,6 +780,288 @@ fn soap_composition_rejects_other_auth_plugins_in_both_auth_modes() {
     }
 }
 
+#[test]
+fn client_selected_flavor_views_flag_an_omitted_route_admission_policy() {
+    let config = make_config(
+        vec![
+            make_proxy("soap", "/soap", vec!["soap"]),
+            make_proxy("keyed", "/keyed", vec!["key"]),
+            make_proxy("cached", "/cached", vec!["cache"]),
+        ],
+        vec![
+            identity_soap_plugin_config("soap", "soap"),
+            make_plugin_config("key", "key_auth", PluginScope::Proxy, Some("keyed"), true),
+            make_plugin_config(
+                "cache",
+                "response_caching",
+                PluginScope::Proxy,
+                Some("cached"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let omits = |proxy: &str, protocol: ProxyProtocol| {
+        cache
+            .request_view("ferrum", proxy, protocol)
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    };
+
+    // An HTTP-only authentication plugin cannot run on a client-selected
+    // native-gRPC or WebSocket request, so both of those views are refused.
+    assert!(!omits("soap", ProxyProtocol::Http));
+    assert!(omits("soap", ProxyProtocol::Grpc));
+    assert!(omits("soap", ProxyProtocol::WebSocket));
+    // The composed gRPC-Web view keeps every HTTP plugin.
+    assert!(
+        !cache
+            .grpc_web_request_view("ferrum", "soap")
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    );
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+    ] {
+        // Authentication that runs on every HTTP-family flavor is unaffected.
+        assert!(!omits("keyed", protocol), "{protocol:?}");
+        // An HTTP-only plugin that is not admission policy refuses nothing.
+        assert!(!omits("cached", protocol), "{protocol:?}");
+    }
+}
+
+/// A timestamp-only `soap_ws_security` policy: freshness enforcement with no
+/// identity, so the plugin is not an auth plugin but still refuses requests.
+fn timestamp_only_soap_config() -> serde_json::Value {
+    json!({
+        "timestamp": {
+            "require": true,
+            "max_age_seconds": 300,
+            "clock_skew_seconds": 300
+        },
+        "reject_missing_security_header": true
+    })
+}
+
+/// Every built-in that declares `gates_request_admission()` beyond the auth
+/// default, with the configuration that decides it. Each row builds its own
+/// cache so one plugin's composition cannot mask another's verdict, and each
+/// row first proves the plugin runs on the HTTP view so a silently omitted
+/// instance cannot pass as "not refused".
+#[test]
+fn every_admission_gating_plugin_marks_the_flavor_views_it_cannot_run_on() {
+    let mut a2a_deny = minimal_plugin_config("a2a_gateway");
+    a2a_deny["policy"] = json!({"methods": {"message/send": {"action": "deny"}}});
+    let mut log_only_validator = minimal_plugin_config("openapi_validator");
+    log_only_validator["enforcement_mode"] = json!("log_only");
+    let mut tool_call_limiter = minimal_plugin_config("rate_limiting");
+    tool_call_limiter["mcp_tool_calls"] = json!({});
+    let mut strict_dedup = minimal_plugin_config("request_deduplication");
+    strict_dedup["enforce_required"] = json!(true);
+
+    // (row, plugin, config, Grpc view refused, WebSocket view refused)
+    let rows: Vec<(&str, &str, serde_json::Value, bool, bool)> = vec![
+        (
+            "timestamp-only soap_ws_security",
+            "soap_ws_security",
+            timestamp_only_soap_config(),
+            true,
+            true,
+        ),
+        (
+            "graphql runs on WebSocket but not native gRPC",
+            "graphql",
+            minimal_plugin_config("graphql"),
+            true,
+            false,
+        ),
+        (
+            "request_deduplication with enforce_required",
+            "request_deduplication",
+            strict_dedup,
+            true,
+            true,
+        ),
+        (
+            "opportunistic request_deduplication",
+            "request_deduplication",
+            minimal_plugin_config("request_deduplication"),
+            false,
+            false,
+        ),
+        (
+            "a2a_gateway deny policy runs on gRPC but not WebSocket",
+            "a2a_gateway",
+            a2a_deny,
+            false,
+            true,
+        ),
+        (
+            "observability-only a2a_gateway",
+            "a2a_gateway",
+            minimal_plugin_config("a2a_gateway"),
+            false,
+            false,
+        ),
+        (
+            "openapi_validator in block mode",
+            "openapi_validator",
+            minimal_plugin_config("openapi_validator"),
+            true,
+            true,
+        ),
+        (
+            "openapi_validator in log_only mode",
+            "openapi_validator",
+            log_only_validator,
+            false,
+            false,
+        ),
+        (
+            "enabled mcp_gateway",
+            "mcp_gateway",
+            minimal_plugin_config("mcp_gateway"),
+            true,
+            true,
+        ),
+        (
+            "request-counting rate_limiting runs on every protocol",
+            "rate_limiting",
+            minimal_plugin_config("rate_limiting"),
+            false,
+            false,
+        ),
+        (
+            "rate_limiting with mcp_tool_calls",
+            "rate_limiting",
+            tool_call_limiter,
+            true,
+            true,
+        ),
+        (
+            "ai_prompt_shield",
+            "ai_prompt_shield",
+            minimal_plugin_config("ai_prompt_shield"),
+            true,
+            true,
+        ),
+        (
+            "ai_rate_limiter",
+            "ai_rate_limiter",
+            minimal_plugin_config("ai_rate_limiter"),
+            true,
+            true,
+        ),
+        (
+            "ai_tool_governor",
+            "ai_tool_governor",
+            minimal_plugin_config("ai_tool_governor"),
+            true,
+            true,
+        ),
+    ];
+
+    for (row, plugin_name, plugin_config, grpc_refused, websocket_refused) in rows {
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["policy"])],
+            vec![make_plugin_config_with_json(
+                "policy",
+                plugin_name,
+                plugin_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let cache = PluginCache::new(&config).unwrap_or_else(|error| panic!("{row}: {error:?}"));
+        assert!(
+            cache
+                .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http)
+                .iter()
+                .any(|plugin| plugin.name() == plugin_name),
+            "{row}: the instance must run on the HTTP view"
+        );
+        let omits = |protocol: ProxyProtocol| {
+            cache
+                .request_view("ferrum", "p1", protocol)
+                .capabilities()
+                .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+        };
+        assert!(!omits(ProxyProtocol::Http), "{row}: HTTP view");
+        assert_eq!(
+            omits(ProxyProtocol::Grpc),
+            grpc_refused,
+            "{row}: native gRPC view"
+        );
+        assert_eq!(
+            omits(ProxyProtocol::WebSocket),
+            websocket_refused,
+            "{row}: WebSocket view"
+        );
+        assert!(
+            !cache
+                .grpc_web_request_view("ferrum", "p1")
+                .capabilities()
+                .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY),
+            "{row}: the composed gRPC-Web view keeps every HTTP plugin"
+        );
+    }
+}
+
+/// A global admission policy reaches every route's flavor views, including a
+/// route that carries no plugin of its own.
+#[test]
+fn a_global_admission_policy_marks_every_route_flavor_view() {
+    let config = make_config(
+        vec![make_proxy("bare", "/bare", vec![])],
+        vec![make_plugin_config_with_json(
+            "global-freshness",
+            "soap_ws_security",
+            timestamp_only_soap_config(),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let omits = |protocol: ProxyProtocol| {
+        cache
+            .request_view("ferrum", "bare", protocol)
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    };
+
+    assert!(!omits(ProxyProtocol::Http));
+    assert!(omits(ProxyProtocol::Grpc));
+    assert!(omits(ProxyProtocol::WebSocket));
+}
+
+/// A custom authentication plugin that keeps the HTTP-only protocol default
+/// gates admission without opting in; a custom plugin that is not an auth
+/// plugin does not, and must opt in itself.
+#[test]
+fn custom_plugins_gate_admission_by_the_auth_default() {
+    struct CustomAuth;
+
+    #[async_trait::async_trait]
+    impl Plugin for CustomAuth {
+        fn name(&self) -> &str {
+            "custom_auth"
+        }
+
+        fn is_auth_plugin(&self) -> bool {
+            true
+        }
+    }
+
+    assert!(CustomAuth.gates_request_admission());
+    assert_eq!(
+        CustomAuth.supported_protocols(),
+        ferrum_edge::plugins::HTTP_ONLY_PROTOCOLS
+    );
+    assert!(!NameOnlyPlugin("custom_policy").gates_request_admission());
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};

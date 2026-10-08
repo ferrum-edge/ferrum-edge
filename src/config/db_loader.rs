@@ -27,6 +27,9 @@ use crate::config::db_backend::{
     ConditionalNamespaceRestore, ConditionalNamespaceSnapshot, GatewayTrustBundleRevisionConflict,
     NamespacePreconditionFailed,
 };
+use crate::config::db_backend::{
+    ConsumerQuarantineTracker, consumer_change_requires_authoritative_reload,
+};
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
     ExternalSpecUpstreamConflict, StoredEvidence, deployment_commit_unknown,
@@ -38,6 +41,7 @@ use crate::config::namespace_registry::{
     NamespaceRegistryRetryableConflict, check_namespace_registry_fault, namespace_registry_fault,
     protected_namespaces_contains, require_namespace_registry_admission_leases,
 };
+use crate::config::policy_graph_scope::PolicyGraphScope;
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -961,6 +965,9 @@ pub struct DatabaseStore {
     /// CLI > env > conf-file > default precedence and could protect the wrong
     /// namespaces.
     protected_namespaces: Vec<String>,
+    /// Namespaces whose last published full load quarantined no consumer, so
+    /// consumer changes can ride the incremental delta (issue #6060).
+    consumer_quarantine: Arc<ConsumerQuarantineTracker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2066,6 +2073,7 @@ impl DatabaseStore {
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+            consumer_quarantine: Arc::new(ConsumerQuarantineTracker::default()),
         };
 
         store.run_migrations().await?;
@@ -2165,6 +2173,7 @@ impl DatabaseStore {
             audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+            consumer_quarantine: Arc::new(ConsumerQuarantineTracker::default()),
         })
     }
 
@@ -2746,6 +2755,7 @@ impl DatabaseStore {
                 hmac_quarantined.len()
             );
         }
+        let consumer_quarantine_active = !quarantined.is_empty() || !hmac_quarantined.is_empty();
 
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
@@ -2829,6 +2839,12 @@ impl DatabaseStore {
             strip_api_spec_id_from_runtime_config(&mut config);
         }
 
+        // Only a load that reached here can be published, and only runtime
+        // and control-plane loads seed a poller (issue #6060).
+        if !matches!(purpose, FullConfigLoadPurpose::BackupExport) {
+            self.consumer_quarantine
+                .record_full_load(namespace, consumer_quarantine_active);
+        }
         self.check_slow_query("load_full_config", start);
         Ok(config)
     }
@@ -2926,6 +2942,193 @@ impl DatabaseStore {
         config.normalize_fields();
         self.check_slow_query("load_namespace_policy_graph", start);
         Ok(config)
+    }
+
+    /// Load the policy-graph neighborhood `scope` names with indexed point
+    /// reads in one snapshot transaction, so plugin-graph admission costs what
+    /// the write touches rather than the namespace (issue #6056). Equal to
+    /// `scope.restrict(load_namespace_policy_graph(namespace))`.
+    pub async fn load_namespace_policy_neighborhood(
+        &self,
+        namespace: &str,
+        scope: &PolicyGraphScope,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
+        let loaded_at = Utc::now();
+        let purpose = FullLoadPurpose::AdmissionValidation;
+        let operation = purpose.operation();
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+
+        // Proxies associated with a changed plugin config join the scope.
+        let changed_ids: Vec<&str> = scope
+            .changed_plugin_config_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut proxy_ids: BTreeSet<String> = scope.proxy_ids.clone();
+        for row in self
+            .fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT DISTINCT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id IN",
+                namespace,
+                &changed_ids,
+                "",
+                Self::ASSOCIATION_LOOKUP_CHUNK_SIZE,
+            )
+            .await
+            .map_err(|e| Self::proxy_plugin_association_query_error(operation, Some(namespace), e))?
+        {
+            proxy_ids.insert(Self::proxy_plugin_association_proxy_id(&row, operation)?);
+        }
+        let proxy_ids: Vec<&str> = proxy_ids.iter().map(String::as_str).collect();
+
+        let mut plugins_by_proxy: ProxyPluginAssociations = HashMap::new();
+        for row in self
+            .fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id IN",
+                namespace,
+                &proxy_ids,
+                "",
+                Self::ASSOCIATION_LOOKUP_CHUNK_SIZE,
+            )
+            .await
+            .map_err(|e| Self::proxy_plugin_association_query_error(operation, Some(namespace), e))?
+        {
+            Self::push_proxy_plugin_association_row(&mut plugins_by_proxy, &row, operation)?;
+        }
+        let mut plugin_ids: BTreeSet<&str> = scope.named_plugin_config_ids();
+        plugin_ids.extend(
+            plugins_by_proxy
+                .values()
+                .flatten()
+                .map(|association| association.plugin_config_id.as_str()),
+        );
+        let plugin_ids: Vec<String> = plugin_ids.into_iter().map(str::to_string).collect();
+        let plugin_ids: Vec<&str> = plugin_ids.iter().map(String::as_str).collect();
+
+        let mut proxies = Vec::with_capacity(proxy_ids.len());
+        for row in self
+            .fetch_namespace_rows_in_tx(
+                &mut tx,
+                "SELECT * FROM proxies WHERE namespace = ? AND id IN",
+                namespace,
+                &proxy_ids,
+                " ORDER BY id",
+                Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE,
+            )
+            .await?
+        {
+            let id: String = row
+                .try_get("id")
+                .map_err(|error| purpose.map_row_error("proxy", None, anyhow::Error::new(error)))?;
+            let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
+            proxies.push(
+                row_to_proxy(&row, id.clone(), plugins)
+                    .map_err(|error| purpose.map_row_error("proxy", Some(id), error))?,
+            );
+        }
+        Self::ensure_no_unmatched_proxy_plugin_associations(operation, &plugins_by_proxy)?;
+
+        // One statement per chunk, ordered by the database like the full
+        // load, so plugin-chain tie order matches runtime under any collation.
+        // Every value is bound: namespace, the namespace-wide plugin names,
+        // then the chunk's ids.
+        let namespace_wide_names =
+            crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES;
+        let name_placeholders = std::iter::repeat_n("?", namespace_wide_names.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plugin_select = format!(
+            "SELECT * FROM plugin_configs WHERE namespace = ? AND (scope = 'global' \
+             OR plugin_name IN ({name_placeholders})"
+        );
+        let id_chunks: Vec<&[&str]> = if plugin_ids.is_empty() {
+            vec![&[]]
+        } else {
+            plugin_ids
+                .chunks(Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE)
+                .collect()
+        };
+        let mut plugin_rows = Vec::new();
+        for chunk in id_chunks {
+            let sql = if chunk.is_empty() {
+                self.q(&format!("{plugin_select}) ORDER BY id"))
+            } else {
+                let id_placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.q(&format!(
+                    "{plugin_select} OR id IN ({id_placeholders})) ORDER BY id"
+                ))
+            };
+            let mut query = sqlx::query(&sql).bind(namespace);
+            for name in namespace_wide_names {
+                query = query.bind(*name);
+            }
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            plugin_rows.extend(query.fetch_all(&mut *tx).await?);
+        }
+        tx.commit().await?;
+
+        // Rows repeat only when the ids span more than one chunk; keep the
+        // first occurrence.
+        let mut seen_plugin_ids = HashSet::with_capacity(plugin_rows.len());
+        let mut plugin_configs = Vec::with_capacity(plugin_rows.len());
+        for row in plugin_rows {
+            let id: String = row.try_get("id").map_err(|error| {
+                purpose.map_row_error("plugin_config", None, anyhow::Error::new(error))
+            })?;
+            if !seen_plugin_ids.insert(id.clone()) {
+                continue;
+            }
+            plugin_configs.push(
+                row_to_plugin_config(&row)
+                    .map_err(|error| purpose.map_row_error("plugin_config", Some(id), error))?,
+            );
+        }
+
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            loaded_at,
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        };
+        config.normalize_fields();
+        self.check_slow_query("load_namespace_policy_neighborhood", start);
+        Ok(config)
+    }
+
+    /// `{select_prefix} (?, ?, ...){suffix}` over `values` in chunks of
+    /// `chunk_size` inside `tx`. `select_prefix` must bind `namespace` as its
+    /// only placeholder and end with `IN`.
+    async fn fetch_namespace_rows_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        select_prefix: &str,
+        namespace: &str,
+        values: &[&str],
+        suffix: &str,
+        chunk_size: usize,
+    ) -> Result<Vec<AnyRow>, sqlx::Error> {
+        let mut rows = Vec::new();
+        for chunk in values.chunks(chunk_size) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!("{select_prefix} ({placeholders}){suffix}"));
+            let mut query = sqlx::query(&sql).bind(namespace);
+            for value in chunk {
+                query = query.bind(*value);
+            }
+            rows.extend(query.fetch_all(&mut **tx).await?);
+        }
+        Ok(rows)
     }
 
     async fn conditional_namespace_snapshot_tx(
@@ -6539,7 +6742,10 @@ impl DatabaseStore {
             }
         }
 
-        if !consumer_ops.is_empty() {
+        // Consumer changes ride the delta only while the published consumer
+        // set has nothing quarantined; otherwise a delete or update may have
+        // to rehydrate a stripped credential (issue #6060).
+        if !consumer_ops.is_empty() && !self.consumer_quarantine.allows_consumer_deltas(namespace) {
             return Err(anyhow::Error::new(
                 crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
                     namespace,
@@ -6561,6 +6767,22 @@ impl DatabaseStore {
 
         let (proxy_upserts, mut removed_proxy_ids) = Self::split_change_ops(proxy_ops);
         let (consumer_upserts, mut removed_consumer_ids) = Self::split_change_ops(consumer_ops);
+        // Point-load consumers first: an upsert carrying a credential that
+        // quarantine judges across consumers escalates before any other
+        // resource is loaded.
+        let added_or_modified_consumers = self
+            .load_consumers_by_ids(namespace, &consumer_upserts)
+            .await?;
+        if added_or_modified_consumers
+            .iter()
+            .any(consumer_change_requires_authoritative_reload)
+        {
+            return Err(anyhow::Error::new(
+                crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                    namespace,
+                ),
+            ));
+        }
         let (plugin_config_upserts, mut removed_plugin_config_ids) =
             Self::split_change_ops(plugin_config_ops);
         let (upstream_upserts, mut removed_upstream_ids) = Self::split_change_ops(upstream_ops);
@@ -6578,9 +6800,6 @@ impl DatabaseStore {
                 .cloned(),
         );
 
-        let added_or_modified_consumers = self
-            .load_consumers_by_ids(namespace, &consumer_upserts)
-            .await?;
         let loaded_consumer_ids: HashSet<String> = added_or_modified_consumers
             .iter()
             .map(|consumer| consumer.id.clone())
@@ -7153,6 +7372,11 @@ impl DatabaseStore {
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
     const ASSOCIATION_LOOKUP_CHUNK_SIZE: usize = 500;
+    /// Ids per ordered policy-neighborhood read. One statement orders the
+    /// whole neighborhood by the database's collation, like the full load;
+    /// beyond this many ids the chunks are each ordered. Stays under SQLite's
+    /// 32,766 and PostgreSQL/MySQL's 65,535 bind-parameter limits.
+    const ORDERED_NEIGHBORHOOD_CHUNK_SIZE: usize = 10_000;
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 
@@ -12343,6 +12567,18 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_policy_graph(self, namespace).await
+    }
+
+    async fn load_namespace_policy_neighborhood(
+        &self,
+        namespace: &str,
+        scope: &PolicyGraphScope,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_namespace_policy_neighborhood(self, namespace, scope).await
+    }
+
+    fn forget_consumer_quarantine_state(&self, namespace: &str) {
+        self.consumer_quarantine.forget(namespace);
     }
 
     async fn count_namespace_resources(

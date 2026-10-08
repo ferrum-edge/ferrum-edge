@@ -5,9 +5,10 @@
 //! cycling unique node ids reset the allowance and the CP's aggregate task /
 //! channel / snapshot / broadcast-subscriber footprint stayed unbounded.
 //!
-//! This module owns every long-lived CP configuration-stream admission budget
-//! as one fail-closed unit. `ConfigSync.Subscribe`, `MeshSubscribe`, and both
-//! ADS methods draw from the same controller:
+//! This module owns CP configuration-stream admission as one fail-closed unit.
+//! `ConfigSync.GetFullConfig` also holds a native permit through response-body
+//! delivery and adds a bounded per-principal request rate. `ConfigSync.Subscribe`,
+//! `MeshSubscribe`, and both ADS methods draw from the same controller:
 //!
 //! | Scope | Checked | Limit |
 //! |-------|---------|-------|
@@ -54,9 +55,10 @@
 //! for node ids. Rejection metrics carry only a compile-time
 //! [`CpGrpcAdmissionRejection::metric_reason`] label.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -71,6 +73,13 @@ pub enum CpGrpcStreamSurface {
 }
 
 impl CpGrpcStreamSurface {
+    fn warning_index(self) -> usize {
+        match self {
+            Self::ConfigSync => 0,
+            Self::MeshSubscribe => 1,
+        }
+    }
+
     pub fn metric_label(self) -> &'static str {
         match self {
             Self::ConfigSync => "config_sync",
@@ -187,6 +196,8 @@ pub enum CpGrpcAdmissionRejection {
     NodeIdUnsafeCharacters,
     /// The stream was admitted but never sent a first request in time.
     FirstRequestTimeout,
+    /// A principal requested unary full-config snapshots too frequently.
+    FullConfigRateLimit,
 }
 
 /// Preserve known CP budget guidance, but never trust arbitrary peer status
@@ -208,6 +219,21 @@ pub(crate) fn admission_status_diagnostic(status: &tonic::Status) -> String {
 }
 
 impl CpGrpcAdmissionRejection {
+    fn warning_index(self) -> usize {
+        match self {
+            Self::TotalStreams => 0,
+            Self::NamespaceStreams => 1,
+            Self::PrincipalStreams => 2,
+            Self::NodeStreams => 3,
+            Self::NodeCardinality => 4,
+            Self::NodeIdEmpty => 5,
+            Self::NodeIdTooLong => 6,
+            Self::NodeIdUnsafeCharacters => 7,
+            Self::FirstRequestTimeout => 8,
+            Self::FullConfigRateLimit => 9,
+        }
+    }
+
     /// Fixed-cardinality metric label. Never client-supplied.
     pub fn metric_reason(self) -> &'static str {
         match self {
@@ -220,6 +246,7 @@ impl CpGrpcAdmissionRejection {
             Self::NodeIdTooLong => "node_id_too_long",
             Self::NodeIdUnsafeCharacters => "node_id_unsafe_characters",
             Self::FirstRequestTimeout => "first_request_timeout",
+            Self::FullConfigRateLimit => "full_config_rate_limit",
         }
     }
 
@@ -257,6 +284,9 @@ impl CpGrpcAdmissionRejection {
                 "xDS stream sent no first request before the initial-request deadline \
                  (FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS)"
             }
+            Self::FullConfigRateLimit => {
+                "ConfigSync.GetFullConfig per-principal rate limit exceeded"
+            }
         }
     }
 
@@ -271,6 +301,7 @@ impl CpGrpcAdmissionRejection {
                 | Self::PrincipalStreams
                 | Self::NodeStreams
                 | Self::NodeCardinality
+                | Self::FullConfigRateLimit
         )
     }
 
@@ -320,6 +351,9 @@ impl CpGrpcAdmissionRejection {
             Self::FirstRequestTimeout => {
                 "CP gRPC stream sent no first request before the initial-request deadline"
             }
+            Self::FullConfigRateLimit => {
+                "CP gRPC per-principal GetFullConfig request rate exceeded"
+            }
         };
         if self.is_capacity() {
             tonic::Status::resource_exhausted(message)
@@ -331,14 +365,29 @@ impl CpGrpcAdmissionRejection {
     }
 }
 
+// The native refusal warning has fixed surface/reason buckets; metrics still
+// count every rejection below.
+static LAST_NATIVE_REJECTION_WARNED: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
+
 /// Record a native admission refusal without accepting any caller-controlled
 /// metric label or log field.
 pub fn record_native_rejection(surface: CpGrpcStreamSurface, rejection: CpGrpcAdmissionRejection) {
-    tracing::warn!(
-        method = surface.method(),
-        reason = rejection.metric_reason(),
-        "Rejecting native CP gRPC configuration stream at admission"
-    );
+    if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        let now = elapsed.as_secs();
+        let bucket = surface.warning_index() * 10 + rejection.warning_index();
+        let last = LAST_NATIVE_REJECTION_WARNED[bucket].load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 60
+            && LAST_NATIVE_REJECTION_WARNED[bucket]
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                method = surface.method(),
+                reason = rejection.metric_reason(),
+                "Rejecting native CP gRPC configuration stream at admission"
+            );
+        }
+    }
     crate::plugins::mesh::prometheus_helpers::increment_cp_grpc_stream_admission_rejection(
         surface.metric_label(),
         rejection.metric_reason(),
@@ -522,6 +571,7 @@ struct CpGrpcAdmissionState {
     /// "never warned". Plain atomics: the reservation path takes no lock and
     /// allocates nothing for the common (not-near-ceiling) case.
     near_ceiling_warned_ms: [AtomicU64; CpGrpcBudgetLayer::COUNT],
+    full_config_requests: Mutex<HashMap<String, HashMap<String, Instant>>>,
 }
 
 impl CpGrpcAdmissionController {
@@ -536,12 +586,47 @@ impl CpGrpcAdmissionController {
                 active_nodes: AtomicUsize::new(0),
                 warn_epoch: Instant::now(),
                 near_ceiling_warned_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+                full_config_requests: Mutex::new(HashMap::new()),
             }),
         }
     }
 
     pub fn limits(&self) -> &CpGrpcAdmissionLimits {
         &self.inner.limits
+    }
+
+    /// Admit at most one unary full-config request per authenticated principal
+    /// per second. Retained keys are bounded per namespace; lock poisoning fails closed.
+    pub fn reserve_full_config_rate(
+        &self,
+        namespace: &str,
+        subject: &str,
+    ) -> Result<(), CpGrpcAdmissionRejection> {
+        const WINDOW: Duration = Duration::from_secs(1);
+        const RETENTION: Duration = Duration::from_secs(60);
+        const MAX_KEYS_PER_NAMESPACE: usize = 4096;
+
+        let key = authenticated_principal_key(namespace, subject);
+        let now = Instant::now();
+        let Ok(mut requests) = self.inner.full_config_requests.lock() else {
+            return Err(CpGrpcAdmissionRejection::FullConfigRateLimit);
+        };
+        let namespace_requests = requests.entry(namespace.to_string()).or_default();
+        if let Some(last) = namespace_requests.get_mut(&key) {
+            if now.duration_since(*last) < WINDOW {
+                return Err(CpGrpcAdmissionRejection::FullConfigRateLimit);
+            }
+            *last = now;
+            return Ok(());
+        }
+        if namespace_requests.len() >= MAX_KEYS_PER_NAMESPACE {
+            namespace_requests.retain(|_, last| now.duration_since(*last) < RETENTION);
+            if namespace_requests.len() >= MAX_KEYS_PER_NAMESPACE {
+                return Err(CpGrpcAdmissionRejection::FullConfigRateLimit);
+            }
+        }
+        namespace_requests.insert(key, now);
+        Ok(())
     }
 
     /// Current total active ADS streams (both methods).
@@ -671,8 +756,9 @@ impl CpGrpcAdmissionController {
         })
     }
 
-    /// Reserve every layer for a native server-streaming RPC whose first
-    /// request already carries its node id.
+    /// Reserve every layer for a native ConfigSync or mesh RPC whose request
+    /// already carries its node id. Streaming callers hold the permit for the
+    /// stream; GetFullConfig transfers it to the encoded response body.
     ///
     /// Node validation precedes every clone or map insertion. Aggregate
     /// reservation and node registration both complete before the caller can
@@ -686,7 +772,7 @@ impl CpGrpcAdmissionController {
         node_id: &str,
     ) -> Result<CpGrpcStreamPermit, CpGrpcAdmissionRejection> {
         self.validate_node_id(node_id)?;
-        let principal = principal_key(subject);
+        let principal = authenticated_principal_key(namespace, subject);
         let node_key = node_state_key(namespace, &principal, node_id);
         let mut permit = self.reserve_stream(namespace, &principal)?;
         permit.register_node(&node_key)?;
@@ -947,6 +1033,19 @@ pub fn validate_node_id(node_id: &str, max_bytes: usize) -> Result<(), CpGrpcAdm
 /// subject adversarially.
 pub fn principal_key(subject: &str) -> String {
     domain_digest(b"xds-principal", subject, PRINCIPAL_KEY_DIGEST_LEN)
+}
+
+/// Stable key for a principal within its authenticated tenant namespace.
+/// The same subject may be chosen independently by credentials in different
+/// namespaces, so namespace is part of both the quota and mutable-state key.
+pub fn authenticated_principal_key(namespace: &str, subject: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cp-principal");
+    hasher.update([0xff]);
+    hasher.update(namespace.len().to_be_bytes());
+    hasher.update(namespace.as_bytes());
+    hasher.update(subject.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Redacted, non-reversible stand-in for a client-supplied identifier

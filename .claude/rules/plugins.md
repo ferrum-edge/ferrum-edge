@@ -984,12 +984,22 @@ on a native-gRPC request.
 - New plugin file: `src/plugins/my_plugin.rs`, implements `Plugin`, constructor returns `Result<Self, String>`.
 - Add a priority constant in `src/plugins/mod.rs`.
 - Override `supported_protocols()` when not HTTP-only. Use the existing protocol constants.
+- Native gRPC and WebSocket views are selected by client headers, so a `Grpc` or `WebSocket` view that omits an instance its chain's `Http` view runs and that declares `gates_request_admission()` (default: `is_auth_plugin()`) is refused before any plugin runs (`PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`, rejection phase `route_protocol_admission`). A new HTTP-only plugin that refuses requests a route must not serve should declare `gates_request_admission()`, scoped to the configurations that can refuse (as `openapi_validator`, `request_deduplication`, `graphql`, and `a2a_gateway` do); one that is not request-admission policy must not. `every_admission_gating_plugin_marks_the_flavor_views_it_cannot_run_on` (`plugin_cache_tests.rs`) is the per-plugin table, and the HBONE admission fence re-checks the bit on every sweep.
 - Register in `create_plugin_with_http_client()` with `?` on `new()` and add to `available_plugins()`.
 - Add unit tests for valid and invalid configs in `tests/unit/plugins/` and register the module.
 - Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
 - Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`stdout_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
 - Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup.
+- A plugin config field that names a process environment variable (credential
+  or URL) resolves it ONLY through `plugins::utils::plugin_secret_env`
+  (`FERRUM_PLUGIN_SECRET_<NAME>`), shape-checked in the constructor so
+  admission refuses any other name with a 400 before anything is read. Never
+  `std::env::var` a config-supplied name, and never add an implicit ambient
+  fallback for a credential sent to a config-chosen endpoint. Add each new
+  field to `ENV_REFERENCE_FIELDS` in
+  `tests/unit/plugins/plugin_secret_env_tests.rs`. `ai_transcript_audit`'s
+  `${secret:NAME}` keeps its own `FERRUM_TRANSCRIPT_SINK_SECRET_*` namespace.
 - Shared entrypoint is `plugins::validate_plugin_config(name, config)`.
 - CP admission runs the SAME construction gate over every enabled plugin config
   before a snapshot or delta can be accepted and broadcast

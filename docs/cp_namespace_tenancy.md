@@ -607,7 +607,7 @@ wire.
 | Surface | Authenticated namespace source | Multi-namespace behaviour |
 |---|---|---|
 | `ConfigSync.Subscribe` | `SubscribeRequest.namespace` authorised by the resolved set (credential binding ∩ mTLS SPIFFE ∩ `ns`) | Missing/wrong/malformed claims fail before initial snapshot serialisation. Full snapshots, deltas, lag recovery, and K8s-triggered broadcasts are namespace-filtered. |
-| `ConfigSync.GetFullConfig` | `FullConfigRequest.namespace` authorised by the resolved set | Same authorisation and filtering as `Subscribe`; wrong claims fail before response serialisation. |
+| `ConfigSync.GetFullConfig` | `FullConfigRequest.namespace` authorised by the resolved set | Same authorisation and filtering as `Subscribe`; wrong claims fail before response serialisation. Admission is held through body delivery, with one request per authenticated principal per second. |
 | Native `MeshConfigSync.MeshSubscribe` | `MeshSubscribeRequest.namespace` authorised by the resolved set | Same authorisation as ConfigSync. Full, delta, and lag recovery slices are built from a namespace-filtered config. |
 | xDS ADS | Single namespace from the resolved set | Multi-tenant streams require exactly one `ns` value because ADS has no namespace request field. Node metadata and resume resource versions cannot change tenant identity. |
 | Kubernetes controller broadcast | Reconciled config namespaces | ConfigSync broadcasts fan out via `NamespaceBroadcasts`; each namespace is serialised independently. |

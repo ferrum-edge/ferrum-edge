@@ -958,3 +958,65 @@ async fn get_full_config_filters_to_dp_namespace() {
 
     handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_full_config_applies_native_stream_admission() {
+    let cfg = GatewayConfig {
+        version: "1".to_string(),
+        loaded_at: Utc::now(),
+        ..Default::default()
+    };
+    let (addr, handle) = start_cp_with_scope(cfg, CpScope::Single("prod".into()), false).await;
+    let subject = "n".repeat(254);
+    let token = mint_token_with_ns(&subject, Some(json!("prod")));
+    let mut client = connect_with_token!(addr, token);
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
+        node_id: subject,
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
+        namespace: "prod".to_string(),
+        real_ip_header: Some(String::new()),
+    });
+
+    let error = client.get_full_config(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+    handle.abort();
+}
+
+#[test]
+fn config_sync_projection_excludes_other_namespaces_virtual_service_cors() {
+    let mesh = MeshConfig {
+        virtual_service_cors_policies: vec![
+            serde_json::from_value(json!({
+                "name": "private-prod-policy",
+                "namespace": "prod",
+                "host": "api.prod.svc.cluster.local",
+                "export_to": ["*"],
+                "cors": { "allowed_origins": [{ "exact": "https://prod.example" }] }
+            }))
+            .expect("prod CORS policy fixture must deserialize"),
+            serde_json::from_value(json!({
+                "name": "private-staging-policy",
+                "namespace": "staging",
+                "host": "api.staging.svc.cluster.local",
+                "export_to": ["*"],
+                "cors": { "allowed_origins": [{ "exact": "https://staging.example" }] }
+            }))
+            .expect("staging CORS policy fixture must deserialize"),
+        ],
+        ..Default::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..Default::default()
+    };
+    let projected =
+        CpGrpcServer::filter_config_to_namespace_for_scope(&config, "prod", &CpScope::All);
+    let policies = &projected
+        .mesh
+        .expect("mesh config retained")
+        .virtual_service_cors_policies;
+    assert_eq!(policies.len(), 1);
+    assert_eq!(policies[0].namespace, "prod");
+}

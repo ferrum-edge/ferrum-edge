@@ -59,6 +59,7 @@ struct TrackedMeshStream<S> {
     drift: Arc<MeshSliceDriftRegistry>,
     config: Arc<ArcSwap<GatewayConfig>>,
     node_id: String,
+    drift_key: String,
     connected_at: DateTime<Utc>,
     /// Opaque drift-session generation. Never logged or published.
     session_token: Option<String>,
@@ -67,10 +68,10 @@ struct TrackedMeshStream<S> {
 impl<S> Drop for TrackedMeshStream<S> {
     fn drop(&mut self) {
         self.registry
-            .remove_if_stale(&self.node_id, self.connected_at);
+            .remove_if_stale_key(&self.drift_key, self.connected_at);
         if let Some(session_token) = self.session_token.as_deref() {
             self.drift.mark_disconnected_with_config(
-                &self.node_id,
+                &self.drift_key,
                 session_token,
                 self.config.as_ref(),
                 Utc::now(),
@@ -96,7 +97,7 @@ where
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(item)) => {
                 self.registry
-                    .touch_heartbeat(&self.node_id, self.connected_at);
+                    .touch_heartbeat_key(&self.drift_key, self.connected_at);
                 Poll::Ready(Some(item))
             }
             other => other,
@@ -567,17 +568,20 @@ impl MeshGrpcServer {
     /// config and every later update, exactly like a remote-discovery one-shot
     /// — instead of refusing the subscription. Diagnostics carry only the
     /// closed-set field label, never caller-supplied bytes.
+    #[allow(clippy::too_many_arguments)]
     fn open_drift_session(
         &self,
         node_id: &str,
+        drift_key: &str,
         namespace: &str,
         now: DateTime<Utc>,
         initial_slice: &MeshSlice,
         slice_request: MeshSliceRequest,
         bearer_namespaces: Option<HashSet<String>>,
     ) -> Option<String> {
-        let session_token = match self.drift.open_projected_session(
+        let session_token = match self.drift.open_projected_session_scoped(
             node_id,
+            drift_key,
             namespace,
             now,
             initial_slice,
@@ -594,7 +598,7 @@ impl MeshGrpcServer {
                 return None;
             }
         };
-        record_sent_best_effort(&self.drift, node_id, &session_token, initial_slice);
+        record_sent_best_effort(&self.drift, drift_key, &session_token, initial_slice);
         // Close the subscribe/publication race: the snapshot this subscription
         // already loaded was read BEFORE the row existed, so a publication
         // landing in that window reconciled a registry that did not yet contain
@@ -603,7 +607,7 @@ impl MeshGrpcServer {
         // currently published config prevents a permanently drifted row.
         let published = self.config.as_ref();
         self.drift
-            .reconcile_session_desired(node_id, &session_token, published, Utc::now());
+            .reconcile_session_desired(drift_key, &session_token, published, Utc::now());
         Some(session_token)
     }
 
@@ -744,6 +748,7 @@ impl MeshConfigSync for MeshGrpcServer {
             }
         };
         let node_id = identity.subject.clone();
+        let drift_key = super::admission::authenticated_principal_key(&inner.namespace, &node_id);
         CpGrpcServer::audit_tenant_subscription(
             "MeshConfigSync.MeshSubscribe",
             &node_id,
@@ -821,6 +826,7 @@ impl MeshConfigSync for MeshGrpcServer {
         } else {
             self.open_drift_session(
                 &node_id,
+                &drift_key,
                 &node_namespace,
                 now,
                 &initial_slice,
@@ -847,7 +853,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let stream_scope = self.scope.clone();
         let stream_bearer_namespaces = bearer_namespaces;
         let stream_drift = self.drift.clone();
-        let stream_node_id = node_id.clone();
+        let stream_node_id = drift_key.clone();
         let stream_session_token = session_token.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
             let slice_request = stream_slice_request.clone();
@@ -989,6 +995,7 @@ impl MeshConfigSync for MeshGrpcServer {
             drift: self.drift.clone(),
             config: self.config.clone(),
             node_id,
+            drift_key,
             connected_at: now,
             session_token,
         };
@@ -1043,15 +1050,41 @@ impl MeshConfigSync for MeshGrpcServer {
         // surface as an unlabelled or misattributed verdict.
         let status = mesh_slice_report_status(report.phase, report.reject_reason)
             .map_err(mesh_slice_drift_status)?;
-        self.drift
-            .record_status(
-                &identity.subject,
+        let mut recorded = false;
+        let namespaces: Vec<&str> = match identity.allowed_namespaces.effective_namespaces() {
+            Some(namespaces) => {
+                let mut namespaces: Vec<_> = namespaces.iter().map(String::as_str).collect();
+                namespaces.sort_unstable();
+                namespaces
+            }
+            None => match &self.scope {
+                CpScope::Single(namespace) => vec![namespace.as_str()],
+                CpScope::Set(_) | CpScope::All => Vec::new(),
+            },
+        };
+        for namespace in namespaces {
+            let key = super::admission::authenticated_principal_key(namespace, &identity.subject);
+            match self.drift.record_status(
+                &key,
                 &report.session_token,
                 &report.version,
                 status,
                 Utc::now(),
-            )
-            .map_err(mesh_slice_drift_status)?;
+            ) {
+                Ok(()) => {
+                    recorded = true;
+                    break;
+                }
+                Err(MeshSliceDriftAdmitError::UnknownNode) => {}
+                Err(MeshSliceDriftAdmitError::SessionMismatch) => {}
+                Err(error) => return Err(mesh_slice_drift_status(error)),
+            }
+        }
+        if !recorded {
+            return Err(mesh_slice_drift_status(
+                MeshSliceDriftAdmitError::UnknownNode,
+            ));
+        }
 
         Ok(Response::new(MeshSliceStatusResponse {}))
     }
