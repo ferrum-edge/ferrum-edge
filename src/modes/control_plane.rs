@@ -1526,10 +1526,20 @@ pub(crate) fn publish_cp_full_reload(
     cp_scope: &CpScope,
     mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
     mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    slow_threshold_ms: Option<u64>,
 ) {
     if refreshed_namespaces.is_empty() {
         return;
     }
+    // `loaded_at` is stamped before the first namespace's snapshot queries.
+    let load = (chrono::Utc::now() - db_config.loaded_at)
+        .to_std()
+        .unwrap_or_default();
+    let resources = db_config.proxies.len()
+        + db_config.consumers.len()
+        + db_config.plugin_configs.len()
+        + db_config.upstreams.len();
+    let publish_started = std::time::Instant::now();
     publication_gate.publish(move || {
         let published =
             cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
@@ -1563,6 +1573,18 @@ pub(crate) fn publish_cp_full_reload(
         }
         MeshGrpcServer::broadcast_full_with_registry(mesh_update_tx, published, mesh_registry);
     });
+    crate::modes::database::log_config_change_applied(
+        crate::modes::database::ConfigChangeStages {
+            path: "full reload",
+            trigger: "control plane",
+            resources,
+            sequence: None,
+            load,
+            apply: publish_started.elapsed(),
+            write_to_live: None,
+        },
+        slow_threshold_ms,
+    );
 }
 
 /// Union of exactly the accepted per-namespace deltas.
@@ -3090,6 +3112,7 @@ pub async fn run(
     let poll_fallback_namespace = env_config.namespace.clone();
     let dp_registry_poll = dp_registry.clone();
     let poll_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
+    let poll_slow_threshold_ms = env_config.db_slow_query_threshold_ms;
     let poll_backend_allow_ips = env_config.backend_allow_ips.clone();
     let rejected_delta_full_reload_threshold = env_config.db_rejected_delta_full_reload_threshold;
     let mesh_registry_poll = mesh_registry.clone();
@@ -3283,6 +3306,7 @@ pub async fn run(
                                     &poll_scope,
                                     &mesh_update_tx,
                                     &mesh_registry_poll,
+                                    poll_slow_threshold_ms,
                                 );
                                 settle_full_reload_rejection_state(
                                     &db_poll,
@@ -3339,12 +3363,15 @@ pub async fn run(
                         }
                     } else {
                         // Incremental poll — only fetch changes since last poll
-                        match load_incremental_config_multi(
+                        let load_started = std::time::Instant::now();
+                        let incremental_load = load_incremental_config_multi(
                             db_poll.as_ref(),
                             &nslist,
                             &last_change_sequences,
                         )
-                        .await
+                        .await;
+                        let load_elapsed = load_started.elapsed();
+                        match incremental_load
                         {
                             Ok(IncrementalMultiLoad {
                                 result,
@@ -3464,6 +3491,9 @@ pub async fn run(
                                 // section, so a concurrent K8s reconcile full
                                 // snapshot can never be emitted after these
                                 // deltas and erase them in subscribers.
+                                let changed_resources =
+                                    crate::modes::database::incremental_resource_count(&result);
+                                let publish_started = std::time::Instant::now();
                                 let compose = publish_cp_incremental(
                                     &publication_gate_poll,
                                     config_poll.as_ref(),
@@ -3477,6 +3507,18 @@ pub async fn run(
                                     &mesh_update_tx,
                                     &mesh_registry_poll,
                                     &last_change_sequences,
+                                );
+                                crate::modes::database::log_config_change_applied(
+                                    crate::modes::database::ConfigChangeStages {
+                                        path: "incremental",
+                                        trigger: "control plane",
+                                        resources: changed_resources,
+                                        sequence: Some(result.sequence_cursor),
+                                        load: load_elapsed,
+                                        apply: publish_started.elapsed(),
+                                        write_to_live: None,
+                                    },
+                                    poll_slow_threshold_ms,
                                 );
 
                                 // Warn-only validators (same set as
@@ -3589,6 +3631,7 @@ pub async fn run(
                                                     &poll_scope,
                                                     &mesh_update_tx,
                                                     &mesh_registry_poll,
+                                                    poll_slow_threshold_ms,
                                                 );
                                                 rejected_delta_tracker.record_accepted();
                                                 db_available_poll.store(true, Ordering::Relaxed);
@@ -3738,6 +3781,7 @@ pub async fn run(
                                             &poll_scope,
                                             &mesh_update_tx,
                                             &mesh_registry_poll,
+                                            poll_slow_threshold_ms,
                                         );
                                         settle_full_reload_rejection_state(
                                             &db_poll,
@@ -3834,6 +3878,7 @@ pub async fn run(
                                                             &poll_scope,
                                                             &mesh_update_tx,
                                                             &mesh_registry_poll,
+                                                            poll_slow_threshold_ms,
                                                         );
                                                         settle_full_reload_rejection_state(
                                                             &db_poll,

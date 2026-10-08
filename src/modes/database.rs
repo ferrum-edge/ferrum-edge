@@ -31,7 +31,7 @@ use crate::config::EnvConfig;
 use crate::config::config_backup::load_config_backup;
 use crate::config::config_change_watch::{
     ConfigChangeWakeWatcherParams, ConfigChangeWatchSettings, ConfigChangeWatcherHealth,
-    ConfigChangeWatcherStatus, wait_for_config_poll_wake,
+    ConfigChangeWatcherStatus, ConfigPollWake, wait_for_config_poll_wake,
 };
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
@@ -2533,7 +2533,7 @@ pub async fn run(
                                 // backend wake-up. Both run identical
                                 // authoritative cursor work below — the wake-up
                                 // only decides *when*, never *what*.
-                                _ = wait_for_config_poll_wake(
+                                wake = wait_for_config_poll_wake(
                                     &mut interval,
                                     poll_wake_signal.as_ref(),
                                     change_stream_debounce,
@@ -2693,12 +2693,14 @@ pub async fn run(
                                 database_delta_poll_metrics_for_poll.record_poll_completed();
                                 continue;
                             }
+                            let load_started = std::time::Instant::now();
                             let incremental_result = db_poll
                                 .load_incremental_config(
                                     &poll_namespace,
                                     after_cursor.sequence,
                                 )
                                 .await;
+                            let load_elapsed = load_started.elapsed();
                             drop(load_topology_permit);
                             match incremental_result {
                                 Ok(result) => {
@@ -2730,15 +2732,18 @@ pub async fn run(
                                             after_cursor.sequence,
                                             &result,
                                         );
-
-                                    match proxy_state_poll
+                                    let changed_resources = incremental_resource_count(&result);
+                                    let apply_started = std::time::Instant::now();
+                                    let applied = proxy_state_poll
                                         .apply_database_incremental(
                                             result,
                                             &db_poll,
                                             next_cursor.topology_epoch,
                                         )
-                                        .await
-                                    {
+                                        .await;
+                                    let apply_elapsed = apply_started.elapsed();
+
+                                    match applied {
                                         Err(actual_epoch) => {
                                             runtime_config_apply_poll
                                                 .observe_topology(actual_epoch);
@@ -2764,7 +2769,21 @@ pub async fn run(
                                             runtime_config_apply_poll
                                                 .record_accepted_cursor(next_cursor);
                                             drop(final_topology_permit);
-                                            debug!("Incremental config reload complete");
+                                            log_config_change_applied(
+                                                ConfigChangeStages {
+                                                    path: "incremental",
+                                                    trigger: config_poll_wake_label(wake),
+                                                    resources: changed_resources,
+                                                    sequence: Some(next_cursor.sequence),
+                                                    load: load_elapsed,
+                                                    apply: apply_elapsed,
+                                                    write_to_live: runtime_config_apply_poll
+                                                        .take_write_to_live(next_cursor),
+                                                },
+                                                proxy_state_poll
+                                                    .env_config
+                                                    .db_slow_query_threshold_ms,
+                                            );
                                             rejected_delta_tracker.record_accepted();
                                         }
                                         Ok(proxy::ConfigApplyOutcome::Unchanged) => {
@@ -2784,7 +2803,21 @@ pub async fn run(
                                             runtime_config_apply_poll
                                                 .record_accepted_cursor(next_cursor);
                                             drop(final_topology_permit);
-                                            debug!("Incremental config poll valid but unchanged");
+                                            log_config_change_applied(
+                                                ConfigChangeStages {
+                                                    path: "incremental (unchanged)",
+                                                    trigger: config_poll_wake_label(wake),
+                                                    resources: changed_resources,
+                                                    sequence: Some(next_cursor.sequence),
+                                                    load: load_elapsed,
+                                                    apply: apply_elapsed,
+                                                    write_to_live: runtime_config_apply_poll
+                                                        .take_write_to_live(next_cursor),
+                                                },
+                                                proxy_state_poll
+                                                    .env_config
+                                                    .db_slow_query_threshold_ms,
+                                            );
                                             rejected_delta_tracker.record_accepted();
                                         }
                                         Ok(proxy::ConfigApplyOutcome::Rejected { errors }) => {
@@ -3334,6 +3367,16 @@ async fn try_publish_full_reload_after_gate(
     config_rejected: &AtomicBool,
     runtime_config_apply: &RuntimeConfigApply,
 ) -> Option<bool> {
+    // `loaded_at` is stamped before the snapshot queries run.
+    let load = (chrono::Utc::now() - new_config.loaded_at)
+        .to_std()
+        .unwrap_or_default();
+    let resources = new_config.proxies.len()
+        + new_config.consumers.len()
+        + new_config.plugin_configs.len()
+        + new_config.upstreams.len();
+    let slow_threshold_ms = proxy_state.env_config.db_slow_query_threshold_ms;
+    let apply_started = std::time::Instant::now();
     let published = publish_full_reload_after_gate(
         db,
         db_available,
@@ -3355,8 +3398,103 @@ async fn try_publish_full_reload_after_gate(
     // full reload publishes (issue #6060).
     if published != Some(true) {
         db.forget_consumer_quarantine_state(namespace);
+    } else {
+        log_config_change_applied(
+            ConfigChangeStages {
+                path: "full reload",
+                trigger: commit_context,
+                resources,
+                sequence: Some(cursor.sequence),
+                load,
+                apply: apply_started.elapsed(),
+                write_to_live: runtime_config_apply.take_write_to_live(cursor),
+            },
+            slow_threshold_ms,
+        );
     }
     published
+}
+
+/// Where one published config change spent its time (issue #6057). Shared by
+/// the database-mode and control-plane poll loops.
+pub(crate) struct ConfigChangeStages<'a> {
+    /// `incremental`, `incremental (unchanged)`, or `full reload`.
+    pub(crate) path: &'static str,
+    /// What started the poll: its wake-up, or the full-reload reason.
+    pub(crate) trigger: &'a str,
+    /// Resources the change carried (incremental) or loaded (full reload).
+    pub(crate) resources: usize,
+    /// Change-log sequence the published generation covers, when it has one
+    /// (a multi-namespace CP generation does not).
+    pub(crate) sequence: Option<u64>,
+    /// Database read: the delta point-loads or the full snapshot.
+    pub(crate) load: Duration,
+    /// Runtime application or CP publication: validation, cache rebuilds or
+    /// composition, and the swap.
+    pub(crate) apply: Duration,
+    /// From the oldest admin write in this process the generation covers to
+    /// now, when this process issued one.
+    pub(crate) write_to_live: Option<Duration>,
+}
+
+fn config_poll_wake_label(wake: ConfigPollWake) -> &'static str {
+    match wake {
+        ConfigPollWake::Interval => "poll interval",
+        ConfigPollWake::ChangeStream => "change stream",
+        ConfigPollWake::AdminWrite => "admin write",
+    }
+}
+
+pub(crate) fn incremental_resource_count(result: &db_backend::IncrementalResult) -> usize {
+    result.added_or_modified_proxies.len()
+        + result.removed_proxy_ids.len()
+        + result.added_or_modified_consumers.len()
+        + result.removed_consumer_ids.len()
+        + result.added_or_modified_plugin_configs.len()
+        + result.removed_plugin_config_ids.len()
+        + result.added_or_modified_upstreams.len()
+        + result.removed_upstream_ids.len()
+}
+
+/// One line per published change. `waiting_ms` is the part of write-to-live
+/// spent before this poll's database read started: poll scheduling plus any
+/// earlier reload still running. WARN when the change took longer than the
+/// slow-query threshold, INFO otherwise.
+pub(crate) fn log_config_change_applied(
+    stages: ConfigChangeStages<'_>,
+    slow_threshold_ms: Option<u64>,
+) {
+    let poll_ms = (stages.load + stages.apply).as_millis() as u64;
+    let write_to_live_ms = stages
+        .write_to_live
+        .map(|elapsed| elapsed.as_millis() as u64);
+    let waiting_ms = write_to_live_ms.map(|total| total.saturating_sub(poll_ms));
+    let slowest_ms = write_to_live_ms.unwrap_or(poll_ms);
+    if slow_threshold_ms.is_some_and(|threshold| slowest_ms > threshold) {
+        warn!(
+            path = stages.path,
+            trigger = stages.trigger,
+            resources = stages.resources,
+            sequence = stages.sequence,
+            write_to_live_ms,
+            waiting_ms,
+            load_ms = stages.load.as_millis() as u64,
+            apply_ms = stages.apply.as_millis() as u64,
+            "Slow config change: published later than the slow-query threshold"
+        );
+    } else {
+        info!(
+            path = stages.path,
+            trigger = stages.trigger,
+            resources = stages.resources,
+            sequence = stages.sequence,
+            write_to_live_ms,
+            waiting_ms,
+            load_ms = stages.load.as_millis() as u64,
+            apply_ms = stages.apply.as_millis() as u64,
+            "Config change published"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
