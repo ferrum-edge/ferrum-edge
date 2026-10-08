@@ -3018,32 +3018,45 @@ impl DatabaseStore {
 
         // One statement per chunk, ordered by the database like the full
         // load, so plugin-chain tie order matches runtime under any collation.
+        // Every value is bound: namespace, the namespace-wide plugin names,
+        // then the chunk's ids.
         let namespace_wide_names =
-            crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES
-                .iter()
-                .map(|name| format!("'{name}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            crate::config::policy_graph_scope::NAMESPACE_WIDE_POLICY_PLUGIN_NAMES;
+        let name_placeholders = std::iter::repeat_n("?", namespace_wide_names.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let plugin_select = format!(
             "SELECT * FROM plugin_configs WHERE namespace = ? AND (scope = 'global' \
-             OR plugin_name IN ({namespace_wide_names})"
+             OR plugin_name IN ({name_placeholders})"
         );
-        let plugin_rows = if plugin_ids.is_empty() {
-            sqlx::query(&self.q(&format!("{plugin_select}) ORDER BY id")))
-                .bind(namespace)
-                .fetch_all(&mut *tx)
-                .await?
+        let id_chunks: Vec<&[&str]> = if plugin_ids.is_empty() {
+            vec![&[]]
         } else {
-            self.fetch_namespace_rows_in_tx(
-                &mut tx,
-                &format!("{plugin_select} OR id IN"),
-                namespace,
-                &plugin_ids,
-                ") ORDER BY id",
-                Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE,
-            )
-            .await?
+            plugin_ids
+                .chunks(Self::ORDERED_NEIGHBORHOOD_CHUNK_SIZE)
+                .collect()
         };
+        let mut plugin_rows = Vec::new();
+        for chunk in id_chunks {
+            let sql = if chunk.is_empty() {
+                self.q(&format!("{plugin_select}) ORDER BY id"))
+            } else {
+                let id_placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.q(&format!(
+                    "{plugin_select} OR id IN ({id_placeholders})) ORDER BY id"
+                ))
+            };
+            let mut query = sqlx::query(&sql).bind(namespace);
+            for name in namespace_wide_names {
+                query = query.bind(*name);
+            }
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            plugin_rows.extend(query.fetch_all(&mut *tx).await?);
+        }
         tx.commit().await?;
 
         // Rows repeat only when the ids span more than one chunk; keep the
