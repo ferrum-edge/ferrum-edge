@@ -31,6 +31,12 @@ def write_run(root, suite, run, protocol, gateway, direct, cpu_seconds=None):
              "wall_seconds": 12.0}) + "\n")
 
 
+def write_manifest(root, runs, protocols, payload_sizes, latency_duration_secs=0):
+    (root / "manifest.json").write_text(json.dumps({"args": {
+        "protocols": protocols, "runs": runs, "payload_sizes": payload_sizes,
+        "latency_duration_secs": latency_duration_secs}}))
+
+
 class PublishedBenchmarkSummaryTests(unittest.TestCase):
     def test_classifies_legs_by_port_not_label(self):
         legs = summary.split_legs([
@@ -44,6 +50,7 @@ class PublishedBenchmarkSummaryTests(unittest.TestCase):
     def test_medians_overhead_cpu_and_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            write_manifest(root, 3, ["http1", "udp"], [64])
             for run, (gw, dr) in enumerate([(100_000, 200_000), (90_000, 200_000),
                                             (110_000, 200_000)], start=1):
                 write_run(root, "throughput_64b", run, "http1",
@@ -53,6 +60,10 @@ class PublishedBenchmarkSummaryTests(unittest.TestCase):
             write_run(root, "throughput_64b", 1, "udp",
                       report("127.0.0.1:5003", 50_000, 2000, 5000, errors=3),
                       report("127.0.0.1:3005", 100_000, 1000, 3000))
+            for run in (2, 3):
+                write_run(root, "throughput_64b", run, "udp",
+                          report("127.0.0.1:5003", 50_000, 2000, 5000),
+                          report("127.0.0.1:3005", 100_000, 1000, 3000))
             document = summary.summarize(root)
 
         http1 = document["suites"]["throughput_64b"]["http1"]
@@ -73,6 +84,7 @@ class PublishedBenchmarkSummaryTests(unittest.TestCase):
     def test_noisy_runs_are_flagged_and_udp_payload_capped(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            write_manifest(root, 2, ["udp"], [10240])
             for run, gw in enumerate([50_000, 100_000], start=1):
                 write_run(root, "throughput_10240b", run, "udp",
                           report("127.0.0.1:5003", gw, 1, 1),
@@ -84,23 +96,60 @@ class PublishedBenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(udp["payload_bytes"], 2048)
         self.assertIn("| UDP |", markdown)
 
-    def test_planned_runs_and_protocols_missing_from_disk_are_flagged(self):
+    def test_missing_manifest_matrix_entry_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "manifest.json").write_text(json.dumps({"args": {
-                "protocols": ["http1", "grpc"], "runs": 3, "payload_sizes": [64],
-                "latency_duration_secs": 0}}))
+            write_manifest(root, 3, ["http1", "grpc"], [64])
             # Only run 1 of 3 ever wrote a log, and grpc never ran at all.
             write_run(root, "throughput_64b", 1, "http1",
                       report("http://127.0.0.1:8000/echo", 100_000, 1, 1),
                       report("http://127.0.0.1:3001/echo", 200_000, 1, 1))
-            document = summary.summarize(root)
-        rows = document["suites"]["throughput_64b"]
-        self.assertEqual(rows["http1"]["runs_complete"], 1)
-        self.assertEqual(rows["http1"]["runs_expected"], 3)
-        self.assertIn("incomplete-runs", rows["http1"]["flags"])
-        self.assertEqual(rows["grpc"]["runs_complete"], 0)
-        self.assertIn("incomplete-runs", rows["grpc"]["flags"])
+            with self.assertRaisesRegex(ValueError, "run directories.*missing"):
+                summary.summarize(root)
+
+    def test_missing_protocol_log_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_manifest(root, 1, ["http1", "grpc"], [64])
+            write_run(root, "throughput_64b", 1, "http1",
+                      report("http://127.0.0.1:8000/echo", 10, 1, 1),
+                      report("http://127.0.0.1:3001/echo", 20, 1, 1))
+            with self.assertRaisesRegex(ValueError, "grpc.log"):
+                summary.summarize(root)
+
+    def test_stale_run_directory_fails_instead_of_mixing_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_manifest(root, 1, ["http1"], [64])
+            write_run(root, "throughput_64b", 1, "http1",
+                      report("http://127.0.0.1:8000/echo", 10, 1, 1),
+                      report("http://127.0.0.1:3001/echo", 20, 1, 1))
+            (root / "raw" / "throughput_64b" / "run2").mkdir()
+            with self.assertRaisesRegex(ValueError, "run2"):
+                summary.summarize(root)
+
+    def test_unselected_protocol_and_suite_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_manifest(root, 1, ["http1"], [64])
+            write_run(root, "throughput_64b", 1, "http1",
+                      report("http://127.0.0.1:8000/echo", 10, 1, 1),
+                      report("http://127.0.0.1:3001/echo", 20, 1, 1))
+            (root / "raw" / "throughput_64b" / "run1" / "grpc.log").write_text("")
+            with self.assertRaisesRegex(ValueError, "grpc.log"):
+                summary.summarize(root)
+
+            (root / "raw" / "throughput_64b" / "run1" / "grpc.log").unlink()
+            (root / "raw" / "throughput_128b").mkdir()
+            with self.assertRaisesRegex(ValueError, "throughput_128b"):
+                summary.summarize(root)
+
+    def test_runner_rejects_nonempty_output_before_building_or_writing_manifest(self):
+        runner = (Path(__file__).resolve().parents[1] / "run_published_benchmark.sh").read_text()
+        refusal = runner.index("Output directory is not empty")
+        self.assertLess(refusal, runner.index("cargo build --release --bin ferrum-edge"))
+        self.assertLess(refusal, runner.index('"$OUT/manifest.json"'))
+        self.assertIn("shopt -s dotglob nullglob", runner)
 
 
 if __name__ == "__main__":

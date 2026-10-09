@@ -59,6 +59,12 @@ cd tests/performance/multi_protocol
 ./run_published_benchmark.sh --runs 5 --protocols "http1 grpc" --payload-sizes 64
 ```
 
+Each run needs a new or empty output directory. `--out DIR` refuses to start if
+`DIR` already contains any files or directories, so an existing result bundle
+cannot acquire a new manifest over old samples. The summarizer also checks that
+`raw/` contains exactly the suites, repetitions, and protocol logs selected in
+the manifest, and fails if any are missing or unexpected.
+
 Suites in the result directory:
 
 - `throughput_<N>b` — closed-loop throughput at `--concurrency` (default 200)

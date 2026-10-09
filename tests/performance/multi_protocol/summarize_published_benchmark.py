@@ -71,21 +71,73 @@ def leg_requests(record):
             + record.get("drain_requests", 0))
 
 
-def load_samples(out):
-    """{suite: {protocol: [per-run sample dict]}}"""
-    suites = {}
+def load_samples(out, expected_runs, expected):
+    """Load only the exact run matrix declared in the manifest."""
     raw_root = out / "raw"
-    for suite_dir in sorted(p for p in raw_root.iterdir() if p.is_dir()):
-        per_protocol = suites.setdefault(suite_dir.name, {})
-        for run_dir in sorted(p for p in suite_dir.iterdir() if p.is_dir()):
-            for log in sorted(run_dir.glob("*.log")):
-                protocol = log.stem
+    if not raw_root.is_dir() or raw_root.is_symlink():
+        raise ValueError("raw/ must be a directory for the manifest run matrix")
+
+    expected_suites = set(expected)
+    actual_suites = set()
+    for path in raw_root.iterdir():
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(f"unexpected entry in raw/: {path.name}")
+        actual_suites.add(path.name)
+    if actual_suites != expected_suites:
+        missing = sorted(expected_suites - actual_suites)
+        extra = sorted(actual_suites - expected_suites)
+        raise ValueError(
+            f"raw suite directories do not match manifest (missing={missing}, extra={extra})"
+        )
+
+    samples = {}
+    for suite, protocols in expected.items():
+        suite_dir = raw_root / suite
+        expected_run_dirs = {f"run{run}" for run in range(1, expected_runs + 1)}
+        actual_run_dirs = set()
+        for path in suite_dir.iterdir():
+            if path.is_symlink() or not path.is_dir():
+                raise ValueError(f"unexpected entry in raw/{suite}/: {path.name}")
+            actual_run_dirs.add(path.name)
+        if actual_run_dirs != expected_run_dirs:
+            missing = sorted(expected_run_dirs - actual_run_dirs)
+            extra = sorted(actual_run_dirs - expected_run_dirs)
+            raise ValueError(
+                f"run directories in raw/{suite}/ do not match manifest "
+                f"(missing={missing}, extra={extra})"
+            )
+
+        per_protocol = {protocol: [] for protocol in protocols}
+        for run in range(1, expected_runs + 1):
+            run_name = f"run{run}"
+            run_dir = suite_dir / run_name
+            expected_files = {
+                name
+                for protocol in protocols
+                for name in (f"{protocol}.log", f"{protocol}.cpu.jsonl")
+            }
+            required_logs = {f"{protocol}.log" for protocol in protocols}
+            actual_files = set()
+            for path in run_dir.iterdir():
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(f"unexpected entry in raw/{suite}/{run_name}/: {path.name}")
+                actual_files.add(path.name)
+            missing = sorted(required_logs - actual_files)
+            extra = sorted(actual_files - expected_files)
+            if missing or extra:
+                raise ValueError(
+                    f"files in raw/{suite}/{run_name}/ do not match manifest "
+                    f"(missing={missing}, extra={extra})"
+                )
+            for protocol in protocols:
+                log = run_dir / f"{protocol}.log"
                 legs = split_legs(extract_json(log.read_text(errors="replace")))
                 sample = {"run": run_dir.name, "gateway": legs.get("gateway"),
                           "direct": legs.get("direct"),
                           "cpu": read_cpu(run_dir / f"{protocol}.cpu.jsonl")}
-                per_protocol.setdefault(protocol, []).append(sample)
-    return suites
+                per_protocol[protocol].append(sample)
+        samples[suite] = per_protocol
+    return samples
 
 
 def median(values):
@@ -253,30 +305,62 @@ def payload_from_suite(suite):
 
 
 def expected_matrix(manifest):
-    """(runs, {suite: protocols}) the wrapper planned, from manifest.json, so a
-    suite, protocol, or run that never produced a log is reported as missing
-    rather than silently absent. Empty when the manifest has no arguments."""
-    args = manifest.get("args") or {}
+    """Return the manifest's exact (run count, {suite: protocols}) matrix."""
+    args = manifest.get("args")
+    if not isinstance(args, dict):
+        raise ValueError("manifest.json must contain an args object")
     runs = args.get("runs")
     protocols = args.get("protocols") or []
-    suites = [f"throughput_{size}b" for size in args.get("payload_sizes") or []]
-    if args.get("latency_duration_secs"):
+    payload_sizes = args.get("payload_sizes") or []
+    latency_duration = args.get("latency_duration_secs", 0)
+    if not isinstance(runs, int) or isinstance(runs, bool) or runs < 1:
+        raise ValueError("manifest args.runs must be a positive integer")
+    if (
+        not isinstance(protocols, list)
+        or not protocols
+        or any(not isinstance(protocol, str) or protocol not in PROTOCOL_ORDER
+               for protocol in protocols)
+        or len(set(protocols)) != len(protocols)
+    ):
+        raise ValueError(
+            "manifest args.protocols must be a non-empty list of unique supported protocols"
+        )
+    if (
+        not isinstance(payload_sizes, list)
+        or any(not isinstance(size, int) or isinstance(size, bool) or size < 1
+               for size in payload_sizes)
+        or len(set(payload_sizes)) != len(payload_sizes)
+    ):
+        raise ValueError("manifest args.payload_sizes must be a list of unique positive integers")
+    if (
+        not isinstance(latency_duration, int)
+        or isinstance(latency_duration, bool)
+        or latency_duration < 0
+    ):
+        raise ValueError(
+            "manifest args.latency_duration_secs must be a non-negative integer"
+        )
+    suites = [f"throughput_{size}b" for size in payload_sizes]
+    if latency_duration > 0:
         suites.append("latency_64b")
+    if not suites:
+        raise ValueError("manifest args must select at least one payload or latency suite")
     return runs, {suite: list(protocols) for suite in suites}
 
 
 def summarize(out):
     out = Path(out)
     manifest_path = out / "manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    samples = load_samples(out)
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValueError("manifest.json is required to summarize published benchmark results")
+    manifest = json.loads(manifest_path.read_text())
     expected_runs, expected = expected_matrix(manifest)
-    suites = set(samples) | set(expected)
+    samples = load_samples(out, expected_runs, expected)
     summary = {}
-    for suite in sorted(suites, key=suite_order):
-        per_protocol = samples.get(suite, {})
+    for suite in sorted(expected, key=suite_order):
+        per_protocol = samples[suite]
         rows = {}
-        for protocol in ordered(set(per_protocol) | set(expected.get(suite, ()))):
+        for protocol in ordered(expected[suite]):
             row = summarize_protocol(per_protocol.get(protocol, []), expected_runs)
             row["payload_bytes"] = payload_from_suite(suite)
             if protocol.startswith("udp") and row["payload_bytes"]:

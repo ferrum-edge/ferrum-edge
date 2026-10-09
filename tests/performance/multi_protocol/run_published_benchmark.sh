@@ -19,7 +19,7 @@
 #     --payload-sizes "<list>"  Throughput payload sizes in bytes (default "64 10240")
 #     --latency-duration <secs> Measured seconds per latency leg (default 10; 0 skips)
 #     --cooldown <secs>         Idle pause before each leg (default 2)
-#     --out <dir>               Result directory (default results/<UTC timestamp>)
+#     --out <dir>               Empty/new result directory (default results/<UTC timestamp>)
 #     --skip-build              Reuse existing release binaries
 
 set -euo pipefail
@@ -55,6 +55,14 @@ done
 
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 OUT="${OUT:-$SCRIPT_DIR/results/$(date -u +%Y%m%dT%H%M%SZ)}"
+mkdir -p "$OUT"
+shopt -s dotglob nullglob
+OUT_ENTRIES=("$OUT"/*)
+shopt -u dotglob nullglob
+if ((${#OUT_ENTRIES[@]} > 0)); then
+    echo "Output directory is not empty: $OUT (choose a new directory or remove it first)" >&2
+    exit 2
+fi
 mkdir -p "$OUT/raw"
 OUT="$(cd "$OUT" && pwd)"
 
