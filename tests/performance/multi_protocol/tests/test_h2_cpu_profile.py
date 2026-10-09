@@ -64,7 +64,7 @@ class H2CPUAdmissionTests(unittest.TestCase):
             self.assertTrue(all(not row['comparable'] for row in result['calibration']))
 
 
-    def campaign(self, directory):
+    def campaign(self, directory, protocol='http2'):
         root = Path(directory)
         for campaign, mode in (('control-before', 'off'), ('counters', 'counters'),
                                ('cpu', 'cpu'), ('control-after', 'off')):
@@ -80,7 +80,8 @@ class H2CPUAdmissionTests(unittest.TestCase):
                                       voluntary_ctxt_switches=7, nonvoluntary_ctxt_switches=3))
                              for index, role in enumerate(roles)]
                     sample = dict(sample_schema=2, gateway=gateway, pair=pair, host_id='one-runner',
-                                  protocol='http2', payload_size=10240, duration_secs=15,
+                                  protocol={'http2': 'HTTP/2', 'grpcs': 'gRPC'}[protocol],
+                                  payload_size=10240, duration_secs=15,
                                   effective_concurrency=200, warmup_requests=200,
                                   total_requests=1500, total_errors=0, total_bytes=1500 * 10240, rps=100,
                                   phases=dict(measurement_secs=15, measurement_elapsed_secs=15.01, timed_out=False),
@@ -89,11 +90,11 @@ class H2CPUAdmissionTests(unittest.TestCase):
                                   process_usage=dict(processes=usage, measurement=usage))
                     for name in ('active_workers', 'active_connections', 'active_streams', 'queued_requests'):
                         sample['observed'][name] = dict(min=0, max=200, mean=100)
-                    path = folder / f'{gateway}_http2_10240.json'
+                    path = folder / f'{gateway}_{protocol}_10240.json'
                     path.write_text(json.dumps(sample))
                     stamp(path, mode)
                     if gateway != 'direct':
-                        config, runtime = self.runtime(gateway=gateway)
+                        config, runtime = self.runtime(protocol=protocol, gateway=gateway)
                         runtime['pair'] = pair
                         (folder / 'diagnostics' / f'{gateway}_runtime.json').write_text(json.dumps(runtime))
                         (folder / 'diagnostics' / f'{gateway}_config.yaml').write_bytes(config)
@@ -102,23 +103,26 @@ class H2CPUAdmissionTests(unittest.TestCase):
                             trace.mkdir(parents=True)
                             (trace / 'trace-manifest.json').write_text(json.dumps(dict(
                                 capture_complete=True, mode='cpu', cpu=dict(samples=100),
-                                binding=dict(arm=gateway, pair=pair, payload=10240, h2_protocol='http2'))))
-        return root / 'counters/pairs/pair_001/ferrum_http2_10240.json'
+                                binding=dict(arm=gateway, pair=pair, payload=10240, h2_protocol=protocol))))
+        return root / f'counters/pairs/pair_001/ferrum_{protocol}_10240.json'
 
     def test_complete_campaign_calibrates_all_roles_and_preserves_controls(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = self.campaign(directory)
-            self.assertEqual(report(directory), 0)
-            result = json.loads((Path(directory) / 'h2-cpu-report.json').read_text())
-            self.assertTrue(result['complete'])
-            self.assertEqual(len(result['observations']), 24)
-            self.assertTrue(all(row['comparable'] for row in result['calibration']))
-            self.assertTrue(all(row['median_rps_overhead_percent'] == 0 for row in result['calibration']))
-            self.assertTrue(json.loads(path.read_text())['h2_cpu_profile']['diagnostic_only'])
+        for protocol in ('http2', 'grpcs'):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                path = self.campaign(directory, protocol)
+                self.assertEqual(report(directory), 0)
+                result = json.loads((Path(directory) / 'h2-cpu-report.json').read_text())
+                self.assertTrue(result['complete'])
+                self.assertEqual(len(result['observations']), 24)
+                self.assertTrue(all(row['protocol'] == protocol for row in result['observations']))
+                self.assertTrue(all(row['comparable'] for row in result['calibration']))
+                self.assertTrue(all(row['median_rps_overhead_percent'] == 0 for row in result['calibration']))
+                self.assertTrue(json.loads(path.read_text())['h2_cpu_profile']['diagnostic_only'])
 
     def test_inconsistent_corrupt_or_incomplete_evidence_keeps_a_failed_report(self):
         for fault in ('json', 'not-object', 'duplicate-role', 'negative-counter', 'missing-scope',
-                      'nonfinite-cpu', 'wrong-pair', 'wrong-gateway', 'mixed-image', 'wrong-capture'):
+                      'nonfinite-cpu', 'wrong-pair', 'wrong-gateway', 'mixed-image', 'wrong-capture',
+                      'malformed-observation', 'malformed-protocol', 'cli-protocol'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 path = self.campaign(directory)
                 sample = json.loads(path.read_text())
@@ -134,6 +138,12 @@ class H2CPUAdmissionTests(unittest.TestCase):
                     sample['pair'] = 2
                 elif fault == 'wrong-gateway':
                     sample['gateway'] = 'envoy'
+                elif fault == 'malformed-observation':
+                    sample['h2_observation'] = True
+                elif fault == 'malformed-protocol':
+                    sample['protocol'] = {}
+                elif fault == 'cli-protocol':
+                    sample['protocol'] = 'http2'
                 elif fault == 'mixed-image':
                     runtime_path = path.parent / 'diagnostics/ferrum_runtime.json'
                     runtime = json.loads(runtime_path.read_text())

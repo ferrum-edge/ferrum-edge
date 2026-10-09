@@ -115,9 +115,13 @@ def report(root):
                         or marker.get('user_stacks_only') is not (mode == 'cpu')
                         or marker.get('scheduler_counters') is not (mode != 'off')):
                     row['issues'].append('missing/mismatched diagnostic marker')
+                # The client serializes display labels; runtime and capture
+                # bindings use the command-line protocol names.
+                protocol = ({'HTTP/2': 'http2', 'gRPC': 'grpcs'}.get(sample.get('protocol'))
+                            if isinstance(sample.get('protocol'), str) else None)
                 if (sample.get('gateway') != gateway or sample.get('pair') != pair
                         or sample.get('sample_schema') != 2
-                        or sample.get('protocol') not in ('http2', 'grpcs')
+                        or protocol is None
                         or sample.get('payload_size') not in (10240, 71680)
                         or sample.get('duration_secs') != 15
                         or sample.get('effective_concurrency') != 200):
@@ -126,10 +130,10 @@ def report(root):
                 # traffic, error and completeness rules still apply here.
                 try:
                     row['issues'].extend(sample_issues(sample))
-                except (TypeError, ValueError, KeyError):
+                except (TypeError, ValueError, KeyError, AttributeError):
                     row['issues'].append('malformed benchmark evidence')
                 row.update(rps=sample.get('rps'), payload=sample.get('payload_size'),
-                           protocol=sample.get('protocol'), host_id=sample.get('host_id'))
+                           protocol=protocol, host_id=sample.get('host_id'))
                 usage = sample.get('process_usage')
                 usage = usage.get('measurement') if isinstance(usage, dict) else None
                 row['usage'] = usage if isinstance(usage, list) else []
