@@ -5790,7 +5790,11 @@ impl MeshConfig {
         terminator_local_ip: Option<std::net::IpAddr>,
     ) -> Result<(), InboundRelayDenial> {
         self.inbound_relay_destination_decision(host, port, terminator_local_ip)?;
-        if self.sidecar_inbound_http_app_ports.binary_search(&port).is_ok() {
+        if self
+            .sidecar_inbound_http_app_ports
+            .binary_search(&port)
+            .is_ok()
+        {
             return Err(InboundRelayDenial::HttpApplicationPort);
         }
         Ok(())

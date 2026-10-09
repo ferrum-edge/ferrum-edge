@@ -11,8 +11,8 @@ use ferrum_edge::_test_support::inbound_connect_relay_synthesis_refusal_for_test
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ServicePort, Workload,
-    WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort,
+    WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::{MeshTopology, prepare_gateway_config_for_mesh};
 
