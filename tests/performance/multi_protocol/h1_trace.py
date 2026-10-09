@@ -1139,6 +1139,7 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
                   header_status=header, buildid_status=buildids, attributes_status=attributes, attributes_verified=attributes_verified,
                   attribute_validation=attribute_validation,
                   raw_decoder_status=raw_status, unwind_complete=False,
+                  inline_expansion=False,
                   enabled_running_time='PERF_SAMPLE_READ with TOTAL_TIME_ENABLED/RUNNING in raw perf.data; actual attributes retained',
                   kernel_stacks='not selected; user-mode cpu-clock only')
     write(out / 'cpu-coverage.json', {k: v for k, v in result.items() if k not in ('callchains', 'folded')})

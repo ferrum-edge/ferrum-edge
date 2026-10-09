@@ -732,10 +732,16 @@ Raw perf.data, build IDs, header attributes, task/MMAP records, decoder exit
 status, loss/throttle records, per-TID samples, depth distribution, unresolved
 samples and folded/decoded call chains are retained. Matching mapped ELF/DSOs
 come from the target mount namespace while alive, never substituted host libc.
+The bounded decoder uses `perf script --no-inline`: concrete symbolized frames
+remain available, but inline source frames are not expanded. Default inline
+expansion repeatedly entered `addr2line` on the 689,819,544-byte production ELF
+and decoded only 5–7 of roughly 1,750 samples before the 30-second limit in
+hosted run 37918132309. The deadline, output caps and sample-count reconciliation
+remain enforced; `inline_expansion: false` records this attribution limit.
 The gateway's retained ELF must match exactly one symbolized release twin.
 Only this disposable synthetic benchmark process's user stack memory may enter
 perf.data. Matching DSO packages are retained under `builds/<twin>/symfs`, with
-a separate 512 MiB ceiling that includes existing partial files and metadata
+a separate 1 GiB ceiling that includes existing partial files and metadata
 reservations; repeat artifacts reference that package. Acquisition pins the
 admitted target's root directory, walks every subsequent source component without
 following symlinks, and requires a regular file with the `/proc/<pid>/maps`

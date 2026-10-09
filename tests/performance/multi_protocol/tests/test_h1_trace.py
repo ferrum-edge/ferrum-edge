@@ -239,6 +239,7 @@ class H1CPUAttributeTests(unittest.TestCase):
                 self.assertEqual(result['samples'], 1)
                 self.assertTrue(nested_fixture_proof(result['callchains'])['proven'])
                 self.assertFalse(result['unwind_complete'])
+                self.assertFalse(result['inline_expansion'])
                 self.assertFalse(result['samples_complete'])
                 self.assertIn('missing matching ELF/build IDs/CFI', result['issues'])
                 self.assertIn('partial unwinding/unresolved samples', result['issues'])
