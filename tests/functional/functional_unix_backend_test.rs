@@ -467,6 +467,10 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
     );
     if grpc_web {
         config = config.replace(
+            "    strip_listen_path: true",
+            "    strip_listen_path: true\n    plugins:\n      - plugin_config_id: \"grpc-web\"",
+        );
+        config = config.replace(
             "plugin_configs: []",
             r#"plugin_configs:
   - id: "grpc-web"

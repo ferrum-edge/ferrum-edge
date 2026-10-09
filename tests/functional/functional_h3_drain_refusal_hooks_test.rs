@@ -870,7 +870,11 @@ async fn h3_buffered_grpc_upload_reset_is_cancelled_and_logged_before_write() {
     let (backend_port, backend) = spawn_grpc_backend().await;
     let mut proxy = base_proxy("https", backend_port);
     proxy["response_body_mode"] = json!("buffer");
-    let (harness, https_port) = spawn_h3_gateway(gateway_yaml(proxy, Vec::new()), &[]).await;
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(proxy, Vec::new()),
+        &[("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", ONE_BLOCK)],
+    )
+    .await;
     let streams_before = backend.received_stream_count();
     let mut upload =
         open_upload_stream(&proxy_url(https_port, GRPC_PATH), "application/grpc").await;
@@ -878,7 +882,24 @@ async fn h3_buffered_grpc_upload_reset_is_cancelled_and_logged_before_write() {
         .send_raw_data(Bytes::from(grpc_frame(b"cancelled")))
         .await
         .expect("upload DATA");
+    // A reset can overtake unaccepted HEADERS and discard the entire stream.
+    // Observe the bridge's real upload reservation before cancelling, so this
+    // exercises an admitted body read and its terminal accounting.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = request_buffer_snapshot(&harness).await;
+        if snapshot["reserved_bytes"].as_u64() == Some(ONE_BLOCK_BYTES) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bridge must admit the upload before cancellation: {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     upload.cancel_request_upload();
+    let entry =
+        wait_for_rejection_phase(&harness, "client_disconnect_buffered_h3_bridge_upload").await;
     let (status, headers) = upload.recv_response().await.expect("cancellation response");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -889,8 +910,6 @@ async fn h3_buffered_grpc_upload_reset_is_cancelled_and_logged_before_write() {
         headers.get(HOOK_HEADER).and_then(|v| v.to_str().ok()),
         Some(HOOK_VALUE)
     );
-    let entry =
-        wait_for_rejection_phase(&harness, "client_disconnect_buffered_h3_bridge_upload").await;
     assert_eq!(entry["client_disconnected"], true);
     assert_eq!(entry["error_class"], "client_disconnect");
     assert_eq!(entry["metadata"]["grpc_status"], "1");
