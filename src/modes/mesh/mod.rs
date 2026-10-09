@@ -6247,6 +6247,11 @@ fn materialize_sidecar_inbound_proxies(
         mesh.sidecar_ingress_bind_overrides.clear();
     }
 
+    // Proxy hop limit (issue #6109): ports this gateway itself listens on (the
+    // mesh listener plan and every Gateway/stream `listen_port`). An inbound
+    // route whose resolved local target is one of them would forward the
+    // request straight back into a Ferrum hop, so it is refused below.
+    let gateway_listener_ports = sidecar_ingress_claimed_ports(config, runtime);
     let mut materialized = 0usize;
     let mut tcp_routes = Vec::new();
     // Container (app) ports claimed by a materialized HTTP-family inbound route.
@@ -6353,6 +6358,10 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 };
+                if gateway_listener_ports.contains(&backend_port) {
+                    warn_inbound_target_is_gateway_listener(service, service_port, backend_port);
+                    continue;
+                }
                 // Claim this container port for the HTTP family so the raw-TCP
                 // inbound branch never preempts it (recorded even when the
                 // operator-overlap scan below skips materializing our route —
@@ -6437,6 +6446,10 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 };
+                if gateway_listener_ports.contains(&backend_port) {
+                    warn_inbound_target_is_gateway_listener(service, service_port, backend_port);
+                    continue;
+                }
                 // Effective protocol with `protocol_overrides` applied (same
                 // resolution `service_tcp_stream_ports` filtered on). Only an
                 // opaque-TLS port carries a real ClientHello, so only it is
@@ -6514,6 +6527,23 @@ fn materialize_sidecar_inbound_proxies(
             "Prepared sidecar raw-TCP inbound routes to the local application"
         );
     }
+}
+
+/// Fail-closed diagnostic for a Sidecar inbound route whose resolved local
+/// target port is a port this gateway listens on (issue #6109).
+fn warn_inbound_target_is_gateway_listener(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    backend_port: u16,
+) {
+    warn!(
+        service = %sanitize_startup_scalar(service.name.to_string()),
+        namespace = %sanitize_startup_scalar(service.namespace.to_string()),
+        service_port = %sanitize_startup_scalar(service_port.port.to_string()),
+        target_port = %sanitize_startup_scalar(backend_port.to_string()),
+        "Inbound mesh route targets a port this gateway listens on; failing closed rather \
+         than forwarding the request back into the gateway. Skipping this route."
+    );
 }
 
 /// Admit Sidecar `ingress[]` listeners for one prepared generation.
@@ -6648,6 +6678,34 @@ fn admit_sidecar_ingress_listeners<'a>(
             claimed_ports.insert(listener.port);
             bind_overrides.insert(listener.port, bind_ip);
             true
+        })
+        .collect();
+
+    // Proxy hop limit (issue #6109): a loopback `defaultEndpoint` that names a
+    // port this gateway itself listens on — the mesh listener plan, a Gateway
+    // or stream listener, or any dedicated bind admitted above, this entry's
+    // own included — sends the request straight back into a Ferrum hop. Two
+    // binds pointing at each other would loop, and the mesh inbound hop-count
+    // exemption assumes the target is the local application. Refuse the whole
+    // entry fail-closed, like a bind conflict. Unix-stream backends name no
+    // TCP port.
+    let listeners: Vec<_> = listeners
+        .into_iter()
+        .filter(|listener| {
+            if listener.endpoint_unix_path.is_some()
+                || !claimed_ports.contains(&listener.endpoint_port)
+            {
+                return true;
+            }
+            warn!(
+                local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                "Sidecar ingress[] defaultEndpoint targets a port this gateway listens on; \
+                 failing closed rather than forwarding the request back into the gateway"
+            );
+            bind_overrides.remove(&listener.port);
+            false
         })
         .collect();
     (listeners, bind_overrides)
@@ -7012,6 +7070,34 @@ fn sidecar_ingress_claimed_ports(
         }
     }
     ports
+}
+
+/// Every port this mesh data plane listens on for the proxy hop limit's mesh
+/// inbound exemption (issue #6109): the mesh listener plan and every proxy
+/// `listen_port` ([`sidecar_ingress_claimed_ports`]), the admin listeners, and
+/// the dedicated Sidecar `ingress[]` binds.
+///
+/// A mesh inbound route whose loopback target is in this set re-enters a
+/// Ferrum hop, so `hop_limit::effective_outbound_proxy_hops` increments the
+/// count for it instead of forwarding it unchanged. Only ports mesh mode
+/// actually binds belong here: `FERRUM_PROXY_HTTP_PORT` /
+/// `FERRUM_PROXY_HTTPS_PORT` are not served in mesh mode, and listing them
+/// would charge a second hop to an application that happens to use them.
+/// Cold path.
+fn mesh_gateway_listener_ports(
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+    config: &GatewayConfig,
+) -> proxy::hop_limit::GatewayListenerPorts {
+    let mut ports = sidecar_ingress_claimed_ports(config, runtime);
+    ports.insert(env_config.admin_http_port);
+    if env_config.admin_https_listener_enabled() {
+        ports.insert(env_config.admin_https_port);
+    }
+    if let Some(mesh) = config.mesh.as_deref() {
+        ports.extend(mesh.sidecar_ingress_bind_overrides.keys().copied());
+    }
+    proxy::hop_limit::GatewayListenerPorts::from_ports(ports)
 }
 
 /// Materialize conflict-checked dedicated bind sockets for Sidecar ingress
@@ -14865,6 +14951,12 @@ fn prepare_mesh_runtime_before_owner(
         Some(shutdown_tx.subscribe()),
         bpf_metrics_state.clone(),
     )?;
+    // Proxy hop limit (issue #6109): publish this generation's listener ports
+    // before any listener binds, so the mesh inbound exemption never forwards
+    // an unchanged count to another gateway listener.
+    let initial_listener_ports =
+        mesh_gateway_listener_ports(env_config, runtime, &proxy_state.config.load_full());
+    proxy::hop_limit::publish_gateway_listener_ports(Some(Arc::new(initial_listener_ports)));
 
     Ok((
         dns_cache,
@@ -20005,10 +20097,31 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
+            // Proxy hop limit (issue #6109): while the candidate is being
+            // applied, the published listener-port snapshot covers BOTH
+            // generations, so a request on either config never forwards an
+            // unchanged count to a port the other one listens on. It settles on
+            // the accepted candidate (or back on the previous snapshot) below.
+            let candidate_listener_ports =
+                mesh_gateway_listener_ports(&proxy_state.env_config, runtime, &config);
+            let candidate_listener_ports = Arc::new(candidate_listener_ports);
+            let previous_listener_ports = proxy::hop_limit::gateway_listener_ports();
+            let transition_listener_ports = match previous_listener_ports.as_deref() {
+                Some(previous) => previous.union(&candidate_listener_ports),
+                None => candidate_listener_ports.as_ref().clone(),
+            };
+            let transition_listener_ports = Some(Arc::new(transition_listener_ports));
+            proxy::hop_limit::publish_gateway_listener_ports(transition_listener_ports);
             let outcome =
                 proxy_state.update_mesh_config(config, &trusted_mesh_ids, staged_gateway_trust);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
+            let settled_listener_ports = if accepted {
+                Some(candidate_listener_ports)
+            } else {
+                previous_listener_ports
+            };
+            proxy::hop_limit::publish_gateway_listener_ports(settled_listener_ports);
             // Publish the node-waypoint resolver snapshot the instant the proxy
             // config is accepted — before recording the apply result or
             // reloading TLS — so the window where the new config is live but the

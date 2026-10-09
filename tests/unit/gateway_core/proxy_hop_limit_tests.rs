@@ -3,20 +3,24 @@
 //!
 //! These tests pin the shared parser/decision helper, the allocation-free
 //! stamp, the outbound re-assertion (including the later gateway-assertion
-//! refresh a finalized-egress header overlay runs), the mesh inbound
-//! forwarded count, the `loop_detected` observability token, plugin admission
-//! refusals, and the structural parity of the two frontends that take the
-//! decision. The live loop (a route whose upstream is the gateway itself) and
-//! the HTTP/2 native-gRPC backend count are exercised in
-//! `tests/functional/functional_proxy_hop_limit_test.rs`.
+//! refresh a finalized-egress header overlay runs, and the final
+//! backend-header-policy pass), the mesh inbound forwarded count and its
+//! gateway-listener guard, the `loop_detected` observability token, the
+//! gRPC-Web refusal flavor, plugin admission refusals, and the structural
+//! parity of the two frontends that take the decision. The live loop (a route
+//! whose upstream is the gateway itself) and the HTTP/2 native-gRPC backend
+//! count are exercised in `tests/functional/functional_proxy_hop_limit_test.rs`;
+//! the mesh materializer's refusal of `ingress[]` / inbound targets that name a
+//! gateway listener is in `tests/integration/sidecar_ingress_bind_tests.rs`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ferrum_edge::config::types::Proxy;
+use async_trait::async_trait;
+use ferrum_edge::config::types::{HttpFlavor, Proxy};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
-use ferrum_edge::plugins::{RequestContext, validate_plugin_config};
-use ferrum_edge::proxy::hop_limit::{self, ProxyHopDecision};
+use ferrum_edge::plugins::{Plugin, RequestContext, validate_plugin_config};
+use ferrum_edge::proxy::hop_limit::{self, GatewayListenerPorts, ProxyHopDecision};
 use ferrum_edge::retry::{
     HTTP_METRICS_GATEWAY_ERROR_CLASSES, HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_LOOP_DETECTED,
     http_metrics_error_class, intern_http_observability_error_class, token_for_rejection_phase,
@@ -314,8 +318,18 @@ fn reassert_in_map_rewrites_a_changed_value_in_place() {
     assert_eq!(headers.get(HOPS).map(String::as_str), Some("100"));
 }
 
+/// The listener ports of a Sidecar data plane with no other gateway
+/// listener: outbound capture `15001` and inbound `15006`.
+fn sidecar_listener_ports() -> GatewayListenerPorts {
+    GatewayListenerPorts::from_ports([15001, 15006])
+}
+
+/// The forwarded count against [`sidecar_listener_ports`]. The published
+/// process-wide snapshot is exercised separately, so these tests do not depend
+/// on what another test or runtime published.
 fn forwarded(ctx: &RequestContext) -> Option<u8> {
-    hop_limit::effective_outbound_proxy_hops(ctx)
+    let ports = sidecar_listener_ports();
+    hop_limit::effective_outbound_proxy_hops_with_listener_ports(ctx, Some(&ports))
 }
 
 fn context_with_hops(hops: Option<u8>) -> RequestContext {
@@ -359,13 +373,19 @@ fn mesh_inbound_hop_to_the_local_workload_forwards_the_received_count() {
     ingress.matched_proxy = Some(route("__mesh-ingress-default-reviews-8443", 8443));
     assert_eq!(forwarded(&ingress), Some(2));
 
-    // The outbound map carries the unchanged count after the re-assertion,
-    // and the gateway-assertion refresh agrees with it.
+    // The outbound map carries the unchanged count after the re-assertion.
     let mut outbound = HashMap::from([(HOPS.to_string(), "3".to_string())]);
     hop_limit::reassert_outbound_proxy_hops_in_map(forwarded(&ctx), &mut outbound);
     assert_eq!(outbound.get(HOPS).map(String::as_str), Some("2"));
+
+    // The gateway-assertion refresh re-asserts the same effective value the
+    // main dispatch point computes from the published snapshot.
+    let published = hop_limit::effective_outbound_proxy_hops(&ctx);
     ferrum_edge::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
-    assert_eq!(outbound.get(HOPS).map(String::as_str), Some("2"));
+    assert_eq!(
+        outbound.get(HOPS).cloned(),
+        published.map(|hops| hops.to_string())
+    );
 }
 
 #[test]
@@ -411,6 +431,213 @@ fn every_other_hop_increments_the_count() {
     let mut disabled = mesh_inbound_context();
     disabled.outbound_proxy_hops = None;
     assert_eq!(forwarded(&disabled), None);
+}
+
+/// A mesh inbound route whose loopback target is ANOTHER gateway listener —
+/// two dedicated Sidecar `ingress[]` binds pointing at each other — re-enters a
+/// Ferrum hop, so it must count. Only a target outside the published listener
+/// set is the local application. With no snapshot published the hop counts too.
+#[test]
+fn mesh_inbound_route_to_another_gateway_listener_counts() {
+    let mut ctx = mesh_inbound_context();
+    ctx.frontend_listen_port = Some(9001);
+    ctx.matched_proxy = Some(route("__mesh-ingress-bind:default-reviews-9001", 9002));
+
+    let both_binds = GatewayListenerPorts::from_ports([15001, 15006, 9001, 9002]);
+    assert_eq!(
+        hop_limit::effective_outbound_proxy_hops_with_listener_ports(&ctx, Some(&both_binds)),
+        Some(3),
+        "a target on another gateway listener must increment"
+    );
+    let one_bind = GatewayListenerPorts::from_ports([15001, 15006, 9001]);
+    assert_eq!(
+        hop_limit::effective_outbound_proxy_hops_with_listener_ports(&ctx, Some(&one_bind)),
+        Some(2),
+        "a target outside the listener set is the local application"
+    );
+    assert_eq!(
+        hop_limit::effective_outbound_proxy_hops_with_listener_ports(&ctx, None),
+        Some(3),
+        "no published snapshot fails closed"
+    );
+}
+
+/// The loop R2-1 describes: bind `9001` forwards to `9002`, and bind `9002`
+/// forwards back to `9001`. Every pass runs the frontend decision and the
+/// effective forwarded count, so the request is refused within the limit.
+#[test]
+fn a_loop_between_two_gateway_ingress_binds_is_bounded() {
+    let listeners = GatewayListenerPorts::from_ports([15001, 15006, 9001, 9002]);
+    let max_hops = hop_limit::DEFAULT_MAX_PROXY_HOPS;
+    let mut received: Option<String> = None;
+    let mut frontend = 9001u16;
+    for pass in 0..=u32::from(max_hops) {
+        let headers = match received.as_deref() {
+            Some(value) => headers_with(&[value]),
+            None => headers_with(&[]),
+        };
+        let hops = match hop_limit::decide_proxy_hops(&headers, max_hops) {
+            ProxyHopDecision::Forward(hops) => hops,
+            ProxyHopDecision::LoopDetected => {
+                assert_eq!(pass, u32::from(max_hops), "refused exactly at the limit");
+                return;
+            }
+            other => panic!("unexpected decision {other:?}"),
+        };
+        let target = if frontend == 9001 { 9002 } else { 9001 };
+        let mut ctx = mesh_inbound_context();
+        ctx.outbound_proxy_hops = Some(hops);
+        ctx.frontend_listen_port = Some(frontend);
+        let id = format!("__mesh-ingress-bind:default-reviews-{frontend}");
+        ctx.matched_proxy = Some(route(&id, target));
+        let forwarded =
+            hop_limit::effective_outbound_proxy_hops_with_listener_ports(&ctx, Some(&listeners));
+        received = forwarded.map(|hops| hops.to_string());
+        frontend = target;
+    }
+    panic!("the loop between two gateway ingress binds was never refused");
+}
+
+#[test]
+fn gateway_listener_port_set_is_an_exact_bitset() {
+    let ports = GatewayListenerPorts::from_ports([0, 1, 63, 64, 15006, 65535]);
+    for port in [1, 63, 64, 15006, 65535] {
+        assert!(ports.contains(port), "{port} must be a listener");
+    }
+    for port in [0, 2, 62, 65, 15005, 15007, 65534] {
+        assert!(!ports.contains(port), "{port} must not be a listener");
+    }
+    assert_eq!(ports.len(), 5, "port 0 (a disabled listener) is ignored");
+    assert!(GatewayListenerPorts::from_ports([0]).is_empty());
+
+    let union = ports.union(&GatewayListenerPorts::from_ports([2, 15006]));
+    assert!(union.contains(2) && union.contains(15006) && union.contains(65535));
+    assert_eq!(union.len(), 6);
+}
+
+/// R2-2: the HTTP/3 frontend promotes a recognized gRPC-Web request to the
+/// gRPC flavor for its request-side decisions, so a hop refusal re-derives the
+/// flavor from the gRPC-Web signal: gRPC-Web gets the plain JSON answer (the
+/// `508` with `X-Gateway-Error: loop_detected`, or the `400`), exactly as on
+/// HTTP/1.1 and HTTP/2. Only native gRPC gets Trailers-Only.
+#[test]
+fn grpc_web_hop_refusals_use_the_plain_http_flavor() {
+    assert_eq!(
+        hop_limit::refusal_http_flavor(HttpFlavor::Grpc, true),
+        HttpFlavor::Plain
+    );
+    assert_eq!(
+        hop_limit::refusal_http_flavor(HttpFlavor::Grpc, false),
+        HttpFlavor::Grpc
+    );
+    assert_eq!(
+        hop_limit::refusal_http_flavor(HttpFlavor::Plain, false),
+        HttpFlavor::Plain
+    );
+    assert_eq!(
+        hop_limit::refusal_http_flavor(HttpFlavor::WebSocket, false),
+        HttpFlavor::WebSocket
+    );
+
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src/http3/server.rs")).unwrap();
+    let refusal = fn_body(&source, "async fn send_h3_proxy_hop_limit_refusal(");
+    assert!(
+        refusal.contains("hop_limit::refusal_http_flavor(http_flavor, grpc_web)"),
+        "the H3 hop refusal must re-derive its flavor from the gRPC-Web signal"
+    );
+    let signal = "grpc_web_response_content_type.is_some(),\n                loop_detected,";
+    assert!(
+        source.contains(signal),
+        "the H3 frontend must pass its gRPC-Web content-type signal to the hop refusal"
+    );
+}
+
+/// A custom plugin that declares the final backend-header-policy phase and
+/// tries to reset the hop count from it.
+struct HopResettingHeaderPolicy;
+
+#[async_trait]
+impl Plugin for HopResettingHeaderPolicy {
+    fn name(&self) -> &str {
+        "hop_resetting_header_policy"
+    }
+
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        true
+    }
+
+    fn enforce_final_backend_header_policy(
+        &self,
+        _ctx: &RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        headers.insert(HOPS.to_string(), "0".to_string());
+        headers.insert("X_Ferrum_Hops".to_string(), "0".to_string());
+    }
+}
+
+/// R2-3: the final backend-header-policy hooks are the last plugin code that
+/// writes the outbound map, so the runner re-asserts the count after them.
+#[test]
+fn final_backend_header_policy_hooks_cannot_reset_the_count() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(HopResettingHeaderPolicy)];
+    let mut ctx = context_with_hops(Some(4));
+    let mut headers = HashMap::from([
+        (HOPS.to_string(), "4".to_string()),
+        ("x-other".to_string(), "kept".to_string()),
+    ]);
+    ferrum_edge::_test_support::run_final_backend_header_policy_hooks_for_test(
+        &plugins,
+        &ctx,
+        &mut headers,
+    );
+    assert_eq!(headers.get(HOPS).map(String::as_str), Some("4"));
+    assert_eq!(headers.get("x-other").map(String::as_str), Some("kept"));
+    assert_eq!(headers.len(), 2, "the underscore variant is dropped");
+
+    // With the limit disabled the hook's write stands.
+    ctx.outbound_proxy_hops = None;
+    ferrum_edge::_test_support::run_final_backend_header_policy_hooks_for_test(
+        &plugins,
+        &ctx,
+        &mut headers,
+    );
+    assert_eq!(headers.get(HOPS).map(String::as_str), Some("0"));
+}
+
+/// Every H1/H2 and H3 final backend-header-policy pass, including both
+/// finalized-egress overlay helpers, goes through the one runner that
+/// re-asserts the count; nothing calls the hook directly.
+#[test]
+fn every_final_backend_header_policy_pass_reasserts_the_count() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let proxy = std::fs::read_to_string(root.join("src/proxy/mod.rs")).unwrap();
+    let runner = fn_body(&proxy, "pub(crate) fn run_final_backend_header_policy_hooks(");
+    assert!(
+        runner.contains("hop_limit::reassert_outbound_proxy_hops_in_map(")
+            && runner.contains("hop_limit::effective_outbound_proxy_hops(ctx)"),
+        "the final backend-header-policy runner must re-assert X-Ferrum-Hops"
+    );
+    assert_eq!(
+        proxy.matches(".enforce_final_backend_header_policy(").count(),
+        1,
+        "only the shared runner may invoke the hook in src/proxy/mod.rs"
+    );
+    let h3 = std::fs::read_to_string(root.join("src/http3/server.rs")).unwrap();
+    assert!(
+        !h3.contains(".enforce_final_backend_header_policy("),
+        "the H3 ladder must use the shared runner"
+    );
+    for overlay in [
+        "pub(crate) fn apply_finalized_request_egress_header_overlay(",
+        "pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(",
+    ] {
+        assert!(
+            fn_body(&proxy, overlay).contains("final_backend_header_policy_hooks("),
+            "`{overlay}` must run the shared final backend-header-policy runner"
+        );
+    }
 }
 
 /// A mesh inbound hop still CHECKS the received count: the frontend decision

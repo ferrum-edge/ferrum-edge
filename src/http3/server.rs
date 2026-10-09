@@ -3127,8 +3127,14 @@ async fn handle_h3_request(
         crate::proxy::hop_limit::ProxyHopDecision::Forward(hops) => Some(hops),
         refused => {
             let loop_detected = refused == crate::proxy::hop_limit::ProxyHopDecision::LoopDetected;
-            boxed_send_h3_proxy_hop_limit_refusal(&mut stream, &state, http_flavor, loop_detected)
-                .await?;
+            boxed_send_h3_proxy_hop_limit_refusal(
+                &mut stream,
+                &state,
+                http_flavor,
+                grpc_web_response_content_type.is_some(),
+                loop_detected,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -19425,9 +19431,11 @@ fn boxed_send_h3_proxy_hop_limit_refusal<'a>(
     stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: &'a ProxyState,
     http_flavor: HttpFlavor,
+    grpc_web: bool,
     loop_detected: bool,
 ) -> BoxedH3RefusalFuture<'a> {
-    let refusal = send_h3_proxy_hop_limit_refusal(stream, state, http_flavor, loop_detected);
+    let refusal =
+        send_h3_proxy_hop_limit_refusal(stream, state, http_flavor, grpc_web, loop_detected);
     Box::pin(refusal)
 }
 
@@ -19439,12 +19447,21 @@ fn boxed_send_h3_proxy_hop_limit_refusal<'a>(
 /// `INVALID_ARGUMENT`. Plain HTTP, WebSocket, and gRPC-Web get the plain JSON
 /// answer for both refusals, exactly as the H1/H2 frontend answers gRPC-Web.
 /// Bodies are compiled-in literals that echo nothing.
+///
+/// `grpc_web` is the frontend's gRPC-Web content-type signal. This handler
+/// promotes a recognized gRPC-Web request to `HttpFlavor::Grpc` for its
+/// request-side decisions, so the refusal flavor is re-derived from the signal
+/// (`hop_limit::refusal_http_flavor`) for the branch, the head status, and the
+/// reject recording alike; without it a gRPC-Web client would get a native
+/// gRPC Trailers-Only answer it cannot read.
 async fn send_h3_proxy_hop_limit_refusal(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: &ProxyState,
     http_flavor: HttpFlavor,
+    grpc_web: bool,
     loop_detected: bool,
 ) -> Result<(), anyhow::Error> {
+    let http_flavor = crate::proxy::hop_limit::refusal_http_flavor(http_flavor, grpc_web);
     let http_status = if loop_detected {
         crate::proxy::hop_limit::warn_loop_detected(state.env_config.max_proxy_hops, "http3");
         StatusCode::LOOP_DETECTED
@@ -19483,8 +19500,9 @@ async fn send_h3_proxy_hop_limit_refusal(
             crate::proxy::hop_limit::INVALID_PROXY_HOPS_GRPC_MESSAGE,
         )
     };
-    // No gRPC-Web content type: native gRPC gets Trailers-Only, and every
-    // other flavor (gRPC-Web included) gets the plain JSON `400`.
+    // No gRPC-Web content type: gRPC-Web was already mapped to `Plain` above,
+    // so native gRPC gets Trailers-Only and every other flavor gets the plain
+    // JSON `400`.
     send_h3_error_flavor_aware(
         stream,
         http_flavor,

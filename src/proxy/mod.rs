@@ -6761,15 +6761,29 @@ async fn run_finalized_request_egress_hooks_inner(
 /// [`crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`]
 /// where the bitset is already in scope; the internal scan keeps the rarely
 /// reached call sites correct without threading the capability set to them.
+///
+/// These hooks are the last plugin code that can write the outbound map, so
+/// when any of them ran the gateway-owned `X-Ferrum-Hops` count (issue #6109)
+/// is re-asserted after them: a built-in or custom implementation cannot reset
+/// it either. Every H1/H2 and H3 caller, including both finalized-egress
+/// overlay helpers, goes through this function.
 pub(crate) fn run_final_backend_header_policy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
+    let mut ran = false;
     for plugin in plugins {
         if plugin.enforces_final_backend_header_policy() {
             plugin.enforce_final_backend_header_policy(ctx, headers);
+            ran = true;
         }
+    }
+    if ran {
+        hop_limit::reassert_outbound_proxy_hops_in_map(
+            hop_limit::effective_outbound_proxy_hops(ctx),
+            headers,
+        );
     }
 }
 

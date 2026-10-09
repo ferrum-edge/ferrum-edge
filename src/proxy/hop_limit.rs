@@ -21,11 +21,12 @@
 //! client can only RAISE the count, never reset it.
 //!
 //! The count is re-asserted on the outbound header map after the request-phase
-//! plugins run AND inside every later gateway-assertion refresh (the deferred
+//! plugins run, inside every later gateway-assertion refresh (the deferred
 //! `before_proxy` passes and the finalized-egress header overlay, through
-//! `refresh_backend_gateway_assertion_headers`), so no plugin output — a
-//! custom plugin or a `serverless_function` `pre_proxy` header copy — can
-//! reset it before dispatch.
+//! `refresh_backend_gateway_assertion_headers`), AND at the end of every final
+//! backend-header-policy hook pass (`run_final_backend_header_policy_hooks`),
+//! so no plugin output — built-in or custom, including a `serverless_function`
+//! `pre_proxy` header copy — can reset it before dispatch.
 //!
 //! Mesh inbound exception: a mesh inbound hop that forwards to the LOCAL
 //! workload through a materialized mesh inbound route (Sidecar inbound or
@@ -33,10 +34,16 @@
 //! it unchanged ([`effective_outbound_proxy_hops`]), so one service call costs
 //! one hop (its outbound side) instead of two. Termination is preserved: such
 //! a route leaves the gateway only for the local application, and anything
-//! the application sends onward re-enters through an incrementing hop. Every
-//! other route on an inbound listener — a plugin route override, an
-//! EgressGateway external route, an operator route, a loopback target on the
-//! accepting listener's own port — increments as usual.
+//! the application sends onward re-enters through an incrementing hop. That
+//! holds only while the route's loopback target is NOT a port this gateway
+//! itself listens on, so the exemption also requires the backend port to be
+//! absent from the published [`GatewayListenerPorts`] snapshot (and fails
+//! closed — increments — before one is published). The mesh materializer
+//! additionally refuses an `ingress[]` `defaultEndpoint` or inbound
+//! `targetPort` that names a gateway listener port. Every other route on an
+//! inbound listener — a plugin route override, an EgressGateway external
+//! route, an operator route, a loopback target on any gateway listener port —
+//! increments as usual.
 //!
 //! Field-value policy (documented in `docs/routing.md`):
 //!
@@ -66,11 +73,16 @@
 //! Hot path: the decision is one `HeaderMap` lookup by a pre-built
 //! `HeaderName` plus a bounded digit scan, and stamping inserts a pre-built
 //! `HeaderValue` backed by static bytes — no allocation and no shared
-//! reference count (cloning a `from_static` value copies a pointer).
+//! reference count (cloning a `from_static` value copies a pointer). The mesh
+//! inbound exemption reads the listener-port snapshot with one lock-free
+//! `ArcSwap::load()` and one bit test, and only for a mesh inbound route.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
+use arc_swap::ArcSwapOption;
+
+use crate::config::types::HttpFlavor;
 use crate::plugins::RequestContext;
 
 /// Lowercase wire name of the gateway-owned hop-count request header.
@@ -231,6 +243,87 @@ pub fn is_proxy_hops_header(name: &str) -> bool {
     crate::proxy::headers::field_names_equivalent_for_backends(name, PROXY_HOPS_HEADER)
 }
 
+/// Every port this gateway process listens on, as a fixed 65,536-bit set:
+/// one bit test per lookup, no hashing, no allocation.
+///
+/// The mesh runtime builds it on the cold path (startup and every accepted
+/// slice apply) from the mesh listener plan, the admin listeners, every proxy
+/// `listen_port` (Gateway listeners, stream listeners, dedicated Sidecar
+/// `ingress[]` binds), and the dedicated bind overrides, then publishes it
+/// with [`publish_gateway_listener_ports`].
+/// [`effective_outbound_proxy_hops`] consults it so a mesh inbound route whose
+/// loopback target is another gateway listener still increments the count.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GatewayListenerPorts {
+    bits: Box<[u64; 1024]>,
+}
+
+impl GatewayListenerPorts {
+    /// Build the set from `ports`. Port `0` (a disabled listener) is ignored.
+    pub fn from_ports<I: IntoIterator<Item = u16>>(ports: I) -> Self {
+        let mut bits = Box::new([0u64; 1024]);
+        for port in ports {
+            if port != 0 {
+                bits[usize::from(port >> 6)] |= 1u64 << (port & 63);
+            }
+        }
+        Self { bits }
+    }
+
+    /// Whether the gateway listens on `port`. Port `0` is never a listener.
+    #[inline]
+    pub fn contains(&self, port: u16) -> bool {
+        port != 0 && (self.bits[usize::from(port >> 6)] & (1u64 << (port & 63))) != 0
+    }
+
+    /// The ports in either set.
+    pub fn union(&self, other: &Self) -> Self {
+        let mut bits = self.bits.clone();
+        for (word, other_word) in bits.iter_mut().zip(other.bits.iter()) {
+            *word |= *other_word;
+        }
+        Self { bits }
+    }
+
+    /// Number of ports in the set.
+    pub fn len(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    /// Whether the set holds no port.
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|word| *word == 0)
+    }
+}
+
+impl std::fmt::Debug for GatewayListenerPorts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayListenerPorts")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+/// The published listener-port snapshot. `None` until a serving runtime
+/// publishes one; the mesh inbound exemption then fails closed (increments).
+static GATEWAY_LISTENER_PORTS: ArcSwapOption<GatewayListenerPorts> = ArcSwapOption::const_empty();
+
+/// Publish (or, with `None`, withdraw) the gateway's listener-port snapshot.
+/// Cold path: called by the mesh runtime at startup and around every slice
+/// apply. In-flight requests see the previous or the new snapshot, never a
+/// partial one.
+pub fn publish_gateway_listener_ports(ports: Option<Arc<GatewayListenerPorts>>) {
+    GATEWAY_LISTENER_PORTS.store(ports);
+}
+
+/// The currently published listener-port snapshot, if any. Cold path.
+pub fn gateway_listener_ports() -> Option<Arc<GatewayListenerPorts>> {
+    GATEWAY_LISTENER_PORTS.load_full()
+}
+
 /// The `X-Ferrum-Hops` value this request forwards, or `None` when the limit
 /// is disabled.
 ///
@@ -238,37 +331,71 @@ pub fn is_proxy_hops_header(name: &str) -> bool {
 /// hop that forwards to the LOCAL workload — the request arrived on a mesh
 /// inbound listener, matched a materialized mesh inbound route (Sidecar
 /// inbound or `ingress[]` loopback route), no plugin overrode the route's
-/// destination, and the route's loopback target is not the accepting listener's
-/// own port — forwards the RECEIVED count unchanged instead. The received count
-/// was still checked against the limit at the frontend.
+/// destination, and the route's loopback target is neither the accepting
+/// listener's own port nor any other port in the published
+/// [`GatewayListenerPorts`] snapshot — forwards the RECEIVED count unchanged
+/// instead. The received count was still checked against the limit at the
+/// frontend. With no snapshot published the hop increments (fail closed).
 ///
-/// Pure function of the request context, so every re-assertion site (the main
-/// dispatch point and each later gateway-assertion refresh) agrees even when a
-/// deferred plugin pass changes the destination. Costs nothing outside the
-/// mesh inbound direction.
+/// Pure function of the request context and the published snapshot, so every
+/// re-assertion site (the main dispatch point, each later gateway-assertion
+/// refresh, and each final backend-header-policy pass) agrees even when a
+/// deferred plugin pass changes the destination. Outside a mesh inbound route
+/// it reads no snapshot at all.
 pub fn effective_outbound_proxy_hops(ctx: &RequestContext) -> Option<u8> {
     let hops = ctx.outbound_proxy_hops?;
-    if forwards_to_local_mesh_workload(ctx) {
-        // `hops = received + 1 >= 1`, so this is exactly `received`.
-        Some(hops.saturating_sub(1))
+    let Some(backend_port) = local_mesh_workload_backend_port(ctx) else {
+        return Some(hops);
+    };
+    let listener_ports = GATEWAY_LISTENER_PORTS.load();
+    Some(forwarded_count(hops, backend_port, listener_ports.as_deref()))
+}
+
+/// [`effective_outbound_proxy_hops`] against an explicit listener-port
+/// snapshot instead of the published one (`None` = no snapshot published).
+pub fn effective_outbound_proxy_hops_with_listener_ports(
+    ctx: &RequestContext,
+    listener_ports: Option<&GatewayListenerPorts>,
+) -> Option<u8> {
+    let hops = ctx.outbound_proxy_hops?;
+    let Some(backend_port) = local_mesh_workload_backend_port(ctx) else {
+        return Some(hops);
+    };
+    Some(forwarded_count(hops, backend_port, listener_ports))
+}
+
+/// The loopback backend port of a materialized mesh inbound route this
+/// request forwards on unchanged, or `None` for every other hop.
+fn local_mesh_workload_backend_port(ctx: &RequestContext) -> Option<u16> {
+    if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound) {
+        return None;
+    }
+    if ctx.has_route_overrides() {
+        return None;
+    }
+    let proxy = ctx.matched_proxy.as_deref()?;
+    if crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
+        && proxy.upstream_id.is_none()
+        && ctx.frontend_listen_port != Some(proxy.backend_port)
+    {
+        Some(proxy.backend_port)
     } else {
-        Some(hops)
+        None
     }
 }
 
-fn forwards_to_local_mesh_workload(ctx: &RequestContext) -> bool {
-    if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound) {
-        return false;
+fn forwarded_count(
+    hops: u8,
+    backend_port: u16,
+    listener_ports: Option<&GatewayListenerPorts>,
+) -> u8 {
+    match listener_ports {
+        // `hops = received + 1 >= 1`, so this is exactly `received`.
+        Some(ports) if !ports.contains(backend_port) => hops.saturating_sub(1),
+        // The target is a gateway listener (or no snapshot is published): the
+        // request re-enters a Ferrum hop, so it must count.
+        _ => hops,
     }
-    if ctx.has_route_overrides() {
-        return false;
-    }
-    let Some(proxy) = ctx.matched_proxy.as_deref() else {
-        return false;
-    };
-    crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
-        && proxy.upstream_id.is_none()
-        && ctx.frontend_listen_port != Some(proxy.backend_port)
 }
 
 /// Re-assert the gateway's forwarded hop count on the authoritative outbound
@@ -322,6 +449,22 @@ pub fn reassert_outbound_proxy_hops_in_map(
         None => {
             headers.insert(PROXY_HOPS_HEADER.to_string(), expected.to_string());
         }
+    }
+}
+
+/// The response flavor a frontend hop-limit refusal is written in.
+///
+/// gRPC-Web (`grpc_web == true`, the frontend recognized a gRPC-Web content
+/// type) gets the plain HTTP answer — the JSON `508` with
+/// `X-Gateway-Error: loop_detected`, or the JSON `400` — exactly as on the
+/// HTTP/1.1 and HTTP/2 frontend, even where the frontend otherwise treats the
+/// request as effective gRPC. Only native gRPC gets Trailers-Only.
+#[inline]
+pub fn refusal_http_flavor(http_flavor: HttpFlavor, grpc_web: bool) -> HttpFlavor {
+    if grpc_web {
+        HttpFlavor::Plain
+    } else {
+        http_flavor
     }
 }
 
