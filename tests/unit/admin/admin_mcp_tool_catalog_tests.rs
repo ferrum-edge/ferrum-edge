@@ -14,6 +14,7 @@ use ferrum_edge::admin::{
     jwt_auth::{JwtConfig, JwtManager, ViewerNamespaceCeiling},
     serve_admin_on_listener,
 };
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::env_config::OperatingMode;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -846,6 +847,40 @@ async fn proxies_without_an_mcp_gateway_or_outside_the_namespace_are_not_found()
     )
     .await;
     assert_eq!(reply.status, 400, "{}", reply.text);
+}
+
+#[tokio::test]
+async fn cached_fallback_misses_after_a_store_failure_are_not_authoritative() {
+    // Issue #6143: with the store failing, the cached snapshot may predate the
+    // proxy or its gateway, so a miss is a stale 503, never the 404 answer.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("closed.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("connect test store");
+    db.pool().close().await;
+    let fixture = fixture_with(|state| {
+        state.db = Some(Arc::new(db));
+        state.mode = "database".to_string();
+    })
+    .await;
+
+    for path in ["/proxies/missing/mcp/tools", PLAIN] {
+        let reply = get(&fixture.base, path, Some(&viewer()), None).await;
+        assert_eq!(reply.status, 503, "{path}: {}", reply.text);
+        assert_eq!(
+            reply.body,
+            json!({"error": ferrum_edge::admin::CACHED_FALLBACK_MISS_MESSAGE}),
+            "{path}"
+        );
+        assert_eq!(reply.data_source.as_deref(), Some("cached"), "{path}");
+    }
+
+    // A cached hit is still served, marked stale.
+    let reply = get(&fixture.base, AGG, Some(&viewer()), None).await;
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert_eq!(reply.data_source.as_deref(), Some("cached"));
 }
 
 #[tokio::test]

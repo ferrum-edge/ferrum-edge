@@ -122,10 +122,15 @@ info:
 
     When the primary database is unavailable, eligible configuration reads fall
     back to the most recent cached configuration and include an
-    `X-Data-Source: cached` response header. Gateway trust bundle list/get reads
-    fail closed with `503 Service Unavailable` on a store failure; they do not
-    serve stale cached trust records. Write operations require a live database
-    and return `503 Service Unavailable` when one is not present.
+    `X-Data-Source: cached` response header. A by-id read the cached
+    configuration does not contain is not confirmed absence after a database
+    error: it returns `503` with `X-Data-Source: cached`, never the
+    authoritative `404`. Without a database (file mode) the cached
+    configuration is authoritative and a miss stays `404`. Gateway trust
+    bundle list/get reads fail closed with `503 Service Unavailable` on a store
+    failure; they do not serve stale cached trust records. Write operations
+    require a live database and return `503 Service Unavailable` when one is
+    not present.
 
     The Admin API can be placed in **read-only mode**, in which case persisted
     configuration and database mutations return `403 Forbidden`. Authenticated
@@ -5687,7 +5692,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
     put:
       operationId: updateProxy
@@ -5917,6 +5922,12 @@ paths:
         catalog. Proxy and proxy-group associations are still read from the
         store.
 
+        When the store read fails, the endpoint answers from the cached
+        configuration with `X-Data-Source: cached`. A proxy or `mcp_gateway`
+        that cached configuration does not hold then answers `503`
+        (`CachedReadUnavailable`), not `404`, because the snapshot may predate
+        it.
+
         `data` lists the tools of every effective `mcp_gateway` instance on
         the proxy, ordered by instance then public name, and paginates with
         the shared `limit` / `offset` bounds. The catalog itself stays within
@@ -5959,7 +5970,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
@@ -6118,7 +6129,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
     put:
       operationId: updateConsumer
@@ -6740,7 +6751,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
     put:
       operationId: updatePluginConfig
@@ -6976,7 +6987,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
     put:
       operationId: updateUpstream
       summary: Update an upstream
@@ -9037,6 +9048,23 @@ components:
         could not durably record the pre-mutation intent, in which case the body
         carries a closed-set `audit_unavailable_reason`. The mutation was not
         performed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    CachedReadUnavailable:
+      description: >-
+        The read could not be answered: the database read failed with no
+        usable cached fallback, there is no database and no cached config
+        (`No database and no cached config available`), or the database read
+        failed and the cached config fallback does not contain
+        the resource (`Resource state unavailable: database read failed and
+        the cached config does not contain it`, with `X-Data-Source: cached`).
+        The cached snapshot may predate the resource, so the latter is not
+        confirmed absence and must not be treated as a `404`; retry later.
+      headers:
+        X-Data-Source:
+          $ref: "#/components/headers/X-Data-Source"
       content:
         application/json:
           schema:

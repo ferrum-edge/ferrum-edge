@@ -704,6 +704,31 @@ JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plu
 
 `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
 
+## Cached-config read fallback
+
+When the database read for `GET /proxies`, `/consumers`, `/plugins/config`,
+`/upstreams` (list or by id), or `GET /proxies/{id}/mcp/tools` fails, the
+Admin API answers from the in-memory cached config instead and marks the
+response with `X-Data-Source: cached`. The cached snapshot may lag the
+database, so:
+
+- **List and hit.** A list, or a by-id read the snapshot contains, returns
+  `200` with `X-Data-Source: cached` and no `ETag`.
+- **Miss.** A by-id read the snapshot does not contain is **not** confirmed
+  absence: the resource may have been created after the snapshot was taken.
+  It returns `503` with `X-Data-Source: cached` and
+  `{"error": "Resource state unavailable: database read failed and the cached config does not contain it"}`,
+  never the authoritative `404 {"error": "<Resource> not found"}`. Treat it
+  as retryable. The MCP tool catalog answers the same way when the cached
+  snapshot holds the proxy but no enabled `mcp_gateway` for it.
+- **No cache.** With neither a database read nor a cached snapshot the read
+  returns `503` with `{"error": "No database and no cached config available"}`.
+
+Without a database (file mode) the cached config is the source of truth, so a
+miss there stays the ordinary `404` and carries no `X-Data-Source` header;
+hits and lists still carry `X-Data-Source: cached`. Gateway trust bundles have
+no cached fallback (see [Gateway Trust Bundles](#gateway-trust-bundles)).
+
 ## Pagination
 
 Resource and TLS list endpoints — `GET /proxies`, `/consumers`, `/plugins/config`, `/upstreams`, `/namespaces`, `/proxies/{id}/mcp/tools`, and the ten `GET /admin/tls/*` list routes — return a paginated envelope `{ "data": [...], "pagination": { "offset", "limit", "total" } }` and accept `limit`/`offset` query parameters. An omitted `limit` applies the default of 100 (maximum 1000; `GET /backup` is the intentional full-export mechanism), `0` is coerced to the default, and representable unsigned 64-bit values above 1000 are capped. Malformed or negative values, limits beyond the unsigned 64-bit range, and offsets beyond `2^63 - 1` are rejected with `400`. The offset is retained as a 64-bit value on every target; for an in-memory collection, an offset too large for the target's address space is a valid request beyond the collection and returns an empty page.
@@ -1041,7 +1066,10 @@ curl -H "Authorization: Bearer $TOKEN" -H "X-Ferrum-Namespace: ferrum" \
 - **Not an MCP proxy.** A proxy with no enabled `mcp_gateway` answers `404`
   with `{"error": "Proxy has no mcp_gateway plugin"}`. The effective set
   follows the runtime merge: associated proxy / proxy-group instances, else
-  global instances of the proxy's namespace.
+  global instances of the proxy's namespace. When the store read failed and
+  the answer came from the cached config, a missing proxy or gateway is a
+  stale `503` instead (see
+  [Cached-config read fallback](#cached-config-read-fallback)).
 - **Database mode limitation.** The proxy row and associated plugin configs
   are read from the store, but global `mcp_gateway` configs are discovered
   from this node's cached namespace config. If the store contains a proxy in a

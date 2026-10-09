@@ -12365,6 +12365,21 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
         })
 }
 
+/// Body of the `503` a by-id read answers when the database read failed and
+/// the cached config fallback does not hold the resource (issue #6143).
+pub const CACHED_FALLBACK_MISS_MESSAGE: &str =
+    "Resource state unavailable: database read failed and the cached config does not contain it";
+
+/// A cached-fallback miss after a database read error. The cached snapshot may
+/// predate the resource, so the miss is not confirmed absence: answer `503`
+/// with the stale marker rather than the authoritative `404`.
+fn cached_fallback_miss_response() -> Response<Full<Bytes>> {
+    json_response_with_stale(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({"error": CACHED_FALLBACK_MISS_MESSAGE}),
+    )
+}
+
 /// Return the shared generic database-error body and emit only a content-free
 /// structured diagnostic. The error is accepted for a uniform call contract
 /// but is deliberately never formatted or inspected.

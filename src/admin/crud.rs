@@ -3015,6 +3015,10 @@ pub(crate) async fn handle_get<R: AdminResource>(
         ));
     }
 
+    // Set when the store read failed and the answer comes from the cached
+    // snapshot instead. A miss is then not an authoritative absence: the
+    // resource may have been created after the snapshot (issue #6143).
+    let mut store_read_failed = false;
     if let Some(ref db) = state.db {
         match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
@@ -3041,6 +3045,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                     return Ok(R::map_precheck_db_error(&error));
                 }
                 super::warn_persistence_failure_redacted("admin_resource_get_cached_fallback");
+                store_read_failed = true;
             }
         }
     }
@@ -3054,6 +3059,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 let body = response_body_for_role(resource, role);
                 Ok(super::json_response_with_stale(StatusCode::OK, &body))
             }
+            None if store_read_failed => Ok(super::cached_fallback_miss_response()),
             None => Ok(not_found_response::<R>()),
         }
     } else {
