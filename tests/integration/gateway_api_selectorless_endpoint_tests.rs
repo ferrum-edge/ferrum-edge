@@ -540,12 +540,23 @@ fn a_restricted_pod_watch_scope_remembers_claims_only_for_terminating_endpoints(
             pod("tenant-a", "payroll-0", "10.1.0.10"),
         ],
     );
+    // kube-proxy and CoreDNS serve an endpoint whose `ready` is true whatever
+    // `terminating` says, so a forged `ready: true, terminating: true` is
+    // not vouched for either.
+    let forged_after = route_fixture(
+        selector_service("10.96.0.60"),
+        vec![
+            payroll_slice(json!({ "ready": true, "terminating": true })),
+            pod("tenant-a", "payroll-0", "10.1.0.10"),
+        ],
+    );
     let restricted = options()
         .with_pod_source_namespaces(vec!["tenant-a".to_string()])
         .with_pod_claim_inventory(PodClaimInventory::new());
     assert_admitted(&before, restricted.clone(), SERVICE_DNS);
     assert_admitted(&after, restricted.clone(), SERVICE_DNS);
     assert_refused(&ready_after, restricted.clone(), "10.1.0.11");
+    assert_refused(&forged_after, restricted.clone(), "10.1.0.11");
     // The refusal did not consume the claim: the terminating endpoint is
     // still within its window.
     assert_admitted(&after, restricted, SERVICE_DNS);

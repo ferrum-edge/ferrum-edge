@@ -228,8 +228,8 @@ struct CoreEndpoint {
     /// `conditions.ready` and `conditions.serving` are both explicitly
     /// `false`; see [`endpoint_is_out_of_service`].
     out_of_service: bool,
-    /// `conditions.terminating` is explicitly `true`; see
-    /// [`endpoint_is_terminating`].
+    /// `conditions.terminating` is explicitly `true` and `conditions.ready`
+    /// explicitly `false`; see [`endpoint_is_terminating`].
     terminating: bool,
     node_name: Option<String>,
 }
@@ -333,11 +333,11 @@ pub const POD_CLAIM_GRACE_WINDOW: Duration = Duration::from_secs(60);
 /// scope covers every namespace it is consulted for every endpoint. With a
 /// restricted scope an IP reused by a Pod outside the scope would still look
 /// like the old Pod's, so it is consulted only for an endpoint reporting
-/// `terminating: true`: the EndpointSlice controller marks a Pod's endpoint
-/// terminating before the Pod leaves the API, and nothing but kube-proxy's
-/// no-ready-endpoint fallback dials one. A claim's window starts at the first
-/// refresh that no longer observes it, however long ago the Pod was last
-/// observed. Memory is bounded by the Pods observed now plus those that left
+/// `terminating: true` with an explicit `ready: false`: the EndpointSlice
+/// controller marks a Pod's endpoint that way before the Pod leaves the API,
+/// and nothing but kube-proxy's no-ready-endpoint fallback dials one. A
+/// claim's window starts at the first refresh that no longer observes it,
+/// however long ago the Pod was last observed. Memory is bounded by the Pods observed now plus those that left
 /// within the window; every refresh prunes the expired claims.
 #[derive(Clone)]
 pub struct PodClaimInventory {
@@ -1125,7 +1125,8 @@ pub(super) fn endpoint_route_backends_for_service(
 /// [`POD_CLAIM_GRACE_WINDOW`] (see [`PodClaimInventory`]), so a terminating
 /// endpoint the EndpointSlice controller has not yet dropped still belongs to
 /// its Pod's namespace. With a restricted Pod watch scope that memory is used
-/// only for endpoints reporting `terminating: true`.
+/// only for endpoints reporting `terminating: true` with an explicit
+/// `ready: false`.
 ///
 /// A `targetRef` is authored with the slice, so on its own it can only make an
 /// endpoint look worse. The one thing it can do for a selector-backed Service
@@ -1206,13 +1207,21 @@ pub(super) fn external_endpoints_opt_in_active(acc: &K8sAccumulator) -> bool {
     acc.options.allow_selectorless_external_endpoints && acc.core.nodes_observed
 }
 
-/// Whether an EndpointSlice endpoint explicitly reports `terminating: true`.
+/// Whether an EndpointSlice endpoint explicitly reports `terminating: true`
+/// together with an explicit `ready: false`.
+///
+/// kube-proxy and CoreDNS treat an endpoint whose `ready` is true or omitted
+/// as a normal endpoint whatever `terminating` says, so only an explicit
+/// `ready: false` keeps it out of normal service. The EndpointSlice
+/// controller always writes `ready: false` on a terminating endpoint.
 fn endpoint_is_terminating(endpoint: &Value) -> bool {
-    endpoint
-        .get("conditions")
-        .and_then(|conditions| conditions.get("terminating"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    let condition = |name: &str| {
+        endpoint
+            .get("conditions")
+            .and_then(|conditions| conditions.get(name))
+            .and_then(Value::as_bool)
+    };
+    condition("terminating") == Some(true) && condition("ready") == Some(false)
 }
 
 /// Whether an EndpointSlice endpoint explicitly reports both `ready: false`
