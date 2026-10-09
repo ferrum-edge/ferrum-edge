@@ -4294,6 +4294,16 @@ async fn handle_h3_request(
     if cors_preflight_exempted {
         Box::pin(async {
             record_h3_flavor_aware_reject(&state, http_flavor, 403);
+            // Log before send, like every other reject in this phase.
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                StatusCode::FORBIDDEN.as_u16(),
+                start_time,
+                crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+                plugin_execution_ns,
+            )
+            .await;
             send_h3_error_flavor_aware_with_policy(
                 &mut stream,
                 http_flavor,
@@ -4305,15 +4315,6 @@ async fn handle_h3_request(
                 initial_response_header_policy_plugins.as_ref(),
             )
             .await?;
-            log_rejected_request(
-                &plugins,
-                &ctx,
-                StatusCode::FORBIDDEN.as_u16(),
-                start_time,
-                crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
-                plugin_execution_ns,
-            )
-            .await;
             Ok::<(), anyhow::Error>(())
         })
         .await?;
