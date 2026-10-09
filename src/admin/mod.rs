@@ -2856,8 +2856,7 @@ fn observability_detail_allowed(
 /// derived using the Admin API signing secret and must not be exposed through
 /// the broader metrics-token/CIDR observability tier.
 fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bool {
-    verified_admin_actor(state, auth_header)
-        .is_some_and(|actor| !actor.is_namespace_bounded())
+    verified_admin_actor(state, auth_header).is_some_and(|actor| !actor.is_namespace_bounded())
 }
 
 /// The actor of a valid Admin API JWT in `auth_header`, or `None` when none was

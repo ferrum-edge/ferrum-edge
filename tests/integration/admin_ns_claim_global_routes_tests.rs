@@ -478,10 +478,7 @@ async fn tenant_health_tier_is_bounded_by_the_claim() {
     let (base, _sd) = start_admin(state).await;
 
     let both = admin_token(json!({"ns": ["prod", "staging"]}));
-    let covering = [
-        ("ns=staging", staging_token()),
-        ("ns=[staging,prod]", both),
-    ];
+    let covering = [("ns=staging", staging_token()), ("ns=[staging,prod]", both)];
     let not_covering = [
         ("ns=prod", admin_token(json!({"ns": "prod"}))),
         ("ns=[]", admin_token(json!({"ns": []}))),
