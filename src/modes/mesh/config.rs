@@ -3842,6 +3842,27 @@ pub fn is_modeled_ingress_app_protocol(protocol: AppProtocol) -> bool {
     is_http_family_app_protocol(protocol) || is_stream_family_app_protocol(protocol)
 }
 
+/// Whether one of `listeners` is an HTTP-family Sidecar `ingress[]` listener
+/// whose loopback `defaultEndpoint` is on `endpoint_port` (issue #6110).
+///
+/// Every loopback ingress endpoint is in the pod's own network namespace, so a
+/// shared port is one application socket. The HTTP route wins it, exactly as
+/// on the service-port default path: a stream-family listener forwarding to
+/// the same port must not hand a peer an opaque byte stream that skips the
+/// HTTP route's plugin chain. A Unix-stream HTTP backend has no TCP port and
+/// never matches.
+pub fn ingress_http_listener_serves_endpoint_port<'a>(
+    listeners: impl IntoIterator<Item = &'a ResolvedIngressListener>,
+    endpoint_port: u16,
+) -> bool {
+    endpoint_port != 0
+        && listeners.into_iter().any(|listener| {
+            listener.is_http_family()
+                && listener.endpoint_unix_path.is_none()
+                && listener.endpoint_port == endpoint_port
+        })
+}
+
 /// Parse an Istio `defaultEndpoint` into the typed backend it names.
 ///
 /// Supported (per Istio's "Arbitrary IPs are not supported" rule): loopback
@@ -5149,11 +5170,12 @@ pub struct MeshConfig {
     /// while every HTTP request written into the tunnel skipped it. The peer
     /// must send HTTP instead.
     ///
-    /// Set ONLY by the Sidecar inbound materializer, in both its default
-    /// service-port and its `ingress[]` branch, whenever the Sidecar has a
-    /// workload identity to materialize for; cleared on every apply. Ambient
-    /// and waypoint terminators never set it, so their matched-route CONNECT
-    /// dispatch (which `mesh_route_dispatch` overrides ride) is unchanged.
+    /// Set ONLY by the Sidecar inbound materializer, for EVERY Sidecar
+    /// (with or without a workload identity: the rule only refuses, and a
+    /// Sidecar peer reaches an HTTP route as HTTP); assigned on every apply.
+    /// Ambient and waypoint terminators never set it, so their matched-route
+    /// CONNECT dispatch (which `mesh_route_dispatch` overrides ride) is
+    /// unchanged.
     /// `serde(skip)` for the same reason as
     /// [`Self::inbound_relay_destinations`].
     #[serde(skip)]
@@ -5608,6 +5630,12 @@ pub enum SidecarIngressConnectRelay {
     /// CONNECT rather than fall back to dialing the authority, including for a
     /// port absent from an explicit-empty/all-invalid replacement surface.
     Deny,
+    /// The authority resolves to an owned stream-family listener, but its
+    /// loopback `defaultEndpoint` port is also an HTTP-family listener's
+    /// endpoint (issue #6110). The HTTP route wins a shared port, so the caller
+    /// refuses the CONNECT as [`InboundRelayDenial::HttpApplicationPort`]
+    /// instead of relaying opaque bytes past that route's plugin chain.
+    HttpApplicationPort,
     /// Relay to the listener's validated loopback `defaultEndpoint`, while
     /// AuthorizationPolicy evaluation stays keyed to `listener_port`.
     Relay {
@@ -6061,6 +6089,10 @@ impl MeshConfig {
     ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
     ///    naming it is outside the declared contract and is refused rather than
     ///    relayed to the listener port the operator replaced.
+    /// 6. The listener's `defaultEndpoint` port is also an HTTP-family
+    ///    listener's endpoint ⇒
+    ///    [`SidecarIngressConnectRelay::HttpApplicationPort`] (issue #6110):
+    ///    the HTTP route wins the shared application port.
     pub fn resolve_sidecar_ingress_connect_relay(
         &self,
         host: &str,
@@ -6096,6 +6128,12 @@ impl MeshConfig {
         {
             return SidecarIngressConnectRelay::Deny;
         }
+        if ingress_http_listener_serves_endpoint_port(
+            &self.local_ingress_listeners,
+            listener.endpoint_port,
+        ) {
+            return SidecarIngressConnectRelay::HttpApplicationPort;
+        }
         SidecarIngressConnectRelay::Relay {
             listener_port: listener.port,
             endpoint_host: listener.endpoint_host.clone(),
@@ -6112,7 +6150,9 @@ impl MeshConfig {
     /// selection) can replace the destination between synthesis and dial. Only
     /// the one mapping this listener declares survives; anything else — a
     /// different backend, a widened port, a withdrawn listener — fails closed
-    /// before the dial.
+    /// before the dial. So does a mapping whose endpoint port an HTTP-family
+    /// listener now serves (issue #6110), which also revokes a live tunnel when
+    /// a reload adds that HTTP listener.
     pub fn sidecar_ingress_connect_relay_endpoint_matches(
         &self,
         listener_port: u16,
@@ -6135,6 +6175,7 @@ impl MeshConfig {
             && !listener.owner_service.is_empty()
             && listener.endpoint_port == port
             && canonical_mesh_host(&listener.endpoint_host) == canonical_mesh_host(host)
+            && !ingress_http_listener_serves_endpoint_port(&self.local_ingress_listeners, port)
     }
 }
 

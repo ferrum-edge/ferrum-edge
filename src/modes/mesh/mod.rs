@@ -6160,28 +6160,28 @@ fn materialize_sidecar_inbound_proxies(
     mesh_slice: &MeshSlice,
 ) {
     // Assigned on every apply, before any early return: only the default
-    // service-port path below publishes HTTP application ports, and only a
-    // Sidecar that materializes inbound routes refuses a CONNECT matching one
-    // (issue #6110).
+    // service-port path below publishes HTTP application ports, and every
+    // Sidecar refuses a bare CONNECT that matches an HTTP route on its inbound
+    // listener (issue #6110).
+    let is_sidecar = runtime.topology == MeshTopology::Sidecar;
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.sidecar_inbound_http_app_ports.clear();
-        mesh.sidecar_inbound_refuses_matched_http_connect = false;
+        // Set for EVERY Sidecar, identity or not: the materialized routes
+        // below (`ingress[]` listeners and the service-port defaults) and any
+        // operator-defined HTTP proxy on the inbound listener all serve HTTP,
+        // and a bare byte-stream CONNECT matching one is refused rather than
+        // relayed as opaque bytes. The rule only ever refuses, so an
+        // identity-less Sidecar, which materializes nothing, loses no
+        // legitimate traffic: a Sidecar peer reaches an HTTP route as HTTP.
+        mesh.sidecar_inbound_refuses_matched_http_connect = is_sidecar;
     }
-    if runtime.topology != MeshTopology::Sidecar {
+    if !is_sidecar {
         return;
     }
     let Some(local_spiffe) = runtime.workload_spiffe_id.as_deref() else {
         debug!("Sidecar inbound route materialization skipped: no workload SPIFFE identity");
         return;
     };
-    // Both branches below (`ingress[]` listeners and the service-port
-    // defaults) serve HTTP on the inbound listener, so a bare byte-stream
-    // CONNECT that matches one of those routes, or an operator-defined HTTP
-    // proxy there, is refused rather than relayed as opaque bytes (issue
-    // #6110).
-    if let Some(mesh) = config.mesh.as_deref_mut() {
-        mesh.sidecar_inbound_refuses_matched_http_connect = true;
-    }
 
     let now = chrono::Utc::now();
     // The local workload(s) are this sidecar's own pods. A SPIFFE id alone is not
@@ -6744,6 +6744,26 @@ fn materialize_sidecar_ingress_listener_proxies(
     // identity can be built.
     let mut tcp_routes = Vec::with_capacity(stream_listeners.len());
     for listener in &stream_listeners {
+        // HTTP-family listeners WIN a shared application port, exactly as on
+        // the service-port default path (issue #6110): a stream listener
+        // forwarding to an HTTP listener's endpoint port relays no plaintext
+        // capture, and an authenticated CONNECT to it is refused
+        // `http_application_port` (`resolve_sidecar_ingress_connect_relay`).
+        if crate::modes::mesh::config::ingress_http_listener_serves_endpoint_port(
+            http_listeners.iter().copied(),
+            listener.endpoint_port,
+        ) {
+            warn!(
+                local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                "Sidecar ingress[] stream listener forwards to the same application port as an \
+                 HTTP listener; the HTTP route wins the port, so this listener relays neither \
+                 captured plaintext nor an authenticated CONNECT. Give it a distinct \
+                 defaultEndpoint port"
+            );
+            continue;
+        }
         let Ok(backend_ip) = listener.endpoint_host.parse::<std::net::IpAddr>() else {
             // endpoint_is_valid already required a loopback IP literal.
             continue;

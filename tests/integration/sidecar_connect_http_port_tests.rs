@@ -22,8 +22,9 @@ use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort,
-    WorkloadRef, WorkloadSelector,
+    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ResolvedIngressListener,
+    ServicePort, SidecarIngressConnectRelay, Workload, WorkloadPort, WorkloadRef,
+    WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::{
     MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
@@ -171,16 +172,18 @@ fn ambient_materializes_no_http_application_ports() {
     assert!(mesh.sidecar_inbound_http_app_ports.is_empty());
 }
 
-/// Only a Sidecar that materializes inbound routes refuses a bare CONNECT that
-/// MATCHES an HTTP route. Ambient keeps matched-route CONNECT dispatch, and a
-/// Sidecar with no workload identity materializes nothing.
+/// Every Sidecar refuses a bare CONNECT that MATCHES an HTTP route, including
+/// one with no workload identity (which materializes nothing of its own but can
+/// still carry operator HTTP proxies): the rule only refuses. Ambient keeps
+/// matched-route CONNECT dispatch.
 #[test]
-fn only_a_materializing_sidecar_refuses_a_connect_matching_an_http_route() {
+fn every_sidecar_refuses_a_connect_matching_an_http_route() {
     assert!(prepared_mesh(MeshTopology::Sidecar).sidecar_inbound_refuses_matched_http_connect);
     assert!(!prepared_mesh(MeshTopology::Ambient).sidecar_inbound_refuses_matched_http_connect);
     let identity_less = prepared_config(MeshTopology::Sidecar, false, HTTP_PORT, TCP_PORT);
     let identity_less = identity_less.mesh.expect("prepared mesh block");
-    assert!(!identity_less.sidecar_inbound_refuses_matched_http_connect);
+    assert!(identity_less.sidecar_inbound_refuses_matched_http_connect);
+    assert!(identity_less.sidecar_inbound_http_app_ports.is_empty());
 }
 
 fn build_state(prepared: GatewayConfig) -> ProxyState {
@@ -386,5 +389,74 @@ fn the_stream_decision_refuses_only_after_ownership_is_proven() {
     assert_eq!(
         InboundRelayDenial::HttpApplicationPort.as_str(),
         "http_application_port"
+    );
+}
+
+/// A Sidecar `ingress[]` listener on `port` forwarding to loopback
+/// `endpoint_port`, owned by the local `reviews` service.
+fn ingress_listener(
+    port: u16,
+    endpoint_port: u16,
+    protocol: AppProtocol,
+) -> ResolvedIngressListener {
+    ResolvedIngressListener {
+        port,
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port,
+        protocol,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: false,
+        owner_namespace: NAMESPACE.to_string(),
+        owner_service: SERVICE.to_string(),
+        bind: None,
+    }
+}
+
+/// `ingress[]` applies the "HTTP wins a shared port" rule too: a stream-family
+/// listener whose `defaultEndpoint` port an HTTP-family listener also forwards
+/// to is refused `http_application_port` rather than relayed as opaque bytes
+/// past the HTTP route's plugin chain. A stream listener with its own endpoint
+/// port still relays, and the post-plugin re-check (also the fence's gate)
+/// agrees with synthesis.
+#[test]
+fn an_ingress_stream_listener_sharing_an_http_listener_endpoint_is_refused() {
+    let mesh = MeshConfig {
+        sidecar_ingress_declared: true,
+        local_ingress_listeners: vec![
+            ingress_listener(9080, 8080, AppProtocol::Http),
+            ingress_listener(9081, 8080, AppProtocol::Tcp),
+            ingress_listener(9082, 6379, AppProtocol::Tcp),
+        ],
+        local_workload_addresses: vec![pod_ip()],
+        ..MeshConfig::default()
+    };
+    let own = Some(pod_ip());
+
+    assert_eq!(
+        mesh.resolve_sidecar_ingress_connect_relay(POD_IP, 9081, own),
+        SidecarIngressConnectRelay::HttpApplicationPort
+    );
+    assert_eq!(
+        synthesis_refusal(&format!("{POD_IP}:9081"), &mesh, false, own),
+        Some("http_application_port")
+    );
+    assert!(!mesh.sidecar_ingress_connect_relay_endpoint_matches(9081, "127.0.0.1", 8080));
+
+    // A stream listener on its own application port keeps the remap.
+    assert_eq!(
+        synthesis_refusal(&format!("{POD_IP}:9082"), &mesh, false, own),
+        None
+    );
+    assert!(mesh.sidecar_ingress_connect_relay_endpoint_matches(9082, "127.0.0.1", 6379));
+
+    // Ownership is decided first: a sibling replica's address keeps the
+    // ordinary mapping refusal, and so does the HTTP listener port itself.
+    assert_eq!(
+        synthesis_refusal("10.244.9.9:9081", &mesh, false, own),
+        Some("ingress_endpoint_mapping_mismatch")
+    );
+    assert_eq!(
+        synthesis_refusal(&format!("{POD_IP}:9080"), &mesh, false, own),
+        Some("ingress_endpoint_mapping_mismatch")
     );
 }

@@ -10346,6 +10346,17 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Whether this instance answers a matched CORS preflight itself rather
+    /// than forwarding it upstream (the `cors` plugin without
+    /// `preflight_continue`). The plain HTTP view of a gRPC-intended route
+    /// exempts a CORS preflight from its route-admission refusal only when the
+    /// view carries such an instance, and refuses an exempted preflight that
+    /// no plugin answered (issue #6110,
+    /// `PluginCapabilities::ANSWERS_CORS_PREFLIGHTS`).
+    fn answers_cors_preflights(&self) -> bool {
+        false
+    }
+
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.
     async fn authenticate(
         &self,

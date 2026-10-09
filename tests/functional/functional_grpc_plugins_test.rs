@@ -1284,37 +1284,43 @@ async fn start_plain_http_backend() -> (u16, tokio::task::JoinHandle<()>) {
     (port, handle)
 }
 
-/// Send an HTTP/1.1 WebSocket upgrade request and return the response status.
-async fn websocket_upgrade_status(gateway_port: u16, path: &str) -> u16 {
+/// Write one raw HTTP/1.1 `request` to the gateway and return the response
+/// status. Raw so the test controls the exact framing headers.
+async fn raw_http1_status(gateway_port: u16, request: &str) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
         .await
         .expect("connect to gateway");
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{gateway_port}\r\nConnection: Upgrade\r\n\
-         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
-    );
     stream
         .write_all(request.as_bytes())
         .await
-        .expect("write upgrade request");
+        .expect("write request");
     let mut head = Vec::new();
     let mut buf = [0_u8; 1024];
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {
         let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
             .await
-            .expect("upgrade response within deadline")
-            .expect("read upgrade response");
-        assert!(read > 0, "gateway closed before answering the upgrade");
+            .expect("response within deadline")
+            .expect("read response");
+        assert!(read > 0, "gateway closed before answering the request");
         head.extend_from_slice(&buf[..read]);
     }
     let head = String::from_utf8_lossy(&head);
     head.split(' ')
         .nth(1)
         .and_then(|status| status.parse().ok())
-        .unwrap_or_else(|| panic!("malformed upgrade response: {head}"))
+        .unwrap_or_else(|| panic!("malformed response: {head}"))
+}
+
+/// Send an HTTP/1.1 WebSocket upgrade request and return the response status.
+async fn websocket_upgrade_status(gateway_port: u16, path: &str) -> u16 {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{gateway_port}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    raw_http1_status(gateway_port, &request).await
 }
 
 /// A gRPC-Web message frame carrying `payload`.
@@ -1329,8 +1335,10 @@ fn grpc_web_frame(payload: &[u8]) -> Vec<u8> {
 /// A route configured with `grpc_method_router` is gRPC-intended (issue
 /// #6110). Plain HTTP and WebSocket requests, which would skip that gRPC-only
 /// admission policy, are refused before any plugin runs. Browser gRPC-Web is
-/// unaffected: its CORS preflight reaches the `cors` plugin, and the gRPC-Web
-/// call runs the method policy. A gRPC-only plugin that is not admission
+/// unaffected: its bodiless CORS preflight reaches the `cors` plugin, and the
+/// gRPC-Web call runs the method policy. A preflight with a body, one on a
+/// route without a preflight-answering `cors`, and one `cors` forwards are all
+/// refused, never sent upstream. A gRPC-only plugin that is not admission
 /// policy (`grpc_deadline`) lets plain HTTP through.
 #[ignore]
 #[tokio::test]
@@ -1357,6 +1365,25 @@ proxies:
       - plugin_config_id: "grpc-web"
       - plugin_config_id: "cors"
       - plugin_config_id: "grpc-method-router"
+  - id: "grpc-no-cors-proxy"
+    listen_path: "/no-cors"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {plain_port}
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "no-cors-method-router"
+  - id: "grpc-forward-cors-proxy"
+    listen_path: "/forward-cors"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {plain_port}
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "forward-cors"
+      - plugin_config_id: "forward-cors-method-router"
   - id: "grpc-deadline-proxy"
     listen_path: "/deadline"
     backend_scheme: http
@@ -1393,6 +1420,31 @@ plugin_configs:
     plugin_name: "grpc_method_router"
     scope: proxy
     proxy_id: "grpc-intended-proxy"
+    enabled: true
+    config:
+      allow_methods:
+        - "my.EchoService/Echo"
+  - id: "no-cors-method-router"
+    plugin_name: "grpc_method_router"
+    scope: proxy
+    proxy_id: "grpc-no-cors-proxy"
+    enabled: true
+    config:
+      allow_methods:
+        - "my.EchoService/Echo"
+  - id: "forward-cors"
+    plugin_name: "cors"
+    scope: proxy
+    proxy_id: "grpc-forward-cors-proxy"
+    enabled: true
+    config:
+      allowed_origins:
+        - "{ORIGIN}"
+      unmatched_preflights: "forward"
+  - id: "forward-cors-method-router"
+    plugin_name: "grpc_method_router"
+    scope: proxy
+    proxy_id: "grpc-forward-cors-proxy"
     enabled: true
     config:
       allow_methods:
@@ -1506,6 +1558,66 @@ plugin_configs:
         hits.limited(),
         0,
         "grpc_method_router must refuse a gRPC-Web call outside its allow list"
+    );
+
+    // An exempted preflight must carry no body: a chunked one (even a
+    // zero-length chunked body) and one with `Content-Length > 0` are refused.
+    for framing in [
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "Content-Length: 5\r\n\r\nhello",
+    ] {
+        let request = format!(
+            "OPTIONS /api/my.EchoService/Echo HTTP/1.1\r\nHost: 127.0.0.1:{gateway_port}\r\n\
+             Origin: {ORIGIN}\r\nAccess-Control-Request-Method: POST\r\n{framing}"
+        );
+        assert_eq!(
+            raw_http1_status(gateway_port, &request).await,
+            403,
+            "a CORS preflight with a body must not be exempt: {framing:?}"
+        );
+    }
+
+    // No preflight-answering `cors` on the route: nothing may answer the
+    // preflight, so it is refused rather than forwarded (the plain backend
+    // would answer `200`).
+    let no_cors = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/no-cors/my.EchoService/Echo"),
+        )
+        .header("origin", ORIGIN)
+        .header("access-control-request-method", "POST")
+        .send()
+        .await
+        .expect("CORS preflight should complete");
+    assert_eq!(
+        no_cors.status().as_u16(),
+        403,
+        "a preflight on a route without cors must not reach the backend"
+    );
+
+    // `cors` forwards a preflight from an unmatched origin under
+    // `unmatched_preflights: forward`; an exempted preflight is never sent
+    // upstream, so it is refused instead.
+    let forwarded = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/forward-cors/my.EchoService/Echo"),
+        )
+        .header("origin", "https://other.example.com")
+        .header("access-control-request-method", "POST")
+        .send()
+        .await
+        .expect("CORS preflight should complete");
+    assert_eq!(
+        forwarded.status().as_u16(),
+        403,
+        "a preflight cors does not answer must not reach the backend"
+    );
+    let body = forwarded.text().await.expect("refusal body");
+    assert!(
+        body.contains("Request protocol not permitted on this route"),
+        "unexpected refusal body: {body}"
     );
 
     let passed = client

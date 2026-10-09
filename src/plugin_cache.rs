@@ -333,6 +333,10 @@ impl Plugin for DeferredCorsPlugin {
         self.inner.cors_uses_strict_origin_policy()
     }
 
+    fn answers_cors_preflights(&self) -> bool {
+        self.inner.answers_cors_preflights()
+    }
+
     fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
         self.inner.response_body_production()
     }
@@ -1116,6 +1120,9 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn may_inject_route_fault(&self) -> bool {
         self.inner.may_inject_route_fault()
+    }
+    fn answers_cors_preflights(&self) -> bool {
+        self.inner.answers_cors_preflights()
     }
     fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
         self.inner.country_mmdb_snapshot()
@@ -4880,9 +4887,16 @@ impl PluginCapabilities {
     /// dispatchers refuse such a request before any plugin runs: the flavor is
     /// chosen by client headers, so serving it would let the client switch the
     /// route's authentication or admission policy off. One exemption, on the
-    /// plain HTTP view only: a CORS preflight, which invokes no gRPC method
-    /// (`proxy::is_cors_preflight_request`).
+    /// plain HTTP view only: a bodiless CORS preflight, which invokes no gRPC
+    /// method (`proxy::is_cors_preflight_request`), when the view also carries
+    /// [`Self::ANSWERS_CORS_PREFLIGHTS`]. An exempted preflight that no plugin
+    /// answered is refused after `on_request_received`, never forwarded.
     pub const OMITS_ROUTE_ADMISSION_POLICY: u32 = 1 << 18;
+    /// At least one plugin answers a matched CORS preflight itself
+    /// (`Plugin::answers_cors_preflights`): the `cors` plugin without
+    /// `preflight_continue`. Gates the one CORS-preflight exemption from
+    /// [`Self::OMITS_ROUTE_ADMISSION_POLICY`] (issue #6110).
+    pub const ANSWERS_CORS_PREFLIGHTS: u32 = 1 << 19;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -5153,6 +5167,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
+        }
+        if p.answers_cors_preflights() {
+            caps |= PluginCapabilities::ANSWERS_CORS_PREFLIGHTS;
         }
         // Strictest active client-facing body ceiling across the matched set.
         // Multiple instances (and a global plus a proxy-scoped instance) compose

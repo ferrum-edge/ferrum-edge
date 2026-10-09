@@ -1129,6 +1129,67 @@ fn a_route_scoped_grpc_admission_policy_marks_its_plain_http_and_websocket_views
     }
 }
 
+/// The CORS-preflight exemption from the gRPC-intended refusal applies only on
+/// a view whose `cors` plugin answers preflights itself (issue #6110). A
+/// `cors` with `preflight_continue` forwards every preflight, and a route with
+/// no `cors` has nothing to answer one, so neither view carries the bit and
+/// the dispatchers refuse their preflights like any other plain HTTP request.
+#[test]
+fn only_a_preflight_answering_cors_lets_a_grpc_intended_view_exempt_preflights() {
+    let router = |id: &str, proxy: &str| {
+        make_plugin_config(
+            id,
+            "grpc_method_router",
+            PluginScope::Proxy,
+            Some(proxy),
+            true,
+        )
+    };
+    let cors = |id: &str, proxy: &str, preflight_continue: bool| {
+        make_plugin_config_with_json(
+            id,
+            "cors",
+            json!({
+                "allowed_origins": ["https://app.example"],
+                "preflight_continue": preflight_continue
+            }),
+            PluginScope::Proxy,
+            Some(proxy),
+        )
+    };
+    let config = make_config(
+        vec![
+            make_proxy("answers", "/answers", vec!["router-a", "cors-a"]),
+            make_proxy("forwards", "/forwards", vec!["router-f", "cors-f"]),
+            make_proxy("no-cors", "/no-cors", vec!["router-n"]),
+        ],
+        vec![
+            router("router-a", "answers"),
+            router("router-f", "forwards"),
+            router("router-n", "no-cors"),
+            cors("cors-a", "answers", false),
+            cors("cors-f", "forwards", true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let has = |proxy: &str, flag: u32| {
+        cache
+            .request_view("ferrum", proxy, ProxyProtocol::Http)
+            .capabilities()
+            .has(flag)
+    };
+
+    for proxy in ["answers", "forwards", "no-cors"] {
+        assert!(
+            has(proxy, PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY),
+            "{proxy}: the route is gRPC-intended"
+        );
+    }
+    assert!(has("answers", PluginCapabilities::ANSWERS_CORS_PREFLIGHTS));
+    assert!(!has("forwards", PluginCapabilities::ANSWERS_CORS_PREFLIGHTS));
+    assert!(!has("no-cors", PluginCapabilities::ANSWERS_CORS_PREFLIGHTS));
+}
+
 /// A GLOBAL gRPC-only admission instance applies to every route, gRPC or not,
 /// so it makes no route gRPC-intended and plain HTTP stays served (issue
 /// #6110). A route-scoped instance of the same plugin does mark its route,
