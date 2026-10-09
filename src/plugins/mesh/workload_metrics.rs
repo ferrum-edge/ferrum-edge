@@ -1111,7 +1111,12 @@ pub(crate) fn validate_effective_metric_tag_override_plan_budget(
     let mut effective_plan_lengths = [0usize; MeshMetricFamily::ALL.len()];
     let mut custom_tag_names = BTreeSet::new();
     for plugin in plugins {
-        if plugin.name() != "workload_metrics" {
+        // Only the registered plugin stamps these plans. A custom plugin
+        // reporting its name must not displace a real instance's family plan
+        // from the sum (issue #6022).
+        if plugin.name() != "workload_metrics"
+            || !crate::plugins::is_builtin_plugin(plugin.as_ref())
+        {
             continue;
         }
         if let Some(marker) = plugin.workload_custom_trace_attributes() {

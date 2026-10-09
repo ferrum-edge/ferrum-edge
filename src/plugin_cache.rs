@@ -4790,11 +4790,14 @@ fn remove_shadowed_globals(
     // global limiter beside same-name scoped instances so every hook remains
     // active and the precomputed route ceiling can fold all configured bounds
     // to their minimum. Letting a looser scoped instance shadow a stricter
-    // global one would silently relax a security boundary.
-    if matches!(
+    // global one would silently relax a security boundary. The exception is
+    // the registered built-in limiters': a custom plugin reporting one of
+    // these names follows the ordinary same-standing rule below.
+    let size_limit = matches!(
         plugin_name,
         "request_size_limiting" | "response_size_limiting"
-    ) {
+    );
+    if builtin && size_limit {
         return;
     }
     plugins.retain(|plugin| {
@@ -4816,6 +4819,21 @@ pub(crate) fn shadow_global_plugins_for_test(
         .collect();
     remove_shadowed_global_plugin(&mut merged, &global_ptrs, scoped);
     merged.push(Arc::clone(scoped));
+    merged
+}
+
+/// Test hook: drop the `globals` that a scoped `plugin_name` config which
+/// built no instance replaces, the way every chain build does.
+pub(crate) fn shadow_global_plugins_by_name_for_test(
+    globals: &[Arc<dyn Plugin>],
+    plugin_name: &str,
+) -> Vec<Arc<dyn Plugin>> {
+    let mut merged = globals.to_vec();
+    let global_ptrs: HashSet<usize> = merged
+        .iter()
+        .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
+        .collect();
+    remove_shadowed_global_plugin_by_name(&mut merged, &global_ptrs, plugin_name);
     merged
 }
 
@@ -5348,6 +5366,17 @@ fn compute_node_waypoint_destination_authz_ready(
     node_waypoint_destination_authz_ready_from_counts(managed, enabled_global, built)
 }
 
+/// Test hook: the NodeWaypoint destination-authz readiness `config` gets when
+/// its prebuilt global chain is `globals` (issue #6022).
+pub(crate) fn node_waypoint_destination_authz_ready_over_globals_for_test(
+    config: &GatewayConfig,
+    globals: &[Arc<dyn Plugin>],
+) -> bool {
+    let tcp = build_protocol_entry(globals, globals, ProxyProtocol::Tcp);
+    let global = HashMap::from([(ProxyProtocol::Tcp, tcp)]);
+    compute_node_waypoint_destination_authz_ready(config, &global)
+}
+
 // ---------------------------------------------------------------------------
 // ProtocolSnapshot — bundles protocol-filtered plugins + phase data for
 // atomic swap via a single ArcSwap. Ensures a request always reads a
@@ -5498,6 +5527,16 @@ fn build_protocol_entry(
 
 const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
 
+/// Whether `plugin` is one of the registered native-gRPC policies the composed
+/// gRPC-Web view runs. Keyed on the built-in type, so a custom plugin
+/// reporting one of these names neither joins the view nor exempts it from
+/// the admission refusal (issue #6022).
+fn is_grpc_web_native_policy(plugin: &Arc<dyn Plugin>) -> bool {
+    H3_GRPC_WEB_NATIVE_POLICY_PLUGINS
+        .iter()
+        .any(|name| is_builtin_named(plugin, name))
+}
+
 fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     // The merged proxy list is already in configured priority/config order.
     // Filtering it once preserves that order, retains every ordinary HTTP
@@ -5508,7 +5547,7 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
             .iter()
             .filter(|plugin| {
                 plugin.supported_protocols().contains(&ProxyProtocol::Http)
-                    || (H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+                    || (is_grpc_web_native_policy(plugin)
                         && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
             })
             .cloned()
@@ -5540,7 +5579,7 @@ fn grpc_web_view_omits_grpc_admission_policy(plugins: &[Arc<dyn Plugin>]) -> boo
         plugin.gates_request_admission()
             && protocols.contains(&ProxyProtocol::Grpc)
             && !protocols.contains(&ProxyProtocol::Http)
-            && !H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+            && !is_grpc_web_native_policy(plugin)
     })
 }
 
@@ -5765,17 +5804,15 @@ fn start_background_tasks(
 /// Release staged workers and publish process-global sink state after the
 /// generation has been installed. Must stay infallible and idempotent.
 fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
+    let generation = || {
+        globals
+            .iter()
+            .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
+    };
     let mut committed = HashSet::new();
-    let mut saw_api_chargeback = false;
-    for plugin in globals
-        .iter()
-        .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
-    {
+    for plugin in generation() {
         let pointer = Arc::as_ptr(plugin) as *const () as usize;
         if committed.insert(pointer) {
-            if is_builtin_named(plugin, "api_chargeback") {
-                saw_api_chargeback = true;
-            }
             plugin.commit_background_tasks();
         }
     }
@@ -5783,9 +5820,21 @@ fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin
     // enabled api_chargeback exists. A generation with zero instances has no
     // plugin callback, so publish absence explicitly after atomic installation
     // (never during candidate construction/validation).
-    if !saw_api_chargeback {
+    if !includes_api_chargeback(generation()) {
         crate::plugins::api_chargeback::publish_render_schema_absence();
     }
+}
+
+/// Whether `plugins` include a registered `api_chargeback`, whose commit
+/// publishes the `/charges` projection. A custom plugin reporting that name
+/// publishes nothing, so it must not suppress the absence publication (issue
+/// #6022).
+pub(crate) fn includes_api_chargeback<'a>(
+    plugins: impl IntoIterator<Item = &'a Arc<dyn Plugin>>,
+) -> bool {
+    plugins
+        .into_iter()
+        .any(|plugin| is_builtin_named(plugin, "api_chargeback"))
 }
 
 // All plugin-cache state swapped as a single unit so a single load observes
@@ -5918,10 +5967,26 @@ fn build_proxy_lifecycle_generations_with_advances(
     Ok((next, high))
 }
 
+/// The global chain without its registered `adaptive_concurrency` instances,
+/// which an adaptive-only rebuild replaces. A custom plugin reporting that
+/// name is not one of them and keeps its place (issue #6022).
+pub(crate) fn globals_without_adaptive_concurrency(
+    globals: &[Arc<dyn Plugin>],
+) -> Vec<Arc<dyn Plugin>> {
+    globals
+        .iter()
+        .filter(|plugin| !is_builtin_named(plugin, "adaptive_concurrency"))
+        .cloned()
+        .collect()
+}
+
 /// Whether the effective set of `proxy_alerts` instances changed for one
 /// continuously present proxy. This catches proxy-group leave/rejoin without
 /// resetting alert ownership for unrelated edits to the same proxy.
-fn proxy_alerts_instances_changed(previous: &[Arc<dyn Plugin>], next: &[Arc<dyn Plugin>]) -> bool {
+pub(crate) fn proxy_alerts_instances_changed(
+    previous: &[Arc<dyn Plugin>],
+    next: &[Arc<dyn Plugin>],
+) -> bool {
     let instance_ids = |plugins: &[Arc<dyn Plugin>]| -> HashSet<usize> {
         plugins
             .iter()
@@ -7472,12 +7537,7 @@ impl PluginCache {
             // Route compatibility can require a fresh global adaptive view
             // without any global PluginConfig changing. Replace only those
             // wrappers so unrelated stateful globals retain their Arc/state.
-            let mut global_plugins = current
-                .global_plugins
-                .iter()
-                .filter(|plugin| !is_builtin_named(plugin, "adaptive_concurrency"))
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut global_plugins = globals_without_adaptive_concurrency(&current.global_plugins);
             for pc in &config.plugin_configs {
                 if !pc.enabled
                     || pc.scope != PluginScope::Global

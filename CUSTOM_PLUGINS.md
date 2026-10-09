@@ -1121,7 +1121,7 @@ plugin_configs:
 - **Proxy**: Plugin runs only for the specified proxy.
 - **Proxy group** (`proxy_group`): Plugin runs for every proxy in the group.
 
-A proxy- or group-scoped plugin with the same name as a global one replaces that global plugin for the affected proxies. A custom plugin only ever replaces a custom global: one whose `name()` reports a built-in name does not remove that built-in's global instance, and a scoped built-in does not remove it either (issue #6022). See [Plugin Scope](docs/plugins.md#plugin-scope-merging) for the full merge rules.
+A proxy- or group-scoped plugin with the same name as a global one replaces that global plugin for the affected proxies. A custom plugin only ever replaces a custom global: one whose `name()` reports a built-in name does not remove that built-in's global instance, and a scoped built-in does not remove a custom global that reports the built-in's name (issue #6022). Both then run on the proxy, so if your custom plugin used to stand in for a built-in global by reporting its name, give it its own name and scope the built-in to the proxies that need it. See [Plugin Scope](docs/plugins.md#plugin-scope-merging) for the full merge rules.
 
 ## Request Context
 

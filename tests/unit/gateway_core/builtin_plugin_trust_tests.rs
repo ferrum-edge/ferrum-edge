@@ -11,20 +11,23 @@ use serde_json::json;
 
 use ferrum_edge::_test_support::{
     composition_shape_plugin_for_test, early_route_total_ms_for_test,
-    exclusive_effective_instance_errors_for_test, install_plugin_finalizers_for_test,
-    run_after_proxy_hooks_for_test, shadow_global_plugins_for_test,
+    exclusive_effective_instance_errors_for_test, globals_without_adaptive_concurrency_for_test,
+    grpc_web_view_omits_admission_policy_for_test, includes_api_chargeback_for_test,
+    install_plugin_finalizers_for_test, prepend_proxy_plugin_for_test,
+    proxy_alerts_instances_changed_for_test, run_after_proxy_hooks_for_test,
+    shadow_global_plugins_by_name_for_test, shadow_global_plugins_for_test,
     validate_plugin_security_composition_for_test,
 };
-use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginScope};
 use ferrum_edge::plugins::compression::CompressionPlugin;
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext, ResponseBodyProduction,
-    create_plugin, is_builtin_plugin, priority,
+    ALL_PROTOCOLS, GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol,
+    RequestContext, ResponseBodyProduction, create_plugin, is_builtin_plugin, priority,
 };
+use ferrum_edge::{PluginCache, PluginCapabilities};
 
 use crate::unit::plugins::plugin_utils::{make_plugin_config_with_json, make_proxy};
 
@@ -409,6 +412,216 @@ fn candidate_admission_stand_ins_keep_built_in_standing() {
     );
 }
 
+#[tokio::test]
+async fn an_omitted_scoped_config_shadows_only_globals_of_its_registered_standing() {
+    let custom = impostor("stdout_logging");
+    let globals = [stdout_logging(), Arc::clone(&custom)];
+    let merged = shadow_global_plugins_by_name_for_test(&globals, "stdout_logging");
+    assert_eq!(
+        merged.len(),
+        1,
+        "an omitted built-in config replaces its global"
+    );
+    assert!(
+        holds(&merged, &custom),
+        "an omitted built-in config must not drop a custom global that reports its name"
+    );
+
+    let custom = impostor("custom_audit");
+    let merged = shadow_global_plugins_by_name_for_test(&[custom], "custom_audit");
+    assert!(
+        merged.is_empty(),
+        "an omitted custom config replaces its custom global"
+    );
+}
+
+#[tokio::test]
+async fn only_the_registered_size_limiters_compose_with_their_globals() {
+    let config = json!({"max_bytes": 20});
+    let limiter = || {
+        create_plugin("request_size_limiting", &config)
+            .expect("valid config")
+            .expect("built-in plugin")
+    };
+    let global = limiter();
+    let merged = shadow_global_plugins_for_test(&[Arc::clone(&global)], &limiter());
+    assert_eq!(
+        merged.len(),
+        2,
+        "a scoped built-in size limiter composes with its global"
+    );
+    assert!(holds(&merged, &global));
+
+    let global = impostor("request_size_limiting");
+    let scoped = impostor("request_size_limiting");
+    let merged = shadow_global_plugins_for_test(&[global], &scoped);
+    assert_eq!(
+        merged.len(),
+        1,
+        "a scoped custom plugin reporting a size-limit name replaces its custom global"
+    );
+    assert!(holds(&merged, &scoped));
+}
+
+/// A custom plugin that reports a built-in name and runs on every protocol.
+struct EveryProtocolImpostor {
+    name: &'static str,
+}
+
+#[async_trait]
+impl Plugin for EveryProtocolImpostor {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        ALL_PROTOCOLS
+    }
+}
+
+fn every_protocol_impostor(name: &'static str) -> Arc<dyn Plugin> {
+    Arc::new(EveryProtocolImpostor { name })
+}
+
+fn node_waypoint_authz_ready(config: &GatewayConfig, globals: &[Arc<dyn Plugin>]) -> bool {
+    ferrum_edge::_test_support::node_waypoint_destination_authz_ready_over_globals_for_test(
+        config, globals,
+    )
+}
+
+#[tokio::test]
+async fn a_custom_global_reporting_mesh_authz_does_not_prove_node_waypoint_authz() {
+    let managed = make_plugin_config_with_json(
+        ferrum_edge::modes::mesh::MESH_AUTHZ_PLUGIN_ID,
+        "mesh_authz",
+        json!({}),
+        PluginScope::Global,
+        None,
+    );
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        plugin_configs: vec![managed],
+        ..Default::default()
+    };
+    let mesh_authz = create_plugin("mesh_authz", &json!({}))
+        .expect("valid config")
+        .expect("built-in plugin");
+    assert!(
+        node_waypoint_authz_ready(&config, &[mesh_authz]),
+        "the managed instance in the global TCP chain proves destination authz"
+    );
+    let custom = every_protocol_impostor("mesh_authz");
+    assert!(
+        !node_waypoint_authz_ready(&config, &[custom]),
+        "a custom plugin reporting mesh_authz in place of the managed instance enforces \
+         nothing, so captured destination authz must not be ready"
+    );
+}
+
+/// A custom gRPC-only authentication plugin that reports the name of a
+/// native-gRPC policy the composed gRPC-Web view runs.
+struct GrpcOnlyAuthImpostor {
+    name: &'static str,
+}
+
+#[async_trait]
+impl Plugin for GrpcOnlyAuthImpostor {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        GRPC_ONLY_PROTOCOLS
+    }
+}
+
+fn grpc_only_auth_impostor(name: &'static str) -> Arc<dyn Plugin> {
+    Arc::new(GrpcOnlyAuthImpostor { name })
+}
+
+#[test]
+fn a_custom_grpc_plugin_reporting_a_grpc_web_policy_name_keeps_that_view_refused() {
+    let config = json!({"deny_methods": ["/pkg.Svc/Dangerous"]});
+    let router = create_plugin("grpc_method_router", &config)
+        .expect("valid config")
+        .expect("built-in plugin");
+    assert!(
+        !grpc_web_view_omits_admission_policy_for_test(&[router]),
+        "the composed gRPC-Web view runs the registered grpc_method_router"
+    );
+    for name in ["grpc_method_router", "grpc_deadline"] {
+        assert!(
+            grpc_web_view_omits_admission_policy_for_test(&[grpc_only_auth_impostor(name)]),
+            "a custom gRPC-only gating plugin reporting {name:?} is not a policy the \
+             gRPC-Web view runs, so the view must be refused (issue #6110)"
+        );
+    }
+
+    // The custom plugin does not join the route's composed view either.
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![make_proxy("p1", "/", vec![])],
+        ..Default::default()
+    };
+    let cache = PluginCache::new(&config).expect("plugin cache");
+    let impostor = grpc_only_auth_impostor("grpc_method_router");
+    prepend_proxy_plugin_for_test(&cache, "ferrum", "p1", Arc::clone(&impostor))
+        .expect("inject the route-scoped plugin");
+    let view = cache.grpc_web_request_view("ferrum", "p1");
+    let capabilities = view.capabilities();
+    assert!(capabilities.has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY));
+    assert!(
+        !holds(&view.plugins(), &impostor),
+        "a custom gRPC-only plugin must not run on the translated gRPC-Web view"
+    );
+}
+
+#[tokio::test]
+async fn an_adaptive_only_rebuild_keeps_a_custom_global_reporting_adaptive_concurrency() {
+    let adaptive = create_plugin("adaptive_concurrency", &json!({}))
+        .expect("valid config")
+        .expect("built-in plugin");
+    let custom = impostor("adaptive_concurrency");
+    let globals = [adaptive, Arc::clone(&custom)];
+    let kept = globals_without_adaptive_concurrency_for_test(&globals);
+    assert_eq!(kept.len(), 1, "only the registered instance is rebuilt");
+    assert!(
+        holds(&kept, &custom),
+        "a custom plugin reporting adaptive_concurrency must stay in the global chain"
+    );
+}
+
+#[tokio::test]
+async fn a_custom_plugin_reporting_api_chargeback_does_not_keep_charges_published() {
+    let config = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]});
+    let chargeback = create_plugin("api_chargeback", &config)
+        .expect("valid config")
+        .expect("built-in plugin");
+    assert!(includes_api_chargeback_for_test(&[chargeback]));
+    assert!(
+        !includes_api_chargeback_for_test(&[impostor("api_chargeback")]),
+        "a generation whose only api_chargeback is a custom plugin must publish the \
+         /charges absence"
+    );
+}
+
+#[test]
+fn custom_plugins_reporting_proxy_alerts_do_not_reset_alert_ownership() {
+    let previous = [impostor("proxy_alerts")];
+    let next = [impostor("proxy_alerts")];
+    assert!(
+        !proxy_alerts_instances_changed_for_test(&previous, &next),
+        "swapping custom plugins that report proxy_alerts changes no alert instance"
+    );
+    assert!(!proxy_alerts_instances_changed_for_test(&[], &next));
+}
+
+/// A regression guard rather than a test of this change: the finalizers have
+/// keyed on the registered type since before issue #6022's plugin-cache sweep.
 #[test]
 fn custom_plugins_reporting_finalized_built_in_names_get_no_finalizer() {
     let mut plugins = vec![
@@ -426,35 +639,221 @@ fn custom_plugins_reporting_finalized_built_in_names_get_no_finalizer() {
     );
 }
 
-/// Every reported-name comparison left in the plugin cache is paired with the
-/// built-in standing of the type, so a custom plugin reporting a built-in name
-/// cannot select, exempt, count, shadow, or drop that built-in. A new lookup
+/// Every `.name()` call in the plugin cache that is not an argument of a
+/// formatting or logging macro, keyed by its trimmed source line, with how
+/// many times that line may occur. Each either pairs the reported name with
+/// the registered type's built-in standing or decides nothing. A new lookup
 /// must go through `is_builtin_named` (or pair the name with standing the same
 /// way) and be listed here.
+const REPORTED_NAME_USES: [(&str, usize); 6] = [
+    // `is_builtin_named` itself.
+    (
+        "plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())",
+        1,
+    ),
+    // `remove_shadowed_global_plugin` hands over the scoped instance's
+    // standing with its name.
+    (
+        "remove_shadowed_globals(plugins, global_ptrs, scoped.name(), builtin);",
+        1,
+    ),
+    // `remove_shadowed_globals`, which also compares built-in standing.
+    ("plugin.name() != plugin_name", 1),
+    // `DeferredCorsPlugin` and `PluginInstanceWrapper` report the wrapped
+    // instance's name.
+    ("self.inner.name()", 2),
+    // The sole-authentication check counts `is_auth_plugin()` instances; the
+    // names only render its error.
+    (".map(|plugin| plugin.name())", 1),
+    // The response-presentation digest hashes the name beside the digest the
+    // instance declares; it selects nothing.
+    (
+        "presentation_policy_contributions.push((p.name(), digest));",
+        1,
+    ),
+];
+
+/// The byte offset of every `.name()` call in `source` outside comments and
+/// string and character literals, with whether it is an argument of a
+/// formatting or logging macro.
+fn reported_name_calls(source: &str) -> Vec<(usize, bool)> {
+    const FORMAT_MACROS: [&str; 6] = ["format", "error", "warn", "info", "debug", "trace"];
+    let bytes = source.as_bytes();
+    let mut calls = Vec::new();
+    // The bracket depth just outside each open formatting macro's arguments.
+    let mut format_depths: Vec<usize> = Vec::new();
+    let mut depth = 0usize;
+    // The last identifier and the offset just past it.
+    let mut ident = ("", 0usize);
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &source[index..];
+        let len = match bytes[index] {
+            _ if rest.starts_with("//") => rest.find('\n').unwrap_or(rest.len()),
+            _ if rest.starts_with("/*") => rest.find("*/").map_or(rest.len(), |end| end + 2),
+            _ if rest.starts_with(".name()") || rest.starts_with("::name(") => {
+                calls.push((index, !format_depths.is_empty()));
+                1
+            }
+            b'"' => quoted_len(rest),
+            b'\'' => char_literal_len(rest).unwrap_or(1),
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let len = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                let raw = if matches!(&rest[..len], "r" | "br") {
+                    raw_string_len(&rest[len..])
+                } else {
+                    None
+                };
+                match raw {
+                    Some(raw) => len + raw,
+                    None => {
+                        ident = (&rest[..len], index + len);
+                        len
+                    }
+                }
+            }
+            b'!' => {
+                let opens = matches!(bytes.get(index + 1), Some(b'(' | b'[' | b'{'));
+                if opens && ident.1 == index && FORMAT_MACROS.contains(&ident.0) {
+                    format_depths.push(depth);
+                }
+                1
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                1
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if format_depths.last() == Some(&depth) {
+                    format_depths.pop();
+                }
+                1
+            }
+            _ => rest.chars().next().map_or(1, char::len_utf8),
+        };
+        index += len;
+    }
+    calls
+}
+
+/// The length of the string literal `rest` starts with.
+fn quoted_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The length of the raw string literal body `rest` starts with (after its
+/// `r` or `br` prefix), or `None` when `rest` does not open one.
+fn raw_string_len(rest: &str) -> Option<usize> {
+    let hashes = rest.bytes().take_while(|&byte| byte == b'#').count();
+    if rest.as_bytes().get(hashes) != Some(&b'"') {
+        return None;
+    }
+    let close = format!("\"{}", "#".repeat(hashes));
+    let body = hashes + 1;
+    let end = rest[body..].find(&close)?;
+    Some(body + end + close.len())
+}
+
+/// The length of the character literal `rest` starts with, or `None` when its
+/// quote opens a lifetime or label instead.
+fn char_literal_len(rest: &str) -> Option<usize> {
+    let mut chars = rest[1..].chars();
+    match chars.next()? {
+        '\\' => rest.get(3..)?.find('\'').map(|end| end + 4),
+        first => (chars.next()? == '\'').then_some(first.len_utf8() + 2),
+    }
+}
+
+/// The 1-based line and trimmed text of every `.name()` call in `source` that
+/// is not a formatting or logging macro argument, and how many calls are.
+fn reported_name_lookups(source: &str) -> (Vec<(usize, &str)>, usize) {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut lookups = Vec::new();
+    let mut format_arguments = 0;
+    for (offset, in_format_macro) in reported_name_calls(source) {
+        if in_format_macro {
+            format_arguments += 1;
+        } else {
+            let line = source[..offset].matches('\n').count();
+            lookups.push((line + 1, lines[line].trim()));
+        }
+    }
+    (lookups, format_arguments)
+}
+
+#[test]
+fn the_reported_name_scan_sees_every_lookup_shape() {
+    let source = r#"
+fn lookups(plugin: &Arc<dyn Plugin>, p: &Arc<dyn Plugin>) {
+    let a = NAMES.contains(&plugin.name());
+    match plugin.name() {
+        _ => {}
+    }
+    let b = "x" == plugin.name();
+    let c = matches!(p.name(), "x" | "y");
+    let d = plugin
+        .name()
+        == "x";
+    let e = <dyn Plugin>::name(plugin.as_ref());
+    // A comment: plugin.name() == "x"
+    /* A block comment: plugin.name() == "x" */
+    let f = "a string: plugin.name() == \"x\" (";
+    let g = format!("{:?} {}", plugin.name(), '(');
+    warn!(plugin = %plugin.name(), "message (with parens)");
+    let h: &'static str = plugin.name();
+}
+"#;
+    let (lookups, format_arguments) = reported_name_lookups(source);
+    let lines: Vec<&str> = lookups.iter().map(|(_, line)| *line).collect();
+    assert_eq!(
+        lines,
+        [
+            "let a = NAMES.contains(&plugin.name());",
+            "match plugin.name() {",
+            "let b = \"x\" == plugin.name();",
+            "let c = matches!(p.name(), \"x\" | \"y\");",
+            ".name()",
+            "let e = <dyn Plugin>::name(plugin.as_ref());",
+            "let h: &'static str = plugin.name();",
+        ]
+    );
+    assert_eq!(format_arguments, 2);
+}
+
+/// A custom plugin reporting a built-in name cannot select, exempt, count,
+/// shadow, or drop that built-in through the plugin cache: every use of the
+/// reported name outside a diagnostic is one of [`REPORTED_NAME_USES`].
 #[test]
 fn plugin_cache_never_keys_a_built_in_lookup_on_the_reported_name_alone() {
-    const PAIRED_WITH_STANDING: [&str; 2] = [
-        // `is_builtin_named`.
-        "plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())",
-        // `remove_shadowed_globals`, which also compares built-in standing.
-        "plugin.name() != plugin_name",
-    ];
     let source = include_str!("../../../src/plugin_cache.rs");
-    let mut paired = 0;
-    for (index, line) in source.lines().enumerate() {
-        let line = line.trim();
-        let compares = [".name() ==", ".name() !=", "matches!(plugin.name()"]
+    let (lookups, format_arguments) = reported_name_lookups(source);
+    assert!(
+        format_arguments >= 10,
+        "the scan must see the plugin cache's diagnostic uses, found {format_arguments}"
+    );
+    for (line, text) in &lookups {
+        let listed = REPORTED_NAME_USES
             .iter()
-            .any(|pattern| line.contains(pattern));
-        if !compares {
-            continue;
-        }
+            .any(|(listed_text, _)| listed_text == text);
         assert!(
-            PAIRED_WITH_STANDING.contains(&line),
-            "src/plugin_cache.rs:{}: a lookup keyed on the reported name alone: {line}",
-            index + 1
+            listed,
+            "src/plugin_cache.rs:{line}: a lookup keyed on the reported name alone: {text}"
         );
-        paired += 1;
     }
-    assert_eq!(paired, PAIRED_WITH_STANDING.len());
+    for (listed, expected) in REPORTED_NAME_USES {
+        let found = lookups.iter().filter(|(_, text)| *text == listed).count();
+        assert_eq!(found, expected, "{listed:?}");
+    }
 }
