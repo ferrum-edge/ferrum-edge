@@ -8,10 +8,68 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_plan import stamp_sample
-from process_usage import IO_FIELDS, client_pids, measurement_usage, parse_io, sample_processes
+from process_usage import (IO_FIELDS, capture_scheduler, client_pids, measurement_usage,
+                           parse_context_switches, parse_io, sample_processes)
 
 
 class PassiveUsageTests(unittest.TestCase):
+    def test_context_switches_include_workers_and_preserve_thread_generations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for tid, generation, voluntary in ((42, 100, 2), (43, 200, 17)):
+                task = root / "42" / "task" / str(tid)
+                task.mkdir(parents=True)
+                fields = ["0"] * 22
+                fields[0], fields[19] = "S", str(generation)
+                (task / "stat").write_text(f"{tid} (worker thread) " + " ".join(fields))
+                (task / "status").write_text(
+                    f"Name:\tworker\nvoluntary_ctxt_switches:\t{voluntary}\n"
+                    "nonvoluntary_ctxt_switches:\t3\n")
+            result = capture_scheduler(42, 100, 4096, root)
+            self.assertEqual(set(result), {"42", "43"})
+            self.assertEqual(result["43"]["start_ticks"], 200)
+            self.assertEqual(result["43"]["voluntary_ctxt_switches"], 17)
+            (root / "42/task/43/status").unlink()
+            with self.assertRaises(OSError):
+                capture_scheduler(42, 100, 4096, root)
+
+    def test_context_switch_parser_rejects_missing_or_negative_counters(self):
+        text = "voluntary_ctxt_switches: 0\nnonvoluntary_ctxt_switches: 3\n"
+        self.assertEqual(parse_context_switches(text)["voluntary_ctxt_switches"], 0)
+        with self.assertRaises(KeyError):
+            parse_context_switches("voluntary_ctxt_switches: 0")
+        with self.assertRaises(ValueError):
+            parse_context_switches(text.replace(": 0", ": -1"))
+
+    def test_scheduler_delta_rejects_worker_churn_reuse_and_counter_regression(self):
+        timeline = [dict(unix_secs=t, processes=[dict(
+            pid=42, role="gateway", start_ticks=1, cpu_seconds=t * 3, rss_bytes=1024,
+            user_cpu_seconds=t * 2, system_cpu_seconds=t,
+            scheduler_threads={str(tid): dict(start_ticks=tid,
+                voluntary_ctxt_switches=n * tid, nonvoluntary_ctxt_switches=n)
+                for tid in (42, 43)})]) for n, t in enumerate((0.9, 1.5, 2.1))]
+        phases = dict(measurement_start_unix_secs=1, measurement_secs=1)
+        row = measurement_usage(dict(timeline=timeline), phases)[0]
+        self.assertAlmostEqual(row["user_cpu_seconds"], 2.4)
+        self.assertAlmostEqual(row["system_cpu_seconds"], 1.2)
+        self.assertEqual(row["context_switches"], dict(scope="all process threads",
+            voluntary_ctxt_switches=170, nonvoluntary_ctxt_switches=4))
+        for failure in ("missing_sample", "retired_worker", "reused_tid", "decreased_counter"):
+            with self.subTest(failure=failure):
+                changed = json.loads(json.dumps(timeline))
+                middle = changed[1]["processes"][0]
+                if failure == "missing_sample":
+                    del middle["scheduler_threads"]
+                elif failure == "retired_worker":
+                    del middle["scheduler_threads"]["43"]
+                elif failure == "reused_tid":
+                    middle["scheduler_threads"]["43"]["start_ticks"] = 900
+                else:
+                    middle["scheduler_threads"]["43"]["voluntary_ctxt_switches"] = 900
+                row = measurement_usage(dict(timeline=changed), phases)[0]
+                self.assertNotIn("context_switches", row)
+                self.assertIn("scheduler_error", row)
+
     def test_io_parser_requires_every_counter_and_preserves_zero(self):
         text = "\n".join(f"{key}: {index}" for index, key in enumerate(IO_FIELDS))
         self.assertEqual(parse_io(text), dict(zip(IO_FIELDS, range(len(IO_FIELDS)))))

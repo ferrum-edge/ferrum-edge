@@ -89,6 +89,7 @@ EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
+H2_CPU_PROFILE=""
 H1_TRACE=none
 H1_TRACE_BUILDS=""
 h1_trace_pid=""
@@ -117,6 +118,8 @@ while [[ $# -gt 0 ]]; do
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
+        --h2-profile) H2_CPU_PROFILE="$2"; shift 2 ;;
+        --profile-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
         --h1-trace) H1_TRACE="$2"; shift 2 ;;
         --h1-trace-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
         --pool-profile) POOL_PROFILE="$2"; shift 2 ;;
@@ -195,11 +198,25 @@ if [ -n "$H1_PROFILE" ]; then
     [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
 fi
 
+# Fixed manual H2/gRPC diagnostic lane. Keep ordinary experiment arms and
+# benchmark leaderboards separate, and calibrate the same runtime policy.
+if [ -n "$H2_CPU_PROFILE" ]; then
+    case "$H2_CPU_PROFILE" in off|counters|cpu) ;; *) exit 2 ;; esac
+    case "$PROTOCOL" in http2|grpcs) ;; *) exit 2 ;; esac
+    case "$PAYLOAD_SIZES" in 10240|71680) ;; *) exit 2 ;; esac
+    [ "$DURATION" = 15 ] && [ "$CONCURRENCY" = 200 ] && [ "$PAIRS" = 2 ] || exit 2
+    [ "$GATEWAYS" = 'ferrum envoy' ] && [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+    [ -z "$H1_PROFILE$POOL_PROFILE$UDP_PROFILE$BASELINE_IMAGE${FERRUM_EXTRA_ENV:-}" ] || exit 2
+    [ "$H1_TRACE" = none ] && [ "$H2_WINDOW" = default ] && [ "$GRPC_CLIENT_CONNECTIONS" = pooled ] || exit 2
+    [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || exit 2
+    if [ "$H2_CPU_PROFILE" = cpu ]; then H1_TRACE=cpu; fi
+fi
+
 case "$H1_TRACE" in none|syscalls|cpu) ;; *) exit 2 ;; esac
 if [ "$H1_TRACE" != none ]; then
     # One existing payload shard per bounded collector lifetime; all five shards
     # remain required. Direct controls are never profiled.
-    [[ "$H1_PROFILE" == trace-calibration || "$H1_PROFILE" == cutoff ]] || exit 2
+    [[ "$H1_PROFILE" == trace-calibration || "$H1_PROFILE" == cutoff || "$H2_CPU_PROFILE" == cpu ]] || exit 2
     [[ "$PAYLOAD_SIZES" != *" "* && -d "$H1_TRACE_BUILDS" ]] || exit 2
     [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || exit 2
 fi
@@ -564,6 +581,7 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    if [ -n "$H2_CPU_PROFILE" ]; then extra_env+=(--user 65532:65532 --cap-drop ALL); fi
     local response_cutoff=0
     case "$PROTOCOL" in
         http3)
@@ -661,22 +679,12 @@ start_ferrum() {
                 "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
                 "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
     fi
-    if [ "$H1_TRACE" != none ]; then
-        python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output" \
-            --runtime "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
-            --config "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" \
-            --sample "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" \
-            --arm "$gw" --pair "$PAIR" --payload "$PAYLOAD_SIZES" \
-            --raw-sample "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" \
-            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit"
-        local trace_wait=0
-        while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
-            [ ! -s "$h1_trace_output/stopped.json" ] || return 1
-            sleep 0.05
-            trace_wait=$(( trace_wait + 1 ))
-        done
-        [ -s "$h1_trace_output/ready.json" ] || return 1
+    if [ -n "$H2_CPU_PROFILE" ]; then
+        wait_for_gateway || return 1
+        h2_profile_runtime "$config_file" || return 2
     fi
+    trace_bind || return 1
+
     if [ -n "$UDP_PROFILE" ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
@@ -732,13 +740,20 @@ start_envoy() {
     fi
 
     echo "[envoy] starting..."
-    GATEWAY_CID=$(docker run -d --rm --network host \
+    local profile_args=()
+    if [ -n "$H2_CPU_PROFILE" ]; then profile_args+=(--user 65532:65532 --cap-drop ALL); fi
+    GATEWAY_CID=$(docker run -d --rm --network host "${profile_args[@]}" \
         -v "$cfg_dst:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
         "$ENVOY_IMAGE" \
         envoy -c /etc/envoy/envoy.yaml --concurrency "$(nproc 2>/dev/null || echo 4)" \
         -l "$GATEWAY_LOG_LEVEL" --disable-hot-restart)
 
+    if [ -n "$H2_CPU_PROFILE" ]; then
+        wait_for_gateway || return 1
+        h2_profile_runtime "$cfg_dst" || return 2
+        trace_bind || return 1
+    fi
     wait_for_gateway
 }
 
@@ -1062,14 +1077,47 @@ wait_for_gateway() {
     return 1
 }
 
+h2_profile_runtime() {
+    local config_file="$1"
+    mkdir -p "$OUTPUT_DIR/diagnostics"
+    cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+    docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+        python3 "$SCRIPT_DIR/h2_cpu_profile.py" runtime --protocol "$PROTOCOL" \
+            --gateway "$gw" --pair "$PAIR" --config "$config_file" \
+            --output "$OUTPUT_DIR/diagnostics/${gw}_runtime.json"
+}
+
+trace_bind() {
+    if [ "$H1_TRACE" != none ]; then
+        local protocol_args=()
+        if [ -n "$H2_CPU_PROFILE" ]; then protocol_args+=(--h2-protocol "$PROTOCOL"); fi
+        python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output" \
+            --runtime "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
+            --config "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" \
+            --sample "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" \
+            --arm "$gw" --pair "$PAIR" --payload "$PAYLOAD_SIZES" \
+            --raw-sample "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" \
+            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit" "${protocol_args[@]}"
+        local trace_wait=0
+        while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
+            [ ! -s "$h1_trace_output/stopped.json" ] || return 1
+            sleep 0.05
+            trace_wait=$(( trace_wait + 1 ))
+        done
+        [ -s "$h1_trace_output/ready.json" ] || return 1
+    fi
+}
+
 h1_trace_start() {
     [ "$H1_TRACE" != none ] && [ "$gw" != direct ] || return 0
     h1_trace_output="$OUTPUT_DIR/traces/${gw}_${PAYLOAD_SIZES}"
     mkdir -p "$h1_trace_output"
     local enabled=(--enabled)
+    local protocol_args=()
+    if [ -n "$H2_CPU_PROFILE" ]; then protocol_args+=(--h2-protocol "$PROTOCOL"); fi
     if [ "$H1_PROFILE" = trace-calibration ] && [ "$gw" = ferrum-baseline ]; then enabled=(); fi
     sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
-        python3 "$SCRIPT_DIR/h1_trace.py" supervise --mode "$H1_TRACE" "${enabled[@]}" \
+        python3 "$SCRIPT_DIR/h1_trace.py" supervise --mode "$H1_TRACE" "${enabled[@]}" "${protocol_args[@]}" \
         --parent "$$" --builds "$H1_TRACE_BUILDS" --artifact-root "$(dirname "$H1_TRACE_BUILDS")" --output "$h1_trace_output" \
         > "$h1_trace_output/supervisor.stdout" 2> "$h1_trace_output/supervisor.stderr" &
     h1_trace_pid=$!
@@ -1175,6 +1223,9 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
+    if [ -n "$H2_CPU_PROFILE" ] && [ "$H2_CPU_PROFILE" != off ]; then
+        sampler_args+=(--scheduler-counters)
+    fi
     if [ -n "$H1_PROFILE" ] && [ "$target" = gateway ]; then
         sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
                       --h1-container-id "$GATEWAY_CID")
@@ -1378,6 +1429,9 @@ run_bench() {
         echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
         head -10 "$err_file" | sed 's/^/[bench]     /'
     fi
+    if [ -n "$H2_CPU_PROFILE" ]; then
+        python3 "$SCRIPT_DIR/h2_cpu_profile.py" stamp "$out" "$H2_CPU_PROFILE"
+    fi
     if [ -n "$h1_trace_pid" ]; then
         # The synchronous client has returned and its raw result/exit and stamped
         # sample are retained. The supervisor validates full request drain and
@@ -1417,7 +1471,7 @@ main() {
     if [ "$H1_PROFILE" = cutoff ] || [ "$H1_PROFILE" = diagnostic ]; then
         expected_gateways+=" ferrum-exp-cutoff-one"
     fi
-    if [ -z "$H1_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -z "$UDP_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
+    if [ -z "$H1_PROFILE$H2_CPU_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -z "$UDP_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
         EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
             "$EXPERIMENT_MANIFEST" "$PROTOCOL")
         if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
