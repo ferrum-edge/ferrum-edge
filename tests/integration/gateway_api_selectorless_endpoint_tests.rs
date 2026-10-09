@@ -509,8 +509,10 @@ fn deleted_pods_lingering_terminating_endpoint_is_attributed_within_the_grace_wi
 fn grace_window_counts_from_when_the_pod_leaves_the_inventory() {
     // The last reconcile that saw payroll-1 ran longer than the window
     // before the one that finds it gone: the window starts at that later
-    // reconcile, and later reconciles do not restart it.
-    let grace = Duration::from_secs(1);
+    // reconcile, and later reconciles do not restart it. The window is long
+    // enough that a stalled runner cannot expire it between the first
+    // "after" reconcile and the admissions that follow it.
+    let grace = Duration::from_secs(5);
     let (before, after) = grace_window_fixtures();
     let inventory = PodClaimInventory::with_grace_window(grace);
     let remembering = options().with_pod_claim_inventory(inventory);
@@ -524,15 +526,29 @@ fn grace_window_counts_from_when_the_pod_leaves_the_inventory() {
 }
 
 #[test]
-fn a_restricted_pod_watch_scope_remembers_no_claims() {
-    // Outside the scope a Pod could reuse the departed Pod's IP unobserved,
-    // so with a restricted scope the lingering endpoint is refused as before.
+fn a_restricted_pod_watch_scope_remembers_claims_only_for_terminating_endpoints() {
+    // Outside the scope a Pod could reuse the departed Pod's IP unobserved.
+    // The EndpointSlice controller marks a deleted Pod's endpoint terminating
+    // before the Pod leaves the API, so with a restricted scope a remembered
+    // claim still vouches for that lingering endpoint, but never for a ready
+    // endpoint naming the same IP.
     let (before, after) = grace_window_fixtures();
+    let ready_after = route_fixture(
+        selector_service("10.96.0.60"),
+        vec![
+            payroll_slice(json!({ "ready": true })),
+            pod("tenant-a", "payroll-0", "10.1.0.10"),
+        ],
+    );
     let restricted = options()
         .with_pod_source_namespaces(vec!["tenant-a".to_string()])
         .with_pod_claim_inventory(PodClaimInventory::new());
     assert_admitted(&before, restricted.clone(), SERVICE_DNS);
-    assert_refused(&after, restricted, "10.1.0.11");
+    assert_admitted(&after, restricted.clone(), SERVICE_DNS);
+    assert_refused(&ready_after, restricted.clone(), "10.1.0.11");
+    // The refusal did not consume the claim: the terminating endpoint is
+    // still within its window.
+    assert_admitted(&after, restricted, SERVICE_DNS);
 }
 
 #[test]

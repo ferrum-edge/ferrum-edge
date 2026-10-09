@@ -228,6 +228,9 @@ struct CoreEndpoint {
     /// `conditions.ready` and `conditions.serving` are both explicitly
     /// `false`; see [`endpoint_is_out_of_service`].
     out_of_service: bool,
+    /// `conditions.terminating` is explicitly `true`; see
+    /// [`endpoint_is_terminating`].
+    terminating: bool,
     node_name: Option<String>,
 }
 
@@ -326,13 +329,16 @@ pub const POD_CLAIM_GRACE_WINDOW: Duration = Duration::from_secs(60);
 /// EndpointSlice attribution consults it only for an IP no Pod observed now
 /// claims, and for a `targetRef` naming a Pod that is no longer observed or no
 /// longer reports the address. A current claim always wins: an IP reused by an
-/// observed Pod of another namespace is that namespace's. It is consulted only
-/// while the Pod watch scope covers every namespace: with a restricted scope,
-/// an IP reused by a Pod outside the scope would still look like the old
-/// Pod's. A claim's window starts at the first refresh that no longer observes
-/// it, however long ago the Pod was last observed. Memory is bounded by the
-/// Pods observed now plus those that left within the window; every refresh
-/// prunes the expired claims.
+/// observed Pod of another namespace is that namespace's. While the Pod watch
+/// scope covers every namespace it is consulted for every endpoint. With a
+/// restricted scope an IP reused by a Pod outside the scope would still look
+/// like the old Pod's, so it is consulted only for an endpoint reporting
+/// `terminating: true`: the EndpointSlice controller marks a Pod's endpoint
+/// terminating before the Pod leaves the API, and nothing but kube-proxy's
+/// no-ready-endpoint fallback dials one. A claim's window starts at the first
+/// refresh that no longer observes it, however long ago the Pod was last
+/// observed. Memory is bounded by the Pods observed now plus those that left
+/// within the window; every refresh prunes the expired claims.
 #[derive(Clone)]
 pub struct PodClaimInventory {
     grace: Duration,
@@ -836,6 +842,7 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
                 addresses: string_array_from_value(endpoint, "addresses"),
                 ready: crate::util::endpointslice::endpoint_slice_endpoint_is_ready(endpoint),
                 out_of_service: endpoint_is_out_of_service(endpoint),
+                terminating: endpoint_is_terminating(endpoint),
                 node_name: nonempty_node_name(string_field(endpoint, "nodeName"))
                     .map(ToOwned::to_owned),
             }
@@ -1117,8 +1124,8 @@ pub(super) fn endpoint_route_backends_for_service(
 /// [`endpoint_is_out_of_service`]). A Pod's IP claim outlives the Pod by
 /// [`POD_CLAIM_GRACE_WINDOW`] (see [`PodClaimInventory`]), so a terminating
 /// endpoint the EndpointSlice controller has not yet dropped still belongs to
-/// its Pod's namespace. That memory is used only while the Pod watch scope
-/// covers every namespace.
+/// its Pod's namespace. With a restricted Pod watch scope that memory is used
+/// only for endpoints reporting `terminating: true`.
 ///
 /// A `targetRef` is authored with the slice, so on its own it can only make an
 /// endpoint look worse. The one thing it can do for a selector-backed Service
@@ -1137,15 +1144,12 @@ pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
         .filter_map(|ip| parse_endpoint_ip(ip.as_str()))
         .collect();
     // With a restricted Pod watch scope an IP reused by an unwatched Pod
-    // would still look like the departed Pod's, so nothing is remembered.
+    // would still look like the departed Pod's, so there the remembered
+    // claims vouch only for terminating endpoints.
+    let remember_every_endpoint = acc.options.watches_every_pod_namespace();
     let inventory = &acc.options.pod_claim_inventory;
-    let mut recent = acc
-        .options
-        .watches_every_pod_namespace()
-        .then(|| inventory.lock());
-    if let Some(recent) = recent.as_mut() {
-        recent.refresh(&acc.core.pods, Instant::now(), inventory.grace);
-    }
+    let mut recent = inventory.lock();
+    recent.refresh(&acc.core.pods, Instant::now(), inventory.grace);
     let mut findings_by_service: BTreeMap<&K8sServiceKey, EndpointSliceFindings> = BTreeMap::new();
     for slice in &acc.core.endpoint_slices {
         let Some(service_key) = slice.guarded_service_key.as_ref() else {
@@ -1162,7 +1166,8 @@ pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
         }
         let attribution = EndpointAttribution {
             state: &acc.core,
-            recent: recent.as_deref(),
+            recent: &recent,
+            remember_every_endpoint,
             cluster_ips: &cluster_ips,
             service_namespace: namespace,
             service_has_selector: service.has_selector,
@@ -1201,6 +1206,15 @@ pub(super) fn external_endpoints_opt_in_active(acc: &K8sAccumulator) -> bool {
     acc.options.allow_selectorless_external_endpoints && acc.core.nodes_observed
 }
 
+/// Whether an EndpointSlice endpoint explicitly reports `terminating: true`.
+fn endpoint_is_terminating(endpoint: &Value) -> bool {
+    endpoint
+        .get("conditions")
+        .and_then(|conditions| conditions.get("terminating"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Whether an EndpointSlice endpoint explicitly reports both `ready: false`
 /// and `serving: false`.
 ///
@@ -1233,9 +1247,11 @@ enum EndpointAddress {
 /// The inventory one Service's endpoint addresses are judged against.
 struct EndpointAttribution<'a> {
     state: &'a CoreState,
-    /// Claims of Pods observed now or within [`POD_CLAIM_GRACE_WINDOW`];
-    /// `None` when the Pod watch scope is restricted.
-    recent: Option<&'a RecentPodClaims>,
+    /// Claims of Pods observed now or within [`POD_CLAIM_GRACE_WINDOW`].
+    recent: &'a RecentPodClaims,
+    /// Whether `recent` vouches for every endpoint (the Pod watch scope
+    /// covers every namespace) or only for terminating ones.
+    remember_every_endpoint: bool,
     /// Every observed Service ClusterIP, in any namespace.
     cluster_ips: &'a HashSet<IpAddr>,
     service_namespace: &'a str,
@@ -1244,6 +1260,8 @@ struct EndpointAttribution<'a> {
 
 impl EndpointAttribution<'_> {
     fn classify(&self, endpoint: &CoreEndpoint, address: &str) -> EndpointAddress {
+        let vouches = self.remember_every_endpoint || endpoint.terminating;
+        let recent = vouches.then_some(self.recent);
         if endpoint
             .pod_key
             .as_ref()
@@ -1262,7 +1280,7 @@ impl EndpointAttribution<'_> {
         if let Some(embedded) = embedded_ipv4(ip) {
             let embedded = IpAddr::V4(embedded);
             if ip_is_never_a_backend(embedded)
-                || self.pod_claim(embedded).is_some()
+                || self.pod_claim(embedded, recent).is_some()
                 || self.is_cluster_infrastructure(embedded)
             {
                 return EndpointAddress::Foreign;
@@ -1274,14 +1292,14 @@ impl EndpointAttribution<'_> {
         if ip_is_never_a_backend(ip) {
             return EndpointAddress::Foreign;
         }
-        if let Some(only_service_namespace) = self.pod_claim(ip) {
+        if let Some(only_service_namespace) = self.pod_claim(ip, recent) {
             return if only_service_namespace {
                 EndpointAddress::NamespacePod
             } else {
                 EndpointAddress::Foreign
             };
         }
-        if self.service_has_selector && self.target_pod_reports(endpoint, ip) {
+        if self.service_has_selector && self.target_pod_reports(endpoint, ip, recent) {
             return EndpointAddress::NamespacePod;
         }
         if self.is_cluster_infrastructure(ip) {
@@ -1293,21 +1311,28 @@ impl EndpointAttribution<'_> {
     /// `Some(true)` when only Pods of the Service's namespace claim `ip`,
     /// `Some(false)` when another namespace's Pod does too, `None` when no
     /// Pod does. The Pods observed now decide; a claim from within the grace
-    /// window counts only for an IP no observed Pod claims.
-    fn pod_claim(&self, ip: IpAddr) -> Option<bool> {
+    /// window (`recent`, when it may vouch for this endpoint) counts only for
+    /// an IP no observed Pod claims.
+    fn pod_claim(&self, ip: IpAddr, recent: Option<&RecentPodClaims>) -> Option<bool> {
         let namespace = self.service_namespace;
         if let Some(namespaces) = self.state.pod_ip_namespaces.get(&ip) {
             return Some(namespaces.iter().all(|claimant| claimant == namespace));
         }
-        let namespaces = self.recent?.ip_namespaces.get(&ip)?;
+        let namespaces = recent?.ip_namespaces.get(&ip)?;
         Some(namespaces.keys().all(|claimant| claimant == namespace))
     }
 
     /// Whether the endpoint's `targetRef` names a Pod of the Service's
     /// namespace that reports `ip`: an observed, non-terminal Pod now, or one
-    /// that did within the grace window. The caller has already refused a
-    /// `targetRef` into another namespace.
-    fn target_pod_reports(&self, endpoint: &CoreEndpoint, ip: IpAddr) -> bool {
+    /// that did within the grace window (`recent`, when it may vouch for this
+    /// endpoint). The caller has already refused a `targetRef` into another
+    /// namespace.
+    fn target_pod_reports(
+        &self,
+        endpoint: &CoreEndpoint,
+        ip: IpAddr,
+        recent: Option<&RecentPodClaims>,
+    ) -> bool {
         let Some(pod_key) = endpoint.pod_key.as_ref() else {
             return false;
         };
@@ -1320,7 +1345,7 @@ impl EndpointAttribution<'_> {
         {
             return true;
         }
-        self.recent
+        recent
             .and_then(|recent| recent.pod_addresses.get(pod_key))
             .is_some_and(|addresses| addresses.contains_key(&ip))
     }
@@ -1714,6 +1739,7 @@ fn auto_workloads_for_service(
                     addresses: Vec::new(),
                     ready: true,
                     out_of_service: false,
+                    terminating: false,
                     node_name: endpoint.node_name.clone(),
                 });
             let seen_addresses = seen_endpoint_addresses.entry(pod_key).or_default();
