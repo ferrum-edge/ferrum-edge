@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use ferrum_edge::_test_support::{
-    early_route_total_ms_for_test, run_after_proxy_hooks_for_test,
+    composition_shape_plugin_for_test, early_route_total_ms_for_test,
+    exclusive_effective_instance_errors_for_test, install_plugin_finalizers_for_test,
+    run_after_proxy_hooks_for_test, shadow_global_plugins_for_test,
     validate_plugin_security_composition_for_test,
 };
 use ferrum_edge::PluginCache;
@@ -300,4 +302,155 @@ fn the_registered_compression_plugin_keeps_its_response_caching_exemption() {
     let plugins = [response_caching(), compression];
     validate_plugin_security_composition_for_test(&plugins)
         .expect("response caching composes with the registered compression plugin");
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-cache lookups key on built-in standing, not the reported name
+// ---------------------------------------------------------------------------
+
+fn stdout_logging() -> Arc<dyn Plugin> {
+    create_plugin("stdout_logging", &json!({}))
+        .expect("valid config")
+        .expect("built-in plugin")
+}
+
+fn holds(plugins: &[Arc<dyn Plugin>], plugin: &Arc<dyn Plugin>) -> bool {
+    plugins.iter().any(|held| Arc::ptr_eq(held, plugin))
+}
+
+#[tokio::test]
+async fn a_scoped_custom_plugin_reporting_a_built_in_name_keeps_that_global() {
+    let global = stdout_logging();
+    let scoped = impostor("stdout_logging");
+    let merged = shadow_global_plugins_for_test(&[Arc::clone(&global)], &scoped);
+    assert_eq!(merged.len(), 2, "the custom plugin replaces nothing");
+    assert!(
+        holds(&merged, &global),
+        "a custom plugin reporting a built-in name must not remove that built-in's global"
+    );
+}
+
+#[tokio::test]
+async fn a_scoped_built_in_keeps_a_custom_global_reporting_its_name() {
+    let global = impostor("stdout_logging");
+    let scoped = stdout_logging();
+    let merged = shadow_global_plugins_for_test(&[Arc::clone(&global)], &scoped);
+    assert_eq!(merged.len(), 2);
+    assert!(
+        holds(&merged, &global),
+        "a built-in must not silently drop a custom global that reports its name"
+    );
+}
+
+#[tokio::test]
+async fn scoped_instances_still_shadow_globals_of_their_own_standing() {
+    let global = stdout_logging();
+    let scoped = stdout_logging();
+    let merged = shadow_global_plugins_for_test(&[Arc::clone(&global)], &scoped);
+    assert_eq!(merged.len(), 1, "a scoped built-in replaces its global");
+    assert!(holds(&merged, &scoped));
+
+    let global = impostor("custom_audit");
+    let scoped = impostor("custom_audit");
+    let merged = shadow_global_plugins_for_test(&[Arc::clone(&global)], &scoped);
+    assert_eq!(merged.len(), 1, "a scoped custom plugin replaces its global");
+    assert!(holds(&merged, &scoped));
+}
+
+#[tokio::test]
+async fn exclusive_instance_checks_count_only_the_registered_built_in() {
+    let config = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]});
+    let chargeback = create_plugin("api_chargeback", &config)
+        .expect("valid config")
+        .expect("built-in plugin");
+    let plugins = [Arc::clone(&chargeback), impostor("api_chargeback")];
+    let errors = exclusive_effective_instance_errors_for_test(&plugins, "p1");
+    assert!(
+        errors.is_empty(),
+        "a custom plugin reporting api_chargeback is not a second instance: {errors:?}"
+    );
+    let plugins = [Arc::clone(&chargeback), chargeback];
+    let errors = exclusive_effective_instance_errors_for_test(&plugins, "p1");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("api_chargeback permits at most one effective instance"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn candidate_admission_stand_ins_keep_built_in_standing() {
+    let config = make_plugin_config_with_json(
+        "allow-all",
+        "ip_restriction",
+        json!({"allow": ["0.0.0.0/0"]}),
+        PluginScope::Global,
+        None,
+    );
+    let stand_in =
+        composition_shape_plugin_for_test(&config).expect("ip_restriction has a stand-in");
+    assert_eq!(stand_in.name(), "ip_restriction");
+    assert!(
+        is_builtin_plugin(stand_in.as_ref()),
+        "admission must see the built-in standing the runtime instance has"
+    );
+    let global = create_plugin("ip_restriction", &json!({"allow": ["0.0.0.0/0"]}))
+        .expect("valid config")
+        .expect("built-in plugin");
+    let merged = shadow_global_plugins_for_test(&[global], &stand_in);
+    assert_eq!(
+        merged.len(),
+        1,
+        "a scoped stand-in shadows the global exactly as the runtime instance does"
+    );
+}
+
+#[test]
+fn custom_plugins_reporting_finalized_built_in_names_get_no_finalizer() {
+    let mut plugins = vec![
+        impostor("cors"),
+        impostor("mesh_route_dispatch"),
+        impostor("cors"),
+    ];
+    install_plugin_finalizers_for_test(&mut plugins)
+        .expect("custom plugins impose no built-in contiguity rule");
+    let names: Vec<_> = plugins.iter().map(|plugin| plugin.name()).collect();
+    assert_eq!(
+        names,
+        ["cors", "mesh_route_dispatch", "cors"],
+        "no finalizer is installed and no custom plugin is wrapped or dropped"
+    );
+}
+
+/// Every reported-name comparison left in the plugin cache is paired with the
+/// built-in standing of the type, so a custom plugin reporting a built-in name
+/// cannot select, exempt, count, shadow, or drop that built-in. A new lookup
+/// must go through `is_builtin_named` (or pair the name with standing the same
+/// way) and be listed here.
+#[test]
+fn plugin_cache_never_keys_a_built_in_lookup_on_the_reported_name_alone() {
+    const PAIRED_WITH_STANDING: [&str; 2] = [
+        // `is_builtin_named`.
+        "plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())",
+        // `remove_shadowed_globals`, which also compares built-in standing.
+        "plugin.name() != plugin_name",
+    ];
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let mut paired = 0;
+    for (index, line) in source.lines().enumerate() {
+        let line = line.trim();
+        let compares = [".name() ==", ".name() !=", "matches!(plugin.name()"]
+            .iter()
+            .any(|pattern| line.contains(pattern));
+        if !compares {
+            continue;
+        }
+        assert!(
+            PAIRED_WITH_STANDING.contains(&line),
+            "src/plugin_cache.rs:{}: a lookup keyed on the reported name alone: {line}",
+            index + 1
+        );
+        paired += 1;
+    }
+    assert_eq!(paired, PAIRED_WITH_STANDING.len());
 }

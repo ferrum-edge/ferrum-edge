@@ -135,6 +135,15 @@ Each proxy's effective plugin list is built by merging global, proxy-scoped, and
 3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
+A scoped instance replaces only a global of the same kind: a built-in replaces
+a built-in, and a custom plugin replaces a custom plugin. Built-in standing
+follows the plugin's registered type, never the name it reports, so a custom
+plugin whose `name()` returns a built-in name (for example `rate_limiting`)
+does not remove that built-in's global instance (issue #6022). The plugin
+cache's other per-plugin lookups (the single-instance checks below, the
+`mesh_authz` readiness count, and adaptive-concurrency and CORS handling) key
+on the registered type the same way.
+
 **Size-limit exception:** `request_size_limiting` and
 `response_size_limiting` policies are conjunctive security boundaries. Their
 same-name global and scoped instances all remain active and compose to the
