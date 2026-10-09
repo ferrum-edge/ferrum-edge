@@ -137,7 +137,6 @@ jobs:
               --payload-sizes "$PROFILE_PAYLOAD" --wallclock-budget-seconds 1800 \
               --output-dir "h2-cpu-evidence/$pass"
           done
-          python3 tests/performance/multi_protocol/h2_cpu_profile.py report h2-cpu-evidence
       - name: Hand back bounded root-owned trace artifacts after success or failure
         if: always()
         run: |
@@ -145,6 +144,11 @@ jobs:
             sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
               python3 tests/performance/multi_protocol/h1_trace.py prepare-artifacts --output h2-cpu-evidence
           fi
+      - name: Retain a report even when a campaign stops early
+        if: always()
+        run: |
+          mkdir -p h2-cpu-evidence
+          python3 tests/performance/multi_protocol/h2_cpu_profile.py report h2-cpu-evidence
       - name: Retain raw profiles, coverage limits, counters and controls
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

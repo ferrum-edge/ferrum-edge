@@ -1089,13 +1089,15 @@ h2_profile_runtime() {
 
 trace_bind() {
     if [ "$H1_TRACE" != none ]; then
+        local protocol_args=()
+        if [ -n "$H2_CPU_PROFILE" ]; then protocol_args+=(--h2-protocol "$PROTOCOL"); fi
         python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output" \
             --runtime "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
             --config "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" \
             --sample "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" \
             --arm "$gw" --pair "$PAIR" --payload "$PAYLOAD_SIZES" \
             --raw-sample "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" \
-            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit"
+            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit" "${protocol_args[@]}"
         local trace_wait=0
         while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
             [ ! -s "$h1_trace_output/stopped.json" ] || return 1

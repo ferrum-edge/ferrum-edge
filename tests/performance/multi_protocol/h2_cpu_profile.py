@@ -6,6 +6,7 @@ software-event validation and bounded ELF retention are shared with H1.
 import argparse
 import hashlib
 import json
+import math
 import re
 import statistics
 import sys
@@ -77,6 +78,14 @@ def stamp(path, mode):
     path.write_text(json.dumps(sample, indent=2) + '\n')
 
 
+def nonnegative(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def positive(value):
+    return nonnegative(value) and value > 0
+
+
 def report(root):
     from benchmark_validity import sample_issues
     root = Path(root)
@@ -93,42 +102,99 @@ def report(root):
                 if len(paths) != 1:
                     row['issues'].append('missing or ambiguous sample')
                     continue
-                sample = json.loads(paths[0].read_text())
+                try:
+                    sample = json.loads(paths[0].read_text())
+                    if not isinstance(sample, dict):
+                        raise ValueError('sample must be an object')
+                except (OSError, ValueError):
+                    row['issues'].append('unreadable or malformed sample')
+                    continue
                 marker = sample.pop('h2_cpu_profile', {})
-                if marker.get('mode') != mode or marker.get('diagnostic_only') is not True:
+                if (not isinstance(marker, dict) or marker.get('mode') != mode
+                        or marker.get('diagnostic_only') is not True
+                        or marker.get('user_stacks_only') is not (mode == 'cpu')
+                        or marker.get('scheduler_counters') is not (mode != 'off')):
                     row['issues'].append('missing/mismatched diagnostic marker')
+                if (sample.get('gateway') != gateway or sample.get('pair') != pair
+                        or sample.get('sample_schema') != 2
+                        or sample.get('protocol') not in ('http2', 'grpcs')
+                        or sample.get('payload_size') not in (10240, 71680)
+                        or sample.get('duration_secs') != 15
+                        or sample.get('effective_concurrency') != 200):
+                    row['issues'].append('sample does not match fixed campaign identity')
                 # Diagnostic exclusion is for scoreboards. All underlying
                 # traffic, error and completeness rules still apply here.
-                row['issues'].extend(sample_issues(sample))
+                try:
+                    row['issues'].extend(sample_issues(sample))
+                except (TypeError, ValueError, KeyError):
+                    row['issues'].append('malformed benchmark evidence')
                 row.update(rps=sample.get('rps'), payload=sample.get('payload_size'),
                            protocol=sample.get('protocol'), host_id=sample.get('host_id'))
-                row['usage'] = sample.get('process_usage', {}).get('measurement', [])
+                usage = sample.get('process_usage')
+                usage = usage.get('measurement') if isinstance(usage, dict) else None
+                row['usage'] = usage if isinstance(usage, list) else []
                 expected_roles = {'backend', 'client'} | ({'gateway'} if gateway != 'direct' else set())
-                if {p.get('role') for p in row['usage']} != expected_roles:
+                roles = [p.get('role') for p in row['usage']
+                         if isinstance(p, dict) and isinstance(p.get('role'), str)]
+                if len(row['usage']) != len(expected_roles) or set(roles) != expected_roles:
                     row['issues'].append('missing/ambiguous process CPU roles')
                 for process in row['usage']:
-                    if (not process.get('complete_bracket') or not process.get('bracket_secs')
-                            or any(key not in process for key in ('user_cpu_seconds', 'system_cpu_seconds'))):
+                    if not isinstance(process, dict):
+                        row['issues'].append('malformed process CPU record')
+                        continue
+                    if (process.get('complete_bracket') is not True
+                            or not positive(process.get('bracket_secs'))
+                            or not all(nonnegative(process.get(key))
+                                       for key in ('user_cpu_seconds', 'system_cpu_seconds'))):
                         row['issues'].append('incomplete user/kernel CPU bracket')
                     if mode != 'off':
-                        counters = process if process['role'] == 'client' else process.get('context_switches', {})
-                        if not all(key in counters for key in ('voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches')):
+                        counters = process if process.get('role') == 'client' else process.get('context_switches')
+                        if (not isinstance(counters, dict)
+                                or not all(type(counters.get(key)) is int and counters[key] >= 0
+                                           for key in ('voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches'))
+                                or (process.get('role') != 'client'
+                                    and counters.get('scope') != 'all process threads')):
                             row['issues'].append('incomplete all-thread scheduler bracket')
+                if gateway != 'direct':
+                    try:
+                        runtime = json.loads((folder / 'diagnostics' / f'{gateway}_runtime.json').read_text())
+                        config = (folder / 'diagnostics' / f'{gateway}_config.yaml').read_bytes()
+                        validate_runtime(dict(arm=gateway, pair=pair), runtime, config, row['protocol'])
+                        row['image_id'] = runtime['image_id']
+                        row['config_sha256'] = runtime['config_sha256']
+                    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                        row['issues'].append('missing/mismatched retained gateway runtime')
                 if mode == 'cpu' and gateway != 'direct':
                     trace = folder / 'traces' / f"{gateway}_{row['payload']}" / 'trace-manifest.json'
                     try:
                         capture = json.loads(trace.read_text())
+                        if not isinstance(capture, dict):
+                            raise ValueError('capture must be an object')
                         row['cpu'] = capture.get('cpu', {})
+                        if (capture.get('mode') != 'cpu' or not isinstance(row['cpu'], dict)
+                                or not positive(row['cpu'].get('samples'))):
+                            row['issues'].append('missing CPU samples or wrong collector mode')
                         row['capture_complete'] = capture.get('capture_complete') is True
+                        binding = capture.get('binding') or {}
+                        if (not isinstance(binding, dict) or binding.get('arm') != gateway
+                                or binding.get('pair') != pair or binding.get('payload') != row['payload']
+                                or binding.get('h2_protocol') != row['protocol']):
+                            row['issues'].append('CPU capture binding mismatch')
                         if not row['capture_complete']:
-                            row['issues'].extend(capture.get('issues') or ['incomplete CPU capture'])
+                            row['issues'].append('incomplete CPU capture')
                     except (OSError, ValueError):
                         row['issues'].append('missing CPU capture')
                 indexed[campaign, pair, gateway] = row
-    identities = {(r.get('host_id'), r.get('protocol'), r.get('payload'))
+    identities = {tuple(r.get(key) if type(r.get(key)) is kind else None
+                        for key, kind in (('host_id', str), ('protocol', str), ('payload', int)))
                   for r in result['observations'] if 'rps' in r}
     if len(identities) != 1 or any(None in identity for identity in identities):
         result['issues'].append('mixed/missing host or workload identity')
+    for gateway in ('ferrum', 'envoy'):
+        runtimes = {(r.get('image_id'), r.get('config_sha256'))
+                    for r in result['observations'] if r['gateway'] == gateway}
+        if len(runtimes) != 1 or any(None in identity for identity in runtimes):
+            result['issues'].append('mixed/missing runtime identity: ' + gateway)
     for gateway in ('direct', 'ferrum', 'envoy'):
         for campaign in ('counters', 'cpu'):
             values = []
@@ -142,7 +208,7 @@ def report(root):
                     rps_overhead_percent=100 * (observed['rps'] / ((before['rps'] + after['rps']) / 2) - 1),
                     control_drift_percent=100 * (after['rps'] / before['rps'] - 1)))
             result['calibration'].append(dict(gateway=gateway, campaign=campaign, pairs=values,
-                comparable=len(values) == 2 and all(abs(v['control_drift_percent']) <= 5 for v in values),
+                comparable=not result['issues'] and len(values) == 2 and all(abs(v['control_drift_percent']) <= 5 for v in values),
                 median_rps_overhead_percent=statistics.median(v['rps_overhead_percent'] for v in values) if values else None))
     result['complete'] = not result['issues'] and all(not row['issues'] for row in result['observations'])
     result['limits'] = ['Shared-runner calibration; two pairs are diagnostic, not a throughput claim.',

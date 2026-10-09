@@ -168,13 +168,19 @@ def clock_receipt():
                 boot_id=boot, time_namespace=namespace)
 
 
-def write_binding(output, *, runtime, config, sample, arm, pair, payload, raw_sample, client_exit):
+def write_binding(output, *, runtime, config, sample, arm, pair, payload, raw_sample, client_exit,
+                  h2_protocol=None):
     """Fixed data-only runner command; future client artifacts need not exist yet."""
     paths = dict(runtime=runtime, config=config, sample=sample,
                  raw_sample=raw_sample, client_exit=client_exit)
-    if (arm not in ('ferrum', 'ferrum-baseline', 'ferrum-exp-cutoff-one')
-            or type(pair) is not int or not 1 <= pair <= 4
-            or type(payload) is not int or payload not in (10240, 71680, 512000, 1048576, 5242880)):
+    if h2_protocol is not None:
+        if (h2_protocol not in ('http2', 'grpcs') or arm not in ('ferrum', 'envoy')
+                or type(pair) is not int or not 1 <= pair <= 2
+                or type(payload) is not int or payload not in (10240, 71680)):
+            raise ValueError('invalid H2 CPU trace binding selection')
+    elif (arm not in ('ferrum', 'ferrum-baseline', 'ferrum-exp-cutoff-one')
+          or type(pair) is not int or not 1 <= pair <= 4
+          or type(payload) is not int or payload not in (10240, 71680, 512000, 1048576, 5242880)):
         raise ValueError('invalid H1 trace binding selection')
     for path in (output, *paths.values()):
         if not Path(path).is_absolute() or '..' in Path(path).parts:
@@ -182,7 +188,10 @@ def write_binding(output, *, runtime, config, sample, arm, pair, payload, raw_sa
     destination = Path(output) / 'bind.json'
     if destination.exists():
         raise ValueError('H1 trace binding already exists')
-    write(destination, dict(paths, arm=arm, pair=pair, payload=payload))
+    binding = dict(paths, arm=arm, pair=pair, payload=payload)
+    if h2_protocol is not None:
+        binding['h2_protocol'] = h2_protocol
+    write(destination, binding)
 
 
 def identity(pid):
@@ -1249,6 +1258,8 @@ def supervise(args):
         result['input_hashes'] = dict(binding=hashlib.sha256(binding_bytes).hexdigest(),
             runtime=hashlib.sha256(runtime_bytes).hexdigest(), config=hashlib.sha256(config).hexdigest())
         h2_protocol = getattr(args, 'h2_protocol', None)
+        if binding.get('h2_protocol') != h2_protocol:
+            raise ValueError('trace binding protocol mismatch')
         if h2_protocol:
             if args.mode != 'cpu' or not args.enabled:
                 raise ValueError('H2 extension permits only enabled user CPU sampling')
@@ -1471,6 +1482,7 @@ def main():
     for field in ('output', 'runtime', 'config', 'sample', 'raw-sample', 'client-exit', 'arm'):
         s.add_argument('--' + field, required=True)
     s.add_argument('--pair', type=int, required=True); s.add_argument('--payload', type=int, required=True)
+    s.add_argument('--h2-protocol', choices=('http2', 'grpcs'))
     args = parser.parse_args()
     if (os.environ.get('GITHUB_ACTIONS'), os.environ.get('RUNNER_ENVIRONMENT'), platform.system(), platform.machine()) != (
             'true', 'github-hosted', 'Linux', 'x86_64'):
@@ -1480,7 +1492,7 @@ def main():
     if args.action == 'bind':
         write_binding(args.output, runtime=args.runtime, config=args.config, sample=args.sample,
                       arm=args.arm, pair=args.pair, payload=args.payload,
-                      raw_sample=args.raw_sample, client_exit=args.client_exit)
+                      raw_sample=args.raw_sample, client_exit=args.client_exit, h2_protocol=args.h2_protocol)
         return 0
     if os.geteuid() != 0:
         raise SystemExit('hosted passive supervisor requires root')
