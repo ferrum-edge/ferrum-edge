@@ -95,7 +95,8 @@ pub struct Oauth2Introspection {
     global_scope_claim: String,
     global_role_claim: String,
     consumer_identity_claim: String,
-    consumer_header_claim: String,
+    /// Unset means each provider displays its effective identity claim.
+    consumer_header_claim: Option<String>,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
     request_headers_to_redact: Vec<String>,
@@ -263,9 +264,11 @@ impl Oauth2Introspection {
         )?;
         let consumer_header_claim = match config_obj.get("consumer_header_claim") {
             Some(value) => {
-                parse_claim_path_value("consumer_header_claim", value, "oauth2_introspection")?
+                let claim =
+                    parse_claim_path_value("consumer_header_claim", value, "oauth2_introspection")?;
+                Some(claim)
             }
-            None => consumer_identity_claim.clone(),
+            None => None,
         };
 
         let global_identity_claim = consumer_identity_claim.as_str();
@@ -565,8 +568,9 @@ impl Oauth2Introspection {
                         "invalid_request",
                     );
                 }
+                let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
                 let (authorization, candidate) =
-                    match self.validate_token(&token, &candidates).await {
+                    match self.validate_token(&token, &candidates, proxy_hops).await {
                         Ok(result) => result,
                         Err(rejection) => return rejection.into_plugin_result(),
                     };
@@ -598,6 +602,7 @@ impl Oauth2Introspection {
         &self,
         token: &str,
         candidates: &[ProviderCandidate],
+        proxy_hops: Option<u8>,
     ) -> Result<(Arc<CachedAuthorization>, ProviderCandidate), IntrospectionRejection> {
         // Fan-out is only reachable after explicit shared-trust opt-in or when
         // the request carried the same token in multiple provider-specific
@@ -611,7 +616,7 @@ impl Oauth2Introspection {
                 continue;
             };
             match self
-                .introspect_with_provider(token, provider, candidate.provider_idx)
+                .introspect_with_provider(token, provider, candidate.provider_idx, proxy_hops)
                 .await
             {
                 Ok(claims) => return Ok((claims, candidate)),
@@ -640,6 +645,7 @@ impl Oauth2Introspection {
         token: &str,
         provider: &IntrospectionProvider,
         provider_idx: usize,
+        proxy_hops: Option<u8>,
     ) -> Result<Arc<CachedAuthorization>, IntrospectionDecision> {
         let now = Instant::now();
         match provider.cache.get(token, now) {
@@ -662,9 +668,8 @@ impl Oauth2Introspection {
             key: token_key,
             cell: Arc::clone(&cell),
         });
-        cell.get_or_init(|| self.introspect_uncached(token, provider, provider_idx))
-            .await
-            .clone()
+        let lookup = || self.introspect_uncached(token, provider, provider_idx, proxy_hops);
+        cell.get_or_init(lookup).await.clone()
     }
 
     async fn introspect_uncached(
@@ -672,6 +677,7 @@ impl Oauth2Introspection {
         token: &str,
         provider: &IntrospectionProvider,
         provider_idx: usize,
+        proxy_hops: Option<u8>,
     ) -> Result<Arc<CachedAuthorization>, IntrospectionDecision> {
         let now = Instant::now();
         // Another completed request can populate the cache between the caller's
@@ -778,6 +784,11 @@ impl Oauth2Introspection {
                 .timeout(provider.request_timeout)
                 .with_form_body(&params)?,
         };
+        // An introspection endpoint that resolves back to the gateway is
+        // refused at the proxy hop limit like a looping route (issue #6128).
+        // A coalesced in-flight lookup carries the hop count of the request
+        // that started it.
+        let request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops);
 
         // Redacted execution: the shared client's slow-call, retry, and
         // egress-denial diagnostics must record the endpoint ORIGIN, never a
@@ -944,7 +955,8 @@ impl Oauth2Introspection {
         let header_claim = provider
             .consumer_header_claim
             .as_deref()
-            .unwrap_or(&self.consumer_header_claim);
+            .or(self.consumer_header_claim.as_deref())
+            .unwrap_or(identity_claim);
         let identity = nonblank_identity(extract_claim_string(claims, identity_claim));
         let header_value = if header_claim == identity_claim {
             identity.clone()
@@ -972,13 +984,13 @@ impl Oauth2Introspection {
     fn resolve_identity(
         &self,
         authorization: &CachedAuthorization,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
         let identity = authorization.identity.as_deref().map(str::to_string);
         let header_value = authorization.identity_header.as_deref().map(str::to_string);
-        let consumer = identity
-            .as_deref()
-            .and_then(|id| consumer_index.find_by_identity(id));
+        // Provider claims do not implicitly resolve through the global
+        // Consumer username index.
+        let consumer = None;
         VerifyOutcome::success(consumer, identity, header_value)
     }
 

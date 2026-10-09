@@ -1,30 +1,33 @@
 #![allow(dead_code)]
-//! Host-side veth interface discovery for pod network namespaces.
+//! Host-side veth interface discovery for enrolled pods.
 //!
 //! When a pod is enrolled for eBPF capture, the node agent attaches a tc
-//! classifier to the host-side veth peer. This module resolves the veth
-//! interface name from the pod's network namespace.
+//! classifier to the host-side veth peer. Ownership is resolved only from
+//! host-side kernel state keyed by the registry-published pod address: an
+//! unambiguous `/32` or `/128` host route whose device is a dedicated host-side
+//! peer. Anything a pod can write (its own sysfs view, interface metadata in its
+//! network namespace) is never ownership evidence.
 
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "linux")]
 use std::path::Path;
 
-/// Discover the host-side veth interface for a pod by reading the pod-side
-/// interface's peer ifindex from the pod's sysfs view, then resolving that
-/// ifindex in the host network namespace.
+/// Discover the dedicated host-side interface the node agent attaches the
+/// inbound tc guard to.
 ///
-/// When the Kubernetes watch path does not have an explicit process id, the
-/// cgroup path is used to find a live process in the pod cgroup tree.
-/// Returns `None` if the interface cannot be determined (non-Linux or missing
-/// procfs/sysfs entries).
-pub fn discover_veth_for_pod(pod_pid: Option<u32>, cgroup_path: Option<&str>) -> Option<String> {
+/// IPv4 is tried first, then IPv6, each through the dedicated route resolvers
+/// below. The resolved device must also be a dedicated host-side peer (a
+/// distinct `iflink`, not a bridge). A subnet route names a shared CNI device
+/// such as `cni0` or `cilium_host`; frames forwarded between pods on the same
+/// bridge never cross it, so a guard there would fail open for every pod it
+/// claims to cover. Such pods resolve to `None` and their enrollment is refused.
+pub fn discover_dedicated_veth_for_pod(
+    pod_ip: Option<std::net::Ipv4Addr>,
+    pod_ip6: Option<std::net::Ipv6Addr>,
+) -> Option<String> {
     #[cfg(test)]
     {
         if let Some(name) = tests::test_override() {
@@ -33,50 +36,27 @@ pub fn discover_veth_for_pod(pod_pid: Option<u32>, cgroup_path: Option<&str>) ->
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(pid) = pod_pid
-            && let Some(iface) = discover_veth_linux(pid)
-        {
-            return Some(iface);
-        }
-
-        cgroup_path.and_then(discover_veth_from_cgroup)
+        resolve_dedicated_veth(
+            Path::new("/proc/net/route"),
+            Path::new("/proc/net/ipv6_route"),
+            Path::new("/sys/class/net"),
+            pod_ip,
+            pod_ip6,
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pod_pid;
-        let _ = cgroup_path;
-        None
-    }
-}
-
-/// Discover the host-side interface that routes to a local pod IP.
-///
-/// This is a fallback for runtimes that expose the pod cgroup and host route
-/// table but block reading peer indexes through `/proc/<pid>/root/sys` or
-/// `setns`. The caller should prefer PID/cgroup netns discovery first because
-/// it identifies the veth peer directly; the route fallback is still scoped by
-/// the tc program's destination-pod-IP map before any packet is classified.
-pub fn discover_veth_for_pod_ip(pod_ip: std::net::Ipv4Addr) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        resolve_iface_by_ipv4_route(Path::new("/proc/net/route"), pod_ip)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pod_ip;
+        let _ = (pod_ip, pod_ip6);
         None
     }
 }
 
 /// Discover a dedicated host-side interface for a local pod IPv4 address.
 ///
-/// Unlike [`discover_veth_for_pod_ip`], this is safe to use as an iptables
-/// ingress-interface capture boundary: it accepts only an unambiguous `/32`
-/// host route. A broader route can legitimately identify a shared CNI bridge
-/// for the eBPF caller above, whose pod-IP map narrows classification, but using
-/// that bridge in `iptables -i` would capture traffic from every attached pod.
+/// Only an unambiguous `/32` host route qualifies. A broader route commonly
+/// names a shared CNI bridge, and using that device as a capture boundary
+/// would cover (or fail to cover) every attached pod rather than this one.
 pub fn discover_dedicated_veth_for_pod_ip(pod_ip: std::net::Ipv4Addr) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -93,9 +73,9 @@ pub fn discover_dedicated_veth_for_pod_ip(pod_ip: std::net::Ipv4Addr) -> Option<
 /// Discover a dedicated host-side interface for a local pod IPv6 address.
 ///
 /// The IPv6 counterpart of [`discover_dedicated_veth_for_pod_ip`], and what lets
-/// an IPv6-only enrolled pod use a deployment that shares neither host `/proc`
-/// nor the `setns` privileges: the IPv4 fallback is keyed on an address such a
-/// pod does not have, so without this it could only ever be refused.
+/// an IPv6-only enrolled pod resolve at all: the IPv4 lookup is keyed on an
+/// address such a pod does not have, so without this it could only ever be
+/// refused.
 ///
 /// `/proc/net/ipv6_route` is parsed strictly and the answer is fail-closed:
 /// only an `RTF_UP` `/128` host route participates, and two DIFFERENT devices
@@ -118,152 +98,18 @@ pub fn discover_dedicated_veth_for_pod_ip6(pod_ip: std::net::Ipv6Addr) -> Option
 }
 
 #[cfg(target_os = "linux")]
-fn discover_veth_linux(pid: u32) -> Option<String> {
-    let peer = read_pod_peer_indexes_from_proc_root(pid).or_else(|| read_pod_peer_indexes(pid))?;
-    resolve_iface_by_peer(peer)
-}
-
-#[cfg(target_os = "linux")]
-fn discover_veth_from_cgroup(cgroup_path: &str) -> Option<String> {
-    let mut dirs = vec![Path::new(cgroup_path).to_path_buf()];
-    let mut scanned_dirs = 0usize;
-
-    while let Some(dir) = dirs.pop() {
-        scanned_dirs += 1;
-        if scanned_dirs > 1024 {
-            break;
-        }
-
-        if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-            for pid in procs.split_whitespace().filter_map(|raw| raw.parse().ok()) {
-                if let Some(iface) = discover_veth_linux(pid) {
-                    return Some(iface);
-                }
-            }
-        }
-
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
-            if descend {
-                dirs.push(entry.path());
-            }
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PodPeerIndexes {
-    pod_ifindex: u32,
-    host_ifindex: u32,
-}
-
-#[cfg(target_os = "linux")]
-fn read_pod_peer_indexes(pid: u32) -> Option<PodPeerIndexes> {
-    std::thread::spawn(move || {
-        let _guard = NetnsGuard::enter_pod_netns(pid)?;
-        read_pod_peer_indexes_from_net_class(Path::new("/sys/class/net"))
-    })
-    .join()
-    .ok()
-    .flatten()
-}
-
-#[cfg(target_os = "linux")]
-fn read_pod_peer_indexes_from_proc_root(pid: u32) -> Option<PodPeerIndexes> {
-    read_pod_peer_indexes_from_proc_root_at(Path::new("/proc"), pid)
-}
-
-#[cfg(target_os = "linux")]
-fn read_pod_peer_indexes_from_proc_root_at(proc_root: &Path, pid: u32) -> Option<PodPeerIndexes> {
-    read_pod_peer_indexes_from_net_class(
-        &proc_root.join(pid.to_string()).join("root/sys/class/net"),
-    )
-}
-
-/// Read the host peer interface index from the pod's network namespace sysfs.
-///
-/// `/proc/{pid}/net/*` exposes the pod-side interface index, not the host-side
-/// veth peer. The pod-side sysfs `iflink` value points at the peer ifindex, so
-/// resolve that value against host `/sys/class/net/*/ifindex`.
-#[cfg(target_os = "linux")]
-fn read_pod_peer_indexes_from_net_class(net_class: &Path) -> Option<PodPeerIndexes> {
-    if let Some(peer) = read_peer_indexes_for_iface(&net_class.join("eth0")) {
-        return Some(peer);
-    }
-
-    for (_, iface_path) in sorted_non_primary_interfaces(net_class)? {
-        if let Some(peer) = read_peer_indexes_for_iface(&iface_path) {
-            return Some(peer);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_peer_indexes_for_iface(iface_path: &Path) -> Option<PodPeerIndexes> {
-    if !iface_path.exists() {
-        return None;
-    }
-    let pod_ifindex = read_u32_from_file(&iface_path.join("ifindex"))?;
-    let host_ifindex = read_u32_from_file(&iface_path.join("iflink"))?;
-    if pod_ifindex == host_ifindex {
-        return None;
-    }
-    Some(PodPeerIndexes {
-        pod_ifindex,
-        host_ifindex,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn sorted_non_primary_interfaces(net_class: &Path) -> Option<Vec<(String, std::path::PathBuf)>> {
-    let mut entries = std::fs::read_dir(net_class)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let iface_name = entry.file_name().to_string_lossy().to_string();
-            (iface_name != "lo" && iface_name != "eth0").then_some((iface_name, entry.path()))
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    Some(entries)
-}
-
-#[cfg(target_os = "linux")]
-fn read_u32_from_file(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-/// Resolve a network interface name by its ifindex from sysfs.
-#[cfg(target_os = "linux")]
-fn resolve_iface_by_peer(peer: PodPeerIndexes) -> Option<String> {
-    resolve_iface_by_peer_in_sysfs(Path::new("/sys/class/net"), peer)
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_iface_by_peer_in_sysfs(sysfs_net: &Path, peer: PodPeerIndexes) -> Option<String> {
-    let entries = std::fs::read_dir(sysfs_net).ok()?;
-    let mut ifindex_match = None;
-    for entry in entries.flatten() {
-        let iface_name = entry.file_name().to_string_lossy().to_string();
-        let iface_path = entry.path();
-        if read_u32_from_file(&iface_path.join("ifindex")) != Some(peer.host_ifindex) {
-            continue;
-        }
-        if read_u32_from_file(&iface_path.join("iflink")) == Some(peer.pod_ifindex) {
-            return Some(iface_name);
-        }
-        if ifindex_match.is_none() {
-            ifindex_match = Some(iface_name);
-        }
-    }
-    ifindex_match
+fn resolve_dedicated_veth(
+    route_path: &Path,
+    route6_path: &Path,
+    sysfs_net: &Path,
+    pod_ip: Option<Ipv4Addr>,
+    pod_ip6: Option<Ipv6Addr>,
+) -> Option<String> {
+    let ipv4 = pod_ip.and_then(|ip| resolve_dedicated_iface_by_ipv4_route(route_path, ip));
+    let ipv6 = || pod_ip6.and_then(|ip| resolve_dedicated_iface_by_ipv6_route(route6_path, ip));
+    let name = ipv4.or_else(ipv6)?;
+    crate::proxy::host_udp_capture::dedicated_host_ifindex(sysfs_net, &name).ok()?;
+    Some(name)
 }
 
 /// Upper bound on a kernel route table this module will parse.
@@ -292,27 +138,13 @@ fn read_route_table(route_path: &Path) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<String> {
-    resolve_iface_by_ipv4_route_mode(route_path, pod_ip, false)
-}
-
-#[cfg(target_os = "linux")]
 fn resolve_dedicated_iface_by_ipv4_route(route_path: &Path, pod_ip: Ipv4Addr) -> Option<String> {
     if pod_ip.is_unspecified() || pod_ip.is_loopback() || pod_ip.is_multicast() {
         return None;
     }
-    resolve_iface_by_ipv4_route_mode(route_path, pod_ip, true)
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_iface_by_ipv4_route_mode(
-    route_path: &Path,
-    pod_ip: Ipv4Addr,
-    require_host_route: bool,
-) -> Option<String> {
     let routes = read_route_table(route_path)?;
     let ip_raw = u32::from_le_bytes(pod_ip.octets());
-    let mut best: Option<(u32, String)> = None;
+    let mut resolved: Option<String> = None;
     let mut ambiguous = false;
 
     for line in routes.lines().skip(1) {
@@ -333,31 +165,19 @@ fn resolve_iface_by_ipv4_route_mode(
         ) else {
             continue;
         };
-        if flags & 0x1 == 0 || mask == 0 || (require_host_route && mask != u32::MAX) {
-            continue;
-        }
-        if ip_raw & mask != destination & mask {
+        // Only an `RTF_UP` host route is evidence that this device belongs to
+        // this pod. A covering subnet route commonly names a shared CNI bridge.
+        if flags & 0x1 == 0 || mask != u32::MAX || ip_raw != destination {
             continue;
         }
 
-        let prefix_len = mask.count_ones();
-        if let Some((best_prefix, best_iface)) = best.as_ref() {
-            if require_host_route && prefix_len == *best_prefix {
-                ambiguous |= best_iface.as_str() != iface;
-            }
-            if prefix_len <= *best_prefix {
-                continue;
-            }
+        match resolved.as_deref() {
+            Some(existing) => ambiguous |= existing != iface,
+            None => resolved = Some(iface.to_string()),
         }
-        best = Some((prefix_len, iface.to_string()));
-        ambiguous = false;
     }
 
-    if ambiguous {
-        None
-    } else {
-        best.map(|(_, iface)| iface)
-    }
+    if ambiguous { None } else { resolved }
 }
 
 #[cfg(target_os = "linux")]
@@ -395,9 +215,9 @@ fn resolve_dedicated_iface_by_ipv6_route(route_path: &Path, pod_ip: Ipv6Addr) ->
             continue;
         };
         // Only a host route is evidence that this device belongs to this pod.
-        // A covering subnet route commonly names a shared CNI bridge; placing
-        // that device in an ingress-interface capture rule would intercept all
-        // attached pods, including unenrolled ones.
+        // A covering subnet route commonly names a shared CNI bridge; using that
+        // device as a capture boundary would cover every attached pod, and a tc
+        // guard there would miss frames forwarded between them.
         if flags & 0x1 == 0 || prefix_len != 128 {
             continue;
         }
@@ -463,45 +283,6 @@ fn parse_route_hex_u32(raw: &str) -> Option<u32> {
     u32::from_str_radix(raw, 16).ok()
 }
 
-#[cfg(target_os = "linux")]
-struct NetnsGuard {
-    original: File,
-}
-
-#[cfg(target_os = "linux")]
-impl NetnsGuard {
-    fn enter_pod_netns(pid: u32) -> Option<Self> {
-        let original = File::open("/proc/self/ns/net").ok()?;
-        let target = File::open(format!("/proc/{pid}/ns/net")).ok()?;
-        if same_file(&original, &target) {
-            return None;
-        }
-        setns(target.as_raw_fd())?;
-        Some(Self { original })
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for NetnsGuard {
-    fn drop(&mut self) {
-        let _ = setns(self.original.as_raw_fd());
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn same_file(left: &File, right: &File) -> bool {
-    match (left.metadata(), right.metadata()) {
-        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
-        _ => false,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn setns(fd: std::os::fd::RawFd) -> Option<()> {
-    let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
-    (rc == 0).then_some(())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -524,13 +305,13 @@ pub(crate) mod tests {
     }
 
     thread_local! {
-        /// Test-only override consulted by `discover_veth_for_pod` before
-        /// it tries procfs/sysfs. Set via [`TestOverrideGuard`] in tests
-        /// that exercise `handle_pod_added` (or any other production code
-        /// that calls `discover_veth_for_pod`) on a host that does not
-        /// have the pod's network namespace materialised (which is every
-        /// machine running `cargo test`). The guard restores the previous
-        /// value on drop so concurrent tests stay isolated.
+        /// Test-only override consulted by `discover_dedicated_veth_for_pod`
+        /// before it reads the host route tables. Set via
+        /// [`TestOverrideGuard`] in tests that exercise `handle_pod_added`
+        /// (or any other production code that resolves the pod veth) on a
+        /// host that has no route to the synthetic pod address (which is
+        /// every machine running `cargo test`). The guard restores the
+        /// previous value on drop so concurrent tests stay isolated.
         static TEST_VETH_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
@@ -542,8 +323,8 @@ pub(crate) mod tests {
 
     /// Drop guard that scopes a test-only veth override to a single test.
     /// Pin one of these on the stack before calling into production code
-    /// that may invoke `discover_veth_for_pod`; previous value is restored
-    /// when the guard drops, so nested overrides still work correctly.
+    /// that may invoke `discover_dedicated_veth_for_pod`; previous value is
+    /// restored when the guard drops, so nested overrides still work correctly.
     pub struct TestOverrideGuard {
         previous: Option<String>,
     }
@@ -569,144 +350,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn discover_veth_no_pid_returns_none() {
-        assert!(discover_veth_for_pod(None, None).is_none());
-    }
-
-    #[test]
-    fn discover_veth_nonexistent_pid() {
-        assert!(discover_veth_for_pod(Some(999_999_999), None).is_none());
-    }
-
-    #[test]
-    fn discover_veth_nonexistent_cgroup_returns_none() {
-        assert!(discover_veth_for_pod(None, Some("/definitely/not/a/cgroup")).is_none());
+    fn discover_dedicated_veth_without_pod_addresses_returns_none() {
+        assert!(discover_dedicated_veth_for_pod(None, None).is_none());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn read_pod_peer_ifindex_uses_iflink_not_pod_ifindex() {
-        let dir = tempdir().unwrap();
-        let net = dir.path();
-        std::fs::create_dir(net.join("lo")).unwrap();
-        write(&net.join("lo/ifindex"), "1\n");
-        write(&net.join("lo/iflink"), "1\n");
-
-        std::fs::create_dir(net.join("eth0")).unwrap();
-        write(&net.join("eth0/ifindex"), "7\n");
-        write(&net.join("eth0/iflink"), "42\n");
-
-        assert_eq!(
-            read_pod_peer_indexes_from_net_class(net),
-            Some(PodPeerIndexes {
-                pod_ifindex: 7,
-                host_ifindex: 42
-            })
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn read_pod_peer_ifindex_skips_non_veth_like_self_links() {
-        let dir = tempdir().unwrap();
-        let net = dir.path();
-        std::fs::create_dir(net.join("eth0")).unwrap();
-        write(&net.join("eth0/ifindex"), "7\n");
-        write(&net.join("eth0/iflink"), "7\n");
-
-        assert_eq!(read_pod_peer_indexes_from_net_class(net), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn read_pod_peer_ifindex_prefers_eth0_over_secondary_interfaces() {
-        let dir = tempdir().unwrap();
-        let net = dir.path();
-        std::fs::create_dir(net.join("net1")).unwrap();
-        write(&net.join("net1/ifindex"), "11\n");
-        write(&net.join("net1/iflink"), "99\n");
-
-        std::fs::create_dir(net.join("eth0")).unwrap();
-        write(&net.join("eth0/ifindex"), "7\n");
-        write(&net.join("eth0/iflink"), "42\n");
-
-        assert_eq!(
-            read_pod_peer_indexes_from_net_class(net),
-            Some(PodPeerIndexes {
-                pod_ifindex: 7,
-                host_ifindex: 42
-            })
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn read_pod_peer_ifindex_uses_proc_root_sysfs_view() {
-        let dir = tempdir().unwrap();
-        let net = dir.path().join("123/root/sys/class/net");
-        std::fs::create_dir_all(net.join("eth0")).unwrap();
-        write(&net.join("eth0/ifindex"), "7\n");
-        write(&net.join("eth0/iflink"), "42\n");
-
-        assert_eq!(
-            read_pod_peer_indexes_from_proc_root_at(dir.path(), 123),
-            Some(PodPeerIndexes {
-                pod_ifindex: 7,
-                host_ifindex: 42
-            })
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_iface_by_peer_uses_host_ifindex_and_reciprocal_iflink() {
-        let dir = tempdir().unwrap();
-        let net = dir.path();
-        std::fs::create_dir(net.join("vethabc")).unwrap();
-        write(&net.join("vethabc/ifindex"), "42\n");
-        write(&net.join("vethabc/iflink"), "7\n");
-        std::fs::create_dir(net.join("cni0")).unwrap();
-        write(&net.join("cni0/ifindex"), "9\n");
-        write(&net.join("cni0/iflink"), "9\n");
-
-        assert_eq!(
-            resolve_iface_by_peer_in_sysfs(
-                net,
-                PodPeerIndexes {
-                    pod_ifindex: 7,
-                    host_ifindex: 42
-                }
-            )
-            .as_deref(),
-            Some("vethabc")
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_iface_by_peer_accepts_unique_host_ifindex_without_reciprocal_iflink() {
-        let dir = tempdir().unwrap();
-        let net = dir.path();
-        std::fs::create_dir(net.join("vethabc")).unwrap();
-        write(&net.join("vethabc/ifindex"), "42\n");
-        write(&net.join("vethabc/iflink"), "0\n");
-
-        assert_eq!(
-            resolve_iface_by_peer_in_sysfs(
-                net,
-                PodPeerIndexes {
-                    pod_ifindex: 7,
-                    host_ifindex: 42
-                }
-            )
-            .as_deref(),
-            Some("vethabc")
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn ipv4_route_resolution_preserves_ebpf_scope_but_capture_requires_a_host_route() {
+    fn ipv4_route_resolution_requires_a_host_route() {
         let dir = tempdir().unwrap();
         let route = dir.path().join("route");
         write(
@@ -731,23 +381,13 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
         );
 
         assert_eq!(
-            resolve_iface_by_ipv4_route(&route, "10.244.1.5".parse().unwrap()).as_deref(),
-            Some("vethpod")
-        );
-        assert_eq!(
-            resolve_iface_by_ipv4_route(&route, "10.244.1.9".parse().unwrap()),
-            Some("cni0".to_string()),
-            "the eBPF fallback may attach to a covering bridge because its pod-IP map narrows \
-             classification"
-        );
-        assert_eq!(
             resolve_dedicated_iface_by_ipv4_route(&route, "10.244.1.5".parse().unwrap()).as_deref(),
             Some("vethpod")
         );
         assert_eq!(
             resolve_dedicated_iface_by_ipv4_route(&route, "10.244.1.9".parse().unwrap()),
             None,
-            "iptables ingress capture must reject the same shared-bridge route"
+            "a covering bridge route is not per-pod ownership evidence"
         );
     }
 
@@ -913,15 +553,153 @@ vethother {other} 00000000 0001 0 0 0 {host} 0 0 0
         );
     }
 
+    /// Host sysfs entry for one interface: `ifindex`, `iflink`, and an optional
+    /// `bridge/` directory marking a bridge master.
+    #[cfg(target_os = "linux")]
+    fn sysfs_iface(sysfs: &Path, name: &str, ifindex: u32, iflink: u32, bridge: bool) {
+        let iface = sysfs.join(name);
+        std::fs::create_dir_all(&iface).unwrap();
+        write(&iface.join("ifindex"), &format!("{ifindex}\n"));
+        write(&iface.join("iflink"), &format!("{iflink}\n"));
+        if bridge {
+            std::fs::create_dir(iface.join("bridge")).unwrap();
+        }
+    }
+
+    /// A bridge CNI (`cni0`), Cilium's default pod-CIDR route through the shared
+    /// `cilium_host` device, a self-linked host device (`dummy0`), and one
+    /// dedicated per-pod veth per family.
+    #[cfg(target_os = "linux")]
+    fn shared_and_dedicated_node(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let route = dir.join("route");
+        write(
+            &route,
+            &format!(
+                "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+                 cni0 {subnet} 00000000 0001 0 0 0 {mask24} 0 0 0\n\
+                 cilium_host {cilium} 00000000 0001 0 0 0 {mask24} 0 0 0\n\
+                 dummy0 {dummy} 00000000 0001 0 0 0 {host} 0 0 0\n\
+                 vethpod {pod} 00000000 0001 0 0 0 {host} 0 0 0\n",
+                subnet = route_hex("10.244.1.0"),
+                cilium = route_hex("10.244.2.0"),
+                dummy = route_hex("10.244.1.7"),
+                pod = route_hex("10.244.1.5"),
+                mask24 = route_hex("255.255.255.0"),
+                host = route_hex("255.255.255.255"),
+            ),
+        );
+        let route6 = dir.join("ipv6_route");
+        write(
+            &route6,
+            &format!(
+                "{}\n{}\n",
+                route6_line("fd00:0:0:1::", 64, 0x1, "cni0"),
+                route6_line("fd00:0:0:1::5", 128, 0x1, "vethpod6"),
+            ),
+        );
+        let sysfs = dir.join("sys-class-net");
+        sysfs_iface(&sysfs, "cni0", 3, 3, true);
+        // `cilium_host` is one end of a host-local veth pair, so only its
+        // subnet route keeps it out; the peer check alone would not.
+        sysfs_iface(&sysfs, "cilium_host", 4, 5, false);
+        sysfs_iface(&sysfs, "dummy0", 6, 6, false);
+        sysfs_iface(&sysfs, "vethpod", 42, 7, false);
+        sysfs_iface(&sysfs, "vethpod6", 43, 8, false);
+        (route, route6)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_agent_resolver_attaches_only_to_a_dedicated_host_peer() {
+        let dir = tempdir().unwrap();
+        let (route, route6) = shared_and_dedicated_node(dir.path());
+        let sysfs = dir.path().join("sys-class-net");
+        let resolve = |v4: Option<&str>, v6: Option<&str>| {
+            resolve_dedicated_veth(
+                &route,
+                &route6,
+                &sysfs,
+                v4.map(|ip| ip.parse().unwrap()),
+                v6.map(|ip| ip.parse().unwrap()),
+            )
+        };
+
+        assert_eq!(
+            resolve(Some("10.244.1.5"), None).as_deref(),
+            Some("vethpod")
+        );
+        assert_eq!(
+            resolve(None, Some("fd00:0:0:1::5")).as_deref(),
+            Some("vethpod6"),
+            "an IPv6-only pod resolves through its /128 host route"
+        );
+        assert_eq!(
+            resolve(Some("10.244.1.9"), None),
+            None,
+            "a pod covered only by the bridge subnet route must not attach to cni0"
+        );
+        assert_eq!(
+            resolve(Some("10.244.2.5"), None),
+            None,
+            "a pod behind Cilium's pod-CIDR route must not attach to cilium_host"
+        );
+        assert_eq!(
+            resolve(Some("10.244.1.7"), None),
+            None,
+            "a /32 to a self-linked device is not a dedicated host peer"
+        );
+        assert_eq!(
+            resolve(None, Some("fd00:0:0:1::9")),
+            None,
+            "an IPv6 subnet route must not be accepted for the node agent"
+        );
+        assert_eq!(
+            resolve(Some("10.244.1.9"), Some("fd00:0:0:1::5")).as_deref(),
+            Some("vethpod6"),
+            "a dual-stack pod with only an IPv6 host route still resolves its own veth"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_agent_resolver_refuses_a_host_route_to_a_bridge_master() {
+        let dir = tempdir().unwrap();
+        let route = dir.path().join("route");
+        write(
+            &route,
+            &format!(
+                "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+                 cni0 {pod} 00000000 0001 0 0 0 {host} 0 0 0\n",
+                pod = route_hex("10.244.1.5"),
+                host = route_hex("255.255.255.255"),
+            ),
+        );
+        let sysfs = dir.path().join("sys-class-net");
+        // A bridge master can carry a distinct link index; its `bridge/`
+        // directory alone must refuse it.
+        sysfs_iface(&sysfs, "cni0", 3, 9, true);
+
+        assert_eq!(
+            resolve_dedicated_veth(
+                &route,
+                &dir.path().join("missing-ipv6-route"),
+                &sysfs,
+                Some("10.244.1.5".parse().unwrap()),
+                None,
+            ),
+            None
+        );
+    }
+
     #[test]
     fn discover_veth_test_override_takes_precedence() {
         let _guard = TestOverrideGuard::new("vethTEST");
         assert_eq!(
-            discover_veth_for_pod(None, None).as_deref(),
+            discover_dedicated_veth_for_pod(None, None).as_deref(),
             Some("vethTEST")
         );
         assert_eq!(
-            discover_veth_for_pod(Some(999_999_999), None).as_deref(),
+            discover_dedicated_veth_for_pod(Some("203.0.113.9".parse().unwrap()), None).as_deref(),
             Some("vethTEST")
         );
     }

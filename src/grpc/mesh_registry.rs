@@ -55,17 +55,37 @@ impl MeshNodeRegistry {
     }
 
     pub fn insert(&self, info: MeshNodeInfo) {
-        self.nodes.insert(info.node_id.clone(), info);
+        let key = super::admission::authenticated_principal_key(&info.namespace, &info.node_id);
+        self.nodes.insert(key, info);
     }
 
-    pub fn remove_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
-        self.nodes.remove_if(node_id, |_, info| {
-            info.connected_at == expected_connected_at
-        });
+    pub fn remove_if_stale(
+        &self,
+        namespace: &str,
+        node_id: &str,
+        expected_connected_at: DateTime<Utc>,
+    ) {
+        let key = super::admission::authenticated_principal_key(namespace, node_id);
+        self.remove_if_stale_key(&key, expected_connected_at);
     }
 
-    pub fn touch_heartbeat(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
-        if let Some(mut entry) = self.nodes.get_mut(node_id)
+    pub(crate) fn remove_if_stale_key(&self, key: &str, expected_connected_at: DateTime<Utc>) {
+        self.nodes
+            .remove_if(key, |_, info| info.connected_at == expected_connected_at);
+    }
+
+    pub fn touch_heartbeat(
+        &self,
+        namespace: &str,
+        node_id: &str,
+        expected_connected_at: DateTime<Utc>,
+    ) {
+        let key = super::admission::authenticated_principal_key(namespace, node_id);
+        self.touch_heartbeat_key(&key, expected_connected_at);
+    }
+
+    pub(crate) fn touch_heartbeat_key(&self, key: &str, expected_connected_at: DateTime<Utc>) {
+        if let Some(mut entry) = self.nodes.get_mut(key)
             && entry.connected_at == expected_connected_at
         {
             entry.last_heartbeat_at = Utc::now();
@@ -149,7 +169,7 @@ mod tests {
 
         registry.insert(registry_info("node-a", "old-version", old_connected_at));
         registry.insert(registry_info("node-a", "new-version", new_connected_at));
-        registry.remove_if_stale("node-a", old_connected_at);
+        registry.remove_if_stale("ferrum", "node-a", old_connected_at);
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 1);
@@ -165,7 +185,7 @@ mod tests {
         registry.insert(registry_info("node-a", "mesh-version", connected_at));
         assert_eq!(registry.len(), 1);
 
-        registry.remove_if_stale("node-a", connected_at);
+        registry.remove_if_stale("ferrum", "node-a", connected_at);
         assert!(registry.is_empty());
     }
 
@@ -176,10 +196,10 @@ mod tests {
         let new_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
 
         registry.insert(registry_info("node-a", "mesh-version", new_connected_at));
-        registry.touch_heartbeat("node-a", old_connected_at);
+        registry.touch_heartbeat("ferrum", "node-a", old_connected_at);
         let before = registry.snapshot()[0].last_heartbeat_at;
 
-        registry.touch_heartbeat("node-a", new_connected_at);
+        registry.touch_heartbeat("ferrum", "node-a", new_connected_at);
 
         let after = registry.snapshot()[0].last_heartbeat_at;
         assert_eq!(before, new_connected_at);

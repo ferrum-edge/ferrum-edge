@@ -349,7 +349,7 @@ Workload API mount instead of hand-writing the volume:
 ambient:
   spire:
     enabled: true
-    workloadSpiffeId: spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)
+    workloadSpiffeId: spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)
     socketHostPath: /run/spire/sockets
     socketMountPath: /run/spire/sockets
     socketFileName: agent.sock
@@ -368,6 +368,9 @@ For NodeWaypoint, `workloadSpiffeId` must include the chart-managed
 distinct SPIFFE ID and downstream policy can pin the exact node waypoint peer.
 The Kubernetes discovery path resolves that token from `spec.nodeName` when it
 publishes `Workload.node_waypoint.spiffe_id`.
+The ambient DaemonSet runs as the `ferrum-mesh-ambient` ServiceAccount, so SPIRE
+registration entries select `k8s:sa:ferrum-mesh-ambient`, and the conventional
+SPIFFE path segment is `sa/ferrum-mesh-ambient`.
 
 The startup contract is implemented by `start_spire_agent_mesh_svid_source` in
 [`src/modes/mesh/mod.rs`](../src/modes/mesh/mod.rs): Ferrum waits up to 30s for

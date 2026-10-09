@@ -124,6 +124,7 @@ fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
@@ -684,29 +685,104 @@ async fn retention_gap_reports_cursor_behind_retained_sequence() {
     );
 }
 
+/// Serializes the tests that lower the change-row cap: they share the
+/// `ferrum` namespace, and one test's restore must not land mid-way through
+/// another.
+static CHANGE_LOG_CAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lowers the incremental poll's change-row cap for one namespace and restores
+/// it on drop, even if the test panics.
+struct ChangeLogCap {
+    namespace: &'static str,
+    _serialized: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ChangeLogCap {
+    fn set(namespace: &'static str, max_rows: usize) -> Self {
+        let serialized = CHANGE_LOG_CAP_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ferrum_edge::_test_support::set_change_log_max_rows_for_test(namespace, Some(max_rows));
+        Self {
+            namespace,
+            _serialized: serialized,
+        }
+    }
+}
+
+impl Drop for ChangeLogCap {
+    fn drop(&mut self) {
+        ferrum_edge::_test_support::set_change_log_max_rows_for_test(self.namespace, None);
+    }
+}
+
+/// 10,000 change rows inserted by one CTE (sequences 1..=10,000); binds the
+/// namespace, then the timestamp.
+const CTE_10K_UPSTREAM_DELETES: &str = "WITH digits(d) AS ( \
+         VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9) \
+     ), seq(n) AS ( \
+         SELECT ones.d + tens.d * 10 + hundreds.d * 100 + thousands.d * 1000 + 1 \
+         FROM digits AS ones \
+         CROSS JOIN digits AS tens \
+         CROSS JOIN digits AS hundreds \
+         CROSS JOIN digits AS thousands \
+     ) \
+     INSERT INTO config_changes \
+         (sequence, namespace, resource_type, resource_id, operation, created_at) \
+     SELECT n, ?, 'upstream', 'upstream-' || n, 'delete', ? FROM seq";
+
+/// A batch past one 10,000-row page still applies as a delta: the poll pages
+/// through the change log instead of forcing a full reload (issue #6058).
+#[tokio::test(flavor = "multi_thread")]
+async fn change_log_batch_past_one_page_loads_incrementally() {
+    // Its own namespace: the cap-lowering tests below override `ferrum`.
+    const NAMESPACE: &str = "change-log-paging";
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+    sqlx::query(CTE_10K_UPSTREAM_DELETES)
+        .bind(NAMESPACE)
+        .bind(&ts)
+        .execute(&store.pool())
+        .await
+        .expect("first 10,000 config_changes rows");
+    for n in 10_001..=10_500 {
+        sqlx::query(
+            "INSERT INTO config_changes \
+                 (sequence, namespace, resource_type, resource_id, operation, created_at) \
+             VALUES (?, ?, 'upstream', ?, 'delete', ?)",
+        )
+        .bind(n as i64)
+        .bind(NAMESPACE)
+        .bind(format!("upstream-{n}"))
+        .bind(&ts)
+        .execute(&store.pool())
+        .await
+        .expect("extra config_changes row");
+    }
+
+    let result = store
+        .load_incremental_config(NAMESPACE, 0)
+        .await
+        .expect("a 10,500-row backlog must load incrementally");
+    assert_eq!(
+        result.sequence_cursor, 10_500,
+        "the cursor covers every page"
+    );
+    assert_eq!(result.removed_upstream_ids.len(), 10_500);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn saturated_change_log_batch_forces_full_reload_fallback() {
     let (store, _temp_dir) = sqlite_store().await;
+    let _cap = ChangeLogCap::set("ferrum", 10_000);
     let ts = Utc::now().to_rfc3339();
 
-    sqlx::query(
-        "WITH digits(d) AS ( \
-             VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9) \
-         ), seq(n) AS ( \
-             SELECT ones.d + tens.d * 10 + hundreds.d * 100 + thousands.d * 1000 + 1 \
-             FROM digits AS ones \
-             CROSS JOIN digits AS tens \
-             CROSS JOIN digits AS hundreds \
-             CROSS JOIN digits AS thousands \
-         ) \
-         INSERT INTO config_changes \
-             (sequence, namespace, resource_type, resource_id, operation, created_at) \
-         SELECT n, 'ferrum', 'upstream', 'upstream-' || n, 'delete', ? FROM seq",
-    )
-    .bind(&ts)
-    .execute(&store.pool())
-    .await
-    .expect("manual saturated config_changes insert must succeed");
+    sqlx::query(CTE_10K_UPSTREAM_DELETES)
+        .bind("ferrum")
+        .bind(&ts)
+        .execute(&store.pool())
+        .await
+        .expect("manual saturated config_changes insert must succeed");
 
     let err = match store.load_incremental_config("ferrum", 0).await {
         Ok(_) => panic!("saturated change-log batch must force caller to full reload"),
@@ -1095,8 +1171,9 @@ async fn full_reload_publishes_when_the_change_watermark_read_fails() {
 ///
 /// Each proxy insert records one `config_changes` row and each of its two
 /// proxy-scoped plugin configs records two (the plugin row plus the proxy
-/// re-upsert), so 2,100 proxies append 10,500 rows — past the 10,000-row
-/// change-batch limit, exactly the shape one scale-harness wave produces.
+/// re-upsert), so 2,100 proxies append 10,500 rows — past the 10,000-row cap
+/// the test sets, the shape one scale-harness wave produces against the
+/// production cap.
 const SATURATED_BATCH_PROXIES: usize = 2_100;
 
 fn scale_proxy_plugin_config(
@@ -1212,6 +1289,9 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
     use std::sync::Arc;
 
     let (store, _temp_dir) = sqlite_store().await;
+    // The fixture's 10,500 rows saturate a 10,000-row cap, as a scale wave
+    // would saturate the production cap (issue #6058 raised it to 100,000).
+    let _cap = ChangeLogCap::set("ferrum", 10_000);
     let db: Arc<dyn DatabaseBackend> = Arc::new(store);
     let proxy_state = scale_proxy_state();
     let apply = RuntimeConfigApply::new("ferrum", 0);

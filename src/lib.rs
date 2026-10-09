@@ -4,6 +4,8 @@
 //! functional tests, and custom plugins. The binary imports these shared modules
 //! and owns its startup pipeline, so library consumers do not compile CLI startup.
 
+#![deny(clippy::disallowed_methods)]
+
 /// The Ferrum Edge binary/crate version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -219,6 +221,24 @@ pub mod _test_support {
             None,
         )
         .await
+    }
+
+    /// Run inbound CONNECT relay synthesis exactly as the dispatcher's
+    /// route-miss arm does (issue #6110): the refusal's
+    /// `mesh.relay.denial_reason`, or `None` when a relay proxy is synthesized.
+    /// `authority` is the CONNECT `:authority` (`host:port`).
+    pub fn inbound_connect_relay_synthesis_refusal_for_test(
+        authority: &str,
+        mesh: &crate::modes::mesh::config::MeshConfig,
+        is_udp_connect: bool,
+        accepted_local_ip: Option<std::net::IpAddr>,
+    ) -> Option<&'static str> {
+        crate::proxy::inbound_connect_relay_synthesis_refusal_for_test(
+            authority,
+            mesh,
+            is_udp_connect,
+            accepted_local_ip,
+        )
     }
 
     pub fn websocket_backend_path_for_test(
@@ -1503,6 +1523,76 @@ pub mod _test_support {
         crate::plugin_cache::install_mesh_route_dispatch_finalizer(plugins)
     }
 
+    /// Merge one scoped instance over `globals` the way every plugin-chain
+    /// build does, dropping the globals it shadows (issue #6022).
+    pub fn shadow_global_plugins_for_test(
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        scoped: &std::sync::Arc<dyn crate::plugins::Plugin>,
+    ) -> Vec<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::shadow_global_plugins_for_test(globals, scoped)
+    }
+
+    /// Drop the `globals` that a scoped `plugin_name` config which built no
+    /// instance replaces, the way every plugin-chain build does (issue #6022).
+    pub fn shadow_global_plugins_by_name_for_test(
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        plugin_name: &str,
+    ) -> Vec<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::shadow_global_plugins_by_name_for_test(globals, plugin_name)
+    }
+
+    /// The at-most-one-effective-instance errors a proxy's merged chain raises.
+    pub fn exclusive_effective_instance_errors_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+    ) -> Vec<String> {
+        crate::plugin_cache::exclusive_effective_instance_errors(plugins, proxy_id)
+    }
+
+    /// The topology-only stand-in candidate admission builds for a built-in
+    /// config, or `None` when it builds none.
+    pub fn composition_shape_plugin_for_test(
+        config: &crate::config::types::PluginConfig,
+    ) -> Option<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::composition_shape_plugin(config)
+    }
+
+    /// The NodeWaypoint destination-authz readiness `config` gets when its
+    /// prebuilt global chain is `globals` (issue #6022).
+    pub fn node_waypoint_destination_authz_ready_over_globals_for_test(
+        config: &crate::config::types::GatewayConfig,
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::plugin_cache::node_waypoint_destination_authz_ready_over_globals_for_test(
+            config, globals,
+        )
+    }
+
+    /// The global chain an adaptive-only rebuild keeps before it rebuilds the
+    /// `adaptive_concurrency` instances (issue #6022).
+    pub fn globals_without_adaptive_concurrency_for_test(
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> Vec<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::globals_without_adaptive_concurrency(globals)
+    }
+
+    /// Whether a generation of `plugins` keeps the `/charges` projection
+    /// published instead of publishing its absence (issue #6022).
+    pub fn includes_api_chargeback_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::plugin_cache::includes_api_chargeback(plugins)
+    }
+
+    /// Whether the effective `proxy_alerts` instances differ between two
+    /// chains of one proxy, which resets alert ownership (issue #6022).
+    pub fn proxy_alerts_instances_changed_for_test(
+        previous: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        next: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::plugin_cache::proxy_alerts_instances_changed(previous, next)
+    }
+
     /// Whether an incremental rebuild of `proxy_ids_to_rebuild` / globals would
     /// reconstruct an active `ai_response_guard` with a node-local descriptor.
     pub fn ai_response_guard_descriptor_preload_required_for_test(
@@ -1546,6 +1636,13 @@ pub mod _test_support {
             proxy_ids_to_rebuild,
             rebuild_globals,
         )
+    }
+
+    /// Whether the composed gRPC-Web view built from `plugins` refuses the
+    /// request because it drops a gRPC-only admission instance (issue #6110).
+    /// The global gRPC-Web view is built from the global chain this way.
+    pub fn grpc_web_view_omits_admission_policy_for_test(plugins: &[Arc<dyn Plugin>]) -> bool {
+        crate::plugin_cache::grpc_web_view_omits_admission_policy_for_test(plugins)
     }
 
     /// Prepend a plugin onto one proxy's resolved list for external tests.
@@ -4033,12 +4130,42 @@ pub mod _test_support {
             self.plugin.check_nonce_replay(nonce)
         }
 
+        pub fn claim_for_principal(&self, nonce: &str, principal: &str) -> Result<(), String> {
+            self.plugin
+                .check_nonce_replay_for_principal_for_tests(nonce, principal)
+        }
+
         pub fn claim_at(&self, nonce: &str, elapsed: std::time::Duration) -> Result<(), String> {
             let now = self
                 .epoch
                 .checked_add(elapsed)
                 .ok_or_else(|| "soap nonce test clock overflow".to_string())?;
             self.plugin.check_nonce_replay_at_for_tests(nonce, now)
+        }
+
+        pub fn claim_for_principal_at(
+            &self,
+            nonce: &str,
+            principal: &str,
+            elapsed: std::time::Duration,
+        ) -> Result<(), String> {
+            let now = self
+                .epoch
+                .checked_add(elapsed)
+                .ok_or_else(|| "soap nonce test clock overflow".to_string())?;
+            self.plugin
+                .check_nonce_replay_for_principal_at_for_tests(nonce, principal, now)
+        }
+
+        /// Retained claims charged to `principal`, expired ones included until
+        /// maintenance reclaims them.
+        pub fn principal_entries(&self, principal: &str) -> Result<usize, String> {
+            self.plugin.nonce_principal_entries_for_tests(principal)
+        }
+
+        /// Exhaust the age-key sequence so the next claim cannot allocate one.
+        pub fn exhaust_age_sequence(&self) -> Result<(), String> {
+            self.plugin.exhaust_nonce_age_sequence_for_tests()
         }
 
         pub fn snapshot(&self) -> Result<SoapNonceReplaySnapshotForTest, String> {
@@ -6833,6 +6960,13 @@ pub mod _test_support {
         phase: Option<NamespaceRegistryPhase>,
     ) {
         crate::config::namespace_registry::set_namespace_registry_fault(namespace, phase);
+    }
+
+    /// Lower the incremental poll's change-row cap for one namespace so a
+    /// small fixture can saturate it and exercise the full-reload fallback.
+    /// `None` restores the default. Always clear it when the test finishes.
+    pub fn set_change_log_max_rows_for_test(namespace: &str, max_rows: Option<usize>) {
+        crate::config::db_backend::set_change_log_max_rows(namespace, max_rows);
     }
 
     /// Shrink the per-chunk write size for one namespace so a small fixture can
@@ -14936,6 +15070,58 @@ pub mod _test_support {
         }
     }
 
+    /// Terminal outcome of the PRODUCTION buffered native-gRPC request collect
+    /// (`collect_grpc_request_body`), projected from the crate-private error.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GrpcBufferedCollectOutcomeForTest {
+        Collected(usize),
+        ResourceExhausted,
+        ReadFailed,
+        TimedOut,
+        DeadlineExceeded,
+        AuthorizationExpired,
+        OtherProxyError,
+    }
+
+    /// Run the PRODUCTION buffered native-gRPC collect over a real hyper
+    /// request: unauthenticated and with no client RPC deadline.
+    pub async fn collect_grpc_request_body_for_test(
+        request: hyper::Request<hyper::body::Incoming>,
+        max_grpc_recv_size_bytes: usize,
+        request_body_read_timeout_ms: u64,
+    ) -> GrpcBufferedCollectOutcomeForTest {
+        use crate::proxy::grpc_proxy::{GrpcProxyError, GrpcRequestBodyCollectError};
+        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body(
+            request,
+            max_grpc_recv_size_bytes,
+            request_body_read_timeout_ms,
+            None,
+            None,
+        )
+        .await;
+        match collected {
+            Ok((_, _, body)) => GrpcBufferedCollectOutcomeForTest::Collected(body.len()),
+            Err(GrpcRequestBodyCollectError::Proxy(GrpcProxyError::ResourceExhausted(_))) => {
+                GrpcBufferedCollectOutcomeForTest::ResourceExhausted
+            }
+            Err(GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(_))) => {
+                GrpcBufferedCollectOutcomeForTest::ReadFailed
+            }
+            Err(GrpcRequestBodyCollectError::Proxy(_)) => {
+                GrpcBufferedCollectOutcomeForTest::OtherProxyError
+            }
+            Err(GrpcRequestBodyCollectError::TimedOut) => {
+                GrpcBufferedCollectOutcomeForTest::TimedOut
+            }
+            Err(GrpcRequestBodyCollectError::DeadlineExceeded) => {
+                GrpcBufferedCollectOutcomeForTest::DeadlineExceeded
+            }
+            Err(GrpcRequestBodyCollectError::AuthorizationExpired(_)) => {
+                GrpcBufferedCollectOutcomeForTest::AuthorizationExpired
+            }
+        }
+    }
+
     /// Split a previewed route total as every early collector does: gRPC
     /// folds it into the RPC deadline, every other request keeps it apart.
     pub fn early_upload_deadlines_for_test(
@@ -16067,6 +16253,27 @@ pub mod _test_support {
         }
     }
 
+    /// The fixed cap on the H3 CORS preflight end-of-stream wait (issue #6110).
+    pub const H3_PREFLIGHT_END_OF_STREAM_WAIT_MS: u64 =
+        crate::http3::server::H3_PREFLIGHT_END_OF_STREAM_WAIT_MS;
+
+    /// Run the H3 CORS preflight end-of-stream proof (issue #6110) exactly as
+    /// the dispatcher does, over a stand-in for the request stream's next-DATA
+    /// future (`Ok(None)` is the FIN, `Ok(Some(_))` a DATA frame).
+    pub async fn h3_request_stream_ends_without_data_for_test<F>(
+        recv_data: F,
+        backend_read_timeout_ms: u64,
+    ) -> bool
+    where
+        F: std::future::Future<Output = Result<Option<bytes::Bytes>, ()>>,
+    {
+        crate::http3::server::h3_request_stream_ends_without_data(
+            recv_data,
+            backend_read_timeout_ms,
+        )
+        .await
+    }
+
     // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
 
     pub use crate::k8s_controller::reconciler::{
@@ -16526,6 +16733,7 @@ pub mod _test_support {
             cp_scope,
             mesh_update_tx,
             mesh_registry,
+            None,
         );
     }
 

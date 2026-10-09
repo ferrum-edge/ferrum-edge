@@ -1068,6 +1068,11 @@ impl Plugin for CorsPlugin {
         self.uses_strict_origin_policy()
     }
 
+    fn answers_cors_preflights(&self) -> bool {
+        // `preflight_continue` forwards every preflight to the backend.
+        !self.preflight_continue
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Record policy ownership before checking Origin. A participating
         // translated Istio policy owns every Access-Control-* response field

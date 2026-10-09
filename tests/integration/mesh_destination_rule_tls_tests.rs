@@ -152,6 +152,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         port_overrides: HashMap::new(),
         source_locality: None,
@@ -206,14 +207,17 @@ fn dr_tls_simple_flows_through_to_upstream_backend_tls() {
         "trafficPolicy": {
             "tls": {
                 "mode": "SIMPLE",
-                "caCertificates": "/etc/certs/ca.pem"
+                "caCertificates": "k8s://default/reviews-tls#ca.crt"
             }
         }
     }));
 
     let tls = tls.expect("DR.tls should be parsed");
     assert_eq!(tls.mode, MtlsMode::Simple);
-    assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+    assert_eq!(
+        tls.ca_certificates.as_deref(),
+        Some("k8s://default/reviews-tls#ca.crt")
+    );
 
     // ── 2. Attach an upstream that the DR's host matches. ──
     config.upstreams.push(build_matching_upstream(
@@ -240,7 +244,10 @@ fn dr_tls_simple_flows_through_to_upstream_backend_tls() {
         .and_then(|tp| tp.tls.as_ref())
         .expect("slice DR.tls present");
     assert_eq!(dr_tls.mode, MtlsMode::Simple);
-    assert_eq!(dr_tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+    assert_eq!(
+        dr_tls.ca_certificates.as_deref(),
+        Some("k8s://default/reviews-tls#ca.crt")
+    );
 }
 
 #[test]
@@ -250,21 +257,27 @@ fn dr_tls_mutual_carries_client_cert_and_key_through_slice() {
         "trafficPolicy": {
             "tls": {
                 "mode": "MUTUAL",
-                "caCertificates": "/etc/certs/ca.pem",
-                "clientCertificate": "/etc/certs/client.pem",
-                "privateKey": "/etc/certs/client.key"
+                "caCertificates": "k8s://default/reviews-tls#ca.crt",
+                "clientCertificate": "k8s://default/reviews-tls#tls.crt",
+                "privateKey": "k8s://default/reviews-tls#tls.key"
             }
         }
     }));
 
     let tls = tls.expect("DR.tls should be parsed");
     assert_eq!(tls.mode, MtlsMode::Mutual);
-    assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+    assert_eq!(
+        tls.ca_certificates.as_deref(),
+        Some("k8s://default/reviews-tls#ca.crt")
+    );
     assert_eq!(
         tls.client_certificate.as_deref(),
-        Some("/etc/certs/client.pem")
+        Some("k8s://default/reviews-tls#tls.crt")
     );
-    assert_eq!(tls.private_key.as_deref(), Some("/etc/certs/client.key"));
+    assert_eq!(
+        tls.private_key.as_deref(),
+        Some("k8s://default/reviews-tls#tls.key")
+    );
 }
 
 #[test]
@@ -488,7 +501,7 @@ fn dr_tls_subset_traffic_policy_carries_tls_block_without_warning() {
                     "trafficPolicy": {
                         "tls": {
                             "mode": "SIMPLE",
-                            "caCertificates": "/etc/certs/v1-ca.pem"
+                            "caCertificates": "k8s://default/v1-tls#ca.crt"
                         }
                     }
                 }]
@@ -508,7 +521,10 @@ fn dr_tls_subset_traffic_policy_carries_tls_block_without_warning() {
         .as_ref()
         .expect("subset tls");
     assert_eq!(tls.mode, MtlsMode::Simple);
-    assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/v1-ca.pem"));
+    assert_eq!(
+        tls.ca_certificates.as_deref(),
+        Some("k8s://default/v1-tls#ca.crt")
+    );
 
     assert!(
         !result
@@ -546,7 +562,7 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
                         "trafficPolicy": {
                             "tls": {
                                 "mode": "SIMPLE",
-                                "caCertificates": "/etc/certs/ca-v1.pem"
+                                "caCertificates": "k8s://default/ca-v1#ca.crt"
                             }
                         }
                     },
@@ -556,7 +572,7 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
                         "trafficPolicy": {
                             "tls": {
                                 "mode": "SIMPLE",
-                                "caCertificates": "/etc/certs/ca-v2.pem"
+                                "caCertificates": "k8s://default/ca-v2#ca.crt"
                             }
                         }
                     }
@@ -624,11 +640,11 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
         .expect("v2 has resolved tls");
     assert_eq!(
         v1_tls.server_ca_cert_path.as_deref(),
-        Some("/etc/certs/ca-v1.pem")
+        Some("k8s://default/ca-v1#ca.crt")
     );
     assert_eq!(
         v2_tls.server_ca_cert_path.as_deref(),
-        Some("/etc/certs/ca-v2.pem")
+        Some("k8s://default/ca-v2#ca.crt")
     );
 
     // ── 2. Each proxy's `resolved_tls` reflects its subset's CA. ──
@@ -644,12 +660,12 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
         .expect("p-v2");
     assert_eq!(
         p_v1.resolved_tls.server_ca_cert_path.as_deref(),
-        Some("/etc/certs/ca-v1.pem"),
+        Some("k8s://default/ca-v1#ca.crt"),
         "p-v1.resolved_tls reflects subset v1 CA"
     );
     assert_eq!(
         p_v2.resolved_tls.server_ca_cert_path.as_deref(),
-        Some("/etc/certs/ca-v2.pem"),
+        Some("k8s://default/ca-v2#ca.crt"),
         "p-v2.resolved_tls reflects subset v2 CA"
     );
 
@@ -675,11 +691,11 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
         "two-subset upstream with distinct CAs must fragment backend H3 pool key"
     );
     assert!(
-        pool_v1.contains("ca-v1.pem"),
+        pool_v1.contains("ca-v1"),
         "v1 pool key must carry v1 CA: {pool_v1}"
     );
     assert!(
-        pool_v2.contains("ca-v2.pem"),
+        pool_v2.contains("ca-v2"),
         "v2 pool key must carry v2 CA: {pool_v2}"
     );
     assert!(
@@ -895,6 +911,88 @@ fn dr_tls_translation_rejects_client_material_selectors_of_the_wrong_kind() {
     }));
     let tls = tls.expect("matching client certificate and key selectors stay admitted");
     assert_eq!(tls.mode, MtlsMode::Mutual);
+}
+
+#[test]
+fn dr_tls_translation_refuses_material_outside_the_rule_namespace() {
+    // The proxy resolves DestinationRule TLS material with its own identity,
+    // so a tenant rule must not name another namespace's Secret or a store
+    // only the gateway's credentials can read.
+    let cases = [
+        (
+            "k8s://egress/partner-mtls#tls.crt",
+            "k8s://egress/partner-mtls#tls.key",
+            "trafficPolicy.tls.clientCertificate",
+            "namespace of the resource",
+        ),
+        (
+            "k8s://default/client-tls#tls.crt",
+            "vault://secret/data/partner#tls.key",
+            "trafficPolicy.tls.privateKey",
+            "secret-manager",
+        ),
+        (
+            "managed://certificates/partner#cert",
+            "k8s://default/client-tls#tls.key",
+            "trafficPolicy.tls.clientCertificate",
+            "secret-manager",
+        ),
+    ];
+    for (client_certificate, private_key, field, reason) in cases {
+        let err = translate_k8s_objects(
+            &[istio_object(
+                "DestinationRule",
+                "partner",
+                serde_json::json!({
+                    "host": "partner.example.com",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "clientCertificate": client_certificate,
+                            "privateKey": private_key
+                        }
+                    }
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect_err("material outside the rule namespace must be refused");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(field) && rendered.contains(reason),
+            "{field} must be refused ({reason:?}), got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("partner-mtls") && !rendered.contains("secret/data"),
+            "the refusal must not echo the reference, got: {rendered}"
+        );
+    }
+
+    let root_rule = |namespace: &str| {
+        let mut rule = istio_object(
+            "DestinationRule",
+            "partner",
+            serde_json::json!({
+                "host": "partner.example.com",
+                "trafficPolicy": {
+                    "tls": {
+                        "mode": "MUTUAL",
+                        "clientCertificate": "k8s://egress/partner-mtls#tls.crt",
+                        "privateKey": "vault://secret/data/partner#tls.key"
+                    }
+                }
+            }),
+        );
+        rule.metadata.namespace = namespace.to_string();
+        rule
+    };
+    // Mesh-operator policy in the root namespace keeps operator-chosen stores.
+    let options = k8s_options()
+        .with_source_namespaces(vec!["default".to_string(), "istio-system".to_string()]);
+    let translated = translate_k8s_objects(&[root_rule("istio-system")], options)
+        .expect("root-namespace DestinationRule keeps operator-chosen material");
+    let mesh = translated.config.mesh.as_ref().expect("mesh present");
+    assert_eq!(mesh.destination_rules.len(), 1);
 }
 
 #[test]

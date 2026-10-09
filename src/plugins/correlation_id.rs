@@ -148,10 +148,12 @@ impl CorrelationId {
 }
 
 /// `name` is expected to be lowercase. The whole gateway-owned `x-consumer-*`
-/// namespace is reserved alongside the closed protocol-managed set.
+/// namespace and the gateway's `X-Ferrum-Hops` loop-guard count are reserved
+/// alongside the closed protocol-managed set.
 pub(crate) fn is_reserved_header_name(name: &str) -> bool {
     RESERVED_HEADER_NAMES.contains(&name)
         || crate::proxy::headers::is_consumer_assertion_header(name)
+        || crate::proxy::hop_limit::is_proxy_hops_header(name)
 }
 
 fn parse_configured_header_name(raw: &str) -> Result<String, String> {

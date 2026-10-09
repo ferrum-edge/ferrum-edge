@@ -2062,6 +2062,84 @@ async fn test_in_place_backend_tls_rotation_to_invalid_keeps_old_listener_servin
     manager.shutdown_all().await;
 }
 
+/// A backend TLS reload that publishes a new CRL while the listener's own
+/// material rotated to invalid content must NOT keep the old listener: its
+/// cached verifier has the previous revocation list compiled in. The listener
+/// fails closed (torn down, port closed, failure reported without the
+/// "kept previous listener" marker), like every HTTP-family backend on the
+/// same reload, and restarts once the material is valid again.
+#[tokio::test]
+async fn test_crl_rotation_with_invalid_tls_rotation_tears_down_listener() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, generate_test_ca_pem("CRL Rotation CA A")).expect("write initial ca");
+    let ca_path_str = ca_path
+        .to_str()
+        .expect("test temp path must be utf-8 for proxy config")
+        .to_string();
+
+    let (manager, port) = start_manager_on_fresh_tcp_port(|port| {
+        let mut proxy = create_stream_proxy("tcp-tls-crl-rotate", BackendScheme::Tcps, port);
+        proxy.backend_tls_verify_server_cert = true;
+        proxy.backend_tls_server_ca_cert_path = Some(ca_path_str.clone());
+        proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+        GatewayConfig {
+            proxies: vec![proxy],
+            ..empty_config()
+        }
+    })
+    .await;
+
+    // Same TLS sources and routing, but the CRL content changed alongside an
+    // invalid in-place CA rotation. Only the CRL change disqualifies the
+    // keep-old path here (see the CA-only rotation test above).
+    std::fs::write(&ca_path, b"not-a-pem-certificate").expect("rotate ca to garbage");
+    let rotated_crl = rustls::pki_types::CertificateRevocationListDer::from(b"crl".to_vec());
+    manager.set_crls(Arc::new(vec![rotated_crl]));
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "invalid TLS under a rotated CRL must surface a failure: {:?}",
+        failures
+    );
+    assert_eq!(failures[0].0, "tcp-tls-crl-rotate");
+    assert!(
+        failures[0].2.contains("Backend TLS config failed"),
+        "failure should be the TLS validation error: {}",
+        failures[0].2
+    );
+    assert!(
+        !failures[0].2.contains("kept previous listener running"),
+        "a CRL rotation must not keep the old listener: {}",
+        failures[0].2
+    );
+    let probe = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await;
+    assert!(
+        probe.is_ok(),
+        "port {} must be closed instead of serving a verifier with the replaced CRL",
+        port
+    );
+    drop(probe);
+
+    // Valid material and an empty CRL list: the listener comes back.
+    std::fs::write(&ca_path, generate_test_ca_pem("CRL Rotation B")).expect("rotate to valid ca");
+    manager.set_crls(Arc::new(Vec::new()));
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "valid material should restart the listener cleanly: {:?}",
+        failures
+    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("restarted TCP TLS listener should bind");
+
+    manager.shutdown_all().await;
+}
+
 /// A mixed config update that rotates backend TLS material to invalid content
 /// IN PLACE *and* changes backend routing (fields outside listener identity,
 /// read live per connection) must NOT take the keep-old-listener path: keeping

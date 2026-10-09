@@ -56,6 +56,7 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: chrono::Utc::now(),

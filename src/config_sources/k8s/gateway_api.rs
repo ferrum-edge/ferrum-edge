@@ -5469,6 +5469,37 @@ fn resource_suffix_component(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// HTTPRoute/GRPCRoute proxy or upstream id materialized in `config_namespace`.
+///
+/// A route materialized in its own namespace keeps the readable
+/// [`resource_id`]; one materialized in its parent's namespace gets a
+/// source-bound id so another tenant's route cannot claim the same key.
+fn http_route_resource_id(
+    readable_prefix: &str,
+    object: &K8sObject,
+    config_namespace: &str,
+    suffix: &str,
+    reserved_len: usize,
+) -> String {
+    if config_namespace == object.metadata.namespace {
+        resource_id(
+            readable_prefix,
+            &object.metadata.namespace,
+            &object.metadata.name,
+            suffix,
+        )
+    } else {
+        gateway_api_source_bound_id(
+            readable_prefix,
+            &object.kind,
+            &object.metadata.namespace,
+            &object.metadata.name,
+            suffix,
+            reserved_len,
+        )
+    }
+}
+
 fn route_scoped_suffix(
     route_kind: &str,
     rule_index: usize,
@@ -6560,12 +6591,28 @@ fn http_route_resources(
                     None,
                     route_namespace_suffix.as_deref(),
                 );
-                let upstream_id = resource_id(
+                let upstream_id = http_route_resource_id(
                     "gwapi-route-upstream",
-                    &object.metadata.namespace,
-                    &object.metadata.name,
+                    object,
+                    config_namespace,
                     &route_suffix,
+                    0,
                 );
+                if let Some(key) = namespaced_resource_key(config_namespace, &upstream_id)
+                    && !acc.claim_gateway_api_route_upstream(&key, object)
+                {
+                    acc.warnings.push(format!(
+                        "{} {:?}/{:?} rules[{}] is refused: another route object already \
+                         derived upstream id {:?} in namespace {:?}",
+                        object.kind,
+                        object.metadata.namespace,
+                        object.metadata.name,
+                        rule_index,
+                        upstream_id,
+                        config_namespace
+                    ));
+                    continue;
+                }
                 let mut upstream = upstream_for_route_with_session(
                     upstream_id.clone(),
                     config_namespace.clone(),
@@ -6630,12 +6677,34 @@ fn http_route_resources(
                         || suffix.clone(),
                         |host_suffix| format!("{suffix}-{host_suffix}"),
                     );
-                    let proxy_id = resource_id(
+                    let proxy_id = http_route_resource_id(
                         "gwapi-route",
-                        &object.metadata.namespace,
-                        &object.metadata.name,
+                        object,
+                        config_namespace,
                         &scoped_suffix,
+                        GATEWAY_API_ROUTE_DERIVED_PLUGIN_ID_PREFIX_LEN,
                     );
+                    // A second route object deriving this key must not replace,
+                    // merge into, or attach plugins to the owner's proxy.
+                    if let Some(key) = namespaced_resource_key(config_namespace, proxy_id.as_str())
+                        && !acc.claim_gateway_api_route_proxy(&key, object)
+                    {
+                        acc.warnings.push(format!(
+                            "{} {:?}/{:?} is refused on this listener: another route object \
+                             already derived proxy id {:?} in namespace {:?}",
+                            object.kind,
+                            object.metadata.namespace,
+                            object.metadata.name,
+                            proxy_id,
+                            config_namespace
+                        ));
+                        acc.record_gateway_api_refused_route_claims(
+                            object,
+                            &host_scope.parent_refs,
+                            host_scope.listener.as_ref(),
+                        );
+                        continue;
+                    }
                     // TLS class comes from *this* scope's own listener policy.
                     // Scanning every policy for a matching port would let an
                     // unrelated HTTPS listener on the same number mark a
@@ -8215,6 +8284,8 @@ fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
         K8sTranslateError::InvalidResource { message, .. } => {
             message.contains("ReferenceGrant")
                 || super::backend_ref::message_is_unsupported_backend_kind(message)
+                || super::backend_ref::message_is_external_name_backend(message)
+                || super::backend_ref::message_is_endpoint_slice_refusal(message)
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -8226,6 +8297,11 @@ fn backend_ref_resolution_reason(error: &K8sTranslateError) -> BackendRefFaultRe
             if super::backend_ref::message_is_unsupported_backend_kind(message) =>
         {
             BackendRefFaultReason::InvalidKind
+        }
+        K8sTranslateError::InvalidResource { message, .. }
+            if super::backend_ref::message_is_external_name_backend(message) =>
+        {
+            BackendRefFaultReason::UnsupportedProtocol
         }
         _ => BackendRefFaultReason::RefNotPermitted,
     }
@@ -8417,7 +8493,9 @@ fn l4_route_proxies_for_namespace(
                 || base_suffix.clone(),
                 |namespace_suffix| format!("{base_suffix}-{namespace_suffix}"),
             );
-            let id = if scheme.is_udp() || config_namespace == object.metadata.namespace {
+            // Every L4 route kind shares one id rule: readable in its own
+            // namespace, source-bound when materialized in a parent's.
+            let id = if config_namespace == object.metadata.namespace {
                 resource_id(
                     "gwapi-l4",
                     &object.metadata.namespace,
@@ -8472,17 +8550,39 @@ fn l4_route_proxies_for_namespace(
 const GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN: usize = 16;
 const GATEWAY_API_L4_PROXY_ID_DIGEST_SUFFIX_LEN: usize = 2 + GATEWAY_API_L4_PROXY_ID_DIGEST_HEX_LEN;
 
+/// Longest id prefix the translator derives from an HTTP/gRPC route proxy id
+/// (`istio-vs-resp-xform-{proxy_id}`). Source-bound route proxy ids leave room
+/// for it so the derived plugin ids stay within `MAX_ID_LENGTH`.
+const GATEWAY_API_ROUTE_DERIVED_PLUGIN_ID_PREFIX_LEN: usize = "istio-vs-resp-xform-".len();
+
 fn gateway_api_l4_proxy_id(
     route_kind: &str,
     namespace: &str,
     route_name: &str,
     suffix: &str,
 ) -> String {
-    // Cross-namespace routes are materialized in their parent Gateway's
-    // namespace, so distinct route owners can share the proxy keyspace. Keep
-    // the readable legacy id, but bind it to the unambiguous, unsanitized
-    // source identity so dash-join and sanitization collisions cannot replace
-    // another tenant's proxy.
+    gateway_api_source_bound_id("gwapi-l4", route_kind, namespace, route_name, suffix, 0)
+}
+
+/// Resource id for a route object materialized OUTSIDE its own namespace.
+///
+/// Cross-namespace routes are materialized in their parent Gateway's
+/// namespace, so distinct route owners share that namespace's proxy, upstream,
+/// and plugin keyspace. [`resource_id`] is a lossy dash join (`shop` /
+/// `checkout-api` and `shop-checkout` / `api` produce the same string), so the
+/// readable id is kept but bound to a digest of the unambiguous, unsanitized,
+/// length-prefixed source identity. Readable ids never contain `__`, so a
+/// source-bound id cannot collide with a same-namespace route's plain id.
+///
+/// `reserved_len` keeps room for ids the translator derives from this one.
+fn gateway_api_source_bound_id(
+    readable_prefix: &str,
+    route_kind: &str,
+    namespace: &str,
+    route_name: &str,
+    suffix: &str,
+    reserved_len: usize,
+) -> String {
     let identity = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}",
         route_kind.len(),
@@ -8495,8 +8595,10 @@ fn gateway_api_l4_proxy_id(
         suffix
     );
     let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
-    let mut readable = resource_id("gwapi-l4", namespace, route_name, suffix);
-    let readable_budget = MAX_ID_LENGTH - GATEWAY_API_L4_PROXY_ID_DIGEST_SUFFIX_LEN;
+    let mut readable = resource_id(readable_prefix, namespace, route_name, suffix);
+    let readable_budget = MAX_ID_LENGTH
+        .saturating_sub(GATEWAY_API_L4_PROXY_ID_DIGEST_SUFFIX_LEN)
+        .saturating_sub(reserved_len);
     if readable.len() > readable_budget {
         let mut end = readable_budget;
         while end > 0 && !readable.is_char_boundary(end) {
@@ -9006,13 +9108,51 @@ fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8
     Ok(())
 }
 
+/// [`super::backend_ref::checked_backend_namespace`] plus the structured
+/// translation warning for EndpointSlice attribution: a refused Service
+/// backend, or a selector-backed one admitted without its EndpointSlices being
+/// checked because the controller observes no Pods in its namespace.
 fn checked_backend_namespace(
     object: &K8sObject,
     backend_ref: &Value,
-    acc: &K8sAccumulator,
+    acc: &mut K8sAccumulator,
     from_kind: &str,
 ) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
-    super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind)
+    use super::backend_ref::{
+        BackendKind, endpoint_slice_unverified_warning, message_is_endpoint_slice_refusal,
+    };
+
+    let checked =
+        super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind);
+    match &checked {
+        Err(K8sTranslateError::InvalidResource { message, .. })
+            if message_is_endpoint_slice_refusal(message) =>
+        {
+            acc.push_warning_once(format!(
+                "Gateway API {from_kind} {:?}/{:?}: {message}",
+                object.metadata.namespace, object.metadata.name
+            ));
+        }
+        Ok((BackendKind::Service, backend_namespace)) => {
+            let pod_discovery_enabled = acc.options.pod_discovery_enabled;
+            let pods_unobserved =
+                !pod_discovery_enabled || !acc.options.includes_pod_namespace(backend_namespace);
+            if pods_unobserved
+                && let Some(name) = string_field(backend_ref, "name")
+                && acc.service_exists(backend_namespace, name)
+                && !acc.service_is_selectorless(backend_namespace, name)
+            {
+                let warning = endpoint_slice_unverified_warning(
+                    backend_namespace,
+                    name,
+                    pod_discovery_enabled,
+                );
+                acc.push_warning_once(warning);
+            }
+        }
+        _ => {}
+    }
+    checked
 }
 
 fn first_backend_ref<'a>(
@@ -9977,6 +10117,16 @@ mod tests {
             service_name.to_string(),
         );
         slice
+    }
+
+    /// A Running Pod in `default` owning `ip`, so a Service's EndpointSlice
+    /// endpoint is a Pod of its namespace (issue #6108).
+    fn core_pod(name: &str, ip: &str) -> K8sObject {
+        let mut pod = object("Pod", serde_json::json!({}));
+        pod.api_version = "v1".to_string();
+        pod.metadata.name = name.to_string();
+        pod.status = serde_json::json!({"phase": "Running", "podIP": ip});
+        pod
     }
 
     fn namespace(name: &str, labels: &[(&str, &str)]) -> K8sObject {
@@ -11655,8 +11805,9 @@ mod tests {
             }),
         );
 
+        let pod = core_pod("manual-0", "10.1.0.10");
         let result = translate_k8s_objects(
-            &[service, endpoint_slice, route],
+            &[service, endpoint_slice, route, pod],
             options().with_pod_discovery_enabled(true),
         )
         .expect("manual EndpointSlice service should translate");
@@ -11707,8 +11858,9 @@ mod tests {
             }),
         );
 
+        let pod = core_pod("named-target-0", "10.1.0.11");
         let result = translate_k8s_objects(
-            &[service, endpoint_slice, route],
+            &[service, endpoint_slice, route, pod],
             options().with_pod_discovery_enabled(true),
         )
         .expect("named Service targetPort should resolve through EndpointSlice port names");
@@ -11756,8 +11908,10 @@ mod tests {
             }),
         );
 
+        let pod_a = core_pod("headless-0", "10.1.0.11");
+        let pod_b = core_pod("headless-1", "10.1.0.12");
         let result = translate_k8s_objects(
-            &[service, endpoint_slice, route],
+            &[service, endpoint_slice, route, pod_a, pod_b],
             options().with_pod_discovery_enabled(true),
         )
         .expect("headless EndpointSlice service should translate");
@@ -11800,6 +11954,8 @@ mod tests {
                 }),
             ],
         );
+        let pod_a = core_pod("manual-0", "10.1.0.21");
+        let pod_b = core_pod("manual-1", "10.1.0.22");
         let direct = core_service(
             "direct",
             serde_json::json!({
@@ -11822,7 +11978,7 @@ mod tests {
         );
 
         let result = translate_k8s_objects(
-            &[manual, manual_slice, direct, route],
+            &[manual, manual_slice, direct, route, pod_a, pod_b],
             options().with_pod_discovery_enabled(true),
         )
         .expect("mixed endpoint and service backends should translate");
@@ -11876,6 +12032,8 @@ mod tests {
                 }),
             ],
         );
+        let pod_a = core_pod("manual-0", "10.1.0.31");
+        let pod_b = core_pod("manual-1", "10.1.0.32");
         let direct = core_service(
             "direct",
             serde_json::json!({
@@ -11898,7 +12056,7 @@ mod tests {
         );
 
         let result = translate_k8s_objects(
-            &[manual, manual_slice, direct, route],
+            &[manual, manual_slice, direct, route, pod_a, pod_b],
             options().with_pod_discovery_enabled(true),
         )
         .expect("mixed endpoint and service backends should translate");
@@ -16235,6 +16393,7 @@ mod tests {
         let service = core_service(
             "api",
             serde_json::json!({
+                "selector": {"app": "api"},
                 "ports": [{"name": "http", "port": 8080}]
             }),
         );

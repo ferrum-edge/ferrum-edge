@@ -6410,7 +6410,7 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
     let fixtures = [
         (
             "body_validator",
-            json!({"grpc_max_decompressed_size_bytes": 0}),
+            json!({"grpc_max_decompressed_size_bytes": 1}),
         ),
         (
             "load_testing",
@@ -7433,7 +7433,7 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         .expect("BodyValidatorConfig must publish grpc_max_decompressed_size_bytes");
     assert_eq!(property["type"], json!("integer"));
     assert_eq!(property["format"], json!("uint64"));
-    assert_eq!(property["minimum"], json!(0));
+    assert_eq!(property["minimum"], json!(1));
     assert!(
         property.get("default").is_none(),
         "environment-derived omission semantics cannot be represented by a static OpenAPI default"
@@ -7443,7 +7443,7 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         .as_str()
         .expect("grpc_max_decompressed_size_bytes description");
     for contract in [
-        "`0` disables the decompressed cap",
+        "Zero is rejected so compressed input is always bounded",
         "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
         "parses as an unsigned integer",
         "10 MiB",
@@ -7462,8 +7462,14 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
-        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 1}),
         true,
+    );
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
+        false,
     );
     assert_component_validity(
         &spec,
@@ -7489,7 +7495,7 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         "docs/plugins.md body_validator section missing `grpc_max_decompressed_size_bytes`"
     );
     for contract in [
-        "`0` disables the decompressed cap",
+        "zero is rejected so compressed input is always bounded",
         "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
         "parses as an unsigned integer",
         "10 MiB",
@@ -7962,6 +7968,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": " x-consumer-trace "}),
         json!({"header_name": "X_Consumer_Trace"}),
         json!({"header_name": "x_consumer-trace"}),
+        json!({"header_name": "X-Ferrum-Hops"}),
+        json!({"header_name": " x_ferrum_hops "}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
         assert!(
@@ -9836,6 +9844,14 @@ fn opa_schema_matches_runtime_validation_contract() {
     });
     assert_component_validity(&spec, "OpaPluginConfig", &base, true);
 
+    // The decision call stamps the gateway-owned hop count itself, so `headers`
+    // refuses it in any spelling, as `Opa::new` does (issue #6128).
+    for name in ["X-Ferrum-Hops", "x_ferrum_hops"] {
+        let mut hops = base.clone();
+        hops["headers"] = json!({name: "0"});
+        assert_component_validity(&spec, "OpaPluginConfig", &hops, false);
+    }
+
     let mut unknown = base.clone();
     unknown
         .as_object_mut()
@@ -10764,8 +10780,8 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
             "smtp_host": "smtp.example.com",
             "smtp_port": 587,
             "tls_mode": "starttls",
-            "username_env": "FERRUM_ALERT_SMTP_USERNAME",
-            "password_env": "FERRUM_ALERT_SMTP_PASSWORD",
+            "username_env": "FERRUM_PLUGIN_SECRET_ALERT_SMTP_USERNAME",
+            "password_env": "FERRUM_PLUGIN_SECRET_ALERT_SMTP_PASSWORD",
             "from": "ferrum@example.com",
             "to": ["oncall@example.com"],
             "subject_template": "[${severity}] ${title}",
@@ -15659,6 +15675,7 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
         json!({"semantic_similarity_enable": true}),
         json!({"sync_mod": "redis"}),
         json!({"redis_ur": "redis://127.0.0.1:6379/0"}),
+        json!({"semantic_embedding_auth_header": "X_Ferrum_Hops"}),
     ] {
         assert_component_validity(&spec, "AiSemanticCacheConfig", &invalid, false);
         assert!(

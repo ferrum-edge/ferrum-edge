@@ -8898,17 +8898,7 @@ fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {
 }
 
 fn overlay_batch_consumers(candidate: &mut GatewayConfig, consumers: &[Consumer]) {
-    for consumer in consumers {
-        if let Some(existing) = candidate
-            .consumers
-            .iter_mut()
-            .find(|item| item.id == consumer.id)
-        {
-            *existing = consumer.clone();
-        } else {
-            candidate.consumers.push(consumer.clone());
-        }
-    }
+    crud::overlay_resources_by_id(&mut candidate.consumers, consumers, |item| item.id.as_str());
 }
 
 /// Assemble the stream-listener port buckets a batch touches from the merged
@@ -8937,31 +8927,13 @@ fn stream_listener_bucket(candidate: &GatewayConfig, ports: &HashSet<u16>) -> Ga
 }
 
 fn overlay_batch_proxies(candidate: &mut GatewayConfig, proxies: &[Proxy]) {
-    for proxy in proxies {
-        if let Some(existing) = candidate
-            .proxies
-            .iter_mut()
-            .find(|item| item.id == proxy.id)
-        {
-            *existing = proxy.clone();
-        } else {
-            candidate.proxies.push(proxy.clone());
-        }
-    }
+    crud::overlay_resources_by_id(&mut candidate.proxies, proxies, |item| item.id.as_str());
 }
 
 fn overlay_batch_plugin_configs(candidate: &mut GatewayConfig, plugins: &[PluginConfig]) {
-    for plugin in plugins {
-        if let Some(existing) = candidate
-            .plugin_configs
-            .iter_mut()
-            .find(|item| item.id == plugin.id)
-        {
-            *existing = plugin.clone();
-        } else {
-            candidate.plugin_configs.push(plugin.clone());
-        }
-    }
+    crud::overlay_resources_by_id(&mut candidate.plugin_configs, plugins, |item| {
+        item.id.as_str()
+    });
 }
 
 /// Batch create endpoint for proxies, consumers, plugin configs, and upstreams.
@@ -12444,6 +12416,21 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
                 "{\"error\":\"Internal Server Error\"}",
             )))
         })
+}
+
+/// Body of the `503` a by-id read answers when the database read failed and
+/// the cached config fallback does not hold the resource (issue #6143).
+pub const CACHED_FALLBACK_MISS_MESSAGE: &str =
+    "Resource state unavailable: database read failed and the cached config does not contain it";
+
+/// A cached-fallback miss after a database read error. The cached snapshot may
+/// predate the resource, so the miss is not confirmed absence: answer `503`
+/// with the stale marker rather than the authoritative `404`.
+fn cached_fallback_miss_response() -> Response<Full<Bytes>> {
+    json_response_with_stale(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({"error": CACHED_FALLBACK_MISS_MESSAGE}),
+    )
 }
 
 /// Return the shared generic database-error body and emit only a content-free

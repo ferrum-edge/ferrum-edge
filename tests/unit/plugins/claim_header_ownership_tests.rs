@@ -174,6 +174,34 @@ fn every_case_variant_of_a_destination_is_removed() {
 }
 
 #[test]
+fn every_underscore_spelling_of_a_destination_is_removed() {
+    // CGI-style backends fold `_` and `-` onto one variable, so a client
+    // `X_Tenant_Id` would otherwise reach the backend beside the verified value.
+    let config = json!({"claim_headers": {"tenant": "X-Tenant-Id"}});
+    let mut headers = HashMap::from([
+        ("X_Tenant_Id".to_string(), "tenant-b".to_string()),
+        ("x_tenant-id".to_string(), "tenant-c".to_string()),
+        ("X-Tenant_ID".to_string(), "tenant-d".to_string()),
+        ("X-Tenant-Idx".to_string(), "keep-me".to_string()),
+    ]);
+
+    authenticate_and_apply(
+        &json!({"sub": "alice", "tenant": "tenant-a"}),
+        &config,
+        &mut headers,
+    );
+
+    assert_eq!(
+        headers,
+        HashMap::from([
+            ("x-tenant-id".to_string(), "tenant-a".to_string()),
+            ("X-Tenant-Idx".to_string(), "keep-me".to_string()),
+        ]),
+        "every spelling a backend folds onto the destination is gateway-owned"
+    );
+}
+
+#[test]
 fn an_instance_never_strips_a_destination_it_does_not_own() {
     let config = json!({"claim_headers": {"email": "X-Owned"}});
     let mut headers = HashMap::from([

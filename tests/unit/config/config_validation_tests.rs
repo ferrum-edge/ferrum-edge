@@ -571,6 +571,66 @@ fn cp_full_and_incremental_rejection_share_plugin_security_composition_validatio
 }
 
 #[test]
+fn duplicate_resource_ids_are_refused_before_publication_and_apply() {
+    // CP: full and incremental admission share one rejecting contract, and it
+    // refuses two resources sharing one `(namespace, id)`.
+    let shared = include_str!("../../../src/config/validation_pipeline.rs");
+    let rejecting_start = shared
+        .find("pub(crate) fn collect_rejecting_runtime_config_errors(")
+        .expect("shared rejecting contract function");
+    let rejecting_end = shared[rejecting_start..]
+        .find("\n}\n")
+        .map(|offset| rejecting_start + offset)
+        .expect("shared rejecting contract body terminates");
+    assert!(
+        shared[rejecting_start..rejecting_end]
+            .contains("errors.extend(collect_duplicate_resource_id_errors(config));"),
+        "the shared CP rejecting contract must refuse duplicate resource ids"
+    );
+
+    // CP: a Kubernetes translation with duplicate ids is refused before the
+    // overlay is retained or broadcast.
+    let reconciler = include_str!("../../../src/k8s_controller/reconciler.rs");
+    let publish = reconciler
+        .find("pub fn publish_k8s_reconcile(")
+        .expect("Kubernetes publication entry point");
+    let duplicate_check = reconciler[publish..]
+        .find("collect_duplicate_resource_id_errors(effective_translation)")
+        .map(|offset| publish + offset)
+        .expect("Kubernetes publication refuses duplicate resource ids");
+    let store = reconciler[publish..]
+        .find("store_accepted_k8s_overlay(")
+        .map(|offset| publish + offset)
+        .expect("overlay retention");
+    assert!(
+        duplicate_check < store,
+        "duplicate ids must be refused before the overlay is retained or published"
+    );
+
+    // DP: a FULL_SNAPSHOT with duplicate ids is refused and the last accepted
+    // configuration keeps serving.
+    let dp_client = include_str!("../../../src/grpc/dp_client.rs");
+    let gate = dp_client
+        .find("if let Err(errors) = config.validate_unique_resource_ids() {")
+        .expect("DP full-snapshot duplicate-id gate");
+    let refusal = dp_client[gate..]
+        .find("return Ok(refuse_unusable_snapshot(subscription.base_applied));")
+        .map(|offset| gate + offset)
+        .expect("the duplicate-id gate refuses the snapshot");
+    let apply = dp_client
+        .find("update_config_off_thread_with_gateway_trust(config, gateway_trust_commit)")
+        .expect("DP full-snapshot apply");
+    assert!(
+        !dp_client[gate..refusal].contains("update_config"),
+        "the duplicate-id gate must refuse without applying anything"
+    );
+    assert!(
+        refusal < apply,
+        "the duplicate-id refusal must precede the snapshot apply"
+    );
+}
+
+#[test]
 fn non_runtime_full_loads_skip_node_local_plugin_files() {
     assert!(FullConfigLoadPurpose::Runtime.loads_node_local_plugin_files());
     assert!(!FullConfigLoadPurpose::ControlPlane.loads_node_local_plugin_files());

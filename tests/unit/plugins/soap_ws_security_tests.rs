@@ -2764,6 +2764,20 @@ fn decode_rejects_duplicate_charset_parameters() {
 }
 
 #[test]
+fn decode_rejects_extended_charset_parameters() {
+    let xml = wrap_soap(&fresh_timestamp());
+    for content_type in [
+        "text/xml; charset*=utf-8''utf-16",
+        "text/xml; charset=utf-8; CHARSET*0=utf-16",
+        "text/xml; charset*0*=utf-8''utf-16",
+    ] {
+        let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
+            .expect_err("an RFC 2231 charset is a second declaration");
+        assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+    }
+}
+
+#[test]
 fn decode_rejects_unbalanced_charset_quotes() {
     let xml = wrap_soap(&fresh_timestamp());
     for content_type in ["text/xml; charset=\"utf-8", "text/xml; charset=utf-8\""] {
@@ -3216,6 +3230,21 @@ fn test_nonce_replay_detected_via_direct_api() {
 }
 
 #[test]
+fn test_one_principal_cannot_consume_the_other_replay_capacity() {
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 8 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    assert!(harness.claim_for_principal("a-1", "principal-a").is_ok());
+    assert!(harness.claim_for_principal("a-2", "principal-a").is_ok());
+    assert!(harness.claim_for_principal("a-3", "principal-a").is_err());
+    assert!(harness.claim_for_principal("b-1", "principal-b").is_ok());
+}
+
+#[test]
 fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
     // Once the fixed retention horizon has elapsed, the atomic entry path must
     // refresh inserted_at instead of treating reuse as a live replay. This
@@ -3252,6 +3281,383 @@ fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
             .is_ok(),
         "expired Occupied nonce must be refreshed, not rejected as a live replay"
     );
+}
+
+const REPLAY_MESSAGE: &str = "WS-Security: nonce replay detected";
+const SATURATED_MESSAGE: &str = "WS-Security: replay protection state is at capacity";
+
+fn principal_nonce_harness() -> SoapNonceReplayHarness {
+    // A cap of 8 gives each principal a share of 2.
+    SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 8 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap()
+}
+
+/// An expired nonce still stored under another principal is a new use, not a
+/// replay (issue #6106). It is re-admitted under the presenting principal and
+/// its quota charge moves: the new principal's share is charged and the
+/// previous principal's charge is released. A live nonce is a replay for every
+/// principal.
+#[test]
+fn test_expired_nonce_is_readmitted_under_a_new_principal_and_moves_its_charge() {
+    let harness = principal_nonce_harness();
+    let still_live = Duration::from_secs(CLAIM_RETENTION_SECONDS - 1);
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", still_live),
+        Err(REPLAY_MESSAGE.to_string()),
+        "a live nonce is a replay whichever principal presents it"
+    );
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", expired),
+        Ok(()),
+        "an expired nonce stored under another principal must be re-admitted"
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 0);
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 1);
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 1, "the move refreshes in place");
+    assert_eq!(snapshot.age_index_entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+
+    // The refreshed claim is live again for both principals.
+    for principal in ["principal-a", "principal-b"] {
+        assert_eq!(
+            harness.claim_for_principal_at("shared", principal, expired),
+            Err(REPLAY_MESSAGE.to_string())
+        );
+    }
+
+    // The released share is usable again, and both shares still bound.
+    for nonce in ["a-1", "a-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-a", expired)
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        harness.claim_for_principal_at("a-3", "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string())
+    );
+    assert!(
+        harness
+            .claim_for_principal_at("b-1", "principal-b", expired)
+            .is_ok()
+    );
+    assert_eq!(
+        harness.claim_for_principal_at("b-2", "principal-b", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "the moved nonce must count against the new principal's share"
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 2);
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 2);
+}
+
+/// A move the new principal's share cannot absorb is refused without evicting
+/// any of that principal's live nonces. Reclaiming the expired claim returns
+/// the previous principal's charge, so neither principal leaks quota.
+#[test]
+fn test_expired_nonce_move_refused_at_the_new_principals_share_evicts_nothing() {
+    let harness = principal_nonce_harness();
+    let later = Duration::from_secs(1);
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    for nonce in ["b-1", "b-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-b", later)
+                .is_ok()
+        );
+    }
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a principal at its share cannot take over another principal's expired nonce"
+    );
+    for nonce in ["b-1", "b-2"] {
+        assert_eq!(
+            harness.claim_for_principal_at(nonce, "principal-b", expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused move must never evict a live nonce"
+        );
+    }
+    assert_eq!(
+        harness.principal_entries("principal-a").unwrap(),
+        0,
+        "reclaiming the expired nonce must release its previous principal's charge"
+    );
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 2);
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-a", expired),
+        Ok(())
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 1);
+}
+
+/// A principal at its share may still refresh its own expired nonce: the
+/// in-place refresh reuses the existing charge.
+#[test]
+fn test_principal_at_its_share_may_refresh_its_own_expired_nonce() {
+    let harness = principal_nonce_harness();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    for nonce in ["a-1", "a-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-a", Duration::ZERO)
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        harness.claim_for_principal_at("a-1", "principal-a", expired),
+        Ok(())
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 2);
+    assert_eq!(harness.snapshot().unwrap().entry_count, 2);
+}
+
+/// A refresh that cannot complete changes nothing. With the age-key sequence
+/// exhausted, refreshing an expired nonce fails closed, for a move and for the
+/// stored principal alike, and leaves the claim, the age index and both
+/// principals' charges exactly as they were.
+#[test]
+fn test_failed_expired_nonce_refresh_leaves_the_charges_unchanged() {
+    let harness = principal_nonce_harness();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    harness.exhaust_age_sequence().unwrap();
+
+    for principal in ["principal-b", "principal-a"] {
+        assert_eq!(
+            harness.claim_for_principal_at("shared", principal, expired),
+            Err(SATURATED_MESSAGE.to_string()),
+            "a refresh that cannot allocate an age key must fail closed"
+        );
+        assert_eq!(harness.principal_entries("principal-a").unwrap(), 1);
+        assert_eq!(harness.principal_entries("principal-b").unwrap(), 0);
+        let snapshot = harness.snapshot().unwrap();
+        assert_eq!(snapshot.entry_count, 1);
+        assert_eq!(snapshot.age_index_entry_count, 1);
+        assert_eq!(snapshot.shared_key_entries, 1);
+        assert_eq!(snapshot.last_expired_removals, 0);
+        assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+    }
+}
+
+fn principal_scope_config(max_cache_size: u64) -> Value {
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_cache_size"] = json!(max_cache_size);
+    config
+}
+
+/// A reload that lowers `max_cache_size` can leave the shared process state
+/// over the new cap. Moving an expired nonce in place would then recycle an
+/// occupied slot above that cap, so the move takes the fresh-claim path
+/// instead, which refuses rather than evicting a live nonce.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_move_through_a_lowered_cap_is_not_refreshed_in_place() {
+    let scope = "soap-lowered-cap-move";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+    let live = [("b-1", "principal-b"), ("c-1", "principal-c")];
+
+    // A cap of 8 gives each principal a share of 2.
+    let original = SoapNonceReplayHarness::with_scope(&principal_scope_config(8), scope, epoch)
+        .expect("original generation must admit");
+    original
+        .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    for (nonce, principal) in live {
+        original
+            .claim_for_principal_at(nonce, principal, Duration::from_secs(1))
+            .expect("the live claim is admitted");
+    }
+
+    // A cap of 2 gives each principal a share of 1; three claims are retained.
+    let lowered = SoapNonceReplayHarness::with_scope(&principal_scope_config(2), scope, epoch)
+        .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at("shared", "principal-d", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a move must not recycle a slot in a store over its cap"
+    );
+    for (nonce, principal) in live {
+        assert_eq!(
+            lowered.claim_for_principal_at(nonce, principal, expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused move must never evict a live nonce"
+        );
+    }
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 0);
+    assert_eq!(lowered.principal_entries("principal-d").unwrap(), 0);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+}
+
+/// The lowered entry cap also stops a principal refreshing its own expired
+/// nonce in place while the store is over the cap.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_same_principal_refresh_through_a_lowered_cap_is_not_in_place() {
+    let scope = "soap-lowered-cap-refresh";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+    let live = [("b-1", "principal-b"), ("c-1", "principal-c")];
+
+    let original = SoapNonceReplayHarness::with_scope(&principal_scope_config(8), scope, epoch)
+        .expect("original generation must admit");
+    original
+        .claim_for_principal_at("a-1", "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    for (nonce, principal) in live {
+        original
+            .claim_for_principal_at(nonce, principal, Duration::from_secs(1))
+            .expect("the live claim is admitted");
+    }
+
+    let lowered = SoapNonceReplayHarness::with_scope(&principal_scope_config(2), scope, epoch)
+        .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at("a-1", "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a refresh must not recycle a slot in a store over its cap"
+    );
+    for (nonce, principal) in live {
+        assert_eq!(
+            lowered.claim_for_principal_at(nonce, principal, expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused refresh must never evict a live nonce"
+        );
+    }
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 0);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+}
+
+/// Lowering the cap lowers every principal's share. A principal left above its
+/// new share may not refresh its own expired nonce in place, and none of its
+/// live nonces is evicted to make room.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_principal_above_a_lowered_share_is_not_refreshed_in_place() {
+    let scope = "soap-lowered-share-refresh";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    // A cap of 8 gives each principal a share of 2.
+    let original = SoapNonceReplayHarness::with_scope(&principal_scope_config(8), scope, epoch)
+        .expect("original generation must admit");
+    original
+        .claim_for_principal_at("a-1", "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    original
+        .claim_for_principal_at("a-2", "principal-a", Duration::from_secs(1))
+        .expect("the live claim is admitted");
+
+    // A cap of 4 gives each principal a share of 1; the store is within the cap.
+    let lowered = SoapNonceReplayHarness::with_scope(&principal_scope_config(4), scope, epoch)
+        .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at("a-1", "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a principal above its share must not refresh in place"
+    );
+    assert_eq!(
+        lowered.claim_for_principal_at("a-2", "principal-a", expired),
+        Err(REPLAY_MESSAGE.to_string()),
+        "a refused refresh must never evict a live nonce"
+    );
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 1);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+}
+
+fn principal_scope_byte_config(max_total_cache_bytes: Option<u64>) -> Value {
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_encoded_length"] = json!(2_048);
+    if let Some(max_total_cache_bytes) = max_total_cache_bytes {
+        config["nonce"]["max_total_cache_bytes"] = json!(max_total_cache_bytes);
+    }
+    config
+}
+
+/// A reload that lowers `max_total_cache_bytes` below the retained bytes stops
+/// in-place refreshes the same way a lowered entry cap does.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_refresh_through_a_lowered_byte_cap_is_not_in_place() {
+    let scope = "soap-lowered-byte-cap-refresh";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+    let nonces = ["a", "b", "c"].map(|fill| fill.repeat(1_500));
+
+    let original =
+        SoapNonceReplayHarness::with_scope(&principal_scope_byte_config(None), scope, epoch)
+            .expect("original generation must admit");
+    original
+        .claim_for_principal_at(&nonces[0], "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    for nonce in &nonces[1..] {
+        original
+            .claim_for_principal_at(nonce, "principal-b", Duration::from_secs(1))
+            .expect("the live claim is admitted");
+    }
+
+    // 4,500 retained bytes against a lowered 4,096-byte cap.
+    let lowered =
+        SoapNonceReplayHarness::with_scope(&principal_scope_byte_config(Some(4_096)), scope, epoch)
+            .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at(&nonces[0], "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a refresh must not recycle a slot in a store over its byte cap"
+    );
+    for nonce in &nonces[1..] {
+        assert_eq!(
+            lowered.claim_for_principal_at(nonce, "principal-b", expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused refresh must never evict a live nonce"
+        );
+    }
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 0);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, 3_000);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
 }
 
 // ── X.509 signature verification — end-to-end roundtrip ─────────────────────
@@ -7110,6 +7516,35 @@ mod advisory_regressions {
         );
     }
 
+    /// RFC 2231 extended and continuation forms of `boundary`, `type`, and
+    /// `start` are decoded by some backend parsers and ignored by Ferrum, so a
+    /// package carrying one would be framed, typed, or rooted differently. They
+    /// are refused, alone or beside the plain form.
+    #[test]
+    fn multipart_extended_parameters_are_refused() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let config = strict_username_token_config();
+        let refused: Result<String, String> = Ok("reject:400:malformed_multipart".to_string());
+
+        for content_type in [
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; boundary*=utf-8''B",
+            "multipart/related; type=\"application/xop+xml\"; boundary*=utf-8''B",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; boundary*0=B",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; BOUNDARY*0*=utf-8''B",
+            "multipart/related; type*=utf-8''application%2Fxop%2Bxml; boundary=A",
+            "multipart/related; type=\"application/xop+xml\"; type*0=text; boundary=A",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; start*=utf-8''%3Cx%3E",
+            "multipart/related; type=\"application/xop+xml\"; boundary=A; Start*1=y",
+        ] {
+            let outcome = classify(&config, Some(content_type));
+            assert_eq!(outcome, refused, "{content_type}");
+        }
+
+        // A parameter that merely shares a prefix with one of them is unrelated.
+        let unrelated = "multipart/related; type=\"application/xop+xml\"; boundary=A; types*=x";
+        assert_eq!(classify(&config, Some(unrelated)), Ok("mtom".to_string()));
+    }
+
     #[test]
     fn multipart_parameters_follow_http_quoted_string_rules() {
         use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
@@ -7195,6 +7630,89 @@ mod advisory_regressions {
         ));
     }
 
+    /// A padded first delimiter fronting an unverified envelope, followed by a
+    /// part carrying a valid credential, is refused rather than authenticated
+    /// on the later part: a padding-tolerant backend takes the first part as
+    /// its root.
+    #[tokio::test]
+    async fn mtom_padded_first_delimiter_is_refused() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let content_type =
+            "multipart/related; type=\"application/xop+xml\"; boundary=MIME_boundary";
+        let unverified = valid_username_token_body().replace("secret123", "wrong-password");
+        let valid_part = format!(
+            "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             \r\n\
+             {}\r\n\
+             --MIME_boundary--\r\n",
+            valid_username_token_body()
+        );
+
+        let mut ctx = ctx_with(&valid_part, Some(content_type));
+        let mut headers = soap_headers_with_content_type(content_type);
+        assert!(
+            matches!(
+                run_soap_request_policy(&plugin, &mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "the valid single-part package must authenticate"
+        );
+
+        for padding in [" ", "\t"] {
+            let package = format!(
+                "--MIME_boundary{padding}\r\n\
+                 Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+                 \r\n\
+                 {unverified}\r\n\
+                 {valid_part}"
+            );
+            let mut ctx = ctx_with(&package, Some(content_type));
+            let mut headers = soap_headers_with_content_type(content_type);
+            let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+            assert!(
+                is_reject(&result),
+                "a padded first delimiter must not be skipped as preamble"
+            );
+        }
+    }
+
+    /// A boundary token planted mid-line in the preamble, fronting an
+    /// unverified envelope, is refused rather than skipped: a parser that finds
+    /// the first delimiter without requiring it to open a line takes the
+    /// planted part as its root, while the later part carries a valid
+    /// credential.
+    #[tokio::test]
+    async fn mtom_preamble_fake_delimiter_is_refused() {
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let content_type =
+            "multipart/related; type=\"application/xop+xml\"; boundary=MIME_boundary";
+        let unverified = valid_username_token_body().replace("secret123", "wrong-password");
+        let valid_part = format!(
+            "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             \r\n\
+             {}\r\n\
+             --MIME_boundary--\r\n",
+            valid_username_token_body()
+        );
+        let package = format!(
+            "X--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             \r\n\
+             {unverified}\r\n\
+             {valid_part}"
+        );
+
+        let mut ctx = ctx_with(&package, Some(content_type));
+        let mut headers = soap_headers_with_content_type(content_type);
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert!(
+            is_reject(&result),
+            "a mid-line delimiter in the preamble must not be skipped"
+        );
+    }
+
     /// Declaring that a route does not accept MTOM must refuse SOAP-bearing
     /// multipart rather than let it stream past.
     #[tokio::test]
@@ -7245,6 +7763,9 @@ mod advisory_regressions {
         assert!(!plugin.is_auth_plugin());
         assert!(!plugin.requires_request_body_before_authenticate());
         assert!(plugin.requires_request_body_before_before_proxy());
+        // Freshness enforcement still refuses requests, so a client-selected
+        // gRPC or WebSocket flavor that skips it must be refused instead.
+        assert!(plugin.gates_request_admission());
     }
 
     /// The two phases are mutually exclusive: an identity-establishing policy
@@ -7539,46 +8060,65 @@ mod mtom_strict_framing {
         assert_eq!(root_of(&with_preamble, Some(ROOT_ID)), "<soap:Envelope/>");
     }
 
-    /// A `--boundary` that is not at the start of a line is payload, not
-    /// framing. The unanchored byte-substring search this replaced truncated
-    /// the envelope at the first such occurrence, so Ferrum validated a prefix
-    /// of the message the backend executed in full.
+    /// A `--boundary` that is not at the start of a line is not framing to
+    /// CRLF parsing, but parsers that match the token inside a part body end
+    /// the part there. The unanchored byte-substring search this replaced
+    /// truncated the envelope the same way, so Ferrum validated a prefix of the
+    /// message the backend executed in full. The token inside a part body fails
+    /// closed, in the envelope and in an attachment alike.
     #[test]
-    fn an_embedded_boundary_substring_does_not_reframe_the_root() {
+    fn an_embedded_boundary_substring_fails_closed() {
         let root = "<soap:Envelope><!--MIME_boundary--></soap:Envelope>";
-        let package = package(root, "opaque-bytes");
-        assert_eq!(
-            root_of(&package, Some(ROOT_ID)),
-            root,
-            "a boundary substring inside the envelope is payload"
-        );
+        let in_root = package(root, "opaque-bytes");
+        assert_closed(&in_root, Some(ROOT_ID), "malformed_encoding");
+        assert_closed(&in_root, None, "malformed_encoding");
+
+        let in_attachment = package("<soap:Envelope/>", "opaque --MIME_boundary bytes");
+        assert_closed(&in_attachment, Some(ROOT_ID), "malformed_encoding");
     }
 
-    /// A fake part planted in the preamble must not become the root. With
-    /// first-part selection an unanchored search finds the planted delimiter
-    /// first and returns the attacker's envelope; anchored framing skips it and
-    /// selects the real first part.
+    /// A fake part planted in the preamble must not become the root. Parsers
+    /// that find the first delimiter without requiring it to open a line frame
+    /// the planted part as the first part, while CRLF framing skips it as
+    /// preamble, so any boundary token in the preamble fails closed: with or
+    /// without `start`, and whatever precedes it on its line.
     #[test]
     fn a_payload_fake_delimiter_cannot_become_the_root() {
         let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
-        // The planted delimiter is mid-line, so it is not a delimiter line for
-        // any conforming parser.
-        let planted = format!(
-            "preamble --MIME_boundary\r\n\
-             Content-Type: text/xml\r\n\
-             \r\n\
-             <soap:Envelope>forged</soap:Envelope>\r\n\
-             {real}"
-        );
-        assert_eq!(
-            root_of(&planted, None),
-            "<soap:Envelope>real</soap:Envelope>",
-            "an unanchored delimiter must not select a root"
-        );
-        assert_eq!(
-            root_of(&planted, Some(ROOT_ID)),
-            "<soap:Envelope>real</soap:Envelope>"
-        );
+        for lead in ["preamble ", "X", "preamble\r\nX"] {
+            let planted = format!(
+                "{lead}--MIME_boundary\r\n\
+                 Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                 \r\n\
+                 <soap:Envelope>forged</soap:Envelope>\r\n\
+                 {real}"
+            );
+            assert_closed(&planted, None, "malformed_encoding");
+            assert_closed(&planted, Some(ROOT_ID), "malformed_encoding");
+        }
+    }
+
+    /// A line that opens with the boundary token followed by more boundary
+    /// characters (`--boundaryX`) is a delimiter to a parser that ignores the
+    /// rest of the line and payload to one that requires an exact match, so it
+    /// fails closed wherever it appears.
+    #[test]
+    fn a_boundary_prefixed_token_at_line_start_fails_closed() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        let forged = "--MIME_boundaryX\r\n\
+                      Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                      \r\n\
+                      <soap:Envelope>forged</soap:Envelope>\r\n";
+
+        let leading = format!("{forged}{real}");
+        assert_closed(&leading, None, "malformed_encoding");
+        assert_closed(&leading, Some(ROOT_ID), "malformed_encoding");
+
+        let after_preamble = format!("preamble\r\n{forged}{real}");
+        assert_closed(&after_preamble, None, "malformed_encoding");
+
+        let in_part = real.replacen("opaque\r\n", &format!("opaque\r\n{forged}"), 1);
+        assert_closed(&in_part, Some(ROOT_ID), "malformed_encoding");
     }
 
     /// LF-only framing is not MIME framing. A parser that tolerates it and one
@@ -7589,6 +8129,100 @@ mod mtom_strict_framing {
         let package = raw.replace("\r\n", "\n");
         assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
         assert_closed(&package, None, "malformed_encoding");
+    }
+
+    /// RFC 2046 transport padding on a delimiter line is framing to a
+    /// padding-tolerant backend parser. Skipping the padded line as payload
+    /// frames the package from a later delimiter instead, so Ferrum would
+    /// validate a different root than such a backend executes. Every padded
+    /// variant fails closed: space or tab padding, on the first delimiter at
+    /// the body start or after a preamble, on a later part delimiter, and on
+    /// the close-delimiter.
+    #[test]
+    fn a_padded_delimiter_line_fails_closed() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        for padding in [" ", "\t", " \t "] {
+            let forged_first = format!(
+                "--MIME_boundary{padding}\r\n\
+                 Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                 \r\n\
+                 <soap:Envelope>forged</soap:Envelope>\r\n\
+                 {real}"
+            );
+            assert_closed(&forged_first, None, "malformed_encoding");
+            assert_closed(&forged_first, Some(ROOT_ID), "malformed_encoding");
+
+            let after_preamble = format!("preamble\r\n{forged_first}");
+            assert_closed(&after_preamble, None, "malformed_encoding");
+            assert_closed(&after_preamble, Some(ROOT_ID), "malformed_encoding");
+
+            let padded_part = real.replacen(
+                "\r\n--MIME_boundary\r\n",
+                &format!("\r\n--MIME_boundary{padding}\r\n"),
+                1,
+            );
+            assert_closed(&padded_part, None, "malformed_encoding");
+            assert_closed(&padded_part, Some(ROOT_ID), "malformed_encoding");
+
+            let padded_close = real.replace(
+                "--MIME_boundary--\r\n",
+                &format!("--MIME_boundary--{padding}\r\nepilogue\r\n--MIME_boundary--\r\n"),
+            );
+            assert_closed(&padded_close, None, "malformed_encoding");
+            assert_closed(&padded_close, Some(ROOT_ID), "malformed_encoding");
+        }
+    }
+
+    /// A boundary token that opens a line after a bare LF or a bare CR is a
+    /// delimiter to a parser that tolerates those line endings and payload to
+    /// strict CRLF framing, so the two select different roots. So is a
+    /// CRLF-opened delimiter line that ends in a bare LF. Each fails closed
+    /// rather than being skipped.
+    #[test]
+    fn a_boundary_opened_or_ended_by_a_bare_line_ending_fails_closed() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        for eol in ["\n", "\r"] {
+            let forged_preamble = format!(
+                "preamble{eol}--MIME_boundary\r\n\
+                 Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+                 \r\n\
+                 <soap:Envelope>forged</soap:Envelope>\r\n\
+                 {real}"
+            );
+            assert_closed(&forged_preamble, None, "malformed_encoding");
+            assert_closed(&forged_preamble, Some(ROOT_ID), "malformed_encoding");
+
+            let bare_part = real.replacen(
+                "\r\n--MIME_boundary\r\n",
+                &format!("{eol}--MIME_boundary{eol}"),
+                1,
+            );
+            assert_closed(&bare_part, None, "malformed_encoding");
+            assert_closed(&bare_part, Some(ROOT_ID), "malformed_encoding");
+        }
+
+        let lf_terminated = real.replacen("\r\n--MIME_boundary\r\n", "\r\n--MIME_boundary\n", 1);
+        assert_closed(&lf_terminated, None, "malformed_encoding");
+        assert_closed(&lf_terminated, Some(ROOT_ID), "malformed_encoding");
+
+        let forged_first = format!(
+            "--MIME_boundary\n\
+             Content-Type: application/xop+xml; type=\"text/xml\"\n\
+             \n\
+             <soap:Envelope>forged</soap:Envelope>\n\
+             {real}"
+        );
+        assert_closed(&forged_first, None, "malformed_encoding");
+    }
+
+    /// Bare line endings that do not open a boundary line are ordinary
+    /// content: an LF-formatted envelope still resolves.
+    #[test]
+    fn bare_line_endings_inside_a_part_body_still_resolve() {
+        let root = "<soap:Envelope>\n  <soap:Body/>\r</soap:Envelope>";
+        let package = package(root, "line one\nline two");
+        assert_eq!(root_of(&package, Some(ROOT_ID)), root);
+        assert_eq!(root_of(&package, None), root);
     }
 
     /// The close-delimiter is mandatory, and nothing boundary-shaped may
@@ -7684,6 +8318,84 @@ mod mtom_strict_framing {
 
         let blank_id = base.replace("<root@example.com>", "<>");
         assert_closed(&blank_id, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// `start` must name the first part. A parser that ignores `start` and
+    /// takes the first part as the root would otherwise execute a different
+    /// envelope than the one `start` selected for validation.
+    #[test]
+    fn a_start_naming_a_later_part_fails_closed() {
+        let package = "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+             Content-ID: <first@example.com>\r\n\
+             \r\n\
+             <soap:Envelope>first</soap:Envelope>\r\n\
+             --MIME_boundary\r\n\
+             Content-Type: application/xop+xml; type=\"text/xml\"\r\n\
+             Content-ID: <root@example.com>\r\n\
+             \r\n\
+             <soap:Envelope>second</soap:Envelope>\r\n\
+             --MIME_boundary--\r\n";
+        assert_closed(package, Some(ROOT_ID), "malformed_encoding");
+
+        let first = "<soap:Envelope>first</soap:Envelope>";
+        assert_eq!(root_of(package, None), first);
+        assert_eq!(root_of(package, Some("first@example.com")), first);
+    }
+
+    /// `Content-ID` comparison takes the widest reading a backend may use:
+    /// ASCII case is ignored and a `cid:` prefix is dropped. `start` resolves
+    /// under it, and two ids that differ only in those ways are duplicates.
+    #[test]
+    fn content_ids_compare_case_insensitively_and_without_cid_scheme() {
+        let base = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        let real = "<soap:Envelope>real</soap:Envelope>";
+        assert_eq!(root_of(&base, Some("ROOT@EXAMPLE.COM")), real);
+        assert_eq!(root_of(&base, Some("cid:root@example.com")), real);
+
+        for variant in [
+            "<ROOT@example.com>",
+            "<cid:root@example.com>",
+            "<CID:Root@Example.Com>",
+        ] {
+            let package = base.replace("<attachment@example.com>", variant);
+            assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+            assert_closed(&package, None, "malformed_encoding");
+        }
+    }
+
+    /// A backend that percent-decodes `Content-ID`s (`%XX` escapes and `+` to a
+    /// space) can resolve an id Ferrum treats as distinct, so `start` and the
+    /// part that backend executes can disagree. Any `Content-ID` or `start`
+    /// carrying `%`, `+`, or embedded whitespace fails closed instead of being
+    /// compared, while plain ids keep resolving.
+    #[test]
+    fn content_ids_a_percent_decoding_backend_would_reinterpret_fail_closed() {
+        let base = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+
+        // `start` names part 1's `<root@x>` case-insensitively; part 2's
+        // `<ROOT%40x>` decodes to the same id for a percent-decoding backend.
+        let start_collision = base
+            .replace("<root@example.com>", "<root@x>")
+            .replace("<attachment@example.com>", "<ROOT%40x>");
+        assert_closed(&start_collision, Some("ROOT@x"), "malformed_encoding");
+        assert_closed(&start_collision, None, "malformed_encoding");
+
+        // A `start` carrying a decoded character is refused before any part is
+        // compared, with or without the angle-bracket wrapper.
+        assert_closed(&base, Some("<ROOT%40example.com>"), "malformed_encoding");
+        assert_closed(&base, Some("root+example.com"), "malformed_encoding");
+        assert_closed(&base, Some("<root @example.com>"), "malformed_encoding");
+
+        // Plain ids are still accepted, including case and `cid:` variants.
+        assert_eq!(
+            root_of(&base, Some("ROOT@EXAMPLE.COM")),
+            "<soap:Envelope>real</soap:Envelope>"
+        );
+        assert_eq!(
+            root_of(&base, Some("cid:root@example.com")),
+            "<soap:Envelope>real</soap:Envelope>"
+        );
     }
 
     /// `start` naming a part the package does not contain has no envelope to

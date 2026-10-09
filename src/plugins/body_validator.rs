@@ -246,7 +246,7 @@ pub struct BodyValidator {
     protobuf_pool_has_proto2: bool,
     /// Whether to reject messages with unknown field numbers.
     protobuf_reject_unknown_fields: bool,
-    /// Maximum decompressed gRPC payload size; 0 disables the decompressed cap.
+    /// Positive maximum decompressed gRPC payload size.
     grpc_max_decompressed_size_bytes: usize,
 
     // ── Cached flags ──
@@ -353,8 +353,16 @@ impl BodyValidator {
         let protobuf_reject_unknown_fields =
             optional_bool(config, "protobuf_reject_unknown_fields")?.unwrap_or(false);
         let grpc_max_decompressed_size_bytes =
-            optional_usize(config, "grpc_max_decompressed_size_bytes")?
-                .unwrap_or_else(default_grpc_max_decompressed_size_bytes);
+            match optional_usize(config, "grpc_max_decompressed_size_bytes")? {
+                Some(0) => {
+                    return Err(
+                    "body_validator: `grpc_max_decompressed_size_bytes` must be greater than zero"
+                        .to_string(),
+                );
+                }
+                Some(limit) => limit,
+                None => default_grpc_max_decompressed_size_bytes(),
+            };
 
         let has_protobuf_request_validation = protobuf_targets.has_request();
         let has_protobuf_response_validation = protobuf_targets.has_response();
@@ -892,6 +900,9 @@ fn parse_grpc_frame(
     body: &[u8],
     max_decompressed_size_bytes: usize,
 ) -> Result<Cow<'_, [u8]>, String> {
+    if max_decompressed_size_bytes == 0 {
+        return Err("gRPC decompressed size limit must be greater than zero".to_string());
+    }
     if body.len() < 5 {
         return Err(format!(
             "gRPC frame too short: {} bytes (minimum 5)",
@@ -912,11 +923,7 @@ fn parse_grpc_frame(
         // gRPC compression uses gzip (deflate) by default per the gRPC spec.
         // Bounded read to prevent compression-bomb DoS.
         let mut decoder = GzDecoder::new(payload);
-        let initial_capacity = if max_decompressed_size_bytes > 0 {
-            payload.len().min(max_decompressed_size_bytes)
-        } else {
-            payload.len()
-        };
+        let initial_capacity = payload.len().min(max_decompressed_size_bytes);
         let mut decompressed = Vec::with_capacity(initial_capacity);
         let mut buf = [0u8; 8192];
         loop {
@@ -926,9 +933,7 @@ fn parse_grpc_frame(
             if n == 0 {
                 break;
             }
-            if max_decompressed_size_bytes > 0
-                && decompressed.len().saturating_add(n) > max_decompressed_size_bytes
-            {
+            if decompressed.len().saturating_add(n) > max_decompressed_size_bytes {
                 return Err(format!(
                     "gRPC decompressed body exceeds max size of {max_decompressed_size_bytes} bytes"
                 ));
@@ -944,6 +949,7 @@ fn parse_grpc_frame(
 fn default_grpc_max_decompressed_size_bytes() -> usize {
     crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
         .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE)
 }
 

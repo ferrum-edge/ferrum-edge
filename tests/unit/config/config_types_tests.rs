@@ -133,6 +133,7 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
@@ -7225,4 +7226,39 @@ fn a_provable_local_a2a_gateway_shadows_a_request_derived_global_one() {
         config.validate_plugin_references().is_ok(),
         "the effective a2a_gateway on this proxy is the configured-public-base local instance"
     );
+}
+
+/// Issue #6057: composition validators resolve a proxy's global fallback from
+/// this index instead of rescanning every plugin config per proxy.
+#[test]
+fn enabled_global_plugin_configs_are_grouped_by_name_in_config_order() {
+    let plugin = |id: &str, name: &str, scope: &str, enabled: bool| -> PluginConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "plugin_name": name,
+            "scope": scope,
+            "proxy_id": if scope == "proxy" { Some("p1") } else { None },
+            "enabled": enabled,
+            "config": {},
+        }))
+        .unwrap()
+    };
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        plugin("dedup-b", "request_deduplication", "global", true),
+        plugin("cors", "cors", "global", true),
+        plugin("dedup-off", "request_deduplication", "global", false),
+        plugin("dedup-local", "request_deduplication", "proxy", true),
+        plugin("dedup-a", "request_deduplication", "global", true),
+    ];
+    let globals = config.enabled_global_plugin_configs_by_name();
+    let ids = |name: &str| -> Vec<&str> {
+        globals
+            .get(name)
+            .map(|plugins| plugins.iter().map(|plugin| plugin.id.as_str()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(ids("request_deduplication"), ["dedup-b", "dedup-a"]);
+    assert_eq!(ids("cors"), ["cors"]);
+    assert!(ids("soap_ws_security").is_empty());
 }

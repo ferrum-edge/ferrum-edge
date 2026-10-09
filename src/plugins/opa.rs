@@ -593,6 +593,12 @@ impl Plugin for Opa {
         for (name, value) in &self.custom_headers {
             request = request.header(name.clone(), value.clone());
         }
+        // A decision URL that resolves back to the gateway is refused at the
+        // proxy hop limit like a looping route (issue #6128).
+        request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(
+            request,
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+        );
 
         // The decision is not made until the complete response document has
         // arrived, so the body wait is part of the external I/O this plugin
@@ -918,6 +924,14 @@ fn parse_header_map(
         if field == "headers" && header_name == CONTENT_TYPE {
             return Err(format!(
                 "{plugin_name}: `{field}` must not include `content-type`; OPA decision requests are always sent as JSON"
+            ));
+        }
+        // The decision call carries the gateway's hop count as exactly one
+        // field line (issue #6128); a configured copy (any case, `_` or `-`)
+        // would sit beside it and reset or duplicate the count.
+        if field == "headers" && crate::proxy::hop_limit::is_proxy_hops_header(key) {
+            return Err(format!(
+                "{plugin_name}: `{field}` must not include `X-Ferrum-Hops`; the gateway owns the proxy hop count"
             ));
         }
         let header_value = HeaderValue::from_str(value).map_err(|error| {

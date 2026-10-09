@@ -2882,6 +2882,70 @@ pub(crate) fn h2_upload_reset_error() -> BoxError {
     h2::Error::from(h2::Reason::CANCEL).into()
 }
 
+/// A frontend request body read by a BUFFERED collect, with the same
+/// END_STREAM rule as [`SizeLimitedIncoming::with_h2_end_stream_required`]
+/// (issue #6022).
+///
+/// The buffered collectors (the early `before_proxy` prebuffer, the H1/H2
+/// retry/body-plugin collect, and the native gRPC collect) used to accept an
+/// HTTP/2 client's `RST_STREAM(NO_ERROR)` as a complete body, because hyper
+/// reports it as a clean end of body. hyper's server does drop the service
+/// future when it sees the reset, but only if that future is still pending:
+/// when the last DATA and the reset are read in the same poll, the collect
+/// finishes first and the truncated body is dispatched. With the gate set, that
+/// EOF yields [`h2_upload_reset_error`] instead, which every collector already
+/// reports as a client disconnect.
+///
+/// Never set for HTTP/1.1: a valid chunked EOF need not update
+/// `is_end_stream()`. One bool and no allocation; the check runs once, at EOF.
+pub(crate) struct H2EndStreamGated<B> {
+    inner: B,
+    require_end_stream: bool,
+}
+
+impl<B> H2EndStreamGated<B> {
+    #[inline]
+    pub(crate) fn new(inner: B, require_end_stream: bool) -> Self {
+        Self {
+            inner,
+            require_end_stream,
+        }
+    }
+}
+
+impl<B> http_body::Body for H2EndStreamGated<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+            Poll::Ready(None) if this.require_end_stream && !this.inner.is_end_stream() => {
+                Poll::Ready(Some(Err(h2_upload_reset_error())))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Outcome to report when the adapter is dropped without having reached a
 /// terminal poll.
 ///

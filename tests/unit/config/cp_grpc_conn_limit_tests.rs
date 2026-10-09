@@ -206,6 +206,42 @@ fn ipv4_and_ipv6_sources_are_accounted_separately() {
     );
     assert_eq!(limiter.tracked_source_ips(), 2);
 }
+
+#[test]
+fn ipv6_per_ip_cap_groups_the_default_prefix_and_folds_mapped_ipv4() {
+    let limiter = Arc::new(ConnLimiter::new(0, 1));
+    let _first = limiter
+        .try_acquire("2001:db8:abcd:12::1".parse().expect("IPv6 address"))
+        .expect("first IPv6 address admitted");
+    assert_eq!(
+        limiter
+            .try_acquire("2001:db8:abcd:12::ffff".parse().expect("IPv6 address"))
+            .expect_err("same /64 shares the source cap"),
+        ConnRejectReason::MaxConnectionsPerIp
+    );
+
+    let mapped = Arc::new(ConnLimiter::new(0, 1));
+    let _v4 = mapped
+        .try_acquire(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        .expect("IPv4 admitted");
+    assert_eq!(
+        mapped
+            .try_acquire("::ffff:192.0.2.1".parse().expect("mapped IPv4"))
+            .expect_err("mapped IPv4 shares the native IPv4 quota"),
+        ConnRejectReason::MaxConnectionsPerIp
+    );
+}
+
+#[test]
+fn ipv6_per_ip_cap_can_use_host_prefix_accounting() {
+    let limiter = Arc::new(ConnLimiter::new_with_ipv6_prefix(0, 1, 128));
+    let _first = limiter
+        .try_acquire("2001:db8:abcd:12::1".parse().expect("IPv6 address"))
+        .expect("first IPv6 host admitted");
+    let _second = limiter
+        .try_acquire("2001:db8:abcd:12::ffff".parse().expect("IPv6 address"))
+        .expect("a distinct IPv6 host has a separate cap");
+}
 // ============================================================================
 // RFC 9298 CONNECT-UDP session admission shares the same ceiling contract
 // ============================================================================

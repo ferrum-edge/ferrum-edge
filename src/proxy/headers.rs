@@ -104,7 +104,8 @@ define_header_name_set! {
 }
 
 /// Returns `true` for the gateway-owned consumer assertion namespace
-/// (`x-consumer-*`, ASCII case-insensitive, `_` equivalent to `-`).
+/// (`x-consumer-*`, ASCII case-insensitive, `_` equivalent to `-`) and for
+/// `x-authenticated-identity`.
 ///
 /// This is the single source of truth for the namespace. Every name under the
 /// prefix is gateway-owned: a client-supplied `X-Consumer-Role` or
@@ -122,37 +123,72 @@ define_header_name_set! {
 /// `HTTP_X_CONSUMER_*` variable, so an underscore spelling would otherwise
 /// reach the backend as the gateway's assertion.
 ///
-/// Allocation-free: one bounded 11-byte compare that folds ASCII case and
-/// normalises `_` to `-`, so it is safe to call per header on the hot path
-/// with lowercase or mixed-case names.
+/// Allocation-free: one bounded compare that folds ASCII case and normalises
+/// `_` to `-`, so it is safe to call per header on the hot path with lowercase
+/// or mixed-case names.
 #[inline]
 pub fn is_consumer_assertion_header(name: &str) -> bool {
-    const PREFIX: &[u8] = b"x-consumer-";
-    let Some(head) = name.as_bytes().get(..PREFIX.len()) else {
+    field_names_equivalent_for_backends(name, "x-authenticated-identity")
+        || has_backend_folded_prefix(name, b"x-consumer-")
+}
+
+/// Returns `true` for the gateway's route path-param captures
+/// (`x-path-param-*`), ASCII case-insensitive with `_` equivalent to `-`, so a
+/// client `X_Path_Param_Id` cannot reach a CGI-style backend beside the
+/// gateway's `x-path-param-id`. Allocation-free.
+#[inline]
+pub fn is_path_param_assertion_header(name: &str) -> bool {
+    has_backend_folded_prefix(name, b"x-path-param-")
+}
+
+/// Whether `name` starts with the lowercase, dash-spelled `prefix` under the
+/// folding backends apply ([`field_names_equivalent_for_backends`]).
+#[inline]
+fn has_backend_folded_prefix(name: &str, prefix: &[u8]) -> bool {
+    let Some(head) = name.as_bytes().get(..prefix.len()) else {
         return false;
     };
-    for (&byte, &expected) in head.iter().zip(PREFIX) {
-        let folded = match byte {
-            b'_' => b'-',
-            other => other.to_ascii_lowercase(),
-        };
-        if folded != expected {
-            return false;
-        }
+    head.iter()
+        .zip(prefix)
+        .all(|(&byte, &expected)| fold_field_name_byte(byte) == expected)
+}
+
+/// Field-name equality under the folding backends apply: ASCII
+/// case-insensitive, with `_` and `-` treated as the same byte.
+///
+/// CGI-style backends (Rack, WSGI, PHP-FPM) map `X-Tenant-Id` and `X_Tenant_Id`
+/// onto the same `HTTP_X_TENANT_ID` variable, so a gateway-owned destination
+/// must be scrubbed of client values under this equivalence, not just case.
+/// Allocation-free.
+#[inline]
+pub fn field_names_equivalent_for_backends(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-    true
+    a.bytes()
+        .zip(b.bytes())
+        .all(|(x, y)| fold_field_name_byte(x) == fold_field_name_byte(y))
+}
+
+#[inline]
+fn fold_field_name_byte(byte: u8) -> u8 {
+    match byte {
+        b'_' => b'-',
+        other => other.to_ascii_lowercase(),
+    }
 }
 
 /// Returns `true` for every backend-visible gateway assertion: the
 /// [`is_consumer_assertion_header`] namespace plus the private GeoIP result
-/// (`x-geo-country`). ASCII case-insensitive and allocation-free.
+/// (`x-geo-country`). ASCII case-insensitive with `_` equivalent to `-`
+/// ([`field_names_equivalent_for_backends`]), and allocation-free.
 ///
 /// Outbound maps that plugins may have mutated are scrubbed of these names and
 /// then receive only the gateway's authoritative values
 /// (`crate::proxy::refresh_backend_gateway_assertion_headers`).
 #[inline]
 pub fn is_gateway_assertion_header(name: &str) -> bool {
-    is_consumer_assertion_header(name) || name.eq_ignore_ascii_case("x-geo-country")
+    is_consumer_assertion_header(name) || field_names_equivalent_for_backends(name, "x-geo-country")
 }
 
 define_header_name_set! {
@@ -428,6 +464,145 @@ pub fn strip_connection_listed_headers(headers: &mut http::HeaderMap) {
     }
 }
 
+/// `Connection` options a client may keep nominating after ingress: the
+/// RFC 9110 §7.6.1 request-direction hop-by-hop fields, which every backend
+/// boundary strips anyway, plus the `close` connection option.
+#[inline]
+fn is_retained_connection_option(token: &str) -> bool {
+    const RETAINED: [&str; 9] = [
+        "close",
+        "connection",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    RETAINED
+        .iter()
+        .any(|retained| token.eq_ignore_ascii_case(retained))
+}
+
+/// Client fields that a `Connection` nomination must not remove at ingress
+/// because the gateway's own routing, framing, or client-address resolution
+/// reads them. `Host` is routing input the client controls in any case, and
+/// `Content-Length` / `Expect` are stripped at the backend boundary
+/// ([`is_backend_request_strip_header`]).
+///
+/// The forwarding fields (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, and the
+/// configured `FERRUM_REAL_IP_HEADER`, already lowercase) feed trusted-proxy
+/// client-IP and scheme resolution. Removing a nominated one would let a
+/// client whose `Connection` header an upstream proxy relays drop the proxy's
+/// assertion and fall back to that proxy's socket address, evading per-IP
+/// deny lists and limits. The backend boundary regenerates or strips these
+/// fields regardless, and the rewritten `Connection` no longer lists them.
+///
+/// `x-ferrum-hops` is the gateway's own loop-guard count
+/// ([`crate::proxy::hop_limit`]): the frontend has already replaced the
+/// client's value with the forwarded count, and a nomination that removed it
+/// would reset the count the next gateway hop reads.
+#[inline]
+fn is_ingress_protected_nominated_field(name: &str, real_ip_header: Option<&str>) -> bool {
+    matches!(
+        name,
+        "host"
+            | "content-length"
+            | "expect"
+            | "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-port"
+            | "x-forwarded-proto"
+            | "x-real-ip"
+            | crate::proxy::hop_limit::PROXY_HOPS_HEADER
+    ) || real_ip_header == Some(name)
+}
+
+/// Resolve a client request's RFC 9110 §7.6.1 `Connection` nominations at
+/// ingress, before any plugin runs.
+///
+/// Every field the client nominates is removed from the client's own header
+/// set here, and `Connection` is rewritten to keep only `close` and the
+/// request hop-by-hop names. The backend builders still apply the
+/// Connection-listed strip to the FINAL outbound map; confining the nomination
+/// at ingress means that strip can no longer remove a field the gateway or a
+/// plugin asserted after admission — consumer identity, verified claim and
+/// path-param headers, GeoIP results, or transformer-added headers. Gateway
+/// assertions are therefore applied after the client's hop-by-hop fields are
+/// gone, not before.
+///
+/// `host`, `content-length`, and `expect` keep their client values for the
+/// gateway's routing and framing, and the forwarding fields (including
+/// `real_ip_header`, the configured `FERRUM_REAL_IP_HEADER`) keep theirs for
+/// trusted-proxy client-IP resolution; retained hop-by-hop names keep theirs
+/// for protocol handling such as the WebSocket upgrade. A nominated
+/// `Authorization` is removed like any other client field, so an auth plugin
+/// then sees no credential and refuses the request.
+///
+/// Hot path: returns after one lookup when `Connection` is absent (always on
+/// HTTP/2, where the field is malformed) and after an allocation-free scan
+/// when every token is already a retained option (`keep-alive`, `close`,
+/// `Upgrade`). Only a request that nominates some other field allocates.
+pub fn confine_connection_nominated_request_headers(
+    headers: &mut http::HeaderMap,
+    real_ip_header: Option<&str>,
+) {
+    let connection = headers.get_all(http::header::CONNECTION);
+    let needs_rewrite = connection.iter().any(|value| {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        value.split(',').any(|token| {
+            let token = token.trim();
+            !token.is_empty() && !is_retained_connection_option(token)
+        })
+    });
+    if !needs_rewrite {
+        return;
+    }
+
+    let mut retained = String::new();
+    let mut nominated: Vec<http::HeaderName> = Vec::new();
+    for value in connection.iter() {
+        // A non-visible-ASCII value carries no usable option; drop it whole.
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if is_retained_connection_option(token) {
+                if !retained.is_empty() {
+                    retained.push_str(", ");
+                }
+                retained.push_str(token);
+                continue;
+            }
+            let Ok(name) = http::HeaderName::from_bytes(token.as_bytes()) else {
+                continue;
+            };
+            if !is_ingress_protected_nominated_field(name.as_str(), real_ip_header)
+                && !nominated.contains(&name)
+            {
+                nominated.push(name);
+            }
+        }
+    }
+    for name in nominated {
+        headers.remove(&name);
+    }
+    headers.remove(http::header::CONNECTION);
+    if !retained.is_empty()
+        && let Ok(value) = http::HeaderValue::from_str(&retained)
+    {
+        headers.insert(http::header::CONNECTION, value);
+    }
+}
+
 /// String-flavored counterpart to [`parse_connection_listed_headers`] for
 /// dispatch sites that iterate a materialised `&HashMap<String, String>`
 /// (e.g. `proxy::proxy_to_backend_retry`, the H3 client builders, the
@@ -551,7 +726,7 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
         || name.starts_with("grpc-")
         || is_consumer_assertion_header(name)
         || name.starts_with("x-ferrum-")
-        || name.starts_with("x-path-param-")
+        || is_path_param_assertion_header(name)
         // `via` and `early-data` are deliberately asymmetric with the header
         // boundary, and that asymmetry is the point:
         //

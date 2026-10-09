@@ -1133,6 +1133,15 @@ pub fn build_backend_dtls_config(
     global_ca_bundle_path: Option<&str>,
     tls_policy: Option<&crate::tls::TlsPolicy>,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
+    // Checked before anything else, so neither `FERRUM_TLS_NO_VERIFY`, the
+    // global CA, nor an ephemeral client certificate can stand in for backend
+    // TLS material this node refused.
+    if proxy.resolved_tls.tls_refused {
+        crate::tls::backend::record_backend_tls_refusal(
+            crate::tls::backend::BackendTlsRefusalSurface::DtlsBuild,
+        );
+        return Err(anyhow::Error::new(crate::tls::backend::TlsError::Refused));
+    }
     // An explicit `system://` trust selection never inherits the global
     // `FERRUM_TLS_NO_VERIFY` opt-out.
     let skip_verify = !proxy.resolved_tls.verify_server_cert
@@ -2298,6 +2307,7 @@ pub(crate) async fn dtls_pre_handshake_per_source_ip_admission_for_test(
     let admission = crate::proxy::PerIpStreamAdmission {
         counts: Some(Arc::new(DashMap::new())),
         max: max_per_source,
+        ipv6_prefix: 64,
     };
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -3209,7 +3219,8 @@ impl DtlsServer {
             match crate::proxy::sni::extract_sni_from_dtls_client_hello(&initial_packet) {
                 crate::proxy::sni::DtlsSniResult::Hostname(host) => Some(host),
                 crate::proxy::sni::DtlsSniResult::NoSni
-                | crate::proxy::sni::DtlsSniResult::InvalidFragment => None,
+                | crate::proxy::sni::DtlsSniResult::InvalidFragment
+                | crate::proxy::sni::DtlsSniResult::Malformed => None,
             };
 
         // The ingress interface half of the capture, for the source-attribution

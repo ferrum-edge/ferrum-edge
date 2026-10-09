@@ -66,6 +66,67 @@ roleRef:
   name: ferrum-mesh-ambient-{{ .Release.Name }}
 subjects:
   - kind: ServiceAccount
-    name: ferrum-mesh
+    name: ferrum-mesh-ambient
     namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- /* Ambient TLS-source Secret access (opt-in, none by default).
+
+       The Ambient identity is projected onto every node, so a node-root
+       compromise yields its token. It therefore gets no namespace-wide Secret
+       verb at all: a `get` without `resourceNames` reads any Secret whose name
+       is known, including the control plane's database URL and JWT signing
+       secrets in the release namespace.
+
+       Each `ambient.tlsSecretRefs` entry names one `k8s://<namespace>/<name>`
+       TLS source Secret. The chart renders one Role and RoleBinding per
+       namespace, restricted by `resourceNames` to exactly those Secrets. The
+       verbs are get/list/watch because the TLS source reload path watches the
+       Secret with a `metadata.name` field selector, and RBAC honours
+       `resourceNames` for list/watch only with that selector. */ -}}
+{{- if .Values.ambient.enabled }}
+{{- $ambientTlsSecrets := dict -}}
+{{- range $index, $ref := (default (list) .Values.ambient.tlsSecretRefs) }}
+{{- $refNamespace := trim (toString (default "" $ref.namespace)) -}}
+{{- $refName := trim (toString (default "" $ref.name)) -}}
+{{- if or (eq $refNamespace "") (eq $refName "") -}}
+{{- fail (printf "ambient.tlsSecretRefs[%d] requires a non-empty namespace and name" $index) -}}
+{{- end -}}
+{{- $names := default (list) (get $ambientTlsSecrets $refNamespace) -}}
+{{- if not (has $refName $names) -}}
+{{- $_ := set $ambientTlsSecrets $refNamespace (append $names $refName) -}}
+{{- end -}}
+{{- end }}
+{{- range $refNamespace := keys $ambientTlsSecrets | sortAlpha }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-mesh-ambient-tls-secrets-{{ $.Release.Name }}
+  namespace: {{ $refNamespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: {{ get $ambientTlsSecrets $refNamespace | sortAlpha | toJson }}
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-mesh-ambient-tls-secrets-{{ $.Release.Name }}
+  namespace: {{ $refNamespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-mesh-ambient-tls-secrets-{{ $.Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-mesh-ambient
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
 {{- end }}

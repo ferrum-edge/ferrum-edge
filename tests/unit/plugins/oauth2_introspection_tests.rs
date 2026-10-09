@@ -647,6 +647,48 @@ async fn claims_to_headers_and_forward_original_false_strip_authorization() {
     );
 }
 
+/// With no display claim configured, a provider identity override also
+/// selects the `X-Authenticated-Identity` value instead of the global default.
+#[tokio::test]
+async fn provider_identity_override_selects_the_default_display_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "global-username",
+            "sub": "provider-subject"
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "consumer_identity_claim": "sub"
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx("provider-identity-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("provider-subject")
+    );
+    assert_eq!(
+        ctx.authenticated_identity_header.as_deref(),
+        Some("provider-subject")
+    );
+}
+
 #[tokio::test]
 async fn principal_less_introspection_attempt_does_not_mutate_later_key_auth_request() {
     let server = MockServer::start().await;
@@ -2546,4 +2588,46 @@ async fn external_identity_realm_binds_the_introspection_authority_and_claim() {
         realm, by_sub,
         "the identity claim path is part of the realm"
     );
+}
+
+/// The introspection call carries the request's gateway hop count
+/// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so an
+/// introspection endpoint that resolves back to the gateway is refused at the
+/// proxy hop limit like a looping route (issue #6128). With the limit disabled
+/// nothing is stamped.
+#[tokio::test]
+async fn introspection_call_carries_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(2), vec!["2"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "username": "external-user"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let endpoint = format!("{}/introspect", server.uri());
+        let plugin =
+            Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+        let mut ctx = make_ctx("hop-count-token");
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
 }

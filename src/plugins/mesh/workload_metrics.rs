@@ -34,6 +34,7 @@ use crate::plugins::mesh::prometheus_helpers::{
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
     trace_exporters_from_providers, trace_is_sampled, validate_trace_provider_endpoints,
+    validate_trace_provider_secret_refs,
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::{
@@ -490,6 +491,8 @@ impl WorkloadMetrics {
             disabled_metrics_marker,
         } = parse_metric_config(config.get("metrics"))?;
         let tracing_providers = parse_tracing_providers(config)?;
+        validate_trace_provider_secret_refs(&tracing_providers)
+            .map_err(|error| format!("workload_metrics: {error}"))?;
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
             .or_else(|| config.get("disable_span_reporting"))
@@ -1108,7 +1111,12 @@ pub(crate) fn validate_effective_metric_tag_override_plan_budget(
     let mut effective_plan_lengths = [0usize; MeshMetricFamily::ALL.len()];
     let mut custom_tag_names = BTreeSet::new();
     for plugin in plugins {
-        if plugin.name() != "workload_metrics" {
+        // Only the registered plugin stamps these plans. A custom plugin
+        // reporting its name must not displace a real instance's family plan
+        // from the sum (issue #6022).
+        if plugin.name() != "workload_metrics"
+            || !crate::plugins::is_builtin_plugin(plugin.as_ref())
+        {
             continue;
         }
         if let Some(marker) = plugin.workload_custom_trace_attributes() {
@@ -3564,7 +3572,7 @@ mod tests {
                 "kind": "lightstep",
                 "config": {
                     "collector_url": "https://ingest.lightstep.com:443",
-                    "access_token_env": "LIGHTSTEP_ACCESS_TOKEN"
+                    "access_token_env": "FERRUM_PLUGIN_SECRET_LIGHTSTEP"
                 }
             }
         }))
@@ -3579,7 +3587,7 @@ mod tests {
                 access_token_env,
             } => {
                 assert_eq!(collector_url, "https://ingest.lightstep.com:443");
-                assert_eq!(access_token_env, "LIGHTSTEP_ACCESS_TOKEN");
+                assert_eq!(access_token_env, "FERRUM_PLUGIN_SECRET_LIGHTSTEP");
             }
             other => panic!("expected Lightstep, got {other:?}"),
         }

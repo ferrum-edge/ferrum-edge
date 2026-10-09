@@ -430,11 +430,6 @@ const MAX_MULTIPART_BOUNDARY_BYTES: usize = 70;
 /// this count and [`MAX_MULTIPART_PART_HEADER_BYTES`] so neither a few enormous
 /// lines nor very many tiny ones can drive unbounded work.
 const MAX_MULTIPART_PART_HEADERS: usize = 32;
-/// Delimiter-line candidates examined across one package. Every candidate that
-/// is rejected as payload advances the scan by at least `2 + boundary.len()`
-/// bytes, so this is a belt-and-braces ceiling on an adversarial package that
-/// embeds boundary-shaped bytes throughout its attachments.
-const MAX_MULTIPART_DELIMITER_CANDIDATES: usize = 4_096;
 
 // ── Configuration admission bounds ──────────────────────────────────────────
 
@@ -1032,6 +1027,7 @@ type NonceAgeKey = (Instant, u64);
 
 struct NonceEntry {
     age_key: NonceAgeKey,
+    principal_digest: [u8; 32],
 }
 
 /// PasswordDigest replay security state.
@@ -1061,6 +1057,7 @@ struct NonceEntry {
 struct NonceReplayState {
     cache: HashMap<Arc<str>, NonceEntry>,
     age_index: BTreeMap<NonceAgeKey, Arc<str>>,
+    principal_counts: HashMap<[u8; 32], usize>,
     retained_key_bytes: usize,
     next_sequence: u64,
     last_expired_removals: usize,
@@ -1071,6 +1068,7 @@ impl NonceReplayState {
         Self {
             cache: HashMap::new(),
             age_index: BTreeMap::new(),
+            principal_counts: HashMap::new(),
             retained_key_bytes: 0,
             next_sequence: 0,
             last_expired_removals: 0,
@@ -1100,16 +1098,29 @@ impl NonceReplayState {
             return false;
         }
         let mut retained_key_bytes = 0usize;
+        let mut principal_counts = HashMap::<[u8; 32], usize>::new();
         for (age_key, nonce) in &self.age_index {
             if !self.age_entry_matches(age_key, nonce) {
                 return false;
             }
+            let Some(entry) = self.cache.get(nonce.as_ref()) else {
+                return false;
+            };
+            let Some(count) = principal_counts
+                .get(&entry.principal_digest)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+            else {
+                return false;
+            };
+            principal_counts.insert(entry.principal_digest, count);
             let Some(total) = retained_key_bytes.checked_add(charged_claim_key_bytes(nonce)) else {
                 return false;
             };
             retained_key_bytes = total;
         }
-        retained_key_bytes == self.retained_key_bytes
+        retained_key_bytes == self.retained_key_bytes && principal_counts == self.principal_counts
     }
 
     fn allocate_age_key(&mut self, now: Instant) -> Option<NonceAgeKey> {
@@ -1122,6 +1133,87 @@ impl NonceReplayState {
         self.cache
             .get(nonce.as_ref())
             .is_some_and(|entry| entry.age_key == *age_key)
+    }
+
+    fn principal_count(&self, principal: &[u8; 32]) -> usize {
+        self.principal_counts.get(principal).copied().unwrap_or(0)
+    }
+
+    /// Refresh one expired claim in place as a new use charged to `principal`,
+    /// moving its quota charge when the claim is stored under another
+    /// principal. The caller has already proven the claim expired and decided
+    /// the refresh fits within the current caps and the presenting principal's
+    /// share.
+    ///
+    /// All-or-nothing: every fallible step (the index and cache lookups, the
+    /// checked count arithmetic and the age-key allocation) runs before the
+    /// first write, so `Err(())` (accounting drift or an exhausted age
+    /// sequence) leaves the claims, the age index, the sequence and the quota
+    /// counts exactly as they were. The writes that follow cannot fail, and the
+    /// count change is applied last, together with the entry's principal.
+    fn refresh_claim_in_place(
+        &mut self,
+        nonce: &str,
+        age_key: NonceAgeKey,
+        principal: &[u8; 32],
+        now: Instant,
+    ) -> Result<(), ()> {
+        let Some(indexed_nonce) = self.age_index.get(&age_key) else {
+            return Err(());
+        };
+        if indexed_nonce.as_ref() != nonce {
+            return Err(());
+        }
+        let shared_nonce = Arc::clone(indexed_nonce);
+        let Some(entry) = self.cache.get_mut(nonce) else {
+            return Err(());
+        };
+        if entry.age_key != age_key {
+            return Err(());
+        }
+        let previous = entry.principal_digest;
+        let moved_counts = if previous == *principal {
+            None
+        } else {
+            let charged = self
+                .principal_counts
+                .get(principal)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1);
+            let released = self
+                .principal_counts
+                .get(&previous)
+                .copied()
+                .and_then(|count| count.checked_sub(1));
+            let (Some(charged), Some(released)) = (charged, released) else {
+                return Err(());
+            };
+            Some((charged, released))
+        };
+        let sequence = self.next_sequence;
+        let Some(next_sequence) = sequence.checked_add(1) else {
+            return Err(());
+        };
+        let new_age_key = (now, sequence);
+        if self.age_index.contains_key(&new_age_key) {
+            return Err(());
+        }
+
+        self.next_sequence = next_sequence;
+        self.age_index.remove(&age_key);
+        self.age_index.insert(new_age_key, shared_nonce);
+        entry.age_key = new_age_key;
+        entry.principal_digest = *principal;
+        if let Some((charged, released)) = moved_counts {
+            self.principal_counts.insert(*principal, charged);
+            if released == 0 {
+                self.principal_counts.remove(&previous);
+            } else {
+                self.principal_counts.insert(previous, released);
+            }
+        }
+        Ok(())
     }
 
     fn remove_age_entry(&mut self, age_key: &NonceAgeKey) -> Result<(), ()> {
@@ -1142,8 +1234,22 @@ impl NonceReplayState {
             Some(nonce) => nonce,
             None => return Err(()),
         };
-        if self.cache.remove(nonce.as_ref()).is_none() {
+        let Some(entry) = self.cache.remove(nonce.as_ref()) else {
             return Err(());
+        };
+        let Some(updated_count) = self
+            .principal_counts
+            .get(&entry.principal_digest)
+            .copied()
+            .and_then(|count| count.checked_sub(1))
+        else {
+            return Err(());
+        };
+        if updated_count == 0 {
+            self.principal_counts.remove(&entry.principal_digest);
+        } else {
+            self.principal_counts
+                .insert(entry.principal_digest, updated_count);
         }
         self.retained_key_bytes = retained_key_bytes;
         Ok(())
@@ -2685,7 +2791,7 @@ impl SoapWsSecurity {
                     // poison a victim's nonce before the legitimate request
                     // arrives. The atomic entry check also prevents two
                     // concurrent valid requests from both accepting it.
-                    self.claim_nonce(nonce_b64)
+                    self.claim_nonce(nonce_b64, &username)
                         .await
                         .map_err(UsernameTokenError::Structural)?;
                     Ok(username)
@@ -2730,9 +2836,11 @@ impl SoapWsSecurity {
     ///
     /// Reached only after the PasswordDigest has verified, so untrusted input
     /// never mutates, consumes, or evicts replay state.
-    async fn claim_nonce(&self, nonce: &str) -> Result<(), String> {
+    async fn claim_nonce(&self, nonce: &str, principal: &str) -> Result<(), String> {
         match &self.nonce_backend {
-            NonceReplayBackend::Process(_) => self.check_nonce_replay(nonce),
+            NonceReplayBackend::Process(_) => {
+                self.check_nonce_replay_for_principal(nonce, principal)
+            }
             NonceReplayBackend::Shared(client) => self.claim_nonce_shared(client, nonce).await,
         }
     }
@@ -2754,7 +2862,12 @@ impl SoapWsSecurity {
     /// `shared` is one atomic Redis `SET NX EX` across every replica. There is
     /// deliberately no fallback between them: a per-replica fallback would
     /// silently reinstate "one replay per replica".
-    async fn claim_saml_assertion(&self, issuer: &str, assertion_id: &str) -> Result<(), String> {
+    async fn claim_saml_assertion(
+        &self,
+        issuer: &str,
+        assertion_id: &str,
+        principal: &str,
+    ) -> Result<(), String> {
         // The claim key is a fixed-width digest, never the issuer or the
         // assertion id: both are credential-adjacent values that would
         // otherwise reach a Redis keyspace, `MONITOR`, `SLOWLOG`, and the Redis
@@ -2768,7 +2881,11 @@ impl SoapWsSecurity {
 
         match &self.nonce_backend {
             NonceReplayBackend::Process(_) => self
-                .check_replay_claim_at(&saml_process_claim_key(&claim_key), Instant::now())
+                .check_replay_claim_at(
+                    &saml_process_claim_key(&claim_key),
+                    &sha256_array(principal.as_bytes()),
+                    Instant::now(),
+                )
                 .map_err(|error| {
                     if error == REPLAY_DETECTED_MESSAGE {
                         SAML_REPLAY_DETECTED_MESSAGE.to_string()
@@ -2897,8 +3014,13 @@ impl SoapWsSecurity {
     /// insert/refresh, and byte accounting share one mutex held only for those
     /// security-state updates, so concurrent fresh claims cannot all observe
     /// room and then overshoot either hard cap. Same-key races resolve under
-    /// the lock: an in-TTL hit is a replay (no reservation); an expired hit
-    /// refreshes the same shared key in place without changing count/bytes.
+    /// the lock: an in-TTL hit is a replay (no reservation) whichever principal
+    /// presents it; an expired hit refreshes the same shared key in place
+    /// without changing count/bytes. An expired hit stored under a different
+    /// principal moves its quota charge to the presenting principal (charged
+    /// first, within its share, then the previous charge is released); when
+    /// the presenting principal is at its share the stale entry is reclaimed
+    /// and the claim takes the fresh-insert path instead.
     /// Lock poison, checked-arithmetic failure, or map/index drift all fail
     /// closed with the fixed saturation class and never recover through the
     /// poisoned state.
@@ -2919,15 +3041,25 @@ impl SoapWsSecurity {
     /// has no process-local state and fails closed here rather than answering
     /// from an empty map.
     pub fn check_nonce_replay(&self, nonce: &str) -> Result<(), String> {
-        self.check_nonce_replay_at(nonce, Instant::now())
+        self.check_nonce_replay_for_principal(nonce, nonce)
     }
 
-    fn check_nonce_replay_at(&self, nonce: &str, now: Instant) -> Result<(), String> {
+    fn check_nonce_replay_for_principal(&self, nonce: &str, principal: &str) -> Result<(), String> {
+        self.check_nonce_replay_at(nonce, principal, Instant::now())
+    }
+
+    fn check_nonce_replay_at(
+        &self,
+        nonce: &str,
+        principal: &str,
+        now: Instant,
+    ) -> Result<(), String> {
         // Attacker-controlled length compare only — outside the admission lock.
         if nonce.len() > self.max_nonce_encoded_length {
             return Err(Self::nonce_too_long());
         }
-        self.check_replay_claim_at(&nonce_process_claim_key(nonce), now)
+        let principal_digest = sha256_array(principal.as_bytes());
+        self.check_replay_claim_at(&nonce_process_claim_key(nonce), &principal_digest, now)
     }
 
     /// Process-local single-use claim for an already-namespaced key.
@@ -2935,7 +3067,12 @@ impl SoapWsSecurity {
     /// Shared by PasswordDigest nonces and SAML assertion ids; the caller
     /// supplies a key carrying its own claim-kind prefix so the two classes can
     /// never collide in the one process-global map.
-    fn check_replay_claim_at(&self, nonce: &str, now: Instant) -> Result<(), String> {
+    fn check_replay_claim_at(
+        &self,
+        nonce: &str,
+        principal_digest: &[u8; 32],
+        now: Instant,
+    ) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
             // A shared-scope instance has no process-local state to consult;
             // answering from an empty local map would be a silent bypass.
@@ -2958,11 +3095,15 @@ impl SoapWsSecurity {
             return Err(Self::nonce_state_saturated_after_unlock(state));
         }
 
+        let principal_limit = self.max_nonce_cache_size.div_ceil(4).max(1);
         // Same-key path first: replay / in-place refresh must not consume a new
         // entry or byte reservation, and must not be rejected as saturated
         // merely because the cache is otherwise full.
-        let existing_age_key = state.cache.get(nonce).map(|entry| entry.age_key);
-        if let Some(age_key) = existing_age_key {
+        let existing_entry = state
+            .cache
+            .get(nonce)
+            .map(|entry| (entry.age_key, entry.principal_digest));
+        if let Some((age_key, existing_principal)) = existing_entry {
             let indexed_nonce_matches = state
                 .age_index
                 .get(&age_key)
@@ -2970,29 +3111,67 @@ impl SoapWsSecurity {
             if !indexed_nonce_matches {
                 return Err(Self::nonce_state_saturated_after_unlock(state));
             }
+            // A live claim is a replay whichever principal presents it.
             if Self::nonce_age_seconds(now, age_key.0) < retention_seconds {
                 return Err(REPLAY_DETECTED_MESSAGE.to_string());
             }
 
-            let Some(new_age_key) = state.allocate_age_key(now) else {
-                return Err(Self::nonce_state_saturated_after_unlock(state));
+            // Expired: re-admission is a *new* use of this nonce, charged to
+            // the presenting principal even when the stale entry is still
+            // stored under another one. Refreshing in place recycles the
+            // occupied slot, so it is allowed only while the store is within
+            // this generation's entry and byte caps (the state outlives reload
+            // generations, so a reload that lowered either cap can leave it
+            // over-full) and the presenting principal is within its share: a
+            // move needs room for one more charge, a same-principal refresh
+            // reuses its charge and is refused only when a lowered cap left the
+            // principal above its share. Otherwise the stale entry is
+            // reclaimed (it is expired, so maintenance could remove it anyway)
+            // and the fresh-claim path below decides; it reclaims only expired
+            // entries and otherwise fails closed, never evicting a live nonce.
+            let charged = state.principal_count(principal_digest);
+            let within_share = if existing_principal == *principal_digest {
+                charged <= principal_limit
+            } else {
+                charged < principal_limit
             };
-            let shared_nonce = match state.age_index.remove(&age_key) {
-                Some(shared_nonce) => shared_nonce,
-                None => return Err(Self::nonce_state_saturated_after_unlock(state)),
-            };
-            if state
-                .age_index
-                .insert(new_age_key, Arc::clone(&shared_nonce))
-                .is_some()
+            if within_share
+                && state.cache.len() <= self.max_nonce_cache_size
+                && state.retained_key_bytes <= self.max_nonce_cache_bytes
             {
+                if state
+                    .refresh_claim_in_place(nonce, age_key, principal_digest, now)
+                    .is_err()
+                {
+                    return Err(Self::nonce_state_saturated_after_unlock(state));
+                }
+                return Ok(());
+            }
+            if state.remove_age_entry(&age_key).is_err() {
                 return Err(Self::nonce_state_saturated_after_unlock(state));
             }
-            let Some(entry) = state.cache.get_mut(shared_nonce.as_ref()) else {
-                return Err(Self::nonce_state_saturated_after_unlock(state));
-            };
-            entry.age_key = new_age_key;
-            return Ok(());
+            state.last_expired_removals += 1;
+        }
+
+        if state
+            .principal_counts
+            .get(principal_digest)
+            .copied()
+            .unwrap_or(0)
+            >= principal_limit
+            && Self::prune_expired_prefix_for_quota_locked(&mut state, retention_seconds, now)
+                .is_err()
+        {
+            return Err(Self::nonce_state_saturated_after_unlock(state));
+        }
+        if state
+            .principal_counts
+            .get(principal_digest)
+            .copied()
+            .unwrap_or(0)
+            >= principal_limit
+        {
+            return Err(Self::nonce_state_saturated_after_unlock(state));
         }
 
         let incoming_bytes = charged_claim_key_bytes(nonce);
@@ -3041,12 +3220,37 @@ impl SoapWsSecurity {
         }
         if state
             .cache
-            .insert(shared_nonce, NonceEntry { age_key })
+            .insert(
+                shared_nonce,
+                NonceEntry {
+                    age_key,
+                    principal_digest: *principal_digest,
+                },
+            )
             .is_some()
         {
             return Err(Self::nonce_state_saturated_after_unlock(state));
         }
+        *state.principal_counts.entry(*principal_digest).or_default() += 1;
         state.retained_key_bytes = retained_key_bytes;
+        Ok(())
+    }
+
+    fn prune_expired_prefix_for_quota_locked(
+        state: &mut NonceReplayState,
+        ttl_seconds: u64,
+        now: Instant,
+    ) -> Result<(), ()> {
+        while state.last_expired_removals < NONCE_MAX_MAINTENANCE_ENTRIES {
+            let Some((&age_key, _)) = state.age_index.first_key_value() else {
+                break;
+            };
+            if Self::nonce_age_seconds(now, age_key.0) < ttl_seconds {
+                break;
+            }
+            state.remove_age_entry(&age_key)?;
+            state.last_expired_removals += 1;
+        }
         Ok(())
     }
 
@@ -3107,7 +3311,42 @@ impl SoapWsSecurity {
         nonce: &str,
         now: Instant,
     ) -> Result<(), String> {
-        self.check_nonce_replay_at(nonce, now)
+        self.check_nonce_replay_at(nonce, nonce, now)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn check_nonce_replay_for_principal_for_tests(
+        &self,
+        nonce: &str,
+        principal: &str,
+    ) -> Result<(), String> {
+        self.check_nonce_replay_for_principal(nonce, principal)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn check_nonce_replay_for_principal_at_for_tests(
+        &self,
+        nonce: &str,
+        principal: &str,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.check_nonce_replay_at(nonce, principal, now)
+    }
+
+    /// Retained claims charged to `principal`, including expired ones
+    /// maintenance has not yet reclaimed (test support).
+    #[allow(dead_code)]
+    pub(crate) fn nonce_principal_entries_for_tests(
+        &self,
+        principal: &str,
+    ) -> Result<usize, String> {
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay observation is process-scope only".to_string());
+        };
+        let state = replay_state
+            .lock()
+            .map_err(|_| "soap_ws_security: nonce replay observation unavailable".to_string())?;
+        Ok(state.principal_count(&sha256_array(principal.as_bytes())))
     }
 
     #[allow(dead_code)]
@@ -3199,7 +3438,8 @@ impl SoapWsSecurity {
         issuer: &str,
         assertion_id: &str,
     ) -> Result<(), String> {
-        self.claim_saml_assertion(issuer, assertion_id).await
+        self.claim_saml_assertion(issuer, assertion_id, issuer)
+            .await
     }
 
     /// The TTL a shared (Redis) claim is written with, without needing a live
@@ -3252,6 +3492,20 @@ impl SoapWsSecurity {
         state
             .age_index
             .insert(age_key, Arc::<str>::from("same-cardinality-index-drift"));
+        Ok(())
+    }
+
+    /// Exhaust the age-key sequence so the next age-key allocation fails
+    /// (test support). Reaching this for real takes 2^64 claims.
+    #[allow(dead_code)]
+    pub(crate) fn exhaust_nonce_age_sequence_for_tests(&self) -> Result<(), String> {
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay test state is process-scope only".to_string());
+        };
+        let mut state = replay_state
+            .lock()
+            .map_err(|_| "soap_ws_security: nonce replay test state unavailable".to_string())?;
+        state.next_sequence = u64::MAX;
         Ok(())
     }
 
@@ -3870,7 +4124,8 @@ impl SoapWsSecurity {
             .attribute("ID")
             .or_else(|| assertion_node.attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
-        self.claim_saml_assertion(&issuer, assertion_id).await?;
+        self.claim_saml_assertion(&issuer, assertion_id, &name_id)
+            .await?;
 
         debug!("soap_ws_security: SAML assertion validated successfully");
         Ok(name_id)
@@ -4475,6 +4730,9 @@ fn classify_soap_media_type(
         next_content_type_parameter(rest).map_err(|_| MediaTypeRejection::MalformedMediaType)?
     {
         rest = next;
+        if is_extended_parameter_for(name, MTOM_PACKAGE_PARAMETERS) {
+            return Err(MediaTypeRejection::MalformedMultipartPackaging);
+        }
         if name.eq_ignore_ascii_case("boundary") {
             if boundary.replace(value.to_string()).is_some() {
                 return Err(MediaTypeRejection::MalformedMultipartPackaging);
@@ -4512,6 +4770,24 @@ fn classify_soap_media_type(
         return Err(MediaTypeRejection::MalformedMultipartPackaging);
     }
     Ok(Some(SoapMediaClass::Mtom { boundary, start }))
+}
+
+/// The `multipart/related` parameters that decide how an MTOM package is
+/// framed and which part is its root.
+const MTOM_PACKAGE_PARAMETERS: &[&str] = &["boundary", "type", "start"];
+
+/// Whether `name` is an RFC 2231 extended or continuation form (`name*`,
+/// `name*0`, `name*0*`, ...) of one of `bases`, compared case-insensitively.
+///
+/// Ferrum reads only the plain form, while parsers that implement RFC 2231
+/// decode the extended form and let it replace or supply the plain value. A
+/// request carrying one would be framed, typed, or rooted differently by such
+/// a backend, so it is refused rather than ignored.
+fn is_extended_parameter_for(name: &str, bases: &[&str]) -> bool {
+    let Some((base, _)) = name.split_once('*') else {
+        return false;
+    };
+    bases.iter().any(|known| base.eq_ignore_ascii_case(known))
 }
 
 /// RFC 2046 `bcharsnospace` plus space. The caller separately rejects a final
@@ -4927,7 +5203,7 @@ impl SoapWsSecurity {
         &self,
         ctx: &mut RequestContext,
         content_type_header: Option<String>,
-        consumer_index: Option<&ConsumerIndex>,
+        _consumer_index: Option<&ConsumerIndex>,
     ) -> PluginResult {
         let media_class = match self.classify_request(content_type_header.as_deref()) {
             SoapRequestDisposition::Governed(class) => class,
@@ -5011,27 +5287,12 @@ impl SoapWsSecurity {
                 .insert("soap_ws_saml_subject".to_string(), subject);
         }
 
-        let Some(consumer_index) = consumer_index else {
-            return PluginResult::Continue;
-        };
         let Some(identity) = principal.principal else {
             return PluginResult::Continue;
         };
-
-        // Namespace-correct Consumer mapping: a Consumer resolved by identity
-        // only counts when it belongs to the matched proxy's namespace. A
-        // cross-namespace match is treated as "no Consumer", so the request
-        // still runs under the verified external principal rather than under
-        // another tenant's Consumer record.
-        let proxy_namespace = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|proxy| proxy.namespace.clone());
-        let consumer = proxy_namespace.and_then(|namespace| {
-            consumer_index
-                .find_by_identity(&identity)
-                .filter(|consumer| consumer.namespace == namespace)
-        });
+        // SOAP principals are not bound to Consumer credentials by the
+        // process-wide identity index.
+        let consumer = None;
 
         match auth_flow::commit_authentication_attempt(
             ctx,
@@ -5140,6 +5401,8 @@ pub fn validate_composition(
         .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
 
+    let globals_by_name = config.enabled_global_plugin_configs_by_name();
+
     // Resolve the effective instances of `name` for `proxy` exactly the way the
     // runtime merge does: a scoped instance shadows the same-named global by
     // its outer `enabled` flag alone.
@@ -5163,13 +5426,7 @@ pub fn validate_composition(
         if !local.is_empty() {
             return local;
         }
-        config
-            .plugin_configs
-            .iter()
-            .filter(|plugin| {
-                plugin.enabled && plugin.scope == PluginScope::Global && plugin.plugin_name == name
-            })
-            .collect()
+        globals_by_name.get(name).cloned().unwrap_or_default()
     };
 
     let mut errors = Vec::new();
@@ -5297,6 +5554,14 @@ impl Plugin for SoapWsSecurity {
 
     fn is_auth_plugin(&self) -> bool {
         self.establishes_identity()
+    }
+
+    /// Every constructed instance enforces: construction refuses a policy with
+    /// no security feature, so a timestamp-only (freshness) policy and a
+    /// `strict` content-type policy refuse requests too, even though they
+    /// establish no identity and are not auth plugins.
+    fn gates_request_admission(&self) -> bool {
+        true
     }
 
     fn needs_request_body_bytes(&self) -> bool {
@@ -7065,6 +7330,15 @@ struct MtomPart<'a> {
     body: &'a [u8],
 }
 
+impl MtomPart<'_> {
+    /// Whether this part's `Content-ID` matches `id` under [`content_ids_match`].
+    fn content_id_matches(&self, id: &str) -> bool {
+        self.content_id
+            .as_deref()
+            .is_some_and(|own| content_ids_match(own, id))
+    }
+}
+
 /// A recognized boundary delimiter *line*.
 struct MtomDelimiter {
     /// Offset of the first `-` of `--boundary`.
@@ -7075,17 +7349,19 @@ struct MtomDelimiter {
     closing: bool,
 }
 
-/// Classify what follows `--boundary` on a candidate delimiter line.
+/// Classify what follows `--boundary` on a line it opens.
 ///
 /// Returns how many bytes the line occupies after the boundary token plus
-/// whether this is the closing delimiter, or `None` when the candidate is not a
-/// delimiter line at all — in which case those bytes are payload and the scan
-/// continues past them.
+/// whether this is the closing delimiter, or `None` when anything else follows
+/// the token. The caller refuses the whole package on `None`; the line is never
+/// skipped as payload.
 ///
 /// Framing is exact CRLF and nothing else. RFC 2046 transport padding is
-/// deliberately *not* accepted: a padded delimiter is precisely the construct
-/// one parser treats as framing and another as payload, and rejecting it fails
-/// closed instead of choosing a reading the backend may not share.
+/// deliberately *not* accepted, on a part delimiter or on the close-delimiter:
+/// a padded line is precisely the construct one parser treats as framing and
+/// another as payload. Skipping it would frame the package from a later
+/// delimiter while a padding-tolerant backend frames it from this one, so it
+/// fails closed instead of choosing a reading the backend may not share.
 fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
     let Some(after_dashes) = rest.strip_prefix(b"--") else {
         // A part delimiter line ends in exactly CRLF and nothing else.
@@ -7102,76 +7378,72 @@ fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
     None
 }
 
-/// A bounded, line-anchored scanner over one package's delimiter lines.
+/// A line-anchored scanner over one package's delimiter lines.
 ///
 /// A delimiter line exists only at the very start of the body or immediately
-/// after a CRLF. That anchoring is what makes an embedded `--boundary`
-/// substring inside a preamble, a header value, or an attachment payload inert
-/// here — exactly as it is inert for a conforming backend parser. An unanchored
-/// byte-substring search would instead let an attacker plant a fake part inside
-/// a payload and have Ferrum validate it while the backend consumed the real
-/// root part (GHSA-435h-f785-wmm4).
+/// after a CRLF, and the boundary token may appear nowhere else. An unanchored
+/// byte-substring search would let an attacker plant a fake part inside a
+/// payload and have Ferrum validate it while the backend consumed the real
+/// root part (GHSA-435h-f785-wmm4). Skipping a mid-line token as payload is
+/// not safe either: several widely deployed parsers find the first delimiter
+/// without requiring it to open a line, or match the token inside a part
+/// body, so a mid-line token in the preamble or in a part frames a different
+/// root for them than CRLF framing does.
+///
+/// Every boundary token is therefore decided, never skipped. After CRLF (or at
+/// the body start) it must be an exact delimiter line; anywhere else —
+/// mid-line, or opened by a bare LF or a bare CR — it refuses the package.
+/// RFC 2046 already requires generators to choose a boundary that does not
+/// occur in the encapsulated material, and generated boundaries (random UUIDs
+/// or hex) never do in practice.
 struct MtomScanner<'a> {
     bytes: &'a [u8],
     dash_boundary: Vec<u8>,
-    crlf_dash_boundary: Vec<u8>,
-    /// Delimiter-line candidates examined so far, across the whole package.
-    candidates: usize,
 }
 
 impl<'a> MtomScanner<'a> {
     fn new(bytes: &'a [u8], boundary: &str) -> Self {
-        let dash_boundary = format!("--{boundary}").into_bytes();
-        let mut crlf_dash_boundary = Vec::with_capacity(dash_boundary.len() + 2);
-        crlf_dash_boundary.extend_from_slice(b"\r\n");
-        crlf_dash_boundary.extend_from_slice(&dash_boundary);
         Self {
             bytes,
-            dash_boundary,
-            crlf_dash_boundary,
-            candidates: 0,
+            dash_boundary: format!("--{boundary}").into_bytes(),
         }
     }
 
     /// The next delimiter line at or after `from`, or `Ok(None)` when the
     /// package has none left.
-    fn next_from(&mut self, from: usize) -> Result<Option<MtomDelimiter>, SoapBodyDecodeError> {
-        let mut search = from;
-        loop {
-            let line_start = if search == 0 && self.bytes.starts_with(&self.dash_boundary) {
-                0
-            } else {
-                let Some(tail) = self.bytes.get(search..) else {
-                    return Ok(None);
-                };
-                match find_subslice(tail, &self.crlf_dash_boundary) {
-                    // The line starts *after* the CRLF that introduces it.
-                    Some(offset) => search + offset + 2,
-                    None => return Ok(None),
-                }
-            };
-            self.candidates += 1;
-            if self.candidates > MAX_MULTIPART_DELIMITER_CANDIDATES {
-                return Err(SoapBodyDecodeError::MalformedEncoding);
-            }
-            let after_boundary = line_start + self.dash_boundary.len();
-            let rest = self
-                .bytes
-                .get(after_boundary..)
-                .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-            if let Some((tail_len, closing)) = mtom_delimiter_tail(rest) {
-                return Ok(Some(MtomDelimiter {
-                    line_start,
-                    next: after_boundary + tail_len,
-                    closing,
-                }));
-            }
-            // Boundary-shaped bytes that are not a delimiter line. Skip past
-            // them and keep scanning; they belong to whatever part is being
-            // framed. `dash_boundary` is at least three bytes, so the scan
-            // always advances.
-            search = after_boundary;
+    ///
+    /// Fails closed on the first boundary token that is not an exact delimiter
+    /// line: a padded or otherwise non-CRLF tail, a token that does not open a
+    /// line, or a line opened by a bare LF or bare CR. Each call stops at the
+    /// first token it finds, so the work across a whole package is one forward
+    /// pass bounded by the part ceiling.
+    fn next_from(&self, from: usize) -> Result<Option<MtomDelimiter>, SoapBodyDecodeError> {
+        let Some(tail) = self.bytes.get(from..) else {
+            return Ok(None);
+        };
+        let Some(offset) = find_subslice(tail, &self.dash_boundary) else {
+            return Ok(None);
+        };
+        let line_start = from + offset;
+        let before = self
+            .bytes
+            .get(..line_start)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        if !before.is_empty() && !before.ends_with(b"\r\n") {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
         }
+        let after_boundary = line_start + self.dash_boundary.len();
+        let rest = self
+            .bytes
+            .get(after_boundary..)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        let (tail_len, closing) =
+            mtom_delimiter_tail(rest).ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        Ok(Some(MtomDelimiter {
+            line_start,
+            next: after_boundary + tail_len,
+            closing,
+        }))
     }
 
     /// Whether the boundary token occurs anywhere in `bytes[from..]`, anchored
@@ -7256,7 +7528,7 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
     let content_id = match content_id_raw {
         Some(raw) => {
             let normalized = normalize_content_id(raw);
-            if normalized.is_empty() {
+            if normalized.is_empty() || content_id_has_decoding_ambiguity(&normalized) {
                 return Err(SoapBodyDecodeError::MalformedEncoding);
             }
             Some(normalized)
@@ -7286,33 +7558,41 @@ fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> 
 /// about which bytes are the envelope (GHSA-435h-f785-wmm4):
 ///
 /// * Delimiter lines are recognized only at the body start or immediately after
-///   a CRLF, with exact CRLF framing and no transport padding.
-/// * Exactly one close-delimiter must be present, and the epilogue after it
-///   must not contain the boundary token at all.
+///   a CRLF, with exact CRLF framing and no transport padding. The boundary
+///   token may appear nowhere else in the package: a padded or non-CRLF tail, a
+///   token in the middle of a line (in the preamble, a part, or the epilogue),
+///   or a line opened by a bare LF or bare CR refuses the package.
+/// * Exactly one close-delimiter must be present.
 /// * Part headers are strict: US-ASCII, no obsolete folding, well-formed field
 ///   names, and at most one `Content-Type` / `Content-ID` /
 ///   `Content-Transfer-Encoding` per part.
-/// * `Content-ID` values are unique across the package (RFC 2387).
-/// * The root is the part whose `Content-ID` matches `start`, or the first part
-///   when `start` is absent — and with `start` supplied exactly one part may
-///   match.
+/// * `Content-ID` values are unique across the package (RFC 2387), compared
+///   ASCII-case-insensitively and with any `cid:` prefix ignored. A value
+///   carrying `%`, `+`, or embedded whitespace is refused, because a backend
+///   that percent-decodes ids would resolve it to a different part than
+///   byte-exact matching does.
+/// * The root is the first part. When `start` is supplied it must name that
+///   first part, so a parser that resolves `start` and one that always takes
+///   the first part agree.
 /// * The root part must itself declare a SOAP/XOP infoset and must not declare
 ///   a re-encoding `Content-Transfer-Encoding`.
 ///
-/// Every other shape — no parts, no matching root, LF-only framing, a missing
-/// or malformed closure, a part header block over its byte/line ceiling, more
-/// than [`MAX_MULTIPART_PARTS`] parts, or more than
-/// [`MAX_MULTIPART_DELIMITER_CANDIDATES`] boundary-shaped candidates — fails
-/// closed.
+/// Every other shape — no parts, a `start` that does not name the first part,
+/// LF-only or padded framing, a missing or malformed closure, a part header
+/// block over its byte/line ceiling, or more than [`MAX_MULTIPART_PARTS`]
+/// parts — fails closed.
 fn extract_mtom_root_part<'a>(
     bytes: &'a [u8],
     boundary: &str,
     start: Option<&str>,
 ) -> Result<MtomRootPart<'a>, SoapBodyDecodeError> {
-    let mut scanner = MtomScanner::new(bytes, boundary);
+    let scanner = MtomScanner::new(bytes, boundary);
 
     // Anything before the first delimiter line is the RFC 2046 preamble, which
-    // every conforming parser ignores; it is skipped rather than inspected.
+    // every conforming parser ignores. It is skipped rather than inspected,
+    // except that any boundary token inside it is refused by the scanner: a
+    // parser that finds the first delimiter without requiring it to open a
+    // line would frame its first part there.
     let first = scanner
         .next_from(0)?
         .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
@@ -7353,36 +7633,35 @@ fn extract_mtom_root_part<'a>(
     }
 
     // RFC 2387 requires package-unique Content-IDs. Two parts claiming one id
-    // let the gateway and the backend resolve `start` to different envelopes.
+    // let the gateway and the backend resolve `start` to different envelopes,
+    // and so do two ids that only a case-insensitive or `cid:`-stripping
+    // comparison would equate.
     for (index, part) in parts.iter().enumerate() {
         let Some(id) = part.content_id.as_deref() else {
             continue;
         };
-        if parts[..index]
-            .iter()
-            .any(|earlier| earlier.content_id.as_deref() == Some(id))
-        {
+        let earlier = &parts[..index];
+        if earlier.iter().any(|other| other.content_id_matches(id)) {
             return Err(SoapBodyDecodeError::MalformedEncoding);
         }
     }
 
-    let root = match start {
-        Some(start) => {
-            let mut matching = parts
-                .iter()
-                .filter(|part| part.content_id.as_deref() == Some(start));
-            let Some(selected) = matching.next() else {
-                return Err(SoapBodyDecodeError::MalformedEncoding);
-            };
-            if matching.next().is_some() {
-                return Err(SoapBodyDecodeError::MalformedEncoding);
-            }
-            selected
-        }
-        None => parts
-            .first()
-            .ok_or(SoapBodyDecodeError::MalformedEncoding)?,
+    // The root is the first part. Some parsers resolve `start`, others ignore
+    // it and take the first part, so a `start` naming any other part would let
+    // the two select different envelopes. Ids are unique under the same
+    // comparison, so the first part is the only one `start` can match.
+    let Some(root) = parts.first() else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
     };
+    if let Some(start) = start {
+        // A `%`/`+`/whitespace-bearing `start` is decoded differently by a
+        // backend that percent-decodes ids, so the part it selects cannot be
+        // proven to be the first part Ferrum selects. Only a plain value is
+        // compared.
+        if content_id_has_decoding_ambiguity(start) || !root.content_id_matches(start) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+    }
 
     // The root part must itself declare a SOAP/XOP infoset. A root part
     // labelled `application/octet-stream` is the same client-selected
@@ -7410,6 +7689,40 @@ fn extract_mtom_root_part<'a>(
         body: root.body,
         content_type: root_content_type.to_string(),
     })
+}
+
+/// Whether two normalized `Content-ID` / `start` values could name the same
+/// part for some backend parser.
+///
+/// RFC 2392 leaves the domain half case-insensitive and parsers differ on the
+/// local half, and some strip a `cid:` URL scheme before comparing. The widest
+/// reading is used: ASCII case is ignored and a leading `cid:` is dropped from
+/// either side. It is an equivalence, so uniqueness under it leaves at most one
+/// part that any of those comparisons can select.
+fn content_ids_match(left: &str, right: &str) -> bool {
+    strip_cid_scheme(left).eq_ignore_ascii_case(strip_cid_scheme(right))
+}
+
+fn strip_cid_scheme(id: &str) -> &str {
+    id.get(..4)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("cid:"))
+        .and_then(|_| id.get(4..))
+        .unwrap_or(id)
+}
+
+/// Whether a normalized `Content-ID` / `start` value carries a character a
+/// percent-decoding backend would reinterpret.
+///
+/// Some stacks (for example JAX-WS's mimepull) look the id up exactly and, on
+/// a miss, retry after a `URLDecoder` pass that maps `%XX` escapes and `+` to a
+/// space. Ferrum's comparison is byte-exact apart from ASCII case folding and a
+/// `cid:` prefix, so a `%`, `+`, or embedded whitespace lets the two select
+/// different parts — the same gateway/backend split a duplicate id produces.
+/// Generated MTOM ids are plain tokens, so a value carrying one is refused
+/// rather than compared.
+fn content_id_has_decoding_ambiguity(id: &str) -> bool {
+    id.bytes()
+        .any(|byte| matches!(byte, b'%' | b'+') || byte.is_ascii_whitespace())
 }
 
 /// The strict MTOM package parser, reached through the lib target's
@@ -7458,6 +7771,11 @@ fn parse_content_type_charset(
     let mut rest = skip_content_type_media_type(content_type)?;
     while let Some((name, value, next)) = next_content_type_parameter(rest)? {
         rest = next;
+        // An RFC 2231 `charset*` is a second, differently decoded charset
+        // declaration for any parser that honors it.
+        if is_extended_parameter_for(name, &["charset"]) {
+            return Err(SoapBodyDecodeError::ConflictingCharset);
+        }
         if !name.eq_ignore_ascii_case("charset") {
             continue;
         }

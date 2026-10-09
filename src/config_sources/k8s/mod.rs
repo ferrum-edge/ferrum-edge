@@ -16,8 +16,8 @@ mod mesh_config;
 // instead of a binary-unused `pub use` re-export.
 pub mod udp_amplification_policy;
 
-pub use core::NodeWaypointInventory;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
+pub use core::{NodeWaypointInventory, POD_CLAIM_GRACE_WINDOW, PodClaimInventory};
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
     backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
@@ -152,6 +152,20 @@ pub struct K8sTranslationOptions {
     /// Opt-in core Kubernetes Pod/Service/EndpointSlice discovery. Default
     /// false for the first rollout so operators can enable it deliberately.
     pub pod_discovery_enabled: bool,
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. When true, a
+    /// Gateway API backendRef to a selector-less Service in the route's own
+    /// namespace may reach EndpointSlice IPs that no observed Pod, Service
+    /// ClusterIP, Node address, or Node Pod CIDR claims (an external database
+    /// or VM). Default false: only observed Pods of the Service's namespace
+    /// are reachable. Never admits another namespace's observed Pods, FQDN
+    /// endpoints, loopback/link-local/unspecified/multicast/cloud-metadata
+    /// addresses, or a Service it cannot check because pod discovery is off.
+    ///
+    /// Takes effect only in a translation that observes at least one Node:
+    /// without the Node watch (`FERRUM_K8S_NODE_LOCALITY_ENABLED` and `nodes`
+    /// RBAC) a Node address or an unwatched Pod's IP looks external, so the
+    /// translation keeps refusing unattributed IPs and warns instead.
+    pub allow_selectorless_external_endpoints: bool,
     /// Whether Sidecar `ingress[]` custom inbound listeners are actually
     /// MATERIALIZED on the data plane (F6 §6.2) — the effective enforcement gate
     /// `FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`,
@@ -193,6 +207,11 @@ pub struct K8sTranslationOptions {
     /// Restore is node-scoped: only a trusted not-Ready or terminating
     /// replacement on that node may reattach the remembered endpoint.
     pub node_waypoint_inventory: NodeWaypointInventory,
+    /// Pod IP claims seen within [`POD_CLAIM_GRACE_WINDOW`], shared across
+    /// reconciles so a Pod deleted before the EndpointSlice controller drops
+    /// its terminating endpoint still owns that endpoint's IP for EndpointSlice
+    /// attribution (issue #6108).
+    pub pod_claim_inventory: PodClaimInventory,
     /// Namespaces excluded from ambient enrollment. Matches the node-agent
     /// capture skip set: `pod_watcher::DEFAULT_EXCLUDED_NAMESPACES` plus
     /// `FERRUM_NODE_AGENT_EXCLUDED_NAMESPACES`. Identity-only NodeWaypoint
@@ -268,9 +287,11 @@ impl K8sTranslationOptions {
             istio_root_namespace: "istio-system".to_string(),
             cluster_domain: "cluster.local".to_string(),
             pod_discovery_enabled: false,
+            allow_selectorless_external_endpoints: false,
             mesh_sidecar_ingress_enforced: false,
             mesh_overlay_authority: false,
             node_waypoint_inventory: NodeWaypointInventory::new(),
+            pod_claim_inventory: PodClaimInventory::new(),
             excluded_namespaces: crate::ebpf::pod_watcher::excluded_namespaces_from_env(),
             source_namespaces: Some(source_namespaces),
             pod_source_namespaces: Some(pod_source_namespaces),
@@ -279,6 +300,13 @@ impl K8sTranslationOptions {
 
     pub fn with_pod_discovery_enabled(mut self, enabled: bool) -> Self {
         self.pod_discovery_enabled = enabled;
+        self
+    }
+
+    /// Set `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. See
+    /// [`K8sTranslationOptions::allow_selectorless_external_endpoints`].
+    pub fn with_selectorless_external_endpoints_allowed(mut self, allowed: bool) -> Self {
+        self.allow_selectorless_external_endpoints = allowed;
         self
     }
 
@@ -316,6 +344,13 @@ impl K8sTranslationOptions {
     /// Share a process-lifetime NodeWaypoint inventory across translations.
     pub fn with_node_waypoint_inventory(mut self, inventory: NodeWaypointInventory) -> Self {
         self.node_waypoint_inventory = inventory;
+        self
+    }
+
+    /// Share a process-lifetime Pod IP claim inventory across translations.
+    /// See [`K8sTranslationOptions::pod_claim_inventory`].
+    pub fn with_pod_claim_inventory(mut self, inventory: PodClaimInventory) -> Self {
+        self.pod_claim_inventory = inventory;
         self
     }
 
@@ -365,6 +400,11 @@ impl K8sTranslationOptions {
         self.pod_source_namespaces
             .as_ref()
             .is_none_or(|namespaces| namespaces.contains(namespace))
+    }
+
+    /// Whether the Pod watch scope covers every namespace (issue #6108).
+    fn watches_every_pod_namespace(&self) -> bool {
+        self.pod_source_namespaces.is_none()
     }
 }
 
@@ -474,6 +514,10 @@ pub struct K8sTranslation {
     /// whenever it keeps serving through any other listener or claim. A refused
     /// claim therefore never withdraws a surviving parent or listener.
     pub refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
+    /// EndpointSlice attribution verdicts for Gateway API backendRefs to core
+    /// Services (issue #6108). The status writer reads this so `ResolvedRefs`
+    /// matches what translation refused.
+    pub(crate) endpoint_slices: backend_ref::EndpointSliceGuard,
 }
 
 /// One refused Gateway API listener claim, in the shape
@@ -969,6 +1013,20 @@ pub(crate) struct K8sAccumulator {
     /// not shift. Gateway API `BackendTLSPolicy` is the only consumer here, and
     /// it needs the transport — TLS must never be originated to a UDP port.
     service_port_specs: HashMap<String, HashMap<String, ServicePortIndex>>,
+    /// `(namespace, name)` of every collected `type: ExternalName` Service.
+    /// Gateway API backendRefs refuse them: the DNS alias they publish can
+    /// name any host — another namespace's Service or the gateway's own
+    /// loopback — without any ReferenceGrant being consulted.
+    external_name_services: HashSet<(String, String)>,
+    /// `(namespace, name)` of every collected Service without a `spec.selector`
+    /// (ExternalName excluded). Gateway API backendRefs refuse one whose
+    /// EndpointSlices cannot be attributed to observed Pods.
+    selectorless_services: HashSet<(String, String)>,
+    /// Gateway API backendRef EndpointSlice attribution verdicts, built from
+    /// the collected Pod/Node/EndpointSlice inventory before routes translate.
+    endpoint_slice_guard: backend_ref::EndpointSliceGuard,
+    /// Warnings already queued by [`Self::push_warning_once`].
+    queued_warnings: HashSet<String>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
@@ -999,6 +1057,12 @@ pub(crate) struct K8sAccumulator {
     /// route or listener.
     pub(crate) gateway_api_route_proxy_attachments:
         HashMap<NamespacedResourceId, Vec<GatewayApiRouteAttachment>>,
+    /// The route object that first derived each HTTPRoute/GRPCRoute proxy id
+    /// and upstream id. Ids are bound to their source route, so a second route
+    /// object deriving the same `(namespace, id)` is refused instead of
+    /// replacing, merging into, or attaching plugins to the owner's resource.
+    pub(crate) gateway_api_route_proxy_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
+    pub(crate) gateway_api_route_upstream_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
     /// Live materialization credit per attachment: the proxies that currently
     /// serve that exact claim. A merged claim is credited to the proxy it
     /// collapsed into, so withdrawing that proxy withdraws the merged claim
@@ -1088,6 +1152,10 @@ impl K8sAccumulator {
             service_ports: HashMap::new(),
             service_import_ports: HashMap::new(),
             service_port_specs: HashMap::new(),
+            external_name_services: HashSet::new(),
+            selectorless_services: HashSet::new(),
+            endpoint_slice_guard: backend_ref::EndpointSliceGuard::default(),
+            queued_warnings: HashSet::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
@@ -1097,6 +1165,8 @@ impl K8sAccumulator {
             gateway_api_route_proxy_listeners: HashMap::new(),
             gateway_api_refused_route_slots: HashSet::new(),
             gateway_api_route_proxy_attachments: HashMap::new(),
+            gateway_api_route_proxy_owners: HashMap::new(),
+            gateway_api_route_upstream_owners: HashMap::new(),
             gateway_api_materialized_route_attachments: HashMap::new(),
             gateway_api_refused_route_attachments: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
@@ -1150,6 +1220,30 @@ impl K8sAccumulator {
             .and_then(|by_svc| by_svc.get(service))
             .and_then(|ports| ports.get(port_name))
             .copied()
+    }
+
+    /// Whether the collected Service `namespace/service` is `type: ExternalName`.
+    pub(crate) fn service_is_external_name(&self, namespace: &str, service: &str) -> bool {
+        self.external_name_services
+            .contains(&(namespace.to_string(), service.to_string()))
+    }
+
+    /// Whether the collected Service `namespace/service` has no `spec.selector`.
+    pub(crate) fn service_is_selectorless(&self, namespace: &str, service: &str) -> bool {
+        self.selectorless_services
+            .contains(&(namespace.to_string(), service.to_string()))
+    }
+
+    pub(crate) fn endpoint_slice_guard(&self) -> &backend_ref::EndpointSliceGuard {
+        &self.endpoint_slice_guard
+    }
+
+    /// Push a translation warning unless this method already queued an
+    /// identical one.
+    pub(crate) fn push_warning_once(&mut self, warning: String) {
+        if self.queued_warnings.insert(warning.clone()) {
+            self.warnings.push(warning);
+        }
     }
 
     pub(crate) fn service_exists(&self, namespace: &str, service: &str) -> bool {
@@ -1504,6 +1598,45 @@ impl K8sAccumulator {
             .insert(proxy_key, attachments);
     }
 
+    /// Claim a route proxy id for `route`. `false` when a different route
+    /// object already derived the same `(namespace, id)`.
+    pub(crate) fn claim_gateway_api_route_proxy(
+        &mut self,
+        key: &NamespacedResourceId,
+        route: &K8sObject,
+    ) -> bool {
+        claim_route_resource_owner(&mut self.gateway_api_route_proxy_owners, key, route)
+    }
+
+    /// Claim a route upstream id for `route`. `false` when a different route
+    /// object already derived the same `(namespace, id)`.
+    pub(crate) fn claim_gateway_api_route_upstream(
+        &mut self,
+        key: &NamespacedResourceId,
+        route: &K8sObject,
+    ) -> bool {
+        claim_route_resource_owner(&mut self.gateway_api_route_upstream_owners, key, route)
+    }
+
+    /// Report the `(route, parentRef, listener)` claims of a route proxy that
+    /// was refused before it was built, so Route status cannot claim them.
+    pub(crate) fn record_gateway_api_refused_route_claims(
+        &mut self,
+        route: &K8sObject,
+        parent_refs: &[String],
+        listener: Option<&GatewayApiListenerKey>,
+    ) {
+        let route_key = K8sResourceKey::from_object(route);
+        for parent_ref in parent_refs {
+            self.gateway_api_refused_route_attachments
+                .insert(GatewayApiRouteAttachment {
+                    route: route_key.clone(),
+                    parent_ref: parent_ref.clone(),
+                    listener: listener.cloned(),
+                });
+        }
+    }
+
     /// The claims one route proxy was built to materialize, cloned so the
     /// caller can mutate the accumulator while acting on them.
     pub(crate) fn gateway_api_route_proxy_attachments_of(
@@ -1678,6 +1811,7 @@ impl K8sAccumulator {
             listener_conflicts: self.gateway_api_listener_conflicts,
             frontend_tls_hostname_conflicts: self.gateway_api_frontend_tls_hostname_conflicts,
             refused_route_attachments,
+            endpoint_slices: self.endpoint_slice_guard,
         }
     }
 }
@@ -1805,6 +1939,67 @@ pub(crate) fn gateway_api_status_conflict_context(
     acc
 }
 
+/// Build the Gateway API backendRef EndpointSlice guard for one translation
+/// into `acc` (issue #6108).
+///
+/// Only Gateway API routes consult the guard, so a snapshot without one skips
+/// it and every Service stays admitted. `objects` is the whole snapshot, not
+/// the include-filtered set, so a route skipped for an unrelated error still
+/// gets a status verdict from a real guard.
+///
+/// With pod discovery on, every Service's EndpointSlices are attributed to the
+/// observed Pods. A selector-less Service the controller cannot check — pod
+/// discovery is off, or its namespace is outside the Pod watch scope — is
+/// recorded as unverifiable and refused: nothing manages its slices, and
+/// nothing here can tell where they point. A selector-backed Service in that
+/// position stays admitted (Kubernetes manages its slices) and the Gateway API
+/// translator warns about it instead.
+///
+/// With pod discovery on, the MCS `ServiceImport` slices that HTTPRoute and
+/// GRPCRoute backends expand onto are verified here too (issue #6123); see
+/// [`core::verify_service_import_endpoint_slices`].
+fn build_endpoint_slice_guard(acc: &mut K8sAccumulator, objects: &[K8sObject]) {
+    if !objects
+        .iter()
+        .any(|object| is_gateway_api_route_kind(&object.kind))
+    {
+        return;
+    }
+    let pod_discovery_enabled = acc.options.pod_discovery_enabled;
+    let cluster_ips = if pod_discovery_enabled {
+        core::observed_cluster_ips(acc)
+    } else {
+        HashSet::new()
+    };
+    let mut guard = if pod_discovery_enabled {
+        core::endpoint_slice_guard(acc, &cluster_ips)
+    } else {
+        backend_ref::EndpointSliceGuard::new(false)
+    };
+    for (namespace, name) in &acc.selectorless_services {
+        if !pod_discovery_enabled || !acc.options.includes_pod_namespace(namespace) {
+            guard.record_unverifiable(namespace, name);
+        }
+    }
+    acc.endpoint_slice_guard = guard;
+    if pod_discovery_enabled {
+        core::verify_service_import_endpoint_slices(acc, &cluster_ips);
+    }
+    if pod_discovery_enabled
+        && acc.options.allow_selectorless_external_endpoints
+        && !core::external_endpoints_opt_in_active(acc)
+    {
+        acc.push_warning_once(backend_ref::external_endpoints_opt_in_inactive_warning());
+    }
+}
+
+fn is_gateway_api_route_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute"
+    )
+}
+
 pub(crate) fn translate_k8s_objects_with_filter<F>(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
@@ -1894,6 +2089,11 @@ where
     // policy that lost a target before route translation reads the map, so the
     // data plane and `status.ancestors` cannot disagree.
     gateway_api::finalize_backend_lb_policies(&mut acc);
+
+    // EndpointSlices are attributed to observed Pods only once every Pod,
+    // Node, Service, and EndpointSlice is indexed, and before any route
+    // resolves a backendRef against them (issue #6108).
+    build_endpoint_slice_guard(&mut acc, objects);
 
     // WorkloadEntry cross-namespace attachment admission depends on the full
     // ReferenceGrant and Service indexes. Collect explicit-service ownership in
@@ -2271,6 +2471,15 @@ pub(crate) fn collect_service(
                 truncated: port_specs_truncated,
             },
         );
+    if backend_ref::service_object_is_external_name(object) {
+        let namespace = object.metadata.namespace.clone();
+        let name = object.metadata.name.clone();
+        acc.external_name_services.insert((namespace, name));
+    } else if !backend_ref::service_object_has_selector(object) {
+        let namespace = object.metadata.namespace.clone();
+        let name = object.metadata.name.clone();
+        acc.selectorless_services.insert((namespace, name));
+    }
 
     // GAMMA Waypoint binding: a Service with the `istio.io/use-waypoint`
     // annotation routes through the named waypoint. We append the binding
@@ -3996,6 +4205,7 @@ pub(crate) fn upstream_for_route_with_session(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
@@ -4041,6 +4251,20 @@ pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &st
         format!("{prefix}-{namespace}-{name}-{suffix}")
     }
     .replace(['/', '.'], "-")
+}
+
+fn claim_route_resource_owner(
+    owners: &mut HashMap<NamespacedResourceId, K8sResourceKey>,
+    key: &NamespacedResourceId,
+    route: &K8sObject,
+) -> bool {
+    if let Some(owner) = owners.get(key) {
+        return owner.kind == route.kind
+            && owner.namespace == route.metadata.namespace
+            && owner.name == route.metadata.name;
+    }
+    owners.insert(key.clone(), K8sResourceKey::from_object(route));
+    true
 }
 
 /// Build a `(namespace, id)` ownership key, failing closed on empty components.

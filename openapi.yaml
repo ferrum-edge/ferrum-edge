@@ -132,10 +132,15 @@ info:
 
     When the primary database is unavailable, eligible configuration reads fall
     back to the most recent cached configuration and include an
-    `X-Data-Source: cached` response header. Gateway trust bundle list/get reads
-    fail closed with `503 Service Unavailable` on a store failure; they do not
-    serve stale cached trust records. Write operations require a live database
-    and return `503 Service Unavailable` when one is not present.
+    `X-Data-Source: cached` response header. A by-id read the cached
+    configuration does not contain is not confirmed absence after a database
+    error: it returns `503` with `X-Data-Source: cached`, never the
+    authoritative `404`. Without a database (file mode) the cached
+    configuration is authoritative and a miss stays `404`. Gateway trust
+    bundle list/get reads fail closed with `503 Service Unavailable` on a store
+    failure; they do not serve stale cached trust records. Write operations
+    require a live database and return `503 Service Unavailable` when one is
+    not present.
 
     The Admin API can be placed in **read-only mode**, in which case persisted
     configuration and database mutations return `403 Forbidden`. Authenticated
@@ -5731,7 +5736,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
     put:
       operationId: updateProxy
@@ -5961,6 +5966,12 @@ paths:
         catalog. Proxy and proxy-group associations are still read from the
         store.
 
+        When the store read fails, the endpoint answers from the cached
+        configuration with `X-Data-Source: cached`. A proxy or `mcp_gateway`
+        that cached configuration does not hold then answers `503`
+        (`CachedReadUnavailable`), not `404`, because the snapshot may predate
+        it.
+
         `data` lists the tools of every effective `mcp_gateway` instance on
         the proxy, ordered by instance then public name, and paginates with
         the shared `limit` / `offset` bounds. The catalog itself stays within
@@ -6003,7 +6014,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
@@ -6162,7 +6173,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
     put:
       operationId: updateConsumer
@@ -6784,7 +6795,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
 
     put:
       operationId: updatePluginConfig
@@ -7020,7 +7031,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/CachedReadUnavailable"
     put:
       operationId: updateUpstream
       summary: Update an upstream
@@ -9096,6 +9107,23 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    CachedReadUnavailable:
+      description: >-
+        The read could not be answered: the database read failed with no
+        usable cached fallback, there is no database and no cached config
+        (`No database and no cached config available`), or the database read
+        failed and the cached config fallback does not contain
+        the resource (`Resource state unavailable: database read failed and
+        the cached config does not contain it`, with `X-Data-Source: cached`).
+        The cached snapshot may predate the resource, so the latter is not
+        confirmed absence and must not be treated as a `404`; retry later.
+      headers:
+        X-Data-Source:
+          $ref: "#/components/headers/X-Data-Source"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     NamespaceAdmissionPreCommitUnavailable:
       description: >-
         Nothing was applied. The admin write gate may have refused the
@@ -10797,7 +10825,12 @@ components:
         backend_tls_client_cert_path:
           type: [string, "null"]
           maxLength: 4096
-          description: Path to mTLS client certificate (PEM). Max 4096 characters.
+          description: >-
+            Path to mTLS client certificate (PEM). Max 4096 characters.
+            Where the admin `ns` claim is enforced, an `operator` may set only
+            inline PEM, `system://`, or a `k8s://` Secret in the addressed
+            namespace; any other reference it introduces is refused with `400`
+            before the material is loaded.
         backend_tls_client_key_path:
           type: [string, "null"]
           maxLength: 4096
@@ -10806,6 +10839,10 @@ components:
             optional pkcs11 build feature. Module overrides require admission by
             FERRUM_PKCS11_MODULE_ALLOWED_PATHS on each node. Without that policy,
             omit module options to use FERRUM_PKCS11_MODULE_PATH. Max 4096 characters.
+            Where the admin `ns` claim is enforced, an `operator` may set only
+            inline PEM, `system://`, or a `k8s://` Secret in the addressed
+            namespace; any other reference it introduces is refused with `400`
+            before the material is loaded.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
@@ -10822,6 +10859,10 @@ components:
             `FERRUM_TLS_NO_VERIFY`. `system://` requires
             `backend_tls_verify_server_cert: true` and must be spelled exactly,
             with no path or query options.
+            Where the admin `ns` claim is enforced, an `operator` may set only
+            inline PEM, `system://`, or a `k8s://` Secret in the addressed
+            namespace; any other reference it introduces is refused with `400`
+            before the material is loaded.
         dns_override:
           type: [string, "null"]
 
@@ -10909,7 +10950,12 @@ components:
             Default: false — the fixed initial stream/connection windows apply. While enabled, adaptive
             windowing replaces those fixed sizes: hyper restarts both at 65535 bytes and grows the connection
             window only as the link is measured, which fragments hundreds of concurrent streams into tiny
-            DATA frames and can trip h2's small-frame flood budget (GOAWAY ENHANCE_YOUR_CALM).
+            DATA frames and can trip h2's small-frame flood budget (GOAWAY ENHANCE_YOUR_CALM). Its BDP
+            PING/SETTINGS traffic can also deadlock a connection carrying large bodies in both directions,
+            especially when both peers enable adaptive windowing; h2 stops reading while a control-frame
+            write waits for socket capacity (issue #6073, upstream https://github.com/hyperium/h2/issues/975).
+            This describes hyper/reqwest HTTP/2 connections; HBONE uses a separate raw-h2 window policy
+            and does not enable this BDP PING/SETTINGS behavior.
             An explicit adaptive choice remains authoritative even alongside window overrides; omit this
             field when setting explicit windows to auto-disable adaptive so fixed sizes apply.
         pool_http2_max_frame_size:
@@ -14668,6 +14714,10 @@ components:
             config takes precedence over the proxy's own backend TLS fields.
             Only meaningful for TLS-enabled backend schemes (`https`, `tcps`,
             `dtls`).
+            Where the admin `ns` claim is enforced, an `operator` may set only
+            inline PEM, `system://`, or a `k8s://` Secret in the addressed
+            namespace; any other reference it introduces is refused with `400`
+            before the material is loaded.
         backend_tls_client_key_path:
           type: [string, "null"]
           description: >-
@@ -14676,6 +14726,10 @@ components:
             With the optional pkcs11 build feature, also accepts a pkcs11 signer
             URI. Module overrides require FERRUM_PKCS11_MODULE_ALLOWED_PATHS on
             each node; without it, omit module options to use FERRUM_PKCS11_MODULE_PATH.
+            Where the admin `ns` claim is enforced, an `operator` may set only
+            inline PEM, `system://`, or a `k8s://` Secret in the addressed
+            namespace; any other reference it introduces is refused with `400`
+            before the material is loaded.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
@@ -14697,6 +14751,10 @@ components:
             `BackendTLSPolicy` `wellKnownCACertificates: System`, requires
             `backend_tls_verify_server_cert: true`, and must be spelled
             exactly, with no path or query options.
+            Where the admin `ns` claim is enforced, an `operator` may set only
+            inline PEM, `system://`, or a `k8s://` Secret in the addressed
+            namespace; any other reference it introduces is refused with `400`
+            before the material is loaded.
         backend_tls_sni:
           type: [string, "null"]
           minLength: 1
@@ -22020,7 +22078,10 @@ components:
             - not:
                 type: string
                 pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]"
-          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names and every name in the gateway-owned x-consumer-* consumer assertion namespace (with `_` equivalent to `-`, so x_consumer_role is included), are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
+            - not:
+                type: string
+                pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss][\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
+          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names, every name in the gateway-owned x-consumer-* consumer assertion namespace (with `_` equivalent to `-`, so x_consumer_role is included), and the gateway-owned x-ferrum-hops proxy hop count (either spelling), are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
         echo_downstream:
           type: [boolean, "null"]
           default: true
@@ -22228,11 +22289,11 @@ components:
         channels:
           ops_slack:
             type: slack
-            webhook_url_env: FERRUM_ALERTS_SLACK_WEBHOOK
+            webhook_url_env: FERRUM_PLUGIN_SECRET_ALERTS_SLACK_WEBHOOK
             channel_override: "#alerts-prod"
           pagerduty_v2:
             type: webhook
-            url_env: FERRUM_PAGERDUTY_EVENTS_URL
+            url_env: FERRUM_PLUGIN_SECRET_PAGERDUTY_EVENTS_URL
             method: POST
             headers:
               Content-Type: application/json
@@ -22287,10 +22348,15 @@ components:
     ProxyAlertsEnvName:
       type: string
       minLength: 1
+      maxLength: 256
+      pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
       description: |
-        Environment variable name resolved at construction. Empty names are
-        rejected. The named variable must also be set and nonempty at
-        construction; that process-environment check is constructor-only.
+        Name of a `FERRUM_PLUGIN_SECRET_<NAME>` environment variable
+        (`<NAME>` uppercase `[A-Z_][A-Z0-9_]*`) resolved at construction.
+        Any other process environment variable, including every other
+        `FERRUM_*` setting, is refused at admission with a 400. The named
+        variable must also be set and nonempty at construction; that
+        process-environment check is constructor-only.
 
     ProxyAlertsEmailAddress:
       type: string
@@ -23344,7 +23410,7 @@ components:
               consumer_header_claim:
                 type: string
                 pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-                description: Per-provider override for consumer header claim (falls back to global); a dot path with no empty segments
+                description: Per-provider override for X-Authenticated-Identity claim (falls back to global, then to this provider's effective consumer_identity_claim); a dot path with no empty segments
               claim_headers:
                 type: object
                 additionalProperties:
@@ -23357,7 +23423,8 @@ components:
                   empty, or wrong-type claim leaves the header absent instead of
                   forwarding client-supplied input.
                   Destinations in the gateway-owned `x-consumer-*` consumer
-                  assertion namespace are rejected at config load.
+                  assertion namespace and `x-authenticated-identity` are
+                  rejected at config load.
               claim_headers_separator:
                 type: string
                 minLength: 1
@@ -23496,7 +23563,7 @@ components:
         consumer_header_claim:
           type: string
           pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-          description: JWT claim for X-Consumer-Username header (default same as consumer_identity_claim); a dot path with no empty segments
+          description: JWT claim for X-Authenticated-Identity header (defaults to each provider's effective consumer_identity_claim); a dot path with no empty segments
         claim_headers:
           type: object
           additionalProperties:
@@ -23509,7 +23576,8 @@ components:
             claim leaves the header absent instead of forwarding client-supplied
             input.
             Destinations in the gateway-owned `x-consumer-*` consumer
-            assertion namespace are rejected at config load.
+            assertion namespace and `x-authenticated-identity` are rejected
+            at config load.
         claim_headers_separator:
           type: string
           default: ","
@@ -23885,8 +23953,14 @@ components:
                 type: string
                 pattern: '^[^.]+(\.[^.]+)*$'
                 description: >-
-                  Per-provider override of the global X-Consumer-Username
-                  display claim path.
+                  Per-provider X-Authenticated-Identity display claim path.
+                  The display claim is resolved in this order: this provider's
+                  consumer_header_claim, then the plugin-level
+                  consumer_header_claim, then this provider's effective
+                  consumer_identity_claim (its own consumer_identity_claim,
+                  else the plugin-level consumer_identity_claim). When the
+                  selected display claim is absent or not a string, the header
+                  carries the authenticated identity value instead.
               claim_headers:
                 type: object
                 propertyNames:
@@ -23904,7 +23978,8 @@ components:
                   claim leaves the header absent instead of forwarding client-supplied
                   input.
                   Destinations in the gateway-owned `x-consumer-*` consumer
-                  assertion namespace are rejected at config load.
+                  assertion namespace and `x-authenticated-identity` are
+                  rejected at config load.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -23930,8 +24005,8 @@ components:
           type: string
           pattern: '^[^.]+(\.[^.]+)*$'
           description: >-
-            Claim used for X-Consumer-Username when no consumer maps. Defaults
-            to the effective consumer_identity_claim.
+            Claim used for X-Authenticated-Identity when no Consumer maps.
+            Defaults to the effective consumer_identity_claim.
 
     OidcRelyingPartyConfig:
       type: object
@@ -24110,7 +24185,8 @@ components:
                   wrong-type claim leaves the header absent instead of forwarding
                   client-supplied input.
                   Destinations in the gateway-owned `x-consumer-*` consumer
-                  assertion namespace are rejected at config load.
+                  assertion namespace and `x-authenticated-identity` are
+                  rejected at config load.
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -24584,10 +24660,6 @@ components:
           minimum: 1
           maximum: 1000000
           description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan."
-        consumer_mapping:
-          type: boolean
-          default: true
-          description: "Whether to map LDAP user to a gateway Consumer"
         hide_credentials:
           type: boolean
           default: true
@@ -26948,14 +27020,23 @@ components:
                   not: {required: [access_token_env, accessTokenEnv]}
                   properties:
                     collector_url: {type: string}
-                    access_token_env: {type: string}
-                    accessTokenEnv: {type: string}
+                    access_token_env:
+                      type: string
+                      maxLength: 256
+                      pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
+                    accessTokenEnv:
+                      type: string
+                      maxLength: 256
+                      pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
           description: |
             Direct provider envelope; name-only references belong to Istio
             translation. Unknown fields are ignored by serde. Active exporters
             require an absolute HTTP(S) endpoint with a host and no embedded
             credentials. Lightstep reads its bearer token from the named local
-            environment variable at construction. URL/header/token validation
+            environment variable at construction; the name must be
+            `FERRUM_PLUGIN_SECRET_<NAME>` (`<NAME>` uppercase
+            `[A-Z_][A-Z0-9_]*`), and any other variable is refused at
+            admission even while span reporting is disabled. URL/header/token validation
             and local environment availability are runtime checks. Exporter
             ranges in the parent conditional apply only with at least one
             selected provider and reporting enabled; inactive numeric options
@@ -27335,30 +27416,36 @@ components:
               type: boolean
               default: true
               description: |
-                Accept MTOM/XOP multipart/related packaging. The gateway locates
-                the root part (by the `start` parameter, else the first part),
-                validates that part's envelope, and never reads or decodes
-                attachment payloads. Set false to declare that this route does
-                not accept MTOM at all; a SOAP-bearing multipart then returns
-                415. Package framing is STRICT because the parser decides which
-                bytes are the envelope: delimiter LINES are recognized only at
-                the body start or immediately after a CRLF with exact CRLF
-                framing and no transport padding (so a `--boundary` sequence in
-                a preamble, header value, attachment payload, or the envelope
-                itself is inert payload); exactly one close-delimiter is
-                required and the epilogue must not contain the boundary token;
-                part headers must be US-ASCII with no obsolete folding, must be
-                well-formed `token: value` pairs, and may carry at most one
-                Content-Type / Content-ID / Content-Transfer-Encoding each;
-                Content-ID values must be package-unique and nonblank, and with
-                `start` supplied exactly one part may match; and the root part
-                must declare a SOAP/XOP essence and must not declare a
-                re-encoding Content-Transfer-Encoding (anything other than
-                7bit/8bit/binary). The whole package is framed and every part
-                parsed before a root is selected, so no later ambiguity is
-                missed by an early return. Bounds are fail-closed (at most 64
-                parts; at most 8 KiB and 32 header lines per part; a ceiling on
-                boundary-shaped candidates per package). MUST NOT be explicitly
+                Accept MTOM/XOP multipart/related packaging. The root part is
+                the first part (when the `start` parameter is supplied it must
+                name that part); the gateway validates that part's envelope and
+                never reads or decodes attachment payloads. Set false to declare
+                that this route does not accept MTOM at all; a SOAP-bearing
+                multipart then returns 415. Package framing is STRICT because
+                the parser decides which bytes are the envelope: delimiter LINES
+                are recognized only at the body start or immediately after a
+                CRLF with exact CRLF framing and no transport padding, and the
+                `--boundary` token may appear nowhere else (a padded, LF-ended,
+                or `--boundaryX` line, a token opened by a bare LF or CR, or a
+                token mid-line in the preamble, a part, or the epilogue refuses
+                the package); exactly one close-delimiter is required; the
+                package Content-Type must not carry an RFC 2231 extended or
+                continuation form (`boundary*`, `type*0`, `start*`, ...) of
+                boundary/type/start; part headers must be US-ASCII with no
+                obsolete folding, must be well-formed `token: value` pairs, and
+                may carry at most one Content-Type / Content-ID /
+                Content-Transfer-Encoding each; Content-ID values must be
+                package-unique (ignoring ASCII case and a leading `cid:`) and
+                nonblank, while a Content-ID or `start` carrying `%`, `+`, or
+                embedded whitespace is refused (a percent-decoding backend
+                would resolve it to a different part); and the root part must
+                declare a SOAP/XOP essence and must not declare a re-encoding
+                Content-Transfer-Encoding (anything other than 7bit/8bit/binary).
+                The whole package is
+                framed and every part parsed before a root is selected, so no
+                later ambiguity is missed by an early return. Bounds are
+                fail-closed (at most 64 parts; at most 8 KiB and 32 header lines
+                per part). MUST NOT be explicitly
                 true when x509_signature.enabled is true — that pairing is
                 refused at admission, and XOP representations (multipart/related
                 and bare application/xop+xml) return 415 under an enabled
@@ -28126,7 +28213,9 @@ components:
             type: string
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             not:
-              pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
+              anyOf:
+                - pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
+                - pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss]$'
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
@@ -28135,7 +28224,9 @@ components:
             Static HTTP headers sent to OPA on every decision request. Names use
             HTTP token syntax and values are visible ASCII (plus tab). The
             `content-type` header is managed by the plugin and cannot be
-            configured here, case-insensitively.
+            configured here, case-insensitively. Neither can the gateway-owned
+            `X-Ferrum-Hops` proxy hop count (any case, `_` or `-`), which the
+            decision request carries itself.
           example:
             Authorization: "Bearer opa-client-token"
         timeout_ms:
@@ -28959,8 +29050,11 @@ components:
             reject every name in the gateway-owned `x-consumer-*` consumer
             assertion namespace (including x-consumer-username and
             x-consumer-custom-id); the error names the rule.
-            Removal and rename sources remain allowed. Use preserve_host_header
-            for Host or trusted-proxy configuration for forwarding identity.
+            Removal and rename sources remain allowed, except for the
+            gateway-owned x-ferrum-hops proxy hop count (either spelling):
+            every rule that names it, as key or new_key, is rejected.
+            Use preserve_host_header for Host or trusted-proxy configuration
+            for forwarding identity.
         value:
           type: string
           not:
@@ -29693,6 +29787,12 @@ components:
             - `ip` (default) — client IP.
             - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
             - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
+        ipv6_prefix:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 64
+          description: IPv6 prefix length used to group source addresses for IP rate-limit keys. IPv4 addresses remain host-specific.
         expose_headers:
           type: boolean
           default: false
@@ -31138,12 +31238,13 @@ components:
         grpc_max_decompressed_size_bytes:
           type: integer
           format: uint64
-          minimum: 0
+          minimum: 1
           maximum: 18446744073709551615
           description: >-
             Maximum decompressed gRPC protobuf payload size in bytes for both
-            request and response validation. Nonnegative integer matching runtime
-            `usize` parsing. `0` disables the decompressed cap. When omitted,
+            request and response validation. Positive integer matching runtime
+            `usize` parsing. Zero is rejected so compressed input is always
+            bounded. When omitted,
             inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses
             as an unsigned integer; otherwise falls back to 10 MiB (10485760).
             No static OpenAPI default is advertised because the effective value
@@ -32780,13 +32881,13 @@ components:
           description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied, whichever provider is selected. The lexical contract matches runtime admission: a non-empty host (a registered name, an IPv4 literal, or a bracketed IPv6 literal), an optional port of 0-65535, no URL userinfo, no fragment, and no raw ASCII whitespace or control character anywhere in the value. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
         aws_region:
           type: string
-          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars. The default endpoint is partition-aware: cn-* regions derive lambda.<region>.amazonaws.com.cn and every other region derives lambda.<region>.amazonaws.com. The air-gapped ISO partitions are not derived and require an explicit aws_endpoint_url."
+          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars. The default endpoint is partition-aware: cn-* regions derive lambda.<region>.amazonaws.com.cn and every other region derives lambda.<region>.amazonaws.com. The air-gapped ISO partitions and the AWS European Sovereign Cloud are not derived and require an explicit aws_endpoint_url. When the key id or secret resolves from the process environment, the region must be a lowercase commercial, GovCloud, or China region (see allow_custom_endpoint_with_ambient_credentials)."
         aws_access_key_id:
           type: string
-          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var."
+          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
         aws_secret_access_key:
           type: string
-          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var."
+          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
         aws_function_name:
           type: string
           minLength: 1
@@ -32795,7 +32896,7 @@ components:
           description: "Lambda function name, partial ARN, or full ARN (aws_lambda only), matching the Lambda Invoke API FunctionName grammar. Falls back to AWS_LAMBDA_FUNCTION_NAME env var; the environment value is held to the same grammar. Validated whenever supplied, whichever provider is selected. Existence and invoke permission are not checked at admission."
         aws_session_token:
           type: string
-          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var."
+          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. A process-environment token may only be sent to an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
         aws_qualifier:
           type: string
           minLength: 1
@@ -32814,15 +32915,51 @@ components:
             control characters). Validated whenever supplied, whichever
             provider is selected. Falls back to `AWS_LAMBDA_ENDPOINT_URL`. A
             non-default port is part of the signed SigV4 canonical `Host`, so
-            a verifying endpoint accepts the invocation.
+            a verifying endpoint accepts the invocation. When the AWS key id
+            or secret resolves from the process environment, a configured
+            override must be an official AWS Lambda endpoint unless
+            `allow_custom_endpoint_with_ambient_credentials` is true (see that
+            field); an `AWS_LAMBDA_ENDPOINT_URL` fallback is set by the same
+            environment owner and is trusted like the environment
+            credentials.
+        allow_custom_endpoint_with_ambient_credentials:
+          type: boolean
+          default: false
+          description: >-
+            aws_lambda only. When `aws_access_key_id` or
+            `aws_secret_access_key` is omitted from the config and resolves
+            from the gateway process environment (`AWS_SESSION_TOKEN` is then
+            used too; it never completes a config key pair), `aws_region` must
+            be a lowercase commercial, GovCloud, or China region, and the
+            config-chosen Lambda endpoint (the host derived from `aws_region`,
+            or the `aws_endpoint_url` override) must be an official AWS Lambda
+            endpoint for that region over HTTPS on the default port:
+            lambda[-fips].<region>.amazonaws.com,
+            lambda[-fips].<region>.api.aws, or an interface VPC endpoint
+            vpce-<id>[-<az>].lambda[-fips].<region>.vpce.amazonaws.com, where
+            <region> is a commercial or GovCloud region; a cn-* region uses
+            amazonaws.com.cn and the dual-stack api.amazonwebservices.com.cn
+            instead. An `AWS_LAMBDA_ENDPOINT_URL` set in the environment (used
+            only when the config sets no `aws_endpoint_url`) is trusted like
+            the environment credentials. Anything else is refused at
+            configuration admission (CP/admin shape-only admission screens a
+            configured `aws_region` and `aws_endpoint_url` whenever the config
+            omits the key pair), and every invocation re-checks the endpoint
+            and fails closed with 500 (`ambient_credential_endpoint_refused`)
+            regardless of `on_error`. Credentials written into the config are
+            not scoped. Set true only to deliberately sign invocations for a
+            private endpoint (for example LocalStack), an air-gapped ISO
+            partition, or the AWS European Sovereign Cloud with the process
+            credentials; anyone who can write this plugin config can then
+            direct those credentials to that endpoint.
         azure_function_key:
           type: string
           pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
-          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var. The value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); the effective config or environment value is parsed at admission so an unusable credential never reaches the serving cache. Validated whenever supplied, whichever provider is selected."
+          description: "Function key for x-functions-key auth (azure_functions only). Falls back to the FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY env var (never the ambient AZURE_FUNCTIONS_KEY, because the key is sent to the config-chosen function_url). The value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); the effective config or environment value is parsed at admission so an unusable credential never reaches the serving cache. Validated whenever supplied, whichever provider is selected."
         gcp_bearer_token:
           type: string
           pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
-          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var. The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
+          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to the FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var (never the ambient GCP_CLOUD_FUNCTIONS_BEARER_TOKEN). The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
         forward_body:
           type: boolean
           default: false
@@ -34422,7 +34559,9 @@ components:
               description: Embedding model sent in the request body.
             api_key_env:
               type: string
-              description: Environment variable holding the provider API key. The variable must exist after Ferrum startup secret resolution and is sent as Authorization Bearer when present.
+              maxLength: 256
+              pattern: '^\s*(?!\S*_(?:FILE|VAULT|AWS|AZURE|GCP)\s*$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*\s*$|^\s*$'
+              description: "Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key (`<NAME>` uppercase `[A-Z_][A-Z0-9_]*`; surrounding whitespace is trimmed and an empty value means unset). Any other process environment variable, including every other `FERRUM_*` setting, is refused at admission with a 400. The variable must exist after Ferrum startup secret resolution (`FERRUM_PLUGIN_SECRET_<NAME>_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` work) and is sent as Authorization Bearer; an unset or empty value fails the first embedding call."
             request_timeout_ms:
               type: integer
               format: uint64
@@ -34867,7 +35006,9 @@ components:
         semantic_embedding_auth_header:
           type: string
           pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+(?![\s\S])'
-          description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key.
+          not:
+            pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss](?![\s\S])'
+          description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key. Must not be the gateway-owned X-Ferrum-Hops proxy hop count (any case, `_` or `-`), which the embedding call carries itself.
         semantic_embedding_auth_scheme:
           type: string
           pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
@@ -36179,16 +36320,43 @@ components:
                 minLength: 1
                 maxLength: 63
                 pattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$'
-                description: "AWS region for Bedrock (e.g. us-east-1). Required for aws_bedrock unless AWS_DEFAULT_REGION/AWS_REGION env var is set."
+                description: "AWS region for Bedrock (e.g. us-east-1). Required for aws_bedrock unless AWS_DEFAULT_REGION/AWS_REGION env var is set. The default endpoint is partition-aware: cn-* regions derive bedrock-runtime.<region>.amazonaws.com.cn and every other region derives bedrock-runtime.<region>.amazonaws.com. When the key id or secret resolves from the process environment, the region must be a lowercase commercial, GovCloud, or China region (see allow_custom_endpoint_with_ambient_credentials)."
               aws_access_key_id:
                 type: string
-                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var."
+                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
               aws_secret_access_key:
                 type: string
-                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var."
+                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
               aws_session_token:
                 type: string
-                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var."
+                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. A process-environment token may only be sent to an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+              allow_custom_endpoint_with_ambient_credentials:
+                type: boolean
+                default: false
+                description: >-
+                  aws_bedrock only. When aws_access_key_id or
+                  aws_secret_access_key is omitted here and resolves from the
+                  gateway process environment (AWS_SESSION_TOKEN is then used
+                  too; it never completes a config key pair), the region must
+                  be a lowercase commercial, GovCloud, or China region, and the
+                  provider endpoint (base_url, or the host derived from
+                  aws_region) must be an official Amazon Bedrock Runtime
+                  endpoint for that region over HTTPS on the default port:
+                  bedrock-runtime[-fips].<region>.amazonaws.com,
+                  bedrock-runtime[-fips].<region>.api.aws, or an interface VPC
+                  endpoint
+                  vpce-<id>[-<az>].bedrock-runtime[-fips].<region>.vpce.amazonaws.com,
+                  where <region> is a commercial or GovCloud region; a cn-*
+                  region uses amazonaws.com.cn and the dual-stack
+                  api.amazonwebservices.com.cn instead. Anything else is
+                  refused at configuration admission, and every provider call
+                  re-checks the rendered endpoint fail closed. Credentials
+                  written into the provider config are not scoped. Set true
+                  only to deliberately sign requests for a private endpoint
+                  (for example LocalStack), an air-gapped ISO partition, or the
+                  AWS European Sovereign Cloud with the process credentials;
+                  anyone who can write this plugin config can then direct those
+                  credentials to that endpoint.
               circuit_breaker:
                 type: object
                 additionalProperties: false
@@ -36379,7 +36547,7 @@ components:
               api_key:
                 type: string
                 minLength: 1
-                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
+                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a whole-value ${FERRUM_PLUGIN_SECRET_<NAME>} reference resolved from the process environment at construction; a ${...} reference to any other variable, including every other FERRUM_* setting, is refused at admission with a 400. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
               model_patterns:
                 type: array
                 minItems: 1
@@ -36834,7 +37002,13 @@ components:
               format: uint64
               default: 16384
               minimum: 1
-              description: Maximum downstream MCP sessions retained by this plugin instance; oldest sessions are evicted when the cap is reached.
+              description: Maximum downstream MCP sessions retained by this plugin instance. When full, only an expired session or one owned by the principal opening a replacement may be removed; otherwise initialization is refused.
+            max_sessions_per_principal:
+              type: [integer, "null"]
+              format: uint64
+              default: 128
+              minimum: 1
+              description: Maximum live downstream MCP sessions owned by one authenticated principal (or by unauthenticated requests as one shared principal). At this cap, the principal's own oldest session is evicted.
             sse_multiplexing:
               type: [boolean, "null"]
               default: false
@@ -37849,7 +38023,7 @@ components:
         `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`; ClickHouse
         URL egress IP screening; whitespace-only trimming for `currency` /
         `pricing_version` / `password_ref`; that a nonempty `password_ref` *is
-        spelled* `FERRUM_*`; and UTF-8 byte bounds where `maxLength` above
+        spelled* `FERRUM_PLUGIN_SECRET_<NAME>`; and UTF-8 byte bounds where `maxLength` above
         counts characters instead.
 
         Activation (serving startup) adds the checks that require local files,
@@ -37974,6 +38148,7 @@ components:
                       password_ref:
                         type: string
                         minLength: 1
+                        maxLength: 256
                         pattern: '\S'
               - anyOf:
                   - required: [clickhouse]
@@ -38138,12 +38313,16 @@ components:
               description: Optional ClickHouse HTTP Basic username. `null` is accepted and means unset.
             password_ref:
               type: [string, "null"]
-              pattern: '^\s*(?:FERRUM_.*)?\s*$'
+              maxLength: 256
+              pattern: '^\s*(?:(?!\S*_(?:FILE|VAULT|AWS|AZURE|GCP)\s*$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*)?\s*$'
               description: |
-                FERRUM_* environment variable containing the ClickHouse password,
-                often materialized at startup from an existing `_FILE`, `_VAULT`,
-                `_AWS`, `_AZURE`, or `_GCP` secret suffix. Empty values are treated
-                as unset. Because the password is sent via HTTP Basic auth,
+                Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable
+                containing the ClickHouse password (`<NAME>` uppercase
+                `[A-Z_][A-Z0-9_]*`), often materialized at startup from a
+                `FERRUM_PLUGIN_SECRET_<NAME>_FILE`, `_VAULT`, `_AWS`, `_AZURE`,
+                or `_GCP` secret suffix. Any other process environment
+                variable, including every other `FERRUM_*` setting, is refused
+                at admission. Empty values are treated as unset. Because the password is sent via HTTP Basic auth,
                 `clickhouse.url` must use `https://` and TLS certificate/hostname
                 verification must stay enabled when this is nonempty after
                 trimming. Empty or whitespace-only values are treated as unset.

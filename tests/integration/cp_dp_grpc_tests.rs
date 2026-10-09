@@ -3711,6 +3711,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
@@ -6257,8 +6258,10 @@ fn native_prefill(
         Rejection::NamespaceStreams => admission
             .reserve_native_stream("ferrum", "other", "other")
             .unwrap(),
+        // The per-principal budget is keyed by (namespace, subject), so the
+        // prefill must hold the same subject in the caller's namespace.
         Rejection::PrincipalStreams => admission
-            .reserve_native_stream("other", "native-node", "other")
+            .reserve_native_stream("ferrum", "native-node", "other")
             .unwrap(),
         Rejection::NodeStreams => admission
             .reserve_native_stream("ferrum", "native-node", "native-node")
@@ -6304,6 +6307,16 @@ async fn native_rpcs_enforce_every_layer_before_snapshot_or_stream_allocation() 
             assert_eq!(harness.mesh_tx.receiver_count(), 0);
             assert!(harness.dp_registry.is_empty());
             assert!(harness.mesh_registry.is_empty());
+            if rejection == Rejection::PrincipalStreams {
+                // The same subject in another namespace is a different
+                // principal and must not draw on the saturated budget.
+                let other_namespace = harness
+                    .admission
+                    .reserve_native_stream("other", "native-node", "other")
+                    .expect("a subject's principal budget must be scoped to its namespace");
+                drop(other_namespace);
+                wait_for_shared_active_streams(&harness.admission, 1).await;
+            }
             drop(held);
             wait_for_shared_active_streams(&harness.admission, 0).await;
         }
@@ -7609,6 +7622,24 @@ mod configsync_identity_binding {
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.snapshot()[0].connected_at, connected_at);
 
+        let oversized_node_id = "x".repeat(16_384);
+        let mut unauthenticated = tonic::Request::new(SubscribeRequest {
+            node_id: oversized_node_id.clone(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
+            namespace: oversized_node_id.clone(),
+            real_ip_header: Some(String::new()),
+            backend_egress_policy: None,
+        });
+        unauthenticated
+            .metadata_mut()
+            .insert("authorization", "Bearer invalid-token".parse().unwrap());
+        let status = match server.subscribe(unauthenticated).await {
+            Ok(_) => panic!("invalid credentials must be refused"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
         let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
         let failure = captured
             .lines()
@@ -7620,6 +7651,17 @@ mod configsync_identity_binding {
         assert!(failure.contains("namespace=\"ferrum\""));
         assert!(failure.contains("node_id does not match authenticated subject"));
         assert!(!failure.contains("victim-dp"));
+        // A non-JWS bearer fails header parsing; either fixed verifier reason
+        // is acceptable, but the audit must keep one rather than "request refused".
+        let bounded_rejection = captured
+            .lines()
+            .find(|line| {
+                line.contains("Invalid token: authentication failed")
+                    || line.contains("Invalid token: malformed JWS header")
+            })
+            .expect("bad-token audit should keep the fixed rejection reason");
+        assert!(bounded_rejection.len() < 2_048);
+        assert!(!bounded_rejection.contains(&"x".repeat(1_000)));
 
         drop(stream);
         assert!(registry.is_empty());

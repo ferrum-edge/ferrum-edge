@@ -1280,6 +1280,10 @@ impl Plugin for OpenapiValidator {
         HTTP_ONLY_PROTOCOLS
     }
 
+    fn gates_request_admission(&self) -> bool {
+        self.mode == EnforcementMode::Block
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

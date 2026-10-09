@@ -1,0 +1,522 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index c04742d..e541cf1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -162,3 +162,9 @@ impl<T, F: FnMut(&mut Context<'_>) -> Poll<T>> Future for PollFn<F> {
+         (self.0)(cx)
+     }
+ }
++
++/// Temporary hosted-only numeric live guard snapshot; absent from shipping h2.
++#[doc(hidden)]
++pub fn ferrum_guard_snapshot() -> String {
++    proto::guard_snapshot()
++}
+diff --git a/src/proto/mod.rs b/src/proto/mod.rs
+index 5e3b4f4..cf7d80f 100644
+--- a/src/proto/mod.rs
++++ b/src/proto/mod.rs
+@@ -10,6 +10,7 @@ pub(crate) use self::connection::{Config, Connection, DataFrameBudget};
+ pub use self::error::{Error, Initiator};
+ pub(crate) use self::peer::{Dyn as DynPeer, Peer};
+ pub(crate) use self::ping_pong::UserPings;
++pub(crate) use self::streams::guard_snapshot;
+ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
+ pub(crate) use self::streams::{Open, PollReset, Prioritized};
+ 
+diff --git a/src/proto/streams/counts.rs b/src/proto/streams/counts.rs
+index f74aa14..bcaa7b6 100644
+--- a/src/proto/streams/counts.rs
++++ b/src/proto/streams/counts.rs
+@@ -31,7 +31,6 @@ impl Budget {
+         self.max = max;
+     }
+ 
+-    #[cfg(test)]
+     fn available(&self) -> usize {
+         self.max.saturating_sub(self.spent)
+     }
+@@ -43,6 +42,8 @@ pub(super) struct Counts {
+     /// inc / dec.
+     peer: peer::Dyn,
+ 
++    pub(super) observation: Option<super::guard_observe::Observation>,
++
+     /// Maximum number of locally initiated streams
+     max_send_streams: usize,
+ 
+@@ -91,7 +92,11 @@ pub(super) struct Counts {
+ impl Counts {
+     /// Create a new `Counts` using the provided configuration values.
+     pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+-        Counts {
++        let mut counts = Counts {
++            observation: super::guard_observe::Observation::new(
++                peer.is_server(),
++                config.data_frame_budget.resolve(None),
++            ),
+             peer,
+             max_send_streams: config.initial_max_send_streams,
+             num_send_streams: 0,
+@@ -106,6 +111,30 @@ impl Counts {
+             data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
+             data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
+             num_recv_empty_data_frames: 0,
++        };
++        counts.guard_emit(0, 0, 0);
++        counts
++    }
++
++    pub(super) fn guard_state(&self) -> [usize; 7] {
++        [
++            self.data_frame_budget.max,
++            self.data_frame_budget.available(),
++            self.num_recv_empty_data_frames,
++            self.num_send_streams,
++            self.num_recv_streams,
++            self.num_local_error_reset_streams,
++            self.num_remote_reset_streams,
++        ]
++    }
++
++    pub(super) fn guard_emit(&mut self, event: u8, branch: u8, reason: u32) {
++        let state = self.guard_state();
++        if let Some(observation) = &mut self.observation {
++            if event == 1 && matches!(branch, 1 | 2) {
++                observation.trigger_stream = observation.last_stream;
++            }
++            observation.emit(event, branch, reason, state);
+         }
+     }
+ 
+@@ -140,10 +169,14 @@ impl Counts {
+     /// Releases the framing overhead of a DATA frame that is no longer
+     /// buffered internally.
+     pub fn release_data_frame(&mut self, payload_len: usize) {
++        let before = self.data_frame_budget.available();
+         if payload_len != 0 && payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
+             self.data_frame_budget
+                 .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len);
+         }
++        if let Some(observation) = &mut self.observation {
++            observation.inc(13, (self.data_frame_budget.available() - before) as u64);
++        }
+     }
+ 
+     /// Returns true when the next opened stream will reach capacity of outbound streams
+diff --git a/src/proto/streams/mod.rs b/src/proto/streams/mod.rs
+index 8db59ab..4e06bfd 100644
+--- a/src/proto/streams/mod.rs
++++ b/src/proto/streams/mod.rs
+@@ -1,6 +1,7 @@
+ mod buffer;
+ mod counts;
+ mod flow_control;
++mod guard_observe;
+ mod prioritize;
+ mod recv;
+ mod send;
+@@ -13,6 +14,7 @@ mod streams;
+ pub(crate) use self::prioritize::Prioritized;
+ pub(crate) use self::recv::Open;
+ pub(crate) use self::send::PollReset;
++pub(crate) use self::streams::guard_snapshot;
+ pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
+ 
+ use self::buffer::Buffer;
+diff --git a/src/proto/streams/recv.rs b/src/proto/streams/recv.rs
+index bf4d53d..84d60cb 100644
+--- a/src/proto/streams/recv.rs
++++ b/src/proto/streams/recv.rs
+@@ -113,6 +113,12 @@ impl Recv {
+         }
+     }
+ 
++    pub(super) fn guard_window(&self, observation: &mut super::guard_observe::Observation) {
++        observation.wire_window = self.flow.window_size();
++        observation.byte_available = self.flow.available().into();
++        observation.in_flight = self.in_flight_data;
++    }
++
+     /// Returns the initial receive window size
+     pub fn init_window_sz(&self) -> WindowSize {
+         self.init_window_sz
+@@ -914,6 +920,11 @@ impl Recv {
+                     "recv_reset; remotely-reset pending-accept streams reached limit ({:?})",
+                     counts.max_remote_reset_streams(),
+                 );
++                if let Some(observation) = &mut counts.observation {
++                    observation.trigger_stream = stream.id.into();
++                    self.guard_window(observation);
++                }
++                counts.guard_emit(1, 5, 11);
+                 return Err(Error::library_go_away_data(
+                     Reason::ENHANCE_YOUR_CALM,
+                     "too_many_resets",
+@@ -963,9 +974,17 @@ impl Recv {
+         let mut to_release: WindowSize = 0;
+         while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
+             if let Event::Data(data) = &event {
++                let before = counts.guard_state()[1];
+                 if data.is_budgeted {
++                    if let Some(observation) = &mut counts.observation { observation.inc(12, 1); }
+                     counts.release_data_frame(data.payload.len());
+                 }
++                let after = counts.guard_state()[1];
++                if let Some(observation) = &mut counts.observation {
++                    self.guard_window(observation);
++                    observation.transition(3, [u32::from(stream.id) as u64, data.payload.len() as u64,
++                        0, u64::from(!data.is_budgeted), 0], [before, after], u8::from(data.is_budgeted));
++                }
+                 to_release = to_release
+                     .saturating_add(data.payload.len() as WindowSize)
+                     .min(stream.in_flight_recv_data);
+@@ -979,6 +998,11 @@ impl Recv {
+             stream.in_flight_recv_data -= to_release;
+             self.release_connection_capacity(to_release, task);
+         }
++        let credit = counts.guard_state()[1];
++        if let Some(observation) = &mut counts.observation {
++            self.guard_window(observation);
++            observation.window_transition(7, credit);
++        }
+     }
+ 
+     /// Get the max ID of streams we can receive.
+diff --git a/src/proto/streams/streams.rs b/src/proto/streams/streams.rs
+index 7776c70..d4e143b 100644
+--- a/src/proto/streams/streams.rs
++++ b/src/proto/streams/streams.rs
+@@ -12,9 +12,77 @@ use http::{HeaderMap, Request, Response};
+ use std::task::{Context, Poll, Waker};
+ use tokio::io::AsyncWrite;
+ 
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, Weak};
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::{fmt, io};
+ 
++// Temporary diagnostic registry: weak handles only, never a connection owner.
++static REGISTRY: Mutex<Vec<Weak<Mutex<Inner>>>> = Mutex::new(Vec::new());
++static REGISTRY_VERSION: AtomicU64 = AtomicU64::new(0);
++static REGISTRY_LOSS: AtomicU64 = AtomicU64::new(0);
++static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
++static GENERATION: AtomicU64 = AtomicU64::new(0);
++
++pub(crate) fn guard_snapshot() -> String {
++    use super::guard_observe::{update, MEMORY_OVERFLOW, SEQUENCE, TARGET};
++    if !tracing::enabled!(target: TARGET, tracing::Level::DEBUG) {
++        return "# H2_GUARD_ACK_V2 ack=0\n".into();
++    }
++    let _serial = match SNAPSHOT_LOCK.try_lock() {
++        Ok(guard) => guard,
++        Err(_) => return "# H2_GUARD_ACK_V2 ack=0\n".into(),
++    };
++    // Five calls cover smoke + before/after both gRPC sizes. Sixteen is a
++    // bounded diagnostic request allowance, not a transport retry budget.
++    let previous = match update(&GENERATION,
++        |n| (n < 16).then_some(n + 1)) {
++        Ok(previous) => previous,
++        Err(_) => return "# H2_GUARD_ACK_V2 ack=0\n".into(),
++    };
++    let generation = previous + 1;
++    let version = REGISTRY_VERSION.load(Ordering::Relaxed);
++    let registry = match REGISTRY.try_lock() {
++        Ok(registry) => registry,
++        Err(_) => return "# H2_GUARD_ACK_V2 ack=0\n".into(),
++    };
++    let handles = registry.clone();
++    drop(registry); // Never acquire Inner while holding the registry lock.
++    let mut captured = 0;
++    let mut retired = 0;
++    let mut missed = 0;
++    for weak in &handles {
++        let inner = match weak.upgrade() {
++            Some(inner) => inner,
++            None => { retired += 1; continue; }
++        };
++        let snapshot = if let Ok(mut guard) = inner.try_lock() {
++            let me = &mut *guard;
++            let state = me.counts.guard_state();
++            me.counts.observation.as_mut().map(|observation| {
++                me.actions.recv.guard_window(observation);
++                (observation.clone(), state)
++            })
++        } else { None };
++        // Formatting and tracing are outside Inner; only one bounded clone
++        // exists at a time. No retries, wait loop, thread or task is created.
++        if let Some((mut observation, state)) = snapshot {
++            observation.emit_generation(3, 0, 0, state, generation);
++            captured += 1;
++        } else { missed += 1; }
++    }
++    let changed = u8::from(version != REGISTRY_VERSION.load(Ordering::Relaxed));
++    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
++    let loss = REGISTRY_LOSS.load(Ordering::Relaxed);
++    let memory = MEMORY_OVERFLOW.load(Ordering::Relaxed);
++    let suppressed = super::guard_observe::suppressed();
++    // This fence is also returned over HTTP, independently of the log sink.
++    // closed=0: a boundary prefix, never a claim of process shutdown/closure.
++    let fields = format!("seq={} generation={} registered={} captured={} retired={} missed={} changed={} registry_loss={} memory_overflow={} suppressed={} closed=0 ack=1",
++        seq, generation, handles.len(), captured, retired, missed, changed, loss, memory, suppressed);
++    tracing::debug!(target: TARGET, parent: None, "H2_GUARD_FENCE_V2 {}", fields);
++    format!("# H2_GUARD_ACK_V2 {}\n", fields)
++}
++
+ #[derive(Debug)]
+ pub(crate) struct Streams<B, P>
+ where
+@@ -136,6 +204,12 @@ where
+             .recv
+             .set_target_connection_window(size, &mut me.actions.task)?;
+         me.counts.set_target_connection_window_size(size);
++        let credit = me.counts.guard_state()[1];
++        if let Some(observation) = &mut me.counts.observation {
++            observation.target(size);
++            me.actions.recv.guard_window(observation);
++            observation.window_transition(4, credit);
++        }
+         Ok(())
+     }
+ 
+@@ -181,6 +255,8 @@ where
+     pub fn clear_expired_reset_streams(&mut self) {
+         let mut me = self.inner.lock().unwrap();
+         let me = &mut *me;
++        let credit = me.counts.guard_state()[1];
++        if let Some(observation) = &mut me.counts.observation { observation.poll_epoch(credit); }
+         me.actions
+             .recv
+             .clear_expired_reset_streams(&mut me.store, &mut me.counts);
+@@ -200,7 +276,18 @@ where
+ 
+             let status = {
+                 let mut me = self.inner.lock().unwrap();
+-                let status = me.buffer_pending(&self.send_buffer, dst)?;
++                let status = me.buffer_pending(&self.send_buffer, dst);
++                let me = &mut *me;
++                let credit = me.counts.guard_state()[1];
++                if let Some(observation) = &mut me.counts.observation {
++                    let before = (observation.wire_window, observation.byte_available, observation.in_flight);
++                    me.actions.recv.guard_window(observation);
++                    if before != (observation.wire_window, observation.byte_available, observation.in_flight) {
++                        observation.window_transition(8, credit);
++                    }
++                }
++
++                let status = status?;
+ 
+                 // Register the task while holding the same lock used to
+                 // observe that all pending frames have been buffered. A
+@@ -263,7 +350,18 @@ where
+         let mut me = self.inner.lock().unwrap();
+         let me = &mut *me;
+ 
+-        me.actions.recv.apply_local_settings(frame, &mut me.store)
++        let result = me.actions.recv.apply_local_settings(frame, &mut me.store);
++        let credit = me.counts.guard_state()[1];
++        if result.is_ok() {
++            if let (Some(observation), Some(size)) =
++                (&mut me.counts.observation, frame.initial_window_size())
++            {
++                observation.stream_window(size);
++                me.actions.recv.guard_window(observation);
++                observation.window_transition(5, credit);
++            }
++        }
++        result
+     }
+ 
+     pub fn send_request(
+@@ -401,7 +499,16 @@ impl<B> DynStreams<'_, B> {
+ 
+     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
+         let mut me = self.inner.lock().unwrap();
+-        me.recv_data(self.peer, self.send_buffer, frame)
++        let before = me.counts.guard_state()[1];
++        let result = me.recv_data(self.peer, self.send_buffer, frame);
++        let me = &mut *me;
++        if let Some(observation) = &mut me.counts.observation {
++            if observation.disposition == 6 {
++                me.actions.recv.guard_window(observation);
++                observation.data_transition(before, before, 0);
++            }
++        }
++        result
+     }
+ 
+     pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
+@@ -456,10 +563,22 @@ impl<B> DynStreams<'_, B> {
+     }
+ }
+ 
++impl Drop for Inner {
++    fn drop(&mut self) {
++        if let Some(observation) = &mut self.counts.observation {
++            REGISTRY_VERSION.fetch_add(1, Ordering::Relaxed);
++            self.actions.recv.guard_window(observation);
++        }
++        self.counts.guard_emit(2, 0, 0);
++    }
++}
++
+ impl Inner {
+     fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
+-        Arc::new(Mutex::new(Inner {
+-            counts: Counts::new(peer, &config),
++        let counts = Counts::new(peer, &config);
++        let observed = counts.observation.is_some();
++        let inner = Arc::new(Mutex::new(Inner {
++            counts,
+             actions: Actions {
+                 recv: Recv::new(peer, &config),
+                 send: Send::new(&config),
+@@ -468,7 +587,17 @@ impl Inner {
+             },
+             store: Store::new(),
+             refs: 1,
+-        }))
++        }));
++        if observed {
++            if let Ok(mut registry) = REGISTRY.try_lock() {
++                registry.retain(|weak| weak.strong_count() != 0);
++                if registry.len() < super::guard_observe::SLOTS {
++                    registry.push(Arc::downgrade(&inner));
++                } else { REGISTRY_LOSS.fetch_add(1, Ordering::Relaxed); }
++            } else { REGISTRY_LOSS.fetch_add(1, Ordering::Relaxed); }
++            REGISTRY_VERSION.fetch_add(1, Ordering::Relaxed);
++        }
++        inner
+     }
+ 
+     fn recv_headers<B>(
+@@ -610,10 +739,17 @@ impl Inner {
+         frame: frame::Data,
+     ) -> Result<(), Error> {
+         let id = frame.stream_id();
++        if let Some(observation) = &mut self.counts.observation {
++            observation.frame(id.into(), frame.payload().len(), frame.flow_controlled_len(), frame.is_end_stream());
++            self.actions.recv.guard_window(observation);
++        }
+ 
+         let stream = match self.store.find_mut(&id) {
+             Some(stream) => stream,
+             None => {
++                if let Some(observation) = &mut self.counts.observation {
++                    observation.disposition(6);
++                }
+                 // The GOAWAY process has begun. All streams with a greater ID
+                 // than specified as part of GOAWAY should be ignored.
+                 if id > self.actions.recv.max_stream_id() {
+@@ -656,14 +792,31 @@ impl Inner {
+             let sz = frame.flow_controlled_len();
+             let is_end_stream = frame.is_end_stream();
+             let payload_len = frame.payload().len();
++            let disposition = if stream.state.is_local_error() { 2 }
++                else if !stream.is_recv { 3 }
++                else if payload_len == 0 && !is_end_stream { 4 }
++                else { 1 };
+             let mut res = actions.recv.recv_data(frame, stream);
++            if let Some(observation) = &mut counts.observation {
++                observation.disposition(if res.is_ok() { disposition } else { 5 });
++                actions.recv.guard_window(observation);
++            }
+             // A stream can receive at most one final DATA frame, so it cannot
+             // be used to create unbounded framing overhead on that stream.
++            let before = counts.guard_state()[1];
+             if res.is_ok() && !is_end_stream {
+-                res = counts.record_data_frame(payload_len).map_err(|_| {
++                let consumed = counts.record_data_frame(payload_len);
++                let after = counts.guard_state()[1];
++                if let Some(observation) = &mut counts.observation {
++                    observation.data_transition(before, after, if consumed.is_ok() { 1 } else { 2 });
++                }
++                res = consumed.map_err(|_| {
++                    counts.guard_emit(1, if payload_len == 0 { 2 } else { 1 }, 11);
+                     tracing::debug!("too many small DATA frames");
+                     Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+                 });
++            } else if let Some(observation) = &mut counts.observation {
++                observation.data_transition(before, before, 0);
+             }
+ 
+             // Any stream error after receiving a DATA frame means
+@@ -673,6 +826,11 @@ impl Inner {
+                 actions
+                     .recv
+                     .release_connection_capacity(sz as WindowSize, &mut None);
++                let credit = counts.guard_state()[1];
++                if let Some(observation) = &mut counts.observation {
++                    actions.recv.guard_window(observation);
++                    observation.window_transition(7, credit);
++                }
+             }
+             actions.reset_on_recv_stream_err_deferred(send_buffer, stream, counts, res)
+         })
+@@ -1546,9 +1704,17 @@ impl OpaqueStreamRef {
+             .poll_data(cx, &mut stream)
+             .map(|result| match result {
+                 Some(Ok(data)) => {
++                    let before = me.counts.guard_state()[1];
+                     if data.is_budgeted {
++                        if let Some(observation) = &mut me.counts.observation { observation.inc(11, 1); }
+                         me.counts.release_data_frame(data.payload.len());
+                     }
++                    let after = me.counts.guard_state()[1];
++                    if let Some(observation) = &mut me.counts.observation {
++                        me.actions.recv.guard_window(observation);
++                        observation.transition(2, [u32::from(stream.id) as u64, data.payload.len() as u64,
++                            0, u64::from(!data.is_budgeted), 0], [before, after], u8::from(data.is_budgeted));
++                    }
+                     Some(Ok(data.payload))
+                 }
+                 Some(Err(err)) => Some(Err(err)),
+@@ -1589,9 +1755,13 @@ impl OpaqueStreamRef {
+ 
+         let mut stream = me.store.resolve(self.key);
+ 
+-        me.actions
+-            .recv
+-            .release_capacity(capacity, &mut stream, &mut me.actions.task)
++        let result = me.actions.recv.release_capacity(capacity, &mut stream, &mut me.actions.task);
++        let credit = me.counts.guard_state()[1];
++        if let Some(observation) = &mut me.counts.observation {
++            me.actions.recv.guard_window(observation);
++            observation.window_transition(7, credit);
++        }
++        result
+     }
+ 
+     /// Clear the receive queue and set the status to no longer receive data frames.
+@@ -1766,6 +1936,11 @@ impl Actions {
+                         "locally-reset streams reached limit ({:?})",
+                         counts.max_local_error_resets().unwrap(),
+                     );
++                    if let Some(observation) = &mut counts.observation {
++                        observation.trigger_stream = stream.id.into();
++                        self.recv.guard_window(observation);
++                    }
++                    counts.guard_emit(1, 3, 11);
+                     return Err(crate::proto::error::GoAway {
+                         reason: Reason::ENHANCE_YOUR_CALM,
+                         debug_data: "too_many_internal_resets".into(),
+@@ -1829,6 +2004,11 @@ impl Actions {
+                     "reset_on_recv_stream_err; locally-reset streams reached limit ({:?})",
+                     counts.max_local_error_resets().unwrap(),
+                 );
++                if let Some(observation) = &mut counts.observation {
++                    observation.trigger_stream = stream.id.into();
++                    self.recv.guard_window(observation);
++                }
++                counts.guard_emit(1, 4, 11);
+                 Err(Error::library_go_away_data(
+                     Reason::ENHANCE_YOUR_CALM,
+                     "too_many_internal_resets",
+@@ -1880,3 +2060,7 @@ impl Actions {
+         self.send.clear_queues(store, counts);
+     }
+ }
++
++#[cfg(test)]
++#[path = "guard_tests.rs"]
++mod guard_observation_tests;

@@ -27,12 +27,14 @@ use crate::config::db_backend::{
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::policy_graph_scope::{PolicyGraphScope, requires_full_policy_graph};
 use crate::config::runtime_config_apply::LiveApplyMode;
 use crate::config::types::{
     Consumer, GatewayConfig, PlaceholderRendering, PluginConfig, PluginScope, Proxy,
     RedactionRendering, Upstream, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+use crate::tls::source::{MaterialKind, check_namespace_scoped_material_reference};
 
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
@@ -1909,45 +1911,158 @@ pub(crate) async fn validate_plugin_graph_candidates(
     plugins: &[PluginConfig],
     removed_plugin_id: Option<&str>,
 ) -> Result<(), AfterValidateError> {
+    let candidate =
+        plugin_graph_admission_candidate(db, namespace, proxies, plugins, removed_plugin_id)
+            .await
+            .map_err(AfterValidateError::Db)?;
+    let http_client = super::plugin_validation_http_client(state);
+    validate_candidate_plugin_graph(&candidate, &http_client)
+}
+
+/// The post-write policy graph a plugin-graph admission validates.
+///
+/// Composition invariants are per proxy apart from a few namespace-wide plugin
+/// types, so a write that only touches some proxies' chains is validated
+/// against the neighborhood [`PolicyGraphScope`] names: those proxies, their
+/// plugin configs, every global, and every namespace-wide instance. Loading
+/// and revalidating the whole namespace for every write made one `POST /batch`
+/// cost O(namespace) and bulk onboarding O(N²) (issue #6056).
+///
+/// The full graph is still used when the write submits, replaces, or removes a
+/// global plugin config (a global joins every chain), or when the candidate
+/// holds a policy only the whole namespace can decide
+/// ([`requires_full_policy_graph`]).
+pub(crate) async fn plugin_graph_admission_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxies: &[Proxy],
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> DbResult<GatewayConfig> {
     // Global plugin scope is global within one runtime namespace. CP snapshots
     // are filtered before broadcast and file/database modes load one namespace,
     // so cross-namespace plugins must never create false admission conflicts.
-    let mut candidate = db
-        .load_namespace_policy_graph(namespace)
-        .await
-        .map_err(AfterValidateError::Db)?;
+    if let Some(scope) = PolicyGraphScope::for_write(proxies, plugins, removed_plugin_id) {
+        let neighborhood = db
+            .load_namespace_policy_neighborhood(namespace, &scope)
+            .await?;
+        // The neighborhood carries every global, so a write replacing or
+        // removing a config that is global today is visible here.
+        let changes_existing_global = neighborhood.plugin_configs.iter().any(|plugin| {
+            plugin.scope == PluginScope::Global
+                && scope.changed_plugin_config_ids.contains(&plugin.id)
+        });
+        if !changes_existing_global {
+            let candidate = overlay_plugin_graph_write(
+                neighborhood,
+                namespace,
+                proxies,
+                plugins,
+                removed_plugin_id,
+            );
+            if !requires_full_policy_graph(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    let graph = db.load_namespace_policy_graph(namespace).await?;
+    Ok(overlay_plugin_graph_write(
+        graph,
+        namespace,
+        proxies,
+        plugins,
+        removed_plugin_id,
+    ))
+}
 
+/// Apply a Proxy/PluginConfig write to a loaded policy graph exactly as
+/// persistence will: submitted rows replace same-id rows or are appended, a
+/// removed config disappears, and a proxy-scoped config is attached to its
+/// `proxy_id` (persistence inserts that association in the same transaction,
+/// issue #4611). Overlays are id-indexed so a large write stays linear.
+fn overlay_plugin_graph_write(
+    mut candidate: GatewayConfig,
+    namespace: &str,
+    proxies: &[Proxy],
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> GatewayConfig {
     if let Some(removed_plugin_id) = removed_plugin_id {
         candidate
             .plugin_configs
             .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
     }
+    // Only same-namespace rows replace by id; a row from another namespace is
+    // appended, never mistaken for this namespace's same-id resource.
+    let (in_namespace, foreign): (Vec<&Proxy>, Vec<&Proxy>) = proxies
+        .iter()
+        .partition(|proxy| proxy.namespace == namespace);
+    overlay_resources_by_id(&mut candidate.proxies, in_namespace, |proxy| {
+        proxy.id.as_str()
+    });
+    candidate.proxies.extend(foreign.into_iter().cloned());
+    let (in_namespace, foreign): (Vec<&PluginConfig>, Vec<&PluginConfig>) = plugins
+        .iter()
+        .partition(|plugin| plugin.namespace == namespace);
+    overlay_resources_by_id(&mut candidate.plugin_configs, in_namespace, |plugin| {
+        plugin.id.as_str()
+    });
+    candidate
+        .plugin_configs
+        .extend(foreign.into_iter().cloned());
 
-    for proxy in proxies {
-        if let Some(existing) = candidate
-            .proxies
-            .iter_mut()
-            .find(|item| item.namespace == namespace && item.id == proxy.id)
-        {
-            *existing = proxy.clone();
-        } else {
-            candidate.proxies.push(proxy.clone());
-        }
-    }
+    let proxy_index: std::collections::HashMap<String, usize> = candidate
+        .proxies
+        .iter()
+        .enumerate()
+        .map(|(index, proxy)| (proxy.id.clone(), index))
+        .collect();
     for plugin in plugins {
-        if let Some(existing) = candidate
-            .plugin_configs
-            .iter_mut()
-            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        if plugin.namespace != namespace || plugin.scope != PluginScope::Proxy {
+            continue;
+        }
+        let Some(&index) = plugin
+            .proxy_id
+            .as_deref()
+            .and_then(|proxy_id| proxy_index.get(proxy_id))
+        else {
+            continue;
+        };
+        let proxy = &mut candidate.proxies[index];
+        if !proxy
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == plugin.id)
         {
-            *existing = plugin.clone();
-        } else {
-            candidate.plugin_configs.push(plugin.clone());
+            proxy.plugins.push(crate::config::types::PluginAssociation {
+                plugin_config_id: plugin.id.clone(),
+            });
         }
     }
+    candidate
+}
 
-    let http_client = super::plugin_validation_http_client(state);
-    validate_candidate_plugin_graph(&candidate, &http_client)
+/// Replace each same-id resource in `existing` with its `incoming` version, or
+/// append it, in O(existing + incoming).
+pub(crate) fn overlay_resources_by_id<'a, T: Clone + 'a>(
+    existing: &mut Vec<T>,
+    incoming: impl IntoIterator<Item = &'a T>,
+    id: impl Fn(&T) -> &str,
+) {
+    let mut index: std::collections::HashMap<String, usize> = existing
+        .iter()
+        .enumerate()
+        .map(|(position, item)| (id(item).to_string(), position))
+        .collect();
+    for item in incoming {
+        match index.get(id(item)) {
+            Some(&position) => existing[position] = item.clone(),
+            None => {
+                index.insert(id(item).to_string(), existing.len());
+                existing.push(item.clone());
+            }
+        }
+    }
 }
 
 /// Validate the exact graph produced by deleting a Proxy, including the
@@ -2466,6 +2581,12 @@ pub(crate) trait AdminResource:
     /// Default is a no-op.
     fn set_actor(&mut self, _actor: &str) {}
 
+    /// TLS material references this resource asks the gateway to resolve, as
+    /// `(field, value, field kind)`. Default: none.
+    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+        Vec::new()
+    }
+
     /// Re-read the committed record after a successful create/update and use
     /// THAT as both the success response body and the audit after-image.
     ///
@@ -2894,6 +3015,10 @@ pub(crate) async fn handle_get<R: AdminResource>(
         ));
     }
 
+    // Set when the store read failed and the answer comes from the cached
+    // snapshot instead. A miss is then not an authoritative absence: the
+    // resource may have been created after the snapshot (issue #6143).
+    let mut store_read_failed = false;
     if let Some(ref db) = state.db {
         match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
@@ -2920,6 +3045,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                     return Ok(R::map_precheck_db_error(&error));
                 }
                 super::warn_persistence_failure_redacted("admin_resource_get_cached_fallback");
+                store_read_failed = true;
             }
         }
     }
@@ -2933,6 +3059,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 let body = response_body_for_role(resource, role);
                 Ok(super::json_response_with_stale(StatusCode::OK, &body))
             }
+            None if store_read_failed => Ok(super::cached_fallback_miss_response()),
             None => Ok(not_found_response::<R>()),
         }
     } else {
@@ -3679,6 +3806,14 @@ impl AdminResource for Upstream {
 
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
+    }
+
+    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+        backend_tls_material_references(
+            self.backend_tls_client_cert_path.as_deref(),
+            self.backend_tls_client_key_path.as_deref(),
+            self.backend_tls_server_ca_cert_path.as_deref(),
+        )
     }
 
     fn restore_absent_update_fields(
@@ -4650,6 +4785,14 @@ impl AdminResource for Proxy {
 
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
+    }
+
+    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+        backend_tls_material_references(
+            self.backend_tls_client_cert_path.as_deref(),
+            self.backend_tls_client_key_path.as_deref(),
+            self.backend_tls_server_ca_cert_path.as_deref(),
+        )
     }
 
     const RESOURCE_NAME: &'static str = "proxy";
@@ -5655,6 +5798,76 @@ fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
     })
 }
 
+fn backend_tls_material_references<'a>(
+    client_cert_path: Option<&'a str>,
+    client_key_path: Option<&'a str>,
+    server_ca_path: Option<&'a str>,
+) -> Vec<(&'static str, &'a str, MaterialKind)> {
+    let candidates = [
+        (
+            "backend_tls_client_cert_path",
+            client_cert_path,
+            MaterialKind::Cert,
+        ),
+        (
+            "backend_tls_client_key_path",
+            client_key_path,
+            MaterialKind::Key,
+        ),
+        (
+            "backend_tls_server_ca_cert_path",
+            server_ca_path,
+            MaterialKind::CaBundle,
+        ),
+    ];
+    let mut references = Vec::new();
+    for (field, value, kind) in candidates {
+        if let Some(value) = value {
+            references.push((field, value, kind));
+        }
+    }
+    references
+}
+
+/// Refuse a TLS material reference a namespace-scoped operator introduces
+/// when it would have the gateway resolve material outside that namespace.
+///
+/// The gateway (and every data plane that later loads the resource) resolves
+/// these references with its OWN identity, and admission loads them on write.
+/// Where the `ns` claim is an authorization boundary, an `operator` may
+/// therefore name only inline PEM, `system://`, or a `k8s://` Secret in the
+/// addressed namespace. The check never resolves the reference, so its answer
+/// does not depend on whether the material exists. A reference already stored
+/// on the resource is left alone, so an unrelated update does not fail on
+/// material an `admin` configured.
+fn tls_reference_refusal<R: AdminResource>(
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    resource: &R,
+    existing: Option<&R>,
+) -> Option<Response<Full<Bytes>>> {
+    if !state.admin_require_namespace_claim || actor.role == AdminRole::Admin {
+        return None;
+    }
+    let stored = existing
+        .map(|existing| existing.tls_material_references())
+        .unwrap_or_default();
+    for (field, value, kind) in resource.tls_material_references() {
+        if stored.contains(&(field, value, kind)) {
+            continue;
+        }
+        let verdict = check_namespace_scoped_material_reference(value, kind, namespace, &[]);
+        if let Err(refusal) = verdict {
+            return Some(super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("`{field}`: {}", refusal.reason())}),
+            ));
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_write<R: AdminResource>(
     state: &AdminState,
@@ -5804,6 +6017,12 @@ async fn handle_write<R: AdminResource>(
     resource.normalize();
     resource.set_namespace(namespace.to_string());
     resource.set_actor(&actor.sub);
+
+    // Before `validate`, which loads the referenced material.
+    let refusal = tls_reference_refusal(state, actor, namespace, &resource, existing.as_ref());
+    if let Some(response) = refusal {
+        return Ok(response);
+    }
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(validation_error) = resource.validate(&validation_ctx) {

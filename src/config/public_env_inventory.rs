@@ -7,9 +7,10 @@
 //!   free helpers such as `tls_managed_store_path_from_env`)
 //! - public controls resolved outside `EnvConfig` (conf-file bootstrap,
 //!   secret-fetch timeout, mesh/injector/node-agent/pool helpers, PKCS#11,
-//!   dynamically constructed injector resource quantities, and the dynamic
+//!   dynamically constructed injector resource quantities, the dynamic
 //!   `ai_transcript_audit` sink-secret namespace
-//!   [`TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV`])
+//!   [`TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV`], and the dynamic plugin-config
+//!   secret namespace [`PLUGIN_SECRET_EXAMPLE_ENV`])
 //!
 //! [`PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS`] is a small allowlist for accepted
 //! compatibility aliases that intentionally share the canonical setting's
@@ -33,6 +34,21 @@
 /// inventory member and owns the matching `docs/configuration.md` row and
 /// `ferrum.conf` template assignment for the whole namespace.
 pub const TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN";
+
+/// Canonical documented example key for the dynamic
+/// `FERRUM_PLUGIN_SECRET_<NAME>` namespace.
+///
+/// Every plugin-config field that names a process environment variable
+/// (`api_chargeback_sink` `clickhouse.password_ref`, `ai_semantic_firewall`
+/// `provider.api_key_env`, `ai_stream_router` `${...}` API keys,
+/// `workload_metrics` Lightstep `access_token_env`, `proxy_alerts` channel
+/// `*_env` fields, and the `serverless_function` Azure/GCP fallbacks) resolves
+/// ONLY this namespace, where `<NAME>` is any uppercase `[A-Z_][A-Z0-9_]*`
+/// suffix (see `crate::plugins::utils::plugin_secret_env`). The namespace has
+/// no fixed key set; this representative key is its machine-checkable
+/// inventory member and owns the matching `docs/configuration.md` row and
+/// `ferrum.conf` template assignment for the whole namespace.
+pub const PLUGIN_SECRET_EXAMPLE_ENV: &str = "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD";
 
 /// Complete sorted inventory of public operator `FERRUM_*` settings.
 ///
@@ -127,7 +143,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_BLOCKING_THREADS",
     "FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES",
     "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES",
-    "FERRUM_CLICKHOUSE_PASSWORD",
     "FERRUM_COMPRESSION_BROTLI_ENABLED",
     "FERRUM_COMPRESSION_GZIP_ENABLED",
     "FERRUM_CONF_PATH",
@@ -267,10 +282,12 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS",
     "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES",
     "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS",
+    "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP",
     "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS",
     "FERRUM_HTTP3_IDLE_TIMEOUT",
     "FERRUM_HTTP3_INITIAL_MTU",
     "FERRUM_HTTP3_MAX_STREAMS",
+    "FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES",
     "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS",
     "FERRUM_HTTP3_RECEIVE_WINDOW",
     "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY",
@@ -297,6 +314,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_INJECTOR_TLS_KEY_PATH",
     "FERRUM_INJECTOR_TRUST_DOMAIN",
     "FERRUM_IO_URING_SPLICE_ENABLED",
+    "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS",
     "FERRUM_K8S_CLUSTER_DOMAIN",
     "FERRUM_K8S_CONTROLLER_ENABLED",
     "FERRUM_K8S_CONTROLLER_NAMESPACE",
@@ -330,6 +348,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_MAX_GRPC_RECV_SIZE_BYTES",
     "FERRUM_MAX_HEADER_COUNT",
     "FERRUM_MAX_HEADER_SIZE_BYTES",
+    "FERRUM_MAX_PROXY_HOPS",
     "FERRUM_MAX_QUERY_PARAMS",
     "FERRUM_MAX_REQUESTS",
     "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
@@ -433,6 +452,7 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_MESH_STOCK_XDS_TOKEN_WATCH_INTERVAL_SECONDS",
     "FERRUM_MESH_STOCK_XDS_URLS",
     "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS",
+    "FERRUM_MESH_TENANT_TLS_FILE_ROOTS",
     "FERRUM_MESH_TOPOLOGY",
     "FERRUM_MESH_TPROXY_MARK",
     "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS",
@@ -504,12 +524,19 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
     "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
     "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS",
+    "FERRUM_PER_IP_IPV6_PREFIX",
     "FERRUM_PKCS11_MODULE_ALLOWED_PATHS",
     "FERRUM_PKCS11_MODULE_PATH",
     "FERRUM_PKCS11_PIN",
     "FERRUM_PLUGIN_HTTP_MAX_RETRIES",
     "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS",
     "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS",
+    // Representative documented member of the dynamic
+    // `FERRUM_PLUGIN_SECRET_<NAME>` namespace that plugin-config environment
+    // references resolve. Arbitrary valid uppercase `<NAME>` suffixes are
+    // accepted at runtime; this example key is the canonical
+    // inventory/docs/`ferrum.conf` surface for the namespace.
+    PLUGIN_SECRET_EXAMPLE_ENV,
     "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS",
     "FERRUM_POOL_ENABLE_HTTP2",
     "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE",
@@ -656,9 +683,17 @@ pub fn is_recognized_ferrum_setting(key: &str) -> bool {
     if PUBLIC_FERRUM_ENV_SETTINGS.binary_search(&key).is_ok() {
         return true;
     }
-    // Preserve the documented dynamic transcript sink-secret namespace.
+    // Preserve the documented dynamic plugin-secret namespace.
+    if crate::plugins::utils::plugin_secret_env::is_plugin_secret_env_name(key) {
+        return true;
+    }
+    // Preserve the documented dynamic transcript sink-secret namespace, minus
+    // the external secret-source suffixes the startup resolver consumes.
     key.strip_prefix("FERRUM_TRANSCRIPT_SINK_SECRET_")
         .is_some_and(|name| {
+            if crate::plugins::utils::plugin_secret_env::has_external_secret_suffix(name) {
+                return false;
+            }
             let mut bytes = name.bytes();
             bytes
                 .next()

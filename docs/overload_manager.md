@@ -222,7 +222,7 @@ namespace:
 | --- | --- | --- |
 | `bind_failed` | Hard failure | The socket bind/probe failed (e.g. the port is already in use). |
 | `backend_tls_invalid` | Hard failure | Backend TLS config validation failed while starting a new TCP+TLS listener; the listener was not installed. |
-| `backend_tls_rotation_invalid` | Hard failure | In-place backend TLS material rotated to invalid content; the **previous** listener was kept running rather than closing the port. |
+| `backend_tls_rotation_invalid` | Hard failure | In-place backend TLS material rotated to invalid content; the **previous** listener was kept running rather than closing the port. Only when the TLS sources, backend routing, and gateway CRL are all unchanged: a rotation that also changed the CRL tears the listener down and reports `backend_tls_invalid`, so a replaced revocation list is never kept in service. |
 | `frontend_tls_deferred` | Deferral | A `frontend_tls` TCP listener is waiting for its rustls `ServerConfig` to be loaded. Clears once TLS material arrives. |
 | `frontend_dtls_deferred` | Deferral | A `frontend_tls` UDP/DTLS listener is waiting for DTLS cert/key material. Clears once material arrives. |
 | `frontend_dtls_build_failed` | Degradation | A `frontend_tls` UDP/DTLS listener could not build its DTLS config from the configured material; retried on the next reconcile. |

@@ -68,6 +68,6 @@ The current progress implementation is a deliberate fork paired with patches
 on 2026-10-04; it is historical evidence, not a release-adoption prerequisite.
 See [patch 002's retirement plan](002-min-data-frame-capacity/README.md#retirement-plan)
 and [the lifecycle inventory](../vendored-patch-lifecycle.json). The receiver's
-adaptive DATA-frame budget fix is separate
-[h2 patch 002](../upstream-h2-patches/002-runtime-data-frame-budget/README.md),
-whose [h2 #965](https://github.com/hyperium/h2/pull/965) is open as of 2026-10-04.
+adaptive DATA-frame budget fix shipped upstream as
+[h2 #965](https://github.com/hyperium/h2/pull/965) in h2 0.4.20 (formerly
+Ferrum h2 patch 002, retired when Ferrum adopted 0.4.20).

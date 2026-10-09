@@ -232,6 +232,7 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
@@ -623,10 +624,13 @@ async fn test_get_proxy_not_found_in_cache() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let (status, body, _) = admin_get(&base_url, "/proxies/nonexistent", &token).await;
+    let (status, body, data_source) = admin_get(&base_url, "/proxies/nonexistent", &token).await;
 
+    // No database: the cache is the source of truth, so the miss stays an
+    // ordinary authoritative 404 without the stale marker (issue #6143).
     assert_eq!(status, 404);
-    assert!(body["error"].as_str().unwrap().contains("not found"));
+    assert_eq!(body, json!({"error": "Proxy not found"}));
+    assert_eq!(data_source, None);
 }
 
 #[tokio::test]
@@ -7158,10 +7162,83 @@ async fn test_get_upstream_not_found_in_cache() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let (status, body, _) = admin_get(&base_url, "/upstreams/nonexistent", &token).await;
+    let (status, body, data_source) = admin_get(&base_url, "/upstreams/nonexistent", &token).await;
 
     assert_eq!(status, 404);
     assert!(body["error"].as_str().unwrap().contains("not found"));
+    assert_eq!(data_source, None);
+}
+
+// ---- Cached fallback after a database read error (issue #6143) ----
+
+/// A database-mode admin whose store fails every read (closed pool) while its
+/// cached snapshot still holds proxies, a consumer, a plugin config and
+/// upstreams.
+async fn start_failed_store_admin_with_cache(
+    tc: &TestConfig,
+) -> (String, tokio::sync::watch::Sender<bool>, tempfile::TempDir) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_failed_store.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    db.pool().close().await;
+    let state = db_admin_state(tc, db, Some(create_test_gateway_config_with_upstreams()));
+    let (base_url, shutdown) = start_test_admin(state).await;
+    (base_url, shutdown, temp_dir)
+}
+
+#[tokio::test]
+async fn cached_fallback_miss_after_db_error_is_503_with_stale_marker() {
+    let tc = TestConfig::default();
+    let (base_url, _shutdown, _dir) = start_failed_store_admin_with_cache(&tc).await;
+    let token = generate_test_token(&tc);
+
+    // The cached snapshot may predate a resource the database holds, so a
+    // miss must never read as Edge's authoritative not-found answer.
+    for path in [
+        "/proxies/created-after-snapshot",
+        "/consumers/created-after-snapshot",
+        "/plugins/config/created-after-snapshot",
+        "/upstreams/created-after-snapshot",
+    ] {
+        let (status, body, data_source) = admin_get(&base_url, path, &token).await;
+        assert_eq!(status, 503, "{path}: {body}");
+        assert_eq!(
+            body,
+            json!({"error": ferrum_edge::admin::CACHED_FALLBACK_MISS_MESSAGE}),
+            "{path}"
+        );
+        assert_eq!(data_source.as_deref(), Some("cached"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn cached_fallback_hit_after_db_error_stays_200_with_stale_marker() {
+    let tc = TestConfig::default();
+    let (base_url, _shutdown, _dir) = start_failed_store_admin_with_cache(&tc).await;
+    let token = generate_test_token(&tc);
+
+    for (path, id) in [
+        ("/proxies/proxy-1", "proxy-1"),
+        ("/consumers/consumer-1", "consumer-1"),
+        ("/plugins/config/plugin-cfg-1", "plugin-cfg-1"),
+        ("/upstreams/upstream-2", "upstream-2"),
+    ] {
+        let (status, body, data_source) = admin_get(&base_url, path, &token).await;
+        assert_eq!(status, 200, "{path}: {body}");
+        assert_eq!(body["id"], id, "{path}");
+        assert_eq!(data_source.as_deref(), Some("cached"), "{path}");
+    }
+
+    // A list served from the cache after the same failure is marked stale too.
+    for path in ["/proxies", "/consumers", "/plugins/config", "/upstreams"] {
+        let (status, body, data_source) = admin_get(&base_url, path, &token).await;
+        assert_eq!(status, 200, "{path}: {body}");
+        assert!(body["data"].is_array(), "{path}: {body}");
+        assert_eq!(data_source.as_deref(), Some("cached"), "{path}");
+    }
 }
 
 #[tokio::test]

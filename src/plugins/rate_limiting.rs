@@ -102,8 +102,13 @@ impl HeaderAuthority {
 }
 
 /// `rate_limiting`-specific top-level config keys (excludes shared Redis fields).
-const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
-    &["limit_by", "expose_headers", "limits", "mcp_tool_calls"];
+const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &[
+    "limit_by",
+    "ipv6_prefix",
+    "expose_headers",
+    "limits",
+    "mcp_tool_calls",
+];
 
 /// Closed key set for the optional `mcp_tool_calls` object.
 pub const RATE_LIMITING_MCP_TOOL_CALLS_KEYS: &[&str] = &["endpoint_path", "tools", "per_tool"];
@@ -144,6 +149,7 @@ const MCP_TOOL_CALL_UNINSPECTABLE_ENCODING_MESSAGE: &str =
 /// counter isolation with defaults.
 pub const RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "limit_by",
+    "ipv6_prefix",
     "expose_headers",
     "limits",
     "mcp_tool_calls",
@@ -248,6 +254,7 @@ enum RateVerdict {
 
 pub struct RateLimiting {
     limit_by: LimitBy,
+    ipv6_prefix: u8,
     expose_headers: bool,
     /// `Some` when this instance counts MCP `tools/call` requests.
     mcp_tool_calls: Option<McpToolCallCounting>,
@@ -323,6 +330,27 @@ impl RateLimiting {
             "rate_limiting: `config`: ",
         )?;
         let limit_by = parse_limit_by(object)?;
+        let ipv6_prefix = match object.get("ipv6_prefix") {
+            None => 64,
+            Some(Value::Null) => {
+                return Err(
+                    "rate_limiting: `ipv6_prefix` must be an integer from 1 through 128"
+                        .to_string(),
+                );
+            }
+            Some(value) => {
+                let prefix = value.as_u64().ok_or_else(|| {
+                    "rate_limiting: `ipv6_prefix` must be an integer from 1 through 128".to_string()
+                })?;
+                u8::try_from(prefix)
+                    .ok()
+                    .filter(|prefix| (1..=128).contains(prefix))
+                    .ok_or_else(|| {
+                        "rate_limiting: `ipv6_prefix` must be an integer from 1 through 128"
+                            .to_string()
+                    })?
+            }
+        };
         let expose_headers = parse_optional_bool(object, "expose_headers")?.unwrap_or(false);
 
         let parsed_limits = parse_limits(object)?;
@@ -340,6 +368,7 @@ impl RateLimiting {
         // Redis posture is added by the backend.
         let mut semantics = LocalStateSemantics::new();
         semantics.text("limit_by", limit_by.as_str());
+        semantics.text("ipv6_prefix", &ipv6_prefix.to_string());
         semantics.windows("default_limit", parsed_limits.default_limit.specs());
         semantics.window_map(
             "consumer_limits",
@@ -376,6 +405,7 @@ impl RateLimiting {
 
         Ok(Self {
             limit_by,
+            ipv6_prefix,
             expose_headers,
             mcp_tool_calls,
             default_limit: parsed_limits.default_limit,
@@ -613,7 +643,7 @@ impl RateLimiting {
             LimitBy::Ip => {}
         }
 
-        ip_key(&ctx.client_ip)
+        ip_key(&ctx.client_ip, self.ipv6_prefix)
     }
 
     fn request_limit_op(&self, ctx: &RequestContext) -> &DynamicRateLimitOp {
@@ -646,7 +676,7 @@ impl RateLimiting {
             LimitBy::Ip => {}
         }
 
-        ip_key(&ctx.client_ip)
+        ip_key(&ctx.client_ip, self.ipv6_prefix)
     }
 
     fn stream_limit_op(&self, ctx: &super::StreamConnectionContext) -> &DynamicRateLimitOp {
@@ -1107,6 +1137,10 @@ impl Plugin for RateLimiting {
         } else {
             super::ALL_PROTOCOLS
         }
+    }
+
+    fn gates_request_admission(&self) -> bool {
+        true
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
@@ -1734,8 +1768,41 @@ fn prefixed_key(prefix: &str, value: &str) -> String {
     key
 }
 
-fn ip_key(client_ip: &str) -> String {
-    prefixed_key("ip:", client_ip)
+fn ip_key(client_ip: &str, ipv6_prefix: u8) -> String {
+    use std::fmt::Write as _;
+
+    let mut key = String::with_capacity(3 + client_ip.len());
+    key.push_str("ip:");
+    if !client_ip.contains(':') {
+        key.push_str(client_ip);
+        return key;
+    }
+    let Some(ip) = crate::util::client_identity::parse_canonical_client_ip(client_ip) else {
+        key.push_str(client_ip);
+        return key;
+    };
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let _ = write!(key, "{ipv4}");
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            let prefix = ipv6_prefix.min(128);
+            let mut octets = ipv6.octets();
+            let whole_bytes = usize::from(prefix / 8);
+            let remaining_bits = prefix % 8;
+            if remaining_bits != 0 {
+                octets[whole_bytes] &= u8::MAX << (8 - remaining_bits);
+            }
+            let zero_from = if remaining_bits == 0 {
+                whole_bytes
+            } else {
+                whole_bytes + 1
+            };
+            octets[zero_from..].fill(0);
+            let _ = write!(key, "{}", std::net::Ipv6Addr::from(octets));
+        }
+    }
+    key
 }
 
 /// Metadata key -> response header for the telemetry `expose_headers` publishes.

@@ -36,10 +36,10 @@ def verify_smoke(path):
 def verify_graph(path):
     metadata = json.loads(path.read_text())
     packages = {p["id"]: p for p in metadata["packages"]}
-    h2 = [p for p in packages.values() if p["name"] == "h2" and p["version"] == "0.4.19"]
+    h2 = [p for p in packages.values() if p["name"] == "h2" and p["version"] == "0.4.20"]
     if len(h2) != 1 or h2[0]["source"] is not None or not h2[0]["manifest_path"].endswith(
-            "/vendor/h2-0.4.19-observation/Cargo.toml"):
-        raise ValueError("diagnostic graph must select exactly one patched h2 0.4.19")
+            "/vendor/h2-0.4.20-observation/Cargo.toml"):
+        raise ValueError("diagnostic graph must select exactly one patched h2 0.4.20")
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
     root = metadata["resolve"]["root"]
 

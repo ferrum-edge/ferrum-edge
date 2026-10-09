@@ -712,9 +712,11 @@ impl AiRateLimiter {
             return key;
         }
 
-        let mut key = String::with_capacity(ctx.client_ip.len() + 3);
+        let ip = crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+            .unwrap_or_else(|| ctx.client_ip.to_string());
+        let mut key = String::with_capacity(ip.len() + 3);
         key.push_str("ip:");
-        key.push_str(&ctx.client_ip);
+        key.push_str(&ip);
         key
     }
 
@@ -2213,6 +2215,10 @@ impl Plugin for AiRateLimiter {
         // notes: this declaration is the admission boundary, because gRPC is
         // detected per request rather than pinned in proxy config.
         super::HTTP_ONLY_PROTOCOLS
+    }
+
+    fn gates_request_admission(&self) -> bool {
+        true
     }
 
     /// This limiter never mutates a backend-visible request header.

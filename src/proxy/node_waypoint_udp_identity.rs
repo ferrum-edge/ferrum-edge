@@ -853,10 +853,11 @@ pub trait NodeWaypointUdpInterfaceResolver: Send + Sync + 'static {
     fn resolve_interface(&self, target: &PodCaptureTarget) -> Result<ResolvedInterface, String>;
 }
 
-/// Production resolver: the pod's own netns view (`iflink` → host peer index)
-/// first, then the host route table keyed on the registry-published pod IP for
-/// both families. Identical to the Ambient host-capture resolution, so the two
-/// paths agree on which interface belongs to a pod.
+/// Production resolver: the host route table keyed on the registry-published
+/// pod IP for both families. Pod-visible sysfs is not ownership evidence: an
+/// enrolled pod can control its own sysfs mount and claim a neighbour's veth.
+/// Identical to the Ambient host-capture resolution, so the two paths agree on
+/// which interface belongs to a pod.
 pub struct VethInterfaceResolver {
     /// Only the Linux `resolve_interface` reads this; the non-Linux impl
     /// refuses outright. The field is still initialized on every host so the
@@ -883,13 +884,10 @@ impl VethInterfaceResolver {
 #[cfg(target_os = "linux")]
 impl NodeWaypointUdpInterfaceResolver for VethInterfaceResolver {
     fn resolve_interface(&self, target: &PodCaptureTarget) -> Result<ResolvedInterface, String> {
-        let name = crate::ebpf::veth::discover_veth_for_pod(None, Some(&target.cgroup_path))
-            .or_else(|| {
-                target
-                    .source_ips
-                    .ipv4
-                    .and_then(crate::ebpf::veth::discover_dedicated_veth_for_pod_ip)
-            })
+        let name = target
+            .source_ips
+            .ipv4
+            .and_then(crate::ebpf::veth::discover_dedicated_veth_for_pod_ip)
             .or_else(|| {
                 target
                     .source_ips

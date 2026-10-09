@@ -56,7 +56,10 @@ impl CapturedMeshEgressLifecycle {
             .plugin_cache
             .plugins_for_protocol(&proxy.namespace, &proxy.id, protocol)
             .iter()
-            .filter(|plugin| plugin.name() == WORKLOAD_METRICS_PLUGIN)
+            .filter(|plugin| {
+                plugin.name() == WORKLOAD_METRICS_PLUGIN
+                    && crate::plugins::is_builtin_plugin(plugin.as_ref())
+            })
             .cloned()
             .collect();
         if plugins.is_empty() {

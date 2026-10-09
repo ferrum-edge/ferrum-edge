@@ -615,6 +615,9 @@ struct CorrelationMeta {
     proxy: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    /// The request's gateway hop count, carried as `X-Ferrum-Hops` on the
+    /// approval call. Never part of the approval request body.
+    proxy_hops: Option<u8>,
 }
 
 /// Bundled inputs for one approval evaluation, keeping the resolve/call
@@ -1434,6 +1437,10 @@ impl GovernorEngine {
             .post(&approval.endpoint_url)
             .timeout(timeout)
             .json(&body);
+        // An approval endpoint that resolves back to the gateway is refused at
+        // the proxy hop limit like a looping route (issue #6128).
+        let request =
+            crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, corr.proxy_hops);
 
         let response = self
             .http_client
@@ -1739,6 +1746,7 @@ impl AiToolGovernor {
                 .map(|p| p.name.clone().unwrap_or_else(|| p.id.clone())),
             model,
             provider: provider.map(str::to_string),
+            proxy_hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
         }
     }
 
@@ -2932,6 +2940,10 @@ impl Plugin for AiToolGovernor {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
+    }
+
+    fn gates_request_admission(&self) -> bool {
+        true
     }
 
     fn enforces_finalized_request_policy(&self) -> bool {
@@ -6779,25 +6791,23 @@ fn parse_json_within_limit(body: &[u8]) -> Option<Value> {
 /// decompression bomb cannot blow up memory. Returns `None` for unsupported
 /// encodings, decode errors, or output past the limit.
 fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-    // A single encoding token only (the compression plugin emits exactly one).
-    let mut out = Vec::new();
-    let limit = MAX_PARSE_BYTES as u64;
-    match encoding.trim().to_ascii_lowercase().as_str() {
-        "gzip" | "x-gzip" => {
-            let mut reader = flate2::read::MultiGzDecoder::new(data).take(limit + 1);
-            reader.read_to_end(&mut out).ok()?;
-        }
-        "br" => {
-            let mut reader = brotli::Decompressor::new(data, 4096).take(limit + 1);
-            reader.read_to_end(&mut out).ok()?;
-        }
+    let coding = match encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => "gzip",
+        "br" => "br",
         _ => return None,
-    }
-    if out.len() as u64 > limit {
-        return None;
-    }
-    Some(out)
+    };
+    super::charged_decode::decode_charged_content_coding_chain(
+        &[coding.to_string()],
+        data,
+        super::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes: MAX_PARSE_BYTES,
+            max_cumulative_bytes: MAX_PARSE_BYTES,
+            max_codings: 1,
+            max_amplification_ratio: 0,
+        },
+        crate::proxy::response_buffer_budget::BudgetRef::global(),
+    )
+    .ok()
 }
 
 fn redacted_approval_url(parsed: &Url) -> String {

@@ -599,6 +599,88 @@ async fn token_auth_plugins_declare_the_headers_they_strip_and_own() {
     }
 }
 
+/// Every registered built-in auth plugin.
+const AUTH_PLUGINS: [&str; 10] = [
+    "basic_auth",
+    "hmac_auth",
+    "jwks_auth",
+    "jwt_auth",
+    "key_auth",
+    "ldap_auth",
+    "mtls_auth",
+    "oauth2_introspection",
+    "oidc_relying_party",
+    "soap_ws_security",
+];
+
+/// Each auth plugin in the configuration that strips the most request headers.
+fn header_stripping_auth_config(name: &str) -> serde_json::Value {
+    match name {
+        "basic_auth" => json!({"hide_credentials": true}),
+        "key_auth" => json!({"key_location": "header:X-API-Key", "hide_credentials": true}),
+        "jwks_auth" => json!({"providers": [{
+            "jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json",
+            "forward_original_token": false,
+            "claim_headers": {"email": "X-User-Email"}
+        }]}),
+        "oauth2_introspection" => json!({"providers": [{
+            "introspection_endpoint": "http://127.0.0.1:9/introspect",
+            "client_auth": {"method": "none"},
+            "from_headers": [{"name": "X-Access-Token"}],
+            "forward_original_token": false
+        }]}),
+        _ => minimal_plugin_config(name),
+    }
+}
+
+/// No built-in auth plugin, even stripping every credential header it can,
+/// leaves an authority rule or a rule on a header it never writes undecided
+/// (issue #6022).
+#[tokio::test]
+async fn no_built_in_auth_plugin_undecides_authority_or_unrelated_header_rules() {
+    let _secret = basic_auth_test_secret_guard();
+    let _registry = log_schema_registry_guard();
+    let authority = json!({"authority": {"exact": "edge.example"}});
+    let authority_rules = json!([rule(authority, Some(700)), path_rule("/", Some(5000))]);
+    let header_rules = json!([
+        header_rule("x-soap-tier", "gold", Some(800)),
+        path_rule("/", Some(5000)),
+    ]);
+    for name in AUTH_PLUGINS {
+        let auth = built_in(name, header_stripping_auth_config(name));
+        assert!(
+            !auth.modifies_request_destination(),
+            "{name} must never rewrite the destination"
+        );
+        if auth.modifies_request_headers() {
+            let names = auth
+                .modified_request_header_names()
+                .unwrap_or_else(|| panic!("{name} must declare the headers it writes"));
+            for reserved in ["host", ":authority", "x-soap-tier"] {
+                assert!(
+                    !names
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(reserved)),
+                    "{name} declares {reserved:?}: {names:?}"
+                );
+            }
+        }
+        let plugins = [Arc::clone(&auth), dispatch(authority_rules.clone())];
+        assert_eq!(
+            preview(&plugins, &request("/soap", &[])),
+            Some(700),
+            "{name} leaves the authority rule decided"
+        );
+        let plugins = [auth, dispatch(header_rules.clone())];
+        let gold = request("/soap", &[("x-soap-tier", "gold")]);
+        assert_eq!(
+            preview(&plugins, &gold),
+            Some(800),
+            "{name} leaves a rule on a header it never writes decided"
+        );
+    }
+}
+
 /// Every built-in auth plugin that may change request headers names them, so
 /// a route matching on any other header (Host included) stays decidable.
 ///
@@ -611,18 +693,6 @@ async fn every_header_writing_auth_plugin_names_its_headers() {
     // every built-in constructs from `minimal_plugin_config` under them.
     let _secret = basic_auth_test_secret_guard();
     let _registry = log_schema_registry_guard();
-    const AUTH_PLUGINS: [&str; 10] = [
-        "basic_auth",
-        "hmac_auth",
-        "jwks_auth",
-        "jwt_auth",
-        "key_auth",
-        "ldap_auth",
-        "mtls_auth",
-        "oauth2_introspection",
-        "oidc_relying_party",
-        "soap_ws_security",
-    ];
     let mut registered = Vec::new();
     for registration in BUILTIN_PLUGIN_REGISTRATIONS {
         let name = registration.name;

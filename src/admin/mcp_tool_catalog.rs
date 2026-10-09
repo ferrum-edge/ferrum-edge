@@ -34,6 +34,9 @@ const MCP_GATEWAY_NOT_FOUND_MESSAGE: &str = "Proxy has no mcp_gateway plugin";
 struct ResolvedGateways {
     configs: Vec<PluginConfig>,
     from_cache: bool,
+    /// The store read failed and `configs` came from the cached snapshot,
+    /// which may predate the gateway: an empty set is not confirmed absence.
+    store_read_failed: bool,
     allowed_methods: Option<Vec<String>>,
 }
 
@@ -60,6 +63,9 @@ pub(super) async fn handle_get_mcp_tool_catalog(
         Err(response) => return Ok(*response),
     };
     if resolved.configs.is_empty() {
+        if resolved.store_read_failed {
+            return Ok(super::cached_fallback_miss_response());
+        }
         return Ok(super::json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": MCP_GATEWAY_NOT_FOUND_MESSAGE}),
@@ -130,6 +136,7 @@ async fn resolve_gateways(
     proxy_id: &str,
 ) -> Result<Option<ResolvedGateways>, Box<Response<Full<Bytes>>>> {
     let cached = state.cached_gateway_config();
+    let mut store_read_failed = false;
     if let Some(db) = state.db.as_ref() {
         match db.get_proxy(namespace, proxy_id).await {
             Ok(None) => return Ok(None),
@@ -151,6 +158,7 @@ async fn resolve_gateways(
                 return Ok(Some(ResolvedGateways {
                     configs,
                     from_cache: false,
+                    store_read_failed: false,
                     allowed_methods: proxy.allowed_methods,
                 }));
             }
@@ -159,6 +167,7 @@ async fn resolve_gateways(
                     return Err(Box::new(Proxy::map_precheck_db_error(&error)));
                 }
                 super::warn_persistence_failure_redacted("admin_mcp_tool_catalog_cached_fallback");
+                store_read_failed = true;
             }
         }
     }
@@ -173,6 +182,11 @@ async fn resolve_gateways(
         .iter()
         .find(|proxy| proxy.id == proxy_id && proxy.namespace == namespace)
     else {
+        // A miss is authoritative only when the cache is the source of truth
+        // (no database); after a store failure it may predate the proxy.
+        if store_read_failed {
+            return Err(Box::new(super::cached_fallback_miss_response()));
+        }
         return Ok(None);
     };
     let associated = proxy
@@ -187,6 +201,7 @@ async fn resolve_gateways(
     Ok(Some(ResolvedGateways {
         configs,
         from_cache: true,
+        store_read_failed,
         allowed_methods: proxy.allowed_methods.clone(),
     }))
 }

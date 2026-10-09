@@ -31,6 +31,9 @@ use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
+use super::address_validation::{
+    IncomingAdmission, UnvalidatedHandshakeBudget, UnvalidatedHandshakePermit, classify_incoming,
+};
 use super::config::Http3ServerConfig;
 use super::peer_identity::{
     H3ConnectionIdentity, ZeroRttCompletion, quic_max_early_data_size, zero_rtt_admitted,
@@ -355,6 +358,34 @@ pub(crate) fn publish_h3_retained_body(
     }
 }
 
+/// Why a buffered H3 request-body drain ended without a complete upload.
+#[derive(Debug)]
+pub(crate) enum H3UploadReadError {
+    /// The request stream failed: a client reset, a lost connection, or a
+    /// malformed frame sequence h3 detected.
+    Stream(h3::error::StreamError),
+    /// A DATA frame followed the trailer section, which makes the request
+    /// malformed (RFC 9114 §4.1).
+    DataAfterTrailers,
+}
+
+impl From<h3::error::StreamError> for H3UploadReadError {
+    fn from(error: h3::error::StreamError) -> Self {
+        Self::Stream(error)
+    }
+}
+
+impl std::fmt::Display for H3UploadReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stream(error) => std::fmt::Display::fmt(error, f),
+            Self::DataAfterTrailers => f.write_str("request DATA frame after the trailer section"),
+        }
+    }
+}
+
+impl std::error::Error for H3UploadReadError {}
+
 /// Drain an H3 request-body recv half into an admitted, capped buffer.
 ///
 /// The buffer and its charge live inside this future, so timeout/deadline
@@ -367,7 +398,7 @@ pub(crate) async fn drain_h3_request_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut upload: H3RetainedUpload,
     charge: &mut Option<RequestBufferPermit>,
-) -> Result<Option<Vec<u8>>, h3::error::StreamError>
+) -> Result<Option<Vec<u8>>, H3UploadReadError>
 where
     S: RecvStream,
 {
@@ -375,6 +406,14 @@ where
         if !upload.push(chunk.chunk()) {
             return Ok(None);
         }
+    }
+    // `recv_data` also ends at a trailer section, which ends the body but not
+    // the request stream. Read on to the stream's own end, so a client reset
+    // or a lost connection after the trailers is refused as the incomplete
+    // request it is instead of being dispatched as a complete upload (issue
+    // #6022). After a clean FIN this returns at once.
+    if stream.recv_data().await?.is_some() {
+        return Err(H3UploadReadError::DataAfterTrailers);
     }
     let (body, permit) = upload.finish();
     *charge = Some(permit);
@@ -884,8 +923,6 @@ fn build_h3_quinn_server_config(
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.initial_mtu(h3_config.initial_mtu);
     // The FRONTEND idle timeout, which the RFC 9298 CONNECT-UDP profile raises
     // to at least its own tunnel idle bound when enabled: a tunnel carrying no
     // datagram generates no QUIC activity either, so a smaller connection idle
@@ -900,24 +937,7 @@ fn build_h3_quinn_server_config(
              tunnel idle timeout; a shorter connection idle limit would close idle tunnels first"
         );
     }
-    transport_config.max_idle_timeout(Some(
-        h3_config
-            .frontend_idle_timeout
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
-    ));
-    transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
-
-    // QUIC flow-control tuning — conservative defaults for untrusted clients.
-    transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
-        h3_config.stream_receive_window,
-        crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
-    ));
-    transport_config.receive_window(crate::http3::config::quic_varint_or_default(
-        h3_config.receive_window,
-        crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
-    ));
-    transport_config.send_window(h3_config.send_window);
+    let transport_config = crate::http3::config::build_frontend_transport_config(h3_config)?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     server_config.transport_config(Arc::new(transport_config));
@@ -1550,6 +1570,10 @@ pub async fn start_http3_listener_with_signal(
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
     let handshake_timeout = h3_config.handshake_timeout;
+    // One budget per listener for handshakes from unvalidated source addresses
+    // (`FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES`).
+    let unvalidated_handshakes =
+        UnvalidatedHandshakeBudget::new(h3_config.max_unvalidated_handshakes);
     // When client authentication is configured the 0.5-RTT accept path is
     // refused for every connection so peer identity is only ever read after
     // handshake completion (issue #2938).
@@ -1643,31 +1667,67 @@ pub async fn start_http3_listener_with_signal(
                             connecting.refuse();
                             continue;
                         }
+                        // QUIC address validation (RFC 9000 §8.1). An Initial's
+                        // source address can be forged, so a handshake for an
+                        // unvalidated source runs only inside the listener's
+                        // dedicated handshake budget; past it the source gets
+                        // a stateless Retry, which holds no connection state
+                        // and costs no TLS work.
+                        let handshake_permit = match classify_incoming(
+                            connecting.remote_address_validated(),
+                            connecting.may_retry(),
+                            &unvalidated_handshakes,
+                        ) {
+                            IncomingAdmission::Validated => None,
+                            IncomingAdmission::Unvalidated(permit) => Some(permit),
+                            IncomingAdmission::Retry => {
+                                // quinn mints the Retry token from the
+                                // endpoint's current server config. An Initial
+                                // queued before the listener was disabled is
+                                // refused instead, as `accept_h3_incoming`
+                                // would refuse it.
+                                if adopted_quic.load().is_none() {
+                                    connecting.refuse();
+                                } else if let Err(error) = connecting.retry() {
+                                    error.into_incoming().refuse();
+                                }
+                                continue;
+                            }
+                            IncomingAdmission::Refuse => {
+                                connecting.refuse();
+                                continue;
+                            }
+                        };
                         let state = Arc::clone(&state);
                         let adopted_quic = Arc::clone(&adopted_quic);
                         let conn_shutdown = shutdown_rx.clone();
                         let gateway_listener_identity = gateway_listener_identity.clone();
                         tokio::spawn(async move {
-                            // Exactly one ConnectionGuard per spawned Incoming.
-                            // `handle_h3_connection` never constructs another, so
-                            // handshake refuse, handshake timeout, GOAWAY drain,
-                            // peer reset, and deadline `endpoint.close` all
-                            // release the counter once through this Drop.
+                            // At most one ConnectionGuard per spawned Incoming,
+                            // owned by its `H3ConnectionAccounting`. Handshake
+                            // refuse, handshake timeout, GOAWAY drain, peer
+                            // reset, and deadline `endpoint.close` all release
+                            // the counter once through that Drop.
                             let overload = Arc::clone(&state.overload);
-                            run_h3_connection_with_guard(overload, async move {
-                                handle_h3_connection(
-                                    connecting,
-                                    state,
-                                    handshake_timeout,
-                                    frontend_listen_port,
-                                    frontend_destination_ip,
-                                    gateway_listener_identity,
-                                    client_auth_configured,
-                                    adopted_quic,
-                                    conn_shutdown,
-                                )
-                                .await
-                            })
+                            run_h3_connection_with_guard(
+                                overload,
+                                handshake_permit,
+                                |accounting| async move {
+                                    handle_h3_connection(
+                                        connecting,
+                                        accounting,
+                                        state,
+                                        handshake_timeout,
+                                        frontend_listen_port,
+                                        frontend_destination_ip,
+                                        gateway_listener_identity,
+                                        client_auth_configured,
+                                        adopted_quic,
+                                        conn_shutdown,
+                                    )
+                                    .await
+                                },
+                            )
                             .await;
                         });
                     }
@@ -1986,20 +2046,74 @@ fn close_h3_connection_for_trust_withdrawal(connection: &quinn::Connection, peer
     );
 }
 
-/// Hold exactly one [`crate::overload::ConnectionGuard`] for the lifetime of
-/// an H3 connection task (issue #4429).
+/// Shared overload accounting for one HTTP/3 connection task (issue #4429).
 ///
-/// The accept-loop spawn is the only constructor. Handshake refuse, handshake
-/// timeout, GOAWAY drain, peer reset, and deadline force-close all return
-/// through here so the overload counter cannot double-decrement or leak.
-pub(crate) async fn run_h3_connection_with_guard<F>(
+/// Holds at most one [`crate::overload::ConnectionGuard`], constructed in
+/// exactly one place ([`Self::charge_connection_budget`]). A connection from a
+/// validated source address is charged when the task starts. A connection from
+/// an unvalidated source instead holds an [`UnvalidatedHandshakePermit`] from
+/// the listener's dedicated handshake budget and is charged only once its
+/// handshake completes, so forged-source Initials can never consume the shared
+/// connection budget that drives overload shedding on every frontend.
+pub(crate) struct H3ConnectionAccounting {
     overload: Arc<crate::overload::OverloadState>,
-    fut: F,
+    conn_guard: Option<crate::overload::ConnectionGuard>,
+    handshake_permit: Option<UnvalidatedHandshakePermit>,
+}
+
+impl H3ConnectionAccounting {
+    fn admit(
+        overload: Arc<crate::overload::OverloadState>,
+        handshake_permit: Option<UnvalidatedHandshakePermit>,
+    ) -> Self {
+        let mut accounting = Self {
+            overload,
+            conn_guard: None,
+            handshake_permit,
+        };
+        if accounting.handshake_permit.is_none() {
+            accounting.charge_connection_budget();
+        }
+        accounting
+    }
+
+    /// Whether this connection's source address was validated before the
+    /// handshake began.
+    fn source_validated(&self) -> bool {
+        self.handshake_permit.is_none()
+    }
+
+    /// The handshake completed: release the unvalidated-handshake permit and
+    /// charge the shared connection budget. Idempotent.
+    fn handshake_completed(&mut self) {
+        self.charge_connection_budget();
+        self.handshake_permit = None;
+    }
+
+    fn charge_connection_budget(&mut self) {
+        if self.conn_guard.is_none() {
+            self.conn_guard = Some(crate::overload::ConnectionGuard::new(&self.overload));
+        }
+    }
+}
+
+/// Run one HTTP/3 connection task under its [`H3ConnectionAccounting`]
+/// (issue #4429).
+///
+/// The accept-loop spawn is the only caller. Handshake refuse, handshake
+/// timeout, GOAWAY drain, peer reset, and deadline force-close all return
+/// through here, and the accounting moves into the connection future, so the
+/// overload counter cannot double-decrement or leak.
+pub(crate) async fn run_h3_connection_with_guard<F, Fut>(
+    overload: Arc<crate::overload::OverloadState>,
+    handshake_permit: Option<UnvalidatedHandshakePermit>,
+    connection: F,
 ) where
-    F: std::future::Future<Output = Result<(), anyhow::Error>>,
+    F: FnOnce(H3ConnectionAccounting) -> Fut,
+    Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
-    let _conn_guard = crate::overload::ConnectionGuard::new(&overload);
-    if let Err(e) = fut.await {
+    let accounting = H3ConnectionAccounting::admit(overload, handshake_permit);
+    if let Err(e) = connection(accounting).await {
         debug!("HTTP/3 connection error: {}", e);
     }
 }
@@ -2194,6 +2308,7 @@ fn accept_h3_incoming(
 #[allow(clippy::too_many_arguments)]
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
+    mut accounting: H3ConnectionAccounting,
     state: Arc<ProxyState>,
     handshake_timeout: Duration,
     frontend_listen_port: Option<u16>,
@@ -2208,8 +2323,16 @@ async fn handle_h3_connection(
     // authentication: the 0.5-RTT accept path would materialize the connection
     // before the peer's certificate is known (issue #2938), and the TLS builder
     // disables client early data for the same listener posture.
+    //
+    // The 0.5-RTT path also materializes the connection before the handshake
+    // completes, so it is reserved for a source address that was validated
+    // before the handshake began: an unvalidated source completes the full
+    // 1-RTT handshake inside its handshake budget first, and is charged to the
+    // shared connection budget only then. Its 0-RTT request streams are still
+    // served, after the handshake, as 1-RTT (RFC 8470 §6.2).
     let early_data_enabled =
-        zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
+        zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured)
+            && accounting.source_validated();
 
     // The listener already stopped accepting, but this Incoming was queued
     // before `set_server_config(None)`. Refuse it so a mid-handshake drain
@@ -2322,6 +2445,9 @@ async fn handle_h3_connection(
         };
         complete_h3_handshake(connecting, handshake_timeout, &mut shutdown_rx).await?
     };
+    // Every branch above either completed the handshake or (0.5-RTT) admitted a
+    // validated source that was charged when its task started.
+    accounting.handshake_completed();
 
     let remote_addr = connection.remote_address();
     // Istio `destination.ip` input. A listener bound to a specific address
@@ -3023,6 +3149,32 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Proxy hop limit (HTTP/3, issue #6109): the same decision the H1/H2
+    // frontend takes, on the client's own field lines and after the header
+    // size/count limits above. The forwarded count is stamped on the raw header
+    // block below, before it is stored on the request context. The refusal is
+    // built out of line and heap-pinned like the `boxed_*` dispatch relays so
+    // this handler's state machine does not grow; it runs only when refused.
+    let outbound_proxy_hops = match crate::proxy::hop_limit::decide_proxy_hops(
+        req.headers(),
+        state.env_config.max_proxy_hops,
+    ) {
+        crate::proxy::hop_limit::ProxyHopDecision::Disabled => None,
+        crate::proxy::hop_limit::ProxyHopDecision::Forward(hops) => Some(hops),
+        refused => {
+            let loop_detected = refused == crate::proxy::hop_limit::ProxyHopDecision::LoopDetected;
+            boxed_send_h3_proxy_hop_limit_refusal(
+                &mut stream,
+                &state,
+                http_flavor,
+                grpc_web_response_content_type.is_some(),
+                loop_detected,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
     // Track this request for overload monitoring and graceful drain.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
@@ -3083,8 +3235,24 @@ async fn handle_h3_request(
     // its plugin snapshot until the timer expires.
     ctx.peer_connection = Some(peer_connection);
 
-    // Store raw headers for deferred materialization.
-    ctx.set_raw_headers(req.headers().clone());
+    // Store raw headers for deferred materialization. HTTP/3 does not reject a
+    // `Connection` field, so resolve its nominations against the client's own
+    // fields before any plugin or gateway assertion can add a header that the
+    // backend-boundary hop-by-hop strip would otherwise remove. `req` keeps the
+    // wire block for the protocol-shape checks below.
+    let mut raw_headers = req.headers().clone();
+    if let Some(hops) = outbound_proxy_hops {
+        // Replace the client's `X-Ferrum-Hops` with the forwarded count before
+        // anything reads the stored block (issue #6109); the confinement below
+        // leaves the field in place.
+        crate::proxy::hop_limit::stamp_proxy_hops(&mut raw_headers, hops);
+        ctx.outbound_proxy_hops = Some(hops);
+    }
+    crate::proxy::headers::confine_connection_nominated_request_headers(
+        &mut raw_headers,
+        state.env_config.real_ip_header.as_deref(),
+    );
+    ctx.set_raw_headers(raw_headers);
     crate::proxy::stamp_original_request_metadata(&mut ctx);
 
     // Validate URL length (path + query string)
@@ -3372,6 +3540,15 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // The WebSocket backend handshake is a GET. Keep route and plugin policy
+    // aligned with the method the backend receives, matching the H2 Extended
+    // CONNECT path. Plain CONNECT and CONNECT-UDP keep CONNECT; the 0-RTT
+    // allowlist above still gates the wire method.
+    if http_flavor == HttpFlavor::WebSocket {
+        method = "GET".to_string();
+        ctx.method = method.clone();
+    }
+
     // Set the early data flag on the request context for plugin visibility.
     ctx.is_early_data = is_early_data;
 
@@ -3423,9 +3600,18 @@ async fn handle_h3_request(
 
     // Per-IP concurrent request limiting (same as HTTP/1.1 and HTTP/2 paths).
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let per_ip_key = if ctx.client_ip.contains(':') {
+            crate::util::client_identity::rate_limit_client_ip_string(
+                &ctx.client_ip,
+                state.per_ip_ipv6_prefix,
+            )
+            .unwrap_or_else(|| ctx.client_ip.clone())
+        } else {
+            ctx.client_ip.clone()
+        };
         let current = {
             let count = counts
-                .entry(ctx.client_ip.clone())
+                .entry(per_ip_key.clone())
                 .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
             count
                 .value()
@@ -3433,7 +3619,7 @@ async fn handle_h3_request(
                 + 1
         };
         let guard = Some(crate::proxy::PerIpRequestGuard {
-            ip: ctx.client_ip.clone(),
+            ip: per_ip_key,
             counts: counts.clone(),
         });
         if current > state.max_concurrent_requests_per_ip {
@@ -3836,6 +4022,55 @@ async fn handle_h3_request(
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
 
+    // Same refusal as the H1/H2 dispatcher: a client-selected flavor whose
+    // view omits the route's authentication or admission policy is refused
+    // before any plugin runs, except a bodiless CORS preflight on the plain
+    // HTTP view of a gRPC-intended route whose `cors` plugin answers
+    // preflights (issue #6110). `Some(exempt)` once the view is marked.
+    let caps = plugin_cache_view.capabilities();
+    let grpc_web_request = grpc_web_response_content_type.is_some();
+    let omitted_policy_exemption = caps
+        .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+        .then(|| h3_grpc_intended_refusal_exempts(&req, request_protocol, grpc_web_request, caps));
+    // HTTP/3 may carry DATA with no `Content-Length`, so the declared framing
+    // proves nothing: the request stream must also END with no DATA frame,
+    // within a fixed small wait. An exempted preflight is answered by `cors`
+    // or refused after the `on_request_received` phase; it is never
+    // forwarded upstream.
+    let read_timeout_ms = proxy.backend_read_timeout_ms;
+    let cors_preflight_exempted = omitted_policy_exemption == Some(true)
+        && boxed_h3_request_stream_ends_without_data(&mut stream, read_timeout_ms).await;
+    if omitted_policy_exemption.is_some() && !cors_preflight_exempted {
+        debug!(
+            proxy_id = %proxy.id,
+            protocol = ?request_protocol,
+            "Rejected HTTP/3 request: route admission policy does not run on the requested protocol"
+        );
+        record_h3_flavor_aware_reject(&state, http_flavor, 403);
+        send_h3_error_flavor_aware_with_policy(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::FORBIDDEN,
+            crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY,
+            crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+            "Request protocol not permitted on this route",
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await?;
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        return Ok(());
+    }
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
     // Publish this route's client-facing body ceilings before any request DATA
@@ -4142,6 +4377,43 @@ async fn handle_h3_request(
         ctx.materialize_query_params();
     } else {
         ctx.materialize_query_params_raw();
+    }
+
+    // An exempted CORS preflight (issue #6110) exists only so the route's
+    // `cors` plugin can answer it, which it does in the phase above. One that
+    // reaches here (`cors` forwards it, or a trigger skipped `cors`) gets the
+    // view's ordinary refusal rather than reaching the backend without the
+    // route's gRPC-only admission policy. It runs before any pre-auth body
+    // buffering and before authentication. Boxed so this cold arm does not widen
+    // `handle_h3_request`'s frame.
+    if cors_preflight_exempted {
+        Box::pin(async {
+            record_h3_flavor_aware_reject(&state, http_flavor, 403);
+            // Log before send, like every other reject in this phase.
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                StatusCode::FORBIDDEN.as_u16(),
+                start_time,
+                crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_error_flavor_aware_with_policy(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::FORBIDDEN,
+                crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY,
+                crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+                "Request protocol not permitted on this route",
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
+        return Ok(());
     }
 
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
@@ -5237,12 +5509,23 @@ async fn handle_h3_request(
         .keys()
         .any(|k| crate::proxy::headers::is_gateway_assertion_header(k));
     if ctx.backend_consumer_username().is_some()
+        || ctx.backend_authenticated_identity().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion
     {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // Proxy hop limit (issue #6109): the same `X-Ferrum-Hops` re-assertion the
+    // H1/H2 ladder makes in `src/proxy/mod.rs::handle_proxy_request_inner`, at
+    // the same point; the deferred passes and the finalized-egress overlay
+    // re-assert it again through `refresh_backend_gateway_assertion_headers`.
+    // Keep both call sites in sync.
+    crate::proxy::hop_limit::reassert_outbound_proxy_hops(
+        crate::proxy::hop_limit::effective_outbound_proxy_hops(&ctx),
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    );
     // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647): the same
     // single hop-budget decision the H1/H2 ladder takes in
     // `src/proxy/mod.rs::handle_proxy_request_inner`, at the same point —
@@ -10927,6 +11210,74 @@ async fn handle_h3_request(
     }
 
     Ok(())
+}
+
+/// The H3 counterpart of the H1/H2 dispatcher's one exemption from the
+/// route-admission refusal: a bodiless CORS preflight on the plain HTTP view
+/// (not gRPC-Web) of a gRPC-intended route whose view carries a
+/// preflight-answering `cors` instance (`caps`) (issue #6110). The request
+/// DATA frames have not been read yet, so this judges only the declared
+/// framing; the dispatcher then requires the stream to end with no DATA frame
+/// ([`boxed_h3_request_stream_ends_without_data`]). Evaluated only once a view
+/// is marked.
+fn h3_grpc_intended_refusal_exempts(
+    req: &http::Request<()>,
+    request_protocol: ProxyProtocol,
+    grpc_web_request: bool,
+    caps: crate::plugin_cache::PluginCapabilities,
+) -> bool {
+    request_protocol == ProxyProtocol::Http
+        && !grpc_web_request
+        && caps.has(crate::plugin_cache::PluginCapabilities::ANSWERS_CORS_PREFLIGHTS)
+        && crate::proxy::is_cors_preflight_request(req.method(), req.headers())
+}
+
+/// Fixed ceiling, in milliseconds, on how long the H3 dispatcher waits for an
+/// exempted CORS preflight's request stream to end (issue #6110).
+///
+/// The wait runs before any plugin (rate limiting, IP restriction, and `cors`
+/// itself all run later), so it must not depend on the route: the route's
+/// `backend_read_timeout_ms` is a backend upload-stall knob (default 30 s, `0`
+/// = unbounded) and can only shorten this bound. A browser sends a preflight's
+/// FIN with its HEADERS frame, so the wait normally ends at once.
+pub(crate) const H3_PREFLIGHT_END_OF_STREAM_WAIT_MS: u64 = 2_000;
+
+/// Whether the H3 request stream ENDS with no DATA frame: the transport proof
+/// that an exempted CORS preflight carries no body (issue #6110). HTTP/3 allows
+/// DATA without `Content-Length`, so the declared framing alone is not enough.
+/// `recv_data` is the stream's next-DATA future: `Ok(None)` is the FIN. A DATA
+/// frame (even an empty one), a stream error, or no FIN within
+/// `min(backend_read_timeout_ms, H3_PREFLIGHT_END_OF_STREAM_WAIT_MS)` (the
+/// fixed cap alone when the route's timeout is `0`) is not proof, and the
+/// preflight is then refused like the rest of the view.
+pub(crate) async fn h3_request_stream_ends_without_data<F, B, E>(
+    recv_data: F,
+    backend_read_timeout_ms: u64,
+) -> bool
+where
+    F: std::future::Future<Output = Result<Option<B>, E>>,
+{
+    let wait_ms = match backend_read_timeout_ms {
+        0 => H3_PREFLIGHT_END_OF_STREAM_WAIT_MS,
+        ms => ms.min(H3_PREFLIGHT_END_OF_STREAM_WAIT_MS),
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_millis(wait_ms), recv_data).await,
+        Ok(Ok(None))
+    )
+}
+
+/// [`h3_request_stream_ends_without_data`] over the live request stream.
+/// Built out of line and boxed so the timer and receive futures do not widen
+/// `handle_h3_request`'s frame.
+#[inline(never)]
+fn boxed_h3_request_stream_ends_without_data(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    backend_read_timeout_ms: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+    Box::pin(async move {
+        h3_request_stream_ends_without_data(stream.recv_data(), backend_read_timeout_ms).await
+    })
 }
 
 pub(crate) fn h3_plugin_protocol_for_request(
@@ -19221,6 +19572,100 @@ where
             }
         },
     }
+}
+
+type BoxedH3RefusalFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>;
+
+/// [`send_h3_proxy_hop_limit_refusal`], CONSTRUCTED OUT OF LINE and returned
+/// boxed, so `handle_h3_request` holds only the pointer across the await.
+#[inline(never)]
+fn boxed_send_h3_proxy_hop_limit_refusal<'a>(
+    stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &'a ProxyState,
+    http_flavor: HttpFlavor,
+    grpc_web: bool,
+    loop_detected: bool,
+) -> BoxedH3RefusalFuture<'a> {
+    let refusal =
+        send_h3_proxy_hop_limit_refusal(stream, state, http_flavor, grpc_web, loop_detected);
+    Box::pin(refusal)
+}
+
+/// The HTTP/3 answer to a request refused by the proxy hop limit (issue
+/// #6109), matching the H1/H2 frontend: `508 Loop Detected` with
+/// `X-Gateway-Error: loop_detected` when the received `X-Ferrum-Hops` count
+/// reached `FERRUM_MAX_PROXY_HOPS`, `400` (no token) when the field is
+/// malformed. Native gRPC gets Trailers-Only `FAILED_PRECONDITION` /
+/// `INVALID_ARGUMENT`. Plain HTTP, WebSocket, and gRPC-Web get the plain JSON
+/// answer for both refusals, exactly as the H1/H2 frontend answers gRPC-Web.
+/// Bodies are compiled-in literals that echo nothing.
+///
+/// `grpc_web` is the frontend's gRPC-Web content-type signal. This handler
+/// promotes a recognized gRPC-Web request to `HttpFlavor::Grpc` for its
+/// request-side decisions, so the refusal flavor is re-derived from the signal
+/// (`hop_limit::refusal_http_flavor`) for the branch, the head status, and the
+/// reject recording alike; without it a gRPC-Web client would get a native
+/// gRPC Trailers-Only answer it cannot read.
+async fn send_h3_proxy_hop_limit_refusal(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &ProxyState,
+    http_flavor: HttpFlavor,
+    grpc_web: bool,
+    loop_detected: bool,
+) -> Result<(), anyhow::Error> {
+    let http_flavor = crate::proxy::hop_limit::refusal_http_flavor(http_flavor, grpc_web);
+    let http_status = if loop_detected {
+        crate::proxy::hop_limit::warn_loop_detected(state.env_config.max_proxy_hops, "http3");
+        StatusCode::LOOP_DETECTED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    crate::diagnostic_ref::record_admission_fence(
+        crate::diagnostic_ref::current_h3_slot().as_ref(),
+        crate::proxy::hop_limit::refusal_rejection_phase(loop_detected),
+        h3_error_head_status(http_flavor, None, http_status),
+    );
+    record_h3_flavor_aware_reject(state, http_flavor, http_status.as_u16());
+    if loop_detected && !matches!(http_flavor, HttpFlavor::Grpc) {
+        // Plain, WebSocket, and gRPC-Web: the JSON body plus the gateway's own
+        // token.
+        return send_h3_reject_flavor_aware(
+            stream,
+            http_flavor,
+            http_status,
+            Bytes::from_static(crate::proxy::hop_limit::LOOP_DETECTED_BODY.as_bytes()),
+            &crate::proxy::loop_detected_reject_headers(),
+            RejectBodyDisposition::WireBody,
+        )
+        .await;
+    }
+    let (http_body, grpc_status, grpc_message) = if loop_detected {
+        (
+            crate::proxy::hop_limit::LOOP_DETECTED_BODY,
+            crate::proxy::grpc_proxy::grpc_status::FAILED_PRECONDITION,
+            crate::proxy::hop_limit::LOOP_DETECTED_GRPC_MESSAGE,
+        )
+    } else {
+        (
+            crate::proxy::hop_limit::INVALID_PROXY_HOPS_BODY,
+            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            crate::proxy::hop_limit::INVALID_PROXY_HOPS_GRPC_MESSAGE,
+        )
+    };
+    // No gRPC-Web content type: gRPC-Web was already mapped to `Plain` above,
+    // so native gRPC gets Trailers-Only and every other flavor gets the plain
+    // JSON `400`.
+    send_h3_error_flavor_aware(
+        stream,
+        http_flavor,
+        None,
+        http_status,
+        http_body,
+        grpc_status,
+        grpc_message,
+    )
+    .await
 }
 
 /// Flavor-aware rejection for H3. When the request is gRPC, emits a

@@ -933,6 +933,7 @@ fn upstream_override_without_snapshot_resets_source_tls() {
         sni: None,
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
+        tls_refused: false,
     };
     proxy_template.dispatch_port_overrides = Some(HashMap::from([(
         8080,
@@ -1002,6 +1003,7 @@ fn direct_backend_override_clears_existing_upstream_id() {
         sni: None,
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
+        tls_refused: false,
     };
     let proxy = Arc::new(proxy_template);
     let mut ctx = ctx();
@@ -1104,6 +1106,7 @@ fn explicit_tls_override_applies_to_clone() {
         sni: None,
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
+        tls_refused: false,
     });
 
     let result = ctx.apply_route_overrides(Arc::clone(&proxy));

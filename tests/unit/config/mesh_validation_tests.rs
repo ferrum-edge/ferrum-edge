@@ -2835,6 +2835,213 @@ fn mesh_config_validate_rejects_destination_rule_client_material_of_the_wrong_ki
 }
 
 #[test]
+fn mesh_config_validate_refuses_destination_rule_material_outside_the_rule_namespace() {
+    let destination_rule = |namespace: &str, client_certificate: &str, private_key: &str| {
+        let mut port_level_settings = HashMap::new();
+        port_level_settings.insert(
+            443,
+            MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some("managed://ca-bundles/platform#ca".into()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        MeshDestinationRule {
+            name: "partner".into(),
+            namespace: namespace.into(),
+            host: "partner.tenant-a.example".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Mutual,
+                    client_certificate: Some(client_certificate.into()),
+                    private_key: Some(private_key.into()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings,
+            subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
+        }
+    };
+
+    let scope_refusal = |error: &String| {
+        error.contains("namespace-scoped") || error.contains("namespace of the resource")
+    };
+
+    // A tenant rule naming another namespace's Secret and a store only the
+    // proxy's own credentials can read is refused at every TLS scope.
+    let foreign = MeshConfig {
+        destination_rules: vec![destination_rule(
+            "tenant-a",
+            "k8s://egress/partner-mtls#tls.crt",
+            "vault://secret/data/partner#tls.key",
+        )],
+        ..MeshConfig::default()
+    };
+    let errors = foreign.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("traffic_policy.tls.client_certificate")
+                && error.contains("namespace of the resource")
+        }),
+        "a cross-namespace Secret must be refused: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("traffic_policy.tls.private_key") && error.contains("secret-manager")
+        }),
+        "a gateway-credential store must be refused: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("port_level_settings[\"443\"].tls.ca_certificates")
+                && error.contains("secret-manager")
+        }),
+        "port-level material must be scoped too: {errors:?}"
+    );
+    assert!(
+        errors.iter().all(|error| !error.contains("partner-mtls")),
+        "diagnostics must not echo the reference: {errors:?}"
+    );
+
+    // The rule's own namespace stays admitted.
+    let mut own = destination_rule(
+        "tenant-a",
+        "k8s://tenant-a/client-tls#tls.crt",
+        "k8s://tenant-a/client-tls#tls.key",
+    );
+    own.port_level_settings.clear();
+    let own = MeshConfig {
+        destination_rules: vec![own],
+        ..MeshConfig::default()
+    };
+    let errors = own.validate();
+    assert!(
+        !errors.iter().any(scope_refusal),
+        "own-namespace material must stay admitted: {errors:?}"
+    );
+
+    // Mesh-operator policy in the root namespace is exempt.
+    let root = MeshConfig {
+        destination_rules: vec![destination_rule(
+            "istio-system",
+            "k8s://egress/partner-mtls#tls.crt",
+            "vault://secret/data/partner#tls.key",
+        )],
+        ..MeshConfig::default()
+    };
+    let errors = root.validate();
+    assert!(
+        !errors.iter().any(scope_refusal),
+        "root-namespace rules are operator policy and stay admitted: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_refuses_tenant_destination_rule_local_files_by_default() {
+    // No `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` is configured in the test
+    // process, so a tenant rule may name no gateway file at any scope.
+    let destination_rule = |namespace: &str| MeshDestinationRule {
+        name: "partner".into(),
+        namespace: namespace.into(),
+        host: "partner.tenant-a.example".into(),
+        traffic_policy: Some(MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Mutual,
+                client_certificate: Some("/etc/egress/partner/tls.crt".into()),
+                private_key: Some("file:///etc/egress/partner/tls.key".into()),
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        }),
+        port_level_settings: HashMap::new(),
+        subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
+    };
+    let file_refusal = |error: &String| error.contains("files on the gateway filesystem");
+
+    let tenant = MeshConfig {
+        destination_rules: vec![destination_rule("tenant-a")],
+        ..MeshConfig::default()
+    };
+    let errors = tenant.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("traffic_policy.tls.client_certificate") && file_refusal(error)
+        }),
+        "a tenant rule naming a gateway file must be refused: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("traffic_policy.tls.private_key") && file_refusal(error)
+        }),
+        "a `file://` reference is a gateway file too: {errors:?}"
+    );
+    assert!(
+        errors.iter().all(|error| !error.contains("/etc/egress")),
+        "diagnostics must not echo the path: {errors:?}"
+    );
+
+    // Mesh-operator policy in the root namespace keeps local files.
+    let root = MeshConfig {
+        destination_rules: vec![destination_rule("istio-system")],
+        ..MeshConfig::default()
+    };
+    let errors = root.validate();
+    assert!(
+        !errors.iter().any(file_refusal),
+        "root-namespace rules may name local files: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_refuses_subset_scope_destination_rule_material() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "partner".into(),
+            namespace: "tenant-a".into(),
+            host: "partner.tenant-a.example".into(),
+            traffic_policy: None,
+            port_level_settings: HashMap::new(),
+            subsets: vec![MeshSubset {
+                name: "v1".into(),
+                labels: HashMap::new(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    tls: Some(MeshTrafficPolicyTls {
+                        mode: MtlsMode::Mutual,
+                        client_certificate: Some("k8s://egress/partner-mtls#tls.crt".into()),
+                        private_key: Some("k8s://egress/partner-mtls#tls.key".into()),
+                        ..MeshTrafficPolicyTls::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+            }],
+            export_to: vec!["*".to_string()],
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    for field in ["client_certificate", "private_key"] {
+        assert!(
+            errors.iter().any(|error| {
+                error.contains(&format!("subsets[0].traffic_policy.tls.{field}"))
+                    && error.contains("namespace of the resource")
+            }),
+            "subset-scope {field} naming another namespace's Secret must be refused: {errors:?}"
+        );
+    }
+    assert!(
+        errors.iter().all(|error| !error.contains("partner-mtls")),
+        "diagnostics must not echo the reference: {errors:?}"
+    );
+}
+
+#[test]
 fn mesh_config_validate_rejects_tracing_percentage_bounds() {
     let mesh = MeshConfig {
         telemetry_resources: vec![MeshTelemetryResource {

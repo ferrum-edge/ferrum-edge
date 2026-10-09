@@ -37,6 +37,7 @@ mod unit {
         mod ai_tool_governor_tests;
         mod ai_transcript_audit_tests;
         mod ai_usage_stream_tests;
+        mod ambient_cloud_credentials_tests;
         mod api_chargeback_sink_tests;
         mod api_chargeback_tests;
         mod auth_flow_credential_deadline_tests;

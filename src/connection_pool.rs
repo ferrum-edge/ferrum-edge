@@ -467,7 +467,13 @@ impl ConnectionPool {
     }
 
     /// Get or create a client for the given proxy using global defaults + proxy overrides.
+    ///
+    /// A refused destination ([`crate::config::types::BackendTlsConfig::tls_refused`])
+    /// fails before the pool lookup and the bounded TLS build queue. The shared
+    /// client always carries a TLS config, so this holds for `http` dispatch too.
     pub async fn get_client(&self, proxy: &Proxy) -> Result<reqwest::Client> {
+        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
+            .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?;
         self.pool
             .get(proxy, &proxy.backend_host, proxy.backend_port, 0)
             .await
@@ -583,7 +589,9 @@ impl ConnectionPool {
         let mut seen = HashSet::new();
         let mut prebuilds = Vec::new();
         for proxy in &config.proxies {
-            if proxy.dispatch_kind != DispatchKind::HttpsPool {
+            // A refused destination would only fail on the executor; the
+            // request path refuses it without building.
+            if proxy.dispatch_kind != DispatchKind::HttpsPool || proxy.resolved_tls.tls_refused {
                 continue;
             }
             let enable_http2 = manager.global_config.effective_enable_http2(proxy);
@@ -655,6 +663,8 @@ impl ConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
+        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
         let manager = self.pool.manager();
         manager
             .backend_h3_tls_configs
@@ -682,6 +692,8 @@ impl ConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
+        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
+            .map_err(|e| anyhow::anyhow!("Failed to build WebSocket backend TLS config: {}", e))?;
         let manager = self.pool.manager();
         manager
             .backend_ws_tls_configs

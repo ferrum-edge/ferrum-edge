@@ -295,6 +295,46 @@ pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, Str
     Ok(value.min(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
 }
 
+/// Settings key for the directories tenant DestinationRules may name TLS
+/// material files under.
+pub const MESH_TENANT_TLS_FILE_ROOTS_KEY: &str = "FERRUM_MESH_TENANT_TLS_FILE_ROOTS";
+
+/// Pure parse/validation for `FERRUM_MESH_TENANT_TLS_FILE_ROOTS`.
+///
+/// Comma-separated absolute directories; blank entries are ignored and an
+/// unset or blank value yields no roots (tenant DestinationRules may name no
+/// local file). Each entry must be absolute, contain no `..` component, and
+/// not be the filesystem root. Diagnostics name the entry position only.
+/// Used by [`EnvConfig`] and
+/// [`crate::tls::source::effective_mesh_tenant_tls_file_roots`].
+pub fn parse_mesh_tenant_tls_file_roots(
+    raw: Option<&str>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut roots = Vec::new();
+    let Some(raw) = raw else {
+        return Ok(roots);
+    };
+    for (index, entry) in raw.split(',').map(str::trim).enumerate() {
+        if entry.is_empty() {
+            continue;
+        }
+        let path = std::path::PathBuf::from(entry);
+        let has_parent_component = path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir));
+        if !path.is_absolute() || has_parent_component || path.parent().is_none() {
+            return Err(format!(
+                "{MESH_TENANT_TLS_FILE_ROOTS_KEY} entry {index} must be an absolute directory \
+                 without `..` components and must not be the filesystem root"
+            ));
+        }
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
 /// Settings key for the shared TLS state document byte ceiling.
 pub const TLS_STORE_MAX_DOCUMENT_BYTES_KEY: &str = "FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES";
 /// Default shared TLS state document byte ceiling (16 MiB).
@@ -2734,6 +2774,22 @@ pub struct EnvConfig {
     /// false for one release; when true, CP also watches core resources and
     /// derives mesh services/workloads from ready pods.
     pub k8s_pod_discovery_enabled: bool,
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. Let a Gateway API
+    /// backendRef to a selector-less Service in the route's own namespace
+    /// reach EndpointSlice IPs that no observed Pod, Service ClusterIP, Node
+    /// address, or Node Pod CIDR claims (an external database or VM). Never
+    /// admits another namespace's observed Pods, FQDN endpoints,
+    /// loopback/link-local/unspecified/multicast/cloud-metadata addresses, or
+    /// a Service it cannot check because pod discovery is off. Default: false.
+    ///
+    /// Active only while the controller watches Nodes: it also needs
+    /// `FERRUM_K8S_CONTROLLER_ENABLED`, `FERRUM_K8S_POD_DISCOVERY_ENABLED`, and
+    /// `FERRUM_K8S_NODE_LOCALITY_ENABLED` (with `nodes` list/watch RBAC), and a
+    /// reconcile that has observed at least one Node. Without the Node watch
+    /// a Node address or an unwatched Pod's IP looks external, so the CP logs a
+    /// startup warning ([`Self::k8s_selectorless_external_endpoints_inactive_reason`])
+    /// or a reconcile warning and keeps refusing unattributed IPs.
+    pub k8s_allow_selectorless_external_endpoints: bool,
     /// Namespace where the Ferrum K8s controller and ambient NodeWaypoint
     /// DaemonSet are installed. Defaults to `FERRUM_NAMESPACE`; Helm sets it
     /// to `.Release.Namespace` so managed workload namespace overrides do not
@@ -2741,7 +2797,9 @@ pub struct EnvConfig {
     pub k8s_controller_namespace: String,
     /// Enable cluster-scoped Node watching to enrich auto-discovered pod
     /// workloads with topology.kubernetes.io/{region,zone}. Requires
-    /// `FERRUM_K8S_POD_DISCOVERY_ENABLED=true` and Node RBAC. Default: false.
+    /// `FERRUM_K8S_POD_DISCOVERY_ENABLED=true` and Node RBAC. The Node watch
+    /// is also what `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS` needs to
+    /// take effect. Default: false.
     pub k8s_node_locality_enabled: bool,
     /// Comma-separated namespaces to watch for CRDs. Empty = all namespaces
     /// (requires ClusterRole). Default: "" (all).
@@ -2819,6 +2877,10 @@ pub struct EnvConfig {
     pub max_single_header_size_bytes: usize,
     /// Maximum number of request headers allowed. 0 = unlimited.
     pub max_header_count: usize,
+    /// Gateway hops (`X-Ferrum-Hops`) an HTTP-family request may already have
+    /// crossed before this gateway refuses it with `508 Loop Detected`
+    /// (issue #6109). `0` disables the limit; the `u8` type bounds it to 255.
+    pub max_proxy_hops: u8,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
     /// Fail-closed per-response ceiling applied when the effective response-body
@@ -3268,6 +3330,13 @@ pub struct EnvConfig {
     /// `Semaphore::MAX_PERMITS`. A larger configured value is a validation
     /// error, never a silent clamp and never a silent "unlimited".
     pub http3_connect_udp_max_sessions: usize,
+    /// Maximum concurrent RFC 9298 CONNECT-UDP tunnels per resolved client
+    /// (default 32). `0` disables the per-client cap. IPv4 is keyed per
+    /// address; IPv6 sources in one [`Self::per_ip_ipv6_prefix`] network
+    /// (`FERRUM_PER_IP_IPV6_PREFIX`, default `/64`) share a budget. The slot is
+    /// held for the tunnel's lifetime, so one client cannot occupy every
+    /// `http3_connect_udp_max_sessions` slot.
+    pub http3_connect_udp_max_sessions_per_ip: u64,
     /// Seconds a CONNECT-UDP tunnel may carry no datagram in either direction
     /// before it is closed (default 120). RFC 9298 §3.2 recommends that a UDP
     /// proxy "SHOULD NOT" use an idle timeout shorter than two minutes, so the
@@ -3303,6 +3372,13 @@ pub struct EnvConfig {
     /// via black-hole detection if a smaller MTU is required. Legal range:
     /// [1200, 65527] (quinn's accepted bounds).
     pub http3_initial_mtu: u16,
+    /// Concurrent QUIC handshakes each HTTP/3 frontend listener runs for
+    /// clients whose source address has not been validated (default: 1024).
+    /// Those handshakes are held in this budget rather than the shared
+    /// overload connection budget until they complete; further unvalidated
+    /// Initials are answered with a stateless QUIC Retry. `0` sends a Retry to
+    /// every unvalidated client.
+    pub http3_max_unvalidated_handshakes: usize,
 
     // Connection pool warmup
     /// Pre-establish backend connections at startup (default: true).
@@ -3767,6 +3843,11 @@ pub struct EnvConfig {
     /// Uses the same client IP resolution as trusted proxy XFF walk.
     /// Default: 0 (disabled). When exceeded, returns 429 Too Many Requests.
     pub max_concurrent_requests_per_ip: u64,
+    /// IPv6 prefix for gateway-wide per-IP caps (FERRUM_PER_IP_IPV6_PREFIX).
+    /// IPv4 clients always use their full address. Default: 64. Range: 1..=128.
+    /// IPv4 clients translated by NAT64/SIIT arrive as IPv6 (for example
+    /// `64:ff9b::/96`) and therefore share one prefix budget.
+    pub per_ip_ipv6_prefix: u8,
     /// Interval in seconds between cleanup sweeps for per-IP request and
     /// WebSocket-session counters. Removes entries where the active count has
     /// dropped to zero. Relevant when `max_concurrent_requests_per_ip > 0`
@@ -4226,6 +4307,7 @@ impl Default for EnvConfig {
             node_agent_cni_socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
+            k8s_allow_selectorless_external_endpoints: false,
             k8s_controller_namespace: "ferrum".to_string(),
             k8s_node_locality_enabled: false,
             k8s_watch_namespaces: Vec::new(),
@@ -4249,6 +4331,7 @@ impl Default for EnvConfig {
             max_header_size_bytes: 32_768,
             max_single_header_size_bytes: 16_384,
             max_header_count: 100,
+            max_proxy_hops: crate::proxy::hop_limit::DEFAULT_MAX_PROXY_HOPS,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
             response_buffer_fallback_max_bytes:
@@ -4347,11 +4430,14 @@ impl Default for EnvConfig {
             http3_websocket_enabled: true,
             http3_connect_udp_enabled: false,
             http3_connect_udp_max_sessions: 256,
+            http3_connect_udp_max_sessions_per_ip: 32,
             http3_connect_udp_idle_timeout_seconds: 120,
             http3_connect_udp_max_datagram_bytes:
                 crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES,
             h3_request_body_drain_ms: 50,
             http3_initial_mtu: 1500,
+            http3_max_unvalidated_handshakes:
+                crate::http3::address_validation::H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT,
             pool_warmup_enabled: true,
             pool_http1_direct: true,
             pool_warmup_concurrency: 500,
@@ -4444,6 +4530,7 @@ impl Default for EnvConfig {
             max_connections: 100_000,
             max_requests: 0,
             max_concurrent_requests_per_ip: 0,
+            per_ip_ipv6_prefix: 64,
             per_ip_cleanup_interval_seconds: 60,
             max_concurrent_fault_delays: DEFAULT_MAX_CONCURRENT_FAULT_DELAYS,
             circuit_breaker_cache_max_entries: 10_000,
@@ -4870,6 +4957,7 @@ impl EnvConfig {
             node_agent_cni_socket_path: String = "FERRUM_NODE_AGENT_CNI_SOCKET_PATH" => "/var/run/ferrum/node-agent-cni.sock".to_string();
             k8s_controller_namespace: String = "FERRUM_K8S_CONTROLLER_NAMESPACE" => namespace.clone();
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
+            k8s_allow_selectorless_external_endpoints: bool = "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
@@ -4909,6 +4997,7 @@ impl EnvConfig {
             max_header_size_bytes: usize = "FERRUM_MAX_HEADER_SIZE_BYTES" => 32_768usize;
             max_single_header_size_bytes: usize = "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES" => 16_384usize;
             max_header_count: usize = "FERRUM_MAX_HEADER_COUNT" => 100usize;
+            max_proxy_hops: u8 = "FERRUM_MAX_PROXY_HOPS" => crate::proxy::hop_limit::DEFAULT_MAX_PROXY_HOPS;
             max_request_body_size_bytes: usize = "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES" => 10_485_760usize;
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
             response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
@@ -4997,10 +5086,12 @@ impl EnvConfig {
             http3_websocket_enabled: bool = "FERRUM_HTTP3_WEBSOCKET_ENABLED" => true;
             http3_connect_udp_enabled: bool = "FERRUM_HTTP3_CONNECT_UDP_ENABLED" => false;
             http3_connect_udp_max_sessions: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS" => 256usize;
+            http3_connect_udp_max_sessions_per_ip: u64 = "FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP" => 32u64;
             http3_connect_udp_idle_timeout_seconds: u64 = "FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS" => 120u64, clamp(1u64, 86_400u64);
             http3_connect_udp_max_datagram_bytes: usize = "FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES" => crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES, clamp(1usize, crate::http3::connect_udp::CONNECT_UDP_MAX_PAYLOAD_BYTES);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
+            http3_max_unvalidated_handshakes: usize = "FERRUM_HTTP3_MAX_UNVALIDATED_HANDSHAKES" => crate::http3::address_validation::H3_MAX_UNVALIDATED_HANDSHAKES_DEFAULT;
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
             pool_http1_direct: bool = "FERRUM_POOL_HTTP1_DIRECT" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
@@ -5057,6 +5148,13 @@ impl EnvConfig {
                 crate::tls::source::MaterialError::InvalidSource { details, .. } => details,
                 other => other.to_string(),
             })?;
+
+        // Shared by the Kubernetes translator, mesh slice validation, and
+        // DestinationRule application, so install one process snapshot.
+        let mesh_tenant_tls_file_roots = parse_mesh_tenant_tls_file_roots(
+            resolve_var(conf, MESH_TENANT_TLS_FILE_ROOTS_KEY).as_deref(),
+        )?;
+        crate::tls::source::install_mesh_tenant_tls_file_roots(mesh_tenant_tls_file_roots)?;
 
         let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
             parse_tls_source_execution_policy(
@@ -5181,6 +5279,7 @@ impl EnvConfig {
             max_connections: usize = "FERRUM_MAX_CONNECTIONS" => 100_000usize;
             max_requests: usize = "FERRUM_MAX_REQUESTS" => 0usize;
             max_concurrent_requests_per_ip: u64 = "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP" => 0u64;
+            per_ip_ipv6_prefix: u8 = "FERRUM_PER_IP_IPV6_PREFIX" => 64u8;
             per_ip_cleanup_interval_seconds: u64 = "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS" => 60u64;
             max_concurrent_fault_delays: usize = "FERRUM_MAX_CONCURRENT_FAULT_DELAYS" => DEFAULT_MAX_CONCURRENT_FAULT_DELAYS;
             circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
@@ -5764,6 +5863,7 @@ impl EnvConfig {
             node_agent_cni_socket_path,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
+            k8s_allow_selectorless_external_endpoints,
             k8s_controller_namespace,
             k8s_node_locality_enabled,
             k8s_watch_namespaces,
@@ -5787,6 +5887,7 @@ impl EnvConfig {
             max_header_size_bytes,
             max_single_header_size_bytes,
             max_header_count,
+            max_proxy_hops,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
             response_buffer_fallback_max_bytes,
@@ -5872,10 +5973,12 @@ impl EnvConfig {
             http3_websocket_enabled,
             http3_connect_udp_enabled,
             http3_connect_udp_max_sessions,
+            http3_connect_udp_max_sessions_per_ip,
             http3_connect_udp_idle_timeout_seconds,
             http3_connect_udp_max_datagram_bytes,
             h3_request_body_drain_ms,
             http3_initial_mtu,
+            http3_max_unvalidated_handshakes,
             pool_warmup_enabled,
             pool_http1_direct,
             pool_warmup_concurrency,
@@ -5971,6 +6074,7 @@ impl EnvConfig {
             max_connections,
             max_requests,
             max_concurrent_requests_per_ip,
+            per_ip_ipv6_prefix,
             per_ip_cleanup_interval_seconds,
             max_concurrent_fault_delays,
             circuit_breaker_cache_max_entries,
@@ -6706,6 +6810,35 @@ impl EnvConfig {
         self.db_tls_mode.is_some_and(DbTlsMode::enables_tls)
     }
 
+    /// The setting that keeps a requested
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true` from taking
+    /// effect, or `None` when it was not requested or can take effect. The
+    /// opt-in needs the Node watch: without it a Node address, or the IP of a
+    /// Pod outside the Pod watch scope, cannot be told from an external host.
+    pub fn k8s_selectorless_external_endpoints_inactive_reason(&self) -> Option<&'static str> {
+        if !self.k8s_allow_selectorless_external_endpoints {
+            None
+        } else if !self.k8s_controller_enabled {
+            Some("FERRUM_K8S_CONTROLLER_ENABLED=false")
+        } else if !self.k8s_pod_discovery_enabled {
+            Some("FERRUM_K8S_POD_DISCOVERY_ENABLED=false")
+        } else if !self.k8s_node_locality_enabled {
+            Some("FERRUM_K8S_NODE_LOCALITY_ENABLED=false")
+        } else {
+            None
+        }
+    }
+
+    /// Whether `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true` was
+    /// requested and the Node watch it needs is configured. Each reconcile
+    /// additionally requires at least one observed Node.
+    pub fn k8s_selectorless_external_endpoints_active(&self) -> bool {
+        self.k8s_allow_selectorless_external_endpoints
+            && self
+                .k8s_selectorless_external_endpoints_inactive_reason()
+                .is_none()
+    }
+
     pub fn mongodb_tls_allows_invalid_certs(&self) -> bool {
         // SECURITY: MongoDB maps `FERRUM_DB_TLS_MODE=require` to
         // `TlsOptions::allow_invalid_certificates=true`: encryption is required,
@@ -7005,13 +7138,21 @@ impl EnvConfig {
     /// still be rejected by a later check, and the non-serving
     /// `ferrum-edge validate` command must not touch the live process at all.
     ///
-    /// Currently one setting: the finite authenticated-stream maximum that
-    /// bounds every admitted authenticated non-WebSocket stream
-    /// (`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`). `validate` has
-    /// already constrained it to `1..=86400`.
+    /// Two settings:
+    ///
+    /// * the finite authenticated-stream maximum that bounds every admitted
+    ///   authenticated non-WebSocket stream
+    ///   (`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`). `validate` has
+    ///   already constrained it to `1..=86400`.
+    /// * the frontend HTTP/2 initial stream window
+    ///   (`FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE`, already clamped at
+    ///   parse), which sizes the upload pump's post-cancel reset probe.
     pub(crate) fn publish_process_wide_stream_settings(&self) {
         crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(
             self.authenticated_stream_max_lifetime_seconds,
+        );
+        crate::proxy::upload_pump::publish_frontend_h2_stream_window(
+            self.frontend_h2_initial_stream_window_size,
         );
     }
 
@@ -7089,6 +7230,7 @@ impl EnvConfig {
         }
 
         self.validate_h3_connect_udp_limits()?;
+        self.validate_per_ip_ipv6_prefix()?;
         self.validate_h3_flow_control_windows()?;
         self.validate_mesh_app_probe_limits()?;
 
@@ -8618,6 +8760,16 @@ impl EnvConfig {
                  deliberately.",
                 self.cp_grpc_max_connections_per_ip, self.cp_grpc_max_connections
             ));
+        }
+        Ok(())
+    }
+
+    /// Validate the IPv6 grouping prefix used by gateway-wide per-IP caps.
+    pub fn validate_per_ip_ipv6_prefix(&self) -> Result<(), String> {
+        if !(1..=128).contains(&self.per_ip_ipv6_prefix) {
+            return Err(
+                "FERRUM_PER_IP_IPV6_PREFIX must be between 1 and 128 (inclusive)".to_string(),
+            );
         }
         Ok(())
     }

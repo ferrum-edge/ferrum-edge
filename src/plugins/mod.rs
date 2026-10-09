@@ -2350,6 +2350,15 @@ pub struct RequestContext {
     /// this with `request_authority` because browsers also trust HTTP localhost
     /// and loopback origins.
     pub request_is_secure: bool,
+    /// Gateway-owned `X-Ferrum-Hops` count the frontend stamped for this
+    /// request (`received + 1`, issue #6109), or `None` when
+    /// `FERRUM_MAX_PROXY_HOPS=0` disables the hop limit. The frontend stamps
+    /// it on the raw header block; the dispatch ladder and every later
+    /// gateway-assertion refresh re-assert
+    /// `proxy::hop_limit::effective_outbound_proxy_hops` on the outbound map
+    /// (the received count for a mesh inbound hop to the local workload).
+    /// Plugins must not rely on it.
+    pub outbound_proxy_hops: Option<u8>,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -2435,8 +2444,8 @@ pub struct RequestContext {
     /// matching `Consumer` exists in the gateway. Used as the rate-limit key and
     /// for `consumer_username` in transaction logs.
     pub authenticated_identity: Option<String>,
-    /// Human-readable identity for the `X-Consumer-Username` header sent to the
-    /// backend. Falls back to `authenticated_identity` when not set separately.
+    /// Unverified display identity requested by the authentication provider.
+    /// This is forwarded separately from the gateway-owned Consumer username.
     pub authenticated_identity_header: Option<String>,
     /// Verified security realm of [`Self::authenticated_identity`]: the
     /// mechanism and verifying authority (issuer, key source, directory) that
@@ -3526,6 +3535,16 @@ pub struct RequestContext {
     /// path could not resolve one; the guard then admits no own-pod
     /// destination and falls back to the termination inventory alone.
     pub mesh_inbound_terminator_ip: Option<std::net::IpAddr>,
+    /// Whether this request is a mesh CONNECT (byte-stream or datagram HBONE)
+    /// whose payload the proxy relays opaquely instead of parsing.
+    ///
+    /// The CONNECT's own method, path, authority, headers and request
+    /// credentials describe the tunnel, not the application requests written
+    /// into it, so `mesh_authz` must treat every HTTP-only attribute as
+    /// unobservable for it. Set by the proxy from the request's wire shape
+    /// before any plugin runs; it can only be set, never cleared, so no plugin
+    /// can return a relay to ordinary HTTP evaluation.
+    hbone_connect_relay: bool,
     /// Set exactly once by `run_finalized_request_egress_hooks` when the
     /// finalized-request-egress phase has run for this request. The phase is
     /// reachable from several dispatch ladders (H1/H2 terminal preparation,
@@ -4002,6 +4021,7 @@ impl RequestContext {
             raw_path: None,
             request_authority: None,
             request_is_secure: false,
+            outbound_proxy_hops: None,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
@@ -4165,6 +4185,7 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
             mesh_inbound_terminator_ip: None,
+            hbone_connect_relay: false,
             finalized_request_egress_dispatched: false,
         }
     }
@@ -5490,6 +5511,7 @@ impl RequestContext {
             path: self.path.clone(),
             raw_path: self.raw_path.clone(),
             request_authority: self.request_authority.clone(),
+            outbound_proxy_hops: self.outbound_proxy_hops,
             request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
@@ -5780,6 +5802,7 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
             mesh_inbound_terminator_ip: self.mesh_inbound_terminator_ip,
+            hbone_connect_relay: self.hbone_connect_relay,
             // The finalized-request-egress phase always runs against the REAL
             // request context (mirror admission leases, mirror result
             // receivers, and serverless terminate provenance all live there and
@@ -6550,12 +6573,13 @@ impl RequestContext {
     ///
     /// Covers the whole gateway-owned `x-consumer-*` namespace
     /// ([`crate::proxy::headers::is_consumer_assertion_header`]), the private
-    /// GeoIP result, and route path-param captures. `name` is expected to be
-    /// lowercase (the `HeaderName` form).
+    /// GeoIP result, and route path-param captures
+    /// ([`crate::proxy::headers::is_path_param_assertion_header`]). Each treats
+    /// `_` as `-`, the folding CGI-style backends apply.
     #[inline]
     pub fn is_reserved_gateway_assertion_header(name: &str) -> bool {
         crate::proxy::headers::is_gateway_assertion_header(name)
-            || name.starts_with("x-path-param-")
+            || crate::proxy::headers::is_path_param_assertion_header(name)
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
@@ -6911,6 +6935,18 @@ impl RequestContext {
         self.peer_spiffe_certificate_principal
     }
 
+    /// Whether this request is a mesh CONNECT whose payload is relayed
+    /// opaquely (see the `hbone_connect_relay` field).
+    pub fn is_hbone_connect_relay(&self) -> bool {
+        self.hbone_connect_relay
+    }
+
+    /// Mark this request as a mesh CONNECT whose payload is relayed opaquely.
+    /// There is deliberately no way to clear the mark.
+    pub fn mark_hbone_connect_relay(&mut self) {
+        self.hbone_connect_relay = true;
+    }
+
     /// Admit a certificate-derived peer SPIFFE principal together with the
     /// leaf's authorization deadline (GHSA-qqg9-3r2g-fh44).
     ///
@@ -6934,10 +6970,7 @@ impl RequestContext {
         self.observe_credential_deadline(deadline);
     }
 
-    /// Return the identity value to forward to the backend in
-    /// `X-Consumer-Username`. This prefers the gateway Consumer username, then
-    /// a plugin-provided display/header identity, then the raw external auth
-    /// identity.
+    /// Return the gateway-mapped Consumer username for the backend assertion.
     ///
     /// Returns `None` when a plugin set the shared
     /// [`SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY`] marker (e.g.
@@ -6948,16 +6981,22 @@ impl RequestContext {
     /// itself stays resolved — `effective_identity()` is unaffected, so rate
     /// limiting, logging, and policy plugins keep working.
     pub fn backend_consumer_username(&self) -> Option<&str> {
-        let username = self
-            .identified_consumer
-            .as_ref()
-            .map(|consumer| consumer.username.as_str())
-            .or_else(|| meaningful_identity(self.authenticated_identity_header.as_deref()))
-            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))?;
         if self.suppresses_backend_consumer_identity_headers() {
             return None;
         }
-        Some(username)
+        self.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str())
+    }
+
+    /// Return the external identity for its distinct backend header.
+    pub fn backend_authenticated_identity(&self) -> Option<&str> {
+        if self.suppresses_backend_consumer_identity_headers() || self.identified_consumer.is_some()
+        {
+            return None;
+        }
+        meaningful_identity(self.authenticated_identity_header.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Return the Consumer custom ID to forward to the backend, if a gateway
@@ -10318,6 +10357,17 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Whether this instance answers a matched CORS preflight itself rather
+    /// than forwarding it upstream (the `cors` plugin without
+    /// `preflight_continue`). The plain HTTP view of a gRPC-intended route
+    /// exempts a CORS preflight from its route-admission refusal only when the
+    /// view carries such an instance, and refuses an exempted preflight that
+    /// no plugin answered (issue #6110,
+    /// `PluginCapabilities::ANSWERS_CORS_PREFLIGHTS`).
+    fn answers_cors_preflights(&self) -> bool {
+        false
+    }
+
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.
     async fn authenticate(
         &self,
@@ -12123,6 +12173,39 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Returns `true` if this instance is request-admission policy a route
+    /// relies on: authentication, or a control that refuses requests the route
+    /// must not serve (schema validation, abuse and quota limits, AI request
+    /// guardrails).
+    ///
+    /// The client chooses the request flavor (native gRPC by `Content-Type`,
+    /// gRPC-Web by its `Content-Type`, WebSocket by upgrade headers, plain HTTP
+    /// by sending none of those), and each flavor runs only the plugins whose
+    /// [`Self::supported_protocols`] include it. The plugin cache marks a view
+    /// that drops an instance like this, and the proxy refuses the request
+    /// rather than dispatching it without the policy. Three directions apply:
+    ///
+    /// - The native-gRPC and WebSocket views are marked when they omit an
+    ///   instance the route's HTTP view runs. Route-scoped and global
+    ///   instances both count.
+    /// - The plain HTTP and WebSocket views of a gRPC-intended route are
+    ///   marked when they omit an instance that runs on native gRPC (issue
+    ///   #6110). Only an instance the route itself is configured with (proxy
+    ///   or proxy-group scope) counts: a global gRPC-only instance says nothing
+    ///   about one route's intent. A CORS preflight is exempt from this one
+    ///   refusal, because it invokes no gRPC method.
+    /// - The composed gRPC-Web view, which keeps every HTTP plugin plus
+    ///   `grpc_method_router` and `grpc_deadline`, is marked when it omits any
+    ///   other instance that runs on native gRPC but not on HTTP. Global
+    ///   instances count, because a gRPC-Web request declares gRPC intent.
+    ///
+    /// Defaults to [`Self::is_auth_plugin`], so every authentication plugin —
+    /// including a custom one that keeps the HTTP-only protocol default —
+    /// participates without opting in.
+    fn gates_request_admission(&self) -> bool {
+        self.is_auth_plugin()
+    }
+
     /// Cache-build diagnostic: whether this instance has an execution trigger.
     fn has_execution_trigger(&self) -> bool {
         false
@@ -13798,6 +13881,7 @@ mod tests {
             sni: None,
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
+            tls_refused: false,
         };
 
         let canary: Upstream = serde_json::from_value(json!({

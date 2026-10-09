@@ -991,9 +991,32 @@ def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
     ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
     node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
     for name, doc in (("ambient", ambient), ("node-agent", node_agent)):
-        for cap in ("BPF", "PERFMON", "SYS_ADMIN"):
+        for cap in ("BPF", "PERFMON"):
             _unquoted_cap(doc, cap, name)
+    _unquoted_cap(ambient, "SYS_ADMIN", "ambient")
     _unquoted_cap(ambient, "SYS_PTRACE", "ambient")
+    _unquoted_cap(node_agent, "NET_ADMIN", "node-agent")
+    # Issue #6112: the node-agent resolves veths from host routes and host
+    # sysfs and never enters a pod netns, so NodeWaypoint must not widen it with
+    # SYS_ADMIN or pod-scoped hostPID. Only the ambient proxy keeps them.
+    if re.search(r'(?m)^\s*- "?SYS_ADMIN"?\s*$', node_agent):
+        fail(
+            "node-agent SYS_ADMIN granted",
+            "NodeWaypoint must not add SYS_ADMIN to the node-agent; it is only the "
+            "kernel < 5.8 dropCapSysAdmin=false back-compat grant",
+        )
+    forbid_text(
+        node_agent,
+        "hostPID:",
+        "node-agent hostPID granted",
+        "the node-agent reads no per-pod /proc state and must not render hostPID",
+    )
+    require_text(
+        ambient,
+        "hostPID: true",
+        "NodeWaypoint ambient hostPID missing",
+        "the NodeWaypoint proxy still enters pod netns and must keep hostPID",
+    )
     # This capture sets ambient.env.FERRUM_ADMIN_HTTP_PORT, so it also proves
     # the steady-state env loop does not re-emit what ferrum-mesh.adminEnv
     # rendered. Scoped past `containers:` so the one-shot preflight init
@@ -1026,6 +1049,27 @@ def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
     print("mesh node-waypoint eBPF capabilities ok")
 
 
+def validate_node_waypoint_kernel57_sys_admin(results_dir: Path) -> None:
+    # Issue #6112: dropCapSysAdmin=false is the only remaining node-agent
+    # SYS_ADMIN grant (kernel 5.7.x BPF back-compat). Pin that it still works
+    # in node_waypoint mode and still renders no pod-scoped hostPID.
+    rendered = require_capture(
+        results_dir, "mesh-node-waypoint-kernel57-sys-admin.yaml"
+    ).read_text(encoding="utf-8")
+    node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    _unquoted_cap(node_agent, "SYS_ADMIN", "node-agent (dropCapSysAdmin=false)")
+    for cap in ("BPF", "NET_ADMIN", "PERFMON"):
+        _unquoted_cap(node_agent, cap, "node-agent (dropCapSysAdmin=false)")
+    forbid_text(
+        node_agent,
+        "hostPID:",
+        "node-agent hostPID granted",
+        "the kernel 5.7 dropCapSysAdmin=false grant adds SYS_ADMIN only; the "
+        "node-agent must still render no hostPID",
+    )
+    print("mesh node-waypoint kernel 5.7 SYS_ADMIN back-compat ok")
+
+
 def validate_udp_cleanup_upgrade(results_dir: Path) -> None:
     rendered = require_capture(
         results_dir, "udp-placement-pod-host-cleanup.yaml"
@@ -1048,6 +1092,73 @@ def validate_udp_cleanup_upgrade(results_dir: Path) -> None:
             "the positive --is-upgrade cleanup fixture must stamp phase=cleanup",
         )
     print("mesh UDP cleanup upgrade capabilities ok")
+
+
+def init_container_block(doc: str, name: str, workload: str) -> str:
+    """Return one rendered pod-level init container, up to its next sibling.
+
+    Pod-level list items sit at eight spaces in a DaemonSet render; env and
+    volumeMount items are deeper, so they cannot end the block early.
+    """
+    match = re.search(
+        rf"(?ms)^        - name:\s*{re.escape(name)}\s*$(.*?)(?=^        - name:|^      [A-Za-z])",
+        doc,
+    )
+    if match is None:
+        fail(
+            "Mesh init container missing from render",
+            f"{workload} must render the {name} init container",
+        )
+        raise AssertionError("unreachable")
+    return match.group(1)
+
+
+def validate_cni_lifecycle_capabilities(results_dir: Path) -> None:
+    """Issue #6122: the CNI lifecycle init containers hold no capabilities.
+
+    They run as uid 0 only to own the root-owned host CNI directories. The
+    installer chmods only staging files it created and never chowns, so
+    CAP_DAC_OVERRIDE / CAP_CHOWN / CAP_FOWNER are not needed; the rollback
+    sidecar only removes and reads in those same directories. The runtime
+    proof is the CNI Lifecycle Live suite's chart install.
+    """
+    captures = (
+        ("cni-lifecycle-rendered.yaml", ("ferrum-cni-rollback", "ferrum-cni-installer")),
+        ("cni-no-rollback.yaml", ("ferrum-cni-installer",)),
+        ("mesh-image-pull-secrets.yaml", ("ferrum-cni-rollback", "ferrum-cni-installer")),
+    )
+    for capture, containers in captures:
+        rendered = require_capture(results_dir, capture).read_text(encoding="utf-8")
+        node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+        for container in containers:
+            block = init_container_block(node_agent, container, f"{capture} node-agent")
+            where = f"{container} in {capture}"
+            if not re.search(
+                r'(?m)^\s*drop:\s*(?:\[\s*"?ALL"?\s*\]|\n\s*- "?ALL"?)\s*$', block
+            ):
+                fail(
+                    "CNI init container keeps capabilities",
+                    f"{where} must render capabilities.drop: [ALL]",
+                )
+            if re.search(r"(?m)^\s*add:", block):
+                fail(
+                    "CNI init container adds capabilities",
+                    f"{where} needs no capability: it owns the root-owned host CNI "
+                    "directories as uid 0, chmods only files it created, and never chowns",
+                )
+            for key, value in (
+                ("allowPrivilegeEscalation", "false"),
+                ("readOnlyRootFilesystem", "true"),
+                ("privileged", "false"),
+            ):
+                require_scalar(
+                    block,
+                    key,
+                    value,
+                    "CNI init container securityContext weakened",
+                    f"{where} must render {key}: {value}",
+                )
+    print("mesh cni lifecycle init container capabilities ok")
 
 
 def validate_image_pull_secrets(results_dir: Path) -> None:
@@ -1108,7 +1219,9 @@ def main() -> int:
     validate_mapped_admin_and_probe_source(results_dir)
     validate_admin_env_override(results_dir)
     validate_node_waypoint_ebpf_caps(results_dir)
+    validate_node_waypoint_kernel57_sys_admin(results_dir)
     validate_udp_cleanup_upgrade(results_dir)
+    validate_cni_lifecycle_capabilities(results_dir)
     validate_image_pull_secrets(results_dir)
     print("mesh production-readiness ok")
     return 0

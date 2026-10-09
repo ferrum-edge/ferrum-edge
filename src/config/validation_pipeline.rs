@@ -247,6 +247,7 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = config.validate_resource_ids() {
         errors.extend(found);
     }
+    errors.extend(collect_duplicate_resource_id_errors(config));
     if let Err(found) = config.validate_regex_listen_paths() {
         errors.extend(found);
     }
@@ -303,6 +304,20 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     }
 
     errors
+}
+
+/// Two resources of one kind sharing a `(namespace, id)`.
+///
+/// Every id-keyed runtime index is ambiguous for such a snapshot, and data
+/// planes refuse it outright and keep their last accepted configuration. The CP
+/// therefore refuses it before publication (full loads, incremental deltas, and
+/// Kubernetes translations), so one bad candidate is reported where it was
+/// produced instead of freezing every data plane on its last good snapshot.
+pub(crate) fn collect_duplicate_resource_id_errors(config: &GatewayConfig) -> Vec<String> {
+    config
+        .validate_unique_resource_ids()
+        .err()
+        .unwrap_or_default()
 }
 
 /// Marker error distinguishing a config-VALIDATION rejection — the loaded

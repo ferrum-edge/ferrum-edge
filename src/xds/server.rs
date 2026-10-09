@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use super::admission::{
     XdsAdmissionController, XdsAdmissionLimits, XdsAdmissionRejection, XdsStreamPermit,
-    principal_key, redacted_identifier, xds_state_key,
+    authenticated_principal_key, redacted_identifier, xds_state_key,
 };
 use super::bounded_xds_log_value;
 use super::nonce::{AckOutcome, XdsNonceTracker};
@@ -1672,7 +1672,6 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
-        let stream_principal_key = principal_key(&identity.subject);
         let stream_namespace = match self.resolve_xds_namespace(&identity.allowed_namespaces) {
             Ok(namespace) => namespace,
             Err(status) => {
@@ -1692,6 +1691,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
+        let stream_principal_key =
+            authenticated_principal_key(&stream_namespace, &identity.subject);
         // Reserve aggregate capacity BEFORE the relay task, the response
         // channel, the broadcast subscription, and the filtered config snapshot
         // exist. A refusal here allocates none of them (issue #3741).
@@ -2062,7 +2063,6 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
-        let stream_principal_key = principal_key(&identity.subject);
         let stream_namespace = match self.resolve_xds_namespace(&identity.allowed_namespaces) {
             Ok(namespace) => namespace,
             Err(status) => {
@@ -2082,6 +2082,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
+        let stream_principal_key =
+            authenticated_principal_key(&stream_namespace, &identity.subject);
         // Delta reserves from the SAME controller as SotW, so splitting a flood
         // across the two ADS methods (or across connections) cannot double a
         // client's budget (issue #3741).

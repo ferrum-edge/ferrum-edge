@@ -9,10 +9,12 @@
 //! publish them; in particular the `CachePadded` overload atomics are read
 //! through their ordinary `load()` accessors.
 //!
-//! The two process-global counters ([`record_backend_retry_attempt`] and
-//! [`record_frontend_tls_handshake_failure`]) are incremented from single
-//! choke points on cold failure paths — a scheduled backend retry and a
-//! refused frontend TLS handshake — with one `Relaxed` `fetch_add` each.
+//! The three process-global counters ([`record_backend_retry_attempt`],
+//! [`record_frontend_tls_handshake_failure`], and
+//! [`record_backend_tls_reload_validation_failure`]) are incremented from
+//! single choke points on cold failure paths — a scheduled backend retry, a
+//! refused frontend TLS handshake, and a destination skipped by a backend TLS
+//! live reload — with one `Relaxed` `fetch_add` each.
 //!
 //! ## Cardinality
 //!
@@ -45,6 +47,50 @@ static FRONTEND_TLS_HANDSHAKE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static FRONTEND_TLS_HANDSHAKE_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Backend request retries scheduled by the retry policy.
 static BACKEND_RETRY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+/// Backend TLS destinations that failed validation during a backend TLS live
+/// reload, indexed by [`BackendTlsReloadValidationFailure::index`].
+static BACKEND_TLS_RELOAD_VALIDATION_FAILURES: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// What failed validation during a backend TLS live reload
+/// (`FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`). A closed set so
+/// `ferrum_backend_tls_reload_validation_failures_total{kind}` has fixed
+/// cardinality: no proxy, plugin, rule, or path is ever a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendTlsReloadValidationFailure {
+    /// A TLS-scheme proxy whose backend TLS material could not build.
+    Proxy,
+    /// A `mesh_route_dispatch` rule whose `destination.backend_tls` could not
+    /// build.
+    RouteDispatchRule,
+    /// A `mesh_route_dispatch` plugin config that did not parse, so none of
+    /// its rule-level backend TLS could be validated.
+    RouteDispatchConfig,
+}
+
+impl BackendTlsReloadValidationFailure {
+    pub const ALL: [Self; 3] = [
+        Self::Proxy,
+        Self::RouteDispatchRule,
+        Self::RouteDispatchConfig,
+    ];
+
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::Proxy => "proxy",
+            Self::RouteDispatchRule => "route_dispatch_rule",
+            Self::RouteDispatchConfig => "route_dispatch_config",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Proxy => 0,
+            Self::RouteDispatchRule => 1,
+            Self::RouteDispatchConfig => 2,
+        }
+    }
+}
 
 /// Bounded reason for a refused frontend TLS handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +126,25 @@ pub fn record_backend_retry_attempt() {
 /// Backend retries scheduled since process start.
 pub fn backend_retry_attempts_total() -> u64 {
     BACKEND_RETRY_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+/// Record one destination skipped by a backend TLS live reload because its
+/// material failed validation.
+///
+/// Called from [`crate::proxy::validate_backend_tls_material_for_config`], the
+/// one place a live reload validates destinations. A refused destination
+/// ([`crate::config::types::BackendTlsConfig::tls_refused`]) is skipped without
+/// a build and is not counted here; `ferrum_backend_tls_refusals_total` covers it.
+pub fn record_backend_tls_reload_validation_failure(kind: BackendTlsReloadValidationFailure) {
+    BACKEND_TLS_RELOAD_VALIDATION_FAILURES[kind.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Destinations that failed backend TLS live-reload validation since process
+/// start, for `kind`.
+pub fn backend_tls_reload_validation_failures_total(
+    kind: BackendTlsReloadValidationFailure,
+) -> u64 {
+    BACKEND_TLS_RELOAD_VALIDATION_FAILURES[kind.index()].load(Ordering::Relaxed)
 }
 
 /// Refused frontend TLS handshakes since process start, as `(timeout, error)`.
@@ -119,7 +184,7 @@ pub fn render_prometheus(proxy_state: Option<&ProxyState>, ns_label: &str) -> St
     output
 }
 
-/// Append the two process-global counters.
+/// Append the three process-global counters.
 pub fn render_process_families(output: &mut String, ns_label: &str) {
     output.push_str(
         "# HELP ferrum_backend_retry_attempts_total Backend request retries scheduled by the retry policy across every dispatch transport.\n",
@@ -141,6 +206,19 @@ pub fn render_process_families(output: &mut String, ns_label: &str) {
     for (reason, value) in [("timeout", timeouts), ("error", errors)] {
         output.push_str(&format!(
             "ferrum_frontend_tls_handshake_failures_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
+        ));
+    }
+
+    output.push_str(
+        "# HELP ferrum_backend_tls_reload_validation_failures_total Backend TLS destinations skipped by a backend TLS live reload because their material failed validation, by bounded kind.\n",
+    );
+    output.push_str("# TYPE ferrum_backend_tls_reload_validation_failures_total counter\n");
+    // Closed kind set: emit every bucket even at zero so alerts can pin them.
+    for kind in BackendTlsReloadValidationFailure::ALL {
+        output.push_str(&format!(
+            "ferrum_backend_tls_reload_validation_failures_total{{kind=\"{}\"{ns_label}}} {}\n",
+            kind.as_metric_label(),
+            backend_tls_reload_validation_failures_total(kind)
         ));
     }
 }

@@ -60,6 +60,7 @@ const DEFAULT_SESSION_MAX_COOKIE_BYTES: u64 = 8000;
 /// minimum: every login answers 503 instead of the configuration being refused
 /// (issue #5029).
 const MIN_SESSION_MAX_COOKIE_BYTES: u64 = 1024;
+const STATE_CACHE_FULL_ERROR: &str = r#"{"error":"OIDC state cache full"}"#;
 const DEFAULT_STATE_TTL_SECS: u64 = 600;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE: usize = 32;
@@ -85,6 +86,7 @@ const STATE_EXPIRY_BUCKET_SECS: u64 = 1;
 const SESSION_PAYLOAD_VERSION: u8 = 2;
 const PENDING_FLOW_PAYLOAD_VERSION: u8 = 1;
 const MAX_PENDING_FLOW_ORIGINAL_URL_BYTES: usize = 2048;
+const MAX_PENDING_CORRELATION_COOKIES: usize = 2;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_USERINFO_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 256 * 1024;
@@ -1367,8 +1369,9 @@ impl OidcRelyingParty {
                 Some(&state),
             );
         };
+        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
         let token = match self
-            .exchange_code(&discovery, &code, &flow.code_verifier)
+            .exchange_code(&discovery, &code, &flow.code_verifier, proxy_hops)
             .await
         {
             Ok(token) => token,
@@ -1380,7 +1383,7 @@ impl OidcRelyingParty {
         };
         let merged_claims = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
             match self
-                .fetch_userinfo(userinfo_endpoint, &token.access_token)
+                .fetch_userinfo(userinfo_endpoint, &token.access_token, proxy_hops)
                 .await
             {
                 Ok(Some(userinfo)) => {
@@ -1450,6 +1453,7 @@ impl OidcRelyingParty {
         discovery: &DiscoveryDoc,
         code: &str,
         code_verifier: &str,
+        proxy_hops: Option<u8>,
     ) -> Result<TokenResponse, String> {
         let params = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
@@ -1462,7 +1466,7 @@ impl OidcRelyingParty {
             ("code_verifier".to_string(), code_verifier.to_string()),
         ];
         let response = self
-            .post_token_endpoint(&discovery.token_endpoint, params)
+            .post_token_endpoint(&discovery.token_endpoint, params, proxy_hops)
             .await
             .map_err(|_| r#"{"error":"Token exchange failed"}"#.to_string())?;
         if !response.status().is_success() {
@@ -1485,6 +1489,7 @@ impl OidcRelyingParty {
         &self,
         token_endpoint: &str,
         mut params: Vec<(String, String)>,
+        proxy_hops: Option<u8>,
     ) -> Result<reqwest::Response, String> {
         let mut request = self
             .provider
@@ -1529,6 +1534,9 @@ impl OidcRelyingParty {
             }
             OidcClientAuth::None => {}
         }
+        // A token / revocation endpoint that resolves back to the gateway is
+        // refused at the proxy hop limit like a looping route (issue #6128).
+        request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops);
         self.provider
             .http_client
             .execute_redacted(
@@ -1626,17 +1634,20 @@ impl OidcRelyingParty {
         &self,
         endpoint: &str,
         access_token: &str,
+        proxy_hops: Option<u8>,
     ) -> Result<Option<Value>, String> {
+        let request = self
+            .provider
+            .http_client
+            .get()
+            .map_err(|error| format!("userinfo request failed: {error}"))?
+            .get(endpoint)
+            .bearer_auth(access_token);
         let response = self
             .provider
             .http_client
             .execute_redacted(
-                self.provider
-                    .http_client
-                    .get()
-                    .map_err(|error| format!("userinfo request failed: {error}"))?
-                    .get(endpoint)
-                    .bearer_auth(access_token),
+                crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops),
                 "oidc_rp_userinfo",
                 &redacted_endpoint_url_str(endpoint),
             )
@@ -1708,7 +1719,10 @@ impl OidcRelyingParty {
         // carrying the same refresh token share one grant, and a spent token is
         // never re-sealed (`mutated` stays false), so this request can never
         // publish the pre-rotation credential over a rotated cookie.
-        let refresh = self.maybe_refresh_session(&mut payload, now).await;
+        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
+        let refresh = self
+            .maybe_refresh_session(&mut payload, now, proxy_hops)
+            .await;
 
         // Token-freshness gate: the ID token was validly verified at login, but
         // its claims must not be served as live authorization past their
@@ -1888,6 +1902,7 @@ impl OidcRelyingParty {
         &self,
         payload: &mut SessionPayload,
         now: i64,
+        proxy_hops: Option<u8>,
     ) -> RefreshOutcome {
         if now < payload.refresh_after_unix {
             return RefreshOutcome::UNCHANGED;
@@ -1913,7 +1928,7 @@ impl OidcRelyingParty {
                         retain: false,
                     };
                     let (outcome, published) = match self
-                        .refresh_tokens(&discovery, &refresh_token, payload, now)
+                        .refresh_tokens(&discovery, &refresh_token, payload, now, proxy_hops)
                         .await
                     {
                         Ok(claims_refreshed) => {
@@ -2054,6 +2069,7 @@ impl OidcRelyingParty {
         refresh_token: &str,
         payload: &mut SessionPayload,
         now: i64,
+        proxy_hops: Option<u8>,
     ) -> Result<bool, RefreshFailure> {
         let params = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
@@ -2061,7 +2077,7 @@ impl OidcRelyingParty {
             ("client_id".to_string(), self.provider.client_id.clone()),
         ];
         let response = self
-            .post_token_endpoint(&discovery.token_endpoint, params)
+            .post_token_endpoint(&discovery.token_endpoint, params, proxy_hops)
             .await?;
         if !response.status().is_success() {
             return Err(classify_refresh_failure(response).await);
@@ -2087,7 +2103,7 @@ impl OidcRelyingParty {
             // instead of being reduced to ID-token-only claims.
             let merged = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
                 match self
-                    .fetch_userinfo(userinfo_endpoint, &token.access_token)
+                    .fetch_userinfo(userinfo_endpoint, &token.access_token, proxy_hops)
                     .await
                 {
                     Ok(Some(userinfo)) => merge_claims(id_claims, userinfo, &self.provider)?,
@@ -2127,7 +2143,7 @@ impl OidcRelyingParty {
         Ok(claims_refreshed)
     }
 
-    fn resolve_identity(&self, claims: &Value, consumer_index: &ConsumerIndex) -> VerifyOutcome {
+    fn resolve_identity(&self, claims: &Value, _consumer_index: &ConsumerIndex) -> VerifyOutcome {
         let identity = nonblank_identity(extract_claim_string(
             claims,
             &self.provider.consumer_identity_claim,
@@ -2139,9 +2155,9 @@ impl OidcRelyingParty {
             extract_claim_string_exact(claims, &self.provider.consumer_header_claim)
                 .or_else(|| identity.clone())
         };
-        let consumer = identity
-            .as_deref()
-            .and_then(|id| consumer_index.find_by_identity(id));
+        // OIDC subjects are provider-scoped and never map through the global
+        // Consumer username index.
+        let consumer = None;
         VerifyOutcome::success(consumer, identity, header)
     }
 
@@ -2164,6 +2180,7 @@ impl OidcRelyingParty {
                     r#"{"error":"OIDC callback host does not match request host"}"#.to_string(),
                 );
             }
+            let pending_cookies = self.pending_correlation_cookie_names(ctx);
             let created = match self.create_flow(ctx) {
                 Ok(flow) => flow,
                 Err(body) => return reject(503, body),
@@ -2181,11 +2198,24 @@ impl OidcRelyingParty {
             };
             let correlation_cookie =
                 self.correlation_cookie(&created.state, &created.sealed_cookie);
-            let cookie = if clear {
-                join_set_cookies(correlation_cookie, self.clear_cookie())
-            } else {
-                correlation_cookie
-            };
+            let mut cookie = correlation_cookie;
+            if pending_cookies.len() >= MAX_PENDING_CORRELATION_COOKIES {
+                for stale_name in pending_cookies
+                    .iter()
+                    .take(pending_cookies.len() - MAX_PENDING_CORRELATION_COOKIES + 1)
+                {
+                    cookie = join_set_cookies(
+                        cookie,
+                        format!(
+                            "{stale_name}=; Max-Age=0; {}",
+                            self.session.correlation_cookie_attrs
+                        ),
+                    );
+                }
+            }
+            if clear {
+                cookie = join_set_cookies(cookie, self.clear_cookie());
+            }
             redirect(self.behavior.challenge_html_status, &location, Some(cookie))
         } else {
             let mut headers = HashMap::new();
@@ -2224,10 +2254,14 @@ impl OidcRelyingParty {
         let sealed_binding_hash: [u8; 32] = Sha256::digest(sealed_cookie.as_bytes());
         let flow = FlowState {
             sealed_binding_hash,
-            source_ip: ctx.client_ip.clone(),
+            source_ip: crate::util::client_identity::rate_limit_client_ip_string(
+                &ctx.client_ip,
+                64,
+            )
+            .unwrap_or_else(|| ctx.client_ip.clone()),
             expires_at: Instant::now() + self.behavior.state_ttl,
         };
-        self.session.state_cache.insert(state.clone(), flow)?;
+        insert_pending_flow_or_use_sealed_cookie(&self.session.state_cache, state.clone(), flow)?;
         Ok(CreatedFlow {
             state,
             code_verifier,
@@ -2528,7 +2562,7 @@ impl OidcRelyingParty {
         name == self.session.cookie_name
             || name
                 .strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
-                .is_some_and(|suffix| suffix.starts_with('_'))
+                .is_some_and(is_derived_correlation_cookie_suffix)
     }
 
     fn correlation_cookie_name(&self, state: &str) -> String {
@@ -2551,6 +2585,21 @@ impl OidcRelyingParty {
             self.correlation_cookie_name(state),
             self.session.correlation_cookie_attrs
         )
+    }
+
+    fn pending_correlation_cookie_names(&self, ctx: &RequestContext) -> Vec<String> {
+        let Some(cookie) = ctx.headers.get("cookie") else {
+            return Vec::new();
+        };
+        cookie
+            .split(';')
+            .filter_map(|segment| segment.trim().split_once('=').map(|(name, _)| name.trim()))
+            .filter(|name| {
+                name.strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
+                    .is_some_and(is_derived_correlation_cookie_suffix)
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     fn callback_reject(
@@ -2658,7 +2707,11 @@ impl super::Plugin for OidcRelyingParty {
                     ];
                     let _ = tokio::time::timeout(
                         Duration::from_secs(5),
-                        self.post_token_endpoint(endpoint, params),
+                        self.post_token_endpoint(
+                            endpoint,
+                            params,
+                            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+                        ),
                     )
                     .await;
                 }
@@ -2849,7 +2902,7 @@ impl StateCache {
             })
             .is_err()
         {
-            return Err(r#"{"error":"OIDC state cache full"}"#.to_string());
+            return Err(STATE_CACHE_FULL_ERROR.to_string());
         }
         if !self.reserve_source(&flow.source_ip) {
             decrement_atomic(&self.active_entries);
@@ -3040,6 +3093,24 @@ impl StateCache {
             self.per_source_entries
                 .remove_if(source_ip, |_, count| *count == 0);
         }
+    }
+}
+
+fn insert_pending_flow_or_use_sealed_cookie(
+    cache: &StateCache,
+    state: String,
+    flow: FlowState,
+) -> Result<(), String> {
+    match cache.insert(state, flow) {
+        Ok(()) => Ok(()),
+        Err(error) if error == STATE_CACHE_FULL_ERROR => {
+            // The sealed cookie carries the complete pending flow, and
+            // callbacks intentionally accept a missing local entry for
+            // cross-replica completion. Preserve browser login availability
+            // when this replica's optional replay cache is full.
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -3477,6 +3548,14 @@ fn derived_cookie_name(prefix: &str, context_seed: &[u8; 32]) -> String {
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(context_seed);
     let suffix: String = encoded.chars().take(12).collect();
     format!("{prefix}_{suffix}")
+}
+
+fn is_derived_correlation_cookie_suffix(suffix: &str) -> bool {
+    suffix.len() == 13
+        && suffix.starts_with('_')
+        && suffix[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn behavior_usize(
@@ -5470,6 +5549,27 @@ mod tests {
     }
 
     #[test]
+    fn full_pending_flow_cache_falls_back_to_the_sealed_cookie() {
+        let cache = StateCache::new(1, 1, Duration::from_secs(600), 16);
+        cache
+            .insert(
+                "cached-state".to_string(),
+                flow_for("192.0.2.1", Instant::now() + Duration::from_secs(60)),
+            )
+            .expect("first flow admitted");
+
+        insert_pending_flow_or_use_sealed_cookie(
+            &cache,
+            "sealed-only-state".to_string(),
+            flow_for("192.0.2.2", Instant::now() + Duration::from_secs(60)),
+        )
+        .expect("a full optional cache must not refuse the sealed flow");
+
+        assert!(cache.entries.contains_key("cached-state"));
+        assert!(cache.admit_callback("sealed-only-state", &[8; 32]).is_ok());
+    }
+
+    #[test]
     fn spent_markers_are_bounded_without_blocking_cross_replica_callbacks() {
         let cache = StateCache::new(2, 2, Duration::from_secs(600), 16);
 
@@ -5745,13 +5845,13 @@ mod tests {
             .expect("explicit discovery document");
         assert!(
             plugin
-                .exchange_code(&discovery, "code", "verifier")
+                .exchange_code(&discovery, "code", "verifier", None)
                 .await
                 .is_err()
         );
         assert!(
             plugin
-                .fetch_userinfo(&format!("{}/userinfo", server.uri()), "access-token")
+                .fetch_userinfo(&format!("{}/userinfo", server.uri()), "access-token", None)
                 .await
                 .is_err()
         );
@@ -6232,7 +6332,7 @@ mod tests {
         );
         assert!(ctx.authenticated_identity_header.is_none());
         assert_eq!(
-            ctx.backend_consumer_username(),
+            ctx.backend_authenticated_identity(),
             Some(" accepted@example.com ")
         );
 

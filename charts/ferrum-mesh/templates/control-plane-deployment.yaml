@@ -37,7 +37,7 @@ spec:
         app.kubernetes.io/name: ferrum-mesh-control-plane
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
-      serviceAccountName: ferrum-mesh
+      serviceAccountName: ferrum-mesh-control-plane
       {{- include "ferrum-mesh.imagePullSecrets" . }}
       terminationGracePeriodSeconds: {{ .Values.controlPlane.terminationGracePeriodSeconds }}
       {{- with .Values.controlPlane.priorityClassName }}

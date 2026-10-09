@@ -52,6 +52,7 @@ use super::utils::byte_budget::{
     ProcessByteReservation, ReservedPayload, RetainedByteCeiling, materialize_reserved_buffer,
     materialize_reserved_payload, process_ceiling,
 };
+use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
@@ -72,6 +73,7 @@ use crate::plugins::utils::log_schema::{
 use tokio::sync::mpsc;
 
 const PLUGIN_NAME: &str = "api_chargeback_sink";
+const PASSWORD_REF_FIELD: &str = "api_chargeback_sink: `clickhouse.password_ref`";
 const STREAM_STATUS_SENTINEL: u16 = 0;
 const DEFAULT_PRICING_VERSION: &str = "default";
 const DEFAULT_CURRENCY: &str = "USD";
@@ -5484,11 +5486,8 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && !reference.starts_with("FERRUM_")
     {
-        return Err(format!(
-            "{PLUGIN_NAME}: `clickhouse.password_ref` must reference a `FERRUM_*` environment variable"
-        ));
+        validate_plugin_secret_env_name(PASSWORD_REF_FIELD, reference)?;
     }
     // Pair completeness is a pure Option shape, so it belongs in cold
     // admission rather than in client construction alone. Reading or parsing
@@ -5720,17 +5719,7 @@ fn resolve_password_ref(password_ref: Option<&str>) -> Result<Option<String>, St
     else {
         return Ok(None);
     };
-    if !reference.starts_with("FERRUM_") {
-        return Err(format!(
-            "{PLUGIN_NAME}: `clickhouse.password_ref` must reference a `FERRUM_*` environment variable"
-        ));
-    }
-    if let Ok(value) = std::env::var(reference) {
-        return Ok(Some(value));
-    }
-    Err(format!(
-        "{PLUGIN_NAME}: `clickhouse.password_ref` references unset environment variable"
-    ))
+    resolve_plugin_secret_env(PASSWORD_REF_FIELD, reference).map(Some)
 }
 
 fn build_clickhouse_http_client(

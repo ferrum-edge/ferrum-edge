@@ -131,6 +131,7 @@ pub struct ConnLimiter {
     max_connections: usize,
     /// Per-IP cap; `0` disables per-IP tracking entirely.
     max_connections_per_ip: usize,
+    ipv6_prefix: u8,
     /// Live per-IP connection counts. Only populated when the per-IP cap is on.
     per_ip_active: DashMap<IpAddr, u32>,
     /// In-flight connections (gauge).
@@ -146,7 +147,21 @@ impl ConnLimiter {
     /// == 0` disables the per-IP cap. With both zero the limiter only tracks the
     /// `active` gauge and never rejects.
     pub fn new(max_connections: usize, max_connections_per_ip: usize) -> Self {
-        Self::with_per_ip_map(max_connections, max_connections_per_ip, DashMap::new())
+        Self::new_with_ipv6_prefix(max_connections, max_connections_per_ip, 64)
+    }
+
+    /// Build a limiter with a configured IPv6 grouping prefix.
+    pub fn new_with_ipv6_prefix(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        ipv6_prefix: u8,
+    ) -> Self {
+        Self::with_per_ip_map(
+            max_connections,
+            max_connections_per_ip,
+            ipv6_prefix,
+            DashMap::new(),
+        )
     }
 
     /// Shared body of both constructors: everything except the per-IP map,
@@ -154,6 +169,7 @@ impl ConnLimiter {
     fn with_per_ip_map(
         max_connections: usize,
         max_connections_per_ip: usize,
+        ipv6_prefix: u8,
         per_ip_active: DashMap<IpAddr, u32>,
     ) -> Self {
         let semaphore = if max_connections > 0 {
@@ -168,6 +184,7 @@ impl ConnLimiter {
             semaphore,
             max_connections,
             max_connections_per_ip,
+            ipv6_prefix,
             per_ip_active,
             active: AtomicU64::new(0),
             rejected_max_connections: AtomicU64::new(0),
@@ -193,10 +210,26 @@ impl ConnLimiter {
         max_connections_per_ip: usize,
         shard_amount_override: usize,
     ) -> Self {
+        Self::with_per_ip_shard_amount_and_ipv6_prefix(
+            max_connections,
+            max_connections_per_ip,
+            shard_amount_override,
+            64,
+        )
+    }
+
+    /// Build a hot-path limiter with explicit shard sizing and IPv6 grouping.
+    pub fn with_per_ip_shard_amount_and_ipv6_prefix(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        shard_amount_override: usize,
+        ipv6_prefix: u8,
+    ) -> Self {
         let shards = crate::util::sharding::pool_shard_amount(shard_amount_override);
         Self::with_per_ip_map(
             max_connections,
             max_connections_per_ip,
+            ipv6_prefix,
             DashMap::with_capacity_and_shard_amount(0, shards),
         )
     }
@@ -235,8 +268,13 @@ impl ConnLimiter {
 
         // 2. Per-IP cap. Check-and-increment under the DashMap shard lock so
         //    concurrent accepts for the same IP cannot both slip past the cap.
+        let per_ip_key = if self.max_connections_per_ip > 0 {
+            crate::util::client_identity::rate_limit_ip(remote_ip, self.ipv6_prefix)
+        } else {
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        };
         let per_ip_tracked = if self.max_connections_per_ip > 0 {
-            match self.per_ip_active.entry(remote_ip) {
+            match self.per_ip_active.entry(per_ip_key) {
                 Entry::Occupied(mut occ) => {
                     if (*occ.get() as usize) >= self.max_connections_per_ip {
                         // `global` drops here, releasing the global slot.
@@ -260,7 +298,7 @@ impl ConnLimiter {
         self.active.fetch_add(1, Ordering::Relaxed);
         Ok(ConnPermit {
             limiter: Arc::clone(self),
-            remote_ip,
+            per_ip_key,
             per_ip_tracked,
             _global: global,
         })
@@ -290,12 +328,12 @@ impl ConnLimiter {
     }
 
     /// Release accounting for a dropped permit. Internal to [`ConnPermit`].
-    fn release(&self, remote_ip: IpAddr, per_ip_tracked: bool) {
+    fn release(&self, per_ip_key: IpAddr, per_ip_tracked: bool) {
         self.active.fetch_sub(1, Ordering::Relaxed);
         if per_ip_tracked {
             // Decrement under the shard lock and evict at zero so the map does
             // not grow unbounded with one entry per IP ever seen.
-            if let Entry::Occupied(mut occ) = self.per_ip_active.entry(remote_ip) {
+            if let Entry::Occupied(mut occ) = self.per_ip_active.entry(per_ip_key) {
                 let count = occ.get_mut();
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -311,7 +349,7 @@ impl ConnLimiter {
 #[derive(Debug)]
 pub struct ConnPermit {
     limiter: Arc<ConnLimiter>,
-    remote_ip: IpAddr,
+    per_ip_key: IpAddr,
     per_ip_tracked: bool,
     /// Global semaphore slot; released when this field drops. `None` when the
     /// global cap is disabled.
@@ -320,6 +358,6 @@ pub struct ConnPermit {
 
 impl Drop for ConnPermit {
     fn drop(&mut self) {
-        self.limiter.release(self.remote_ip, self.per_ip_tracked);
+        self.limiter.release(self.per_ip_key, self.per_ip_tracked);
     }
 }

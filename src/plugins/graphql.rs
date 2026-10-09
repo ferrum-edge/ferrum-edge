@@ -32,6 +32,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -502,15 +503,21 @@ impl GraphqlPlugin {
             .then(|| ctx.effective_identity())
             .flatten()
         {
-            Some(identity) => ("consumer:", identity),
-            None => ("ip:", ctx.client_ip.as_str()),
+            Some(identity) => ("consumer:", Cow::Borrowed(identity)),
+            None => (
+                "ip:",
+                Cow::Owned(
+                    crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                        .unwrap_or_else(|| ctx.client_ip.clone()),
+                ),
+            ),
         };
         let mut key = String::with_capacity(
             4 + identity_kind.len() + identity.len() + kind.len() + value.len() + 2,
         );
         key.push_str("gql:");
         key.push_str(identity_kind);
-        key.push_str(identity);
+        key.push_str(&identity);
         key.push(':');
         key.push_str(kind);
         key.push(':');
@@ -1569,6 +1576,14 @@ impl Plugin for GraphqlPlugin {
     /// pair it with a plugin that egresses the request before finalization, the
     /// same rule `waf` and `body_validator` carry (GHSA-4vr5-4wm3-x5xv).
     fn enforces_finalized_request_policy(&self) -> bool {
+        self.has_any_config
+    }
+
+    /// Depth, complexity, alias, introspection, and rate-limit rules refuse
+    /// requests on HTTP. A JSON-bearing native gRPC `Content-Type` selects the
+    /// `Grpc` view, which this plugin does not run on, so the route must refuse
+    /// it instead of forwarding the body unchecked.
+    fn gates_request_admission(&self) -> bool {
         self.has_any_config
     }
 

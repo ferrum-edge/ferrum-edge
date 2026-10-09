@@ -27,7 +27,18 @@ paths:
 - Plugins have `id`, `config`, optional `priority_override`, and a priority where lower runs first.
 - Scopes are `global`, `proxy`, and `proxy_group`.
 - Multiple instances per proxy are allowed.
-- A proxy/group-scoped plugin replaces a same-named global for that proxy.
+- A proxy/group-scoped plugin replaces a same-named global of the SAME built-in
+  standing for that proxy (issue #6022): built-in replaces built-in, custom
+  replaces custom. Standing is the registered type (`is_builtin_plugin`, a
+  `TypeId` check that looks through the cache's wrappers), never `name()`; a
+  custom plugin reporting a built-in name neither removes that built-in global
+  nor is removed by a scoped built-in. Every other per-plugin lookup in
+  `src/plugin_cache.rs` keys on standing too (`is_builtin_named`), and
+  `builtin_plugin_trust_tests.rs` scans that file for any other `.name()` use
+  outside a diagnostic macro — add new legitimate uses to its commented
+  allowlist, never a bare name comparison. The size-limit conjunctive
+  exception applies to the registered `request_size_limiting` /
+  `response_size_limiting` only.
 - Multiple scoped instances of the same type may coexist.
 - Exception: `api_chargeback` admits at most one effective instance per proxy
   after merge (shared `/charges` registry is exactly-once) and requires every
@@ -984,12 +995,47 @@ on a native-gRPC request.
 - New plugin file: `src/plugins/my_plugin.rs`, implements `Plugin`, constructor returns `Result<Self, String>`.
 - Add a priority constant in `src/plugins/mod.rs`.
 - Override `supported_protocols()` when not HTTP-only. Use the existing protocol constants.
+- Native gRPC and WebSocket views are selected by client headers, so a `Grpc` or `WebSocket` view that omits an instance its chain's `Http` view runs and that declares `gates_request_admission()` (default: `is_auth_plugin()`) is refused before any plugin runs (`PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`, rejection phase `route_protocol_admission`). A new HTTP-only plugin that refuses requests a route must not serve should declare `gates_request_admission()`, scoped to the configurations that can refuse (as `openapi_validator`, `request_deduplication`, `graphql`, and `a2a_gateway` do); one that is not request-admission policy must not. `every_admission_gating_plugin_marks_the_flavor_views_it_cannot_run_on` (`plugin_cache_tests.rs`) is the per-plugin table, and the HBONE admission fence re-checks the bit on every sweep. The reverse direction holds too (issue #6110): a route whose OWN chain (proxy / proxy-group scope, recognized by pointer against the global `Arc`s) carries a gating instance that runs on `Grpc` but not on the requested flavor marks its `Http` and `WebSocket` views, so plain HTTP cannot skip a gRPC-only policy such as `grpc_method_router` (which always gates). A GLOBAL gRPC-only instance marks nothing: it says nothing about one route's intent, and marking would refuse plain HTTP gateway-wide (a one-time warning per global chain built says so). `build_protocol_entry` therefore takes the generation's globals at every call site. A bodiless CORS preflight is exempt from that one refusal only when the view carries a preflight-answering `cors` (`Plugin::answers_cors_preflights`, `PluginCapabilities::ANSWERS_CORS_PREFLIGHTS`), and is refused after `on_request_received` if no plugin answered it. The composed gRPC-Web view is marked when it drops a gRPC-only gating instance other than `grpc_method_router` / `grpc_deadline`, globals included.
 - Register in `create_plugin_with_http_client()` with `?` on `new()` and add to `available_plugins()`.
 - Add unit tests for valid and invalid configs in `tests/unit/plugins/` and register the module.
 - Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
 - Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`stdout_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
 - Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup.
+- A plugin config field that names a process environment variable (credential
+  or URL) resolves it ONLY through `plugins::utils::plugin_secret_env`
+  (`FERRUM_PLUGIN_SECRET_<NAME>`), shape-checked in the constructor so
+  admission refuses any other name with a 400 before anything is read. Never
+  `std::env::var` a config-supplied name, and never add an implicit ambient
+  fallback for a credential sent to a config-chosen endpoint. Add each new
+  field to `ENV_REFERENCE_FIELDS` in
+  `tests/unit/plugins/plugin_secret_env_tests.rs`. `ai_transcript_audit`'s
+  `${secret:NAME}` keeps its own `FERRUM_TRANSCRIPT_SINK_SECRET_*` namespace.
+- The standard AWS credential fallbacks (`AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) in `serverless_function`
+  (`aws_lambda`) and `ai_federation` (`aws_bedrock`) are the only remaining
+  ambient credential fallbacks; neither plugin uses the AWS SDK default chain
+  (IMDS, ECS, web identity, SSO, profiles), so keep it that way or extend the
+  scope. Whenever the key id or secret resolves from the environment, the
+  region must pass the partition grammar
+  (`ambient_cloud_credentials::aws_region_partition`, mirroring the SDK
+  `aws` / `aws-cn` / `aws-us-gov` regexes with lowercase letters) and the
+  config-chosen endpoint (derived host, `aws_endpoint_url`, `base_url`) must
+  pass `AmbientAwsEndpointScope` at admission AND again before signing each
+  request (issue #6111). Never relax the region check to a shape check
+  (legacy dash-style S3 hosts like `lambda.s3-us-west-2.amazonaws.com` are
+  customer buckets) and never widen it to generic `*.amazonaws.com`. A `cn-*`
+  region pairs only with `amazonaws.com.cn` / `api.amazonwebservices.com.cn`.
+  Provenance comes from the resolution itself (`AwsCredentialSources`, returned
+  by `ai_federation::build_auth`); never re-read the environment to decide it.
+  `AWS_SESSION_TOKEN` only completes an environment key pair, never config
+  keys. `AWS_LAMBDA_ENDPOINT_URL` (used only without a config
+  `aws_endpoint_url`) is environment-owned and exempt from the endpoint scope,
+  but the region is still screened. CP shape-only admission screens a
+  configured `aws_region` and `aws_endpoint_url` for rows without a key pair.
+  Config-supplied credentials are unscoped; the only bypass is the
+  per-instance `allow_custom_endpoint_with_ambient_credentials` opt-in. A new
+  ambient cloud credential fallback must use the same scope.
 - Shared entrypoint is `plugins::validate_plugin_config(name, config)`.
 - CP admission runs the SAME construction gate over every enabled plugin config
   before a snapshot or delta can be accepted and broadcast

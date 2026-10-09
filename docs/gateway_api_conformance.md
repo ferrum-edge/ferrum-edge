@@ -108,6 +108,9 @@ direct black-box lab checks.
 | `HTTPRoute` rule `retry` (`codes`, `attempts`, `backoff`) | No upstream feature exists on `v1.5.1`; Ferrum data-plane regressions | Experimental-channel rule field, present in the experimental CRD bundle the lab installs and validated exactly as that CRD does (codes 400–599, integer `attempts`, GEP-2257 `backoff`); CRD-valid values beyond Ferrum's limits (`attempts` outside 0–100, `backoff` over 5m) are `UnsupportedValue`. `attempts` counts retries after the initial attempt, `codes` are the retried statuses, and `backoff` is a fixed minimum wait. Status retries replay only `GET`/`HEAD`/`OPTIONS`/`PUT`/`DELETE`; a failure before any byte reached the backend is retried for every method. Every attempt and backoff stays inside the rule's `timeouts.request` budget, and a response whose head reached the client is never replayed. The policy stays on the rule's own dispatch entry, never on the shared proxy or upstream. See [Rule retry](#rule-retry). GRPCRoute defines no `retry` and stays refused |
 | `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
+| `type: ExternalName` Service backendRefs | No (refused) | An ExternalName Service is a DNS alias that can name any host, so dialing it would bypass the ReferenceGrant boundary. Following Gateway API guidance, every route kind refuses it: HTTPRoute/GRPCRoute fail that backend closed, TCPRoute/TLSRoute/UDPRoute reject the route, and status reports `ResolvedRefs=False` / `UnsupportedProtocol` |
+| Service backendRefs and their EndpointSlices | Yes, inside the Service's namespace | Kubernetes does not manage the EndpointSlices of a Service without `spec.selector`, and anyone who can write EndpointSlices can attach an extra slice to a selector-backed Service by label, so either could name another namespace's Pods. With pod discovery enabled, a backendRef to a Service is admitted only when every endpoint IP belongs to an observed Pod in the Service's namespace (Gateway API conformance `HTTPRouteServiceTypes` writes exactly such slices), or, for a selector-backed Service, to a same-namespace Pod its `targetRef` names whose status reports that IP (host-network DaemonSets). An endpoint that names or carries the IP of another namespace's Pod, an FQDN endpoint, or a loopback/link-local/unspecified/multicast/broadcast/cloud-metadata address is refused on every route kind with `ResolvedRefs=False` / `RefNotPermitted`, the same fail-closed shape as an unpermitted reference. Any other IP is refused unless `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true`, which admits it for a selector-less Service and same-namespace routes only, never a Service ClusterIP, Node address, or Node Pod CIDR, and only while the controller watches Nodes (`FERRUM_K8S_NODE_LOCALITY_ENABLED=true`). A Pod's IP stays attributed for 60 seconds after the first reconcile that no longer observes the Pod (with a restricted Pod watch scope, the single-namespace default, only for an endpoint reporting `terminating: true` with an explicit `ready: false`), and an endpoint reporting both `ready: false` and `serving: false` is ignored. Without pod discovery a selector-less Service is refused as unverifiable and a selector-backed one is admitted with a translation warning |
+| Cross-namespace route identity | Yes | A route attached to a Gateway in another namespace is materialized in the Gateway's namespace with proxy, upstream, and plugin ids bound to the route's full source identity (`<readable id>__<digest>`), so two tenants' routes can never share or replace one another's resources. A second route object deriving an id another route owns is refused and reported in Route status |
 | Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace (`HTTPRoute`, `GRPCRoute`, `TCPRoute`, and `TLSRoute`). `allowedRoutes.namespaces.selector` is parsed atomically with Kubernetes label-key/value and operator-cardinality validation; a malformed component invalidates the listener and attaches no routes. ReferenceGrant is not used for parentRefs. |
 | Invalid backend references | Yes | Missing Services/ServiceImports, unsupported backend target kinds, and unpermitted cross-namespace refs are reported as unresolved and materialize fail-closed HTTP 500 routes |
 | MCS `ServiceImport` backendRefs | Partial (Ferrum translation/status; not an upstream conformance feature claim) | GEP-1748 Extended: `group: multicluster.x-k8s.io` / `kind: ServiceImport` resolves through the same typed backend-kind adapter as core `Service`, including ReferenceGrant authorization, port existence checks, ClusterSet DNS (`*.svc.clusterset.local`), and optional MCS-labeled EndpointSlice expansion when pod discovery is enabled. The MCS CRD is watched when present and skipped cleanly when absent. Upstream profiles/features remain unchanged — this is not advertised as a Gateway API conformance claim. |
@@ -1088,10 +1091,23 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
 - **MCS `ServiceImport` backendRefs** (`group: multicluster.x-k8s.io`) resolve
   through the shared backend-kind adapter to ClusterSet DNS
   (`{name}.{namespace}.svc.clusterset.local`) or ready EndpointSlice addresses
-  labeled `multicluster.kubernetes.io/service-name`. Cross-namespace imports
-  require a ReferenceGrant whose `to` names that group/kind. Missing imports and
-  unknown kinds stay fail-closed with `ResolvedRefs=False`
-  (`BackendNotFound` / `InvalidKind`).
+  labeled `multicluster.kubernetes.io/service-name`. An imported slice is used
+  only when its `endpointslice.kubernetes.io/managed-by` names the MCS
+  controller rather than Kubernetes' own EndpointSlice controllers (a
+  provenance label, not authentication) and its namespace is inside the Pod
+  watch scope, and its addresses are refused when they can never be a backend
+  (loopback, link-local, cloud metadata, FQDNs) or are this cluster's
+  infrastructure without being a Pod of the import's namespace (another
+  namespace's Pod, a Service ClusterIP other than the exported Service's own
+  while that Service's EndpointSlices pass attribution, a Node address or Pod
+  CIDR). Node addresses and Pod CIDRs need the Node watch, and other
+  namespaces' Pods a cluster-wide Pod watch; without them each reconcile that
+  admits an imported slice warns that its addresses went unchecked. Remote
+  endpoints cannot be checked against local Pods, so imported slices are
+  trusted as far as the MCS controller and EndpointSlice write RBAC are.
+  Cross-namespace imports require a ReferenceGrant whose `to` names that
+  group/kind. Missing imports and unknown kinds stay fail-closed with
+  `ResolvedRefs=False` (`BackendNotFound` / `InvalidKind`).
 - **Zero-weight-only rule** (every `backendRef` in a matched rule has
   `weight: 0`) is *not* dropped. Ferrum keeps the route materialized and applies
   the same synthesized 100% fault-abort used for wholly invalid/unresolved

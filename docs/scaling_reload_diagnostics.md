@@ -17,7 +17,7 @@ profile rather than claiming to isolate every internal operation.
 Issue #4116's SQLite failure reached 27,000 proxies with successful traffic but
 did not publish the final 30,000-proxy cursor within 900 seconds. The harness
 retains that convergence bound, all cardinalities, traffic assertions, poll
-cadence and the 10,000-row change-log safety valve. Diagnostics change neither
+cadence and the change-log safety valve (100,000 rows per incremental poll since issue #6058; 10,000 at the time of issue #4116). Diagnostics change neither
 publication decisions nor the order of snapshot/cursor operations. The slow
 query setting remains disabled by default outside the harness.
 

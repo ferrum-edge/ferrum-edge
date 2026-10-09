@@ -97,7 +97,7 @@ fn node_waypoint_pod(node_name: &str, ip: &str, ready: bool, hbone_port: u16) ->
         "ferrum-system",
         &format!("ferrum-node-waypoint-{node_name}"),
         json!({
-            "serviceAccountName": "ferrum-mesh",
+            "serviceAccountName": "ferrum-mesh-ambient",
             "nodeName": node_name,
             "hostNetwork": true,
             "containers": [{
@@ -371,7 +371,7 @@ fn k8s_pod_discovery_resolves_node_waypoint_downward_api_spiffe_id() {
     push_pod_env(
         &mut waypoint,
         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)",
     );
 
     let translation = translate_k8s_objects(
@@ -399,7 +399,7 @@ fn k8s_pod_discovery_resolves_node_waypoint_downward_api_spiffe_id() {
 
     assert_eq!(
         node_waypoint.spiffe_id.as_str(),
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a"
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a"
     );
     assert_eq!(node_waypoint.node_name.as_deref(), Some("node-a"));
 }
@@ -410,7 +410,8 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
     // with a ServiceAccount and no Service. Issue #4274's per-assertor grant
     // is derived from Workload.node_waypoint bindings, so identity-only
     // sources must carry the same per-node SVID as service-backed destinations.
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
     let dest_spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
     let mut source = object(
@@ -514,7 +515,8 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
 
 #[test]
 fn k8s_pod_discovery_does_not_grant_unenrolled_identity_only_sources() {
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
     let mut source = object(
         "Pod",
@@ -574,7 +576,8 @@ fn k8s_pod_discovery_does_not_grant_unenrolled_identity_only_sources() {
 
 #[test]
 fn k8s_pod_discovery_does_not_grant_identity_only_sources_in_excluded_namespaces() {
-    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let waypoint_spiffe =
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
     let source_spiffe = "spiffe://cluster.local/ns/monitoring/sa/frontend";
     let mut source = object(
         "Pod",
@@ -633,7 +636,7 @@ fn k8s_pod_discovery_does_not_recursively_expand_node_waypoint_spiffe_env() {
     push_pod_env(
         &mut waypoint,
         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_NODE_NAME_ALIAS)",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/$(FERRUM_NODE_NAME_ALIAS)",
     );
 
     let translation = translate_k8s_objects(
@@ -1208,6 +1211,51 @@ fn k8s_pod_discovery_rejects_untrusted_node_waypoint_looking_pods() {
 }
 
 #[test]
+fn k8s_pod_discovery_trusts_only_the_ambient_service_account_for_node_waypoints() {
+    let spiffe_id = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/node-a";
+    let node_waypoint_for = |service_account: &str| {
+        let mut waypoint =
+            node_waypoint_pod_with_spiffe("node-a", "192.0.2.10", true, 15008, spiffe_id);
+        waypoint.spec["serviceAccountName"] = json!(service_account);
+        let translation = translate_k8s_objects(
+            &[
+                node("node-a", "node-uid-a"),
+                service(),
+                ready_pod(),
+                endpoint_slice(),
+                waypoint,
+            ],
+            options(),
+        )
+        .expect("K8s core translation succeeds");
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh config")
+            .workloads
+            .iter()
+            .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+            .expect("reviews workload")
+            .node_waypoint
+            .clone()
+    };
+
+    let trusted = node_waypoint_for("ferrum-mesh-ambient").expect("trusted");
+    assert_eq!(trusted.address, "192.0.2.10");
+    assert_eq!(trusted.spiffe_id.as_str(), spiffe_id);
+
+    // The previous shared chart identity and the control-plane identity both
+    // run in the waypoint namespace, but neither runs the NodeWaypoint.
+    for service_account in ["ferrum-mesh", "ferrum-mesh-control-plane", "default"] {
+        assert!(
+            node_waypoint_for(service_account).is_none(),
+            "{service_account} must not be trusted as a NodeWaypoint identity"
+        );
+    }
+}
+
+#[test]
 fn k8s_pod_discovery_rejects_ambient_controller_namespace_pods() {
     let mut ambient = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
     ambient.metadata.uid = "ambient-pod-uid".to_string();
@@ -1358,7 +1406,7 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
     push_pod_env(
         &mut waypoint,
         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)",
     );
 
     let translation = translate_k8s_objects(
@@ -1385,6 +1433,302 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
         workload.node_waypoint.is_none(),
         "noncanonical field_path/spec.node_name must not resolve trusted NodeWaypoint identity"
     );
+}
+
+/// A ready Pod `namespace/name` running as `service_account` whose own status
+/// reports `ip`.
+fn ready_pod_in(namespace: &str, name: &str, service_account: &str, ip: &str) -> K8sObject {
+    let mut pod = ready_pod();
+    pod.metadata.namespace = namespace.to_string();
+    pod.metadata.name = name.to_string();
+    pod.spec["serviceAccountName"] = json!(service_account);
+    pod.status["podIP"] = json!(ip);
+    pod
+}
+
+/// The `default/reviews` EndpointSlice carrying `endpoints`.
+fn reviews_slice_with(endpoints: Value) -> K8sObject {
+    let mut slice = endpoint_slice();
+    slice.spec["endpoints"] = endpoints;
+    slice
+}
+
+/// Every address the translation attaches to a `reviews` workload identity.
+fn reviews_workload_addresses(translation: &K8sTranslation) -> Vec<&str> {
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    mesh.workloads
+        .iter()
+        .filter(|workload| workload.service_name == "reviews")
+        .flat_map(|workload| workload.addresses.iter().map(String::as_str))
+        .collect()
+}
+
+fn reviews_service_workload_count(translation: &K8sTranslation) -> usize {
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    mesh.services
+        .iter()
+        .find(|service| service.namespace == "default" && service.name == "reviews")
+        .expect("reviews service")
+        .workloads
+        .len()
+}
+
+fn assert_warned(translation: &K8sTranslation, fragment: &str) {
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(fragment)),
+        "expected a warning containing {fragment:?}: {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_slice_target_ref_into_another_namespace() {
+    // A slice author in `default` names `payments/ledger-0`. Neither an
+    // address that Pod does not own nor one it does may lend its identity to
+    // the `reviews` Service: the EndpointSlice controller never names another
+    // namespace's Pod (issue #6123).
+    for address in ["10.1.0.99", "10.9.0.5"] {
+        let ledger = ready_pod_in("payments", "ledger-0", "ledger", "10.9.0.5");
+        let forged = reviews_slice_with(json!([{
+            "addresses": [address],
+            "targetRef": {"kind": "Pod", "name": "ledger-0", "namespace": "payments"},
+            "conditions": {"ready": true}
+        }]));
+
+        let translation = translate_k8s_objects(&[service(), ledger, forged], options())
+            .expect("K8s core translation succeeds");
+
+        assert_eq!(reviews_service_workload_count(&translation), 0, "{address}");
+        assert!(
+            reviews_workload_addresses(&translation).is_empty(),
+            "{address}"
+        );
+        let mesh = translation.config.mesh.as_ref().expect("mesh config");
+        assert!(
+            mesh.workloads
+                .iter()
+                .all(|workload| workload.namespace != "payments"),
+            "{address}: {:?}",
+            mesh.workloads
+        );
+        assert_warned(&translation, "1 name a Pod outside the Service's namespace");
+    }
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_slice_ip_lookup_into_another_namespace() {
+    // Without a `targetRef` the endpoint resolves by IP; an IP owned by
+    // another namespace's Pod is refused the same way.
+    let ledger = ready_pod_in("payments", "ledger-0", "ledger", "10.9.0.5");
+    let forged = reviews_slice_with(json!([{
+        "addresses": ["10.9.0.5"],
+        "conditions": {"ready": true}
+    }]));
+
+    let translation = translate_k8s_objects(&[service(), ledger, forged], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(&translation, "1 name a Pod outside the Service's namespace");
+}
+
+#[test]
+fn k8s_pod_discovery_attaches_only_addresses_the_named_pod_reports() {
+    let mixed = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.10", "10.1.0.99"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), mixed], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
+    assert_warned(
+        &translation,
+        "1 are not reported by the named Pod's own status",
+    );
+
+    // An endpoint left with no address the Pod reports attaches nothing.
+    let forged = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.99"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), forged], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(
+        &translation,
+        "1 are not reported by the named Pod's own status",
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_an_address_another_namespace_pod_also_reports() {
+    // Two namespaces' Pods report the same IP (a reused IP, or a forged Pod
+    // status); neither may claim it for its identity.
+    let squatter = ready_pod_in("payments", "ledger-0", "ledger", "10.1.0.10");
+
+    let translation = translate_k8s_objects(
+        &[service(), ready_pod(), endpoint_slice(), squatter],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(
+        &translation,
+        "1 are also reported by another namespace's Pod",
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_a_never_a_backend_address_even_when_the_pod_reports_it() {
+    let mut pod = ready_pod();
+    pod.status["podIP"] = json!("169.254.169.254");
+    let slice = reviews_slice_with(json!([{
+        "addresses": ["169.254.169.254"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+
+    let translation = translate_k8s_objects(&[service(), pod, slice], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(&translation, "1 can never be a backend");
+}
+
+#[test]
+fn k8s_pod_discovery_attaches_a_controller_slice_naming_the_services_own_pod() {
+    let mut slice = endpoint_slice();
+    slice.metadata.labels.insert(
+        "endpointslice.kubernetes.io/managed-by".to_string(),
+        "endpointslice-controller.k8s.io".to_string(),
+    );
+
+    let translation = translate_k8s_objects(&[service(), ready_pod(), slice], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    assert_eq!(
+        mesh.workloads[0].spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/default/sa/reviews"
+    );
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("mesh workload derivation")),
+        "{:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_publishes_the_pods_own_spelling_of_an_ipv4_mapped_address() {
+    // A slice may spell the Pod's IPv4 address IPv4-mapped. The workload
+    // carries the address the Pod reports, once (issue #6123).
+    let mut mapped = reviews_slice_with(json!([{
+        "addresses": ["::ffff:10.1.0.10"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+    mapped.metadata.name = "reviews-mapped".to_string();
+
+    let translation = translate_k8s_objects(
+        &[service(), ready_pod(), endpoint_slice(), mapped],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
+}
+
+/// A ready host-network Pod `namespace/name` reporting its Node's IP.
+fn host_network_pod_in(namespace: &str, name: &str, node_ip: &str) -> K8sObject {
+    let mut pod = ready_pod_in(namespace, name, name, node_ip);
+    pod.spec["hostNetwork"] = json!(true);
+    pod
+}
+
+#[test]
+fn k8s_pod_discovery_attaches_a_host_network_pod_named_by_target_ref() {
+    // A host-network DaemonSet Pod reports its Node's IP, as does every other
+    // host-network Pod on that Node, in any namespace. The EndpointSlice
+    // controller's same-namespace `targetRef` attaches it; the other
+    // namespace's host-network Pod must not refuse it.
+    let agent = host_network_pod_in("default", "reviews-v1", "192.168.10.5");
+    let kube_proxy = host_network_pod_in("kube-system", "kube-proxy-a", "192.168.10.5");
+    let slice = reviews_slice_with(json!([{
+        "addresses": ["192.168.10.5"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+
+    let translation = translate_k8s_objects(&[service(), agent, kube_proxy, slice], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(
+        reviews_workload_addresses(&translation),
+        vec!["192.168.10.5"]
+    );
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("mesh workload derivation")),
+        "{:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_ip_lookup_never_resolves_a_node_ip_or_a_shared_ip() {
+    // Without a `targetRef` an endpoint resolves its Pod by IP. A Node IP,
+    // which every host-network Pod on the Node reports, identifies no Pod;
+    // neither does an IP two Pods report.
+    let agent = host_network_pod_in("default", "reviews-v1", "192.168.10.5");
+    let kube_proxy = host_network_pod_in("kube-system", "kube-proxy-a", "192.168.10.5");
+    let node_ip = reviews_slice_with(json!([{
+        "addresses": ["192.168.10.5"],
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), agent, kube_proxy, node_ip], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+
+    let twin = ready_pod_in("default", "reviews-v2", "reviews", "10.1.0.10");
+    let shared_ip = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.10"],
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), twin, shared_ip], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+
+    // The same endpoint resolves once only one Pod reports the IP.
+    let sole_ip = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.10"],
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), sole_ip], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1416,6 +1760,7 @@ async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend
         .step(HttpStep::RespondBodyEnd)
         .spawn()
         .expect("spawn endpoint backend");
+    const POD_IP: &str = "10.244.0.250";
     for (case_index, target_port) in [json!(service_port.port), json!("container-http")]
         .into_iter()
         .enumerate()
@@ -1435,7 +1780,7 @@ async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend
             "manual-ip4",
             json!({
                 "addressType": "IPv4", "ports": [{"name": "http", "port": backend_port}],
-                "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+                "endpoints": [{"addresses": [POD_IP], "conditions": {"ready": true}}]
             }),
         );
         slice
@@ -1452,15 +1797,25 @@ async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend
             }),
         );
         route.api_version = "gateway.networking.k8s.io/v1".into();
-        let mut translated =
-            translate_k8s_objects(&[service, slice, route], options_for_namespace("default"))
-                .expect("translate manual endpoint route");
+        // The backendRef guard admits a Service's endpoints only when they are
+        // Pods of its namespace, and never a loopback address (issue #6108).
+        // The slice names this Pod's ordinary IP; the served config is then
+        // pointed at the loopback address the local backend listens on.
+        let mut pod = object("Pod", "default", "manual-0", json!({}));
+        pod.status = json!({"phase": "Running", "podIP": POD_IP});
+        let mut translated = translate_k8s_objects(
+            &[service, slice, route, pod],
+            options_for_namespace("default"),
+        )
+        .expect("translate manual endpoint route");
         assert_eq!(translated.config.proxies.len(), 1);
-        assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
+        assert_eq!(translated.config.proxies[0].backend_host, POD_IP);
         assert_eq!(translated.config.proxies[0].backend_port, backend_port);
         translated.config.proxies[0].listen_port = None;
         translated.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
-        let yaml = serde_yaml::to_string(&translated.config).expect("serialize translated config");
+        let yaml = serde_yaml::to_string(&translated.config)
+            .expect("serialize translated config")
+            .replace(POD_IP, "127.0.0.1");
         let gateway = GatewayHarness::builder()
             .mode_in_process()
             .file_config(yaml)

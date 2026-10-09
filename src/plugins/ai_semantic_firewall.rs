@@ -19,6 +19,7 @@ use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
     SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
@@ -142,6 +143,10 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
 /// Bound the wire body before generic JSON deserialization so a compromised or
 /// faulty provider cannot force an unbounded allocation.
 const MAX_EMBEDDING_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Schema label for the provider credential reference in diagnostics.
+const API_KEY_ENV_FIELD: &str = "ai_semantic_firewall: `provider.api_key_env`";
+
 /// OpenAI-compatible embedding models are normally at most a few thousand
 /// dimensions. This deliberately generous ceiling bounds scalar allocation and
 /// normalization work while retaining compatibility with custom models.
@@ -531,8 +536,9 @@ struct ProviderConfig {
     /// Literal IPs are intentionally omitted because they require no lookup.
     warmup_hostname: Option<String>,
     model: Option<String>,
-    /// Name of the env var holding the provider API key. Resolved lazily at the
-    /// first embedding call rather than in `new()` so config validation (CP
+    /// Name of the `FERRUM_PLUGIN_SECRET_<NAME>` env var holding the provider
+    /// API key (shape-checked at construction). Resolved lazily at the first
+    /// embedding call rather than in `new()` so config validation (CP
     /// admin, `ferrum-edge validate`) does not require the live secret to be
     /// present in a process that never calls the provider.
     api_key_env: Option<String>,
@@ -1129,7 +1135,12 @@ impl AiSemanticFirewall {
 
         let outcome = self
             .engine
-            .evaluate(Direction::Request, &segments, &ctx.plugin_http_call_ns)
+            .evaluate(
+                Direction::Request,
+                &segments,
+                &ctx.plugin_http_call_ns,
+                crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            )
             .await;
         if self
             .engine
@@ -1243,7 +1254,12 @@ impl AiSemanticFirewall {
 
         let outcome = self
             .engine
-            .evaluate(Direction::Response, &segments, &ctx.plugin_http_call_ns)
+            .evaluate(
+                Direction::Response,
+                &segments,
+                &ctx.plugin_http_call_ns,
+                crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            )
             .await;
         if self
             .engine
@@ -1274,6 +1290,7 @@ impl FirewallEngine {
         direction: Direction,
         segments: &[TextSegment],
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> EvaluationOutcome {
         let mut matches = self.lexical_matches(direction, segments);
         let has_reject_match = matches.iter().any(|m| m.action == Action::Reject);
@@ -1285,7 +1302,13 @@ impl FirewallEngine {
             && let Some(provider) = &self.provider
         {
             match self
-                .semantic_matches(provider, direction, segments, plugin_http_call_ns)
+                .semantic_matches(
+                    provider,
+                    direction,
+                    segments,
+                    plugin_http_call_ns,
+                    proxy_hops,
+                )
                 .await
             {
                 Ok(mut semantic_matches) => {
@@ -1370,6 +1393,7 @@ impl FirewallEngine {
         direction: Direction,
         segments: &[TextSegment],
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<Vec<RuleMatch>, String> {
         // Filter candidate segments BEFORE touching the provider. A request whose
         // extracted segments have no active semantic rule for this direction (e.g.
@@ -1393,7 +1417,7 @@ impl FirewallEngine {
         }
 
         let index = self
-            .rule_embedding_index(provider, plugin_http_call_ns)
+            .rule_embedding_index(provider, plugin_http_call_ns, proxy_hops)
             .await?;
 
         let segment_inputs: Vec<String> = candidate_segments
@@ -1401,7 +1425,7 @@ impl FirewallEngine {
             .map(|segment| segment.text.clone())
             .collect();
         let segment_embeddings = self
-            .embed_texts(provider, &segment_inputs, plugin_http_call_ns)
+            .embed_texts(provider, &segment_inputs, plugin_http_call_ns, proxy_hops)
             .await?;
 
         let mut matches = Vec::new();
@@ -1459,10 +1483,11 @@ impl FirewallEngine {
         &self,
         provider: &ProviderConfig,
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<Arc<RuleEmbeddingIndex>, String> {
         self.rule_embeddings
             .get_or_try_init(|| async {
-                self.build_rule_embedding_index(provider, plugin_http_call_ns)
+                self.build_rule_embedding_index(provider, plugin_http_call_ns, proxy_hops)
                     .await
                     .map(Arc::new)
             })
@@ -1474,6 +1499,7 @@ impl FirewallEngine {
         &self,
         provider: &ProviderConfig,
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<RuleEmbeddingIndex, String> {
         let mut inputs = Vec::new();
         let mut rule_ranges = Vec::new();
@@ -1491,7 +1517,7 @@ impl FirewallEngine {
         }
 
         let embeddings = self
-            .embed_texts(provider, &inputs, plugin_http_call_ns)
+            .embed_texts(provider, &inputs, plugin_http_call_ns, proxy_hops)
             .await?;
         let mut rule_embeddings = HashMap::new();
         let mut allow_topic_embeddings = HashMap::new();
@@ -1514,6 +1540,7 @@ impl FirewallEngine {
         provider: &ProviderConfig,
         texts: &[String],
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<Vec<EmbeddingVector>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -1540,16 +1567,16 @@ impl FirewallEngine {
             let authorization = provider
                 .authorization_header
                 .get_or_try_init(|| async {
-                    let api_key = std::env::var(env_name).map_err(|_| {
-                        format!(
-                            "ai_semantic_firewall: provider.api_key_env {env_name:?} is set but not present in this process"
-                        )
-                    })?;
+                    let api_key = resolve_plugin_secret_env(API_KEY_ENV_FIELD, env_name)?;
                     Ok::<String, String>(format!("Bearer {api_key}"))
                 })
                 .await?;
             request = request.header("Authorization", authorization.as_str());
         }
+        // An embedding endpoint that resolves back to the gateway is refused at
+        // the proxy hop limit like a looping route (issue #6128). The shared
+        // rule index carries the hop count of the request that built it.
+        request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops);
 
         let response = self
             .http_client
@@ -2137,6 +2164,10 @@ impl Plugin for AiSemanticFirewall {
         HTTP_ONLY_PROTOCOLS
     }
 
+    fn gates_request_admission(&self) -> bool {
+        true
+    }
+
     fn enforces_finalized_request_policy(&self) -> bool {
         true
     }
@@ -2478,6 +2509,7 @@ impl Plugin for AiSemanticFirewall {
             Arc::clone(&self.engine),
             config,
             Arc::clone(&ctx.plugin_http_call_ns),
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
             hold_stats,
         )))
     }
@@ -3202,6 +3234,9 @@ fn parse_provider_config(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    if let Some(env_name) = api_key_env.as_deref() {
+        validate_plugin_secret_env_name(API_KEY_ENV_FIELD, env_name)?;
+    }
     // Resolve the API key lazily at the first embedding call (see `embed_texts`),
     // not here: `new()` runs during CP admin validation and `ferrum-edge
     // validate`, which must not require the live secret in a process that never
@@ -5047,6 +5082,8 @@ struct StreamInspector {
     /// Cloned from `ctx.plugin_http_call_ns` so embedding-call time is attributed
     /// to the request even when driven from a detached H1/H2 task.
     plugin_http_call_ns: Arc<AtomicU64>,
+    /// The request's gateway hop count, carried on every embedding call.
+    proxy_hops: Option<u8>,
     /// Non-delta response extraction paths (e.g. `$.choices[*].message.content`,
     /// `$.output_text`), precomputed once. `Some` only when the config enables
     /// such paths, so the common delta-only case pays nothing per window.
@@ -5094,6 +5131,7 @@ impl StreamInspector {
         engine: Arc<FirewallEngine>,
         config: StreamingInspectConfig,
         plugin_http_call_ns: Arc<AtomicU64>,
+        proxy_hops: Option<u8>,
         hold_stats: Arc<StreamHoldStats>,
     ) -> Self {
         // Pre-split the configured response paths: delta paths are covered by the
@@ -5142,6 +5180,7 @@ impl StreamInspector {
             config,
             window,
             plugin_http_call_ns,
+            proxy_hops,
             non_delta_extraction,
             inspections_used: 0,
             terminated: false,
@@ -5429,9 +5468,12 @@ impl StreamInspector {
         // The inner scope ends the evaluation's borrow of `self` before the
         // expiry branch below takes `&mut self`.
         let evaluated = {
-            let evaluation =
-                self.engine
-                    .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns);
+            let evaluation = self.engine.evaluate(
+                Direction::Response,
+                &segments,
+                &self.plugin_http_call_ns,
+                self.proxy_hops,
+            );
             match remaining {
                 Some(remaining) => tokio::time::timeout(remaining, evaluation).await.ok(),
                 None => Some(evaluation.await),
@@ -5490,6 +5532,7 @@ impl StreamInspector {
         self.inspections_used += 1;
         let engine = Arc::clone(&self.engine);
         let plugin_http_call_ns = Arc::clone(&self.plugin_http_call_ns);
+        let proxy_hops = self.proxy_hops;
         let concurrency = self.detect_concurrency.clone();
         let provider_error_logged = Arc::clone(&self.detect_provider_error_logged);
         let max_hold = self.config.max_hold;
@@ -5514,7 +5557,12 @@ impl StreamInspector {
                     None => None,
                 };
                 engine
-                    .evaluate(Direction::Response, &segments, &plugin_http_call_ns)
+                    .evaluate(
+                        Direction::Response,
+                        &segments,
+                        &plugin_http_call_ns,
+                        proxy_hops,
+                    )
                     .await
             };
             // `detect` never cuts (the bytes are already on the wire), so an
@@ -7925,22 +7973,23 @@ fn array_has_object_with_any(value: Option<&Value>, keys: &[&str]) -> bool {
 }
 
 fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-
-    let mut output = Vec::new();
-    let limit = MAX_INSPECTION_BODY_BYTES as u64;
-    match encoding.trim().to_ascii_lowercase().as_str() {
-        "gzip" | "x-gzip" => {
-            let mut reader = flate2::read::MultiGzDecoder::new(data).take(limit + 1);
-            reader.read_to_end(&mut output).ok()?;
-        }
-        "br" => {
-            let mut reader = brotli::Decompressor::new(data, 4096).take(limit + 1);
-            reader.read_to_end(&mut output).ok()?;
-        }
+    let coding = match encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => "gzip",
+        "br" => "br",
         _ => return None,
-    }
-    (output.len() <= MAX_INSPECTION_BODY_BYTES).then_some(output)
+    };
+    super::charged_decode::decode_charged_content_coding_chain(
+        &[coding.to_string()],
+        data,
+        super::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes: MAX_INSPECTION_BODY_BYTES,
+            max_cumulative_bytes: MAX_INSPECTION_BODY_BYTES,
+            max_codings: 1,
+            max_amplification_ratio: 0,
+        },
+        crate::proxy::response_buffer_budget::BudgetRef::global(),
+    )
+    .ok()
 }
 
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {

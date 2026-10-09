@@ -13,6 +13,7 @@
 use ferrum_edge::util::client_identity::{
     canonical_client_ip_text, canonical_ip, canonical_ip_arc, canonical_ip_string,
     canonical_socket_addr, parse_canonical_client_ip, parse_client_ip_literal,
+    rate_limit_ip_string,
 };
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -79,6 +80,27 @@ fn true_ipv6_semantics_are_preserved() {
     }
     assert_ne!(canonical_ip(ip("::192.0.2.10")), ip("192.0.2.10"));
     assert_ne!(canonical_ip(ip("64:ff9b::c000:20a")), ip("192.0.2.10"));
+}
+
+#[test]
+fn rate_limit_ipv6_prefix_groups_network_hosts_and_keeps_ipv4_exact() {
+    assert_eq!(
+        rate_limit_ip_string(ip("2001:db8:abcd:12::1"), 64),
+        rate_limit_ip_string(ip("2001:db8:abcd:12::ffff"), 64)
+    );
+    assert_ne!(
+        rate_limit_ip_string(ip("2001:db8:abcd:12::1"), 64),
+        rate_limit_ip_string(ip("2001:db8:abcd:13::1"), 64)
+    );
+    assert_ne!(
+        rate_limit_ip_string(ip("2001:db8:abcd:12::1"), 128),
+        rate_limit_ip_string(ip("2001:db8:abcd:12::2"), 128)
+    );
+    assert_eq!(rate_limit_ip_string(ip("192.0.2.1"), 64), "192.0.2.1");
+    assert_eq!(
+        rate_limit_ip_string(ip("::ffff:192.0.2.1"), 64),
+        rate_limit_ip_string(ip("192.0.2.1"), 64)
+    );
 }
 
 #[test]

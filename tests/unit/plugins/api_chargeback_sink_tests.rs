@@ -843,7 +843,7 @@ async fn password_ref_requires_https_clickhouse_url() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());
     config["clickhouse"]["url"] = json!("http://localhost:8123");
-    config["clickhouse"]["password_ref"] = json!("FERRUM_CLICKHOUSE_PASSWORD");
+    config["clickhouse"]["password_ref"] = json!("FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD");
 
     let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
         Ok(_) => panic!("password_ref over http should be rejected"),
@@ -859,7 +859,7 @@ async fn password_ref_rejects_disabled_tls_verification() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());
     config["clickhouse"]["url"] = json!("https://localhost:8443");
-    config["clickhouse"]["password_ref"] = json!("FERRUM_CLICKHOUSE_PASSWORD");
+    config["clickhouse"]["password_ref"] = json!("FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD");
     config["clickhouse"]["tls"] = json!({ "insecure_skip_verify": true });
 
     let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
@@ -1015,7 +1015,7 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
             json!({
                 "clickhouse": {
                     "url": "http://clickhouse.example:8123",
-                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD"
+                    "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD"
                 },
                 "spool": { "enabled": false },
                 "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
@@ -1026,7 +1026,7 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
             json!({
                 "clickhouse": {
                     "url": "https://clickhouse.example:8443",
-                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
+                    "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD",
                     "tls": { "insecure_skip_verify": true }
                 },
                 "spool": { "enabled": false },
@@ -1038,7 +1038,7 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
             json!({
                 "clickhouse": {
                     "url": "https://clickhouse.example:8443",
-                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
+                    "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD",
                     "tls": { "verify_hostname": false }
                 },
                 "spool": { "enabled": false },
@@ -1152,19 +1152,42 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
     );
 }
 
+/// `password_ref` is sent as the HTTP Basic password to the config-chosen
+/// ClickHouse URL, so it may only name the plugin-secret namespace. A
+/// gateway-owned `FERRUM_*` secret (the admin JWT key, the database URL) is
+/// refused at admission exactly like an unrelated process variable.
 #[tokio::test]
-async fn password_ref_must_use_ferrum_prefix() {
+async fn password_ref_must_use_plugin_secret_namespace() {
     let temp = tempfile::tempdir().unwrap();
-    let mut config = valid_config(temp.path());
-    // https so the prefix check is reached rather than the https-required guard.
-    config["clickhouse"]["url"] = json!("https://localhost:8123");
-    config["clickhouse"]["password_ref"] = json!("PATH");
+    for reference in [
+        "PATH",
+        "FERRUM_ADMIN_JWT_SECRET",
+        "FERRUM_DB_URL",
+        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+        "FERRUM_CLICKHOUSE_PASSWORD",
+        "FERRUM_PLUGIN_SECRET_",
+        "FERRUM_PLUGIN_SECRET_lower",
+    ] {
+        let mut config = valid_config(temp.path());
+        // https so the namespace check is reached rather than the https-required guard.
+        config["clickhouse"]["url"] = json!("https://localhost:8123");
+        config["clickhouse"]["password_ref"] = json!(reference);
 
-    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
-        Ok(_) => panic!("non-FERRUM password_ref should be rejected"),
-        Err(error) => error,
-    };
-    assert!(error.contains("`clickhouse.password_ref` must reference a `FERRUM_*`"));
+        let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+            Ok(_) => panic!("password_ref {reference:?} should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("`clickhouse.password_ref` must name a `FERRUM_PLUGIN_SECRET_<NAME>`"),
+            "{reference}: {error}"
+        );
+    }
+
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://localhost:8123");
+    config["clickhouse"]["password_ref"] = json!("  FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD  ");
+    ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("a namespaced password_ref is admitted without reading the environment");
 }
 
 #[tokio::test]

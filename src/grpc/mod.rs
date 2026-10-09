@@ -19,6 +19,7 @@ pub mod dp_client;
 pub mod mesh_registry;
 pub mod mesh_server;
 pub mod mesh_slice_drift;
+pub mod response_admission;
 
 pub mod proto {
     // tonic's generated server traits expand through async-trait, which adds a

@@ -175,6 +175,7 @@ async fn plugin_name_priority_protocols_and_registration() {
     assert_eq!(plugin.name(), "ai_semantic_firewall");
     assert_eq!(plugin.priority(), priority::AI_SEMANTIC_FIREWALL);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(plugin.gates_request_admission());
     assert!(plugin.requires_request_body_buffering());
 
     let created = create_plugin("ai_semantic_firewall", &config)
@@ -1804,7 +1805,7 @@ async fn validation_succeeds_without_api_key_env_secret() {
         "provider": {
             "type": "openai_compatible_embeddings",
             "endpoint": "http://127.0.0.1:9/v1/embeddings",
-            "api_key_env": "FERRUM_EDGE_AI_SEMANTIC_FIREWALL_DEFINITELY_MISSING_KEY"
+            "api_key_env": "FERRUM_PLUGIN_SECRET_AI_SEMANTIC_FIREWALL_MISSING_KEY"
         },
         "builtins": {"prompt_injection": true}
     });
@@ -5716,7 +5717,7 @@ async fn response_only_stream_detection_does_not_govern_unrelated_requests() {
 
 #[tokio::test]
 async fn successful_api_key_resolution_is_cached_per_plugin_instance() {
-    const ENV_NAME: &str = "FERRUM_EDGE_TEST_SEMANTIC_FIREWALL_CACHED_KEY_2255";
+    const ENV_NAME: &str = "FERRUM_PLUGIN_SECRET_TEST_SEMANTIC_FIREWALL_CACHED_KEY_2255";
     unsafe { std::env::set_var(ENV_NAME, "cache-me") };
 
     let server = MockServer::start().await;
@@ -10194,4 +10195,40 @@ async fn builtin_tool_abuse_keeps_its_tool_segment_context_gate() {
     let mut headers = json_headers();
     let rejected = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(rejected, Some(403));
+}
+
+/// Every embedding call — the rule index built for the first request and the
+/// request's own segments — carries the request's gateway hop count
+/// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so an embedding
+/// endpoint that resolves back to the gateway is refused at the proxy hop limit
+/// like a looping route (issue #6128). With the limit disabled nothing is
+/// stamped.
+#[tokio::test]
+async fn embedding_calls_carry_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(5), vec!["5"]), (None, Vec::new())] {
+        let server = nonmatching_embedding_server().await;
+        let firewall = plugin(&json!({
+            "inspect": {"request": true, "response": false},
+            "on_error": "reject",
+            "provider": provider(&format!("{}/v1/embeddings", server.uri())),
+            "builtins": disabled_builtins_with("prompt_injection")
+        }));
+        let mut ctx = make_post_ctx(&json!({
+            "messages": [{"role": "user", "content": "A harmless governed request."}]
+        }));
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        assert_continue(firewall.before_proxy(&mut ctx, &mut json_headers()).await);
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(!received.is_empty(), "the firewall must call the embedder");
+        for request in &received {
+            let hops: Vec<&str> = request
+                .headers
+                .get_all("x-ferrum-hops")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+        }
+    }
 }

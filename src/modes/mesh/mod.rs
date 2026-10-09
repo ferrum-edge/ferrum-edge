@@ -2958,6 +2958,7 @@ fn node_waypoint_udp_listener_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
@@ -3865,9 +3866,14 @@ fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
         normalized.updated_at = epoch;
         serde_json::to_value(&normalized).unwrap_or(serde_json::Value::Null)
     }
-    // The DR-derived `#[serde(skip)]` fallback overlay is invisible to the
-    // serialized comparison, so compare it explicitly first.
-    if a.dispatch_port_override_fallback != b.dispatch_port_override_fallback {
+    // The DR-derived `#[serde(skip)]` fallback overlay and backend TLS refusal
+    // marker are invisible to the serialized comparison, so compare them
+    // explicitly first. A refused upstream keeps no TLS material, so without
+    // the marker it would serialize exactly like one with no DestinationRule
+    // TLS at all.
+    if a.dispatch_port_override_fallback != b.dispatch_port_override_fallback
+        || a.backend_tls_refused != b.backend_tls_refused
+    {
         return false;
     }
     let a_value = content_value(a);
@@ -4812,6 +4818,7 @@ fn build_east_west_service_proxies_and_upstreams(
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: HashMap::new(),
+                backend_tls_refused: false,
                 dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: now,
@@ -6152,7 +6159,23 @@ fn materialize_sidecar_inbound_proxies(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    if runtime.topology != MeshTopology::Sidecar {
+    // Assigned on every apply, before any early return: only the default
+    // service-port path below publishes HTTP application ports, and every
+    // Sidecar refuses a bare CONNECT that matches an HTTP route on its inbound
+    // listener (issue #6110).
+    let is_sidecar = runtime.topology == MeshTopology::Sidecar;
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.sidecar_inbound_http_app_ports.clear();
+        // Set for EVERY Sidecar, identity or not: the materialized routes
+        // below (`ingress[]` listeners and the service-port defaults) and any
+        // operator-defined HTTP proxy on the inbound listener all serve HTTP,
+        // and a bare byte-stream CONNECT matching one is refused rather than
+        // relayed as opaque bytes. The rule only ever refuses, so an
+        // identity-less Sidecar, which materializes nothing, loses no
+        // legitimate traffic: a Sidecar peer reaches an HTTP route as HTTP.
+        mesh.sidecar_inbound_refuses_matched_http_connect = is_sidecar;
+    }
+    if !is_sidecar {
         return;
     }
     let Some(local_spiffe) = runtime.workload_spiffe_id.as_deref() else {
@@ -6240,6 +6263,11 @@ fn materialize_sidecar_inbound_proxies(
         mesh.sidecar_ingress_bind_overrides.clear();
     }
 
+    // Proxy hop limit (issue #6109): ports this gateway itself listens on (the
+    // mesh listener plan and every Gateway/stream `listen_port`). An inbound
+    // route whose resolved local target is one of them would forward the
+    // request straight back into a Ferrum hop, so it is refused below.
+    let gateway_listener_ports = sidecar_ingress_claimed_ports(config, runtime);
     let mut materialized = 0usize;
     let mut tcp_routes = Vec::new();
     // Container (app) ports claimed by a materialized HTTP-family inbound route.
@@ -6346,6 +6374,10 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 };
+                if gateway_listener_ports.contains(&backend_port) {
+                    warn_inbound_target_is_gateway_listener(service, service_port, backend_port);
+                    continue;
+                }
                 // Claim this container port for the HTTP family so the raw-TCP
                 // inbound branch never preempts it (recorded even when the
                 // operator-overlap scan below skips materializing our route —
@@ -6430,6 +6462,10 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 };
+                if gateway_listener_ports.contains(&backend_port) {
+                    warn_inbound_target_is_gateway_listener(service, service_port, backend_port);
+                    continue;
+                }
                 // Effective protocol with `protocol_overrides` applied (same
                 // resolution `service_tcp_stream_ports` filtered on). Only an
                 // opaque-TLS port carries a real ClientHello, so only it is
@@ -6489,8 +6525,14 @@ fn materialize_sidecar_inbound_proxies(
     }
 
     let tcp_route_count = tcp_routes.len();
+    // The same HTTP-family claim also refuses a bare authenticated CONNECT
+    // naming one of these ports (issue #6110): an HTTP route serves the port,
+    // so the request must arrive as HTTP and run that route's plugin chain.
+    let mut http_app_ports: Vec<u16> = http_inbound_backend_ports.into_iter().collect();
+    http_app_ports.sort_unstable();
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.local_inbound_tcp_routes = tcp_routes;
+        mesh.sidecar_inbound_http_app_ports = http_app_ports;
     }
 
     if materialized > 0 {
@@ -6507,6 +6549,23 @@ fn materialize_sidecar_inbound_proxies(
             "Prepared sidecar raw-TCP inbound routes to the local application"
         );
     }
+}
+
+/// Fail-closed diagnostic for a Sidecar inbound route whose resolved local
+/// target port is a port this gateway listens on (issue #6109).
+fn warn_inbound_target_is_gateway_listener(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    backend_port: u16,
+) {
+    warn!(
+        service = %sanitize_startup_scalar(service.name.to_string()),
+        namespace = %sanitize_startup_scalar(service.namespace.to_string()),
+        service_port = %sanitize_startup_scalar(service_port.port.to_string()),
+        target_port = %sanitize_startup_scalar(backend_port.to_string()),
+        "Inbound mesh route targets a port this gateway listens on; failing closed rather \
+         than forwarding the request back into the gateway. Skipping this route."
+    );
 }
 
 /// Admit Sidecar `ingress[]` listeners for one prepared generation.
@@ -6643,6 +6702,34 @@ fn admit_sidecar_ingress_listeners<'a>(
             true
         })
         .collect();
+
+    // Proxy hop limit (issue #6109): a loopback `defaultEndpoint` that names a
+    // port this gateway itself listens on — the mesh listener plan, a Gateway
+    // or stream listener, or any dedicated bind admitted above, this entry's
+    // own included — sends the request straight back into a Ferrum hop. Two
+    // binds pointing at each other would loop, and the mesh inbound hop-count
+    // exemption assumes the target is the local application. Refuse the whole
+    // entry fail-closed, like a bind conflict. Unix-stream backends name no
+    // TCP port.
+    let listeners: Vec<_> = listeners
+        .into_iter()
+        .filter(|listener| {
+            if listener.endpoint_unix_path.is_some()
+                || !claimed_ports.contains(&listener.endpoint_port)
+            {
+                return true;
+            }
+            warn!(
+                local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                "Sidecar ingress[] defaultEndpoint targets a port this gateway listens on; \
+                 failing closed rather than forwarding the request back into the gateway"
+            );
+            bind_overrides.remove(&listener.port);
+            false
+        })
+        .collect();
     (listeners, bind_overrides)
 }
 
@@ -6715,6 +6802,26 @@ fn materialize_sidecar_ingress_listener_proxies(
     // identity can be built.
     let mut tcp_routes = Vec::with_capacity(stream_listeners.len());
     for listener in &stream_listeners {
+        // HTTP-family listeners WIN a shared application port, exactly as on
+        // the service-port default path (issue #6110): a stream listener
+        // forwarding to an HTTP listener's endpoint port relays no plaintext
+        // capture, and an authenticated CONNECT to it is refused
+        // `http_application_port` (`resolve_sidecar_ingress_connect_relay`).
+        if crate::modes::mesh::config::ingress_http_listener_serves_endpoint_port(
+            http_listeners.iter().copied(),
+            listener.endpoint_port,
+        ) {
+            warn!(
+                local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                "Sidecar ingress[] stream listener forwards to the same application port as an \
+                 HTTP listener; the HTTP route wins the port, so this listener relays neither \
+                 captured plaintext nor an authenticated CONNECT. Give it a distinct \
+                 defaultEndpoint port"
+            );
+            continue;
+        }
         let Ok(backend_ip) = listener.endpoint_host.parse::<std::net::IpAddr>() else {
             // endpoint_is_valid already required a loopback IP literal.
             continue;
@@ -7007,6 +7114,34 @@ fn sidecar_ingress_claimed_ports(
     ports
 }
 
+/// Every port this mesh data plane listens on for the proxy hop limit's mesh
+/// inbound exemption (issue #6109): the mesh listener plan and every proxy
+/// `listen_port` ([`sidecar_ingress_claimed_ports`]), the admin listeners, and
+/// the dedicated Sidecar `ingress[]` binds.
+///
+/// A mesh inbound route whose loopback target is in this set re-enters a
+/// Ferrum hop, so `hop_limit::effective_outbound_proxy_hops` increments the
+/// count for it instead of forwarding it unchanged. Only ports mesh mode
+/// actually binds belong here: `FERRUM_PROXY_HTTP_PORT` /
+/// `FERRUM_PROXY_HTTPS_PORT` are not served in mesh mode, and listing them
+/// would charge a second hop to an application that happens to use them.
+/// Cold path.
+fn mesh_gateway_listener_ports(
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+    config: &GatewayConfig,
+) -> proxy::hop_limit::GatewayListenerPorts {
+    let mut ports = sidecar_ingress_claimed_ports(config, runtime);
+    ports.insert(env_config.admin_http_port);
+    if env_config.admin_https_listener_enabled() {
+        ports.insert(env_config.admin_https_port);
+    }
+    if let Some(mesh) = config.mesh.as_deref() {
+        ports.extend(mesh.sidecar_ingress_bind_overrides.keys().copied());
+    }
+    proxy::hop_limit::GatewayListenerPorts::from_ports(ports)
+}
+
 /// Materialize conflict-checked dedicated bind sockets for Sidecar ingress
 /// entries that declared a supported loopback `bind` (issue #3266).
 ///
@@ -7036,6 +7171,25 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
             listener.port,
         );
         let proxy = if listener.is_stream_family() {
+            // The dedicated bind honors the same "HTTP wins a shared port"
+            // rule as the capture table and the CONNECT remap (issue #6110):
+            // relaying it would hand a direct client an opaque byte stream to
+            // the HTTP listener's application socket.
+            if crate::modes::mesh::config::ingress_http_listener_serves_endpoint_port(
+                listeners.iter().copied(),
+                listener.endpoint_port,
+            ) {
+                warn!(
+                    local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                    listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                    endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                    "Sidecar ingress[] stream listener with a dedicated bind forwards to the same \
+                     application port as an HTTP listener; the HTTP route wins the port, so no \
+                     dedicated bind listener is materialized for it. Give it a distinct \
+                     defaultEndpoint port"
+                );
+                continue;
+            }
             let Ok(backend_ip) = listener.endpoint_host.parse::<std::net::IpAddr>() else {
                 continue;
             };
@@ -7183,6 +7337,7 @@ fn mesh_ingress_unix_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
@@ -10172,6 +10327,7 @@ fn mesh_outbound_route_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         k8s_service_uid,
@@ -10372,10 +10528,26 @@ fn synthesize_mesh_outbound_cors_plugins(
 /// DP subscribers, including native input that repeats one name for distinct
 /// host spellings. This order is an intra-tier tiebreak only; it is never
 /// cross-tier precedence.
+///
+/// A tenant rule's local TLS files are re-checked on this node only when the
+/// rule is applied to a local upstream; a refusal fails that rule's
+/// destinations closed (see [`fail_closed_upstream_backend_tls`]) and the rest
+/// of the slice still applies.
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
+) -> Result<(), anyhow::Error> {
+    let tenant_file_roots = crate::tls::source::effective_mesh_tenant_tls_file_roots();
+    apply_destination_rules_with_tenant_file_roots(config, runtime, mesh_slice, &tenant_file_roots)
+}
+
+/// [`apply_destination_rules`] against an explicit tenant TLS file root list.
+fn apply_destination_rules_with_tenant_file_roots(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+    tenant_file_roots: &[std::path::PathBuf],
 ) -> Result<(), anyhow::Error> {
     let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_destination_rules: Vec<&MeshDestinationRule> = mesh_slice
@@ -10588,6 +10760,11 @@ fn apply_destination_rules(
     // namespaces. Counted, then reported ONCE — a per-rule warning would be
     // per-reload × per-DP spam.
     let mut refused_out_of_lookup_path = 0usize;
+    // Upstreams governed by a tenant rule whose local TLS file did not resolve
+    // under a tenant file root on THIS node. Their backend TLS is marked
+    // refused after every rule has applied, so every TLS build for those
+    // destinations fails while the rest of the slice applies.
+    let mut tls_file_refused_upstreams: HashSet<usize> = HashSet::new();
 
     for dr in sorted_destination_rules.iter().copied() {
         let mut matched_any_host = false;
@@ -10632,6 +10809,60 @@ fn apply_destination_rules(
             );
             continue;
         };
+
+        // Slice validation admitted this rule's local TLS files lexically.
+        // This node is about to project them onto its upstreams, so re-check
+        // each one after symlink resolution. Only rules that reach a local
+        // upstream are checked: a file's presence is per-node state, so one
+        // tenant's missing or escaping file must fail only the destinations
+        // that rule governs, never the whole slice.
+        let escape = crate::modes::mesh::config::destination_rule_tls_file_escape_error(
+            dr,
+            &mesh_slice.istio_root_namespace,
+            tenant_file_roots,
+        );
+        if let Some(error) = escape {
+            // HBONE and Sidecar mesh-mTLS dispatch never reads backend TLS
+            // material: those transports run only for plaintext-scheme proxies
+            // and authenticate with the gateway SVID. Refusing the material
+            // therefore leaves their traffic on the mesh identity, so the
+            // warning must not claim it fails closed.
+            let mesh_transport_upstreams = matching_upstream_indices
+                .iter()
+                .filter(|&&idx| {
+                    config
+                        .upstreams
+                        .get(idx)
+                        .is_some_and(upstream_uses_mesh_transport)
+                })
+                .count();
+            let tls_upstreams = matching_upstream_indices.len() - mesh_transport_upstreams;
+            let reason = sanitize_startup_scalar(error);
+            if tls_upstreams > 0 {
+                warn!(
+                    rule_namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
+                    rule = %sanitize_startup_scalar(dr.name.to_string()),
+                    upstreams = tls_upstreams,
+                    reason = %reason,
+                    "DestinationRule local TLS file does not resolve under a tenant TLS file root \
+                     on this node; backend TLS for the destinations it governs is refused and \
+                     fails closed"
+                );
+            }
+            if mesh_transport_upstreams > 0 {
+                warn!(
+                    rule_namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
+                    rule = %sanitize_startup_scalar(dr.name.to_string()),
+                    upstreams = mesh_transport_upstreams,
+                    reason = %reason,
+                    "DestinationRule local TLS file does not resolve under a tenant TLS file root \
+                     on this node; its TLS material is refused, and traffic to the HBONE / \
+                     mesh-mTLS destinations it governs continues over the gateway mesh \
+                     identity, which never uses that material"
+                );
+            }
+            tls_file_refused_upstreams.extend(matching_upstream_indices.iter().copied());
+        }
 
         let connect_timeout_ms = dr
             .traffic_policy
@@ -11118,7 +11349,57 @@ fn apply_destination_rules(
     // than whatever value a mid-loop pass would have observed.
     resolve_subset_traffic_policy(config, runtime)?;
 
+    // Runs after the subset pass so no scope (upstream, per-port, subset) can
+    // keep the refused rule's file reference or fall back to a weaker posture.
+    for &idx in &tls_file_refused_upstreams {
+        if let Some(upstream) = config.upstreams.get_mut(idx) {
+            fail_closed_upstream_backend_tls(upstream);
+        }
+    }
+
     Ok(())
+}
+
+/// Fail an upstream's backend TLS closed at every scope (upstream, per-port,
+/// subset). Used when a DestinationRule's local TLS file is refused on this
+/// node: the destination must not fall back to the PeerAuthentication default,
+/// system roots, the global CA, or the gateway's own client certificate.
+///
+/// The refusal is explicit: every scope keeps no material and carries
+/// [`BackendTlsConfig::tls_refused`], which every backend TLS builder checks
+/// before it reads anything else, so neither `FERRUM_TLS_NO_VERIFY` nor the
+/// global CA / client pair can stand in for the refused material. The refusal
+/// covers every backend client build for the destination, including the shared
+/// HTTP client a plaintext-scheme proxy builds (it carries a TLS config even
+/// for `http` backends), because cached TLS configs are keyed without the
+/// scheme. HBONE and Sidecar mesh-mTLS dispatch never read this material, so
+/// traffic over those transports keeps the gateway mesh identity.
+fn fail_closed_upstream_backend_tls(upstream: &mut Upstream) {
+    upstream.backend_tls_refused = true;
+    upstream.backend_tls_client_cert_path = None;
+    upstream.backend_tls_client_key_path = None;
+    upstream.backend_tls_server_ca_cert_path = None;
+    upstream.backend_tls_verify_server_cert = true;
+    upstream.backend_tls_sni = None;
+    upstream.backend_tls_san_allow_list.clear();
+    for port_override in upstream.port_overrides.values_mut() {
+        if port_override.tls.is_some() {
+            port_override.tls = Some(BackendTlsConfig::refused());
+        }
+    }
+    for resolved in upstream.resolved_subset_tls.values_mut() {
+        if resolved.tls.is_some() {
+            resolved.tls = Some(BackendTlsConfig::refused());
+        }
+    }
+    if let Some(fallback) = upstream.dispatch_port_override_fallback.as_mut()
+        && fallback.tls.is_some()
+    {
+        fallback.tls = Some(BackendTlsConfig::refused());
+    }
+    crate::tls::backend::record_backend_tls_refusal(
+        crate::tls::backend::BackendTlsRefusalSurface::SliceApply,
+    );
 }
 
 /// Compute each upstream's resolved subset overlay against the settled
@@ -12812,6 +13093,7 @@ fn build_egress_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
@@ -14730,6 +15012,12 @@ fn prepare_mesh_runtime_before_owner(
         Some(shutdown_tx.subscribe()),
         bpf_metrics_state.clone(),
     )?;
+    // Proxy hop limit (issue #6109): publish this generation's listener ports
+    // before any listener binds, so the mesh inbound exemption never forwards
+    // an unchanged count to another gateway listener.
+    let initial_listener_ports =
+        mesh_gateway_listener_ports(env_config, runtime, &proxy_state.config.load_full());
+    proxy::hop_limit::publish_gateway_listener_ports(Some(Arc::new(initial_listener_ports)));
 
     Ok((
         dns_cache,
@@ -16351,9 +16639,10 @@ fn start_mesh_admin_listeners(
     let admin_state_for_https = admin_state.clone();
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
     // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
-    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new_with_ipv6_prefix(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
+        env_config.per_ip_ipv6_prefix,
     ));
 
     // Validate admin HTTPS TLS material BEFORE spawning any admin listener so a
@@ -19869,10 +20158,31 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
+            // Proxy hop limit (issue #6109): while the candidate is being
+            // applied, the published listener-port snapshot covers BOTH
+            // generations, so a request on either config never forwards an
+            // unchanged count to a port the other one listens on. It settles on
+            // the accepted candidate (or back on the previous snapshot) below.
+            let candidate_listener_ports =
+                mesh_gateway_listener_ports(&proxy_state.env_config, runtime, &config);
+            let candidate_listener_ports = Arc::new(candidate_listener_ports);
+            let previous_listener_ports = proxy::hop_limit::gateway_listener_ports();
+            let transition_listener_ports = match previous_listener_ports.as_deref() {
+                Some(previous) => previous.union(&candidate_listener_ports),
+                None => candidate_listener_ports.as_ref().clone(),
+            };
+            let transition_listener_ports = Some(Arc::new(transition_listener_ports));
+            proxy::hop_limit::publish_gateway_listener_ports(transition_listener_ports);
             let outcome =
                 proxy_state.update_mesh_config(config, &trusted_mesh_ids, staged_gateway_trust);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
+            let settled_listener_ports = if accepted {
+                Some(candidate_listener_ports)
+            } else {
+                previous_listener_ports
+            };
+            proxy::hop_limit::publish_gateway_listener_ports(settled_listener_ports);
             // Publish the node-waypoint resolver snapshot the instant the proxy
             // config is accepted — before recording the apply result or
             // reloading TLS — so the window where the new config is live but the
@@ -27889,6 +28199,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
@@ -29158,9 +29469,9 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Mutual,
-                        ca_certificates: Some("/etc/certs/ca.pem".to_string()),
-                        client_certificate: Some("/etc/certs/client.pem".to_string()),
-                        private_key: Some("/etc/certs/client.key".to_string()),
+                        ca_certificates: Some("k8s://default/reviews-tls#ca.crt".to_string()),
+                        client_certificate: Some("k8s://default/reviews-tls#tls.crt".to_string()),
+                        private_key: Some("k8s://default/reviews-tls#tls.key".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -29178,17 +29489,200 @@ mod tests {
         let upstream = &config.upstreams[0];
         assert_eq!(
             upstream.backend_tls_client_cert_path.as_deref(),
-            Some("/etc/certs/client.pem")
+            Some("k8s://default/reviews-tls#tls.crt")
         );
         assert_eq!(
             upstream.backend_tls_client_key_path.as_deref(),
-            Some("/etc/certs/client.key")
+            Some("k8s://default/reviews-tls#tls.key")
         );
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
-            Some("/etc/certs/ca.pem")
+            Some("k8s://default/reviews-tls#ca.crt")
         );
         assert!(upstream.backend_tls_verify_server_cert);
+    }
+
+    fn tenant_file_tls_destination_rule(name: &str, host: &str, ca: &str) -> MeshDestinationRule {
+        MeshDestinationRule {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            host: host.to_string(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some(ca.to_string()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
+        }
+    }
+
+    fn assert_backend_tls_fails_closed(upstream: &Upstream) {
+        assert!(
+            upstream.backend_tls_refused,
+            "a refused destination must carry the explicit refusal marker"
+        );
+        assert!(
+            BackendTlsConfig::from_upstream(upstream).tls_refused,
+            "the marker must reach the resolved backend TLS config"
+        );
+        for (field, value) in [
+            ("ca", upstream.backend_tls_server_ca_cert_path.as_deref()),
+            (
+                "client cert",
+                upstream.backend_tls_client_cert_path.as_deref(),
+            ),
+            (
+                "client key",
+                upstream.backend_tls_client_key_path.as_deref(),
+            ),
+        ] {
+            assert_eq!(value, None, "{field} must not keep the refused reference");
+        }
+        assert!(upstream.backend_tls_verify_server_cert);
+        assert!(upstream.backend_tls_sni.is_none());
+        assert!(upstream.backend_tls_san_allow_list.is_empty());
+    }
+
+    #[test]
+    fn refused_backend_tls_config_carries_the_marker_and_no_material() {
+        let slot = BackendTlsConfig::refused();
+        assert!(slot.tls_refused);
+        assert!(slot.verify_server_cert);
+        assert!(slot.server_ca_cert_path.is_none());
+        assert!(slot.client_cert_path.is_none());
+        assert!(slot.client_key_path.is_none());
+    }
+
+    #[test]
+    fn dr_tls_missing_tenant_file_fails_only_its_destination_closed() {
+        // One tenant rule names a file that is absent on this node. The slice
+        // must still apply: the valid rule's destination keeps its TLS, and
+        // only the bad rule's destination fails closed.
+        let root = tempfile::tempdir().expect("tempdir");
+        let present = root.path().join("reviews-ca.pem");
+        std::fs::write(&present, "material").expect("write ca");
+        let missing = root.path().join("ratings-ca.pem");
+        let present = present.to_str().expect("utf-8 temp path").to_string();
+        let missing = missing.to_str().expect("utf-8 temp path").to_string();
+        let tenant_file_roots = vec![root.path().to_path_buf()];
+        let mut config = GatewayConfig {
+            proxies: vec![
+                destination_rule_test_proxy("p1", "u1"),
+                destination_rule_test_proxy("p2", "u2"),
+            ],
+            upstreams: vec![
+                destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local"),
+                destination_rule_test_upstream("u2", "ratings.default.svc.cluster.local"),
+            ],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![
+                tenant_file_tls_destination_rule(
+                    "reviews",
+                    "reviews.default.svc.cluster.local",
+                    &present,
+                ),
+                tenant_file_tls_destination_rule(
+                    "ratings",
+                    "ratings.default.svc.cluster.local",
+                    &missing,
+                ),
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules_with_tenant_file_roots(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &slice,
+            &tenant_file_roots,
+        )
+        .expect("one tenant's missing file must not refuse the slice");
+
+        let reviews = &config.upstreams[0];
+        assert_eq!(
+            reviews.backend_tls_server_ca_cert_path.as_deref(),
+            Some(present.as_str()),
+            "the valid rule's destination keeps its TLS"
+        );
+        assert!(reviews.backend_tls_client_cert_path.is_none());
+        assert!(reviews.backend_tls_verify_server_cert);
+
+        let ratings = &config.upstreams[1];
+        assert_backend_tls_fails_closed(ratings);
+        assert_ne!(
+            ratings.backend_tls_server_ca_cert_path.as_deref(),
+            Some(missing.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dr_tls_tenant_file_symlink_escaping_its_root_fails_the_destination_closed() {
+        // The link sits under the root, so the static check admits it; the
+        // per-upstream re-check resolves it and refuses. No scope may keep
+        // the escaping reference.
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let platform_ca = outside.path().join("platform-ca.pem");
+        std::fs::write(&platform_ca, "platform material").expect("write target");
+        let link = root.path().join("ca.pem");
+        std::os::unix::fs::symlink(&platform_ca, &link).expect("symlink");
+        let link = link.to_str().expect("utf-8 temp path").to_string();
+        let tenant_file_roots = vec![root.path().to_path_buf()];
+        let host = "reviews.default.svc.cluster.local";
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream("u1", host)],
+            ..GatewayConfig::default()
+        };
+        let mut rule = tenant_file_tls_destination_rule("reviews", host, &link);
+        rule.subsets = vec![MeshSubset {
+            name: "v1".to_string(),
+            labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some(link.clone()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+        }];
+        let slice = MeshSlice {
+            destination_rules: vec![rule],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules_with_tenant_file_roots(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &slice,
+            &tenant_file_roots,
+        )
+        .expect("an escaping tenant file fails its destination, not the slice");
+
+        let upstream = &config.upstreams[0];
+        assert_backend_tls_fails_closed(upstream);
+        let subset_tls = upstream
+            .resolved_subset_tls
+            .get("v1")
+            .and_then(|resolved| resolved.tls.as_ref())
+            .expect("v1 subset keeps a resolved TLS slot");
+        assert!(
+            subset_tls.tls_refused,
+            "the subset scope must fail closed too"
+        );
+        assert!(
+            subset_tls.server_ca_cert_path.is_none(),
+            "the subset scope must not keep the escaping reference"
+        );
     }
 
     #[test]
@@ -29223,7 +29717,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         sni: Some("reviews.default.svc.cluster.local".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
@@ -29236,9 +29730,9 @@ mod tests {
                     traffic_policy: Some(MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Mutual,
-                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
-                            client_certificate: Some("/etc/certs/v1-client.pem".to_string()),
-                            private_key: Some("/etc/certs/v1-client.key".to_string()),
+                            ca_certificates: Some("k8s://default/v1-tls#ca.crt".to_string()),
+                            client_certificate: Some("k8s://default/v1-tls#tls.crt".to_string()),
+                            private_key: Some("k8s://default/v1-tls#tls.key".to_string()),
                             sni: Some("v1.reviews.mesh.internal".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
@@ -29257,7 +29751,7 @@ mod tests {
         // Upstream-level TLS reflects the top-level DR.tls.
         assert_eq!(
             upstream.backend_tls_server_ca_cert_path.as_deref(),
-            Some("/etc/certs/upstream-ca.pem"),
+            Some("k8s://default/up-tls#ca.crt"),
             "upstream CA still reflects upstream-level DR.tls"
         );
         assert_eq!(
@@ -29276,16 +29770,16 @@ mod tests {
             .expect("v1 resolved tls is Some");
         assert_eq!(
             subset_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/v1-ca.pem"),
+            Some("k8s://default/v1-tls#ca.crt"),
             "subset overlay swaps the CA for v1 dispatch"
         );
         assert_eq!(
             subset_tls.client_cert_path.as_deref(),
-            Some("/etc/certs/v1-client.pem")
+            Some("k8s://default/v1-tls#tls.crt")
         );
         assert_eq!(
             subset_tls.client_key_path.as_deref(),
-            Some("/etc/certs/v1-client.key")
+            Some("k8s://default/v1-tls#tls.key")
         );
         assert_eq!(
             subset_tls.sni.as_deref(),
@@ -29522,7 +30016,7 @@ mod tests {
             MeshTrafficPolicy {
                 tls: Some(MeshTrafficPolicyTls {
                     mode: MtlsMode::Simple,
-                    ca_certificates: Some("/etc/certs/port-8080-ca.pem".to_string()),
+                    ca_certificates: Some("k8s://default/secure-8080-tls#ca.crt".to_string()),
                     sni: Some("port8080.secure.internal".to_string()),
                     ..MeshTrafficPolicyTls::default()
                 }),
@@ -29555,7 +30049,7 @@ mod tests {
             .expect("port 8080 resolved backend TLS");
         assert_eq!(
             tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/port-8080-ca.pem"),
+            Some("k8s://default/secure-8080-tls#ca.crt"),
             "per-port TLS resolves the CA for port 8080"
         );
         assert_eq!(tls.sni.as_deref(), Some("port8080.secure.internal"));
@@ -29661,7 +30155,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -29673,7 +30167,7 @@ mod tests {
                     traffic_policy: Some(MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Simple,
-                            ca_certificates: Some("/etc/certs/v1-ca.pem".to_string()),
+                            ca_certificates: Some("k8s://default/v1-tls#ca.crt".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
                         ..MeshTrafficPolicy::default()
@@ -29693,12 +30187,12 @@ mod tests {
 
         assert_eq!(
             p1.resolved_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/upstream-ca.pem"),
+            Some("k8s://default/up-tls#ca.crt"),
             "proxy without upstream_subset gets upstream-level CA"
         );
         assert_eq!(
             p2.resolved_tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/v1-ca.pem"),
+            Some("k8s://default/v1-tls#ca.crt"),
             "proxy with upstream_subset='v1' gets subset overlay CA"
         );
     }
@@ -29725,7 +30219,7 @@ mod tests {
                 traffic_policy: Some(MeshTrafficPolicy {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::Simple,
-                        ca_certificates: Some("/etc/certs/upstream-ca.pem".to_string()),
+                        ca_certificates: Some("k8s://default/up-tls#ca.crt".to_string()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -32978,6 +33472,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: loaded_at,
@@ -33209,6 +33704,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
@@ -33691,6 +34187,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
@@ -39571,7 +40068,7 @@ mod tests {
                     MeshTrafficPolicy {
                         tls: Some(MeshTrafficPolicyTls {
                             mode: MtlsMode::Simple,
-                            ca_certificates: Some("/etc/certs/primary-ca.pem".to_string()),
+                            ca_certificates: Some("k8s://default/primary-tls#ca.crt".to_string()),
                             sni: Some("primary.external.com".to_string()),
                             ..MeshTrafficPolicyTls::default()
                         }),
@@ -39606,7 +40103,7 @@ mod tests {
             .expect("service-port override carries resolved TLS policy");
         assert_eq!(
             tls.server_ca_cert_path.as_deref(),
-            Some("/etc/certs/primary-ca.pem")
+            Some("k8s://default/primary-tls#ca.crt")
         );
         assert_eq!(tls.sni.as_deref(), Some("primary.external.com"));
     }

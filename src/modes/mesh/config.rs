@@ -705,8 +705,9 @@ pub struct MeshExtAuthzBodyCheck {
 /// Hop-by-hop / framing / routing / mesh-identity header names that may never
 /// be forwarded to a provider nor written back from one.
 ///
-/// Names are compared after ASCII-lowercasing. `x-ferrum-` prefixed names are
-/// reserved gateway assertions and are refused by prefix, not by exact name.
+/// Names are compared after ASCII-lowercasing. `x-ferrum-` prefixed names (with
+/// `_` folded to `-`) are reserved gateway assertions and are refused by prefix,
+/// not by exact name.
 const MESH_EXT_AUTHZ_RESERVED_HEADERS: &[&str] = &[
     "connection",
     "content-length",
@@ -756,8 +757,24 @@ fn mesh_ext_authz_header_name_is_wellformed(name: &str) -> bool {
 
 fn mesh_ext_authz_header_is_reserved(lowercase: &str) -> bool {
     MESH_EXT_AUTHZ_RESERVED_HEADERS.contains(&lowercase)
-        || lowercase.starts_with("x-ferrum-")
+        || mesh_ext_authz_header_has_ferrum_prefix(lowercase)
         || lowercase.starts_with("x-forwarded-")
+}
+
+/// `x-ferrum-` gateway assertions are reserved in either spelling: `_` is
+/// folded to `-` before the prefix test, because backends that fold the two
+/// (CGI, nginx `underscores_in_headers`) read `x_ferrum_hops` as the gateway's
+/// `X-Ferrum-Hops` (issue #6128).
+fn mesh_ext_authz_header_has_ferrum_prefix(lowercase: &str) -> bool {
+    const PREFIX: &[u8] = b"x-ferrum-";
+    lowercase
+        .as_bytes()
+        .get(..PREFIX.len())
+        .is_some_and(|head| {
+            head.iter()
+                .zip(PREFIX)
+                .all(|(&byte, &expected)| byte == expected || (byte == b'_' && expected == b'-'))
+        })
 }
 
 /// Validate a header name that will be COPIED FROM the client request INTO the
@@ -3842,6 +3859,27 @@ pub fn is_modeled_ingress_app_protocol(protocol: AppProtocol) -> bool {
     is_http_family_app_protocol(protocol) || is_stream_family_app_protocol(protocol)
 }
 
+/// Whether one of `listeners` is an HTTP-family Sidecar `ingress[]` listener
+/// whose loopback `defaultEndpoint` is on `endpoint_port` (issue #6110).
+///
+/// Every loopback ingress endpoint is in the pod's own network namespace, so a
+/// shared port is one application socket. The HTTP route wins it, exactly as
+/// on the service-port default path: a stream-family listener forwarding to
+/// the same port must not hand a peer an opaque byte stream that skips the
+/// HTTP route's plugin chain. A Unix-stream HTTP backend has no TCP port and
+/// never matches.
+pub fn ingress_http_listener_serves_endpoint_port<'a>(
+    listeners: impl IntoIterator<Item = &'a ResolvedIngressListener>,
+    endpoint_port: u16,
+) -> bool {
+    endpoint_port != 0
+        && listeners.into_iter().any(|listener| {
+            listener.is_http_family()
+                && listener.endpoint_unix_path.is_none()
+                && listener.endpoint_port == endpoint_port
+        })
+}
+
 /// Parse an Istio `defaultEndpoint` into the typed backend it names.
 ///
 /// Supported (per Istio's "Arbitrary IPs are not supported" rule): loopback
@@ -5113,6 +5151,52 @@ pub struct MeshConfig {
     /// [`Self::inbound_relay_destinations`].
     #[serde(skip)]
     pub inbound_relay_own_address_ports: Vec<MeshOwnAddressPortBound>,
+    /// Runtime-only set of the local application (container) ports that a
+    /// materialized Sidecar HTTP-family inbound route serves (issue #6110),
+    /// sorted and deduplicated.
+    ///
+    /// A bare authenticated byte-stream CONNECT on the Sidecar `:15006`
+    /// listener whose authority names one of these ports is refused
+    /// ([`InboundRelayDenial::HttpApplicationPort`]) instead of being relayed
+    /// as opaque bytes: the port is served by an HTTP route, and relaying it
+    /// would skip that route's plugin chain. Stream-family (TCP/opaque) ports
+    /// keep the CONNECT relay. A container port that both an HTTP-family and a
+    /// stream-family service port resolve to is in this set, because the HTTP
+    /// route wins that port, so a raw-TCP CONNECT for the stream-family service
+    /// (a Ferrum peer's raw-TCP egress included) is refused too. The remedy is
+    /// distinct container ports for the two service ports.
+    ///
+    /// Populated ONLY by the default Sidecar service-port inbound
+    /// materializer and assigned on every apply (empty on every other
+    /// topology, and when a Sidecar `ingress[]` block is declared, whose
+    /// CONNECT remap already refuses every HTTP-family listener port).
+    /// `serde(skip)` for the same reason as
+    /// [`Self::inbound_relay_destinations`].
+    #[serde(skip)]
+    pub sidecar_inbound_http_app_ports: Vec<u16>,
+    /// Runtime-only: a bare byte-stream CONNECT on the inbound listener that
+    /// MATCHES an HTTP-family route is refused (issue #6110) instead of being
+    /// relayed to that route's backend as opaque bytes.
+    ///
+    /// [`Self::sidecar_inbound_http_app_ports`] covers the route MISS, where
+    /// the relay is synthesized from the authority. This flag covers the route
+    /// HIT: a CONNECT whose authority names a service host
+    /// (`reviews.default.svc.cluster.local:9080`), a Sidecar `ingress[]` HTTP
+    /// listener host, or an operator-defined HTTP proxy matches that route,
+    /// and relaying it would run the route's plugin chain once, on the CONNECT,
+    /// while every HTTP request written into the tunnel skipped it. The peer
+    /// must send HTTP instead.
+    ///
+    /// Set ONLY by the Sidecar inbound materializer, for EVERY Sidecar
+    /// (with or without a workload identity: the rule only refuses, and a
+    /// Sidecar peer reaches an HTTP route as HTTP); assigned on every apply.
+    /// Ambient and waypoint terminators never set it, so their matched-route
+    /// CONNECT dispatch (which `mesh_route_dispatch` overrides ride) is
+    /// unchanged.
+    /// `serde(skip)` for the same reason as
+    /// [`Self::inbound_relay_destinations`].
+    #[serde(skip)]
+    pub sidecar_inbound_refuses_matched_http_connect: bool,
     /// The authoritative node-local enrolled-pod registry bounding
     /// [`Self::inbound_relay_destinations`] (issue #4249).
     ///
@@ -5240,6 +5324,10 @@ pub enum InboundRelayDenial {
     /// The address IS one this proxy terminates for, but the owning workload
     /// record does not declare the requested port.
     PortNotDeclared,
+    /// A byte-stream CONNECT names a port a materialized Sidecar HTTP-family
+    /// inbound route serves (issue #6110). Relaying it as opaque bytes would
+    /// skip that route's plugin chain, so the peer must send HTTP instead.
+    HttpApplicationPort,
 }
 
 impl InboundRelayDenial {
@@ -5250,6 +5338,7 @@ impl InboundRelayDenial {
             Self::UnresolvableHost => "unresolvable_authority",
             Self::AddressNotTerminated => "address_not_terminated_here",
             Self::PortNotDeclared => "port_not_declared",
+            Self::HttpApplicationPort => "http_application_port",
         }
     }
 }
@@ -5558,6 +5647,12 @@ pub enum SidecarIngressConnectRelay {
     /// CONNECT rather than fall back to dialing the authority, including for a
     /// port absent from an explicit-empty/all-invalid replacement surface.
     Deny,
+    /// The authority resolves to an owned stream-family listener, but its
+    /// loopback `defaultEndpoint` port is also an HTTP-family listener's
+    /// endpoint (issue #6110). The HTTP route wins a shared port, so the caller
+    /// refuses the CONNECT as [`InboundRelayDenial::HttpApplicationPort`]
+    /// instead of relaying opaque bytes past that route's plugin chain.
+    HttpApplicationPort,
     /// Relay to the listener's validated loopback `defaultEndpoint`, while
     /// AuthorizationPolicy evaluation stays keyed to `listener_port`.
     Relay {
@@ -5739,6 +5834,39 @@ impl MeshConfig {
         }
 
         self.inbound_relay_inventory_decision(candidate, address, port)
+    }
+
+    /// [`Self::inbound_relay_destination_decision`] for a BYTE-STREAM relay
+    /// (issue #6110): the same ownership guard, then a refusal for a port a
+    /// materialized Sidecar HTTP-family inbound route serves
+    /// ([`Self::sidecar_inbound_http_app_ports`]).
+    ///
+    /// A bare authenticated CONNECT on the Sidecar `:15006` listener is the
+    /// raw-TCP egress lane. An HTTP application port is reached by plain HTTP
+    /// over the same mTLS listener, where the route's plugin chain runs, so a
+    /// CONNECT that would relay it as opaque bytes is refused instead. The
+    /// ownership guard runs first so a destination this terminator does not
+    /// own keeps its existing denial reason. The set is empty on every
+    /// topology but Sidecar, so Ambient and waypoint HBONE relays are
+    /// unchanged. The datagram relay does not call this: `connect-udp` never
+    /// reaches an HTTP route.
+    ///
+    /// Hot path: one binary search over a short sorted slice, no allocation.
+    pub fn inbound_stream_relay_destination_decision(
+        &self,
+        host: &str,
+        port: u16,
+        terminator_local_ip: Option<std::net::IpAddr>,
+    ) -> Result<(), InboundRelayDenial> {
+        self.inbound_relay_destination_decision(host, port, terminator_local_ip)?;
+        if self
+            .sidecar_inbound_http_app_ports
+            .binary_search(&port)
+            .is_ok()
+        {
+            return Err(InboundRelayDenial::HttpApplicationPort);
+        }
+        Ok(())
     }
 
     /// Screen DNS answers for the ordinary inbound HBONE relay before any
@@ -5978,6 +6106,10 @@ impl MeshConfig {
     ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
     ///    naming it is outside the declared contract and is refused rather than
     ///    relayed to the listener port the operator replaced.
+    /// 6. The listener's `defaultEndpoint` port is also an HTTP-family
+    ///    listener's endpoint ⇒
+    ///    [`SidecarIngressConnectRelay::HttpApplicationPort`] (issue #6110):
+    ///    the HTTP route wins the shared application port.
     pub fn resolve_sidecar_ingress_connect_relay(
         &self,
         host: &str,
@@ -6013,6 +6145,12 @@ impl MeshConfig {
         {
             return SidecarIngressConnectRelay::Deny;
         }
+        if ingress_http_listener_serves_endpoint_port(
+            &self.local_ingress_listeners,
+            listener.endpoint_port,
+        ) {
+            return SidecarIngressConnectRelay::HttpApplicationPort;
+        }
         SidecarIngressConnectRelay::Relay {
             listener_port: listener.port,
             endpoint_host: listener.endpoint_host.clone(),
@@ -6029,7 +6167,9 @@ impl MeshConfig {
     /// selection) can replace the destination between synthesis and dial. Only
     /// the one mapping this listener declares survives; anything else — a
     /// different backend, a widened port, a withdrawn listener — fails closed
-    /// before the dial.
+    /// before the dial. So does a mapping whose endpoint port an HTTP-family
+    /// listener now serves (issue #6110), which also revokes a live tunnel when
+    /// a reload adds that HTTP listener.
     pub fn sidecar_ingress_connect_relay_endpoint_matches(
         &self,
         listener_port: u16,
@@ -6052,6 +6192,7 @@ impl MeshConfig {
             && !listener.owner_service.is_empty()
             && listener.endpoint_port == port
             && canonical_mesh_host(&listener.endpoint_host) == canonical_mesh_host(host)
+            && !ingress_http_listener_serves_endpoint_port(&self.local_ingress_listeners, port)
     }
 }
 
@@ -6188,6 +6329,8 @@ impl Default for MeshConfig {
             inbound_relay_admits_accepted_local_address: false,
             inbound_relay_admits_loopback_namespace: false,
             inbound_relay_own_address_ports: Vec::new(),
+            sidecar_inbound_http_app_ports: Vec::new(),
+            sidecar_inbound_refuses_matched_http_connect: false,
             inbound_relay_node_local_registry: Default::default(),
         }
     }
@@ -7495,6 +7638,7 @@ fn validate_mesh_config_internal(
             &dr.export_to,
             &mut errors,
         );
+        validate_destination_rule_tls_reference_scope(dr, istio_root_namespace, &mut errors);
         // Validate top-level trafficPolicy boundary fields (outlier-detection
         // ranges, client-TLS mode/cert consistency) that the K8s translator
         // enforces but the native/file/xDS slice path otherwise skips.
@@ -8130,6 +8274,134 @@ fn validate_mesh_outlier_detection(
         errors.push(format!(
             "{context}.max_ejection_percent: must be from 0 to 100"
         ));
+    }
+}
+
+/// Refuse a DestinationRule client-TLS material reference that would have the
+/// proxy resolve material outside the rule's own namespace.
+///
+/// The proxy resolves `caCertificates` / `clientCertificate` / `privateKey`
+/// with its OWN identity (Kubernetes ServiceAccount, cloud credentials, managed
+/// store, filesystem), so a rule authored in a tenant namespace may name only
+/// inline PEM, `system://`, a `k8s://` Secret in its own namespace, or a local
+/// file under a `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` directory (none by
+/// default). Rules in the mesh root namespace are mesh-operator policy and are
+/// exempt. Shared by the Kubernetes translator and native/file/xDS slice
+/// validation so both boundaries reach the same verdict.
+pub(crate) fn destination_rule_tls_reference_error(
+    field: &str,
+    value: &str,
+    kind: crate::tls::source::MaterialKind,
+    rule_namespace: &str,
+    root_namespace: &str,
+) -> Option<String> {
+    if destination_rule_is_root_policy(rule_namespace, root_namespace) {
+        return None;
+    }
+    let tenant_file_roots = crate::tls::source::effective_mesh_tenant_tls_file_roots();
+    match crate::tls::source::check_namespace_scoped_material_reference(
+        value,
+        kind,
+        rule_namespace,
+        &tenant_file_roots,
+    ) {
+        Ok(()) => None,
+        Err(refusal) => Some(format!("{field}: {}", refusal.reason())),
+    }
+}
+
+/// Load-time re-check of a tenant DestinationRule's local TLS files on the
+/// node that reads them: each file must still resolve, after symlinks, under
+/// one of `tenant_file_roots` (`FERRUM_MESH_TENANT_TLS_FILE_ROOTS`). A file
+/// that is missing or cannot be resolved is refused too. Root-namespace rules
+/// are exempt. Returns the first refusal as a schema path plus a fixed reason;
+/// the referenced value is never echoed.
+pub(crate) fn destination_rule_tls_file_escape_error(
+    dr: &MeshDestinationRule,
+    root_namespace: &str,
+    tenant_file_roots: &[std::path::PathBuf],
+) -> Option<String> {
+    use crate::tls::source::check_tenant_file_reference_resolved;
+    if destination_rule_is_root_policy(&dr.namespace, root_namespace) {
+        return None;
+    }
+    for (field, value, kind) in destination_rule_tls_references(dr) {
+        let verdict = check_tenant_file_reference_resolved(value, kind, tenant_file_roots);
+        if let Err(refusal) = verdict {
+            return Some(format!("{field}: {}", refusal.reason()));
+        }
+    }
+    None
+}
+
+fn destination_rule_is_root_policy(rule_namespace: &str, root_namespace: &str) -> bool {
+    let root_namespace = root_namespace.trim();
+    !root_namespace.is_empty() && rule_namespace == root_namespace
+}
+
+/// Every client-TLS material reference a DestinationRule carries, at every
+/// scope (top level, `port_level_settings`, subsets), as
+/// `(schema path, value, field kind)`.
+fn destination_rule_tls_references(
+    dr: &MeshDestinationRule,
+) -> Vec<(String, &str, crate::tls::source::MaterialKind)> {
+    let context = format!("MeshDestinationRule {:?}", dr.name);
+    let mut policies: Vec<(String, &MeshTrafficPolicy)> = Vec::new();
+    if let Some(policy) = dr.traffic_policy.as_ref() {
+        policies.push((format!("{context}.traffic_policy"), policy));
+    }
+    for (port, policy) in &dr.port_level_settings {
+        let label = format!("{context}.port_level_settings[\"{port}\"]");
+        policies.push((label, policy));
+    }
+    for (index, subset) in dr.subsets.iter().enumerate() {
+        if let Some(policy) = subset.traffic_policy.as_ref() {
+            let label = format!("{context}.subsets[{index}].traffic_policy");
+            policies.push((label, policy));
+        }
+    }
+    let mut references = Vec::new();
+    for (policy_context, policy) in policies {
+        let Some(tls) = policy.tls.as_ref() else {
+            continue;
+        };
+        let material = [
+            (
+                "ca_certificates",
+                tls.ca_certificates.as_deref(),
+                crate::tls::source::MaterialKind::CaBundle,
+            ),
+            (
+                "client_certificate",
+                tls.client_certificate.as_deref(),
+                crate::tls::source::MaterialKind::Cert,
+            ),
+            (
+                "private_key",
+                tls.private_key.as_deref(),
+                crate::tls::source::MaterialKind::Key,
+            ),
+        ];
+        for (field, value, kind) in material {
+            if let Some(value) = value {
+                references.push((format!("{policy_context}.tls.{field}"), value, kind));
+            }
+        }
+    }
+    references
+}
+
+fn validate_destination_rule_tls_reference_scope(
+    dr: &MeshDestinationRule,
+    root_namespace: &str,
+    errors: &mut Vec<String>,
+) {
+    for (field, value, kind) in destination_rule_tls_references(dr) {
+        if let Some(error) =
+            destination_rule_tls_reference_error(&field, value, kind, &dr.namespace, root_namespace)
+        {
+            errors.push(error);
+        }
     }
 }
 

@@ -1972,7 +1972,8 @@ async fn test_claim_suppresses_consumer_identity_header_injection() {
     let mut ctx = post_ctx(&body);
     // Simulate an auth plugin having resolved a principal earlier.
     ctx.authenticated_identity = Some("internal-alice".to_string());
-    assert_eq!(ctx.backend_consumer_username(), Some("internal-alice"));
+    assert_eq!(ctx.backend_consumer_username(), None);
+    assert_eq!(ctx.backend_authenticated_identity(), Some("internal-alice"));
 
     let mut headers = json_headers();
     plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -1991,6 +1992,7 @@ async fn test_claim_suppresses_consumer_identity_header_injection() {
         "identity header injection must be suppressed for provider-routed requests"
     );
     assert_eq!(ctx.backend_consumer_custom_id(), None);
+    assert_eq!(ctx.backend_authenticated_identity(), None);
     // The principal itself stays resolved for rate limiting / logging.
     assert_eq!(ctx.effective_identity(), Some("internal-alice"));
 }
@@ -2243,6 +2245,7 @@ async fn test_backend_tls_default_and_inherit() {
         sni: Some("llm.internal.example.com".to_string()),
         san_allow_list: vec!["llm.internal.example.com".to_string()],
         san_allow_list_key_digest: Some("digest".to_string()),
+        tls_refused: false,
     };
     let mut proxy = create_test_proxy();
     proxy.resolved_tls = inherited_tls.clone();
@@ -6307,6 +6310,7 @@ async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_muta
         sni: Some("llm.internal.example.com".to_string()),
         san_allow_list: vec!["spiffe://internal/llm".to_string()],
         san_allow_list_key_digest: None,
+        tls_refused: false,
     };
     let inherited = proxy.resolved_tls.clone();
 

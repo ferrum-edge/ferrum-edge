@@ -9,9 +9,10 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::{GatewayConfig, K8sMeshOverlay};
+use crate::config::validation_pipeline::collect_duplicate_resource_id_errors;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, NodeWaypointInventory,
-    translate_k8s_objects_collecting_skips,
+    PodClaimInventory, translate_k8s_objects_collecting_skips,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;
@@ -214,6 +215,9 @@ pub struct ReconcilerConfig {
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub pod_discovery_enabled: bool,
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`; see
+    /// [`crate::config_sources::k8s::K8sTranslationOptions::allow_selectorless_external_endpoints`].
+    pub allow_selectorless_external_endpoints: bool,
     pub gateway_api_data_plane_service_namespace: Option<String>,
     pub gateway_api_data_plane_service_name: Option<String>,
     pub gateway_api_status_address: Option<String>,
@@ -327,6 +331,7 @@ async fn run_reconcile_loop(
     }
 
     let node_waypoint_inventory = NodeWaypointInventory::new();
+    let pod_claim_inventory = PodClaimInventory::new();
 
     // Initial reconciliation — block until first success.
     do_reconcile(
@@ -347,6 +352,8 @@ async fn run_reconcile_loop(
             watch_namespaces: reconciler_config.watch_namespaces.clone(),
             trust_domain: trust_domain.clone(),
             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+            allow_selectorless_external_endpoints: reconciler_config
+                .allow_selectorless_external_endpoints,
             gateway_api_data_plane_service_namespace: reconciler_config
                 .gateway_api_data_plane_service_namespace
                 .clone(),
@@ -361,6 +368,7 @@ async fn run_reconcile_loop(
             metrics: Arc::clone(&metrics),
             revision: Arc::clone(&revision),
             node_waypoint_inventory: node_waypoint_inventory.clone(),
+            pod_claim_inventory: pod_claim_inventory.clone(),
         },
     )
     .await;
@@ -395,6 +403,8 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        allow_selectorless_external_endpoints: reconciler_config
+                            .allow_selectorless_external_endpoints,
                         gateway_api_data_plane_service_namespace: reconciler_config
                             .gateway_api_data_plane_service_namespace
                             .clone(),
@@ -412,6 +422,7 @@ async fn run_reconcile_loop(
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
                         node_waypoint_inventory: node_waypoint_inventory.clone(),
+                        pod_claim_inventory: pod_claim_inventory.clone(),
                     },
                 ).await;
             }
@@ -440,6 +451,8 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        allow_selectorless_external_endpoints: reconciler_config
+                            .allow_selectorless_external_endpoints,
                         gateway_api_data_plane_service_namespace: reconciler_config
                             .gateway_api_data_plane_service_namespace
                             .clone(),
@@ -457,6 +470,7 @@ async fn run_reconcile_loop(
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
                         node_waypoint_inventory: node_waypoint_inventory.clone(),
+                        pod_claim_inventory: pod_claim_inventory.clone(),
                     },
                 ).await;
             }
@@ -635,6 +649,7 @@ struct ReconcileContext {
     watch_namespaces: Vec<String>,
     trust_domain: TrustDomain,
     pod_discovery_enabled: bool,
+    allow_selectorless_external_endpoints: bool,
     gateway_api_data_plane_service_namespace: Option<String>,
     gateway_api_data_plane_service_name: Option<String>,
     gateway_api_status_address: Option<String>,
@@ -654,6 +669,9 @@ struct ReconcileContext {
     /// Last Ready NodeWaypoint endpoint per node, shared across reconciles.
     /// Applied only with same-node trusted replacement evidence.
     node_waypoint_inventory: NodeWaypointInventory,
+    /// Pod IP claims seen within the EndpointSlice attribution grace window,
+    /// shared across reconciles (issue #6108).
+    pod_claim_inventory: PodClaimInventory,
 }
 
 fn namespaces_for_broadcast(
@@ -776,6 +794,21 @@ pub fn publish_k8s_reconcile(
         // A retention publishes its edited copy; every other reconcile
         // publishes the candidate itself, with no clone at all.
         let effective_translation = retained_translation.as_ref().unwrap_or(translation);
+
+        // Every data plane refuses a snapshot carrying two resources with one
+        // `(namespace, id)`. Refuse the translation here instead, keeping the
+        // last accepted overlay, so the fault is reported on the CP rather than
+        // freezing the whole fleet on its last good snapshot.
+        let duplicate_ids = collect_duplicate_resource_id_errors(effective_translation);
+        if !duplicate_ids.is_empty() {
+            for message in &duplicate_ids {
+                error!(
+                    "Kubernetes configuration rejected — {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
+            }
+            return None;
+        }
 
         // Validate the exact composed candidate before retaining the overlay
         // or making it visible. Kubernetes translation can synthesize plugin
@@ -1126,9 +1159,11 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_source_namespaces(source_namespaces)
         .with_pod_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
+        .with_selectorless_external_endpoints_allowed(ctx.allow_selectorless_external_endpoints)
         .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced)
         .with_mesh_overlay_authority(ctx.mesh_overlay_authority)
-        .with_node_waypoint_inventory(ctx.node_waypoint_inventory.clone());
+        .with_node_waypoint_inventory(ctx.node_waypoint_inventory.clone())
+        .with_pod_claim_inventory(ctx.pod_claim_inventory.clone());
     let Some((translation, translation_errors)) =
         translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {

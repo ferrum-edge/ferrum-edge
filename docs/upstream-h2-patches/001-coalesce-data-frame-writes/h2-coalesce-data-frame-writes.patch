@@ -1,8 +1,8 @@
 diff --git a/src/client.rs b/src/client.rs
-index cb7e677ae..7cba12550 100644
+index 9d0ff31..da1a9e9 100644
 --- a/src/client.rs
 +++ b/src/client.rs
-@@ -1331,6 +1331,12 @@ where
+@@ -1332,6 +1332,12 @@ where
      T: AsyncRead + AsyncWrite + Unpin,
      B: Buf,
  {
@@ -16,7 +16,7 @@ index cb7e677ae..7cba12550 100644
          mut io: T,
          builder: Builder,
 diff --git a/src/codec/framed_write.rs b/src/codec/framed_write.rs
-index efd1966cf..d72a3ce56 100644
+index efd1966..e38c25f 100644
 --- a/src/codec/framed_write.rs
 +++ b/src/codec/framed_write.rs
 @@ -52,6 +52,10 @@ struct Encoder<B> {
@@ -133,7 +133,7 @@ index efd1966cf..d72a3ce56 100644
      pub fn get_mut(&mut self) -> &mut T {
          &mut self.inner
      }
-@@ -376,3 +440,459 @@ mod unstable {
+@@ -376,3 +441,459 @@ mod unstable {
          }
      }
  }
@@ -594,7 +594,7 @@ index efd1966cf..d72a3ce56 100644
 +    }
 +}
 diff --git a/src/codec/mod.rs b/src/codec/mod.rs
-index d7aecee91..c01a69295 100644
+index d7aecee..c01a692 100644
 --- a/src/codec/mod.rs
 +++ b/src/codec/mod.rs
 @@ -121,6 +121,17 @@ impl<T, B> Codec<T, B> {
@@ -616,10 +616,10 @@ index d7aecee91..c01a69295 100644
          self.inner.get_mut()
      }
 diff --git a/src/proto/connection.rs b/src/proto/connection.rs
-index 757e2b275..38a08a91a 100644
+index bb72d60..f465c9a 100644
 --- a/src/proto/connection.rs
 +++ b/src/proto/connection.rs
-@@ -124,6 +124,12 @@ where
+@@ -131,6 +131,12 @@ where
      P: Peer,
      B: Buf,
  {
@@ -633,10 +633,10 @@ index 757e2b275..38a08a91a 100644
          fn streams_config(config: &Config) -> streams::Config {
              streams::Config {
 diff --git a/src/proto/streams/streams.rs b/src/proto/streams/streams.rs
-index 1b73b3339..a8761ec48 100644
+index ea81ee0..b10a610 100644
 --- a/src/proto/streams/streams.rs
 +++ b/src/proto/streams/streams.rs
-@@ -225,6 +225,10 @@ where
+@@ -228,6 +228,10 @@ where
              };
  
              if !reclaimed {

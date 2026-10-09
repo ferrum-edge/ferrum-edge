@@ -357,7 +357,7 @@ pub async fn post_admin_batch(
 /// routable before a measurement phase starts.
 ///
 /// Provisioning a batch appends tens of thousands of `config_changes` rows.
-/// When the poller's cursor falls more than `CHANGE_LOG_BATCH_LIMIT` (10,000)
+/// When the poller's cursor falls more than `CHANGE_LOG_MAX_ROWS` (100,000)
 /// rows behind, `load_config_changes_after` deliberately bails and forces a
 /// FULL reload; on a SQL store with tens of thousands of proxies, consumers and
 /// plugin configs that reload takes a substantial fraction of a 30-second
@@ -481,9 +481,10 @@ pub const APPLY_STATUS_WAIT_MS: u64 = 30_000;
 ///
 /// Deliberately larger than [`CONFIG_CONVERGENCE_MAX_WAIT_SECS`]: deferred
 /// provisioning batches a whole wave's reload debt to this boundary, and a
-/// wave of 3,000 consumers always escalates the poll to a FULL reload
-/// (`IncrementalFullReloadRequired::for_consumer_changes`), so the gate must
-/// absorb up to two full reloads at 30k scale on a CI runner already loaded
+/// wave of 3,000 consumers can escalate the poll to a FULL reload
+/// (`IncrementalFullReloadRequired::for_consumer_changes`, whenever plugin
+/// quarantine is active or unknown, or a consumer carries `hmac_auth`), so the
+/// gate must absorb up to two full reloads at 30k scale on a CI runner already loaded
 /// by the inserts (observed 186s at only 9k proxies on PostgreSQL). The
 /// data-plane probe gate that follows keeps its own tighter bound — by the
 /// time the cursor is applied, routability is one probe away.

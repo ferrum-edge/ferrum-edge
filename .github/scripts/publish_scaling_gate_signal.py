@@ -48,6 +48,10 @@ ISSUE_REASON_MAX_CHARS = 200
 ISSUE_RUN_LINE_RE = re.compile(r"(?m)^Run: \S+/actions/runs/([1-9][0-9]*)\s*$")
 WORKFLOW_FILE = "scaling-regression.yml"
 WORKFLOW_RUN_LIST_PER_PAGE = 5
+# Events that run this repository's own copy of the workflow on `main`. A fork
+# cannot schedule or dispatch here, so each event is queried server-side and a
+# fork's pull-request run can never crowd trusted runs out of the page.
+TRUSTED_RUN_EVENTS = ("schedule", "workflow_dispatch")
 # Weekly cadence (7d) plus one day so Sunday–Friday freshness checks do not
 # fire between a healthy Saturday run and the next scheduled window.
 MAX_AGE_SECONDS = 8 * 24 * 60 * 60
@@ -323,56 +327,71 @@ def latest_run_on_main(
 ) -> tuple[LatestRun | None, str | None]:
     """Return the newest scaling-regression run on `main`, not the last success.
 
-    GitHub lists workflow runs by created_at descending. Freshness must honor
-    that order: a newer failure, cancel, timeout, skip, or in-progress run
-    cannot be greened by an older success still inside the eight-day window.
-    Out-of-order, malformed, or future-dated history fails closed. Generation
-    identity is the exact `id` of the first validated run, not numeric ordering
-    across ids.
+    Scheduled and manually dispatched runs on `main` are both generations of
+    this gate, so either can close the signal. Each event is listed separately
+    (GitHub returns created_at descending) and the two pages are merged by
+    creation time. Freshness must honor that order: a newer failure, cancel,
+    timeout, skip, or in-progress run cannot be greened by an older success
+    still inside the eight-day window. Out-of-order, malformed, untrusted, or
+    future-dated history fails closed. Generation identity is the exact `id` of
+    the first validated run, not numeric ordering across ids.
     """
 
-    query = urllib.parse.urlencode(
-        {
-            "branch": "main",
-            "per_page": str(WORKFLOW_RUN_LIST_PER_PAGE),
-        }
-    )
-    url = (
-        f"https://api.github.com/repos/{repo}/actions/workflows/"
-        f"{WORKFLOW_FILE}/runs?{query}"
-    )
-    try:
-        payload = request("GET", url, token, None)
-    except SignalError as exc:
-        return None, f"{exc.code}: {exc.message}"
-    if not isinstance(payload, dict):
-        return None, "schema: workflow runs payload is not an object"
-    runs = payload.get("workflow_runs")
-    if not isinstance(runs, list):
-        return None, "schema: workflow_runs is not a list"
-    if len(runs) > WORKFLOW_RUN_LIST_PER_PAGE:
-        return None, "schema: workflow runs page exceeded bound"
-    if not runs:
-        return None, None
-
-    previous_created: datetime | None = None
-    for entry in runs:
-        if not isinstance(entry, dict):
-            return None, "schema: workflow run item is not an object"
-        head_branch = entry.get("head_branch")
-        if head_branch != "main":
-            return None, "schema: workflow run is not on main"
+    validated: list[tuple[datetime, dict[str, Any]]] = []
+    for event in TRUSTED_RUN_EVENTS:
+        query = urllib.parse.urlencode(
+            {
+                "branch": "main",
+                "event": event,
+                "per_page": str(WORKFLOW_RUN_LIST_PER_PAGE),
+            }
+        )
+        url = (
+            f"https://api.github.com/repos/{repo}/actions/workflows/"
+            f"{WORKFLOW_FILE}/runs?{query}"
+        )
         try:
-            created = parse_iso8601(entry.get("created_at"), "workflow run created_at")
+            payload = request("GET", url, token, None)
         except SignalError as exc:
             return None, f"{exc.code}: {exc.message}"
-        if created > now:
-            return None, "schema: workflow run timestamp is in the future"
-        if previous_created is not None and created > previous_created:
-            return None, "schema: workflow runs are out of order"
-        previous_created = created
+        if not isinstance(payload, dict):
+            return None, "schema: workflow runs payload is not an object"
+        runs = payload.get("workflow_runs")
+        if not isinstance(runs, list):
+            return None, "schema: workflow_runs is not a list"
+        if len(runs) > WORKFLOW_RUN_LIST_PER_PAGE:
+            return None, "schema: workflow runs page exceeded bound"
 
-    latest_entry = runs[0]
+        previous_created: datetime | None = None
+        for entry in runs:
+            if not isinstance(entry, dict):
+                return None, "schema: workflow run item is not an object"
+            head_branch = entry.get("head_branch")
+            if head_branch != "main":
+                return None, "schema: workflow run is not on main"
+            if entry.get("event") != event:
+                return None, "schema: workflow run is not scheduled or dispatched"
+            head_repository = entry.get("head_repository")
+            if not isinstance(head_repository, dict) or head_repository.get("full_name") != repo:
+                return None, "schema: workflow run is not from the repository"
+            if entry.get("path") != f".github/workflows/{WORKFLOW_FILE}":
+                return None, "schema: workflow run path is unexpected"
+            try:
+                created = parse_iso8601(entry.get("created_at"), "workflow run created_at")
+            except SignalError as exc:
+                return None, f"{exc.code}: {exc.message}"
+            if created > now:
+                return None, "schema: workflow run timestamp is in the future"
+            if previous_created is not None and created > previous_created:
+                return None, "schema: workflow runs are out of order"
+            previous_created = created
+            validated.append((created, entry))
+
+    if not validated:
+        return None, None
+    # Stable sort: within one event the API order is already newest-first.
+    validated.sort(key=lambda item: item[0], reverse=True)
+    latest_entry = validated[0][1]
     if not isinstance(latest_entry, dict):
         return None, "schema: workflow run item is not an object"
     stamp = (
@@ -743,6 +762,9 @@ def self_test() -> int:
             "status": status,
             "conclusion": conclusion,
             "head_branch": head_branch,
+            "event": "schedule",
+            "head_repository": {"full_name": "ferrum-edge/ferrum-edge"},
+            "path": f".github/workflows/{WORKFLOW_FILE}",
         }
         if extra:
             run.update(extra)
@@ -760,7 +782,26 @@ def self_test() -> int:
                 raise AssertionError(f"must query main branch runs: {url}")
             if f"per_page={WORKFLOW_RUN_LIST_PER_PAGE}" not in url:
                 raise AssertionError(f"must bound workflow run pagination: {url}")
-            return {"workflow_runs": runs}
+            # Serve dispatched runs only to the dispatch query and everything
+            # else to the schedule query, so an untrusted event still reaches
+            # the client-side checks the way an unfiltered page would.
+            if "event=workflow_dispatch" in url:
+                return {
+                    "workflow_runs": [
+                        run
+                        for run in runs
+                        if isinstance(run, dict) and run.get("event") == "workflow_dispatch"
+                    ]
+                }
+            if "event=schedule" not in url:
+                raise AssertionError(f"must query trusted run events server-side: {url}")
+            return {
+                "workflow_runs": [
+                    run
+                    for run in runs
+                    if not isinstance(run, dict) or run.get("event") != "workflow_dispatch"
+                ]
+            }
 
         return request
 
@@ -806,6 +847,58 @@ def self_test() -> int:
         "close",
         False,
         "latest fresh success",
+    )
+    fork_run = workflow_run(
+        created=timedelta(minutes=1),
+        run_id=221,
+        extra={"head_repository": {"full_name": "attacker/ferrum-edge"}},
+    )
+    expect_history([fork_run], "open", True, "fork run is not trusted")
+    pull_request_run = workflow_run(
+        created=timedelta(minutes=1),
+        run_id=222,
+        extra={"event": "pull_request"},
+    )
+    expect_history([pull_request_run], "open", True, "pull request run is not trusted")
+    expect_history(
+        [
+            workflow_run(
+                created=timedelta(hours=2),
+                run_id=223,
+                extra={"event": "workflow_dispatch"},
+            )
+        ],
+        "close",
+        False,
+        "dispatched main run closes",
+    )
+    expect_history(
+        [
+            workflow_run(
+                created=timedelta(hours=2),
+                conclusion="failure",
+                run_id=224,
+                extra={"event": "workflow_dispatch"},
+            ),
+            workflow_run(created=timedelta(days=1), run_id=225),
+        ],
+        "open",
+        True,
+        "newer dispatched failure over older scheduled success",
+    )
+    expect_history(
+        [
+            workflow_run(created=timedelta(hours=2), run_id=226),
+            workflow_run(
+                created=timedelta(days=1),
+                conclusion="failure",
+                run_id=227,
+                extra={"event": "workflow_dispatch"},
+            ),
+        ],
+        "close",
+        False,
+        "newer scheduled success over older dispatched failure",
     )
     expect_history(
         [workflow_run(created=timedelta(days=9), run_id=23)],

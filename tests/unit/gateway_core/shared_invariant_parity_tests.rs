@@ -2994,3 +2994,274 @@ fn streaming_h2_arm_uses_the_tested_body_regime() {
     assert!(!arm.contains("grpc_streaming_response_deadline("));
     assert!(!arm.contains("state.response_coalesce_flush("));
 }
+
+// ---------------------------------------------------------------------------
+// Client `Connection` nominations are resolved at ingress
+// ---------------------------------------------------------------------------
+//
+// Every backend builder strips the names the request's `Connection` field
+// lists from the FINAL outbound map, after the gateway and its plugins have
+// asserted identity, claim, GeoIP, and path-param headers. A frontend that
+// captured the client header block without resolving the nominations first
+// would let a client name one of those assertions and have the gateway strip
+// it. Each raw-header capture therefore confines the nominations first
+// (`proxy::headers::confine_connection_nominated_request_headers`).
+
+/// `(frontend, source file, function-body raw-header capture)`.
+const RAW_HEADER_INGRESS_SITES: &[(&str, &str, &str)] = &[
+    (
+        "H1/H2 (and HBONE inner requests)",
+        "src/proxy/mod.rs",
+        "ctx.set_raw_headers(req.headers().clone());",
+    ),
+    (
+        "native H3",
+        "src/http3/server.rs",
+        "ctx.set_raw_headers(raw_headers);",
+    ),
+];
+
+/// How many lines above the capture the confinement call may sit.
+const CONNECTION_CONFINEMENT_WINDOW_LINES: usize = 8;
+
+#[test]
+fn every_raw_header_ingress_confines_connection_nominations_first() {
+    for (frontend, file, capture) in RAW_HEADER_INGRESS_SITES {
+        let text = source(file);
+        let needle = format!("    {capture}");
+        let lines: Vec<&str> = text.lines().collect();
+        let sites: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == needle)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "{frontend}: `{file}` must capture the client header block exactly once"
+        );
+        let start = sites[0].saturating_sub(CONNECTION_CONFINEMENT_WINDOW_LINES);
+        let window = &lines[start..sites[0]];
+        assert!(
+            window
+                .iter()
+                .any(|line| line.contains("confine_connection_nominated_request_headers(")),
+            "{frontend}: `{file}` must confine `Connection` nominations before the capture"
+        );
+    }
+
+    // Every function-body capture in production sources is listed above.
+    let expected: BTreeSet<(String, String)> = RAW_HEADER_INGRESS_SITES
+        .iter()
+        .map(|(_, file, capture)| (file.to_string(), capture.to_string()))
+        .collect();
+    let mut found = BTreeSet::new();
+    for (path, text) in production_sources() {
+        for line in text.lines() {
+            if line.starts_with("    ctx.set_raw_headers(") {
+                found.insert((path.clone(), line.trim_start().to_string()));
+            }
+        }
+    }
+    assert_eq!(
+        found, expected,
+        "a raw client-header capture changed; list the new site above"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Client-selected flavor views that omit route admission policy are refused
+// ---------------------------------------------------------------------------
+//
+// The client picks the native-gRPC or WebSocket plugin view with its own
+// headers. The plugin cache marks a view that omits an admission-gating
+// instance the route's HTTP view runs
+// (`PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`), and every request
+// dispatcher must refuse such a request after resolving the view and before
+// the first plugin hook runs. A dispatcher that resolved the view and went
+// straight to the hooks would serve the route without that policy.
+
+/// `(dispatcher, source file, function signature)`.
+const ROUTE_PROTOCOL_ADMISSION_DISPATCHERS: &[(&str, &str, &str)] = &[
+    (
+        "H1/H2",
+        "src/proxy/mod.rs",
+        "async fn handle_proxy_request_inner(",
+    ),
+    (
+        "native H3",
+        "src/http3/server.rs",
+        "async fn handle_h3_request(",
+    ),
+];
+
+#[test]
+fn every_dispatcher_refuses_a_flavor_view_that_omits_route_admission_policy() {
+    for (dispatcher, file, signature) in ROUTE_PROTOCOL_ADMISSION_DISPATCHERS {
+        let text = source(file);
+        let body = item_body(&text, signature, "\n}\n");
+        let position = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{dispatcher}: `{file}` must contain `{needle}`"))
+        };
+        let view = position("let plugin_cache_view = ");
+        let refusal = position("PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)");
+        let first_hook = position("plugin.on_request_received(&mut ctx)");
+        assert!(
+            view < refusal && refusal < first_hook,
+            "{dispatcher}: `{file}` must refuse the omitted-policy view after resolving it \
+             and before the first plugin hook"
+        );
+        assert_eq!(
+            body.matches("OMITS_ROUTE_ADMISSION_POLICY").count(),
+            1,
+            "{dispatcher}: `{file}` must check the omitted-policy bit exactly once"
+        );
+    }
+}
+
+/// The one exemption from that refusal (issue #6110): a bodiless CORS
+/// preflight on the plain HTTP view of a gRPC-intended route whose `cors`
+/// plugin answers preflights. Each dispatcher evaluates it in the refusal's
+/// own condition, after the capability bit, so it can never relax any other
+/// check and never runs unless a view is marked. An exempted preflight that no
+/// plugin answered is refused right after the `on_request_received` phase, so
+/// it never reaches the backend without the route's gRPC-only policy.
+#[test]
+fn every_dispatcher_exempts_a_cors_preflight_only_inside_the_route_admission_refusal() {
+    const EXEMPTION: &str = "grpc_intended_refusal_exempts(";
+    const UNANSWERED_PREFLIGHT_REFUSAL: &str = "if cors_preflight_exempted {";
+    for (dispatcher, file, signature) in ROUTE_PROTOCOL_ADMISSION_DISPATCHERS {
+        let text = source(file);
+        let body = item_body(&text, signature, "\n}\n");
+        let position = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{dispatcher}: `{file}` must contain `{needle}`"))
+        };
+        let refusal = position("PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)");
+        let exemption = position(EXEMPTION);
+        assert!(
+            refusal < exemption && body[refusal..exemption].len() < 96,
+            "{dispatcher}: `{file}` must evaluate the preflight exemption in the refusal's \
+             own condition, after the capability bit"
+        );
+        assert_eq!(
+            body.matches(EXEMPTION).count(),
+            1,
+            "{dispatcher}: `{file}` must exempt a CORS preflight exactly once"
+        );
+        assert!(
+            text.contains("is_cors_preflight_request("),
+            "{dispatcher}: `{file}` must share the one preflight predicate"
+        );
+        assert!(
+            text.contains("PluginCapabilities::ANSWERS_CORS_PREFLIGHTS)"),
+            "{dispatcher}: `{file}` must exempt a preflight only on a view whose `cors` \
+             plugin answers it"
+        );
+        let first_hook = position("plugin.on_request_received(&mut ctx)");
+        let unanswered = position(UNANSWERED_PREFLIGHT_REFUSAL);
+        // Pre-auth body buffering starts here, so the refusal must come first:
+        // it never reads a body, authenticates, or dispatches.
+        let authentication_inputs = position("let authenticate_body_requirements");
+        assert!(
+            first_hook < unanswered && unanswered < authentication_inputs,
+            "{dispatcher}: `{file}` must refuse an exempted preflight no plugin answered \
+             right after `on_request_received`, before body buffering, authentication or \
+             dispatch"
+        );
+        assert_eq!(
+            body.matches(UNANSWERED_PREFLIGHT_REFUSAL).count(),
+            1,
+            "{dispatcher}: `{file}` must refuse an unanswered preflight exactly once"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket Extended CONNECT: 0-RTT gate and session logs use the wire method
+// ---------------------------------------------------------------------------
+//
+// Route `allowed_methods` and plugin method policy evaluate an RFC 8441 /
+// RFC 9220 WebSocket as `GET`, the method of the backend handshake. The
+// replayable request is still a `CONNECT` stream, so the
+// `FERRUM_TLS_EARLY_DATA_METHODS` gate must match `CONNECT` on both
+// dispatchers (issue #6107), and the WebSocket session log records keep the
+// wire method too.
+
+#[test]
+fn h3_early_data_method_gate_runs_before_the_websocket_get_rewrite() {
+    let text = source("src/http3/server.rs");
+    let body = item_body(&text, "async fn handle_h3_request(", "\n}\n");
+    let gate_needle = "if is_early_data && !state.early_data_methods.contains(&method) {";
+    let rewrite_needle = "method = \"GET\".to_string();";
+    assert_eq!(
+        body.matches(gate_needle).count(),
+        1,
+        "native H3 must check the 0-RTT method allowlist exactly once"
+    );
+    assert_eq!(
+        body.matches(rewrite_needle).count(),
+        1,
+        "native H3 must rewrite the WebSocket policy method exactly once"
+    );
+    let gate = body.find(gate_needle).unwrap_or(usize::MAX);
+    let rewrite = body.find(rewrite_needle).unwrap_or(0);
+    assert!(
+        gate < rewrite,
+        "native H3 must gate 0-RTT on the wire method before rewriting a WebSocket to `GET`"
+    );
+}
+
+#[test]
+fn h1_h2_early_data_method_gate_matches_the_wire_method() {
+    let text = source("src/proxy/mod.rs");
+    let body = item_body(&text, "async fn handle_proxy_request_inner(", "\n}\n");
+    let rewrite_needle = "method = \"GET\".to_string();";
+    let wire_needle = "let wire_method = req.method().as_str();";
+    let gate_needle = "!state.early_data_methods.contains(wire_method)";
+    for needle in [rewrite_needle, wire_needle, gate_needle] {
+        assert_eq!(
+            body.matches(needle).count(),
+            1,
+            "H1/H2: `src/proxy/mod.rs` must contain `{needle}` exactly once"
+        );
+    }
+    assert!(
+        !body.contains("early_data_methods.contains(&method)"),
+        "H1/H2 must not gate 0-RTT on the policy method, which is `GET` for an RFC 8441 WebSocket"
+    );
+    let rewrite = body.find(rewrite_needle).unwrap_or(usize::MAX);
+    let wire = body.find(wire_needle).unwrap_or(0);
+    let gate = body.find(gate_needle).unwrap_or(0);
+    assert!(
+        rewrite < wire && wire < gate,
+        "H1/H2 must read the wire method from the request, not the normalized binding"
+    );
+}
+
+#[test]
+fn extended_connect_websocket_session_logs_record_the_wire_method() {
+    let proxy = source("src/proxy/mod.rs");
+    for needle in [
+        "let ws_method = if is_h2_websocket { \"CONNECT\" } else { \"GET\" };",
+        "let ws_err_method = if is_h2_websocket { \"CONNECT\" } else { \"GET\" };",
+    ] {
+        assert_eq!(
+            proxy.matches(needle).count(),
+            1,
+            "H1/H2 WebSocket session records must log `{needle}`"
+        );
+    }
+    let h3 = source("src/http3/websocket.rs");
+    assert_eq!(
+        h3.matches("http_method: \"CONNECT\".to_string(),").count(),
+        3,
+        "H3 WebSocket session meta, upgrade summary, and backend-error summary must log CONNECT"
+    );
+    assert!(
+        !h3.contains("http_method: \"GET\""),
+        "H3 WebSocket session records must not log the policy method"
+    );
+}

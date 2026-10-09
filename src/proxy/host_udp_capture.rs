@@ -1771,25 +1771,20 @@ pub(crate) fn dedicated_host_ifindex(sysfs_net: &Path, name: &str) -> Result<u32
 #[cfg(target_os = "linux")]
 impl HostUdpCaptureBackend for ProxyHostUdpBackend {
     fn resolve_interface(&self, target: &PodCaptureTarget) -> Result<ResolvedInterface, String> {
-        // Prefer the pod's own netns view (`iflink` → host peer index), which
-        // identifies the veth peer directly. Fall back to the host route table
-        // keyed on the registry-published pod IP, which needs neither `hostPID`
-        // nor `setns` — that fallback is what lets this path run without the
-        // per-pod-netns producer's elevated privileges.
+        // Resolve ownership from the host route table keyed on the
+        // registry-published pod IP. Pod-visible sysfs can be controlled by an
+        // enrolled workload and cannot establish host-veth ownership.
         //
         // BOTH families are tried, and that is load-bearing rather than tidiness:
-        // on the intended deployment (no `hostPID`, so the cgroup/`/proc` view is
-        // unavailable) the route table is the ONLY resolver, so a v4-only
-        // fallback would refuse every IPv6-only enrolled pod while this path
+        // the route table is the ONLY resolver (no pod PID or per-pod `/proc`
+        // view is ever consulted), so a v4-only lookup would refuse every
+        // IPv6-only enrolled pod while this path
         // claims dual-stack support. v4 is tried first so a dual-stack pod keeps
         // resolving exactly as before.
-        let name = crate::ebpf::veth::discover_veth_for_pod(None, Some(&target.cgroup_path))
-            .or_else(|| {
-                target
-                    .source_ips
-                    .ipv4
-                    .and_then(crate::ebpf::veth::discover_dedicated_veth_for_pod_ip)
-            })
+        let name = target
+            .source_ips
+            .ipv4
+            .and_then(crate::ebpf::veth::discover_dedicated_veth_for_pod_ip)
             .or_else(|| {
                 target
                     .source_ips

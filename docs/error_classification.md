@@ -211,7 +211,7 @@ Construction sites attach a typed `source` so [`is_port_exhaustion`](../src/retr
 
 A body-read failure after the response headers arrived is always post-wire: `connection_error` stays `false` and `retry_on_connect_failure` can never replay a request the backend already processed.
 
-The same mapping applies when the backend never produces response headers at all. Live HTTP-family dispatch (reqwest streaming and retry, H3 cross-protocol reqwest, direct H2 send, native H3, and the dedicated H2/HBONE/sidecar/unix header-wait and body-collect timeout arms) classifies through `ErrorClass` and then [`http_backend_failure_status_and_body`](../src/proxy/mod.rs) / [`http_backend_dispatch_error_response`](../src/proxy/mod.rs). `ReadWriteTimeout` is **504** with `{"error":"Backend timeout"}` (and `X-Gateway-Error: backend_timeout`); connect/refused/unavailable classes stay **502** with `{"error":"Backend unavailable"}` (and `X-Gateway-Error: connection_failure` when `connection_error` is set). That is the public pair README Troubleshooting documents.
+The same mapping applies when the backend never produces response headers at all. Live HTTP-family dispatch (reqwest streaming and retry, H3 cross-protocol reqwest, direct H2 send, native H3, and the dedicated H2/HBONE/sidecar/unix header-wait and body-collect timeout arms) classifies through `ErrorClass` and then [`http_backend_failure_status_and_body`](../src/proxy/mod.rs) / [`http_backend_dispatch_error_response`](../src/proxy/mod.rs). `ReadWriteTimeout` is **504** with `{"error":"Backend timeout"}` (and `X-Gateway-Error: backend_timeout`); connect/refused/unavailable classes stay **502** with `{"error":"Backend unavailable"}` (and `X-Gateway-Error: connection_failure` when `connection_error` is set). A route-total deadline that expires after dispatch begins is `ReadWriteTimeout` even if the `send()` call is still establishing the TCP/TLS connection; this handoff marker is set immediately before `send()`, not after the backend accepts the connection or receives request bytes. That is the public pair README Troubleshooting documents.
 
 The eager-buffer path (`buffered_backend_response_from_eager_collect` in [`src/proxy/mod.rs`](../src/proxy/mod.rs)) and the buffered reqwest collector (`collect_response_with_limit`) both classify through `classify_reqwest_error` rather than hardcoding one class. Idle `backend_read_timeout_ms` between buffered chunks (`next_reqwest_chunk_idle`) surfaces here as `ReadWriteTimeout` and uses the same 504 mapping as the dispatch-level helper, matching the direct-H2 arm's `HyperBodyCollectError::ReadTimeout` and the native-H3 read-timeout arm. Every other class keeps the 502. Identical backend behavior therefore produces the same status and `error_class` on every transport, so `TransactionSummary`, operator dashboards, and circuit-breaker `failure_status_codes` matching cannot diverge by dispatch path.
 
@@ -246,7 +246,7 @@ its empty-bodied automatic `400`. The response uses the same JSON envelope
 handler-layer protocol rejects use: `Content-Type: application/json`, a fixed
 `{"error":"..."}` body matching `check_protocol_headers()`, and
 `Connection: close`. Like the handler-layer protocol `400`s, it carries **no**
-`X-Gateway-Error`: that header is the closed eight-token client-facing
+`X-Gateway-Error`: that header is the closed nine-token client-facing
 vocabulary below, which names why a *backend* attempt failed, and none of its
 tokens describes a client-caused `400` (issue #4543). The parse reject names
 itself only in its `warn`-level log line (`parse_reject_class`,
@@ -312,9 +312,9 @@ HTTP-family 5xx use **two** closed vocabularies across three surfaces:
 
 | Surface | Closed set | Cardinality |
 |---|---|---|
-| `X-Gateway-Error` (client header) | eight coarse tokens below | **8** |
+| `X-Gateway-Error` (client header) | nine coarse tokens below | **9** |
 | Access-log `error_class` | [`ErrorClass::as_str`](../src/retry.rs) | **19** (omitted when unset) |
-| `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus five non-class tokens | **24** (omitted on 2xx/3xx/4xx; an unclassified backend 5xx carries `backend_error`) |
+| `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus six non-class tokens | **25** (omitted on 2xx/3xx/4xx; an unclassified backend 5xx carries `backend_error`) |
 
 The header is the stable client-facing contract and must not change spelling.
 Metrics and logs keep the granular class so PromQL and log alerts can split
@@ -384,18 +384,19 @@ confirm what the gateway saw, use a diagnostic reference (below).
 | Token | When |
 |---|---|
 | `connection_failure` | Pre-wire connect/DNS/TLS failure (502) |
-| `backend_timeout` | A backend held the request (it accepted the connection and was sent the request) but did not answer in time (504) |
+| `backend_timeout` | The backend dispatch attempt did not produce an answer before its deadline (504). A route-total deadline counts as a backend timeout once the dispatch begins `send()`, including while TCP/TLS connection establishment is still in progress; this does not mean the backend accepted the connection or received request bytes |
 | `backend_error` | Backend returned 5xx, or a post-wire 5xx without a more specific token |
 | `circuit_breaker_open` | Open-breaker 503; never reached a backend |
 | `overload` | Gateway resource refusal: overload/drain `reject_new_requests` 503, or response-transformer output above the configured response ceiling (502) |
 | `config_stale` | DP stale-config fence 503 |
 | `concurrency_limit` | `adaptive_concurrency` admission 503 |
-| `request_timeout` | A matched route rule's total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API `timeouts.request`) expired before any backend held the request: during the client upload, a gateway-local phase, admission, or retry backoff (504). The transaction log records `route_request_timeout` as `before_dispatch` or `retry_backoff` |
+| `request_timeout` | A matched route rule's total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API `timeouts.request`) expired before backend dispatch began: during the client upload, a gateway-local phase, admission, or retry backoff (504). The transaction log records `route_request_timeout` as `before_dispatch` or `retry_backoff` |
+| `loop_detected` | The request arrived with an `X-Ferrum-Hops` count at or above `FERRUM_MAX_PROXY_HOPS`, so the gateway refused it before routing with `508 Loop Detected`. Native gRPC gets Trailers-Only `FAILED_PRECONDITION` instead, which carries no HTTP 5xx and therefore no token. No backend was contacted. Only the refusing hop writes this token: an outer Ferrum hop that relays the `508` labels it `backend_error`, like any other backend 5xx. The malformed-field `400` (phase `proxy_hops_invalid`) carries no token. See [Proxy hop limit](routing.md#proxy-hop-limit) |
 
 Do not reuse `backend_error` for a response that never reached a backend, and
-do not reuse `backend_timeout` for a timeout no backend held. A route-deadline
-`504` whose recorded phase is `dispatch` (the backend held the cancelled
-attempt) stays `backend_timeout`.
+do not reuse `backend_timeout` for a timeout before dispatch began. A
+route-deadline `504` whose recorded phase is `dispatch` stays `backend_timeout`,
+including expiry while the initial TCP/TLS connection is still being established.
 
 ### Granular class → header token
 
@@ -424,10 +425,11 @@ attempt) stays `backend_timeout`.
 | *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |
 | *(no `ErrorClass`; `rejection_phase=config_stale`)* | `config_stale` |
 | *(no `ErrorClass`; `rejection_phase=adaptive_concurrency`)* | `concurrency_limit` |
+| *(no `ErrorClass`; `rejection_phase=proxy_hop_limit`, status 508)* | `loop_detected` (reserved: the hop-limit fence emits no transaction summary, so no metric row carries it today) |
 | *(no `ErrorClass`; no `rejection_phase`; backend 5xx)* | `backend_error` |
 
-Those five gateway-authored tokens appear on the metric (and the header) when
-there is no `ErrorClass`. The first four are named by a `rejection_phase`;
+Those six gateway-authored tokens appear on the metric (and the header) when
+there is no `ErrorClass`. The first five are named by a `rejection_phase`;
 `backend_error` is the fallback for a backend 5xx the gateway never
 classified and no fence rejected, so the metric never loses a 5xx to an
 empty label. They are omitted from the access log in that case;
@@ -663,7 +665,7 @@ refusal: HTTP **502** with the existing `Response body too large` JSON error
 and numeric `limit`, plus the existing
 gateway-owned `overload` header token. It uses `DispatchPolicyRejected`, not
 `GatewayBufferCapacity` or `ResponseBodyTooLarge`, so the closed sets stay at
-eight header tokens and nineteen error classes. Private request provenance restores
+nine header tokens and nineteen error classes. Private request provenance restores
 the header after mutable hooks and stamps the class in the shared transaction-log
 funnel, including native H3 and cross-protocol paths.
 

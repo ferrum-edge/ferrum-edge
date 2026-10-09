@@ -875,6 +875,10 @@ fn the_placement_contract_rejects_present_but_empty_or_zero_era_pair_keys() {
 fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
     let ambient = read("templates/ambient-daemonset.yaml");
     let rbac = read("templates/ambient-rbac.yaml");
+    let nodes_rbac = rbac
+        .split("\n---\n")
+        .find(|document| document.contains("resources: [\"nodes\"]"))
+        .expect("ambient-rbac.yaml must contain the nodes ClusterRole document");
 
     assert!(
         ambient.contains(
@@ -921,7 +925,7 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
     );
 
     assert!(
-        rbac.contains("resources: [\"nodes\"]") && rbac.contains("verbs: [\"get\"]"),
+        nodes_rbac.contains("resources: [\"nodes\"]") && nodes_rbac.contains("verbs: [\"get\"]"),
         "the ambient service account needs a read-only nodes grant for the preflight lookup"
     );
     // Least privilege: get without list/watch/write. Kubernetes RBAC does not
@@ -937,23 +941,31 @@ fn the_preflight_binds_its_node_lookup_to_this_pods_node_name() {
         "\"*\"",
     ] {
         assert!(
-            !rbac.contains(forbidden),
+            !nodes_rbac.contains(forbidden),
             "the ambient nodes grant must not carry {forbidden}"
         );
     }
     assert!(
-        !rbac.contains("resourceNames:"),
+        !nodes_rbac.contains("resourceNames:"),
         "do not add resourceNames: a static name cannot name this pod's node, \
          and claiming a single-object restriction Kubernetes does not provide \
          is worse than documenting the runtime binding"
     );
+    let nodes_binding = rbac
+        .split("\n---\n")
+        .find(|document| {
+            document.contains("kind: ClusterRoleBinding")
+                && document.contains("name: ferrum-mesh-ambient-{{ .Release.Name }}")
+        })
+        .expect("ambient-rbac.yaml must bind the nodes ClusterRole");
+    let ambient_subject = "name: ferrum-mesh-ambient\n    namespace: {{ .Release.Namespace }}";
     assert!(
-        rbac.contains("name: ferrum-mesh\n    namespace: {{ .Release.Namespace }}"),
+        nodes_binding.contains(ambient_subject),
         "the grant must bind the ambient DaemonSet's own service account"
     );
     assert!(
-        rbac.contains("`get` without `resourceNames` as a single-object restriction")
-            && rbac.contains("runtime request is what binds the lookup"),
+        nodes_rbac.contains("`get` without `resourceNames` as a single-object restriction")
+            && nodes_rbac.contains("runtime request is what binds the lookup"),
         "the Role comment must not claim an enforcement boundary Kubernetes RBAC \
          does not provide"
     );

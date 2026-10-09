@@ -1875,6 +1875,43 @@ async fn browser_challenge_accepts_same_host_with_normalized_names_ips_and_ports
 }
 
 #[tokio::test]
+async fn browser_challenges_expire_old_pending_flow_cookies_at_the_per_browser_cap() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let first = issue_browser_challenge(&plugin).await;
+    let first_pair = cookie_pair(&first.cookie).to_string();
+
+    let mut second_ctx = html_ctx();
+    second_ctx
+        .headers
+        .insert("cookie".to_string(), first_pair.clone());
+    let second_headers = assert_callback_redirect(
+        plugin
+            .authenticate(&mut second_ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let second_cookie = second_headers
+        .get("set-cookie")
+        .expect("second flow cookie");
+    let second_pair = cookie_pair(second_cookie).to_string();
+
+    let mut third_ctx = html_ctx();
+    third_ctx
+        .headers
+        .insert("cookie".to_string(), format!("{first_pair}; {second_pair}"));
+    let third_headers = assert_callback_redirect(
+        plugin
+            .authenticate(&mut third_ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let set_cookie = third_headers.get("set-cookie").expect("third flow cookies");
+    assert!(set_cookie.contains("Max-Age=0"));
+    assert!(
+        set_cookie.lines().count() >= 2,
+        "the response expires an older pending flow and sets the new one: {set_cookie}"
+    );
+}
+
+#[tokio::test]
 async fn loopback_http_challenge_remains_available_on_the_same_host() {
     for (redirect_uri, request_host) in [
         ("http://localhost:3000/oauth/callback", "LOCALHOST:5173"),
@@ -2289,6 +2326,31 @@ async fn pending_login_admission_is_bounded_per_source() {
 }
 
 #[tokio::test]
+async fn pending_login_source_limit_groups_ipv6_addresses_by_prefix() {
+    let mut config = base_config();
+    config["behavior"]["state_cache_max_entries"] = json!(4);
+    config["behavior"]["state_cache_max_entries_per_source"] = json!(1);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut first = html_ctx();
+    first.client_ip = "2001:db8:abcd:12::1".to_string();
+    assert_reject(
+        plugin
+            .authenticate(&mut first, &ConsumerIndex::new(&[]))
+            .await,
+        Some(302),
+    );
+    let mut sibling = html_ctx();
+    sibling.client_ip = "2001:db8:abcd:12::ffff".to_string();
+    assert_reject(
+        plugin
+            .authenticate(&mut sibling, &ConsumerIndex::new(&[]))
+            .await,
+        Some(503),
+    );
+}
+
+#[tokio::test]
 async fn pending_login_admission_is_bounded_globally_across_sources() {
     let mut config = base_config();
     config["behavior"]["state_cache_max_entries"] = json!(1);
@@ -2302,13 +2364,16 @@ async fn pending_login_admission_is_bounded_globally_across_sources() {
             .await,
         Some(302),
     );
+    // The local pending-flow cache stays bounded, but a full cache no longer
+    // refuses logins: the sealed cookie carries the whole flow, so another
+    // source still gets its redirect instead of a global 503.
     let mut distributed = html_ctx();
     distributed.client_ip = "192.0.2.99".to_string();
     assert_reject(
         plugin
             .authenticate(&mut distributed, &ConsumerIndex::new(&[]))
             .await,
-        Some(503),
+        Some(302),
     );
 }
 
@@ -4662,4 +4727,63 @@ async fn external_identity_realm_binds_the_oidc_issuer_and_identity_claim() {
         realm, by_email,
         "the identity claim path is part of the realm"
     );
+}
+
+/// The refresh-token grant carries the request's gateway hop count
+/// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so a token
+/// endpoint that resolves back to the gateway is refused at the proxy hop limit
+/// like a looping route (issue #6128). The authorization-code exchange,
+/// UserInfo, and logout revocation share the same token-endpoint helper. With
+/// the limit disabled nothing is stamped.
+#[tokio::test]
+async fn refresh_grant_carries_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(6), vec!["6"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-access-token",
+                "refresh_token": "rotated-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let plugin = OidcRelyingParty::new(
+            &refresh_config(&format!("{}/token", server.uri())),
+            PluginHttpClient::default(),
+        )
+        .expect("valid refresh config");
+        let now = chrono::Utc::now().timestamp();
+        let cookie = oidc_sealed_refresh_session_cookie_for_test(
+            &plugin,
+            json!({
+                "sub": "oidc-subject",
+                "email": "accepted@example.test",
+                "exp": now + 3600
+            }),
+            Some("original-refresh-token".to_string()),
+            true,
+            false,
+        )
+        .expect("session seals");
+        let mut ctx = session_ctx(&cookie);
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+
+        let received = server.received_requests().await.expect("requests");
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
 }

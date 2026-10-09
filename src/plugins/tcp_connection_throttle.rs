@@ -216,7 +216,8 @@ impl TcpConnectionThrottle {
             }
             None => {
                 let canonical_ip =
-                    crate::util::client_identity::canonical_client_ip_text(&ctx.client_ip);
+                    crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                        .unwrap_or_else(|| ctx.client_ip.clone());
                 let mut key = String::with_capacity(
                     "proxy::ip:".len() + proxy_key.len() + canonical_ip.len(),
                 );

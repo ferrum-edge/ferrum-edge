@@ -86,6 +86,10 @@ pub trait CpFullLoadSource: Send + Sync {
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
     async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error>;
+
+    /// See [`DatabaseBackend::forget_consumer_quarantine_state`]: a loaded
+    /// snapshot the CP rejects never goes live (issue #6060).
+    fn forget_consumer_quarantine_state(&self, _namespace: &str) {}
 }
 
 #[async_trait::async_trait]
@@ -107,6 +111,10 @@ where
 
     async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
         DatabaseBackend::latest_global_change_sequence(self).await
+    }
+
+    fn forget_consumer_quarantine_state(&self, namespace: &str) {
+        DatabaseBackend::forget_consumer_quarantine_state(self, namespace);
     }
 }
 
@@ -759,7 +767,9 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
         let config = db
             .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
             .await?;
-        let mut config = prepare_cp_full_snapshot(config)?;
+        let mut config = prepare_cp_full_snapshot(config).inspect_err(|_| {
+            db.forget_consumer_quarantine_state(ns);
+        })?;
         // `mesh` is owned by the K8s overlay slot, never by a DB snapshot; the
         // publication step re-merges it (#2982).
         config.mesh = None;
@@ -784,6 +794,7 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
                     acc.apply_success(ns, next);
                 }
                 Err(error) => {
+                    db.forget_consumer_quarantine_state(ns);
                     error!(
                         namespace = %sanitize_startup_scalar(ns),
                         error = %sanitize_startup_cause(&error, &[]),
@@ -814,6 +825,14 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
     }
 
     acc.finish(previous, last_hard_error)
+}
+
+/// A loaded snapshot that will not publish must not leave its namespace marked
+/// free of consumer quarantine (issue #6060).
+fn forget_consumer_quarantine_states<B: CpFullLoadSource + ?Sized>(db: &B, namespaces: &[String]) {
+    for namespace in namespaces {
+        db.forget_consumer_quarantine_state(namespace);
+    }
 }
 
 /// Pure accumulator for multi-namespace CP full loads. `load_full_config_multi`
@@ -1118,13 +1137,20 @@ async fn load_full_config_multi_with_sequence(
             failed_namespaces: Vec::new(),
         }
     } else {
-        load_full_config_multi(db, &load_namespaces, previous).await?
+        load_full_config_multi(db, &load_namespaces, previous)
+            .await
+            .inspect_err(|_| forget_consumer_quarantine_states(db, &load_namespaces))?
     };
 
     // The same whole-store rule applies after resource loading when the
     // snapshot will publish a global revision. An unsequenced `All` snapshot
     // preserves the per-namespace LKG continuation contract.
     if publishes_store_global_revision {
+        // Nothing below publishes, so no namespace loaded here may keep the
+        // clean consumer-quarantine state its load recorded (issue #6060).
+        if !outcome.failed_namespaces.is_empty() || !outcome.rejected_namespaces.is_empty() {
+            forget_consumer_quarantine_states(db, &load_namespaces);
+        }
         if !outcome.failed_namespaces.is_empty() {
             anyhow::bail!(
                 "CP All-scope full reload could not refresh every namespace; retaining the prior \
@@ -1500,10 +1526,20 @@ pub(crate) fn publish_cp_full_reload(
     cp_scope: &CpScope,
     mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
     mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    slow_threshold_ms: Option<u64>,
 ) {
     if refreshed_namespaces.is_empty() {
         return;
     }
+    // `loaded_at` is stamped before the first namespace's snapshot queries.
+    let load = (chrono::Utc::now() - db_config.loaded_at)
+        .to_std()
+        .unwrap_or_default();
+    let resources = db_config.proxies.len()
+        + db_config.consumers.len()
+        + db_config.plugin_configs.len()
+        + db_config.upstreams.len();
+    let publish_started = std::time::Instant::now();
     publication_gate.publish(move || {
         let published =
             cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
@@ -1537,6 +1573,18 @@ pub(crate) fn publish_cp_full_reload(
         }
         MeshGrpcServer::broadcast_full_with_registry(mesh_update_tx, published, mesh_registry);
     });
+    crate::modes::database::log_config_change_applied(
+        crate::modes::database::ConfigChangeStages {
+            path: "full reload",
+            trigger: "control plane",
+            resources,
+            sequence: None,
+            load,
+            apply: publish_started.elapsed(),
+            write_to_live: None,
+        },
+        slow_threshold_ms,
+    );
 }
 
 /// Union of exactly the accepted per-namespace deltas.
@@ -2460,9 +2508,10 @@ pub async fn run(
     let reserved_ports = env_config.reserved_gateway_ports();
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
     // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
-    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
+    let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new_with_ipv6_prefix(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
+        env_config.per_ip_ipv6_prefix,
     ));
     // Start durable audit delivery now (issue #2421): discovery, adoption of
     // records abandoned by a prior process generation, and replay must not wait
@@ -2703,9 +2752,10 @@ pub async fn run(
         // listener, the TLS/mTLS accept loop, and every certificate-reload
         // generation, so the cap is a property of the CP gRPC surface rather
         // than of one listener instance or one certificate.
-        let grpc_conn_limiter = Arc::new(ConnLimiter::new(
+        let grpc_conn_limiter = Arc::new(ConnLimiter::new_with_ipv6_prefix(
             env_config.cp_grpc_max_connections,
             env_config.cp_grpc_max_connections_per_ip,
+            env_config.per_ip_ipv6_prefix,
         ));
         crate::plugins::prometheus_metrics::global_registry()
             .set_cp_grpc_conn_metrics(Arc::clone(&grpc_conn_limiter));
@@ -2810,7 +2860,7 @@ pub async fn run(
         let grpc_startup_ready = startup_ready.clone();
         let grpc_serving_degraded = serving_degraded.clone();
         let handle = tokio::spawn(async move {
-            let mut builder = Server::builder()
+            let builder = Server::builder()
                 .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
                 .http2_max_pending_accept_reset_streams(Some(
                     grpc_http2_max_pending_accept_reset_streams,
@@ -2843,6 +2893,7 @@ pub async fn run(
             };
             let _ = grpc_started_tx.send(());
             let router = builder
+                .layer(crate::grpc::response_admission::FullConfigPermitLayer)
                 .add_service(grpc_server.into_service())
                 .add_service(mesh_grpc_server.into_service());
             let result = if let Some(xds_server) = xds_server {
@@ -2906,6 +2957,16 @@ pub async fn run(
                  FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
             );
         }
+        if let Some(reason) = env_config.k8s_selectorless_external_endpoints_inactive_reason() {
+            warn!(
+                reason,
+                "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true has no effect: it needs \
+                 the Node watch (FERRUM_K8S_POD_DISCOVERY_ENABLED=true and \
+                 FERRUM_K8S_NODE_LOCALITY_ENABLED=true with nodes list/watch RBAC) to tell Node \
+                 addresses and Node Pod CIDRs from external hosts, so EndpointSlice IPs no \
+                 observed Pod claims stay refused"
+            );
+        }
         // T2-B: when `FERRUM_K8S_WATCH_NAMESPACES` isn't set, fall back to the
         // CP's namespace scope (T2-A). `CpScope::Single`/`Set` produce an
         // explicit watch list; `CpScope::All` returns `None` here, which the
@@ -2947,6 +3008,8 @@ pub async fn run(
             watch_mesh_config: env_config.k8s_watch_mesh_config,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
+            allow_selectorless_external_endpoints: env_config
+                .k8s_selectorless_external_endpoints_active(),
             watch_node_locality: env_config.k8s_node_locality_enabled,
             gateway_api_data_plane_service_namespace: env_config
                 .gateway_api_data_plane_service_namespace
@@ -3013,6 +3076,12 @@ pub async fn run(
                  FERRUM_K8S_CONTROLLER_ENABLED=false"
             );
         }
+        if env_config.k8s_allow_selectorless_external_endpoints {
+            warn!(
+                "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true has no effect because \
+                 FERRUM_K8S_CONTROLLER_ENABLED=false"
+            );
+        }
         None
     };
 
@@ -3064,6 +3133,7 @@ pub async fn run(
     let poll_fallback_namespace = env_config.namespace.clone();
     let dp_registry_poll = dp_registry.clone();
     let poll_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
+    let poll_slow_threshold_ms = env_config.db_slow_query_threshold_ms;
     let poll_backend_allow_ips = env_config.backend_allow_ips.clone();
     let rejected_delta_full_reload_threshold = env_config.db_rejected_delta_full_reload_threshold;
     let mesh_registry_poll = mesh_registry.clone();
@@ -3257,6 +3327,7 @@ pub async fn run(
                                     &poll_scope,
                                     &mesh_update_tx,
                                     &mesh_registry_poll,
+                                    poll_slow_threshold_ms,
                                 );
                                 settle_full_reload_rejection_state(
                                     &db_poll,
@@ -3313,12 +3384,15 @@ pub async fn run(
                         }
                     } else {
                         // Incremental poll — only fetch changes since last poll
-                        match load_incremental_config_multi(
+                        let load_started = std::time::Instant::now();
+                        let incremental_load = load_incremental_config_multi(
                             db_poll.as_ref(),
                             &nslist,
                             &last_change_sequences,
                         )
-                        .await
+                        .await;
+                        let load_elapsed = load_started.elapsed();
+                        match incremental_load
                         {
                             Ok(IncrementalMultiLoad {
                                 result,
@@ -3438,6 +3512,9 @@ pub async fn run(
                                 // section, so a concurrent K8s reconcile full
                                 // snapshot can never be emitted after these
                                 // deltas and erase them in subscribers.
+                                let changed_resources =
+                                    crate::modes::database::incremental_resource_count(&result);
+                                let publish_started = std::time::Instant::now();
                                 let compose = publish_cp_incremental(
                                     &publication_gate_poll,
                                     config_poll.as_ref(),
@@ -3451,6 +3528,18 @@ pub async fn run(
                                     &mesh_update_tx,
                                     &mesh_registry_poll,
                                     &last_change_sequences,
+                                );
+                                crate::modes::database::log_config_change_applied(
+                                    crate::modes::database::ConfigChangeStages {
+                                        path: "incremental",
+                                        trigger: "control plane",
+                                        resources: changed_resources,
+                                        sequence: Some(result.sequence_cursor),
+                                        load: load_elapsed,
+                                        apply: publish_started.elapsed(),
+                                        write_to_live: None,
+                                    },
+                                    poll_slow_threshold_ms,
                                 );
 
                                 // Warn-only validators (same set as
@@ -3563,6 +3652,7 @@ pub async fn run(
                                                     &poll_scope,
                                                     &mesh_update_tx,
                                                     &mesh_registry_poll,
+                                                    poll_slow_threshold_ms,
                                                 );
                                                 rejected_delta_tracker.record_accepted();
                                                 db_available_poll.store(true, Ordering::Relaxed);
@@ -3663,6 +3753,7 @@ pub async fn run(
                                     );
                                 } else {
                                     warn!(
+                                        reason = db_backend::incremental_fallback_reason(&e),
                                         "Authoritative primary incremental poll failed, falling back to full reload"
                                     );
                                 }
@@ -3712,6 +3803,7 @@ pub async fn run(
                                             &poll_scope,
                                             &mesh_update_tx,
                                             &mesh_registry_poll,
+                                            poll_slow_threshold_ms,
                                         );
                                         settle_full_reload_rejection_state(
                                             &db_poll,
@@ -3808,6 +3900,7 @@ pub async fn run(
                                                             &poll_scope,
                                                             &mesh_update_tx,
                                                             &mesh_registry_poll,
+                                                            poll_slow_threshold_ms,
                                                         );
                                                         settle_full_reload_rejection_state(
                                                             &db_poll,

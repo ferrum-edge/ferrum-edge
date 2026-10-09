@@ -260,14 +260,9 @@ jobs:
           echo '{"schema_version":1,"points":[]}' > protocol-perf-results/history.json
           # Pull the newest successful run's trends artifact when present so the
           # rolling median±MAD baseline can accumulate across scheduled runs.
-          prior_run="$(gh run list \
-            --workflow protocol-perf-regression.yml \
-            --branch main \
-            --status success \
-            --limit 10 \
-            --json databaseId,headSha \
-            --jq "map(select(.headSha != \"${CURRENT_SHA}\")) | .[0].databaseId // empty" \
-            || true)"
+          python3 -I .github/scripts/latest_trusted_scheduled_runs.py --self-test
+          prior_run="$(python3 -I .github/scripts/latest_trusted_scheduled_runs.py \
+            --workflow protocol-perf-regression.yml --current-sha "$CURRENT_SHA")"
           if [[ -n "${prior_run}" ]]; then
             mkdir -p protocol-perf-results/prior-trends
             if gh run download "${prior_run}" \

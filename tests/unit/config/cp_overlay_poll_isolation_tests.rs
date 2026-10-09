@@ -742,3 +742,64 @@ fn reconcile_full_never_erases_a_newer_committed_poll_delta() {
     }
     assert_eq!(dp_state, committed, "the DP stream must not roll back");
 }
+
+#[test]
+fn reconcile_refuses_a_translation_with_duplicate_resource_ids() {
+    // Every DP refuses a snapshot carrying two resources with one
+    // `(namespace, id)`. The CP must refuse the translation first and keep the
+    // last accepted overlay, instead of broadcasting a snapshot that freezes
+    // the whole fleet on its last good config.
+    let (harness, mut dp_rx) = PublicationHarness::new(GatewayConfig::default());
+    let mut mesh_rx = harness.mesh_subscribe();
+    let managed = BTreeSet::from(["ferrum".to_string()]);
+    harness.publish_reconcile(&k8s_translation(1), &managed);
+    let accepted = proxy_ids(&harness.config_arc.load_full());
+    assert!(accepted.contains("gwapi-route-1"), "{accepted:?}");
+    drain(&mut dp_rx);
+    drain(&mut mesh_rx);
+
+    let mut duplicated = k8s_translation(2);
+    duplicated
+        .proxies
+        .push(make_proxy("gwapi-route-2", "ferrum"));
+    harness.publish_reconcile(&duplicated, &managed);
+
+    assert_eq!(
+        proxy_ids(&harness.config_arc.load_full()),
+        accepted,
+        "a translation with duplicate ids must not replace the accepted config"
+    );
+    assert!(
+        drain(&mut dp_rx).is_empty(),
+        "a refused translation must not reach any DP"
+    );
+    assert!(
+        drain(&mut mesh_rx).is_empty(),
+        "a refused translation must not reach any mesh subscriber"
+    );
+
+    // A corrected translation publishes normally afterwards.
+    harness.publish_reconcile(&k8s_translation(3), &managed);
+    assert!(
+        proxy_ids(&harness.config_arc.load_full()).contains("gwapi-route-3"),
+        "a valid translation must still publish after a refusal"
+    );
+}
+
+#[test]
+fn shared_cp_admission_refuses_duplicate_resource_ids() {
+    let mut config = GatewayConfig::default();
+    config.proxies.push(make_proxy("dup", "ferrum"));
+    let mut twin = make_proxy("dup", "ferrum");
+    twin.listen_path = Some("/dup-twin".to_string());
+    config.proxies.push(twin);
+
+    let errors =
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Duplicate proxy ID")),
+        "CP full and incremental admission must refuse duplicate ids: {errors:?}"
+    );
+}

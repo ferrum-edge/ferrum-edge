@@ -55,6 +55,9 @@ pub struct K8sControllerConfig {
     pub watch_mesh_config: bool,
     pub watch_gateway_api: bool,
     pub pod_discovery_enabled: bool,
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`; see
+    /// [`crate::config_sources::k8s::K8sTranslationOptions::allow_selectorless_external_endpoints`].
+    pub allow_selectorless_external_endpoints: bool,
     pub watch_node_locality: bool,
     pub gateway_api_data_plane_service_namespace: Option<String>,
     pub gateway_api_data_plane_service_name: Option<String>,
@@ -693,6 +696,8 @@ pub async fn start_k8s_controller(
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
         pod_discovery_enabled: controller_config.pod_discovery_enabled,
+        allow_selectorless_external_endpoints: controller_config
+            .allow_selectorless_external_endpoints,
         gateway_api_data_plane_service_namespace: controller_config
             .gateway_api_data_plane_service_namespace,
         gateway_api_data_plane_service_name: controller_config.gateway_api_data_plane_service_name,

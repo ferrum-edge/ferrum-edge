@@ -1,6 +1,6 @@
 //! Gateway-owned diagnostic references (issue #5767).
 //!
-//! `X-Gateway-Error` is a closed, coarse, eight-token public vocabulary: one
+//! `X-Gateway-Error` is a closed, coarse, nine-token public vocabulary: one
 //! token (`connection_failure`, say) covers DNS, TCP, TLS, pool, and egress
 //! policy failures, and the precise `error_class` behind it reaches only the
 //! operator's logs. This module adds an additive, opt-in bridge between the
@@ -195,6 +195,10 @@ pub const MESH_REGISTRY_ONLY_PHASE: &str = "mesh_registry_only";
 /// retired (`421`, issue #5921).
 pub const RETIRED_GATEWAY_LISTENER_PHASE: &str = "gateway_listener_retired";
 
+/// Rejection phase of a request whose client-selected protocol flavor (native
+/// gRPC, WebSocket) cannot run the route's authentication or admission policy.
+pub const ROUTE_PROTOCOL_ADMISSION_PHASE: &str = "route_protocol_admission";
+
 /// Plugin hook phases. A rejection recorded in one of them is a plugin
 /// rejection even when the rejecting plugin's name is not known.
 const PLUGIN_HOOK_PHASES: [&str; 9] = [
@@ -216,11 +220,14 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     ROUTE_NOT_FOUND_PHASE,
     MESH_REGISTRY_ONLY_PHASE,
     RETIRED_GATEWAY_LISTENER_PHASE,
+    ROUTE_PROTOCOL_ADMISSION_PHASE,
     BACKEND_ADMISSION_PHASE,
     "h1_framing_unverified",
     "config_stale",
     "client_trust_withdrawn",
     "overload",
+    crate::proxy::hop_limit::PROXY_HOP_LIMIT_REJECTION_PHASE,
+    crate::proxy::hop_limit::PROXY_HOPS_INVALID_REJECTION_PHASE,
     "allowed_methods",
     "max_forwards",
     "backend_max_connections",

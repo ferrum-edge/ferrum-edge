@@ -138,12 +138,12 @@
 //! `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED` (default `true`), a refreshable CRL
 //! source, and the poll cadence — `FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS`
 //! (default 30s) for file-backed sources, the source's own `?poll=` or
-//! `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` otherwise. One consequence is worth
-//! stating plainly: that task validates the WHOLE backend TLS surface before it
-//! publishes anything, so a backend TLS validation failure with nothing to do
-//! with the CRL withholds the mesh inbound publication as well, and disabling
-//! backend live reload pins the mesh inbound enforced set at its startup
-//! snapshot.
+//! `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` otherwise. That task validates the
+//! backend TLS surface one destination at a time (issue #6105): a destination
+//! whose material no longer builds is warned and skipped, so it cannot withhold
+//! the mesh inbound publication; only a CRL candidate that fails to load does.
+//! Disabling backend live reload pins the mesh inbound enforced set at its
+//! startup snapshot.
 //!
 //! ALL THREE PUBLISHERS SHARE ONE FENCE-OWNED LOCK
 //! ([`HboneAdmissionFence::publication_lock`]), taken by the trust install, the
@@ -196,6 +196,7 @@ use super::hbone_proxy::{
 use super::{
     MeshInboundTlsPolicy, SharedMeshInboundTlsPolicy, inbound_hbone_relay_destination_decision,
     mesh_egress_udp_destination_allowed, mesh_inbound_peer_auth_transport_mismatch_for_policy,
+    sidecar_inbound_refuses_matched_http_connect,
 };
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugin_cache::PluginCacheRequestView;
@@ -388,7 +389,9 @@ pub enum HboneRelayDestinationGate {
     /// admitted EgressGateway external UDP endpoint.
     Datagram,
     /// Explicitly configured proxy: no ownership guard applies; presence in the
-    /// published generation is the gate.
+    /// published generation is the gate, plus the Sidecar refusal of a bare
+    /// CONNECT that matched an HTTP route on the inbound listener (issue
+    /// #6110).
     Configured,
 }
 
@@ -2119,6 +2122,18 @@ impl HboneAdmissionFence {
         // nothing and keeps the reuse fold from resolving a second copy.
         let view = admitting_request_view(snapshot, epoch);
 
+        // The request path refuses a view that omits the route's admission
+        // policy before any plugin runs, ahead of the authorize chain. A reload
+        // that adds an HTTP-only admission plugin to this route therefore
+        // refuses the peer's next CONNECT on a gRPC-classified view, so the
+        // live tunnel must not outlive it. A capability bit read; no hook runs.
+        if view
+            .capabilities()
+            .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+        {
+            return Some(HboneRevocationReason::AuthorizationDenied);
+        }
+
         if self.authorize_chain_denies(snapshot, &view).await {
             return Some(HboneRevocationReason::AuthorizationDenied);
         }
@@ -2172,7 +2187,13 @@ impl HboneAdmissionFence {
                 .is_ok()
                     || mesh_egress_udp_destination_allowed(app_host, app_port, mesh)
             }
-            HboneRelayDestinationGate::Configured => true,
+            HboneRelayDestinationGate::Configured => {
+                // A configured route has no ownership guard, but a reload can
+                // make it an HTTP route on the Sidecar inbound listener, where
+                // the peer's next bare CONNECT would be refused (issue #6110).
+                let direction = snapshot.ctx.mesh_direction;
+                !sidecar_inbound_refuses_matched_http_connect(proxy, direction, mesh)
+            }
         };
         if !destination_owned {
             return Some(HboneRevocationReason::RelayDestination);

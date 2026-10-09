@@ -563,7 +563,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
             "database": "ferrum",
             "table": "charges_raw",
             "timeout_ms": 1000,
-            "password_ref": "FERRUM_CHARGEBACK_LIFECYCLE_MISSING_SECRET"
+            "password_ref": "FERRUM_PLUGIN_SECRET_CHARGEBACK_MISSING"
         },
         "batch": {"size": 2, "flush_interval_ms": 60000, "buffer_capacity": 10},
         "retry": {"max_attempts": 1, "initial_delay_ms": 1, "max_delay_ms": 1, "jitter": false},
@@ -598,7 +598,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
     // Retryable: after the secret appears, start can succeed.
     // SAFETY: test-only env mutation for deferred secret activation.
     unsafe {
-        std::env::set_var("FERRUM_CHARGEBACK_LIFECYCLE_MISSING_SECRET", "test-secret");
+        std::env::set_var("FERRUM_PLUGIN_SECRET_CHARGEBACK_MISSING", "test-secret");
     }
     plugin
         .start_background_tasks()
@@ -655,7 +655,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         "dropping a rejected staged sink must preserve live diagnostics"
     );
     unsafe {
-        std::env::remove_var("FERRUM_CHARGEBACK_LIFECYCLE_MISSING_SECRET");
+        std::env::remove_var("FERRUM_PLUGIN_SECRET_CHARGEBACK_MISSING");
     }
     drop(plugin);
     let status_after: Value =

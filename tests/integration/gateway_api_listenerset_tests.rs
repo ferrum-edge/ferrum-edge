@@ -94,7 +94,10 @@ fn service() -> K8sObject {
     let mut svc = object(
         "Service",
         "backend",
-        json!({ "ports": [{ "port": 8080, "protocol": "TCP" }] }),
+        json!({
+            "selector": { "app": "backend" },
+            "ports": [{ "port": 8080, "protocol": "TCP" }]
+        }),
     );
     svc.api_version = "v1".to_string();
     svc

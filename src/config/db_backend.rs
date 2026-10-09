@@ -1560,11 +1560,12 @@ impl std::fmt::Display for NamespacedResourceId {
 ///
 /// Contains only resources referenced by durable change-log records newer than
 /// the caller's sequence cursor, plus keys of resources that were deleted.
-/// Consumer mutations are the exception: loaders return
-/// [`IncrementalFullReloadRequired`] so previously quarantined credentials can
-/// be rehydrated from storage. The polling loop advances `sequence_cursor` only
-/// after the delta validates and applies, so rejected deltas are retried from
-/// the same durable point.
+/// Consumer mutations ride the delta unless quarantine could change their
+/// outcome; then loaders return [`IncrementalFullReloadRequired`] so previously
+/// quarantined credentials can be rehydrated from storage (see
+/// [`ConsumerQuarantineTracker`]). The polling loop advances `sequence_cursor`
+/// only after the delta validates and applies, so rejected deltas are retried
+/// from the same durable point.
 ///
 /// Serializable for CP-to-DP gRPC delta broadcasts. Every removal key is a
 /// namespace-qualified `{namespace, id}` object on the wire and in memory.
@@ -1606,6 +1607,75 @@ impl IncrementalResult {
     }
 }
 
+/// `config_changes` rows one incremental-poll query reads. Paging keeps each
+/// query's memory bounded while a large batch still applies as a delta.
+pub const CHANGE_LOG_PAGE_ROWS: usize = 10_000;
+
+/// Change rows one incremental poll reads before it falls back to a full
+/// reload. Matches the per-namespace change-log retention (100,000 rows), so
+/// any backlog that is still retained applies as a delta. Below this, point-
+/// loading the changed resources is far cheaper than decoding, diffing and
+/// staging the whole namespace: one admin batch of a few thousand proxies with
+/// plugins already writes more than 10,000 rows, which used to force a full
+/// reload on every large write (issue #6058).
+pub const CHANGE_LOG_MAX_ROWS: usize = 100_000;
+
+static CHANGE_LOG_MAX_ROWS_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
+static CHANGE_LOG_MAX_ROWS_OVERRIDES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn change_log_max_rows_overrides()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, usize>> {
+    CHANGE_LOG_MAX_ROWS_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The change-row cap for `namespace`: [`CHANGE_LOG_MAX_ROWS`] unless a test
+/// lowered it. Production pays one relaxed load per poll.
+pub fn change_log_max_rows(namespace: &str) -> usize {
+    if !CHANGE_LOG_MAX_ROWS_OVERRIDDEN.load(Ordering::Acquire) {
+        return CHANGE_LOG_MAX_ROWS;
+    }
+    change_log_max_rows_overrides()
+        .get(namespace)
+        .copied()
+        .unwrap_or(CHANGE_LOG_MAX_ROWS)
+}
+
+/// Lower (or, with `None`, restore) the change-row cap for one namespace so a
+/// test can saturate an incremental poll without writing 100,000 rows.
+pub(crate) fn set_change_log_max_rows(namespace: &str, max_rows: Option<usize>) {
+    let mut overrides = change_log_max_rows_overrides();
+    match max_rows.filter(|rows| *rows > 0) {
+        Some(rows) => {
+            overrides.insert(namespace.to_string(), rows);
+        }
+        None => {
+            overrides.remove(namespace);
+        }
+    }
+    CHANGE_LOG_MAX_ROWS_OVERRIDDEN.store(!overrides.is_empty(), Ordering::Release);
+}
+
+/// Static category for an incremental poll that fell back to a full reload,
+/// safe to log: it classifies the loaders' own fallback errors without
+/// echoing database error text.
+pub fn incremental_fallback_reason(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("reached limit") {
+        "change-log batch over the cap"
+    } else if message.contains("behind retained sequence") {
+        "cursor behind the retained change log"
+    } else if message.contains("non-transactional config_changes") {
+        "standalone MongoDB change log"
+    } else {
+        "incremental load error"
+    }
+}
+
 /// Marker returned by an incremental loader when a consumer mutation must be
 /// applied from an authoritative full snapshot.
 ///
@@ -1614,7 +1684,8 @@ impl IncrementalResult {
 /// snapshot cannot restore a different consumer whose stored credential was
 /// previously stripped. Consumer creates, updates, and deletes therefore
 /// escalate to the poller's existing same-tick full-reload path, which reloads
-/// every stored consumer before applying quarantine again.
+/// every stored consumer before applying quarantine again, whenever quarantine
+/// could change the outcome (issue #6060): see [`ConsumerQuarantineTracker`].
 #[derive(Debug)]
 pub struct IncrementalFullReloadRequired {
     namespace: String,
@@ -1685,6 +1756,66 @@ impl std::fmt::Display for IncrementalFullReloadRequired {
 }
 
 impl std::error::Error for IncrementalFullReloadRequired {}
+
+/// Whether consumer deltas can be applied incrementally for each namespace
+/// (issue #6060).
+///
+/// Load-time quarantine removes colliding consumers and strips weak or
+/// duplicate `hmac_auth` credentials, first-loaded consumer wins. A delta
+/// patched onto that sanitized snapshot is only equivalent to a fresh full
+/// load when nothing is quarantined: then a delete or update cannot free a
+/// stripped credential or a shadowed identity, because there is none, and
+/// persistence (`consumer_identity_index`, credential uniqueness) refuses a
+/// new collision at write time.
+///
+/// A loader records a namespace as clean only at the end of a successful
+/// authoritative full load (runtime or control plane) that quarantined
+/// nothing, and forgets it as soon as the load quarantines anything or is not
+/// published ([`DatabaseBackend::forget_consumer_quarantine_state`]). An
+/// unknown namespace escalates, so a missed record costs one extra full
+/// reload, never a stale credential.
+///
+/// Independently of this state, a changed consumer carrying `hmac_auth` always
+/// escalates ([`consumer_change_requires_authoritative_reload`]): which of two
+/// consumers keeps a shared secret depends on full-load order.
+#[derive(Debug, Default)]
+pub struct ConsumerQuarantineTracker {
+    clean_namespaces: std::sync::Mutex<HashSet<String>>,
+}
+
+impl ConsumerQuarantineTracker {
+    /// Record the result of a successful authoritative full load.
+    pub fn record_full_load(&self, namespace: &str, quarantined_anything: bool) {
+        if quarantined_anything {
+            self.forget(namespace);
+            return;
+        }
+        if let Ok(mut clean) = self.clean_namespaces.lock() {
+            clean.insert(namespace.to_string());
+        }
+    }
+
+    /// Return `namespace` to unknown, so its next consumer change escalates.
+    pub fn forget(&self, namespace: &str) {
+        if let Ok(mut clean) = self.clean_namespaces.lock() {
+            clean.remove(namespace);
+        }
+    }
+
+    /// Whether consumer deltas for `namespace` may skip the full reload. A
+    /// poisoned lock answers `false` (escalate).
+    pub fn allows_consumer_deltas(&self, namespace: &str) -> bool {
+        self.clean_namespaces
+            .lock()
+            .is_ok_and(|clean| clean.contains(namespace))
+    }
+}
+
+/// Whether a changed consumer carries a credential that load-time quarantine
+/// judges against other consumers, so only a full load decides its outcome.
+pub fn consumer_change_requires_authoritative_reload(consumer: &Consumer) -> bool {
+    consumer.credentials.contains_key("hmac_auth")
+}
 
 /// Whether an incremental-load error is the expected consumer-change
 /// escalation rather than a database connectivity or query failure.
@@ -2188,6 +2319,30 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         &self,
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Forget that `namespace`'s last full load quarantined nothing, so its
+    /// next consumer change escalates to a full reload. Pollers call this when
+    /// a loaded full snapshot is rejected or not published: the live consumer
+    /// set then still comes from an older snapshot (issue #6060). The default
+    /// is a no-op for backends without a [`ConsumerQuarantineTracker`], whose
+    /// consumer changes always escalate.
+    fn forget_consumer_quarantine_state(&self, _namespace: &str) {}
+
+    /// Load only the policy-graph neighborhood `scope` names: the proxies a
+    /// plugin-graph write affects, the plugin configs they are associated
+    /// with, every global, and every instance of a namespace-wide plugin type
+    /// (issue #6056). The result must equal
+    /// [`PolicyGraphScope::restrict`](crate::config::policy_graph_scope::PolicyGraphScope::restrict)
+    /// applied to [`Self::load_namespace_policy_graph`]; the default does
+    /// exactly that, and backends override it with targeted queries so the
+    /// cost follows the write rather than the namespace.
+    async fn load_namespace_policy_neighborhood(
+        &self,
+        namespace: &str,
+        scope: &crate::config::policy_graph_scope::PolicyGraphScope,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        Ok(scope.restrict(self.load_namespace_policy_graph(namespace).await?))
+    }
 
     /// Count namespace resources on the authoritative primary without
     /// deserializing rows/documents.

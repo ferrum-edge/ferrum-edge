@@ -134,11 +134,20 @@ fn backend_lb_policy_cookie_affinity_selects_stable_target_on_lb_path() {
         }),
     );
 
-    let result = translate_k8s_objects(
-        &[policy, service, endpoints, route],
-        options().with_pod_discovery_enabled(true),
-    )
-    .expect("BackendLBPolicy + multi-endpoint Service should translate");
+    // The selector's Pods: the backendRef guard admits only endpoints that are
+    // Pods of the Service's namespace (issue #6108).
+    let pods = ["10.1.0.10", "10.1.0.11", "10.1.0.12"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, ip)| {
+            let mut pod = object("Pod", "v1", &format!("api-{index}"), json!({}));
+            pod.status = json!({"phase": "Running", "podIP": ip});
+            pod
+        });
+    let mut objects = vec![policy, service, endpoints, route];
+    objects.extend(pods);
+    let result = translate_k8s_objects(&objects, options().with_pod_discovery_enabled(true))
+        .expect("BackendLBPolicy + multi-endpoint Service should translate");
 
     assert_eq!(result.config.upstreams.len(), 1);
     let upstream = &result.config.upstreams[0];
@@ -318,6 +327,7 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: chrono::Utc::now(),

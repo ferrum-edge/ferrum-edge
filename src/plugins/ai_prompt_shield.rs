@@ -1927,6 +1927,10 @@ impl Plugin for AiPromptShield {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn gates_request_admission(&self) -> bool {
+        true
+    }
+
     fn enforces_finalized_request_policy(&self) -> bool {
         true
     }

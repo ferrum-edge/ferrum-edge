@@ -396,8 +396,10 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "--branch main" in text and "--status success" in text,
-        "history must come from a successful run on the trusted main branch",
+        "latest_trusted_scheduled_runs.py" in text
+        and "--self-test" in text
+        and "--workflow protocol-perf-regression.yml" in text,
+        "history must use the trusted scheduled-run selector",
         failures,
     )
 
@@ -833,7 +835,7 @@ jobs:
       - run: python3 tests/performance/multi_protocol/run_protocol_regression_scenarios.py
       - run: python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py
       - run: echo protocol_perf_budgets.json alert trends runner_health
-      - run: gh run list --branch main --status success
+      - run: python3 -I .github/scripts/latest_trusted_scheduled_runs.py --workflow protocol-perf-regression.yml --current-sha "$CURRENT_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
 """
     validate_workflow_text(good, failures)

@@ -522,7 +522,7 @@ fn database_poll_tick_records_on_every_normal_exit_without_async_wrapper() {
 
     let tick = poll_attempt_body(
         source,
-        "_ = wait_for_config_poll_wake(",
+        "wake = wait_for_config_poll_wake(",
         "_ = poll_shutdown.changed() => {",
     );
     assert!(
@@ -599,7 +599,7 @@ fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
         (
             "database",
             include_str!("../../../src/modes/database.rs"),
-            "_ = wait_for_config_poll_wake(",
+            "wake = wait_for_config_poll_wake(",
             "_ = poll_shutdown.changed() => {",
         ),
         (
@@ -680,7 +680,7 @@ fn poll_loop_availability_writes_go_through_the_counting_helper() {
         (
             "database",
             include_str!("../../../src/modes/database.rs"),
-            "_ = wait_for_config_poll_wake(",
+            "wake = wait_for_config_poll_wake(",
             "_ = poll_shutdown.changed() => {",
             0usize,
         ),

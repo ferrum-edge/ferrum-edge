@@ -1,5 +1,5 @@
 diff --git a/src/proto/streams/send.rs b/src/proto/streams/send.rs
-index 4d9486960..f6c44616e 100644
+index 4d94869..f6c4461 100644
 --- a/src/proto/streams/send.rs
 +++ b/src/proto/streams/send.rs
 @@ -413,6 +413,15 @@ impl Send {
@@ -19,10 +19,10 @@ index 4d9486960..f6c44616e 100644
          &self,
          cx: &Context,
 diff --git a/src/proto/streams/streams.rs b/src/proto/streams/streams.rs
-index e01dc8b48..9cb28ea91 100644
+index b10a610..7776c70 100644
 --- a/src/proto/streams/streams.rs
 +++ b/src/proto/streams/streams.rs
-@@ -1410,6 +1410,16 @@ impl<B> StreamRef<B> {
+@@ -1422,6 +1422,16 @@ impl<B> StreamRef<B> {
          me.actions.send.capacity(&mut stream)
      }
  
@@ -40,7 +40,7 @@ index e01dc8b48..9cb28ea91 100644
      pub fn poll_capacity(&mut self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
          let mut me = self.opaque.inner.lock().unwrap();
 diff --git a/src/share.rs b/src/share.rs
-index 101987342..ed82fa706 100644
+index 1019873..ed82fa7 100644
 --- a/src/share.rs
 +++ b/src/share.rs
 @@ -295,6 +295,18 @@ impl<B: Buf> SendStream<B> {

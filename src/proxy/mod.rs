@@ -95,6 +95,7 @@ mod hbone_proxy;
 // Used by external tests; unused in the separately compiled bin target.
 pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
+pub mod hop_limit;
 pub mod host_udp_capture;
 /// Privileged live-kernel gate for Ambient host-network UDP capture (#3705).
 /// Ignored by default; the hosted `ambient-host-udp-live` job runs it with
@@ -278,6 +279,13 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Client-visible body (`403`, or gRPC `PERMISSION_DENIED`) for a request whose
+/// client-selected protocol flavor cannot run the route's authentication or
+/// admission policy
+/// ([`crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`]).
+pub(crate) const ROUTE_PROTOCOL_NOT_PERMITTED_BODY: &str =
+    r#"{"error":"Request protocol not permitted on this route"}"#;
+
 /// Precomputed circuit-breaker-open reject headers. Open-breaker 503s are
 /// still a reject path, but the map is rebuilt from this snapshot so the
 /// observability token is not `format!()`ed or assembled per request.
@@ -302,6 +310,14 @@ static CONFIG_STALE_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>>
         HashMap::from([(
             X_GATEWAY_ERROR_HEADER.to_string(),
             X_GATEWAY_ERROR_CONFIG_STALE.to_string(),
+        )])
+    });
+
+static LOOP_DETECTED_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_LOOP_DETECTED.to_string(),
         )])
     });
 
@@ -2641,6 +2657,115 @@ fn inbound_hbone_relay_destination_decision(
     mesh.inbound_relay_destination_decision(host, port, terminator_local_ip)
 }
 
+/// [`inbound_hbone_relay_destination_decision`] for a BYTE-STREAM relay: the
+/// same ownership guard, plus the Sidecar refusal of a port a materialized
+/// HTTP-family inbound route serves (issue #6110, see
+/// [`crate::modes::mesh::config::MeshConfig::inbound_stream_relay_destination_decision`]).
+/// Relay synthesis, the handler's post-plugin re-check, and the admission
+/// fence's sweep all use it, so a reload that turns a port into an HTTP
+/// application port revokes a live byte-stream tunnel to it.
+fn inbound_hbone_stream_relay_destination_decision(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    terminator_local_ip: Option<std::net::IpAddr>,
+) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
+    let Some(mesh) = mesh else {
+        return Err(crate::modes::mesh::config::InboundRelayDenial::NoSlice);
+    };
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.inbound_stream_relay_destination_decision(host, port, terminator_local_ip)
+}
+
+/// Whether a bare byte-stream CONNECT that MATCHED `proxy` must be refused
+/// because that route serves HTTP on the Sidecar inbound listener (issue #6110,
+/// see
+/// [`crate::modes::mesh::config::MeshConfig::sidecar_inbound_refuses_matched_http_connect`]).
+///
+/// The dispatcher refuses such a CONNECT before the route's plugin chain runs,
+/// and the admission fence re-applies this to every live tunnel admitted
+/// through a configured route, so a reload that turns the route into an HTTP
+/// route on the Sidecar inbound listener revokes it. Hot path: two compares
+/// and a flag read, reached only for an HBONE CONNECT.
+pub(crate) fn sidecar_inbound_refuses_matched_http_connect(
+    proxy: &Proxy,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && !proxy.dispatch_kind.is_stream()
+        && mesh.is_some_and(|mesh| mesh.sidecar_inbound_refuses_matched_http_connect)
+}
+
+/// The refusal answered for a bare byte-stream CONNECT that matched an
+/// HTTP-family route on the Sidecar inbound listener (issue #6110): the same
+/// `http_application_port` reason, `403`, and `mesh.relay.*` metadata as a
+/// route-miss relay to an HTTP application port.
+fn matched_http_route_connect_refusal(
+    authority: Option<&http::uri::Authority>,
+) -> InboundConnectRelayRefusal {
+    let reason = crate::modes::mesh::config::InboundRelayDenial::HttpApplicationPort.as_str();
+    let unresolved = || InboundConnectRelayRefusal {
+        reason,
+        destination: None,
+    };
+    let Some(authority) = authority else {
+        return unresolved();
+    };
+    let Some(port) = authority.port_u16() else {
+        return unresolved();
+    };
+    let host = hbone_relay_authority_host_for_mesh(authority.host());
+    InboundConnectRelayRefusal::new(reason, host, port)
+}
+
+/// Whether `method` + `headers` form a bodiless CORS preflight: `OPTIONS`
+/// carrying both `Origin` and `Access-Control-Request-Method`, no
+/// `Transfer-Encoding`, and `Content-Length` absent or `0`.
+///
+/// A browser preflights every cross-origin gRPC-Web call, and the preflight
+/// carries no gRPC `Content-Type`, so it classifies as plain HTTP. The request
+/// dispatchers exempt it from ONE refusal only: a plain HTTP view marked
+/// [`crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`]
+/// because its route is gRPC-intended (issue #6110), and only when that view
+/// carries [`crate::plugin_cache::PluginCapabilities::ANSWERS_CORS_PREFLIGHTS`].
+/// A preflight invokes no method, so the route's gRPC-only admission policy has
+/// nothing to judge, and refusing it would stop the browser from ever sending
+/// the gRPC-Web call. The route's HTTP plugins (`cors` among them) still run on
+/// it, and a preflight no plugin answered is refused, never forwarded.
+///
+/// The declared framing is necessary but not sufficient: each dispatcher also
+/// proves from its own transport that no body follows (H1/H2
+/// `Body::is_end_stream`, H3 the request stream's end with no DATA frame).
+pub(crate) fn is_cors_preflight_request(method: &http::Method, headers: &http::HeaderMap) -> bool {
+    method == http::Method::OPTIONS
+        && headers.contains_key(http::header::ORIGIN)
+        && headers.contains_key(http::header::ACCESS_CONTROL_REQUEST_METHOD)
+        && !headers.contains_key(http::header::TRANSFER_ENCODING)
+        && headers
+            .get(http::header::CONTENT_LENGTH)
+            .is_none_or(|value| value.as_bytes() == b"0")
+}
+
+/// The H1/H2 dispatcher's one exemption from the route-admission refusal: a
+/// bodiless CORS preflight on the plain HTTP view (not gRPC-Web) of a view that
+/// carries a preflight-answering `cors` instance (`caps`), whose body hyper has
+/// already proven empty (END_STREAM on the H2 HEADERS frame; no H1 framing).
+/// Only the gRPC-intended rule marks that view, so no other refusal is
+/// relaxed. Evaluated only once a view is marked.
+fn grpc_intended_refusal_exempts(
+    req: &Request<Incoming>,
+    request_protocol: ProxyProtocol,
+    grpc_web_request: bool,
+    caps: PluginCapabilities,
+) -> bool {
+    request_protocol == ProxyProtocol::Http
+        && !grpc_web_request
+        && caps.has(PluginCapabilities::ANSWERS_CORS_PREFLIGHTS)
+        && is_cors_preflight_request(req.method(), req.headers())
+        && hyper::body::Body::is_end_stream(req.body())
+}
+
 /// Round-robin cursor over an admitted external UDP destination's precomputed
 /// dial endpoints (issue #3263).
 ///
@@ -2801,17 +2926,25 @@ impl InboundConnectRelayRefusal {
 ///    A declared ingress block that does not resolve to exactly one valid,
 ///    owner-stamped, stream-family mapping for that exact local IP is refused
 ///    (`ingress_endpoint_mapping_mismatch`) instead of falling through to dial
-///    an unlisted or invalid port the operator replaced.
+///    an unlisted or invalid port the operator replaced. A stream listener
+///    whose `defaultEndpoint` port an HTTP-family listener also forwards to is
+///    refused `http_application_port` (issue #6110): the HTTP route wins the
+///    shared application port.
 /// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
 ///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
 ///    original destination the peer asked for — but only when that authority is
 ///    a destination THIS proxy terminates for. Unreachable for a declared
-///    ingress listener port so this can never widen it.
+///    ingress listener port so this can never widen it. On the Sidecar
+///    `:15006` listener a byte-stream CONNECT to a port a materialized
+///    HTTP-family inbound route serves is refused
+///    (`http_application_port`, issue #6110): that port is reached as HTTP so
+///    the route's plugin chain runs.
 ///
 /// Returns an [`InboundConnectRelayRefusal`] when the authority is
 /// missing/portless or is not a destination this terminator owns per
-/// [`inbound_hbone_relay_destination_decision`]. The caller answers it through
-/// [`reject_inbound_connect_relay_synthesis`] (issue #5763): the documented
+/// [`inbound_hbone_relay_destination_decision`] (byte-stream:
+/// [`inbound_hbone_stream_relay_destination_decision`]). The caller answers it through
+/// [`reject_inbound_connect_relay_pre_plugin`] (issue #5763): the documented
 /// `403 hbone_relay_destination_denied`, `503 hbone_relay_not_ready` before the
 /// first mesh slice, or the unauthenticated-peer `403` for a peerless CONNECT.
 ///
@@ -2858,6 +2991,16 @@ fn build_inbound_hbone_relay_proxy(
                 port,
             ));
         }
+        SidecarIngressConnectRelay::HttpApplicationPort => {
+            let denial = InboundRelayDenial::HttpApplicationPort;
+            warn_inbound_connect_to_http_application_port(
+                "ingress_remap",
+                host,
+                port,
+                accepted_local_ip,
+            );
+            return Err(InboundConnectRelayRefusal::new(denial.as_str(), host, port));
+        }
         SidecarIngressConnectRelay::Relay {
             listener_port,
             endpoint_host,
@@ -2872,9 +3015,22 @@ fn build_inbound_hbone_relay_proxy(
         }
     }
 
-    if let Err(denial) =
+    // A byte-stream relay additionally refuses a Sidecar HTTP application port
+    // (issue #6110); the datagram relay keeps the ordinary ownership guard.
+    let decision = if is_udp_connect {
         inbound_hbone_relay_destination_decision(host, port, mesh, accepted_local_ip)
-    {
+    } else {
+        inbound_hbone_stream_relay_destination_decision(host, port, mesh, accepted_local_ip)
+    };
+    if let Err(denial) = decision {
+        if denial == InboundRelayDenial::HttpApplicationPort {
+            warn_inbound_connect_to_http_application_port(
+                "relay_synthesis",
+                host,
+                port,
+                accepted_local_ip,
+            );
+        }
         if is_udp_connect
             && let Some((dial_host, dial_port)) =
                 mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
@@ -2908,14 +3064,61 @@ fn build_inbound_hbone_relay_proxy(
     })
 }
 
-/// Answer a synthesis-time inbound CONNECT relay refusal (issue #5763).
+/// An authenticated peer tunnelled to a port a Sidecar HTTP route serves
+/// (issue #6110): operator-visible (a peer is bypassing an HTTP route, or a
+/// client is misconfigured), but sampled because a peer can drive it at request
+/// rate. Transport facts only. `relay_phase` names the route-miss decision that
+/// refused it (`relay_synthesis` or `ingress_remap`); a CONNECT that matched an
+/// HTTP route warns `matched_route` at its own site.
+fn warn_inbound_connect_to_http_application_port(
+    relay_phase: &'static str,
+    host: &str,
+    port: u16,
+    accepted_local_ip: Option<std::net::IpAddr>,
+) {
+    let denial = crate::modes::mesh::config::InboundRelayDenial::HttpApplicationPort.as_str();
+    crate::warn_sampled!(
+        relay_phase = relay_phase,
+        authority_host = host,
+        authority_port = port,
+        denial = denial,
+        terminator_local_ip = ?accepted_local_ip,
+        "Refused authenticated inbound CONNECT to a Sidecar HTTP application port; \
+         HTTP traffic to this port must be sent as HTTP so its inbound route's plugin \
+         chain runs"
+    );
+}
+
+/// Test hook: run inbound CONNECT relay synthesis for `authority` against
+/// `mesh` and return the refusal's `mesh.relay.denial_reason`, or `None` when
+/// a relay proxy is synthesized (issue #6110).
+pub(crate) fn inbound_connect_relay_synthesis_refusal_for_test(
+    authority: &str,
+    mesh: &crate::modes::mesh::config::MeshConfig,
+    is_udp_connect: bool,
+    accepted_local_ip: Option<std::net::IpAddr>,
+) -> Option<&'static str> {
+    let authority = authority.parse::<http::uri::Authority>().ok();
+    build_inbound_hbone_relay_proxy(
+        authority.as_ref(),
+        Some(mesh),
+        is_udp_connect,
+        accepted_local_ip,
+    )
+    .err()
+    .map(|refusal| refusal.reason)
+}
+
+/// Answer an inbound CONNECT relay refusal decided before any plugin runs:
+/// a relay-synthesis refusal on a route miss (issue #5763), or a bare CONNECT
+/// that MATCHED a Sidecar HTTP route (issue #6110).
 ///
 /// No plugin chain has run yet, so the transaction line goes to the logging
-/// plugins the synthesized relay would have carried (the global chain).
+/// plugins a synthesized relay would have carried (the global chain).
 /// Nothing is dialed. See [`reject_inbound_connect_relay_synthesis_with_plugins`]
 /// for the terminal it answers with.
 #[allow(clippy::too_many_arguments)]
-async fn reject_inbound_connect_relay_synthesis(
+async fn reject_inbound_connect_relay_pre_plugin(
     state: &ProxyState,
     epoch: &RequestEpoch,
     ctx: &mut RequestContext,
@@ -4286,6 +4489,10 @@ pub(crate) async fn buffer_request_body_for_before_proxy(
     // cancellation alike.
     let budget_permit = response_buffer_budget::RequestBufferPermit::reserve(ceiling)
         .ok_or(RequestBodyBufferError::BufferCapacityExceeded)?;
+    // An HTTP/2 client's masked reset is a client disconnect here, never a
+    // complete body (issue #6022).
+    let require_end_stream = parts.version == hyper::Version::HTTP_2;
+    let body = body::H2EndStreamGated::new(body, require_end_stream);
     let limited = http_body_util::Limited::new(body, ceiling);
     let collected = match route_deadline_at {
         None => {
@@ -5337,12 +5544,24 @@ pub struct PerIpLimitExceeded;
 /// [`ProxyState::start_per_ip_cleanup_task`] so stale zero-count entries are
 /// swept. `Default` is the disabled dimension, which is what standalone/test
 /// listener constructors get.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PerIpStreamAdmission {
     /// `None` when the dimension is disabled (`max == 0` at startup).
     pub counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
     /// `0` = unlimited.
     pub max: u64,
+    /// IPv6 grouping prefix for this per-source cap.
+    pub ipv6_prefix: u8,
+}
+
+impl Default for PerIpStreamAdmission {
+    fn default() -> Self {
+        Self {
+            counts: None,
+            max: 0,
+            ipv6_prefix: 64,
+        }
+    }
 }
 
 impl PerIpStreamAdmission {
@@ -5354,7 +5573,7 @@ impl PerIpStreamAdmission {
         &self,
         ip: &str,
     ) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
-        try_acquire_per_ip_slot(self.counts.as_ref(), ip, self.max)
+        try_acquire_per_ip_slot_with_prefix(self.counts.as_ref(), ip, self.max, self.ipv6_prefix)
     }
 }
 
@@ -6733,15 +6952,29 @@ async fn run_finalized_request_egress_hooks_inner(
 /// [`crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`]
 /// where the bitset is already in scope; the internal scan keeps the rarely
 /// reached call sites correct without threading the capability set to them.
+///
+/// These hooks are the last plugin code that can write the outbound map, so
+/// when any of them ran the gateway-owned `X-Ferrum-Hops` count (issue #6109)
+/// is re-asserted after them: a built-in or custom implementation cannot reset
+/// it either. Every H1/H2 and H3 caller, including both finalized-egress
+/// overlay helpers, goes through this function.
 pub(crate) fn run_final_backend_header_policy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
+    let mut ran = false;
     for plugin in plugins {
         if plugin.enforces_final_backend_header_policy() {
             plugin.enforce_final_backend_header_policy(ctx, headers);
+            ran = true;
         }
+    }
+    if ran {
+        hop_limit::reassert_outbound_proxy_hops_in_map(
+            hop_limit::effective_outbound_proxy_hops(ctx),
+            headers,
+        );
     }
 }
 
@@ -7100,6 +7333,13 @@ pub struct ProxyState {
     /// frontend. `None` when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS=0`
     /// (unlimited). Held for the tunnel lifetime, never on a datagram path.
     pub h3_connect_udp_sessions: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-client concurrent CONNECT-UDP tunnel counters, keyed by
+    /// `connect_udp::connect_udp_client_key` (IPv6 grouped by prefix). `None`
+    /// when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP=0` (disabled). Held
+    /// for the tunnel lifetime, never on a datagram path.
+    pub per_ip_connect_udp_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Maximum concurrent CONNECT-UDP tunnels per resolved client. 0 = disabled.
+    pub http3_connect_udp_max_sessions_per_ip: u64,
     /// True only after the serving mode actually starts an H3 listener whose
     /// extended CONNECT/WebSocket support is enabled.
     ///
@@ -7111,6 +7351,8 @@ pub struct ProxyState {
     pub per_ip_request_counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
     /// Maximum concurrent requests per resolved client IP. 0 = disabled.
     pub max_concurrent_requests_per_ip: u64,
+    /// Prefix shared by gateway-wide IPv6 per-IP caps.
+    pub per_ip_ipv6_prefix: u8,
     /// Per-IP concurrently upgraded WebSocket session counters. Each resolved
     /// client IP gets an AtomicU64 tracking active sessions. `None` when
     /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` (disabled).
@@ -7832,6 +8074,175 @@ fn prime_gateway_svid_rotation_baseline(
     Some((sources, tracker))
 }
 
+/// Outcome of validating every backend TLS destination before a backend TLS
+/// live reload (`FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`) publishes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BackendTlsValidationReport {
+    /// Destinations whose backend TLS built.
+    pub validated: usize,
+    /// Destinations whose backend TLS this node refused
+    /// ([`BackendTlsConfig::tls_refused`]). Already reported at slice apply,
+    /// so they are skipped without building or warning again.
+    pub refused: usize,
+    /// Destinations whose backend TLS could not build. Each is warned and
+    /// skipped; its TLS builds keep failing closed at dispatch until the
+    /// material is fixed, and every other destination still reloads.
+    pub failed: usize,
+}
+
+/// Gateway-wide inputs shared by every backend TLS validation build.
+#[derive(Clone, Copy)]
+pub struct BackendTlsValidationInputs<'a> {
+    pub policy: Option<&'a TlsPolicy>,
+    pub global_ca: Option<&'a Path>,
+    pub global_no_verify: bool,
+    pub global_client_cert: Option<&'a Path>,
+    pub global_client_key: Option<&'a Path>,
+    pub crls: &'a [rustls::pki_types::CertificateRevocationListDer<'static>],
+}
+
+impl<'a> BackendTlsValidationInputs<'a> {
+    fn builder<'b>(&self, proxy: &'b Proxy) -> BackendTlsConfigBuilder<'b>
+    where
+        'a: 'b,
+    {
+        BackendTlsConfigBuilder {
+            proxy,
+            policy: self.policy,
+            global_ca: self.global_ca,
+            global_no_verify: self.global_no_verify,
+            global_client_cert: self.global_client_cert,
+            global_client_key: self.global_client_key,
+            crls: self.crls,
+        }
+    }
+}
+
+/// Validate the backend TLS of every TLS-scheme proxy and every
+/// `mesh_route_dispatch` rule-level `backend_tls` in `config`, one destination
+/// at a time.
+///
+/// Never stops at the first failure: a destination whose material cannot build
+/// is warned, counted in [`BackendTlsValidationReport::failed`], and recorded on
+/// `ferrum_backend_tls_reload_validation_failures_total{kind}`, and a refused
+/// destination is counted in [`BackendTlsValidationReport::refused`] without a
+/// build. Either way the remaining destinations are still validated, so a
+/// backend TLS live reload keeps reloading the others (issue #6105).
+pub fn validate_backend_tls_material_for_config(
+    config: &GatewayConfig,
+    inputs: BackendTlsValidationInputs<'_>,
+) -> BackendTlsValidationReport {
+    use crate::data_path_metrics::{
+        BackendTlsReloadValidationFailure, record_backend_tls_reload_validation_failure,
+    };
+
+    let mut report = BackendTlsValidationReport::default();
+    for proxy in config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy_backend_uses_tls(proxy))
+    {
+        if proxy.resolved_tls.tls_refused {
+            report.refused = report.refused.saturating_add(1);
+            continue;
+        }
+        match inputs.builder(proxy).build_rustls() {
+            Ok(_) => report.validated = report.validated.saturating_add(1),
+            Err(error) => {
+                report.failed = report.failed.saturating_add(1);
+                record_backend_tls_reload_validation_failure(
+                    BackendTlsReloadValidationFailure::Proxy,
+                );
+                warn!(
+                    proxy_id = %crate::startup::sanitize_startup_scalar(&proxy.id),
+                    error = %crate::startup::sanitize_startup_cause(&error, &[]),
+                    "Backend TLS validation failed for this destination during backend TLS \
+                     reload; skipping it. Its TLS builds keep failing closed until the material \
+                     is fixed, and every other destination still reloads"
+                );
+            }
+        }
+    }
+    let proxy_map = config
+        .proxies
+        .iter()
+        .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
+        .collect::<HashMap<_, _>>();
+    for plugin in &config.plugin_configs {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let dispatch_config = match MeshRouteDispatchConfig::from_value_normalized(&plugin.config) {
+            Ok(dispatch_config) => dispatch_config,
+            Err(error) => {
+                report.failed = report.failed.saturating_add(1);
+                record_backend_tls_reload_validation_failure(
+                    BackendTlsReloadValidationFailure::RouteDispatchConfig,
+                );
+                warn!(
+                    plugin_id = %crate::startup::sanitize_startup_scalar(&plugin.id),
+                    error = %crate::startup::sanitize_startup_cause(&error, &[]),
+                    "mesh_route_dispatch config did not parse during backend TLS reload; \
+                     skipping its rule-level backend TLS"
+                );
+                continue;
+            }
+        };
+        let base_proxy = plugin
+            .proxy_id
+            .as_deref()
+            .and_then(|proxy_id| {
+                proxy_map
+                    .get(&(plugin.namespace.as_str(), proxy_id))
+                    .copied()
+            })
+            // Representative proxy used only to supply the ambient
+            // backend-TLS context for validating the rule's own material.
+            // Prefer one in the plugin's own namespace; fall back to any
+            // proxy so a global rule declared in a namespace that owns no
+            // proxies is still validated (it runs on every proxy anyway).
+            .or_else(|| {
+                config
+                    .proxies
+                    .iter()
+                    .find(|proxy| proxy.namespace == plugin.namespace)
+            })
+            .or_else(|| config.proxies.first());
+        let Some(base_proxy) = base_proxy else {
+            continue;
+        };
+        for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+            let Some(tls) = rule.destination.backend_tls.as_ref() else {
+                continue;
+            };
+            let mut validation_proxy = base_proxy.clone();
+            validation_proxy.id = format!(
+                "{}:mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls",
+                plugin.id
+            );
+            validation_proxy.backend_scheme = Some(BackendScheme::Https);
+            validation_proxy.resolved_tls = tls.clone();
+            match inputs.builder(&validation_proxy).build_rustls() {
+                Ok(_) => report.validated = report.validated.saturating_add(1),
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    record_backend_tls_reload_validation_failure(
+                        BackendTlsReloadValidationFailure::RouteDispatchRule,
+                    );
+                    warn!(
+                        plugin_id = %crate::startup::sanitize_startup_scalar(&plugin.id),
+                        rule = rule_idx,
+                        error = %crate::startup::sanitize_startup_cause(&error, &[]),
+                        "mesh_route_dispatch rule backend TLS validation failed during backend \
+                         TLS reload; skipping it. Every other destination still reloads"
+                    );
+                }
+            }
+        }
+    }
+    report
+}
+
 fn proxy_backend_uses_tls(proxy: &Proxy) -> bool {
     matches!(
         proxy.backend_scheme,
@@ -8329,6 +8740,16 @@ fn spawn_backend_svid_rotation_task(
             }
         }
     })
+}
+
+/// Whether no two consumers share a key the `ConsumerIndex` maps (identity or
+/// credential). A full build resolves a shared key by snapshot order (last
+/// wins); a patched index cannot replay that order, so a modified or removed
+/// consumer could move a shared API key to a different consumer. Full loads
+/// only warn on pre-existing duplicate credentials, so check before patching.
+fn consumer_index_keys_unique(config: &GatewayConfig) -> bool {
+    config.validate_unique_consumer_identities().is_ok()
+        && config.validate_unique_consumer_credentials().is_ok()
 }
 
 impl ProxyState {
@@ -9570,16 +9991,11 @@ impl ProxyState {
     fn validate_backend_tls_material(
         &self,
         crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
-    ) -> Result<usize, anyhow::Error> {
+    ) -> BackendTlsValidationReport {
         let config = self.config.load_full();
-        let mut validated = 0usize;
-        for proxy in config
-            .proxies
-            .iter()
-            .filter(|proxy| proxy_backend_uses_tls(proxy))
-        {
-            BackendTlsConfigBuilder {
-                proxy,
+        validate_backend_tls_material_for_config(
+            &config,
+            BackendTlsValidationInputs {
                 policy: self.tls_policy.as_deref(),
                 global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
                 global_no_verify: self.env_config.tls_no_verify,
@@ -9594,98 +10010,8 @@ impl ProxyState {
                     .as_deref()
                     .map(Path::new),
                 crls,
-            }
-            .build_rustls()
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "backend TLS validation failed for proxy '{}': {}",
-                    proxy.id,
-                    error
-                )
-            })?;
-            validated = validated.saturating_add(1);
-        }
-        let proxy_map = config
-            .proxies
-            .iter()
-            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
-            .collect::<HashMap<_, _>>();
-        for plugin in &config.plugin_configs {
-            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-                continue;
-            }
-            let dispatch_config = MeshRouteDispatchConfig::from_value_normalized(&plugin.config)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "mesh_route_dispatch backend TLS validation failed for plugin '{}': {}",
-                        plugin.id,
-                        error
-                    )
-                })?;
-            let base_proxy = plugin
-                .proxy_id
-                .as_deref()
-                .and_then(|proxy_id| {
-                    proxy_map
-                        .get(&(plugin.namespace.as_str(), proxy_id))
-                        .copied()
-                })
-                // Representative proxy used only to supply the ambient
-                // backend-TLS context for validating the rule's own material.
-                // Prefer one in the plugin's own namespace; fall back to any
-                // proxy so a global rule declared in a namespace that owns no
-                // proxies is still validated (it runs on every proxy anyway).
-                .or_else(|| {
-                    config
-                        .proxies
-                        .iter()
-                        .find(|proxy| proxy.namespace == plugin.namespace)
-                })
-                .or_else(|| config.proxies.first());
-            let Some(base_proxy) = base_proxy else {
-                continue;
-            };
-            for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
-                let Some(tls) = rule.destination.backend_tls.as_ref() else {
-                    continue;
-                };
-                let mut validation_proxy = base_proxy.clone();
-                validation_proxy.id = format!(
-                    "{}:mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls",
-                    plugin.id
-                );
-                validation_proxy.backend_scheme = Some(BackendScheme::Https);
-                validation_proxy.resolved_tls = tls.clone();
-                BackendTlsConfigBuilder {
-                    proxy: &validation_proxy,
-                    policy: self.tls_policy.as_deref(),
-                    global_ca: self.env_config.tls_ca_bundle_path.as_deref().map(Path::new),
-                    global_no_verify: self.env_config.tls_no_verify,
-                    global_client_cert: self
-                        .env_config
-                        .backend_tls_client_cert_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_client_key: self
-                        .env_config
-                        .backend_tls_client_key_path
-                        .as_deref()
-                        .map(Path::new),
-                    crls,
-                }
-                .build_rustls()
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "mesh_route_dispatch backend TLS validation failed for plugin '{}' rule {}: {}",
-                        plugin.id,
-                        rule_idx,
-                        error
-                    )
-                })?;
-                validated = validated.saturating_add(1);
-            }
-        }
-        Ok(validated)
+            },
+        )
     }
 
     fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
@@ -9693,7 +10019,10 @@ impl ProxyState {
             self.env_config.tls_crl_file_path.as_deref(),
             self.env_config.tls_crl_expiry_warning_days,
         )?;
-        let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
+        // Per-destination: a destination whose material cannot build is warned
+        // and skipped (it keeps failing closed at dispatch), so one broken or
+        // refused destination never stalls the reload for every other one.
+        let report = self.validate_backend_tls_material(active_crls.as_ref().as_slice());
         // Publish the admitted CRL generation before restarting health probes
         // so replacement tasks snapshot this exact generation. A refused
         // candidate never reaches this store, so previous verifiers,
@@ -9750,7 +10079,9 @@ impl ProxyState {
         });
 
         info!(
-            validated_backend_tls_configs = validated,
+            validated_backend_tls_configs = report.validated,
+            refused_backend_tls_configs = report.refused,
+            failed_backend_tls_configs = report.failed,
             "Backend TLS material reloaded; backend client pools and DTLS config caches were drained and stream listeners reconciled"
         );
         Ok(())
@@ -10090,6 +10421,9 @@ impl ProxyState {
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
         let websocket_max_connections_per_ip = env_config.websocket_max_connections_per_ip;
+        let per_ip_ipv6_prefix = env_config.per_ip_ipv6_prefix;
+        let http3_connect_udp_max_sessions_per_ip =
+            env_config.http3_connect_udp_max_sessions_per_ip;
         let mesh_egress_strip_baggage_keys =
             Arc::new(env_config.mesh_egress_strip_baggage_keys.clone());
         let pool_shard_amount =
@@ -10621,10 +10955,12 @@ impl ProxyState {
             PerIpStreamAdmission {
                 counts: per_ip_tcp_connections.clone(),
                 max: tcp_max_connections_per_ip,
+                ipv6_prefix: per_ip_ipv6_prefix,
             },
             PerIpStreamAdmission {
                 counts: per_ip_udp_sessions.clone(),
                 max: udp_max_sessions_per_ip,
+                ipv6_prefix: per_ip_ipv6_prefix,
             },
         );
         let hbone_admission_fence = Arc::new(hbone_admission_fence::HboneAdmissionFence::new(
@@ -10703,6 +11039,14 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             h3_connect_udp_sessions,
+            per_ip_connect_udp_sessions: if http3_connect_udp_max_sessions_per_ip > 0 {
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
+            } else {
+                None
+            },
+            http3_connect_udp_max_sessions_per_ip,
             h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
@@ -10712,6 +11056,7 @@ impl ProxyState {
                 None
             },
             max_concurrent_requests_per_ip,
+            per_ip_ipv6_prefix,
             per_ip_websocket_sessions: if websocket_max_connections_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
                     pool_shard_amount,
@@ -10805,18 +11150,19 @@ impl ProxyState {
 
     /// Start a background task that periodically removes stale zero-count
     /// entries from `per_ip_request_counts`, `per_ip_websocket_sessions`,
-    /// `per_ip_tcp_connections` and `per_ip_udp_sessions`.
+    /// `per_ip_connect_udp_sessions`, `per_ip_tcp_connections` and
+    /// `per_ip_udp_sessions`.
     /// Normally entries are cleaned via the RAII drop of
     /// [`PerIpRequestGuard`] / [`PerIpConnectionGuard`], but this sweep catches
     /// edge cases (e.g., task cancellation without guard drop).
     ///
-    /// Returns `Some(JoinHandle)` when either per-IP map is enabled so the
-    /// caller can join the task during the background-task drain phase of
-    /// graceful shutdown. Returns `None` when both
-    /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` and
-    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` and both stream-listener
-    /// per-source caps are `0` (no tracking, no task to spawn). The task exits
-    /// cleanly on `shutdown_rx` change so it doesn't wedge shutdown — consistent with `start_backend_capability_refresh_task`,
+    /// Returns `Some(JoinHandle)` when any per-IP request, WebSocket,
+    /// CONNECT-UDP, TCP, or UDP tracking map is enabled so the caller can join
+    /// the task during the background-task drain phase of graceful shutdown.
+    /// Returns `None` when all of those per-source caps are disabled (no
+    /// tracking, no task to spawn). The task exits cleanly on `shutdown_rx`
+    /// change so it doesn't wedge shutdown — consistent with
+    /// `start_backend_capability_refresh_task`,
     /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
     /// metrics monitors.
     pub fn start_per_ip_cleanup_task(
@@ -10828,6 +11174,9 @@ impl ProxyState {
             maps.push(counts.clone());
         }
         if let Some(counts) = self.per_ip_websocket_sessions.as_ref() {
+            maps.push(counts.clone());
+        }
+        if let Some(counts) = self.per_ip_connect_udp_sessions.as_ref() {
             maps.push(counts.clone());
         }
         // Stream-listener per-source admission maps (issue #4544). Their
@@ -13280,7 +13629,17 @@ impl ProxyState {
             rebuild_globals,
             country_mmdb_load_mode,
         )?;
-        let consumer_inner = if consumer_changed {
+        let consumer_inner = if consumer_changed
+            && consumer_index_keys_unique(&current.config)
+            && consumer_index_keys_unique(new_config)
+        {
+            ConsumerIndex::build_delta_inner(
+                &current.consumer_index,
+                &delta.added_consumers,
+                &delta.removed_consumer_ids,
+                &delta.modified_consumers,
+            )
+        } else if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
         } else {
             Arc::clone(&current.consumer_index)
@@ -13530,9 +13889,13 @@ impl ProxyState {
             };
             let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
             let lb_inner = LoadBalancerCache::build_inner(&new_config);
-            let staged_config = Arc::new(new_config.clone());
+            // Publish the candidate itself, not a second full copy of it: a
+            // whole-config clone here held three generations of the config at
+            // once during every reload (issue #6058).
+            let staged_config = Arc::new(new_config);
+            let new_config: &GatewayConfig = &staged_config;
             let published = match self.publish_request_epoch_with_gateway_trust(
-                &new_config,
+                new_config,
                 explicit_trust,
                 |_| {
                     Ok(Some(StagedRequestEpoch {
@@ -13612,7 +13975,7 @@ impl ProxyState {
                 self.adaptive_buffer.prune_missing(&active_proxies);
             }
 
-            warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+            warn_if_h3_backend_tls_policy_incompatible(new_config, self.tls_policy.as_deref());
             self.spawn_backend_capability_refresh();
 
             // Wake external config watchers (Gateway API listener lifecycle).
@@ -13676,12 +14039,16 @@ impl ProxyState {
         // `FnOnce` closures even though they never run concurrently.
         let route_changed = std::cell::Cell::new(false);
         let proxy_plugin_rebuild_count = std::cell::Cell::new(0usize);
-        let staged_config = Arc::new(new_config.clone());
+        // Publish the candidate itself, not a second full copy of it: a
+        // whole-config clone here held three generations of the config at
+        // once during every reload (issue #6058).
+        let staged_config = Arc::new(new_config);
+        let new_config: &GatewayConfig = &staged_config;
         let publish_result = self.publish_request_epoch_with_gateway_trust(
-            &new_config,
+            new_config,
             explicit_trust,
             |current| {
-                let delta = ConfigDelta::compute(&current.config, &new_config);
+                let delta = ConfigDelta::compute(&current.config, new_config);
                 if delta.is_empty() {
                     // ConfigDelta does not represent node-local plugin-file
                     // contents or the mesh block. Claim an accepted MMDB
@@ -13692,7 +14059,7 @@ impl ProxyState {
                     let country_mmdb_plugin_cache =
                         self.plugin_cache.build_country_mmdb_reload_inner(
                             &current.plugin_cache,
-                            &new_config,
+                            new_config,
                             matches!(
                                 self.env_config.mode,
                                 crate::config::env_config::OperatingMode::DataPlane
@@ -13721,9 +14088,9 @@ impl ProxyState {
                     // route-held `Arc<Proxy>` values stay stale until an
                     // unrelated event (#3243).
                     let projected_routes_changed =
-                        Self::projected_route_proxy_content_changed(&current.config, &new_config);
+                        Self::projected_route_proxy_content_changed(&current.config, new_config);
                     let mut projected_lb_modified =
-                        Self::projected_dr_dispatch_changed_upstreams(&current.config, &new_config);
+                        Self::projected_dr_dispatch_changed_upstreams(&current.config, new_config);
                     let projected_lb_changed = !projected_lb_modified.is_empty();
                     if !mesh_changed
                         && !gateway_trust_changed
@@ -13765,7 +14132,7 @@ impl ProxyState {
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
                         route_table: if rebuild_routes {
-                            RouterCache::build_route_table_snapshot(&new_config)
+                            RouterCache::build_route_table_snapshot(new_config)
                         } else {
                             Arc::clone(&current.route_table)
                         },
@@ -13775,7 +14142,7 @@ impl ProxyState {
                         load_balancer: if projected_lb_changed {
                             LoadBalancerCache::build_delta_inner(
                                 &current.load_balancer,
-                                &new_config,
+                                new_config,
                                 &[],
                                 &[],
                                 &projected_lb_modified,
@@ -13797,7 +14164,7 @@ impl ProxyState {
                 };
                 let staged = self.stage_incremental_request_epoch(
                     current,
-                    &new_config,
+                    new_config,
                     Arc::clone(&staged_config),
                     &delta,
                     country_mmdb_load_mode,
@@ -13816,7 +14183,7 @@ impl ProxyState {
             Ok(None) => {
                 debug!("Config poll: candidate valid but unchanged, skipping update");
                 // Still update loaded_at timestamp
-                self.config.store(Arc::new(new_config));
+                self.config.store(Arc::clone(&staged_config));
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
@@ -13887,7 +14254,7 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        self.prune_stale_target_health(&new_config);
+        self.prune_stale_target_health(new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -13944,7 +14311,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
-        warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        warn_if_h3_backend_tls_policy_incompatible(new_config, self.tls_policy.as_deref());
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed.
@@ -14396,12 +14763,16 @@ impl ProxyState {
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
         // a plain `let mut bool`.
         let route_changed = std::cell::Cell::new(false);
-        let staged_config = Arc::new(new_config.clone());
+        // Publish the candidate itself, not a second full copy of it: a
+        // whole-config clone here held three generations of the config at
+        // once during every reload (issue #6058).
+        let staged_config = Arc::new(new_config);
+        let new_config: &GatewayConfig = &staged_config;
         let publish_result = self.publish_request_epoch_with_gateway_trust(
-            &new_config,
+            new_config,
             explicit_trust,
             |current| {
-                let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
+                let delta = crate::config_delta::ConfigDelta::compute(&current.config, new_config);
                 if delta.is_empty() {
                     // A concurrent writer can make the prospective delta above
                     // disappear after its off-thread MMDB generation was
@@ -14409,7 +14780,7 @@ impl ProxyState {
                     // leaving it unowned or retaining stale geo readers.
                     let plugin_cache = self.plugin_cache.build_country_mmdb_reload_inner(
                         &current.plugin_cache,
-                        &new_config,
+                        new_config,
                         false,
                     )?;
                     // Gateway listener TLS classification and other projected
@@ -14419,8 +14790,8 @@ impl ProxyState {
                     // unchanged; publish the new table before waking the
                     // listener manager.
                     let rebuild_routes =
-                        Self::projected_route_proxy_content_changed(&current.config, &new_config)
-                            || Self::mesh_route_table_inputs_changed(&current.config, &new_config);
+                        Self::projected_route_proxy_content_changed(&current.config, new_config)
+                            || Self::mesh_route_table_inputs_changed(&current.config, new_config);
                     if plugin_cache.is_none() && !rebuild_routes {
                         return Ok(None);
                     }
@@ -14428,7 +14799,7 @@ impl ProxyState {
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
                         route_table: if rebuild_routes {
-                            RouterCache::build_route_table_snapshot(&new_config)
+                            RouterCache::build_route_table_snapshot(new_config)
                         } else {
                             Arc::clone(&current.route_table)
                         },
@@ -14442,7 +14813,7 @@ impl ProxyState {
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
-                    &new_config,
+                    new_config,
                     Arc::clone(&staged_config),
                     &delta,
                     crate::plugin_cache::CountryMmdbLoadMode::PreloadedOnly,
@@ -14503,7 +14874,7 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        self.prune_stale_target_health(&new_config);
+        self.prune_stale_target_health(new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -14558,7 +14929,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
-        warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        warn_if_h3_backend_tls_policy_incompatible(new_config, self.tls_policy.as_deref());
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
@@ -15099,6 +15470,17 @@ pub fn try_acquire_per_ip_websocket_session(
     try_acquire_per_ip_slot(counts, ip, max)
 }
 
+/// Same as [`try_acquire_per_ip_websocket_session`], but groups IPv6 sources by
+/// the configured `FERRUM_PER_IP_IPV6_PREFIX` instead of the fixed /64.
+pub fn try_acquire_per_ip_websocket_session_with_prefix(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    ip: &str,
+    max: u64,
+    ipv6_prefix: u8,
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+    try_acquire_per_ip_slot_with_prefix(counts, ip, max, ipv6_prefix)
+}
+
 /// Try to admit one long-lived unit of work for `ip` against a per-source
 /// budget.
 ///
@@ -15117,20 +15499,35 @@ pub fn try_acquire_per_ip_slot(
     ip: &str,
     max: u64,
 ) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
+    try_acquire_per_ip_slot_with_prefix(counts, ip, max, 64)
+}
+
+fn try_acquire_per_ip_slot_with_prefix(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    ip: &str,
+    max: u64,
+    ipv6_prefix: u8,
+) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
     let Some(counts) = counts else {
         return Ok(None);
     };
     if max == 0 {
         return Ok(None);
     }
+    let per_ip_key = if ip.contains(':') {
+        crate::util::client_identity::rate_limit_client_ip_string(ip, ipv6_prefix)
+            .unwrap_or_else(|| ip.to_string())
+    } else {
+        ip.to_string()
+    };
     let current = {
         let count = counts
-            .entry(ip.to_string())
+            .entry(per_ip_key.clone())
             .or_insert_with(|| AtomicU64::new(0));
         count.value().fetch_add(1, Ordering::Relaxed) + 1
     };
     let guard = PerIpConnectionGuard {
-        ip: ip.to_string(),
+        ip: per_ip_key,
         counts: counts.clone(),
     };
     if current > max {
@@ -15441,10 +15838,11 @@ async fn handle_websocket_request_authenticated(
     // which is released at the upgrade boundary so a long-lived session does
     // not block ordinary HTTP from the same IP. Keyed on `ctx.client_ip`
     // (socket peer, or forwarding headers only from a trusted proxy).
-    let per_ip_ws_guard = match try_acquire_per_ip_websocket_session(
+    let per_ip_ws_guard = match try_acquire_per_ip_websocket_session_with_prefix(
         state.per_ip_websocket_sessions.as_ref(),
         &ctx.client_ip,
         state.websocket_max_connections_per_ip,
+        state.per_ip_ipv6_prefix,
     ) {
         Ok(guard) => guard,
         Err(_) => {
@@ -15480,6 +15878,13 @@ async fn handle_websocket_request_authenticated(
             &mut client_headers,
             "x-consumer-username",
             username.to_string(),
+        );
+    }
+    if let Some(identity) = ctx.backend_authenticated_identity() {
+        push_forwardable_header_override(
+            &mut client_headers,
+            "x-authenticated-identity",
+            identity.to_string(),
         );
     }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
@@ -17297,8 +17702,7 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
-/// Drop every gateway assertion (the whole `x-consumer-*` namespace plus
-/// `x-geo-country`), in any case variant, from a plugin-mutable header map.
+/// Drop every gateway assertion, in any case variant, from a plugin-mutable header map.
 fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));
 }
@@ -17306,10 +17710,15 @@ fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, Str
 /// Remove plugin-controlled gateway assertion headers and restore only the
 /// authenticated principal and private GeoIP lookup result for dispatch.
 ///
-/// Every `x-consumer-*` name is gateway-owned, so a plugin- or config-authored
-/// `x-consumer-role` is dropped here exactly like a forged
+/// Every `x-consumer-*` name and `x-authenticated-identity` are gateway-owned,
+/// so a plugin- or config-authored `x-consumer-role` is dropped here exactly
 /// `x-consumer-username`; only the authenticated `x-consumer-username` /
 /// `x-consumer-custom-id` are written back.
+///
+/// The gateway-owned `X-Ferrum-Hops` count (issue #6109) is re-asserted here
+/// too, so a deferred `before_proxy` pass or a finalized-egress header overlay
+/// (a `serverless_function` `pre_proxy` header copy) cannot reset it after the
+/// main dispatch-ladder re-assertion.
 ///
 /// `pub` (rather than `pub(crate)`) only so the external
 /// `tests/unit/gateway_core` target can exercise it; not a supported API.
@@ -17318,17 +17727,27 @@ pub fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
+    hop_limit::reassert_outbound_proxy_hops_in_map(
+        hop_limit::effective_outbound_proxy_hops(ctx),
+        headers,
+    );
     let principal_username = ctx.backend_consumer_username().map(str::to_string);
+    let external_identity = ctx.backend_authenticated_identity().map(str::to_string);
     let principal_custom_id = principal_username
         .as_ref()
         .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
     let geo_country = ctx.backend_geo_country().map(str::to_string);
     let source_has_reserved_assertion = principal_username.is_none()
+        && external_identity.is_none()
         && geo_country.is_none()
         && headers
             .keys()
             .any(|name| headers_mod::is_gateway_assertion_header(name));
-    if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
+    if principal_username.is_none()
+        && external_identity.is_none()
+        && geo_country.is_none()
+        && !source_has_reserved_assertion
+    {
         return;
     }
 
@@ -17338,6 +17757,9 @@ pub fn refresh_backend_gateway_assertion_headers(
         if let Some(custom_id) = principal_custom_id {
             headers.insert("x-consumer-custom-id".to_string(), custom_id);
         }
+    }
+    if let Some(identity) = external_identity {
+        headers.insert("x-authenticated-identity".to_string(), identity);
     }
     if let Some(country) = geo_country {
         headers.insert("x-geo-country".to_string(), country);
@@ -26824,6 +27246,9 @@ pub(crate) const X_GATEWAY_ERROR_CONFIG_STALE: &str = crate::retry::OBS_CONFIG_S
 /// gateway-local phases, admission, or retry backoff), so no backend is to
 /// blame for the `504`.
 pub(crate) const X_GATEWAY_ERROR_REQUEST_TIMEOUT: &str = crate::retry::OBS_REQUEST_TIMEOUT;
+/// The request had already crossed `FERRUM_MAX_PROXY_HOPS` gateway hops and
+/// was refused with `508 Loop Detected` before routing; no backend was asked.
+pub(crate) const X_GATEWAY_ERROR_LOOP_DETECTED: &str = crate::retry::OBS_LOOP_DETECTED;
 
 /// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
 /// that run before a proxy is matched, so no per-route `allowed_methods`
@@ -26949,6 +27374,10 @@ pub(crate) fn overload_reject_headers() -> HashMap<String, String> {
 
 pub(crate) fn config_stale_reject_headers() -> HashMap<String, String> {
     CONFIG_STALE_REJECT_HEADERS.clone()
+}
+
+pub(crate) fn loop_detected_reject_headers() -> HashMap<String, String> {
+    LOOP_DETECTED_REJECT_HEADERS.clone()
 }
 
 /// Whether `method` is in the route's configured `allowed_methods`.
@@ -32470,6 +32899,53 @@ fn retired_gateway_listener_response(
     response
 }
 
+/// The answer to a request refused by the proxy hop limit (issue #6109):
+/// `508 Loop Detected` with `X-Gateway-Error: loop_detected` when the received
+/// `X-Ferrum-Hops` count reached `FERRUM_MAX_PROXY_HOPS`, or `400` (no token)
+/// when the field is malformed. Native gRPC gets Trailers-Only
+/// `FAILED_PRECONDITION` / `INVALID_ARGUMENT`; gRPC-Web gets the plain JSON
+/// answer, like every other frontend admission fence. Bodies are compiled-in
+/// literals that echo nothing. Out of line so the request handler's state
+/// machine does not grow.
+#[inline(never)]
+fn proxy_hop_limit_refusal_response(
+    state: &ProxyState,
+    ctx: &RequestContext,
+    is_grpc: bool,
+    loop_detected: bool,
+) -> Response<ProxyBody> {
+    let status = if loop_detected {
+        hop_limit::warn_loop_detected(state.env_config.max_proxy_hops, "http1_http2");
+        StatusCode::LOOP_DETECTED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    record_request(state, status.as_u16());
+    crate::diagnostic_ref::record_admission_fence(
+        ctx.diagnostic_slot(),
+        hop_limit::refusal_rejection_phase(loop_detected),
+        admission_fence_head_status(is_grpc, status),
+    );
+    match (is_grpc, loop_detected) {
+        (true, true) => grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::FAILED_PRECONDITION,
+            hop_limit::LOOP_DETECTED_GRPC_MESSAGE,
+        ),
+        (true, false) => grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            hop_limit::INVALID_PROXY_HOPS_GRPC_MESSAGE,
+        ),
+        (false, true) => build_response_with_gateway_error(
+            StatusCode::LOOP_DETECTED,
+            hop_limit::LOOP_DETECTED_BODY,
+            X_GATEWAY_ERROR_LOOP_DETECTED,
+        ),
+        (false, false) => {
+            build_response(StatusCode::BAD_REQUEST, hop_limit::INVALID_PROXY_HOPS_BODY)
+        }
+    }
+}
+
 /// Connection-scoped and process-wide admission fences, then the routed
 /// request pipeline. Only [`handle_proxy_request_on_frontend_port`] calls this.
 #[allow(clippy::too_many_arguments)]
@@ -32700,7 +33176,7 @@ fn boxed_handle_proxy_request_inner(
 /// function can attach the [`RequestGuard`] to the response body.
 #[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_inner(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
@@ -32718,6 +33194,22 @@ async fn handle_proxy_request_inner(
 
     let mut method = req.method().as_str().to_owned();
     let inbound_version = req.version();
+    if inbound_version == hyper::Version::HTTP_11
+        && method != "GET"
+        && crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::WebSocket
+    {
+        record_request(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
+        return Ok(build_method_not_allowed_response_with_allow(
+            r#"{"error":"WebSocket upgrades require GET"}"#,
+            "GET",
+        ));
+    }
+    if is_h2_websocket_connect(&req) {
+        // The WebSocket backend handshake is a GET. Keep route and plugin
+        // policy aligned with the method the backend receives. The 0-RTT
+        // allowlist below still gates the wire method (`CONNECT`).
+        method = "GET".to_string();
+    }
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
     // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
     // byte-stream `is_hbone_connect` (different wire marker). EITHER shape is a
@@ -32856,6 +33348,36 @@ async fn handle_proxy_request_inner(
         ));
     }
 
+    // Proxy hop limit (issue #6109). Decided on the client's own field lines,
+    // after the header size/count limits (the stamp below must not push a
+    // request at the count limit over it) and before the `Connection`
+    // confinement (which leaves `x-ferrum-hops` in place). The forwarded count
+    // replaces the client's value in the raw block every backend builder reads
+    // from, so the incremented count reaches the backend on every transport and
+    // retry. One header lookup and no allocation; nothing at all when disabled.
+    match hop_limit::decide_proxy_hops(req.headers(), state.env_config.max_proxy_hops) {
+        hop_limit::ProxyHopDecision::Disabled => {}
+        hop_limit::ProxyHopDecision::Forward(hops) => {
+            hop_limit::stamp_proxy_hops(req.headers_mut(), hops);
+            ctx.outbound_proxy_hops = Some(hops);
+        }
+        refused => {
+            return Ok(proxy_hop_limit_refusal_response(
+                &state,
+                &ctx,
+                grpc_proxy::is_grpc_request(&req),
+                refused == hop_limit::ProxyHopDecision::LoopDetected,
+            ));
+        }
+    }
+
+    // Resolve the client's `Connection` nominations against the client's own
+    // fields before any plugin or gateway assertion can add a header that the
+    // backend-boundary hop-by-hop strip would otherwise remove.
+    headers_mod::confine_connection_nominated_request_headers(
+        req.headers_mut(),
+        state.env_config.real_ip_header.as_deref(),
+    );
     // Store raw headers for deferred materialization. The clone is a single
     // contiguous allocation (HeaderMap's internal Vec) — much cheaper than
     // N individual String allocations from the previous eager conversion.
@@ -33085,11 +33607,16 @@ async fn handle_proxy_request_inner(
             .is_some_and(|v| v.as_bytes() == b"1");
         if is_early_data {
             ctx.is_early_data = true;
-            if !state.early_data_methods.contains(&method) {
+            // Gate the wire method, not the policy method. An RFC 8441
+            // WebSocket was normalized to `GET` above, but the replayable
+            // request is a `CONNECT` stream; HTTP/3 gates its RFC 9220
+            // WebSocket on `CONNECT` before the same rewrite.
+            let wire_method = req.method().as_str();
+            if !state.early_data_methods.contains(wire_method) {
                 let is_grpc = grpc_proxy::is_grpc_request(&req);
                 warn!(
                     "Rejected 0-RTT request: method {} not in allowed early data methods",
-                    method
+                    wire_method
                 );
                 record_request(&state, 425);
                 if is_grpc {
@@ -33162,14 +33689,23 @@ async fn handle_proxy_request_inner(
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
     // covering all 30+ return paths without manual tracking.
     let per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let per_ip_key = if ctx.client_ip.contains(':') {
+            crate::util::client_identity::rate_limit_client_ip_string(
+                &ctx.client_ip,
+                state.per_ip_ipv6_prefix,
+            )
+            .unwrap_or_else(|| ctx.client_ip.clone())
+        } else {
+            ctx.client_ip.clone()
+        };
         let current = {
             let count = counts
-                .entry(ctx.client_ip.clone())
+                .entry(per_ip_key.clone())
                 .or_insert_with(|| AtomicU64::new(0));
             count.value().fetch_add(1, Ordering::Relaxed) + 1
         };
         let guard = Some(PerIpRequestGuard {
-            ip: ctx.client_ip.clone(),
+            ip: per_ip_key,
             counts: counts.clone(),
         });
         if current > state.max_concurrent_requests_per_ip {
@@ -33509,6 +34045,48 @@ async fn handle_proxy_request_inner(
         other => other,
     };
 
+    // A bare byte-stream CONNECT that MATCHES an HTTP-family route on the
+    // Sidecar inbound listener (a service host, a Sidecar `ingress[]` HTTP
+    // listener host, or an operator-defined HTTP proxy) is refused before the
+    // route's plugin chain runs (issue #6110). Relaying it would run that chain
+    // once, on the CONNECT, judged as Layer-4 traffic, while every HTTP request
+    // written into the tunnel skipped it. The route-miss relay refuses an HTTP
+    // application port the same way. Ambient and waypoint terminators never
+    // set the flag, so their matched-route CONNECT dispatch is unchanged.
+    if is_hbone_connect
+        && route_match.as_ref().is_some_and(|rm| {
+            sidecar_inbound_refuses_matched_http_connect(
+                &rm.proxy,
+                ctx.mesh_direction,
+                epoch.config.mesh.as_deref(),
+            )
+        })
+    {
+        let refusal = matched_http_route_connect_refusal(req.uri().authority());
+        // An authenticated peer tunnelled to a port an HTTP route serves:
+        // operator-visible, but sampled because a peer can drive it at request
+        // rate. Transport facts only.
+        crate::warn_sampled!(
+            relay_phase = "matched_route",
+            destination = ?refusal.destination,
+            denial = refusal.reason,
+            "Refused authenticated inbound CONNECT that matched a Sidecar HTTP route; HTTP \
+             traffic to this route must be sent as HTTP so its plugin chain runs"
+        );
+        let response = reject_inbound_connect_relay_pre_plugin(
+            &state,
+            &epoch,
+            &mut ctx,
+            &refusal,
+            false,
+            start_time,
+            request_uses_grpc_content_type,
+            grpc_web_response_content_type,
+        )
+        .await;
+        return Ok(response);
+    }
+
     // Datagram-over-HBONE CONNECTs MUST always traverse the guarded inbound
     // relay-synthesis path, never an LB-backed HTTP/TCP route. The UDP handler
     // dials a local `UdpSocket` straight at the route's backend addr+port, so a
@@ -33628,7 +34206,7 @@ async fn handle_proxy_request_inner(
                     // before the first slice, or the unauthenticated-peer 403
                     // for a peerless CONNECT) and writes a transaction line,
                     // instead of masquerading as a route miss.
-                    let response = reject_inbound_connect_relay_synthesis(
+                    let response = reject_inbound_connect_relay_pre_plugin(
                         &state,
                         &epoch,
                         &mut ctx,
@@ -33858,6 +34436,54 @@ async fn handle_proxy_request_inner(
     let initial_response_header_policy_plugins =
         plugin_cache_view.initial_response_header_policy_plugins();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
+
+    // The client selected this flavor (gRPC `Content-Type`, WebSocket upgrade,
+    // or plain HTTP on a gRPC-intended route) and its plugin view omits
+    // authentication or admission policy that another view of the route runs.
+    // Refuse before any plugin runs instead of serving the route without that
+    // policy. One exemption: a bodiless CORS preflight on the plain HTTP view
+    // when the route's `cors` plugin answers preflights. Only the gRPC-intended
+    // rule (issue #6110) marks that view, a preflight invokes no gRPC method,
+    // and browser gRPC-Web cannot start without it. `Some(exempt)` once the
+    // view is marked.
+    let caps = plugin_cache_view.capabilities();
+    let omitted_policy_exemption = caps
+        .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+        .then(|| grpc_intended_refusal_exempts(&req, request_protocol, grpc_web_request, caps));
+    // An exempted preflight is answered by `cors` or refused after the
+    // `on_request_received` phase; it is never forwarded upstream.
+    let cors_preflight_exempted = omitted_policy_exemption == Some(true);
+    if omitted_policy_exemption == Some(false) {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            proxy_id = %proxy.id,
+            protocol = ?request_protocol,
+            "Rejected request: route admission policy does not run on the requested protocol"
+        );
+        let mut reject = normalize_reject_response(
+            StatusCode::FORBIDDEN,
+            Bytes::from_static(ROUTE_PROTOCOL_NOT_PERMITTED_BODY.as_bytes()),
+            &EMPTY_HEADERS,
+            is_grpc_request,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        record_status(&state, StatusCode::FORBIDDEN.as_u16());
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        return Ok(build_response_from_normalized_reject(reject));
+    }
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
     // Ordinary request hooks stay skipped, but terminal transaction logging
@@ -34111,6 +34737,36 @@ async fn handle_proxy_request_inner(
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // An exempted CORS preflight (issue #6110) exists only so the route's
+    // `cors` plugin can answer it, which it does in the phase above. One that
+    // reaches here (`cors` forwards it, or a trigger skipped `cors`) gets the
+    // view's ordinary refusal rather than reaching the backend without the
+    // route's gRPC-only admission policy.
+    if cors_preflight_exempted {
+        let mut reject = normalize_reject_response(
+            StatusCode::FORBIDDEN,
+            Bytes::from_static(ROUTE_PROTOCOL_NOT_PERMITTED_BODY.as_bytes()),
+            &EMPTY_HEADERS,
+            false,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        boxed_log_rejected_request(
+            &plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(&state, StatusCode::FORBIDDEN.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
     }
 
     // Materialize query params before authentication — key_auth and jwt_auth
@@ -35121,12 +35777,27 @@ async fn handle_proxy_request_inner(
         .keys()
         .any(|name| headers_mod::is_gateway_assertion_header(name));
     if ctx.backend_consumer_username().is_some()
+        || ctx.backend_authenticated_identity().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion
     {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // Proxy hop limit (issue #6109): re-assert the forwarded `X-Ferrum-Hops`
+    // count on the authoritative outbound map now that every request-phase
+    // plugin has run, so no plugin can reset the count the next gateway hop
+    // reads. Later deferred passes and the finalized-egress overlay re-assert
+    // it again through `refresh_backend_gateway_assertion_headers`. A mesh
+    // inbound hop to the local workload forwards the received count unchanged
+    // (`effective_outbound_proxy_hops`). One lookup on the common path; the
+    // native HTTP/3 frontend does the same at the same point — keep both call
+    // sites in sync.
+    hop_limit::reassert_outbound_proxy_hops(
+        hop_limit::effective_outbound_proxy_hops(&ctx),
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    );
     // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647). One checked,
     // bounded hop-budget decision, taken here — after authentication,
     // authorization, the `cors` plugin's local preflight answer, and every
@@ -48915,8 +49586,12 @@ async fn proxy_to_backend(
                             );
                         }
                     };
-                let limited =
-                    http_body_util::Limited::new((*original_req).into_body(), retained_ceiling);
+                // A masked HTTP/2 client reset is a disconnect, not a complete
+                // body (issue #6022); see `body::H2EndStreamGated`.
+                let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
+                let gated =
+                    body::H2EndStreamGated::new((*original_req).into_body(), require_end_stream);
+                let limited = http_body_util::Limited::new(gated, retained_ceiling);
                 let body_bytes = match collect_request_body_under_authorization(
                     limited.collect(),
                     request_ctx.grpc_deadline_at(),
@@ -52619,10 +53294,14 @@ fn build_response_with_gateway_error(
 }
 
 fn build_method_not_allowed_response(body: &str) -> Response<ProxyBody> {
+    build_method_not_allowed_response_with_allow(body, PROTOCOL_LEVEL_405_ALLOW)
+}
+
+fn build_method_not_allowed_response_with_allow(body: &str, allow: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
         .header("Content-Type", "application/json")
-        .header("Allow", PROTOCOL_LEVEL_405_ALLOW)
+        .header("Allow", allow)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(
@@ -61475,7 +62154,10 @@ async fn proxy_to_backend_http3(
     let (request_body, request_buffer_permit) = match client_request_body {
         ClientRequestBody::Buffered(buffered) => (buffered.body, buffered.budget),
         ClientRequestBody::Streaming(original_req) => {
-            let (_parts, body) = (*original_req).into_parts();
+            // An HTTP/2 client's upload EOF must be its own END_STREAM (issue
+            // #6022), exactly as on the streamed arm above. Never for HTTP/1.1.
+            let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
+            let (_parts, mut client_body) = (*original_req).into_parts();
             // Fail-closed retained ceiling + aggregate admission taken BEFORE
             // the buffer is allocated (issue #4153). `0` on
             // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` stays "unlimited" for
@@ -61511,15 +62193,29 @@ async fn proxy_to_backend_http3(
                         return (request_buffer_capacity_backend_response(resolved_ip), None);
                     }
                 };
-            let limited = http_body_util::Limited::new(body, retained_ceiling);
-            let body = match collect_request_body_under_authorization(
+            // Collected through a borrow so the client body's receive state
+            // is still readable once the collect ends.
+            let limited = http_body_util::Limited::new(&mut client_body, retained_ceiling);
+            let collected = collect_request_body_under_authorization(
                 limited.collect(),
                 grpc_deadline_at,
                 proxy.backend_read_timeout_ms,
                 buffered_upload_auth_deadline.as_ref(),
             )
-            .await
-            {
+            .await;
+            // hyper reports an inbound `RST_STREAM(NO_ERROR)` as a clean end of
+            // body, so a collect that ended without the client's END_STREAM
+            // holds a truncated upload. Refuse it as the client disconnect it
+            // is, never dispatch it to the H3 backend as a complete request.
+            let collected = match collected {
+                Ok(Ok(_))
+                    if require_end_stream && !hyper::body::Body::is_end_stream(&client_body) =>
+                {
+                    Ok(Err(crate::proxy::body::h2_upload_reset_error()))
+                }
+                other => other,
+            };
+            let body = match collected {
                 Ok(Ok(collected)) => collected.to_bytes().to_vec(),
                 // `Limited::collect()` yields either a `LengthLimitError` (the
                 // body really exceeded the ceiling -> 413) or the underlying
@@ -65982,6 +66678,7 @@ mod tests {
             sni: None,
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
+            tls_refused: false,
         };
 
         let sources = collect_backend_tls_watched_sources(&config, &env_config);
@@ -70619,6 +71316,7 @@ mod tests {
             sni: None,
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
+            tls_refused: false,
         };
 
         let now = chrono::Utc::now();
@@ -74955,6 +75653,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
@@ -75016,6 +75715,7 @@ mod tests {
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: HashMap::new(),
+                backend_tls_refused: false,
                 dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: chrono::Utc::now(),
@@ -75634,6 +76334,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: Some(UpstreamPortOverride {
                 max_retries: Some(2),
                 h2_max_concurrent_streams: Some(64),
@@ -75711,6 +76412,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            backend_tls_refused: false,
             dispatch_port_override_fallback: Some(UpstreamPortOverride {
                 // Top-level overlay: a CONFLICTING pending cap + retries (must NOT
                 // override the per-port values) and an inherited-only idleTimeout.

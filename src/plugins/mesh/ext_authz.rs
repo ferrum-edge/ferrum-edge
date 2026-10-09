@@ -12,15 +12,17 @@
 //! [`crate::plugins::priority::MESH_AUTHZ`], step 3 of the plugin lifecycle),
 //! i.e. after authentication and before `before_proxy`. Every HTTP-family
 //! ingress path that runs the plugin chain reaches it identically — HTTP/1.1,
-//! HTTP/2, native gRPC, HTTP/3, and HTTP relayed inside a mesh/HBONE CONNECT —
-//! because they all funnel through the same `authorize` ladder.
+//! HTTP/2, native gRPC, and HTTP/3 — because they all funnel through the same
+//! `authorize` ladder.
 //!
 //! Layer-4 sessions (`on_stream_connect`: raw TCP, TLS passthrough, UDP, DTLS)
 //! have no HTTP request to check and therefore CANNOT run a provider check.
 //! They do not silently skip it: `evaluate_mesh_authorization_policies` turns a
 //! matched-but-unexecutable CUSTOM delegation into a denial. A CUSTOM policy
 //! whose rules match an L4 connection closes it rather than serving it
-//! unchecked.
+//! unchecked. A mesh/HBONE CONNECT relay is treated the same way: the requests
+//! inside the tunnel are opaque bytes, so `mesh_authz` refuses a matched
+//! delegation instead of asking the provider about the CONNECT itself.
 //!
 //! ## Fail-closed contract
 //!
@@ -525,6 +527,12 @@ pub struct MeshExtAuthzCheckRequest<'a> {
     /// "no body" from "a body exists but was not buffered", which must fail
     /// closed for a provider that inspects bodies.
     pub body_proven_empty: bool,
+    /// The request's gateway hop count
+    /// ([`crate::proxy::hop_limit::plugin_call_proxy_hops`]), carried as
+    /// `X-Ferrum-Hops` on the check so a provider that resolves back to the
+    /// gateway is refused at the proxy hop limit. `None` when the limit is
+    /// disabled.
+    pub proxy_hops: Option<u8>,
 }
 
 /// The PROCESS-WIDE in-flight CUSTOM check budget.
@@ -750,10 +758,21 @@ impl MeshExtAuthzExecutor {
         {
             check_headers.insert(http::header::HOST, value);
         }
+        // The check carries exactly the gateway's hop count (issue #6128).
+        // Provider admission refuses every `x-ferrum-*` name (either `_` or
+        // `-` spelling) in `includeRequestHeadersInCheck` and
+        // `includeAdditionalHeadersInCheck`, so no forwarded or fixed copy can
+        // reach this map; the remove is defence-in-depth, one cheap lookup,
+        // so the stamp below can never sit beside a second field line.
+        if request.proxy_hops.is_some() {
+            check_headers.remove(crate::proxy::hop_limit::PROXY_HOPS_HEADER);
+        }
         let mut builder = client
             .request(method, url.as_str())
             .timeout(provider.timeout)
             .headers(check_headers);
+        builder =
+            crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(builder, request.proxy_hops);
         // `Content-Length` is set by reqwest from the body, matching the
         // protocol's automatic fields (Host, Method, Path, Content-Length).
         if let Some(body) = body {
@@ -1002,6 +1021,7 @@ mod tests {
             authority: None,
             body,
             body_proven_empty,
+            proxy_hops: None,
         }
     }
 

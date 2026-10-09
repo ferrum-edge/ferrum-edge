@@ -1374,8 +1374,8 @@ async fn test_jwks_auth_validates_rs256_token() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
-    assert!(ctx.identified_consumer.is_some());
-    assert_eq!(ctx.identified_consumer.unwrap().username, "idp-user");
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(ctx.backend_authenticated_identity(), Some("idp-user"));
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
 }
 
@@ -2508,7 +2508,11 @@ async fn test_jwks_auth_maps_subject_to_custom_id() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
-    assert_eq!(ctx.identified_consumer.unwrap().username, "local-user");
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(
+        ctx.backend_authenticated_identity(),
+        Some("idp-subject-12345")
+    );
 }
 
 // ─── Scope/Role Claim-Based Authorization ──────────────────────────────
@@ -2990,9 +2994,15 @@ async fn test_jwks_auth_per_provider_consumer_identity_claim_override() {
         .insert("authorization".to_string(), format!("Bearer {}", token));
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
-    // Consumer found via "preferred_username", not "sub"
-    assert!(ctx.identified_consumer.is_some());
-    assert_eq!(ctx.identified_consumer.unwrap().username, "keycloak-user");
+    // The identity claim remains external and does not resolve a Consumer.
+    assert!(ctx.identified_consumer.is_none());
+    // With no display claim configured, the provider's identity override also
+    // selects the display value instead of the global `sub` default.
+    assert_eq!(
+        ctx.authenticated_identity_header.as_deref(),
+        Some("keycloak-user")
+    );
+    assert_eq!(ctx.backend_authenticated_identity(), Some("keycloak-user"));
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("keycloak-user"));
 }
 
@@ -3715,6 +3725,23 @@ fn build_dpop_fixture_with_times(
     iat: i64,
     exp: Option<i64>,
 ) -> (DpopFixture, serde_json::Value) {
+    build_dpop_fixture_for_subject_with_times(jti, "idp-user", iat, exp)
+}
+
+/// Build a DPoP fixture whose access token names `sub`. Every token shares the
+/// signing key and issuer, so distinct subjects are distinct replay-quota
+/// principals inside one replay lane.
+fn build_dpop_fixture_for_subject(jti: &str, sub: &str) -> (DpopFixture, serde_json::Value) {
+    let now = chrono::Utc::now().timestamp();
+    build_dpop_fixture_for_subject_with_times(jti, sub, now, Some(now + 60))
+}
+
+fn build_dpop_fixture_for_subject_with_times(
+    jti: &str,
+    sub: &str,
+    iat: i64,
+    exp: Option<i64>,
+) -> (DpopFixture, serde_json::Value) {
     use base64::Engine;
     use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -3727,7 +3754,7 @@ fn build_dpop_fixture_with_times(
     let jkt = jwk_thumbprint_sha256(&jwk).unwrap();
 
     let access_token = create_rs256_token(
-        &json!({"sub": "idp-user", "iss": DPOP_TEST_ISSUER, "cnf": {"jkt": jkt}}),
+        &json!({"sub": sub, "iss": DPOP_TEST_ISSUER, "cnf": {"jkt": jkt}}),
         private_key_pem,
     );
     let mut hasher = Sha256::new();
@@ -4376,12 +4403,13 @@ fn dpop_same_issuer_sources_share_a_realm_and_issuer_matching_stays_exact() {
 
 /// Filling a provider's replay lane, then reloading with a *lower* cap, must
 /// refuse new proofs at the new cap while every previously admitted marker
-/// stays a replay.
+/// stays a replay. Each proof belongs to its own token principal, so the
+/// lane-wide cap, not the per-principal quota, is what refuses the new proof.
 #[tokio::test]
 async fn dpop_capacity_decrease_across_equivalent_generations_preserves_live_markers() {
-    let (retained_a, jwks) = build_dpop_fixture("dpop-cap-dec-a");
-    let (retained_b, _) = build_dpop_fixture("dpop-cap-dec-b");
-    let (fresh, _) = build_dpop_fixture("dpop-cap-dec-fresh");
+    let (retained_a, jwks) = build_dpop_fixture_for_subject("dpop-cap-dec-a", "cap-dec-a");
+    let (retained_b, _) = build_dpop_fixture_for_subject("dpop-cap-dec-b", "cap-dec-b");
+    let (fresh, _) = build_dpop_fixture_for_subject("dpop-cap-dec-fresh", "cap-dec-fresh");
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
 
     let mut high = dpop_provider(&jwks);
@@ -4418,11 +4446,12 @@ async fn dpop_capacity_decrease_across_equivalent_generations_preserves_live_mar
 }
 
 /// Reloading with a *higher* cap must restore headroom on the same lane
-/// without reopening an already-claimed proof.
+/// without reopening an already-claimed proof. The two proofs belong to
+/// different token principals so only the lane-wide cap is under test.
 #[tokio::test]
 async fn dpop_capacity_increase_across_equivalent_generations_restores_headroom() {
-    let (retained, jwks) = build_dpop_fixture("dpop-cap-inc-retained");
-    let (fresh, _) = build_dpop_fixture("dpop-cap-inc-fresh");
+    let (retained, jwks) = build_dpop_fixture_for_subject("dpop-cap-inc-retained", "cap-inc-a");
+    let (fresh, _) = build_dpop_fixture_for_subject("dpop-cap-inc-fresh", "cap-inc-b");
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
 
     let mut low = dpop_provider(&jwks);
@@ -4449,6 +4478,44 @@ async fn dpop_capacity_increase_across_equivalent_generations_restores_headroom(
     );
     let mut new_proof = dpop_ctx(&fresh);
     assert_continue(raised.authenticate(&mut new_proof, &consumer_index).await);
+}
+
+/// The per-principal replay quota lives on the shared lane, so an equivalent
+/// reload neither resets it nor charges a retained marker a second time.
+#[tokio::test]
+async fn dpop_principal_quota_carries_across_equivalent_generations() {
+    let (first, jwks) = build_dpop_fixture_for_subject("dpop-quota-gen-1", "quota-a");
+    let (second, _) = build_dpop_fixture_for_subject("dpop-quota-gen-2", "quota-a");
+    let (third, _) = build_dpop_fixture_for_subject("dpop-quota-gen-3", "quota-a");
+    let (other, _) = build_dpop_fixture_for_subject("dpop-quota-gen-other", "quota-b");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    // Eight entries leave each principal a quota of two live markers.
+    let mut provider = dpop_provider(&jwks);
+    provider["dpop_replay_max_entries"] = json!(8);
+    let original = dpop_plugin_with_providers(json!([provider.clone()]), "dpop-quota-reload");
+    let mut seed = dpop_ctx(&first);
+    assert_continue(original.authenticate(&mut seed, &consumer_index).await);
+    drop(original);
+
+    let reloaded = dpop_plugin_with_providers(json!([provider]), "dpop-quota-reload");
+    let mut again = dpop_ctx(&first);
+    assert_reject(
+        reloaded.authenticate(&mut again, &consumer_index).await,
+        Some(401),
+    );
+    // The retained marker is charged once, so the principal keeps one slot.
+    let mut next = dpop_ctx(&second);
+    assert_continue(reloaded.authenticate(&mut next, &consumer_index).await);
+    // The reload did not reset the quota either.
+    let mut over = dpop_ctx(&third);
+    assert_reject(
+        reloaded.authenticate(&mut over, &consumer_index).await,
+        Some(503),
+    );
+    // Another principal still has the headroom the quota preserved.
+    let mut peer = dpop_ctx(&other);
+    assert_continue(reloaded.authenticate(&mut peer, &consumer_index).await);
 }
 
 /// Duplicate equivalent providers with incompatible capacities cannot share a

@@ -46,6 +46,7 @@ use super::{
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const DEFAULT_SESSION_TTL_SECONDS: u64 = 3600;
 const DEFAULT_MAX_SESSIONS: usize = 16_384;
+const DEFAULT_MAX_SESSIONS_PER_PRINCIPAL: usize = 128;
 const METADATA_REWRITE_KEY: &str = "mcp.needs_request_rewrite";
 const METADATA_REWRITE_METHOD_KEY: &str = "mcp.rewrite.method";
 const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
@@ -138,6 +139,7 @@ const MCP_SESSIONS_KEYS: &[&str] = &[
     "downstream_session_header",
     "initialize_upstreams",
     "max_sessions",
+    "max_sessions_per_principal",
     "session_ttl_seconds",
     "sse_keepalive_seconds",
     "sse_listener_max_lifetime_seconds",
@@ -365,6 +367,7 @@ struct McpSessionConfig {
     initialize_upstreams: InitializeStrategy,
     session_ttl: Duration,
     max_sessions: usize,
+    max_sessions_per_principal: usize,
     /// When true, the aggregate router serves the event-stream half of MCP
     /// Streamable HTTP: a GET with `Accept: text/event-stream` attaches the one
     /// multiplexed server-message listener for the downstream session, and a
@@ -1305,6 +1308,12 @@ impl McpSessionPrincipal {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum McpSessionQuotaKey {
+    Principal(McpSessionPrincipal),
+    Anonymous(String),
+}
+
 #[derive(Clone)]
 struct DownstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
@@ -1315,6 +1324,9 @@ struct DownstreamMcpSession {
     /// Principal that created this session, or `None` when the request carried
     /// no authenticated principal (deployments with no authentication plugin).
     principal: Option<McpSessionPrincipal>,
+    /// Anonymous sessions are isolated for quota accounting by their /64
+    /// source prefix. This key never participates in session reuse checks.
+    quota_key: McpSessionQuotaKey,
     upstream_sessions: HashMap<String, UpstreamMcpSession>,
     catalog: Arc<RwLock<McpCatalog>>,
     // Per-session catalog refresh lock: serializes discovery for *this* session's
@@ -2554,6 +2566,13 @@ impl McpGateway {
         // admission critical section so the only work under the lock stays the
         // in-memory scan/insert.
         let principal = McpSessionPrincipal::from_context(ctx);
+        let quota_key = match principal.as_ref() {
+            Some(principal) => McpSessionQuotaKey::Principal(principal.clone()),
+            None => McpSessionQuotaKey::Anonymous(
+                crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                    .unwrap_or_else(|| ctx.client_ip.clone()),
+            ),
+        };
 
         // Enforce the cap and reclaim sessions atomically, but keep upstream
         // DELETE I/O *out* of the critical section. Under the admission lock we do
@@ -2568,12 +2587,9 @@ impl McpGateway {
             let _admission_guard = self.session_admission_lock.lock().await;
 
             let mut expired_keys: Vec<String> = Vec::new();
-            let mut live: Vec<(Instant, String)> = Vec::new();
             for entry in self.session_store.iter() {
                 if self.session_is_expired(entry.value()) {
                     expired_keys.push(entry.key().clone());
-                } else {
-                    live.push((entry.value().last_seen, entry.key().clone()));
                 }
             }
 
@@ -2584,64 +2600,75 @@ impl McpGateway {
                 }
             }
 
-            // After reclaiming expired sessions, evict the oldest live sessions if
-            // still at the cap so there is room for exactly one new session.
-            let target = self.sessions.max_sessions.saturating_sub(1);
-            if live.len() > target {
-                let to_remove = live.len() - target;
-                live.sort_unstable_by_key(|(last_seen, _)| *last_seen);
-                for (_, key) in live.into_iter().take(to_remove) {
-                    if let Some(session) = self.take_downstream_session(&key) {
-                        evicted.push(session);
-                    }
+            // Reclaim only this quota key's oldest session at its own quota.
+            // A full aggregate store never sacrifices another principal's
+            // live session; when this caller has no session to replace, refuse.
+            let mut owned_live: Vec<(Instant, String)> = self
+                .session_store
+                .iter()
+                .filter(|entry| {
+                    !self.session_is_expired(entry.value()) && entry.value().quota_key == quota_key
+                })
+                .map(|entry| (entry.value().last_seen, entry.key().clone()))
+                .collect();
+            let global_cap_reached = self.session_store.len() >= self.sessions.max_sessions;
+            if owned_live.len() >= self.sessions.max_sessions_per_principal || global_cap_reached {
+                owned_live.sort_unstable_by_key(|(last_seen, _)| *last_seen);
+                if let Some((_, key)) = owned_live.first()
+                    && let Some(session) = self.take_downstream_session(key)
+                {
+                    evicted.push(session);
                 }
             }
 
-            let upstream_sessions = self
-                .servers
-                .values()
-                .filter(|server| server.enabled)
-                .map(|server| {
-                    (
-                        server.server_id.clone(),
-                        UpstreamMcpSession {
-                            server_id: server.server_id.clone(),
-                            upstream_session_id: None,
-                            protocol_version: None,
-                            initialized: false,
-                            init_lock: Arc::new(Mutex::new(())),
-                        },
-                    )
-                })
-                .collect();
-            let catalog = Arc::new(RwLock::new(McpCatalog::default()));
-            self.session_store.insert(
-                downstream_session_id.clone(),
-                DownstreamMcpSession {
-                    downstream_session_id: downstream_session_id.clone(),
-                    protocol_version,
-                    client_info,
-                    client_capabilities,
-                    principal,
-                    upstream_sessions,
-                    catalog: Arc::clone(&catalog),
-                    catalog_refresh_lock: Arc::new(Mutex::new(())),
-                    last_seen: Instant::now(),
-                },
-            );
-            self.session_catalogs_by_hash
-                .insert(hash_str(&downstream_session_id), catalog);
-            // Pair the MCP session with its broker slot inside the SAME
-            // admission critical section that just made room, so the two
-            // cardinalities cannot diverge and a later GET cannot race
-            // initialize. Failure is fail-closed rather than ignored: a session
-            // the client can initialize but never attach an event stream to is
-            // exactly the silently half-working state to avoid.
-            if self.sessions.sse_multiplexing
-                && let Err(error) = self.sse_broker.ensure_session(&downstream_session_id)
-            {
-                self.take_downstream_session(&downstream_session_id);
-                sse_admission_error = Some(error);
+            if self.session_store.len() >= self.sessions.max_sessions {
+                sse_admission_error = Some(AggregateSseError::SessionCapacityRefused);
+            }
+
+            if sse_admission_error.is_none() {
+                let upstream_sessions = self
+                    .servers
+                    .values()
+                    .filter(|server| server.enabled)
+                    .map(|server| {
+                        (
+                            server.server_id.clone(),
+                            UpstreamMcpSession {
+                                server_id: server.server_id.clone(),
+                                upstream_session_id: None,
+                                protocol_version: None,
+                                initialized: false,
+                                init_lock: Arc::new(Mutex::new(())),
+                            },
+                        )
+                    })
+                    .collect();
+                let catalog = Arc::new(RwLock::new(McpCatalog::default()));
+                self.session_store.insert(
+                    downstream_session_id.clone(),
+                    DownstreamMcpSession {
+                        downstream_session_id: downstream_session_id.clone(),
+                        protocol_version,
+                        client_info,
+                        client_capabilities,
+                        principal,
+                        quota_key,
+                        upstream_sessions,
+                        catalog: Arc::clone(&catalog),
+                        catalog_refresh_lock: Arc::new(Mutex::new(())),
+                        last_seen: Instant::now(),
+                    },
+                );
+                self.session_catalogs_by_hash
+                    .insert(hash_str(&downstream_session_id), catalog);
+                // Pair the MCP session with its broker slot inside the SAME
+                // admission critical section that just made room.
+                if self.sessions.sse_multiplexing
+                    && let Err(error) = self.sse_broker.ensure_session(&downstream_session_id)
+                {
+                    self.take_downstream_session(&downstream_session_id);
+                    sse_admission_error = Some(error);
+                }
             }
             evicted
         };
@@ -2735,6 +2762,10 @@ impl McpGateway {
                 self.protocol_version_for_session(downstream_session_id),
             )
             .json(&body);
+        // Every upstream MCP call carries the request's gateway hop count, so
+        // an upstream that resolves back to the gateway is refused at the proxy
+        // hop limit like a looping route (issue #6128).
+        let request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
             .execute_tracked(request, "mcp_gateway.initialize", &ctx.plugin_http_call_ns)
@@ -2864,6 +2895,7 @@ impl McpGateway {
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
         }
+        request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
             .execute_tracked(
@@ -2976,6 +3008,7 @@ impl McpGateway {
                         .as_deref()
                         .unwrap_or(session.protocol_version.as_str()),
                 );
+            let request = stamp_upstream_proxy_hops(request, ctx);
             match self
                 .http_client
                 .execute_tracked(
@@ -3533,6 +3566,7 @@ impl McpGateway {
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
         }
+        request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
             .execute_tracked(
@@ -6961,6 +6995,10 @@ impl Plugin for McpGateway {
         HTTP_ONLY_PROTOCOLS
     }
 
+    fn gates_request_admission(&self) -> bool {
+        self.enabled
+    }
+
     /// The public-URI/name rewrite this plugin applies to `resources/read`,
     /// `tools/call`, and `prompts/get` results is **not** a function of static
     /// configuration, so it cannot be reduced to a construction-time digest.
@@ -7927,6 +7965,19 @@ enum ResponseRewriteOutcome {
     Unchanged,
     Changed,
     Ambiguous,
+}
+
+/// Stamp the request's gateway hop count on an upstream MCP call made on its
+/// behalf (initialize, the initialized notification, discovery, session
+/// `DELETE`) through the shared plugin-call helper.
+fn stamp_upstream_proxy_hops(
+    request: reqwest::RequestBuilder,
+    ctx: &RequestContext,
+) -> reqwest::RequestBuilder {
+    crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(
+        request,
+        crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+    )
 }
 
 fn mcp_content_type_is_json(value: &str) -> bool {
@@ -9699,6 +9750,18 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
     }
     let max_sessions = usize::try_from(max_sessions)
         .map_err(|_| "mcp_gateway: `sessions.max_sessions` is too large".to_string())?;
+    let max_sessions_per_principal =
+        optional_u64_from_object(sessions, "max_sessions_per_principal")?
+            .unwrap_or(DEFAULT_MAX_SESSIONS_PER_PRINCIPAL.min(max_sessions) as u64);
+    if max_sessions_per_principal == 0 || max_sessions_per_principal > max_sessions as u64 {
+        return Err(
+            "mcp_gateway: `sessions.max_sessions_per_principal` must be from 1 through `sessions.max_sessions`"
+                .to_string(),
+        );
+    }
+    let max_sessions_per_principal = usize::try_from(max_sessions_per_principal).map_err(|_| {
+        "mcp_gateway: `sessions.max_sessions_per_principal` is too large".to_string()
+    })?;
     let downstream_session_header =
         optional_string_from_object(sessions, "downstream_session_header")?
             .unwrap_or_else(|| "mcp-session-id".to_string());
@@ -9731,6 +9794,7 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         initialize_upstreams,
         session_ttl: Duration::from_secs(session_ttl_seconds),
         max_sessions,
+        max_sessions_per_principal,
         sse_multiplexing: optional_bool_from_object(sessions, "sse_multiplexing")?.unwrap_or(false),
         sse_bounds: parse_sse_bounds(sessions)?,
     })
@@ -10431,6 +10495,12 @@ pub fn validate_composition(
         .iter()
         .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
+    // Resolved once: scanning every plugin config per proxy made this
+    // O(proxies × plugin configs) on every reload (issue #6057).
+    let global_gateways: Vec<&PluginConfig> = config
+        .enabled_global_plugin_configs_by_name()
+        .remove("mcp_gateway")
+        .unwrap_or_default();
 
     let mut errors = Vec::new();
     for proxy in &config.proxies {
@@ -10460,15 +10530,7 @@ pub fn validate_composition(
             })
             .collect();
         let effective: Vec<&PluginConfig> = if local.is_empty() {
-            config
-                .plugin_configs
-                .iter()
-                .filter(|plugin| {
-                    plugin.enabled
-                        && plugin.scope == PluginScope::Global
-                        && plugin.plugin_name == "mcp_gateway"
-                })
-                .collect()
+            global_gateways.clone()
         } else {
             local
         };

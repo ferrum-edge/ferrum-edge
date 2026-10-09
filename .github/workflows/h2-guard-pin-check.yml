@@ -8,7 +8,7 @@ on:
       - Cargo.lock
       - Dockerfile
       - vendor/VENDOR_INTEGRITY.sha256
-      - vendor/h2-0.4.19-ferrum-patched/**
+      - vendor/h2-0.4.20-ferrum-patched/**
       - docs/upstream-h2-patches/**
       - tests/performance/multi_protocol/h2_guard/**
       - .github/workflows/h2-guard-pin-check.yml

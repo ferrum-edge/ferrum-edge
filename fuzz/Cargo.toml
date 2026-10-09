@@ -22,7 +22,7 @@ rdkafka = { version = "0.39", features = ["curl-static"] }
 # `cfg_attr(feature = "unstable", allow(missing_docs))`). h2's own fuzz crate
 # enables it the same way. `unstable` only widens visibility of h2 internals;
 # it changes no runtime behaviour.
-h2 = { version = "0.4.19", features = ["unstable"] }
+h2 = { version = "0.4.20", features = ["unstable"] }
 
 [dev-dependencies]
 proptest = "=1.6.0"
@@ -40,7 +40,7 @@ tokio-tungstenite = { path = "../vendor/tokio-tungstenite-0.29.0-ferrum-patched"
 dimpl = { path = "../vendor/dimpl-0.6.1-ferrum-patched" }
 hyper-util = { path = "../vendor/hyper-util-0.1.21-ferrum-patched" }
 hyper = { path = "../vendor/hyper-1.10.0-ferrum-patched" }
-h2 = { path = "../vendor/h2-0.4.19-ferrum-patched" }
+h2 = { path = "../vendor/h2-0.4.20-ferrum-patched" }
 
 [[bin]]
 name = "traceparent"

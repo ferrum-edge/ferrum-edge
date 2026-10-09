@@ -383,24 +383,38 @@ render_chart_assertions() {
     grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostNetwork:|dnsPolicy:' <<<"$rendered" >&2 || true
     exit 1
   fi
-  if [[ "$(grep -c "hostPID: true" <<<"$rendered" || true)" -lt 2 ]]; then
-    echo "NodeWaypoint eBPF render did not grant hostPID to both ambient and node-agent daemonsets" >&2
+  local ambient_ds node_agent_ds
+  # Select whole rendered documents by kind and metadata name: label lines
+  # such as `app.kubernetes.io/name: ferrum-mesh-node-agent` appear in other
+  # objects first and must not delimit the DaemonSet bodies.
+  ambient_ds="$(awk 'BEGIN { RS = "\n---" }
+    /kind: DaemonSet/ && /\n  name: ferrum-mesh-ambient\n/ { print }
+  ' <<<"$rendered")"
+  node_agent_ds="$(awk 'BEGIN { RS = "\n---" }
+    /kind: DaemonSet/ && /\n  name: ferrum-mesh-node-agent\n/ { print }
+  ' <<<"$rendered")"
+  if [[ -z "$ambient_ds" || -z "$node_agent_ds" ]]; then
+    echo "NodeWaypoint eBPF render is missing the ambient or node-agent DaemonSet" >&2
+    exit 1
+  fi
+  # Issue #6112: only the ambient proxy enters pod network namespaces, so only
+  # it keeps hostPID + SYS_ADMIN. The node-agent resolves veths from host
+  # routes and host sysfs and must render neither; this live gate then proves
+  # its NodeWaypoint enrollment, tc redirect, and SOCK_OPS bridge work without
+  # them.
+  if ! grep -q "hostPID: true" <<<"$ambient_ds"; then
+    echo "NodeWaypoint eBPF render did not grant hostPID to the ambient daemonset" >&2
     grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostPID:|hostNetwork:' <<<"$rendered" >&2 || true
     exit 1
   fi
-  local ambient_ds node_agent_ds
-  ambient_ds="$(awk '
-    /name: ferrum-mesh-ambient/ { in_ambient = 1 }
-    in_ambient { print }
-    /name: ferrum-mesh-node-agent/ && in_ambient { exit }
-  ' <<<"$rendered")"
-  node_agent_ds="$(awk '
-    /name: ferrum-mesh-node-agent/ { in_agent = 1 }
-    in_agent { print }
-  ' <<<"$rendered")"
+  if grep -q "hostPID:" <<<"$node_agent_ds"; then
+    echo "NodeWaypoint eBPF render granted hostPID to the node-agent daemonset" >&2
+    grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostPID:|hostNetwork:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
   for cap in BPF PERFMON SYS_ADMIN; do
-    if ! grep -q -- "- ${cap}" <<<"$ambient_ds" || ! grep -q -- "- ${cap}" <<<"$node_agent_ds"; then
-      echo "NodeWaypoint eBPF render did not grant ${cap} to both proxy and node-agent" >&2
+    if ! grep -q -- "- ${cap}" <<<"$ambient_ds"; then
+      echo "NodeWaypoint eBPF render did not grant ${cap} to the node-waypoint proxy" >&2
       grep -nE "kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|capabilities:|add:|- ${cap}" <<<"$rendered" >&2 || true
       exit 1
     fi
@@ -410,11 +424,16 @@ render_chart_assertions() {
       exit 1
     fi
   done
-  if [[ "$(grep -c -- '- BPF' <<<"$rendered" || true)" -lt 2 ]] ||
-    [[ "$(grep -c -- '- PERFMON' <<<"$rendered" || true)" -lt 2 ]] ||
-    [[ "$(grep -c -- '- SYS_ADMIN' <<<"$rendered" || true)" -lt 2 ]]; then
-    echo "NodeWaypoint eBPF render did not grant BPF/PERFMON/SYS_ADMIN to both proxy and node-agent" >&2
-    grep -nE 'capabilities:|add:|- SYS_ADMIN|- BPF|- NET_ADMIN|- PERFMON|- SYS_PTRACE' <<<"$rendered" >&2 || true
+  for cap in BPF NET_ADMIN PERFMON; do
+    if ! grep -q -- "- ${cap}" <<<"$node_agent_ds"; then
+      echo "NodeWaypoint eBPF render did not grant ${cap} to the node-agent" >&2
+      grep -nE "kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|capabilities:|add:|- ${cap}" <<<"$rendered" >&2 || true
+      exit 1
+    fi
+  done
+  if grep -qE -- '- "?SYS_ADMIN"?$' <<<"$node_agent_ds"; then
+    echo "NodeWaypoint eBPF render granted SYS_ADMIN to the node-agent" >&2
+    grep -nE 'kind: DaemonSet|name: ferrum-mesh-node-agent|capabilities:|add:|- SYS_ADMIN' <<<"$rendered" >&2 || true
     exit 1
   fi
   if ! grep -q -- '- SYS_PTRACE' <<<"$rendered"; then
@@ -453,12 +472,7 @@ render_chart_assertions() {
     grep -nE "name: ferrum-mesh-(ambient|node-agent)|FERRUM_ADMIN_HTTP_PORT|value: \"?(9000|$AMBIENT_ADMIN_PORT|$NODE_AGENT_ADMIN_PORT)\"?" <<<"$rendered" >&2 || true
     exit 1
   fi
-  local ambient_block
-  ambient_block="$(awk '
-    /name: ferrum-mesh-ambient/ { in_ambient = 1 }
-    in_ambient { print }
-    /name: ferrum-mesh-node-agent/ && in_ambient { exit }
-  ' <<<"$rendered")"
+  local ambient_block="$ambient_ds"
   if ! grep -q "readinessProbe:" <<<"$ambient_block" ||
     ! grep -A15 "readinessProbe:" <<<"$ambient_block" | grep -q -- "- \"$AMBIENT_ADMIN_PORT\""; then
     echo "NodeWaypoint ambient render did not add an admin health readiness probe" >&2
@@ -489,7 +503,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh/node/"'$(FERRUM_K8S_NODE_NAME)'
+  local spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh-ambient/node/"'$(FERRUM_K8S_NODE_NAME)'
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set image.repository="$IMAGE_REPOSITORY" \
@@ -556,7 +570,7 @@ render_chart_assertions() {
     exit 1
   fi
 
-  local shared_spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh"
+  local shared_spire_id="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/ferrum-mesh-ambient"
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set ambient.enabled=true \
@@ -1030,12 +1044,12 @@ discover_ingress_redirect_ifaces() {
 }
 
 node_waypoint_spiffe_template() {
-  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
 }
 
 node_waypoint_spiffe_for_node() {
   local node="$1"
-  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/%s' "$TRUST_DOMAIN" "$MESH_NS" "$node"
+  printf 'spiffe://%s/ns/%s/sa/ferrum-mesh-ambient/node/%s' "$TRUST_DOMAIN" "$MESH_NS" "$node"
 }
 
 collect_spire_diagnostics() {
@@ -1081,7 +1095,7 @@ install_spire_production_identity() {
       "$spiffe_id" \
       "$agent_parent_id" \
       "$MESH_NS" \
-      ferrum-mesh \
+      ferrum-mesh-ambient \
       "k8s:node-name:$node" \
       "k8s:container-name:ferrum-edge"
   done
@@ -1324,7 +1338,7 @@ for pod in items:
         continue
 
     env = {item["name"]: item for item in ferrum.get("env") or []}
-    expected_spiffe_template = f"spiffe://{trust_domain}/ns/{mesh_ns}/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)"
+    expected_spiffe_template = f"spiffe://{trust_domain}/ns/{mesh_ns}/sa/ferrum-mesh-ambient/node/$(FERRUM_K8S_NODE_NAME)"
     expected_values = {
         "FERRUM_MESH_CA_BACKEND": "spire_agent",
         "FERRUM_MESH_SPIRE_AGENT_SOCKET": "/run/spire/sockets/agent.sock",

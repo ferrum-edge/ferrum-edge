@@ -42,10 +42,10 @@ use prost::Message;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, interval_at};
 use tokio_stream::StreamExt;
@@ -69,6 +69,7 @@ use super::configsync_lifecycle::{
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
+use super::response_admission::FullConfigPermitHandle;
 use crate::FERRUM_VERSION;
 use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
@@ -86,6 +87,48 @@ use crate::modes::mesh::slice::{
 /// Application-level ConfigSync heartbeat interval (matches DP silence budget).
 pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
+#[derive(Default)]
+struct TenantRejectionLogState {
+    last_logged: u64,
+    suppressed: u64,
+}
+
+static TENANT_SUBSCRIPTION_REJECTION_LOGS: LazyLock<
+    Mutex<HashMap<(&'static str, &'static str), TenantRejectionLogState>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const TENANT_REJECTION_LOG_INTERVAL_SECS: u64 = 60;
+fn bounded_log_value(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        let escaped = if character.is_control() {
+            format!("\\u{{{:x}}}", u32::from(character))
+        } else {
+            character.to_string()
+        };
+        if output.len().saturating_add(escaped.len()) > 128 {
+            output.push('…');
+            break;
+        }
+        output.push_str(&escaped);
+    }
+    output
+}
+
+fn bounded_tenant_rejection_reason(reason: &str) -> &'static str {
+    match reason {
+        "Invalid token: authentication failed" => "Invalid token: authentication failed",
+        "Invalid token: malformed JWS header" => "Invalid token: malformed JWS header",
+        "node_id does not match authenticated subject" => {
+            "node_id does not match authenticated subject"
+        }
+        "Missing authorization token" => "Missing authorization token",
+        "GetFullConfig node_id does not match authenticated subject" => {
+            "GetFullConfig node_id does not match authenticated subject"
+        }
+        _ => "request refused",
+    }
+}
 
 /// Project this subscriber's namespace view of Gateway frontend TLS.
 ///
@@ -674,15 +717,53 @@ impl CpGrpcServer {
         result: &'static str,
         reason: &str,
     ) {
+        // Record the bounded values as `&str` so the text formatter quotes
+        // them and the JSON formatter stores the plain string.
+        let node_id = bounded_log_value(node_id);
+        let namespace = bounded_log_value(namespace);
         match result {
             "success" => info!(
                 audit.event = "tenant_subscription",
-                surface, node_id, namespace, result, "Tenant subscription accepted"
+                surface,
+                node_id = node_id.as_str(),
+                namespace = namespace.as_str(),
+                result,
+                "Tenant subscription accepted"
             ),
-            _ => warn!(
-                audit.event = "tenant_subscription",
-                surface, node_id, namespace, result, reason, "Tenant subscription rejected"
-            ),
+            _ => {
+                if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                    let now = elapsed.as_secs();
+                    let reason = bounded_tenant_rejection_reason(reason);
+                    let suppressed =
+                        TENANT_SUBSCRIPTION_REJECTION_LOGS
+                            .lock()
+                            .ok()
+                            .and_then(|mut logs| {
+                                let state = logs.entry((surface, reason)).or_default();
+                                if state.last_logged != 0
+                                    && now.saturating_sub(state.last_logged)
+                                        < TENANT_REJECTION_LOG_INTERVAL_SECS
+                                {
+                                    state.suppressed = state.suppressed.saturating_add(1);
+                                    return None;
+                                }
+                                state.last_logged = now;
+                                Some(std::mem::take(&mut state.suppressed))
+                            });
+                    if let Some(suppressed) = suppressed {
+                        warn!(
+                            audit.event = "tenant_subscription",
+                            surface,
+                            node_id = node_id.as_str(),
+                            namespace = namespace.as_str(),
+                            result,
+                            reason,
+                            suppressed_count = suppressed,
+                            "Tenant subscription rejected"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -968,6 +1049,14 @@ impl CpGrpcServer {
         let mut visible_namespaces =
             Self::mesh_visible_namespaces(mesh, request, allow_cross_namespace_mesh_visibility);
         Self::constrain_visible_namespaces_to_scope(&mut visible_namespaces, scope);
+        mesh.virtual_service_cors_policies.retain(|policy| {
+            visible_namespaces.contains(&policy.namespace)
+                && Self::namespace_allowed_by_scope(&policy.namespace, scope)
+                && bearer_namespaces.is_none_or(|allowed| allowed.contains(&policy.namespace))
+                && crate::modes::mesh::config::virtual_service_cors_policy_exported_to_namespace(
+                    policy, namespace,
+                )
+        });
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
         // namespace this CP is allowed to serve. An explicit bearer claim
@@ -2403,14 +2492,14 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<FullConfigRequest>,
     ) -> Result<Response<FullConfigResponse>, Status> {
+        let rejected_request = request.get_ref();
         let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
             Ok(identity) => identity,
             Err(status) => {
-                let req = request.get_ref();
                 Self::audit_tenant_subscription(
                     "ConfigSync.GetFullConfig",
-                    &req.node_id,
-                    &req.namespace,
+                    &rejected_request.node_id,
+                    &rejected_request.namespace,
                     "failure",
                     status.message(),
                 );
@@ -2421,6 +2510,18 @@ impl ConfigSync for CpGrpcServer {
 
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;
+        if req.node_id.trim() != identity.subject {
+            Self::audit_tenant_subscription(
+                "ConfigSync.GetFullConfig",
+                &req.node_id,
+                &req.namespace,
+                "failure",
+                "node_id does not match authenticated subject",
+            );
+            return Err(Status::permission_denied(
+                "GetFullConfig node_id must match the authenticated JWT subject",
+            ));
+        }
         Self::check_config_sync_build(
             "ConfigSync.GetFullConfig",
             &req.node_id,
@@ -2439,8 +2540,7 @@ impl ConfigSync for CpGrpcServer {
             return Err(status);
         }
         // Same cross-namespace guard as `Subscribe` — without it
-        // `GetFullConfig` would leak the wrong namespace's snapshot. We
-        // discard the returned sender; `GetFullConfig` is unary.
+        // `GetFullConfig` would leak the wrong namespace's snapshot.
         if let Err(status) = self.authorise_namespace(&allowed, &req.namespace) {
             Self::audit_tenant_subscription(
                 "ConfigSync.GetFullConfig",
@@ -2451,6 +2551,40 @@ impl ConfigSync for CpGrpcServer {
             );
             return Err(status);
         }
+        if let Err(rejection) = self
+            .admission
+            .reserve_full_config_rate(&req.namespace, &identity.subject)
+        {
+            record_native_rejection(CpGrpcStreamSurface::ConfigSync, rejection);
+            let status = rejection.into_native_status();
+            Self::audit_tenant_subscription(
+                "ConfigSync.GetFullConfig",
+                &req.node_id,
+                &req.namespace,
+                "failure",
+                status.message(),
+            );
+            return Err(status);
+        }
+        let admission_permit = match self.admission.reserve_native_stream(
+            &req.namespace,
+            &identity.subject,
+            &req.node_id,
+        ) {
+            Ok(permit) => permit,
+            Err(rejection) => {
+                record_native_rejection(CpGrpcStreamSurface::ConfigSync, rejection);
+                let status = rejection.into_native_status();
+                Self::audit_tenant_subscription(
+                    "ConfigSync.GetFullConfig",
+                    &req.node_id,
+                    &req.namespace,
+                    "failure",
+                    status.message(),
+                );
+                return Err(status);
+            }
+        };
         let config = self.config.load_full();
         let (filtered, trust_bundles_json) =
             Self::filter_config_and_trust_for_scope(config.as_ref(), &req.namespace, &self.scope)
@@ -2504,7 +2638,11 @@ impl ConfigSync for CpGrpcServer {
             )
         );
 
-        Ok(Response::new(response))
+        let mut tonic_response = Response::new(response);
+        tonic_response
+            .extensions_mut()
+            .insert(FullConfigPermitHandle::new(admission_permit));
+        Ok(tonic_response)
     }
 }
 

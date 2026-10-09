@@ -352,7 +352,10 @@ pub fn apply_claim_headers_from_context(
 /// because the effective `before_proxy` map is not guaranteed to be all
 /// lowercase: hyper normalizes wire field names, but plugins and transformers
 /// insert operator-cased names, so a lowercase insert alone could leave an
-/// `X-Authenticated-Email` variant beside the gateway's value.
+/// `X-Authenticated-Email` variant beside the gateway's value. It also treats
+/// `_` as `-` ([`crate::proxy::headers::field_names_equivalent_for_backends`]):
+/// a client `X_Authenticated_Email` reaches a CGI-style backend as the same
+/// variable as the gateway's `x-authenticated-email`.
 fn sanitize_owned_claim_header_destinations(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
@@ -367,7 +370,7 @@ fn sanitize_owned_claim_header_destinations(
             !sanitized
                 .sanitized_claim_header_destinations
                 .contains(destination)
-                && name.eq_ignore_ascii_case(destination)
+                && crate::proxy::headers::field_names_equivalent_for_backends(name, destination)
         })
     });
     for destination in destinations.names() {
@@ -454,9 +457,12 @@ fn normalize_allowed_header(raw_header: &str, plugin: &str, field: &str) -> Resu
 /// Headers a claim mapping may never write. The whole gateway-owned
 /// `x-consumer-*` namespace is reserved
 /// ([`crate::proxy::headers::is_consumer_assertion_header`]), not only the
-/// two identity fields the gateway itself asserts.
+/// two identity fields the gateway itself asserts, and so is the gateway's
+/// `X-Ferrum-Hops` loop-guard count
+/// ([`crate::proxy::hop_limit::is_proxy_hops_header`]).
 pub fn is_reserved_header(name: &str) -> bool {
     crate::proxy::headers::is_consumer_assertion_header(name)
+        || crate::proxy::hop_limit::is_proxy_hops_header(name)
         || matches!(
             name.to_ascii_lowercase().as_str(),
             "host"

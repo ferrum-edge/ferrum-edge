@@ -66,7 +66,7 @@ fn sign_proof(claims: &Value, jwk: &Jwk) -> String {
 
 /// Access-token claims carrying the `cnf.jkt` thumbprint binding for the JWK.
 fn token_claims_for(jkt: &str) -> Value {
-    json!({ "sub": "user", "cnf": { "jkt": jkt } })
+    json!({ "iss": "issuer", "sub": "user", "cnf": { "jkt": jkt } })
 }
 
 fn now() -> i64 {
@@ -140,6 +140,7 @@ impl Harness {
             proof: &proof,
             access_token,
             access_token_claims: &token_claims,
+            token_principal: &[b"issuer".as_slice(), b"user".as_slice()],
             method: "GET",
             htu,
             clock_skew: Duration::from_secs(30),

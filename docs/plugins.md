@@ -135,11 +135,29 @@ Each proxy's effective plugin list is built by merging global, proxy-scoped, and
 3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
+A scoped instance replaces only a global of the same kind: a built-in replaces
+a built-in, and a custom plugin replaces a custom plugin. Built-in standing
+follows the plugin's registered type, never the name it reports, so a custom
+plugin whose `name()` returns a built-in name (for example `rate_limiting`)
+does not remove that built-in's global instance, and a scoped built-in does
+not remove a custom global that reports its name (issue #6022). Both instances
+then run on the proxy, so the merged chain must still pass the composition
+checks: a reload that would put, for example, a custom late header mutator
+beside a retained `request_deduplication` or `response_caching` global is
+refused. The plugin cache's other per-plugin lookups key on the registered type
+the same way: the single-instance checks (`api_chargeback`,
+`api_chargeback_sink`, `load_testing`), the NodeWaypoint `mesh_authz` readiness
+count, the native-gRPC policies the composed gRPC-Web view runs
+(`grpc_method_router`, `grpc_deadline`), and the adaptive-concurrency,
+`/charges`, `proxy_alerts`, `workload_metrics`, and CORS bookkeeping.
+
 **Size-limit exception:** `request_size_limiting` and
 `response_size_limiting` policies are conjunctive security boundaries. Their
 same-name global and scoped instances all remain active and compose to the
 strictest (minimum) configured limit; a looser scoped instance cannot replace
-or relax a stricter global instance.
+or relax a stricter global instance. The exception covers the registered
+built-in limiters only: a custom plugin that reports one of these names
+follows the ordinary rule above.
 
 **Chargeback exception:** `api_chargeback` follows the same merge steps, but
 the resulting effective list may contain **at most one** instance per proxy,
@@ -288,12 +306,15 @@ When a request is successfully authenticated, the gateway automatically injects 
 
 | Header | Value | Present |
 |--------|-------|---------|
-| `X-Consumer-Username` | Mapped Consumer `username`, otherwise external auth header/display identity, otherwise external `authenticated_identity` | Always (when authenticated) |
+| `X-Consumer-Username` | Mapped Consumer `username` | Only when a gateway Consumer is mapped |
 | `X-Consumer-Custom-Id` | The Consumer's `custom_id` field | Only when a gateway Consumer is mapped and `custom_id` is set |
+| `X-Authenticated-Identity` | External identity claim or configured display claim | Only when authenticated without a mapped Consumer |
 
-These headers are injected on all proxy paths (HTTP/1.1, HTTP/2, HTTP/3, gRPC, cross-protocol bridges, and WebSocket).
+These headers are injected on all proxy paths (HTTP/1.1, HTTP/2, HTTP/3, gRPC, cross-protocol bridges, and WebSocket). External identities are not implicitly mapped to Consumers by matching a username, ID, or custom ID; Consumer policy applies only when an authentication plugin establishes a gateway Consumer identity. Treat `X-Authenticated-Identity` as an external display value, not as a gateway-verified Consumer assertion.
 
 **The whole `x-consumer-*` request-header namespace is gateway-owned.** Every client-supplied request header whose name starts with `x-consumer-` (case-insensitive, with `_` treated as equivalent to `-`, so `X_Consumer_Role` and `x_consumer-groups` count too) — not only `X-Consumer-Username` and `X-Consumer-Custom-Id` — is removed before any plugin runs and before dispatch on every protocol path, and is also refused in request trailers. A client `X-Consumer-Role: admin` or `X-Consumer-Groups: admins` therefore never reaches a backend. After the plugin phases the gateway scrubs the namespace again from the outbound header map, so a plugin (built-in or custom) cannot author a name beneath it either, and then writes back only its own authenticated `X-Consumer-Username` / `X-Consumer-Custom-Id`. Backends may trust any `x-consumer-*` header they receive from Ferrum as a gateway assertion. The underscore spelling is covered because `_` is a legal header-name byte and CGI-style backends (Rack, WSGI, PHP-FPM) fold `X-Consumer-Role` and `X_Consumer_Role` onto the same `HTTP_X_CONSUMER_ROLE` variable. Plugin configuration cannot target the namespace (either spelling): `request_transformer` header destinations, `claim_headers` / `output_claim_headers` destinations, `correlation_id.header_name`, `mesh_route_dispatch` `request_transform` destinations, `request_deduplication.header_name`, and `mcp_gateway` `sessions.downstream_session_header` / `sessions.upstream_session_header` under `x-consumer-*` are rejected at config load. The Kubernetes Gateway API translator refuses an HTTPRoute or GRPCRoute `RequestHeaderModifier` `set`/`add` of an `x-consumer-*` name per route (`Accepted=False`, `UnsupportedValue`), so the rest of the cluster's config still loads. Other consequences: a load-balancer `hash_on: header:x-consumer-*` key no longer sees a client value, a mesh AuthorizationPolicy `when` condition on `request.headers[x-consumer-*]` sees the header as absent rather than the client's value, and mesh sidecars strip `x-consumer-*` headers the application propagates. Third-party AI provider dispatch (`ai_federation`, `ai_stream_router`) sends no `x-consumer-*` header at all.
+
+`X-Authenticated-Identity` is also gateway-owned: Ferrum removes client and plugin copies before dispatch, then writes the value only for an authenticated external principal. Backends must not treat this display value as proof of a mapped Consumer.
 
 ---
 
@@ -348,6 +369,26 @@ protocol-managed field is a no-op after the origin strip and never invents
 framing.
 
 ---
+
+## Plugin HTTP calls and the proxy hop limit
+
+An HTTP call a plugin makes on behalf of the current request carries the request's gateway hop count in `X-Ferrum-Hops` (`received + 1`, the same value the proxied request carries), so a plugin target that resolves back to a Ferrum gateway is refused with `508 Loop Detected` at the same `FERRUM_MAX_PROXY_HOPS` limit as a looping route (see [Proxy hop limit](routing.md#proxy-hop-limit)). Every such call goes through one shared helper, `proxy::hop_limit::stamp_plugin_call_proxy_hops`, which adds exactly one field line from a pre-built static value. With `FERRUM_MAX_PROXY_HOPS=0` nothing is stamped.
+
+| Carries the hop count (request-scoped) | Carries none (not request-scoped) |
+|---|---|
+| `serverless_function` invocations | `http_logging`, `loki_logging`, `otel_tracing` exporters |
+| `mcp_gateway` upstream `initialize`, `notifications/initialized`, discovery, and session `DELETE` | `api_chargeback_sink` and the `ai_transcript_audit` collector |
+| `ai_federation` provider calls | `proxy_alerts` and other notification webhooks |
+| `opa` decisions, `oauth2_introspection`, `mesh_authz` `CUSTOM` (ext_authz) checks | JWKS fetches and OIDC / OAuth discovery refreshes |
+| `oidc_relying_party` code exchange, refresh grant, revocation, and UserInfo | the `ai_federation` Vertex service-account token grant |
+| `ai_semantic_firewall` and `ai_semantic_cache` embedding calls, the `ai_tool_governor` approval webhook | the `spec_expose` document fetch |
+| `request_mirror` shadows, `load_testing` replays and fan-out | |
+
+- A coalesced call (an `oauth2_introspection` lookup or `oidc_relying_party` refresh shared by concurrent requests, an `ai_semantic_cache` embedding flight, the `ai_semantic_firewall` rule index built on first use) carries the count of the request that started it.
+- A plugin that forwards a copied header set (`request_mirror`, `load_testing`) has the copied field, in any spelling, replaced by the gateway's count, so the call never carries two field lines. Configuration cannot name the field either: an ext_authz provider's `includeRequestHeadersInCheck` / `includeAdditionalHeadersInCheck` refuse every `x-ferrum-*` name (`_` or `-`), and `opa`'s `headers` map and `ai_semantic_cache`'s `semantic_embedding_auth_header` refuse `X-Ferrum-Hops` in any spelling, all at admission. A plugin call is never the mesh inbound hop to the local workload, so it carries the incremented count even where the proxied request forwards the received one.
+- Plugins that route the request through the proxy itself (`a2a_gateway`, `ai_stream_router`, MCP OpenAPI bridge tools, `mesh_route_dispatch`, route overrides in general) need no extra handling: the proxied request already carries the count.
+- Sinks and shared cache refreshes serve many requests or run on a timer, so there is no single request whose count they could carry. A sink endpoint that routes back through a gateway route running the same sink is a feedback loop at the sink's batch rate that the hop limit cannot stop; point sink endpoints at a destination that does not run the sink.
+- A custom plugin that calls out on behalf of a request should stamp its call the same way: `stamp_plugin_call_proxy_hops(builder, hop_limit::plugin_call_proxy_hops(ctx))`.
 
 ## Logging Plugins
 
@@ -442,7 +483,7 @@ config:
 
 Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same bounded non-blocking writer as runtime stdout events, so logging never waits for stdout on request-processing threads. Capacity is reserved before JSON serialization; saturation and oversize records are dropped with monotonic telemetry. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch.
 
-After a WebSocket upgrade, `on_ws_disconnect` emits a second HTTP-family `TransactionSummary` line carrying the session-end `error_class`. Method, path, and status are the values captured at upgrade admission (`GET`/`101` for HTTP/1.1, `CONNECT`/`200` for HTTP/2 and HTTP/3 Extended CONNECT), not a path inferred from the rewritten backend target, so in-session protocol violations and backend RSTs appear in the same access-log schema as handshake failures. Stream disconnects continue to use `on_stream_disconnect` / `StreamTransactionSummary`.
+After a WebSocket upgrade, `on_ws_disconnect` emits a second HTTP-family `TransactionSummary` line carrying the session-end `error_class`. Method, path, and status are the values captured at upgrade admission (`GET`/`101` for HTTP/1.1 and the wire method `CONNECT`/`200` for HTTP/2 and HTTP/3 Extended CONNECT), not a path inferred from the rewritten backend target, so in-session protocol violations and backend RSTs appear in the same access-log schema as handshake failures. Stream disconnects continue to use `on_stream_disconnect` / `StreamTransactionSummary`.
 
 Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, terminal outcome, or a compiled boolean `expression` tree. Flat filter keys are exactly `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`; mesh Telemetry `filter.expression` strings containing `||` compile into the optional `expression` field instead. Telemetry latency atoms accept `response.duration` or `duration`; thresholds are integer milliseconds unless suffixed with `ms` or `s`. For HTTP-family terminal summaries — including the projected WebSocket disconnect summary above — `errors_only` uses one final predicate: dispatch/error class, response-body error, incomplete streamed body, client disconnect, gateway rejection, or nonzero final gRPC status. TCP, UDP, and DTLS stream/disconnect summaries instead match `error_class` or `connection_error`; status-code atoms evaluate false because those stream summaries have no HTTP status, while duration and error atoms retain their normal meaning. Flat HTTP status and latency filters remain independent and all configured predicates must match; `expression` trees use short-circuit `&&` / `||` semantics with `&&` binding tighter than `||`. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
 
@@ -1378,7 +1419,7 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
 }
 ```
 
-The `log` phase records the HTTP upgrade handshake once (101 Switching Protocols for HTTP/1.1; for HTTP/2 or HTTP/3 Extended CONNECT, `http_method` is `"CONNECT"` and `response_status_code` is `200`). Session-end records come only from plugins with a WebSocket disconnect hook — for example `stdout_logging` (a second summary line), `ws_logging` (a disconnect record), and `statsd_logging` (`websocket.*` metrics). For frame-level observability, use the `ws_frame_logging` plugin.
+The `log` phase records the HTTP upgrade handshake once (101 Switching Protocols for HTTP/1.1; for HTTP/2 or HTTP/3 Extended CONNECT, `http_method` is the wire method `"CONNECT"` and `response_status_code` is `200`, and a failed backend handshake's `websocket_backend_error` record carries the same method with status `502`). Route `allowed_methods` and plugin method policy still evaluate an Extended CONNECT WebSocket as `GET`, so a handshake refused by routing, `allowed_methods` or a plugin is logged with `GET`; a gateway egress-policy denial is logged as `websocket_backend_error` with `CONNECT`. Session-end records come only from plugins with a WebSocket disconnect hook — for example `stdout_logging` (a second summary line), `ws_logging` (a disconnect record), and `statsd_logging` (`websocket.*` metrics). For frame-level observability, use the `ws_frame_logging` plugin.
 
 #### Example: WebSocket (Upgrade Failed)
 
@@ -1438,7 +1479,8 @@ latency fields remain `-1.0`; a configured target in such a record is not proof
 that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
 phase or gateway admission gate that rejected the request. Possible values
 include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
-`grpc_backend_error`, and `websocket_backend_error`. Gateway-generated gRPC
+`route_protocol_admission`, `grpc_backend_error`, and
+`websocket_backend_error`. Gateway-generated gRPC
 errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
 sinks can distinguish gRPC failures even though the downstream HTTP status is
 `200`.
@@ -1451,6 +1493,7 @@ Terminal transaction logging is independent of ordinary request hooks:
 | --- | --- | --- | --- |
 | Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
 | Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
+| Matched proxy whose native-gRPC or WebSocket plugin view omits an HTTP-only authentication or admission plugin, a plain HTTP or WebSocket request (other than a bodiless CORS preflight that the route's `cors` plugin answers) to a gRPC-intended route whose own chain carries a gRPC-only admission plugin such as `grpc_method_router`, or a gRPC-Web request whose composed view cannot run a gRPC-only admission plugin (see [Protocol Support](plugin_execution_order.md#protocol-support)) | 403 (native gRPC: trailers-only `PERMISSION_DENIED`) | Emitted once with `rejection_phase: "route_protocol_admission"` | Not run |
 | Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
@@ -1830,7 +1873,7 @@ When this plugin generates a header because the client omitted a valid inbound v
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `header_name` | String or null | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Surrounding whitespace is trimmed with Rust `str::trim` Unicode `White_Space` semantics (U+0085 is trimmed; U+FEFF is not) and the name is lowercased internally. After trimming, the name must be a valid HTTP field-name token (RFC 7230 §3.2.6) that `http::HeaderName` can represent — at most 65,535 ASCII bytes. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing-context, gRPC status, WebSocket handshake, and internal marker names (`host`, `forwarded`, `via`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `connection`, `content-encoding`, `content-length`, `early-data`, `expect`, `traceparent`, `tracestate`, `transfer-encoding`, `upgrade`, `grpc-status`, `x-grpc-web-mode`, `x-ferrum-original-content-encoding`, `sec-websocket-*`, and the other names listed in the OpenAPI schema) are rejected, as is every name in the gateway-owned `x-consumer-*` consumer assertion namespace. The effective deployment-specific `FERRUM_REAL_IP_HEADER` value is also rejected case-insensitively so correlation cannot overwrite backend-visible client attribution; CP/DP deployments enforce one matching value across the config-sync handshake before distributing config. Security-sensitive request and response names (`authorization`, `cookie`, `set-cookie`, `www-authenticate`, `api-key`, `x-api-key`, `x-goog-api-key`, API/auth/CSRF/XSRF token aliases, forwarded authorization, and proxy equivalents) are also rejected so correlation processing cannot replace, copy, or echo credentials or authentication state. Null selects the default. |
+| `header_name` | String or null | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Surrounding whitespace is trimmed with Rust `str::trim` Unicode `White_Space` semantics (U+0085 is trimmed; U+FEFF is not) and the name is lowercased internally. After trimming, the name must be a valid HTTP field-name token (RFC 7230 §3.2.6) that `http::HeaderName` can represent — at most 65,535 ASCII bytes. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing-context, gRPC status, WebSocket handshake, and internal marker names (`host`, `forwarded`, `via`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `connection`, `content-encoding`, `content-length`, `early-data`, `expect`, `traceparent`, `tracestate`, `transfer-encoding`, `upgrade`, `grpc-status`, `x-grpc-web-mode`, `x-ferrum-original-content-encoding`, `sec-websocket-*`, and the other names listed in the OpenAPI schema) are rejected, as is every name in the gateway-owned `x-consumer-*` consumer assertion namespace and the gateway's `x-ferrum-hops` proxy hop count. The effective deployment-specific `FERRUM_REAL_IP_HEADER` value is also rejected case-insensitively so correlation cannot overwrite backend-visible client attribution; CP/DP deployments enforce one matching value across the config-sync handshake before distributing config. Security-sensitive request and response names (`authorization`, `cookie`, `set-cookie`, `www-authenticate`, `api-key`, `x-api-key`, `x-goog-api-key`, API/auth/CSRF/XSRF token aliases, forwarded authorization, and proxy equivalents) are also rejected so correlation processing cannot replace, copy, or echo credentials or authentication state. Null selects the default. |
 | `echo_downstream` | bool or null | `true` | Include the resolved ID in ordinary responses, plugin rejection responses, and successful H1 Upgrade/H2-H3 Extended CONNECT WebSocket handshakes. Null selects the default. |
 
 The config itself must be a JSON object; top-level null and every other non-object value are rejected. The object is closed: keys other than `header_name` and `echo_downstream` are rejected deterministically rather than silently enabling defaults.
@@ -1873,9 +1916,9 @@ the terminal numeric `grpc_status` (`0`–`16`, or `OTHER` for malformed/future
 codes), so application failures under HTTP 200 are distinguishable. HTTP 5xx
 rows add an optional `error_class` label using granular `ErrorClass::as_str`
 (19 variants) or a gateway-authored token (`circuit_breaker_open`,
-`overload`, `config_stale`, `concurrency_limit`, `backend_error`) when the rejection has no
+`overload`, `config_stale`, `concurrency_limit`, `loop_detected`, `backend_error`) when the rejection has no
 `ErrorClass`; 2xx/3xx/4xx omit the label so the common series is not
-multiplied. `X-Gateway-Error` stays on the coarser eight-token header set.
+multiplied. `X-Gateway-Error` stays on the coarser nine-token header set.
 `ferrum_stream_disconnects_total` adds the same optional
 `error_class` from `ErrorClass::as_str` (omitted when unset). The
 `ferrum_rate_limit_exceeded_total` process counter aggregates each rejection,
@@ -2437,7 +2480,7 @@ Every `claim_headers` destination configured on `jwks_auth`, `oauth2_introspecti
 
 There is deliberately **no fallback between them**. A per-replica fallback would silently reinstate the cross-replica bypass the shared authority exists to close, so a shared-backend timeout, partition, authentication failure, corruption, capacity failure, or proven-unsupported topology rejects the protected request. A configuration whose scope and backend disagree — `shared` with no Redis, or Redis with no `shared` consumer — is refused at admission rather than degraded at runtime.
 
-**Capacity never forgets a live marker.** At capacity the authority prunes **expired** markers only. If no expired slot can be reclaimed, the new protected request is refused with a fixed classification. Evicting an unexpired marker to admit a new request would treat capacity pressure as permission to forget a replay marker, letting one client with a valid credential burn other clients' protection by generating unique proofs. Capacity degrades into refusal, never into silent unprotection. Repeated refusals while every retained marker is still live are O(1): a conservative earliest-expiry lower bound skips the map walk until an expiry is actually due. Ordinary admission may move that bound only earlier (`fetch_min`) under a lock-free active-writer count plus a completed-revision counter; prune may store a later bound only after a scan that observed no active writer and no missed completed revision. An even/odd seqlock is not used, because two writers on different map shards can both be in flight while a single parity bit looks stable. Each live process-scoped authority enforces the `replay_max_entries` / `dpop_replay_max_entries` it was admitted with against the shared lane, so an equivalent reload that raises or lowers the cap takes effect without rebuilding the lane, evicting a live marker, or changing the replay domain. Duplicate equivalent `jwks_auth` providers that share one replay domain must declare the same `dpop_replay_scope` and, for `process`, the same `dpop_replay_max_entries`; incompatible authorities or capacities are refused at admission so matching order cannot pick which store or cap applies.
+**Capacity never forgets a live marker.** At capacity the authority prunes **expired** markers only. If no expired slot can be reclaimed, the new protected request is refused with a fixed classification. Process-scoped lanes also cap one principal at one quarter of the configured entry ceiling (rounded up, minimum one), preserving the remaining slots for other principals. An expired marker presented again by a different principal is re-admitted under that principal, moving its quota charge from the previous principal (and refused only if the new principal is already at its share). The principal key is a digest and is never logged or exposed. Evicting an unexpired marker to admit a new request would treat capacity pressure as permission to forget a replay marker, letting one client with a valid credential burn other clients' protection by generating unique proofs. Capacity degrades into refusal, never into silent unprotection. Repeated refusals while every retained marker is still live are O(1): a conservative earliest-expiry lower bound skips the map walk until an expiry is actually due. Ordinary admission may move that bound only earlier (`fetch_min`) under a lock-free active-writer count plus a completed-revision counter; prune may store a later bound only after a scan that observed no active writer and no missed completed revision. An even/odd seqlock is not used, because two writers on different map shards can both be in flight while a single parity bit looks stable. Each live process-scoped authority enforces the `replay_max_entries` / `dpop_replay_max_entries` it was admitted with against the shared lane, so an equivalent reload that raises or lowers the cap takes effect without rebuilding the lane, evicting a live marker, or changing the replay domain. Duplicate equivalent `jwks_auth` providers that share one replay domain must declare the same `dpop_replay_scope` and, for `process`, the same `dpop_replay_max_entries`; incompatible authorities or capacities are refused at admission so matching order cannot pick which store or cap applies.
 
 **Retention is fixed, not configured.** Each caller declares one compile-time horizon that dominates the widest span any admissible configuration can accept one unchanged proof over (`2 × max clock skew`, plus one second). This is not a knob: a later generation that widens its clock skew would otherwise make a captured proof acceptable again after its shorter marker had already been reclaimed, and `SET … NX EX` cannot rewrite the TTL of a key it did not create. Because every generation and every replica writes the same horizon, an existing marker always keeps at least the protection interval it was admitted with, across reloads and rolling deployments alike.
 
@@ -2582,8 +2625,8 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present in the token. Equivalent providers that share one exact issuer must declare the same list **and**, when that list is non-empty, the same effective `role_claim`: matching order would otherwise let a sibling skip the stricter role gate |
 | `providers[].scope_claim` | String (optional) | Per-provider override for scope claim path. Equivalent providers that share one exact issuer and declare a non-empty `required_scopes` must resolve to the same effective claim path (override, else the plugin-level `scope_claim`); requiring the same scope VALUES from different claim paths is two different gates, and matching order would decide which applies |
 | `providers[].role_claim` | String (optional) | Per-provider override for role claim path. Same equivalence requirement as `scope_claim`, applied when `required_roles` is non-empty |
-| `providers[].consumer_identity_claim` | String (optional) | Per-provider override for consumer identity claim |
-| `providers[].consumer_header_claim` | String (optional) | Per-provider override for consumer header claim |
+| `providers[].consumer_identity_claim` | String (optional) | Per-provider override for external authenticated identity claim |
+| `providers[].consumer_header_claim` | String (optional) | Per-provider display claim for `X-Authenticated-Identity` |
 | `providers[].claim_headers` | Object (optional) | Per-provider claim-to-header mappings; keys are claim paths and values are upstream header names. Destinations in the gateway-owned `x-consumer-*` namespace are rejected at config load |
 | `providers[].claim_headers_separator` | String (optional) | Separator for array claim header values |
 | `providers[].output_claim_headers` | Object[] (optional, max 16) | Istio `RequestAuthentication.jwtRules[].outputClaimToHeaders` projection: an ordered list of `{header, claim}` pairs (a list, not a map, because one claim may be published to several headers). Destinations are gateway-owned exactly like `claim_headers` — stripped from the inbound request before validation and set only from a validated claim. Duplicate destinations (including collisions with the provider's effective `claim_headers` map), framing/provenance/gateway-reserved or credential-bearing destinations, and invalid header names are rejected at config load; only nonblank string, integer, and boolean claims no larger than 8192 bytes are published (Istio `ClaimToHeader` does not support arrays, objects, null, or floating-point numbers), and anything else (or a header-illegal value) leaves the destination absent |
@@ -2595,8 +2638,8 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`; remote sources only) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
-| `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
-| `consumer_header_claim` | String | Global JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
+| `consumer_identity_claim` | String | Global JWT claim used as the external authenticated identity (default: `"sub"`) |
+| `consumer_header_claim` | String | Global JWT display claim for `X-Authenticated-Identity` (default: each provider's effective `consumer_identity_claim`, so a provider identity override also selects its display claim) |
 | `claim_headers` | Object | Global claim-to-header mappings used when the matched provider has no provider override |
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
@@ -2642,7 +2685,7 @@ Retention is **not** configurable. Every marker is retained for a fixed 601-seco
 
 ### `oauth2_introspection`
 
-Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, explicit multi-provider routing, client authentication, bounded token caches and outbound work, claim-based authorization, consumer lookup, claim header fan-out, and optional token stripping before proxying.
+Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, explicit multi-provider routing, client authentication, bounded token caches and outbound work, claim-based authorization, claim header fan-out, and optional token stripping before proxying. Introspection identities do not implicitly map to Consumers by matching a username, ID, or custom ID.
 
 **Priority:** 1050
 
@@ -2674,13 +2717,13 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
 | `providers[].scope_claim` | String (optional) | Per-provider override of the global `scope_claim` |
 | `providers[].role_claim` | String (optional) | Per-provider override of the global `role_claim` |
-| `providers[].consumer_identity_claim` | String (optional) | Per-provider override of the global `consumer_identity_claim` |
-| `providers[].consumer_header_claim` | String (optional) | Per-provider override of the global `consumer_header_claim` |
+| `providers[].consumer_identity_claim` | String (optional) | Per-provider override of the external authenticated identity claim |
+| `providers[].consumer_header_claim` | String (optional) | Per-provider display claim for `X-Authenticated-Identity`. Resolution order: this provider's `consumer_header_claim`, then the global `consumer_header_claim`, then this provider's effective `consumer_identity_claim` (its override, else the global one). An absent or non-string display claim falls back to the authenticated identity value |
 | `providers[].claim_headers` | Object (optional) | Claim-to-header mappings; keys are claim paths and values are upstream header names |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
-| `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
-| `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps; defaults to the effective `consumer_identity_claim` |
+| `consumer_identity_claim` | String | Global claim used as the external authenticated identity (default: `"username"`) |
+| `consumer_header_claim` | String | Global display claim for `X-Authenticated-Identity`; defaults to the effective `consumer_identity_claim` |
 
 Every claim path is a dot path (`realm_access.roles`) with no empty segments, and every non-empty string list entry is trimmed and must not be blank. A provider override replaces the global value for that provider only.
 
@@ -2753,8 +2796,8 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].claim_headers` | Object (optional) | Session claim-to-header mappings |
 | `providers[].scope_claim` | String | Claim holding granted scopes (default: `scope`) |
 | `providers[].role_claim` | String | Claim holding roles (default: `roles`) |
-| `providers[].consumer_identity_claim` | String | Claim resolved against the consumer index (default: `sub`) |
-| `providers[].consumer_header_claim` | String | Claim emitted as the consumer username header (default: `sub`) |
+| `providers[].consumer_identity_claim` | String | Claim used as the external authenticated identity (default: `sub`) |
+| `providers[].consumer_header_claim` | String | Claim emitted in `X-Authenticated-Identity` (default: `sub`) |
 | `providers[].id_token_clock_skew_secs` | u64 | ID token expiry leeway (default: `60`; `0`–`3600`) |
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies. Published or placeholder values are rejected at admission |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation; the same published/placeholder rejection applies |
@@ -2770,7 +2813,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `session.same_site` | String | `lax` (default), `strict`, or `none`; case-insensitive. `none` requires `session.secure: true` |
 | `session.path` | String | Session cookie `Path` (default: `/`) |
 | `behavior.rp_initiated_logout` | Boolean | Default `true`; send the sealed session ID token as a logout hint and attempt discovered refresh-token revocation (five-second bound) |
-| `behavior.state_ttl_secs` | u64 | Pending authorization-flow lifetime (default: `600`; `1`–`3600`) |
+| `behavior.state_ttl_secs` | u64 | Pending authorization-flow lifetime (default: `600`; `1`–`3600`). At most two pending-flow cookies are retained per browser; creating another expires the oldest cookie before setting the new one |
 | `behavior.refresh_skew_secs` | u64 | Refresh lead time before token expiry (default: `30`; must be `<= session.ttl_secs / 2`) |
 | `behavior.challenge_html_status` | u64 | Browser challenge status: `302` (default), `303`, or `307` |
 | `behavior.challenge_api_status` | u64 | Non-browser challenge status: `401` (default) or `403` |
@@ -3237,14 +3280,13 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
 | `max_cache_entries` | u64 | `10000` | Strict cache cap (1–1,000,000). Atomic admission preserves the cap under concurrency, and a saturated cache replaces one entry without a full-map scan |
-| `consumer_mapping` | bool | `true` | Whether to look up a matching gateway Consumer via `consumer_index.find_by_identity()` |
 
 **Authentication modes** (must configure one):
 
 1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder and `canonical_identity_attribute`. Fastest option, no service account needed. After the user's bind succeeds, the plugin issues a base-scope search on the bound DN over that same authenticated connection and takes the canonical attribute's single value as the identity.
 2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user.
 
-In **both** modes the configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping and username-based group authorization. Directories match login attributes case- and whitespace-insensitively, so `alice`, `ALICE`, and `alice ` all bind to the same account; deriving the identity from the directory entry keeps them one Ferrum principal instead of three, so per-consumer rate limits and `access_control` `disallowed_consumers` revocation cannot be evaded by varying the presented login.
+In **both** modes the configured canonical attribute—not the client-supplied username—is exported and used for username-based group authorization. Directories match login attributes case- and whitespace-insensitively, so `alice`, `ALICE`, and `alice ` all bind to the same account; deriving the identity from the directory entry keeps them one Ferrum principal instead of three. LDAP identities do not implicitly map to a gateway Consumer by username.
 
 The two modes are mutually exclusive: a configuration that sets `bind_dn_template` together with `search_base_dn` or `search_filter` is **rejected** at load, rather than silently taking the direct-bind branch and leaving the search keys inert.
 
@@ -3275,7 +3317,7 @@ config:
   cache_ttl_seconds: 300
 ```
 
-In both modes the plugin sets `ctx.authenticated_identity` to the validated `canonical_identity_attribute` value taken from the authenticated directory entry — read with a base-scope search on the bound DN for direct bind, or from the unique search result for search-then-bind. The presented login is never exported, and an entry that cannot yield exactly one canonical value fails closed with a `500` rather than falling back to it. When `consumer_mapping` is enabled (default), the same authenticated identity is used to find a matching gateway Consumer for ACL and rate-limiting integration.
+In both modes the plugin sets `ctx.authenticated_identity` to the validated `canonical_identity_attribute` value taken from the authenticated directory entry — read with a base-scope search on the bound DN for direct bind, or from the unique search result for search-then-bind. The presented login is never exported, and an entry that cannot yield exactly one canonical value fails closed with a `500` rather than falling back to it. The external identity is emitted as `X-Authenticated-Identity`; it does not establish a mapped Consumer.
 
 **Status codes:** The plugin distinguishes failure classes so clients and operators get an accurate signal:
 
@@ -3328,16 +3370,17 @@ Media types are parsed **structurally** — `type/subtype` plus RFC 9110 paramet
 | `strict` *(default)* | Every request on this proxy is a governed SOAP request. A missing Content-Type returns `415`, an unsupported media type returns `415`, and a malformed one returns `400` — all before backend dispatch. |
 | `mixed_route` | Only requests whose media type is a recognized SOAP representation are governed; everything else passes through the SOAP policy. This is the explicit opt-out for proxies that intentionally serve mixed traffic. A malformed media-type label still fails closed in this mode, because an unparsable label cannot be proven non-SOAP. With an identity-establishing configuration the pass-through still reaches the authentication chain and is answered `401` — see [Phase, identity, and composition](#phase-identity-and-composition). |
 
-Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the gateway locates the root part (by `start`, else the first part), validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
+Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the root part is the first part (when `start` is supplied it must name that part), the gateway validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
 
 **MTOM package framing is strict, because the parser decides which bytes are the envelope.** Any package shape a conforming backend parser would frame differently is a gateway/backend representation split, so it fails closed rather than being resolved by a rule the backend need not share. The whole package is framed and every part parsed *before* a root is selected, so no ambiguity later in the package is missed by an early return. Specifically:
 
-- Boundary delimiter *lines* are recognized only at the start of the body or immediately after a CRLF, with exact CRLF framing and no RFC 2046 transport padding. A `--boundary` sequence anywhere else — in the preamble, in a header value, inside an attachment payload, inside the envelope itself — is payload, exactly as it is for a conforming parser.
-- Exactly one close-delimiter (`--boundary--`) must be present, and the epilogue after it must not contain the boundary token at all.
+- Boundary delimiter *lines* are recognized only at the start of the body or immediately after a CRLF, with exact CRLF framing and no RFC 2046 transport padding, and the `--boundary` token may appear nowhere else in the package. One with anything other than exact CRLF (or `--` then CRLF, or end of body, for the close-delimiter) after it — transport padding such as a trailing space or tab, a bare LF terminator, or further characters such as `--boundaryX` — refuses the package. So does a `--boundary` opened by a bare LF or bare CR, or one in the middle of a line: in the preamble, inside the envelope, inside an attachment payload, or in the epilogue. Parsers differ on all of these — some accept transport padding or LF-only line endings, some find the first delimiter without requiring it to open a line, some match the token inside a part body — so skipping any of them as payload could validate a different root than the backend executes. RFC 2046 already requires a generator to choose a boundary that does not occur in the encapsulated material, and the random boundaries MTOM stacks generate never do in practice.
+- Exactly one close-delimiter (`--boundary--`) must be present.
+- The package `Content-Type` must not carry an RFC 2231 extended or continuation form (`boundary*`, `boundary*0`, `type*`, `start*`, ...) of `boundary`, `type`, or `start`; such a request is refused with `400`. Parsers that implement RFC 2231 decode those forms and let them replace or supply the plain value, so the backend would frame, type, or root the package differently. An extended `charset*` on a SOAP `Content-Type` is likewise refused as a conflicting charset declaration.
 - Part headers must be US-ASCII with exact CRLF line endings, must not use obsolete folded continuation lines, must be well-formed `token: value` pairs, and may carry at most one `Content-Type`, one `Content-ID`, and one `Content-Transfer-Encoding` each.
-- `Content-ID` values must be unique across the package (RFC 2387) and must not be blank. When `start` is supplied, exactly one part may match it.
+- `Content-ID` values must be unique across the package (RFC 2387) and must not be blank. Uniqueness and `start` matching ignore ASCII case and a leading `cid:`, the widest comparison a backend may apply. A `Content-ID` or `start` carrying `%`, `+`, or embedded whitespace is refused instead: a backend that percent-decodes ids (`%XX` escapes, `+` as space) would resolve it to a different part than byte-exact matching does. When `start` is supplied it must name the **first** part: some parsers resolve `start` and others always take the first part as the root, and requiring both to agree keeps them on one envelope.
 - The root part must itself declare a SOAP/XOP essence and must not declare a re-encoding `Content-Transfer-Encoding` (anything other than `7bit`/`8bit`/`binary`).
-- Bounds are fail-closed: at most 64 parts, at most 8 KiB and 32 lines of headers per part, and a ceiling on boundary-shaped candidates examined per package.
+- Bounds are fail-closed: at most 64 parts and at most 8 KiB and 32 lines of headers per part.
 
 **X.509 signatures and MTOM/XOP are mutually exclusive.** Ferrum implements no WS-Security attachment-signature transform, so for a XOP representation the digest it verifies covers the `xop:Include` element rather than the attachment octets that element stands for — an attacker-selected attachment present during validation would never be detected. When `x509_signature.enabled` is `true`, MTOM/XOP `multipart/related` **and** bare `application/xop+xml` are therefore refused with `415` before dispatch, and an explicit `content_type.allow_mtom: true` alongside an enabled `x509_signature` is refused at config admission. `username_token` and `saml` keep accepting MTOM/XOP: those mechanisms authenticate *who sent the message*, and neither claims integrity over attachment octets.
 
@@ -3395,7 +3438,7 @@ As a runtime backstop for every other transform (including custom plugins), an i
 | `saml.allowed_subject_confirmation_methods` | String[] | `["urn:oasis:names:tc:SAML:2.0:cm:bearer"]` | Accepted `SubjectConfirmation/@Method` URIs. Only `bearer` is implemented; `holder-of-key` is rejected at admission because the confirmation key is not bound to the message signature |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
 | `nonce.replay_scope` | String | *(required for PasswordDigest and for SAML)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
-| `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; a full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
+| `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; in process scope one principal may retain at most one quarter of this ceiling (rounded up, minimum one). An expired nonce presented again is a new use charged to the presenting principal; if it is stored under a different principal, its quota charge moves to the new one. It is refreshed in place only while the cache is within this ceiling and `nonce.max_total_cache_bytes`, and the presenting principal is within its share (a principal reusing its own expired nonce keeps its charge; a different principal needs room for one more). Otherwise the expired claim is reclaimed and the nonce is claimed afresh: that can still succeed once expired claims are reclaimed, and is otherwise refused by the per-principal share, this ceiling, or the byte cap. A full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
 | `nonce.max_total_cache_bytes` | u64 | `67108864` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
 
@@ -3613,7 +3656,7 @@ max created_max_age_seconds (86400) + 2 × max created_clock_skew_seconds (3600)
 - There is no `nonce.cache_ttl_seconds`: the key is rejected as unknown rather than silently ignored, because it could not shorten effective retention.
 - A `PasswordText` or timestamp-only policy never populates replay state, so none of this costs it anything.
 
-**Sizing.** The cost is paid in capacity, not in security. Under `replay_scope: process`, size `nonce.max_cache_size` / `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × 93 601 s — plus peak accepted SAML assertion rate when `saml.enabled` is true, because accepted assertion-id claims share the same bounded process map for the same horizon (each charges a fixed 64-byte SHA-256 hex claim key). The defaults (`100000` entries / `67108864` bytes) sustain roughly **1 authenticated PasswordDigest request per second**; the `1000000`-entry ceiling sustains roughly **10 per second**. A higher sustained rate needs `replay_scope: shared`, where retention is Redis's memory cost rather than the gateway's. Under-provisioning surfaces as fail-closed `401` rejections — never as a silent replay window, because a live claim is never evicted to make room.
+**Sizing.** The cost is paid in capacity, not in security. Under `replay_scope: process`, size `nonce.max_cache_size` / `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × 93 601 s — plus peak accepted SAML assertion rate when `saml.enabled` is true, because accepted assertion-id claims share the same bounded process map for the same horizon (each charges a fixed 64-byte SHA-256 hex claim key). The defaults (`100000` entries / `67108864` bytes) sustain roughly **1 authenticated PasswordDigest request per second** across all principals; one principal is limited to roughly **0.25 per second** at that default. The `1000000`-entry ceiling sustains roughly **10 per second** overall and **2.5 per second** per principal. A higher sustained rate needs `replay_scope: shared`, where retention is Redis's memory cost rather than the gateway's memory. Under-provisioning surfaces as fail-closed `401` rejections — never as a silent replay window, because a live claim is never evicted to make room.
 
 **Across reload generations and replicas.** Every generation, in either scope, expires entries against the same constant, so no generation can expire, refresh, or under-protect another's claim in either direction. Under `shared`, `SET NX` declining to rewrite an existing key's TTL is therefore correct: whichever replica or generation wrote that key already gave it the full horizon.
 
@@ -3897,7 +3940,7 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 |---|---|---|---|
 | `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. |
 | `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, or contain empty, `.`, or `..` path segments. |
-| `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured. |
+| `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured, nor can the gateway-owned `X-Ferrum-Hops` (any case, `_` or `-`), which the decision request carries itself. |
 | `timeout_ms` | Integer | `1000` | Requested per-decision timeout. Every positive value is accepted; the effective timeout is capped at `30000` ms. |
 | `max_response_bytes` | Integer or null | `262144` | Maximum decoded OPA response size. Oversized declared or streamed responses use the configured fail posture. An explicit `null` selects the default, exactly like omitting the key. |
 | `fail_open` | Boolean | `false` | Continue the request when OPA is unavailable, times out, returns non-2xx, returns malformed JSON, or exceeds `max_response_bytes`. |
@@ -4208,6 +4251,11 @@ unknown keys, consistently in runtime admission and OpenAPI.
 
 At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
 
+For IP-based keys, this plugin defaults to an IPv6 `/64` prefix; `ipv6_prefix`
+can override that grouping for this plugin only. The sibling `graphql`,
+`grpc_method_router`, `udp_rate_limiting`, and `ai_rate_limiter` plugins use a
+fixed `/64`; gateway-wide `FERRUM_*_PER_IP` caps also group IPv6 by `/64`.
+
 **Local-mode algorithm selection** (automatic):
 - Windows ≤ 5 seconds → token bucket (O(1) memory, ideal for TPS limiting)
 - Windows > 5 seconds → bounded aggregate sliding window (fixed 64 count buckets
@@ -4238,6 +4286,7 @@ mode** below). Do not read a single guarantee across all three.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `limit_by` | String | `ip` | Rate limit key: `ip`, `consumer`, or `spiffe_identity` (`spiffe` alias accepted) |
+| `ipv6_prefix` | Integer | `64` | For IP keys, group IPv6 source addresses by this prefix length (1–128); IPv4 stays host-specific |
 | `expose_headers` | bool | `false` | Inject `x-ratelimit-*` headers |
 | `limits` | Array | required | One default rule plus optional consumer-scoped rules |
 | `limits[].scope` | String | required | `default` or `consumers`; exactly one `default` rule is required |
@@ -4265,7 +4314,7 @@ mode** below). Do not read a single guarantee across all three.
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings. A `redis_url` fragment (`#insecure` or any other) is rejected at plugin construction; it is not a per-URL skip-verify switch. A configured CA bundle is exclusive: if the path is set and verification is on, a load failure refuses plugin construction instead of falling back to system/public roots. `FERRUM_TLS_NO_VERIFY=true` remains the sanctioned skip-verify path and does not treat an unloadable CA as a construction error.
 
 **Behavior by mode:**
-- `limit_by: "ip"` — Enforces in `on_request_received` phase (before auth), keyed by client IP.
+- `limit_by: "ip"` — Enforces in `on_request_received` phase (before auth), keyed by client IP. IPv6 sources in one configured `ipv6_prefix` network share a budget; the default `/64` prevents address rotation within a typical allocation from creating fresh budgets.
 - `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by the authenticated identity: mapped consumer username when present, otherwise external `authenticated_identity`. Falls back to client IP if neither exists.
 - `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after [`spiffe_identity`](#spiffe_identity)), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
 - Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream [`spiffe_identity`](#spiffe_identity) hook. Both modes fall back to client IP when their identity is absent.
@@ -4298,7 +4347,7 @@ config:
 - **Recognition matches `mcp_gateway`.** The body is read after it is buffered, in `before_proxy` (the plugin's `on_request_received` / `authorize` charges do not run in this mode). Member names are decoded before comparison (an escaped `"m\u0065thod"` is `method`), the media types are the ones the gateway admits (`application/json`, `application/json-rpc`, any `+json`, or no `Content-Type`), and a batch is read within fixed recognizer bounds of 32 members, 1 MiB, and 256 KiB per member. Raising `mcp_gateway.validation.max_batch_items`, `max_batch_bytes`, or `max_batch_item_bytes` above these bounds means the limiter refuses larger batches with JSON-RPC `-32600`. A body with duplicate member names, or a batch past those bounds, is refused with JSON-RPC `-32600` instead of being counted one way here and parsed another way downstream. Any in-scope POST with non-identity `Content-Encoding` is refused with `-32017`, even when its body has no `tools/call`, because its body cannot be inspected; earlier request decompression removes the encoding and keeps normal recognition. `endpoint_path`, when set, narrows which POSTs are in scope. Ordinary JSON traffic that cannot spell `tools/call` is answered by a byte scan without parsing, and with `endpoint_path` set no other path is buffered at all.
 - **Placement.** The charge runs at priority 2900, before `mcp_gateway` (2992): every `tools/call` attempt counts, including one the gateway then refuses (unknown or ungranted tool, invalid arguments, an aggregate batch member answered `-32009`). To count only calls the gateway admitted, give the instance a `priority_override` above 2992.
 - **Refusal is a JSON-RPC error on HTTP `200`.** An exceeded budget answers `{"jsonrpc":"2.0","id":<the call's id>,"error":{"code":-32015,"message":"MCP tool-call rate limit exceeded"}}` with `Content-Type: application/json` and, with `expose_headers`, the usual `x-ratelimit-limit` / `x-ratelimit-remaining: 0` / `x-ratelimit-window`. A batch gets one error per request-form member (by its own id; an id longer than 4096 bytes is answered with `id: null`), and a refused request with no request-form member gets one error with `id: null`. HTTP `200` is deliberate and matches `mcp_gateway`, which answers every JSON-RPC error on `200`: MCP streamable HTTP clients resolve the pending request from a JSON-RPC error on a 2xx response and surface its code and message to the agent, while a `429` POST response is raised as a transport failure that loses both. A state-capacity refusal also answers `-32015`; a fail-closed Redis outage (`redis_failure_policy: fail_closed`) answers `-32016` (`MCP tool-call rate limit unavailable`) with no rate-limit headers. Because the refusal rides HTTP `200`, status-code metrics do not see it; `ferrum_rate_limit_exceeded_total` and the `ratelimit_mcp_tool_calls` metadata (the number of charges the request carried) do.
-- **Scope.** The mode is HTTP-only (a stream, WebSocket, or gRPC request has no `tools/call` to count) and changes the limiter's local-state identity, so switching an instance between request counting and tool-call counting never reuses a live budget.
+- **Scope.** The mode is HTTP-only (a stream, WebSocket, or gRPC request has no `tools/call` to count) and changes the limiter's local-state identity, so switching an instance between request counting and tool-call counting never reuses a live budget. A native-gRPC or WebSocket request on a route with a tool-call limiter is refused with `403` / `PERMISSION_DENIED` (see [Protocol Support](plugin_execution_order.md#protocol-support)).
 
 **Counter storage** (`sync_mode`): only `local` and `redis` are supported. There is intentionally no database-backed counter policy; database writes on the hot path are non-performant and can cause operational issues.
 
@@ -4418,6 +4467,10 @@ startup, database/CP admin returns HTTP 400, and a DP rejects the update and
 keeps its last-known-good runtime config.
 
 **Behavior:**
+- `br` request bodies are fingerprinted only after the shared charged strict
+  decoder accepts them. Malformed or over-limit Brotli is rejected with `400`;
+  if the shared decode budget is exhausted, the gateway returns `503`. Malformed
+  gzip retains the existing behavior of fingerprinting its original bytes.
 - Logical idempotency keys are scoped by the stable plugin-config identity, the effective destination partition (matched proxy namespace and ID, listen path, upstream id or direct host/port/scheme, route authority, rewritten path), a mandatory caller-authorization partition, the authenticated display identity when `scope_by_consumer: true`, and the idempotency header value. Namespace is part of the logical digest even under a custom Redis prefix, so equal resource IDs in separate namespaces never share ownership or replay state. The stored key is a canonically length-framed SHA-256 digest, not a delimiter-joined raw string
 - **Caller authorization, not a display subject.** The key binds the authentication mechanism, resolved identity and consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented, so two tokens resolving to one `sub` with different scopes or tenancy claims cannot claim or replay one another's operation. Both credential views are bound under separate provenance labels — the pristine inbound wire headers and the live backend-visible headers — so an earlier plugin that rewrites credentials cannot erase the original caller distinction. **Every** caller also binds its canonical peer address, which the origin observes through Ferrum's regenerated `X-Forwarded-For`; only an anonymous caller's address binding can be relaxed, via `anonymous_caller_scope: shared`
 - **Credential headers participate in the request fingerprint as digests** rather than being excluded for scoped callers. The raw secret never enters a key or a log line, and a same-subject/different-scope credential produces a different fingerprint and is refused as a conflict instead of replaying
@@ -4612,7 +4665,7 @@ Configuration must be a top-level object. Accepted keys are `status_code`, `cont
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `status_code` | u16 | `503` | Final HTTP status (200–599), including JSON numbers with a zero fractional part (for example `503.0`). Informational statuses including `101` and out-of-range values are rejected at construction. `204`/`205`/`304` force an empty body (explicit non-empty `body` is rejected). A configured 2xx never establishes a CONNECT/Extended CONNECT tunnel — those requests fail closed with `403`. Native gRPC maps this code to `grpc-status` under HTTP 200 instead of returning it as the wire status. |
+| `status_code` | u16 | `503` | Final HTTP status (200–599), including JSON numbers with a zero fractional part (for example `503.0`). Informational statuses including `101` and out-of-range values are rejected at construction. `204`/`205`/`304` force an empty body (explicit non-empty `body` is rejected). A configured 2xx never establishes an H2/H3 WebSocket Extended CONNECT tunnel — those requests fail closed with `403`. Native gRPC maps this code to `grpc-status` under HTTP 200 instead of returning it as the wire status. |
 | `body` | String | _(omit)_ | Explicit response body. Field presence — including `body: ""` — is authoritative and suppresses `message`. Omitting the field selects the default renderer. Native gRPC does not send these bytes as RPC DATA. |
 | `content_type` | String | `application/json` | Response `Content-Type` header for ordinary HTTP. Surrounding whitespace is trimmed; the result must be a nonempty valid HTTP header value. Default-body formatting uses exact subtype `json`/`xml` or RFC 6838 `+json`/`+xml` suffixes after parameter stripping — not arbitrary substrings (`application/notjson` is plain text). Native gRPC overwrites this with `application/grpc`. |
 | `message` | String | `"Service unavailable"` | Builds the default body when `body` is omitted. For JSON media types, a complete unambiguous JSON `message` is emitted as the body; malformed or parser-ambiguous JSON fails safe into the `{message,status_code}` envelope. XML types wrap the message in `<message>` (XML 1.0-legal characters only; illegal controls are rejected). Other types emit `message` as plain text. |
@@ -4673,13 +4726,14 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"aws_lambda"` |
-| `aws_region` | String | — | AWS region. Falls back to `AWS_DEFAULT_REGION` / `AWS_REGION` env var. The default endpoint is partition-aware: a `cn-*` region derives `https://lambda.<region>.amazonaws.com.cn`, every other region derives `https://lambda.<region>.amazonaws.com` |
-| `aws_access_key_id` | String | — | IAM access key. Falls back to `AWS_ACCESS_KEY_ID` env var |
-| `aws_secret_access_key` | String | — | IAM secret key. Falls back to `AWS_SECRET_ACCESS_KEY` env var |
+| `aws_region` | String | — | AWS region. Falls back to `AWS_DEFAULT_REGION` / `AWS_REGION` env var. The default endpoint is partition-aware: a `cn-*` region derives `https://lambda.<region>.amazonaws.com.cn`, every other region derives `https://lambda.<region>.amazonaws.com`. With process-environment credentials it must be a commercial, GovCloud, or China region (see [Ambient AWS credential scope](#ambient-aws-credential-scope)) |
+| `aws_access_key_id` | String | — | IAM access key. Falls back to `AWS_ACCESS_KEY_ID` env var; a process-environment credential is [scoped to official AWS Lambda endpoints](#ambient-aws-credential-scope) |
+| `aws_secret_access_key` | String | — | IAM secret key. Falls back to `AWS_SECRET_ACCESS_KEY` env var; a process-environment credential is [scoped to official AWS Lambda endpoints](#ambient-aws-credential-scope) |
 | `aws_function_name` | String | — | Lambda function name, partial ARN, or full ARN, validated against the Lambda Invoke API `FunctionName` grammar (≤ 170 characters). Falls back to `AWS_LAMBDA_FUNCTION_NAME` env var; the environment value is held to the same grammar |
-| `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var |
+| `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var only when `aws_access_key_id` and `aws_secret_access_key` also come from the environment (a token is bound to its access key, so it never completes a config key pair); a process-environment token is [scoped to official AWS Lambda endpoints](#ambient-aws-credential-scope) |
 | `aws_qualifier` | String | — | Optional version/alias qualifier (e.g., `$LATEST`, `prod`), validated against the Lambda Invoke API `Qualifier` grammar: `A-Z a-z 0-9 $ _ -`, ≤ 128 characters |
-| `aws_endpoint_url` | String | — | Optional HTTP(S) origin-only Lambda endpoint override. No userinfo, path, query, or fragment; falls back to `AWS_LAMBDA_ENDPOINT_URL` |
+| `aws_endpoint_url` | String | — | Optional HTTP(S) origin-only Lambda endpoint override. No userinfo, path, query, or fragment; falls back to `AWS_LAMBDA_ENDPOINT_URL`. With process-environment credentials a configured `aws_endpoint_url` must be an official AWS Lambda endpoint unless `allow_custom_endpoint_with_ambient_credentials` is `true`; an `AWS_LAMBDA_ENDPOINT_URL` fallback is trusted like the environment credentials |
+| `allow_custom_endpoint_with_ambient_credentials` | Boolean | `false` | Deliberately let process-environment AWS credentials sign invocations for a config-chosen endpoint outside the official scope (LocalStack, an air-gapped ISO partition, the AWS European Sovereign Cloud). See [Ambient AWS credential scope](#ambient-aws-credential-scope) |
 
 **Azure Functions** — calls the HTTP trigger URL:
 
@@ -4687,7 +4741,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `provider` | String | (required) | `"azure_functions"` |
 | `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
-| `azure_function_key` | String | — | Function key for auth. Falls back to `AZURE_FUNCTIONS_KEY` env var. The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
+| `azure_function_key` | String | — | Function key for auth. Falls back to the `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` env var (never the ambient `AZURE_FUNCTIONS_KEY`, because the key is sent to the config-chosen `function_url`). The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
 
 **GCP Cloud Functions** — calls the HTTPS trigger URL:
 
@@ -4695,7 +4749,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `provider` | String | (required) | `"gcp_cloud_functions"` |
 | `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
-| `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var. The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
+| `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to the `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var (never the ambient `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`). The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
 
 #### Common Parameters
 
@@ -4860,7 +4914,29 @@ If request deduplication acquired an idempotency key earlier in the chain, each 
 
 #### Environment Variable Fallback
 
-Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.).
+Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.). The Azure function key and GCP bearer token are sent to the config-chosen `function_url`, so their fallbacks are confined to the [plugin-secret namespace](configuration.md): `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` and `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`. The ambient `AZURE_FUNCTIONS_KEY` / `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` variables are never read.
+
+#### Ambient AWS credential scope
+
+The AWS credential fallbacks (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are a different trust class from the `FERRUM_PLUGIN_SECRET_<NAME>` namespace. A plugin-secret value is one the environment owner deliberately placed where plugin configs may use it, so it may follow a config to its chosen endpoint. The standard AWS variables are the gateway process's own cloud identity — often exported for unrelated reasons (a launcher that copies a task role or instance profile into the environment, a CI runner) — and the principal writing plugin config (an admin API `operator`, a CP tenant, a mesh policy author) does not own them. The same rule therefore applies to `serverless_function` (`aws_lambda`) and to `ai_federation` (`aws_bedrock`).
+
+These plugins read **only** those three variables (plus the region variables and, for Lambda, `AWS_LAMBDA_FUNCTION_NAME` / `AWS_LAMBDA_ENDPOINT_URL`) from the process environment. They never consult the AWS SDK default credential chain — no instance metadata (IMDS), no ECS container credentials (`AWS_CONTAINER_CREDENTIALS_*`), no web identity token, no SSO, and no shared config or credentials profile files — so the scope below covers every ambient credential source they use. A value the gateway's external secret resolution writes into those variables (the `_VAULT`, `_AWS`, `_FILE`, … suffixes) is treated as ambient too.
+
+- **Config credentials are not scoped.** When `aws_access_key_id` and `aws_secret_access_key` (and `aws_session_token`, when one is used) are written into the plugin config, they are the config author's own credentials and may sign requests for any endpoint the config validly names — a LocalStack origin, a mock server, a corporate proxy. `AWS_SESSION_TOKEN` is never paired with a config key pair: an STS session token is bound to its access key, so the environment token is only used when the key id and secret also came from the environment.
+- **Process-environment credentials are scoped to the service.** When the key id or the secret resolves from the environment, the region must be a commercial (`us|eu|ap|sa|ca|me|af|il|mx-<area>-<n>`), GovCloud (`us-gov-<area>-<n>`), or China (`cn-<area>-<n>`) region — the AWS SDK partition grammars, with lowercase letters only — and the endpoint the config chooses must be an official endpoint of that service for that region, over HTTPS on the default port:
+  - `<service>[-fips].<region>.amazonaws.com`,
+  - dual-stack `<service>[-fips].<region>.api.aws`,
+  - an interface VPC endpoint `vpce-<id>[-<az>].<service>[-fips].<region>.vpce.amazonaws.com`,
+
+  where `<region>` is a commercial or GovCloud region; a China (`cn-*`) region uses `amazonaws.com.cn` in place of `amazonaws.com` and the dual-stack `api.amazonwebservices.com.cn` in place of `api.aws`. No other pairing of region and suffix matches.
+
+  `<service>` is `lambda` for `serverless_function` and `bedrock-runtime` for `ai_federation`. Generic `*.amazonaws.com` is deliberately **not** accepted: customer-owned EC2 DNS names, load balancers, API Gateway stages, and S3 buckets and websites live under that suffix too. That is also why the region is matched against the partition grammar rather than its shape: a legacy dash-style S3 host such as `lambda.s3-us-west-2.amazonaws.com` is the bucket named `lambda`, and `s3-us-west-2`, `s3-external-1`, or `s3-website-us-east-1` is not a region. The config-chosen endpoint is the host derived from `aws_region` (so a malformed region cannot redirect the derived host), `aws_endpoint_url`, or the Bedrock `base_url`.
+- **`AWS_LAMBDA_ENDPOINT_URL` is trusted like the environment credentials.** It is set by the same environment owner, so when a `serverless_function` row sets no `aws_endpoint_url`, an `AWS_LAMBDA_ENDPOINT_URL` endpoint (the usual LocalStack setup) needs no opt-in. The region is still screened, and a config-set `aws_endpoint_url` stays scoped even when `AWS_LAMBDA_ENDPOINT_URL` is set.
+- **Partitions without public endpoints need the opt-in.** The air-gapped ISO partitions (`us-iso-*`, `us-isob-*`, `eu-isoe-*`, `us-isof-*`) and the AWS European Sovereign Cloud (`eusc-*`, `*.amazonaws.eu`) use their own region grammars and DNS suffixes and are not modelled, so process credentials reach them only through `allow_custom_endpoint_with_ambient_credentials` (the region screen applies even with an `AWS_LAMBDA_ENDPOINT_URL`).
+- **Enforced twice.** Configuration admission refuses an out-of-scope region or endpoint with a validation error that names the environment-resolved fields and the opt-in, never the endpoint, the region, or a credential. CP/admin shape-only admission of `serverless_function` cannot see a serving node's environment, so whenever the row omits the key pair it screens a configured `aws_region` (even with no endpoint configured) and a configured `aws_endpoint_url`; the serving node re-checks the fully resolved values when it builds its plugin cache. Every request then re-checks the endpoint before signing: `serverless_function` fails closed with `500` (`ambient_credential_endpoint_refused`) regardless of `on_error`, and `ai_federation` treats it as a pre-wire dispatch-policy rejection of that provider. Both emit a sampled warning that names the redacted destination or the provider, never a credential.
+- **Explicit opt-in.** `allow_custom_endpoint_with_ambient_credentials: true` (a top-level `serverless_function` field, a per-provider `ai_federation` field; default `false`) lifts the scope for that instance or provider, for a deliberately chosen private endpoint such as LocalStack or an air-gapped partition. Anyone who can write that plugin config can then direct the process credentials to the endpoint it names, so prefer config credentials (or an official VPC endpoint, which needs no opt-in) where possible.
+
+Azure Functions and GCP Cloud Functions credentials have no process-environment fallback outside the plugin-secret namespace, and `ai_federation` reads no ambient credential for any provider other than `aws_bedrock` (Google Vertex service-account OAuth is additionally pinned to `https://oauth2.googleapis.com/token`).
 
 #### Example: AWS Lambda pre-proxy enrichment
 
@@ -5058,6 +5134,7 @@ config:
 - Header and query operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints. Rejection is by property **presence**, not by parsed value, for every target — an explicit `new_key: null` on `add`/`update`/`remove`, or an explicit `value: null` on `remove`/`rename`, fails exactly as a string would. (An explicit `value: null` on a body `add`/`update` remains valid: that sets the target field to JSON null.)
 - Header `add`/`update` destinations and `rename` destinations reject gateway-owned names (case-insensitive): `Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Keep-Alive`, `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, `Expect`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Ferrum-Original-Content-Encoding`, and `X-Grpc-Web-Mode`. Use `preserve_host_header` for Host or trusted-proxy configuration for forwarding identity. Removal and rename sources remain allowed; query/body keys are unaffected.
 - Header `add`/`update` destinations and `rename` destinations also reject the whole gateway-owned `x-consumer-*` namespace (case-insensitive), including `X-Consumer-Username` and `X-Consumer-Custom-Id`: the error names the offending `rule[N]` and the `x-consumer-*` rule. Only the gateway asserts consumer identity to backends (see [Consumer Identity Headers](#consumer-identity-headers)). `remove` of, and `rename` away from, an `x-consumer-*` name remain allowed.
+- Every header rule that names the gateway-owned `X-Ferrum-Hops` proxy hop count (any case, `_` or `-`) is rejected, including `remove` and `rename` away from it: resetting the count would let a request loop past `FERRUM_MAX_PROXY_HOPS` (see [Proxy hop limit](routing.md#proxy-hop-limit)).
 - Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
 - Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF keep a dedicated diagnostic and other forbidden control bytes (NUL, DEL, …) fail construction instead of being dropped later at a protocol boundary. Route-level request header transforms (`mesh_route_dispatch` → `apply_route_overrides`) apply the same value gate.
 
@@ -5775,7 +5852,7 @@ Media types outside `content_types` / `response_content_types`, and allowlisted 
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
 | `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields; at least one is required |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor (independent of required-field initialization, which is always enforced) |
-| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
+| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Positive maximum decompressed gRPC protobuf payload size for request and response validation; zero is rejected so compressed input is always bounded. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer greater than zero; otherwise falls back to 10 MiB (10485760). |
 
 **gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
 
@@ -6074,6 +6151,9 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 
 **Priority:** 2850
 
+IP-based rate keys group IPv6 addresses in the same `/64`; IPv4 remains
+per-address. Consumer keys are unaffected.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth. Inclusive range `0..=4294967295`; negative values and values above `4294967295` are rejected at plugin load time |
@@ -6252,6 +6332,41 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 
 **Priority:** 275
 **Protocol:** gRPC only
+
+**A route configured with this plugin is gRPC-only.** Every instance is
+request-admission policy, and it cannot run on plain HTTP or WebSocket
+requests, so when a proxy (or its proxy group) carries `grpc_method_router`,
+the gateway refuses a plain HTTP or WebSocket request on that route with `403`
+`{"error":"Request protocol not permitted on this route"}` and
+`rejection_phase: "route_protocol_admission"` before any plugin runs, rather
+than serving it without the method policy. Native gRPC and gRPC-Web requests
+run the method policy and are unaffected. A browser's CORS preflight (`OPTIONS`
+with `Origin` and `Access-Control-Request-Method`, no body) is exempt when the
+route also carries a `cors` plugin that answers preflights (one without
+`preflight_continue`): it invokes no gRPC method, and browser gRPC-Web cannot
+start without it, so it reaches that `cors` plugin as before. The preflight must
+have no body on every protocol: no `Transfer-Encoding`, `Content-Length` absent
+or `0`, and on HTTP/2 and HTTP/3 a request stream that ends with no DATA frame
+(HTTP/3 waits at most 2 seconds for that end, or the route's
+`backend_read_timeout_ms` when it is shorter). An exempted preflight is never
+forwarded to the backend: if no plugin answers
+it (for example `cors` forwards an unmatched preflight with
+`unmatched_preflights: forward`, or a trigger skips `cors`), it gets the same
+`403` / `route_protocol_admission` refusal. Serve plain HTTP endpoints such as
+health checks from a separate route.
+
+A `global` instance does not refuse anything this way, because it applies to
+every route, gRPC or not. It therefore does not constrain a backend that also
+serves the same methods over plain HTTP, such as a Connect server
+(`application/json` or `application/connect+proto` POSTs to
+`/package.Service/Method`) or grpc-gateway transcoding: those calls reach the
+backend without the global method policy. The gateway logs a warning at load
+and reload while such a global instance exists. Attach the plugin to the proxy
+or proxy group to make that route gRPC-only. See
+[Protocol Support](plugin_execution_order.md#protocol-support).
+
+IP-based rate keys group IPv6 addresses in the same `/64`; IPv4 remains
+per-address. Consumer keys are unaffected.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -6831,9 +6946,11 @@ config:
   providers:
     - name: openai
       provider_type: openai
-      api_key: ${OPENAI_API_KEY}
+      api_key: "sk-..."
       model_patterns: ["gpt-*"]
 ```
+
+`ai_federation` does **not** expand `${...}` references in `api_key`, so supply the literal credential as shown (unlike [`ai_stream_router`](#ai_stream_router), whose `api_key` accepts a whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference).
 
 With it enabled, `before_proxy` claims the streaming request, commits exactly one provider, and rewrites the routing decision through `RequestContext.route_override_*` so the **normal proxy dispatch path** relays the provider's SSE incrementally. On a proxy with backend-path policy, this hook runs in the deferred pass only after the effective target path is authorized; provider I/O still waits for finalized request egress after all final-body policy. Time to first token, client-disconnect cancellation, byte budgets, retained-response ceilings, and shutdown accounting all come from the shared streaming response machinery rather than a plugin-private relay; the plugin itself creates no queues, channels, or detached tasks.
 
@@ -6964,7 +7081,7 @@ Gemini function calls do not carry an OpenAI call ID in the native response shap
 
 **Google Vertex additional fields:** `google_project_id`, `google_region`, `google_service_account_json`.
 
-**AWS Bedrock additional fields:** `aws_region`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`. Credentials fall back to standard AWS environment variables (`AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+**AWS Bedrock additional fields:** `aws_region`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`, `allow_custom_endpoint_with_ambient_credentials` (Boolean, default `false`). Credentials fall back to standard AWS environment variables (`AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`). `AWS_SESSION_TOKEN` is used only when the key id and secret also come from the environment. A credential resolved from the process environment may only be signed for an official Amazon Bedrock Runtime endpoint of the configured region (`bedrock-runtime[-fips].<region>.amazonaws.com`, `bedrock-runtime[-fips].<region>.api.aws`, or `vpce-<id>[-<az>].bedrock-runtime[-fips].<region>.vpce.amazonaws.com` for a commercial or GovCloud region; `amazonaws.com.cn` and the dual-stack `api.amazonwebservices.com.cn` for a `cn-*` region); a `base_url` or `aws_region` outside that scope is refused at admission unless `allow_custom_endpoint_with_ambient_credentials: true` is set on the provider, and every provider call re-checks the rendered endpoint. The default endpoint is partition-aware (`bedrock-runtime.<region>.amazonaws.com.cn` for a `cn-*` region). Credentials written into the provider config are not scoped. See [Ambient AWS credential scope](#ambient-aws-credential-scope).
 
 **Example configuration:**
 
@@ -7060,13 +7177,13 @@ config:
     - name: openai
       provider_type: openai
       endpoint: https://api.openai.com/v1/chat/completions
-      api_key: ${OPENAI_API_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_OPENAI_API_KEY}
       model_patterns: ["gpt-*", "o*"]
       priority: 1
     - name: anthropic
       provider_type: anthropic
       endpoint: https://api.anthropic.com/v1/messages
-      api_key: ${ANTHROPIC_API_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_ANTHROPIC_API_KEY}
       model_patterns: ["claude-*"]
       priority: 2
       anthropic_version: "2023-06-01"
@@ -7090,7 +7207,7 @@ config:
 | `name` | String | — | **Required**, non-empty, unique within the instance. Surfaced as `ai_stream_router.provider`. |
 | `provider_type` | String | — | **Required**. One of `openai`, `openai_compatible`, `anthropic`, `google_gemini`. |
 | `endpoint` | String | — | **Required** absolute `https://` URL (or `http://` with `allow_plaintext`). May carry a literal `{model}` path placeholder and its own query string. A literal-IP host is checked against the gateway backend egress policy at admission, and an explicit port `0` is rejected (an outbound destination cannot use port zero). |
-| `api_key` | String | — | **Required**, non-empty. A `${ENV_VAR}` reference is resolved from the process environment. The resolved value must be a valid HTTP header value, so a stray newline is a configuration error rather than a `502` on every request. |
+| `api_key` | String | — | **Required**, non-empty. A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference is resolved from the process environment at construction; a `${...}` reference to any other variable (including every other `FERRUM_*` setting) is refused at admission, and an unset or empty referenced variable fails construction. The resolved value must be a valid HTTP header value, so a stray newline is a configuration error rather than a `502` on every request. |
 | `model_patterns` | Array | — | **Required**, 1–128 globs matched against the request `model`. Each glob is 1–256 ASCII bytes containing only letters, digits, `.`, `_`, `:`, `/`, `+`, `-`, and `*`, with no `..` sequence; unsupported wildcards such as `?` or `[` fail admission. `*` is the only wildcard, never consumes a URL-structural separator (`/`, `?`, `#`, `&`, `\`) or whitespace, and the pattern is anchored at both ends — so `*mini` matches `model-mini` and `mini-mini` alike, and never matches `mini-pro`. |
 | `priority` | Integer | provider index + 1 | Lower is matched first. Must be at least `1` and fit in a `u32`. |
 | `allow_plaintext` | Boolean | `false` | Required opt-in for an `http://` endpoint: plaintext provider egress is rejected at admission without it. It has no effect on an `https` endpoint and does not relax runtime TLS or FIPS policy. Use it only for an internal, same-trust-domain provider. |
@@ -7109,7 +7226,7 @@ config:
       provider_type: openai_compatible
       endpoint: http://vllm.internal.svc.cluster.local:8000/v1/chat/completions
       allow_plaintext: true
-      api_key: ${INTERNAL_VLLM_KEY}
+      api_key: ${FERRUM_PLUGIN_SECRET_INTERNAL_VLLM_KEY}
       model_patterns: ["llama-*", "mistral-*"]
 ```
 
@@ -7253,7 +7370,7 @@ Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy 
 | `provider.type` | string | required | `openai_compatible_embeddings` |
 | `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint. Literal IP hosts are checked against `FERRUM_BACKEND_ALLOW_IPS`; DNS hostnames participate in startup warmup and are checked by the shared plugin HTTP client at request time |
 | `provider.model` | string | optional | Embedding model name |
-| `provider.api_key_env` | string | optional | Environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
+| `provider.api_key_env` | string | optional | Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Any other variable (including every other `FERRUM_*` setting) is refused at admission. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
 | `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
 | `builtins.*` | bool/object | all enabled when `builtins` is omitted | Built-in packs. Boolean shorthand enables/disables a pack; object form supports `enabled`, `examples_mode`, and `examples` |
 | `extraction.request_json_paths` | string[] | all supported request paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported request paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected request fields |
@@ -7410,7 +7527,7 @@ config:
     type: openai_compatible_embeddings
     endpoint: http://localhost:8081/v1/embeddings
     model: text-embedding-3-small
-    api_key_env: EMBEDDING_API_KEY
+    api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
     request_timeout_ms: 5000
 ```
 
@@ -7425,7 +7542,7 @@ config:
     type: openai_compatible_embeddings
     endpoint: http://localhost:8081/v1/embeddings
     model: text-embedding-3-small
-    api_key_env: EMBEDDING_API_KEY
+    api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
 ```
 
 **HR assistant allowlist:**
@@ -7539,7 +7656,7 @@ Caches LLM responses keyed by family-correct prompts across Ferrum's recognized 
 | `semantic_embedding_input_type` | String (optional) | -- | Nonblank provider-specific input/task type. Used by Voyage (`query`/`document`), Cohere/Bedrock Cohere (`search_query`, `search_document`, `classification`, `clustering`), Gemini (`SEMANTIC_SIMILARITY`, etc.), and Vertex (`task_type`). |
 | `semantic_embedding_output_dimension` | u64 (optional) | -- | Provider-specific reduced embedding dimension from 1 to 16384 when supported. Mistral uses `output_dimension`; OpenAI/Azure OpenAI and Titan use `dimensions`; Voyage/Cohere use `output_dimension`; Gemini/Vertex use `outputDimensionality`. |
 | `semantic_embedding_api_key` | String (optional) | -- | Nonblank API key for the embedding endpoint. The final authorization header is validated at admission, retained as sensitive, and reused on requests. Invalid characters in either key or scheme fail admission with a value-redacted field error. Sent in `semantic_embedding_auth_header` with `semantic_embedding_auth_scheme` when configured. |
-| `semantic_embedding_auth_header` | String | provider default | Valid HTTP header name used for `semantic_embedding_api_key`. Defaults to `Authorization`, except Azure OpenAI uses `api-key` and Google Gemini uses `x-goog-api-key`. |
+| `semantic_embedding_auth_header` | String | provider default | Valid HTTP header name used for `semantic_embedding_api_key`. Defaults to `Authorization`, except Azure OpenAI uses `api-key` and Google Gemini uses `x-goog-api-key`. Must not be the gateway-owned `X-Ferrum-Hops` (any case, `_` or `-`), which the embedding call carries itself. |
 | `semantic_embedding_auth_scheme` | String | provider default | Valid HTTP header value prefix for the API key. Defaults to `Bearer`, except Azure OpenAI and Google Gemini send the raw key. Set to an empty string to send the raw key. |
 | `semantic_similarity_threshold` | number | `0.95` | Minimum cosine similarity for a semantic cache hit. Must be > 0 and <= 1. |
 | `semantic_vector_max_candidates` | u64 | `16` | Number of nearest HNSW candidates to inspect (`ef_search` / `ef_construction`). Increase when semantic entries span many scopes. Must be positive. Hard maximum 1024. |
@@ -7797,11 +7914,14 @@ Rate-limits consumers by LLM token consumption instead of request count. The lim
 
 Supports both regular JSON and streaming responses. A JSON usage document is read from the collected response body; a streaming response is metered **incrementally**, without buffering (see **Streaming token accounting** below). When `ai_token_metrics` is active on a buffered response, tokens are read from its metadata instead.
 
-**This plugin is HTTP-only.** Native gRPC is not supported and the plugin is not registered for the `Grpc` protocol view, so it can never be attached to native gRPC AI traffic as an enforcement control. The entire accounting lifecycle — prompt estimation, pre-reservation, and post-response reconciliation — is defined over bare JSON request bodies and JSON/SSE response bodies; native gRPC carries length-prefixed, optionally compressed protobuf frames with no gateway-known usage schema, and no explicitly configured descriptor-based usage extraction exists. Because gRPC is never pinned in proxy configuration — a single `http`/`https` proxy serves REST, gRPC, and WebSocket by per-request content-type detection — the declared protocol set *is* the admission boundary: `PluginCache` builds one plugin list per protocol, and the admin API, file mode, CP validation, and DP full/incremental config application all go through that same shared build, so none of them installs this limiter on the native gRPC view.
+**This plugin is HTTP-only.** Native gRPC is not supported and the plugin is not registered for the `Grpc` protocol view, so it can never be attached to native gRPC AI traffic as an enforcement control. The entire accounting lifecycle — prompt estimation, pre-reservation, and post-response reconciliation — is defined over bare JSON request bodies and JSON/SSE response bodies; native gRPC carries length-prefixed, optionally compressed protobuf frames with no gateway-known usage schema, and no explicitly configured descriptor-based usage extraction exists. Because gRPC is never pinned in proxy configuration — a single `http`/`https` proxy serves REST, gRPC, and WebSocket by per-request content-type detection — the declared protocol set *is* the admission boundary: `PluginCache` builds one plugin list per protocol, and the admin API, file mode, CP validation, and DP full/incremental config application all go through that same shared build, so none of them installs this limiter on the native gRPC view. Because this limiter is admission policy, a native-gRPC or WebSocket request on a route that carries it is refused with `403` / `PERMISSION_DENIED` rather than served unmetered (see [Protocol Support](plugin_execution_order.md#protocol-support)).
 
 **gRPC-Web is also unsupported.** gRPC-Web rides the HTTP (and composed H3 gRPC-Web) view, so the plugin can still observe it, and it explicitly stays out of the way: framed `application/grpc-web*` bodies — including the `+json` variants that otherwise satisfy the JSON content-type screen — are never buffered, never classified as a JSON AI request, and never parsed as a JSON usage document on the response side. Such traffic is left as ordinary non-AI traffic rather than being charged zero tokens against a budget or turned into a 502 by `on_unmetered_response`. Ordinary HTTP JSON and SSE AI traffic is unaffected.
 
 **Priority:** 4200
+
+When `limit_by: "ip"`, IPv6 addresses in the same `/64` share token budgets;
+IPv4 remains per-address.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -7920,7 +8040,7 @@ config:
 
 Scans AI/LLM request bodies for PII and either rejects, redacts, or warns.
 
-This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-decoding contract, so the plugin is not registered for the gRPC protocol view and must not be treated as a fail-closed PII control for unary or streaming native gRPC traffic. Request buffering is only enabled for matching JSON `POST` requests when the plugin has at least one valid pattern to scan. Ordinary scan modes skip gRPC-Web framed bodies. In `scan_fields: mcp_arguments`, `+json` gRPC-Web media types are accepted only when the body is bare JSON. Framed payloads, including `application/grpc-web-text+json`, fail JSON parsing and pass uninspected; `mcp_gateway` refuses them. A body that fails the whole-document parse but looks like a JSON document that may still carry a `tools/call` is refused instead (see **Unparseable bodies** under `mcp_arguments` below).
+This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-decoding contract, so the plugin is not registered for the gRPC protocol view and must not be treated as a fail-closed PII control for unary or streaming native gRPC traffic. A native-gRPC or WebSocket request on a route that carries the shield is refused with `403` / `PERMISSION_DENIED` rather than served uninspected (see [Protocol Support](plugin_execution_order.md#protocol-support)). Request buffering is only enabled for matching JSON `POST` requests when the plugin has at least one valid pattern to scan. Ordinary scan modes skip gRPC-Web framed bodies. In `scan_fields: mcp_arguments`, `+json` gRPC-Web media types are accepted only when the body is bare JSON. Framed payloads, including `application/grpc-web-text+json`, fail JSON parsing and pass uninspected; `mcp_gateway` refuses them. A body that fails the whole-document parse but looks like a JSON document that may still carry a `tools/call` is refused instead (see **Unparseable bodies** under `mcp_arguments` below).
 
 **Method scope is one decision.** Buffering, `before_proxy`, the request-body transform, and final validation all apply the same bare-JSON `POST` scope. Another body plugin can force a request onto the buffered path, and the shared transform loop then visits every body-modifying plugin regardless of which one asked for the buffer — so without a method check on the transform itself, adding an unrelated body rule to a route would silently extend the shield's redaction to methods the same shield configuration otherwise leaves untouched. The context-free `transform_request_body` compatibility API proves that scope from an explicit `:method` pseudo-header and declines when it cannot.
 
@@ -8259,6 +8379,7 @@ config:
     initialize_upstreams: lazy
     session_ttl_seconds: 3600
     max_sessions: 16384
+    max_sessions_per_principal: 128
   servers:
     github:
       upstream_url: http://github-mcp.example/mcp
@@ -8305,6 +8426,7 @@ config:
 | `sessions.initialize_upstreams` | enum | `lazy` | `lazy`, `startup`, or `passthrough`; `startup` is a V1 alias for `lazy`. |
 | `sessions.session_ttl_seconds` | uint | `3600` | Must be greater than 0. |
 | `sessions.max_sessions` | uint | `16384` | Must be greater than 0. |
+| `sessions.max_sessions_per_principal` | uint | `128` (capped to `max_sessions`) | Must be from 1 through `sessions.max_sessions`; at this cap, the principal's own oldest session is evicted. |
 | `sessions.sse_multiplexing` | bool | `false` | Aggregate-router only. Enables the `GET` session event stream and POST-attached response streams — see *Aggregate MCP Streamable HTTP event streams*. |
 | `sessions.sse_max_streams_per_session` | uint | `64` | 1–4096. |
 | `sessions.sse_max_retained_events` | uint | `128` | 1–16384. |
@@ -8459,7 +8581,7 @@ servers:
 
 `sessions.downstream_session_header` is stamped onto the client response, so it additionally rejects protocol-managed hop-by-hop / framing names (see [Final response framing](#final-response-framing)); `sessions.upstream_session_header` is a backend request field and keeps its own contract.
 
-`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. The cap check, in-memory eviction, and insert are serialized (so concurrent `initialize` calls cannot grow the store past `max_sessions`) in a single scan, while the evicted sessions' upstream `DELETE` cleanup is issued concurrently *after* that critical section so eviction never blocks new sessions behind upstream network round trips. In `aggregate_router` mode the gateway mints a synthetic downstream session id and never forwards it upstream: routed calls strip the downstream session header and carry only a mediated upstream session id when one exists. A downstream session is also **bound to the principal that created it**: the gateway records the authenticated `Consumer` (namespace plus record id, falling back to the username) or, when no Consumer is mapped, the external authenticated identity set by plugins such as `jwks_auth` **together with the realm that verified it** — the authentication mechanism plus the verifying authority (`jwks_auth` provider issuer and key source, `oidc_relying_party` issuer, `oauth2_introspection` issuer and introspection/discovery endpoint, `ldap_auth` directory URL, bind/search base, and identity attribute) — and every later request presenting that session id must carry the same principal. Equal subject strings from different accepted issuers, providers, or authentication plugins (two issuers that both assert `sub: alice`, say) are therefore different owners and cannot reuse each other's session for catalog listing, routed calls, the SSE listener, cancellation, or `DELETE`; a Consumer-mapped caller stays bound by namespace and record id alone. A `jwks_auth` provider that pins no `issuer` (one key set shared by several tenants) also binds each token's verified `iss`, and every realm includes the claim path the identity is read from (`consumer_identity_claim` or its provider override). The realm is an opaque configuration digest committed with the identity at the authentication boundary; it carries no token or claim material. **Changing a provider's `jwks` / `jwks_uri` / `discovery_url`, `issuer`, introspection endpoint, identity claim, or an `ldap_auth` directory URL / bind or search base changes the realm, so existing aggregate MCP sessions owned by external identities under the old realm stop matching and their clients must re-`initialize`.** A mismatch is refused with the same `404` session-not-found response an unknown or terminated session produces, so possession of a session id is not by itself enough to reach that session's private catalog or its mediated upstream sessions, and a refusal does not disclose whether the session exists. Refused reuse does not extend the session's idle lifetime. The comparison runs in both directions, so a session minted on a proxy with no authentication plugin — where there is no principal to record — stays usable only by equally unauthenticated requests. Server ids must be URI-safe (`[A-Za-z0-9._-]`) because they appear in public `mcp://` resource URIs, and `sessions.downstream_session_header`/`sessions.upstream_session_header` must be valid HTTP header names; both are checked at config validation. In `aggregate_router` mode, `validation.validate_tool_results` (default `false`) compiles each discovered tool `outputSchema` at catalog construction, pins that exact validator for each dispatched call, and, when enabled, validates the caller-visible `tools/call` result before release: `structuredContent` is preferred, a single JSON text `content` block is accepted when structured content is absent, disagreeing mixed variants fail closed with JSON-RPC `-32012`, and exact response bytes with duplicate object members are rejected before any JSON rewrite or materialization. Well-formed tool errors (`isError: true` with array `content`) and well-formed upstream JSON-RPC errors are preserved; non-boolean or bare `isError` values and event-stream / non-JSON / oversized results fail closed. Transparent mode rejects the option because it has no mediated tool catalog. Invalid or unrepresentable `outputSchema` values (non-local `$ref`, over-budget document nesting/nodes, over-budget local `$ref` resolution depth, unsupported `$vocabulary`) are refused at catalog admission with field-specific diagnostics and never log result bodies. Changing the flag on reload/update reconstructs enforcement; deleting or disabling the plugin removes it. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, advertising a capability with no dedicated dispatch — `capabilities.advertise_completions`, `capabilities.advertise_logging`, or `capabilities.advertise_tasks` — requires `capabilities.passthrough_unknown_methods: true` so those methods (`completion/complete`, `logging/*`, `tasks/*`) are routed to the primary upstream instead of advertised without support. If `observability.log_raw_arguments` is enabled, the gateway logs the arguments it parses from the synchronized request body; when `ai_prompt_shield` redacts earlier in the chain, those arguments are already redacted. Without the shield, raw arguments may contain secrets or PII, so prefer the default argument hashing unless the logging path is explicitly protected.
+`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; expired sessions are reclaimed before accepting new `initialize` calls. `sessions.max_sessions_per_principal` bounds each caller’s live sessions. At that cap, the caller’s own oldest session is evicted; when the aggregate cap is full and the caller has no session to replace, initialization is refused without evicting another principal’s live session. Anonymous sessions are quota-grouped by resolved client IPv6 `/64` (IPv4 remains per-address), so one anonymous source cannot evict another source's session. Admission, in-memory eviction, and insert are serialized so concurrent `initialize` calls cannot exceed either cap, while evicted sessions' upstream `DELETE` cleanup is issued concurrently *after* that critical section so eviction never blocks new sessions behind upstream network round trips. In `aggregate_router` mode the gateway mints a synthetic downstream session id and never forwards it upstream: routed calls strip the downstream session header and carry only a mediated upstream session id when one exists. A downstream session is also **bound to the principal that created it**: the gateway records the authenticated `Consumer` (namespace plus record id, falling back to the username) or, when no Consumer is mapped, the external authenticated identity set by plugins such as `jwks_auth` **together with the realm that verified it** — the authentication mechanism plus the verifying authority (`jwks_auth` provider issuer and key source, `oidc_relying_party` issuer, `oauth2_introspection` issuer and introspection/discovery endpoint, `ldap_auth` directory URL, bind/search base, and identity attribute) — and every later request presenting that session id must carry the same principal. Equal subject strings from different accepted issuers, providers, or authentication plugins (two issuers that both assert `sub: alice`, say) are therefore different owners and cannot reuse each other's session for catalog listing, routed calls, the SSE listener, cancellation, or `DELETE`; a Consumer-mapped caller stays bound by namespace and record id alone. A `jwks_auth` provider that pins no `issuer` (one key set shared by several tenants) also binds each token's verified `iss`, and every realm includes the claim path the identity is read from (`consumer_identity_claim` or its provider override). The realm is an opaque configuration digest committed with the identity at the authentication boundary; it carries no token or claim material. **Changing a provider's `jwks` / `jwks_uri` / `discovery_url`, `issuer`, introspection endpoint, identity claim, or an `ldap_auth` directory URL / bind or search base changes the realm, so existing aggregate MCP sessions owned by external identities under the old realm stop matching and their clients must re-`initialize`.** A mismatch is refused with the same `404` session-not-found response an unknown or terminated session produces, so possession of a session id is not by itself enough to reach that session's private catalog or its mediated upstream sessions, and a refusal does not disclose whether the session exists. Refused reuse does not extend the session's idle lifetime. The comparison runs in both directions, so a session minted on a proxy with no authentication plugin — where there is no principal to record — stays usable only by equally unauthenticated requests. Server ids must be URI-safe (`[A-Za-z0-9._-]`) because they appear in public `mcp://` resource URIs, and `sessions.downstream_session_header`/`sessions.upstream_session_header` must be valid HTTP header names; both are checked at config validation. In `aggregate_router` mode, `validation.validate_tool_results` (default `false`) compiles each discovered tool `outputSchema` at catalog construction, pins that exact validator for each dispatched call, and, when enabled, validates the caller-visible `tools/call` result before release: `structuredContent` is preferred, a single JSON text `content` block is accepted when structured content is absent, disagreeing mixed variants fail closed with JSON-RPC `-32012`, and exact response bytes with duplicate object members are rejected before any JSON rewrite or materialization. Well-formed tool errors (`isError: true` with array `content`) and well-formed upstream JSON-RPC errors are preserved; non-boolean or bare `isError` values and event-stream / non-JSON / oversized results fail closed. Transparent mode rejects the option because it has no mediated tool catalog. Invalid or unrepresentable `outputSchema` values (non-local `$ref`, over-budget document nesting/nodes, over-budget local `$ref` resolution depth, unsupported `$vocabulary`) are refused at catalog admission with field-specific diagnostics and never log result bodies. Changing the flag on reload/update reconstructs enforcement; deleting or disabling the plugin removes it. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, advertising a capability with no dedicated dispatch — `capabilities.advertise_completions`, `capabilities.advertise_logging`, or `capabilities.advertise_tasks` — requires `capabilities.passthrough_unknown_methods: true` so those methods (`completion/complete`, `logging/*`, `tasks/*`) are routed to the primary upstream instead of advertised without support. If `observability.log_raw_arguments` is enabled, the gateway logs the arguments it parses from the synchronized request body; when `ai_prompt_shield` redacts earlier in the chain, those arguments are already redacted. Without the shield, raw arguments may contain secrets or PII, so prefer the default argument hashing unless the logging path is explicitly protected.
 
 **Aggregate MCP Streamable HTTP event streams.** In `aggregate_router` mode with `sessions.sse_multiplexing` (default **`false`**), the gateway serves the event-stream half of MCP Streamable HTTP: a client may open **one** `GET` SSE listener per live downstream MCP session (`Accept: text/event-stream` plus the configured session header), and a `POST` carrying a JSON-RPC **request** whose result the gateway does not already hold is answered with its **own** `text/event-stream` response on that same `POST`.
 
@@ -8952,7 +9074,9 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings. A configured CA bundle is exclusive: if the path is set and verification is on, a load failure refuses plugin construction instead of falling back to system/public roots. `FERRUM_TLS_NO_VERIFY=true` remains the sanctioned skip-verify path and does not treat an unloadable CA as a construction error.
 
 At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram. Unknown top-level keys are rejected. A configured rate times `window_seconds` that overflows an unsigned 64-bit integer is refused at construction (a residual the OpenAPI schema cannot express).
-IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once at UDP/DTLS session admission, before local or Redis key construction, so both textual forms share one datagram and byte budget without adding per-datagram allocation.
+IP-based keys group IPv6 addresses in the same `/64`; IPv4 and IPv4-mapped IPv6
+addresses share one per-address budget. IPv4 keys reuse the resolved address
+allocation on the per-datagram hot path.
 
 **Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes; it uses the same `redis_failure_policy` and Cluster screening as `rate_limiting`. Counting is a **plain fixed window** (`{prefix:key}:datagrams|bytes:{window_index}`, one counter per configured window with no previous-window term at all) — neither the sub-bucketed trailing window nor the weighted approximation — so a datagram flood may straddle a window boundary and spend two consecutive windows' budgets back to back. While the centralized store is unavailable the default `fail_closed` policy drops the datagram (a datagram has no error channel, so failing closed *is* the drop), and `local_fallback` is the explicit opt-in to per-process counters. The datagram and byte keys of one client share a hash tag so their transaction is slot-stable.
 
@@ -9635,7 +9759,7 @@ Direct providers use these envelopes (they are different from Istio's name-only 
 | `opentelemetry` | `endpoint` string | OTLP/HTTP JSON; supply the complete `/v1/traces` URL. |
 | `zipkin` | `url` string | Zipkin v2 JSON; supply the complete `/api/v2/spans` URL. |
 | `datadog` | `agent_url` string | Optional `service` string or null overrides the span service name; the exporter appends `/v0.3/traces` if needed. |
-| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
+| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `access_token_env` must name a `FERRUM_PLUGIN_SECRET_<NAME>` variable (any other variable is refused at admission, even while span reporting is disabled). `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
 
 Provider objects require `kind` and `config`; unknown nested keys are ignored. Active endpoint URLs must be absolute HTTP(S), have a host, and contain no embedded credentials. Lightstep's variable must be readable and its value valid for the bearer header.
 

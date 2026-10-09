@@ -1257,6 +1257,7 @@ jobs:
               integration::admin_backend_egress_policy_tests
               integration::admin_batch_atomicity_tests
               integration::admin_batch_reference_check_tests
+              integration::admin_plugin_graph_scope_tests
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
               integration::admin_metrics_tls_inventory_snapshot_tests
@@ -1295,6 +1296,8 @@ jobs:
               integration::gateway_api_backend_ref_kinds_tests
               integration::gateway_api_backend_tls_policy_tests
               integration::gateway_api_listenerset_tests
+              integration::gateway_api_route_isolation_tests
+              integration::gateway_api_selectorless_endpoint_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_gatewayclass_authority_tests
               integration::k8s_controller_istio_status_cas_tests
@@ -1350,6 +1353,7 @@ jobs:
               integration::mesh_destination_rule_visibility_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
+              integration::sidecar_connect_http_port_tests
               integration::sidecar_ingress_bind_tests
               integration::mesh_config_revision_tests
               integration::mesh_subscribe_validation_tests
@@ -1362,6 +1366,7 @@ jobs:
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
+              integration::http3_quic_admission_tests
               integration::mesh_h3_plain_ws_bridge_tests
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests
@@ -1398,6 +1403,8 @@ jobs:
               integration::port_aware_route_traffic_tests
               integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
+              integration::consumer_delta_quarantine_tests
+              integration::cp_consumer_quarantine_forget_tests
               integration::db_mutation_decode_fail_closed_tests
               integration::consumer_identity_enforcement_tests
               integration::db_offline_bootstrap_tests
@@ -2060,7 +2067,7 @@ jobs:
         env:
           RUSTFLAGS: "--cap-lints=warn"
         run: |
-          cargo update --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.19
+          cargo update --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.20
           cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
           # Patch 002: every positive amount of HTTP/2 flow-control capacity
           # permits body progress, including a 512-byte peer stream window and
@@ -2075,10 +2082,10 @@ jobs:
           cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
           # The gateway runs hyper on the vendored h2 (h2-001), so run every
           # Ferrum hyper regression on that combination as well.
-          h2_vendored='patch.crates-io.h2.path="vendor/h2-0.4.19-ferrum-patched"'
+          h2_vendored='patch.crates-io.h2.path="vendor/h2-0.4.20-ferrum-patched"'
           # Fail unless the combination really resolves the vendored h2.
           cargo tree -i h2 --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full \
-            --config "$h2_vendored" | grep -F 'h2 v0.4.19 (' | grep -F 'vendor/h2-0.4.19-ferrum-patched)'
+            --config "$h2_vendored" | grep -F 'h2 v0.4.20 (' | grep -F 'vendor/h2-0.4.20-ferrum-patched)'
           cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_ \
             --config "$h2_vendored"
 
@@ -2091,17 +2098,14 @@ jobs:
         env:
           RUSTFLAGS: "--cap-lints=warn"
         run: |
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
-          # Patch 002: an automatic small-DATA-frame budget follows runtime
-          # target-window changes without resetting outstanding charges.
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib budget
+          cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
+          # Upstream hyperium/h2#965 (h2 0.4.20; formerly Ferrum patch 002): an
+          # automatic small-DATA-frame budget follows runtime target-window
+          # changes without resetting outstanding charges, on our patched crate.
+          cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib budget
           # Patch 003: assigned send window is reported apart from the
           # send-buffer limit that caps `capacity()` (Hyper patch 005 reads it).
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
-          # Patch 004: a client connection whose last handle drops right after
-          # Connection::poll decided not to close still wakes itself and
-          # closes against an idle peer (issue #6052).
-          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_client_close_wakeup
+          cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -2220,6 +2224,7 @@ jobs:
               functional_http3_connect_udp_test
               functional_key_auth_query_test
               functional_max_forwards_test
+              functional_proxy_hop_limit_test
               functional_request_mirror_admission_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test
@@ -4269,6 +4274,17 @@ jobs:
             --set-string nodeAgent.admin.port=19090 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.captureMode=ebpf \
+            --set nodeAgent.proxyMode=node_waypoint \
+            --set-string nodeAgent.admin.port=19090 \
+            --set nodeAgent.security.dropCapSysAdmin=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-node-waypoint-kernel57-sys-admin.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set injector.enabled=true \
             --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
@@ -4283,6 +4299,19 @@ jobs:
             --set ambient.probes.startup.override.exec.command[0]=/bin/startup-amb \
             --set controlPlane.probes.startup.override.exec.command[0]=/bin/startup-cp \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-startup-overrides.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.tlsSecretRefs[0].namespace=edge \
+            --set ambient.tlsSecretRefs[0].name=edge-frontend \
+            --set ambient.tlsSecretRefs[1].namespace=edge \
+            --set ambient.tlsSecretRefs[1].name=edge-frontend-ca \
+            --set ambient.tlsSecretRefs[2].namespace=ferrum \
+            --set ambient.tlsSecretRefs[2].name=mesh-dtls \
+            --set ambient.tlsSecretRefs[3].namespace=edge \
+            --set ambient.tlsSecretRefs[3].name=edge-frontend \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-ambient-tls-secret-refs.yaml"
           python3 -I .github/scripts/verify_mesh_workload_probes.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
           # Mesh production-readiness (#4266/#4267/#4288): helm stays in this

@@ -414,6 +414,7 @@ pub fn validate_composition(
         .iter()
         .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
+    let globals_by_name = config.enabled_global_plugin_configs_by_name();
 
     // Resolve each name the way the runtime merge does before deciding whether
     // the pair is actually effective together. Two properties of that merge are
@@ -452,15 +453,7 @@ pub fn validate_composition(
             })
             .collect();
         let effective: Vec<&PluginConfig> = if local.is_empty() {
-            config
-                .plugin_configs
-                .iter()
-                .filter(|plugin| {
-                    plugin.enabled
-                        && plugin.scope == PluginScope::Global
-                        && plugin.plugin_name == name
-                })
-                .collect()
+            globals_by_name.get(name).cloned().unwrap_or_default()
         } else {
             local
         };
@@ -3274,8 +3267,40 @@ fn request_body_digest(
                 decoded_body_digest_with_limit(&mut decoder, "gzip")
             }
             "br" => {
-                let mut decoder = brotli::Decompressor::new(body, 4096);
-                decoded_body_digest_with_limit(&mut decoder, "brotli")
+                let decoded = super::charged_decode::decode_charged_content_coding_chain(
+                    &["br".to_string()],
+                    body,
+                    super::utils::content_encoding::DecodeLimits {
+                        max_decoded_bytes: MAX_CANONICAL_DECODED_BODY_BYTES,
+                        max_cumulative_bytes: MAX_CANONICAL_DECODED_BODY_BYTES,
+                        max_codings: 1,
+                        max_amplification_ratio: 0,
+                    },
+                    crate::proxy::response_buffer_budget::BudgetRef::request_decode(),
+                );
+                match decoded {
+                    Ok(decoded) => {
+                        let mut hasher = Sha256::new();
+                        hasher.update(decoded);
+                        return Ok(format!("sha256-{}", hex::encode(hasher.finalize())));
+                    }
+                    Err(error) => {
+                        let (status_code, message) = match error {
+                            super::charged_decode::ChargedDecodeError::CapacityRefused => {
+                                (503, "Request decode capacity is temporarily unavailable")
+                            }
+                            _ => (
+                                400,
+                                "Request body encoding is invalid or exceeds fingerprint limits",
+                            ),
+                        };
+                        return Err(PluginResult::Reject {
+                            status_code,
+                            body: serde_json::json!({"error": message}).to_string(),
+                            headers: HashMap::new(),
+                        });
+                    }
+                }
             }
             _ => Err("unsupported body encoding".to_string()),
         };
@@ -3449,6 +3474,14 @@ impl Plugin for RequestDeduplication {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
+    }
+
+    /// With `enforce_required` the idempotency guarantee is admission policy
+    /// (requests without a usable key are refused), so a native gRPC or
+    /// WebSocket request, which this plugin never sees, must be refused rather
+    /// than served without it. Opportunistic deduplication refuses nothing.
+    fn gates_request_admission(&self) -> bool {
+        self.enforce_required
     }
 
     fn requires_response_body_buffering(&self) -> bool {
