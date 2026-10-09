@@ -13969,7 +13969,9 @@ async fn run_h3_grpc_upload_pump(
         // never emit an all-reserved block that collapses to nothing. A DECODE
         // error means the inbound request is malformed: fail the upload closed
         // rather than silently finishing the backend stream as if the client had
-        // sent no trailing metadata.
+        // sent no trailing metadata. `recv_trailers` reads on to the request
+        // stream's own end, so a reset or a lost connection after the trailers is
+        // a client abort (issue #6022), never a FIN on the backend stream.
         let trailers = match h3_grpc_upload_await_until_authorization(
             auth_deadline_plan,
             shutdown.as_ref(),
@@ -14016,6 +14018,11 @@ async fn run_h3_grpc_upload_pump(
                 }
             }
             Some(Ok(_)) => {}
+            Some(Err(error))
+                if crate::http3::stream_util::h3_request_read_error_is_client_abort(&error) =>
+            {
+                upload.publish_fault(H3GrpcUploadFault::ClientAbort);
+            }
             Some(Err(_error)) => {
                 upload.publish_fault(H3GrpcUploadFault::MalformedTrailers);
             }

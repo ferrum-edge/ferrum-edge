@@ -72,6 +72,26 @@ body plugins need the whole upload before dispatch. The collect borrows the clie
 it ends the gateway checks the body's receive state. An HTTP/2 upload that ended without the
 client's `END_STREAM` is answered as a `499` client disconnect and never sent to the H3 backend.
 
+An HTTP/3 frontend upload has its own form of the rule. A trailer section ends the request body
+but not the request stream, so a streamed HTTP/3 upload ends the backend upload only after the
+client's FIN. A client that resets the stream after its trailers, with any code including
+`H3_NO_ERROR`, or loses its connection there, has cancelled the request. Every streaming path
+records it as a client disconnect, never as malformed trailers or a backend failure:
+
+- Native HTTP/3 backend and native HTTP/3 gRPC: the backend request stream is reset with
+  `H3_REQUEST_CANCELLED`, never finished.
+- HTTP/3 to gRPC bridge: the channel body resets the HTTP/2 backend stream instead of sending
+  `END_STREAM`.
+- Plain HTTP/3 to HTTP bridge: the request body ends with an error. An HTTP/1.1 backend sees an
+  aborted body and a closed connection, never the terminal chunk. An HTTP/2 backend sees its stream
+  reset. A reset in the middle of the body takes the same path.
+
+An undecodable trailer section is still answered as malformed trailers (`400` /
+`INVALID_ARGUMENT`). When the client declared a `Content-Length`, an HTTP/1.1 backend behind the
+plain bridge ends the body by that length, so it can receive the whole declared body before the
+reset arrives. The buffered HTTP/3 drains apply the same end-of-stream read before dispatch (see
+[HTTP/3](http3.md)).
+
 The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
 classifier never count this gateway-initiated reset as a backend failure (see
 [error classification](error_classification.md)). The sidecar mesh-mTLS, HBONE, and Unix-socket

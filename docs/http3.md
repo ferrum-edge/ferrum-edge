@@ -466,9 +466,19 @@ Every native-H3 buffered upload drain — the three early collectors (before `au
 
 Every one of these drains also reads to the end of the request stream before it accepts the body (issue #6022). A trailer section ends the body but not the stream, so after the trailers the drain waits for the client's FIN. A client that resets the stream, or loses the connection, after sending its trailers has cancelled the request: the upload is never dispatched as a complete body. What the client sees depends on the path: a native drain ends the stream with an error, the plain and mesh bridges answer `408`, and the gRPC bridge answers `INVALID_ARGUMENT`. A DATA frame after the trailer section is malformed (RFC 9114 §4.1) and takes the same arms. A body without trailers already ends at the FIN, so the extra read returns at once.
 
+Streamed uploads follow the same rule (issue #6022). The native-H3 upload, the native-H3 gRPC upload pump, and the H3-to-gRPC bridge pump read the trailer section with `recv_trailers`, which itself waits for the stream's end, and only then finish the backend upload. The plain bridge reader reads on with a second `recv_data` before it lets the backend body end. A reset (any code, `H3_NO_ERROR` included) or a lost connection after the trailers is a client disconnect on every streaming path, never a completed request:
+
+- Native-H3 backend: the backend request stream is reset with `H3_REQUEST_CANCELLED`, never finished, and the request is recorded as a client disconnect.
+- Native-H3 gRPC: the pump publishes a client abort, the backend stream is reset with `H3_REQUEST_CANCELLED`, and the RPC is recorded as a client disconnect.
+- H3-to-gRPC bridge: the channel body resets the HTTP/2 backend stream instead of sending END_STREAM, and the failure is recorded as a client disconnect.
+- Plain H3-to-HTTP bridge: the request body ends with an error, so an HTTP/1.1 backend sees an aborted body and a closed connection, never the terminal chunk, and an HTTP/2 backend sees its stream reset. The request ends as a client disconnect. A reset in the middle of the body takes the same path.
+
+None of these paths reports the reset as malformed trailers (`400` / `INVALID_ARGUMENT`) or charges it to backend health. An undecodable trailer section, or a known frame after it, is still malformed. One limit remains on the plain bridge: when the client declared a `Content-Length`, an HTTP/1.1 backend's own framing ends the body once the declared bytes are relayed, so that backend can receive the whole declared body before the reset arrives.
+
 **Plain flavor — request body streamed via an mpsc bridge.** `reqwest::Body::wrap_stream` requires a `'static + Send + Sync` stream, which cannot directly hold the `&mut RequestStream` borrow the H3 listener already has on the shared request stream. The bridge uses a bounded `tokio::sync::mpsc` channel:
 
 - One task (inlined via `tokio::join!`) reads `RequestStream::recv_data()` and pushes `Bytes` chunks into the `Sender`.
+- The reader signals EOF only at the stream's own end. `recv_data()` also stops at a trailer section, so the reader reads once more, and only a clean FIN ends the body. A reset or a lost connection, in the body or after the trailers, makes the body stream yield an `io::Error`, so reqwest aborts the backend request instead of ending it cleanly.
 - The `Receiver` is wrapped via `stream::unfold` and handed to `Body::wrap_stream`; the Receiver owns its own state and satisfies the `'static` bound.
 - Channel capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 32). Memory is bounded by `capacity × average_h3_chunk_size`.
 - `max_request_body_size_bytes` is enforced inline — if exceeded, the reader pushes an `io::Error` onto the channel so reqwest aborts with a reset stream rather than forwarding a truncated body.

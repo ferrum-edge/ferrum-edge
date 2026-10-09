@@ -3596,6 +3596,12 @@ impl Http3ConnectionPool {
         // backend stream as if the client had sent none. Classified as a client
         // request-body fault (post-wire, neutral for backend health — see
         // `is_h3_client_request_body_disconnect`). Absent trailers are fine.
+        //
+        // `recv_trailers` also reads on to the request stream's own end, so the
+        // backend stream is FINished only after the client's clean FIN. A reset
+        // or a lost connection after the trailers is the client cancelling the
+        // request (issue #6022): it takes the client-disconnect arm, and the
+        // upload guard resets the backend stream instead of finishing it.
         let trailers = await_h3_dispatch(auth, true, None, async {
             Ok(frontend_stream.recv_trailers().await)
         })
@@ -3624,6 +3630,12 @@ impl Http3ConnectionPool {
                 }
             }
             Ok(_) => {}
+            Err(e) if crate::http3::stream_util::h3_request_read_error_is_client_abort(&e) => {
+                return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                    "client disconnected while sending request body: {}",
+                    e
+                )));
+            }
             Err(e) => {
                 return Err(H3PoolError::post_wire(anyhow::anyhow!(
                     "malformed client request trailers: {}",

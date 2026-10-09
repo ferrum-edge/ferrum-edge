@@ -895,6 +895,13 @@ impl Http3GrpcStream {
             .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
 
+    /// Reset the request-upload direction with `code` instead of finishing it.
+    /// `H3_NO_ERROR` models a client that abandons its upload with the reset
+    /// code that most resembles a clean end.
+    pub fn reset_request_upload(&mut self, code: h3::error::Code) {
+        self.stream.stop_stream(code);
+    }
+
     /// Cancel only the response-download direction while leaving the request
     /// upload open. This models a client that stops consuming a streaming RPC
     /// after response headers have arrived.

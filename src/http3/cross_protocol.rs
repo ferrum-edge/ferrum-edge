@@ -148,6 +148,7 @@ use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
 use super::server::{H3RetainedUpload, publish_h3_retained_body};
+use super::stream_util::h3_request_read_error_is_client_abort;
 
 /// Outcome reported back to the H3 listener so it can update request
 /// counters, build the `TransactionSummary` for log plugins, and record
@@ -4942,10 +4943,17 @@ where
                 // stopped reading". `backend_connect_timeout_ms` bounds that
                 // window.
                 let transport_consuming = Arc::new(AtomicBool::new(false));
+                // Set by the reader when the client's upload ended without its
+                // clean FIN: a reset or lost connection, mid-body or after the
+                // trailer section (issue #6022). The body stream then ends with
+                // an error, never the clean end that would complete a truncated
+                // request at the backend.
+                let reader_peer_reset = Arc::new(AtomicBool::new(false));
                 let body_stream_reader_finished = Arc::clone(&reader_finished);
                 let body_stream_reader_done_notify = Arc::clone(&reader_done_notify);
                 let body_stream_write_timed_out = Arc::clone(&write_timed_out);
                 let body_stream_transport_consuming = Arc::clone(&transport_consuming);
+                let body_stream_upload_aborted = Arc::clone(&reader_peer_reset);
                 let body_stream = futures_util::stream::unfold(
                     (
                         rx,
@@ -4953,6 +4961,7 @@ where
                         body_stream_reader_done_notify,
                         body_stream_write_timed_out,
                         body_stream_transport_consuming,
+                        body_stream_upload_aborted,
                     ),
                     |(
                         mut rx,
@@ -4960,6 +4969,7 @@ where
                         reader_done_notify,
                         write_timed_out,
                         transport_consuming,
+                        upload_aborted,
                     )| async move {
                         transport_consuming.store(true, Ordering::Release);
                         loop {
@@ -4975,10 +4985,31 @@ where
                                         reader_done_notify,
                                         write_timed_out,
                                         transport_consuming,
+                                        upload_aborted,
                                     ),
                                 ));
                             }
-                            if reader_finished.load(Ordering::Acquire) && rx.is_empty() {
+                            // Read before the abort flag: the reader publishes an
+                            // abort before it finishes, so a finished reader's
+                            // abort is always seen here.
+                            let finished = reader_finished.load(Ordering::Acquire);
+                            if upload_aborted.load(Ordering::Acquire) {
+                                return Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionAborted,
+                                        "client aborted the request body upload",
+                                    )),
+                                    (
+                                        rx,
+                                        reader_finished,
+                                        reader_done_notify,
+                                        write_timed_out,
+                                        transport_consuming,
+                                        upload_aborted,
+                                    ),
+                                ));
+                            }
+                            if finished && rx.is_empty() {
                                 return None;
                             }
                             tokio::select! {
@@ -4992,6 +5023,7 @@ where
                                                 reader_done_notify,
                                                 write_timed_out,
                                                 transport_consuming,
+                                                upload_aborted,
                                             ),
                                         )
                                     });
@@ -5039,7 +5071,6 @@ where
                 // The future is `'static` and does not hold `&mut` on either
                 // half, so the upload pump can keep polling recv_data.
                 let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(stream);
-                let reader_peer_reset = Arc::new(AtomicBool::new(false));
                 let reader_reset_flag = Arc::clone(&reader_peer_reset);
                 // gRPC request-message accounting for the streamed upload, read
                 // in its own framing: a pass-through gRPC-Web upload counts its
@@ -5146,6 +5177,29 @@ where
                                         }
                                     }
                                     Ok(None) => {
+                                        // `recv_data` also ends at a trailer
+                                        // section, which ends the body but not
+                                        // the request stream. Read on to the
+                                        // stream's own end before the body may
+                                        // end cleanly, so a reset or a lost
+                                        // connection after the trailers aborts
+                                        // the backend upload instead of
+                                        // completing it (issue #6022). A DATA
+                                        // frame after the trailers is malformed
+                                        // (RFC 9114 §4.1) and aborts it too.
+                                        // After a clean FIN this returns at once.
+                                        let end = tokio::select! {
+                                            biased;
+                                            _ = reader_halt.notified() => {
+                                                crate::http3::stream_util::halt_request_body(stream);
+                                                finish_reader();
+                                                return;
+                                            }
+                                            end = stream.recv_data() => end,
+                                        };
+                                        if !matches!(end, Ok(None)) {
+                                            reader_reset_flag.store(true, Ordering::Release);
+                                        }
                                         finish_reader();
                                         return;
                                     }
@@ -5153,7 +5207,10 @@ where
                                         // Request-stream reset/termination while
                                         // headers are still outstanding is
                                         // downstream cancellation, not a
-                                        // backend body error.
+                                        // backend body error. The flag also
+                                        // makes the body stream end with an
+                                        // error, so the backend upload is
+                                        // aborted rather than cleanly ended.
                                         reader_reset_flag.store(true, Ordering::Release);
                                         finish_reader();
                                         return;
@@ -10072,6 +10129,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                             // Preserve it as an H2 trailers frame so client-streaming
                             // gRPC metadata is not silently dropped at the protocol
                             // bridge. Malformed trailers fail the upload closed.
+                            // `recv_trailers` reads on to the stream's own end, so a
+                            // reset or lost connection after the trailers fails the
+                            // upload as a client abort (issue #6022), never as a
+                            // clean END_STREAM to the backend.
                             Ok(None) => {
                                 let trailer_result = tokio::select! {
                                     biased;
@@ -10097,8 +10158,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                                         }
                                     }
                                     Ok(_) => {}
-                                    Err(_e) => {
-                                        pump_frontend_malformed.store(true, Ordering::Release);
+                                    Err(e) => {
+                                        if !h3_request_read_error_is_client_abort(&e) {
+                                            pump_frontend_malformed.store(true, Ordering::Release);
+                                        }
                                         pump_frontend_failed.store(true, Ordering::Release);
                                         tokio::select! {
                                             biased;
