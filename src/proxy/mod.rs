@@ -15223,13 +15223,12 @@ async fn handle_connection(
     // count can be drained once after the connection resolves.
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = Arc::clone(&h1_framing_signals);
-    // gRPC backend-shard affinity for this connection's HTTP/2 streams
-    // (issue #5588), allocated on the first HTTP/2 request.
-    let affinity_slots = Arc::clone(state.grpc_pool.frontend_slot_table());
-    let connection_affinity = frontend_affinity::LazyConnectionAffinity::new(affinity_slots);
+    // Benchmark-only #6022 control: do not allocate or scope frontend
+    // affinity. Authorization and request/transport lifetime owners stay
+    // unchanged; the gRPC pool takes its existing unscoped round-robin path.
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
-        let frontend_stream = connection_affinity.open_stream(req.version());
+        let frontend_stream = None::<frontend_affinity::FrontendStream>;
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let http1_framing_result =
@@ -24230,13 +24229,12 @@ async fn handle_tls_connection(
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = h1_framing_signals.clone();
     let service_h1_framing_signals = h1_framing_signals;
-    // gRPC backend-shard affinity for this connection's HTTP/2 streams
-    // (issue #5588), allocated on the first HTTP/2 request.
-    let affinity_slots = Arc::clone(state.grpc_pool.frontend_slot_table());
-    let connection_affinity = frontend_affinity::LazyConnectionAffinity::new(affinity_slots);
+    // Benchmark-only #6022 control: do not allocate or scope frontend
+    // affinity. Authorization and request/transport lifetime owners stay
+    // unchanged; the gRPC pool takes its existing unscoped round-robin path.
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
-        let frontend_stream = connection_affinity.open_stream(req.version());
+        let frontend_stream = None::<frontend_affinity::FrontendStream>;
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
