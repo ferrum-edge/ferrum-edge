@@ -1301,6 +1301,29 @@ fn plain_upload_aborted_error() -> std::io::Error {
     )
 }
 
+/// Debug evidence for a streamed plain-bridge upload aborted before a backend
+/// response (issue #6022). `transport_consuming` says whether the backend
+/// transport had begun the request: reqwest polls the body only once it owns a
+/// connection and has written the request head. A backend that never saw the
+/// upload can then be told apart from one whose request was left open. Out of
+/// line so `dispatch_plain`'s already large state machine carries no extra
+/// event locals.
+#[inline(never)]
+fn debug_plain_upload_aborted_before_response(transport_consuming: bool) {
+    debug!(
+        transport_consuming,
+        "cross-protocol H3 to HTTP: streamed upload aborted before a backend response"
+    );
+}
+
+/// Debug evidence that the backend transport polled the streamed body after
+/// its abort and received the error that makes it abort the backend request
+/// (issue #6022).
+#[inline(never)]
+fn debug_plain_upload_body_ended_with_abort() {
+    debug!("cross-protocol H3 to HTTP: streamed upload body ended with an abort");
+}
+
 /// The state the plain bridge's request-body reader and dispatch loop share
 /// with the streamed body reqwest polls.
 #[doc(hidden)]
@@ -1345,6 +1368,7 @@ fn plain_upload_body_stream(
                         "backend request body write timeout",
                     )))
                 } else if signals.upload_aborted.load(Ordering::Acquire) {
+                    debug_plain_upload_body_ended_with_abort();
                     Some(Err(plain_upload_aborted_error()))
                 } else if finished && rx.is_empty() {
                     return None;
@@ -1360,7 +1384,10 @@ fn plain_upload_body_stream(
                             {
                                 return None;
                             }
-                            None => Some(Err(plain_upload_aborted_error())),
+                            None => {
+                                debug_plain_upload_body_ended_with_abort();
+                                Some(Err(plain_upload_aborted_error()))
+                            }
                         },
                         _ = &mut reader_done => None,
                     }
@@ -5463,6 +5490,11 @@ where
                     if abort_backend_upload {
                         reader_peer_reset.store(true, Ordering::Release);
                         reader_done_notify.notify_waiters();
+                    }
+                    if reader_peer_reset.load(Ordering::Acquire) {
+                        debug_plain_upload_aborted_before_response(
+                            transport_consuming.load(Ordering::Acquire),
+                        );
                     }
                     // The one halt sequence shared by every pre-header terminal
                     // that left the reader running. `halt_notify` makes the

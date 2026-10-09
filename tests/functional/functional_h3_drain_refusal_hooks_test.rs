@@ -28,7 +28,12 @@
 //! way the request can end without the client's FIN after its trailers: a
 //! reset, a reset together with STOP_SENDING, a lost connection, a declared
 //! `Content-Length`, an HTTP/2 backend, and the gateway's own response-header
-//! timeout. Each backend sees the upload aborted, never completed.
+//! timeout. Each backend sees the upload aborted, never completed. Each
+//! HTTP/1.1 test first waits until the backend has the upload's head and body,
+//! so the abort it asserts is the end of a request the backend really
+//! received. That backend counts every connection and every way one ends, and
+//! the gateway runs with the plain bridge's debug lines on, so a failure says
+//! whether the request never reached the backend or was left open there.
 //!
 //! Run with:
 //!
@@ -855,13 +860,57 @@ async fn h3_buffered_drain_refuses_a_reset_after_the_trailer_section() {
 // Streamed upload: end of the request stream after a trailer section
 // ────────────────────────────────────────────────────────────────────────────
 
-/// How the streamed uploads one backend received ended.
+/// What one streamed-upload backend saw on the connections it accepted.
+///
+/// Every connection is counted, and so is every way one can end, so a failure
+/// tells a request the backend never received (no upload head, or a
+/// connection that closed before its head was complete) apart from one the
+/// gateway left open (an upload head with neither end).
 #[derive(Default)]
 struct StreamedUploadEnds {
-    /// Request bodies that reached their terminal chunk.
+    /// Connections accepted, the capability probe's included.
+    connections: AtomicUsize,
+    /// Connections that closed before a complete request head.
+    closed_before_head: AtomicUsize,
+    /// The bytes those connections delivered before they closed.
+    pre_head_bytes: AtomicUsize,
+    /// Request heads whose request line names the upload path.
+    upload_heads: AtomicUsize,
+    /// Uploads whose body bytes had begun to arrive after the head.
+    upload_bodies_started: AtomicUsize,
+    /// Request bodies that reached their end by their own framing.
     completed: AtomicUsize,
-    /// Request bodies whose connection closed before the terminal chunk.
+    /// Request bodies whose connection closed before that end.
     aborted: AtomicUsize,
+}
+
+fn count(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::SeqCst)
+}
+
+impl StreamedUploadEnds {
+    /// Uploads the backend received that have neither completed nor aborted.
+    fn open_uploads(&self) -> usize {
+        let ended = count(&self.completed) + count(&self.aborted);
+        count(&self.upload_heads).saturating_sub(ended)
+    }
+
+    /// Every count, for a failure message.
+    fn summary(&self) -> String {
+        format!(
+            "connections = {}, closed before a complete head = {} ({} bytes), \
+             upload heads = {}, upload bodies started = {}, completed = {}, aborted = {}, \
+             still open = {}",
+            count(&self.connections),
+            count(&self.closed_before_head),
+            count(&self.pre_head_bytes),
+            count(&self.upload_heads),
+            count(&self.upload_bodies_started),
+            count(&self.completed),
+            count(&self.aborted),
+            self.open_uploads(),
+        )
+    }
 }
 
 /// Whether a chunked request body has reached its terminal (last) chunk.
@@ -891,7 +940,8 @@ fn request_body_complete(head: &str, body: &[u8]) -> bool {
 /// terminal chunk otherwise. A body that reaches its end counts as completed
 /// and is answered `200`; a connection that closes first counts as aborted.
 /// Requests to any other target (the capability probe) are answered and not
-/// counted.
+/// counted as uploads. Every connection, and every one that closed before its
+/// head was complete, is counted too.
 async fn spawn_streamed_upload_backend(
     path: &'static str,
 ) -> (u16, Arc<StreamedUploadEnds>, JoinHandle<()>) {
@@ -906,6 +956,7 @@ async fn spawn_streamed_upload_backend(
             let Ok((mut socket, _)) = listener.accept().await else {
                 continue;
             };
+            task_ends.connections.fetch_add(1, Ordering::SeqCst);
             let ends = Arc::clone(&task_ends);
             tokio::spawn(async move {
                 let mut received: Vec<u8> = Vec::new();
@@ -916,7 +967,12 @@ async fn spawn_streamed_upload_backend(
                         break at + 4;
                     }
                     match socket.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
+                        Ok(0) | Err(_) => {
+                            let partial = received.len();
+                            ends.closed_before_head.fetch_add(1, Ordering::SeqCst);
+                            ends.pre_head_bytes.fetch_add(partial, Ordering::SeqCst);
+                            return;
+                        }
                         Ok(read) => received.extend_from_slice(&buf[..read]),
                     }
                 };
@@ -925,8 +981,15 @@ async fn spawn_streamed_upload_backend(
                     let _ = socket.write_all(OK_RESPONSE).await;
                     return;
                 }
+                ends.upload_heads.fetch_add(1, Ordering::SeqCst);
+                let mut body_started = false;
                 loop {
-                    if request_body_complete(&head, &received[head_end..]) {
+                    let body = &received[head_end..];
+                    if !body_started && !body.is_empty() {
+                        body_started = true;
+                        ends.upload_bodies_started.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if request_body_complete(&head, body) {
                         ends.completed.fetch_add(1, Ordering::SeqCst);
                         let _ = socket.write_all(OK_RESPONSE).await;
                         return;
@@ -945,18 +1008,102 @@ async fn spawn_streamed_upload_backend(
     (port, ends, task)
 }
 
-/// Wait until the backend has seen one upload close before its terminal chunk.
-async fn wait_for_aborted_upload(harness: &GatewayHarness, ends: &StreamedUploadEnds) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ends.aborted.load(Ordering::SeqCst) == 0 {
+/// The gateway's own evidence for the streamed-upload tests: the plain bridge
+/// logs, at `debug`, each upload it aborts before a backend response (and
+/// whether the backend transport had begun that request) and each time the
+/// backend transport takes the abort from the body.
+const STREAMED_UPLOAD_LOG_FILTER: &str = "info,ferrum_edge::http3::cross_protocol=debug";
+
+/// How long a streamed-upload test waits for the backend to see one step.
+const UPLOAD_OBSERVATION_WINDOW: Duration = Duration::from_secs(10);
+
+/// Spawn the gateway for one streamed-upload test, with the plain bridge's
+/// debug evidence in its captured output.
+async fn spawn_streamed_upload_gateway(proxy: Value) -> (GatewayHarness, u16) {
+    let yaml = gateway_yaml(proxy, Vec::new());
+    spawn_h3_gateway(yaml, &[("RUST_LOG", STREAMED_UPLOAD_LOG_FILTER)]).await
+}
+
+/// Wait until the backend has the upload's head and the start of its body.
+/// The test ends the upload only after this, so the end it then asserts is the
+/// end of a request the backend really received.
+async fn wait_for_upload_body_started(harness: &GatewayHarness, ends: &StreamedUploadEnds) {
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    while count(&ends.upload_bodies_started) == 0 {
         assert!(
             Instant::now() < deadline,
-            "the backend must see the streamed upload aborted; completed = {}; logs:\n{}",
-            ends.completed.load(Ordering::SeqCst),
+            "the backend must receive the upload's head and first body bytes before the test \
+             ends the upload; {}; logs:\n{}",
+            ends.summary(),
+            harness.captured_combined().unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until no upload the backend received is still open, then require that
+/// none completed and that the cancelled one ended aborted: its connection
+/// closed before the terminal chunk. The backend had already received the
+/// upload (`wait_for_upload_body_started`), so an upload still open at the
+/// deadline is a backend request the gateway left open, and a completed one is
+/// a cancelled upload delivered as whole.
+async fn assert_upload_aborted(harness: &GatewayHarness, ends: &StreamedUploadEnds) {
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    while ends.open_uploads() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the gateway must end the backend request of a cancelled upload, never leave it \
+             open; {}; logs:\n{}",
+            ends.summary(),
             harness.captured_combined().unwrap_or_default()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert_eq!(
+        count(&ends.completed),
+        0,
+        "a request cancelled after its trailer section must never complete at the backend; {}",
+        ends.summary()
+    );
+    assert!(
+        count(&ends.aborted) > 0,
+        "the backend must see the cancelled upload aborted; {}; logs:\n{}",
+        ends.summary(),
+        harness.captured_combined().unwrap_or_default()
+    );
+}
+
+/// Open a streamed upload, send its body and its trailer section, and leave the
+/// request stream open. Waits until the backend has the upload, then pauses so
+/// the gateway reads the trailer section before the test ends the stream some
+/// other way: h3 surfaces a reset ahead of frames it still has buffered, which
+/// would abort the upload without exercising the end-of-stream read. Then
+/// confirms the trailers alone did not end the backend's request body.
+async fn upload_through_trailers(
+    url: &str,
+    headers: &[(&str, &str)],
+    harness: &GatewayHarness,
+    ends: &StreamedUploadEnds,
+) -> Http3GrpcStream {
+    let mut upload =
+        open_upload_stream_with_headers(url, "application/octet-stream", headers).await;
+    upload
+        .send_raw_data(Bytes::from_static(b"cancelled upload"))
+        .await
+        .expect("send upload");
+    upload
+        .send_request_trailers(upload_trailers())
+        .await
+        .expect("send trailers");
+    wait_for_upload_body_started(harness, ends).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        count(&ends.completed),
+        0,
+        "a trailer section alone must not end the backend's request body; {}",
+        ends.summary()
+    );
+    upload
 }
 
 /// The streamed counterpart of the drain test above, over the plain
@@ -971,34 +1118,13 @@ async fn wait_for_aborted_upload(harness: &GatewayHarness, ends: &StreamedUpload
 #[ignore]
 async fn h3_streamed_upload_aborts_the_backend_body_on_a_reset_after_the_trailer_section() {
     let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
-    let yaml = gateway_yaml(base_proxy("http", backend_port), Vec::new());
-    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let proxy = base_proxy("http", backend_port);
+    let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
     let url = proxy_url(https_port, UPLOAD_PATH);
 
-    let mut reset = open_upload_stream(&url, "application/octet-stream").await;
-    reset
-        .send_raw_data(Bytes::from_static(b"cancelled upload"))
-        .await
-        .expect("send upload");
-    reset
-        .send_request_trailers(upload_trailers())
-        .await
-        .expect("send trailers");
-    // As in the drain test, the pause lets the gateway read the trailer
-    // section before the reset arrives.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        ends.completed.load(Ordering::SeqCst),
-        0,
-        "a trailer section alone must not end the backend's request body"
-    );
+    let mut reset = upload_through_trailers(&url, &[], &harness, &ends).await;
     reset.reset_request_upload(h3::error::Code::H3_NO_ERROR);
-    wait_for_aborted_upload(&harness, &ends).await;
-    assert_eq!(
-        ends.completed.load(Ordering::SeqCst),
-        0,
-        "a request reset after its trailer section must never complete at the backend"
-    );
+    assert_upload_aborted(&harness, &ends).await;
     drop(reset);
 
     let mut complete = open_upload_stream(&url, "application/octet-stream").await;
@@ -1014,57 +1140,18 @@ async fn h3_streamed_upload_aborts_the_backend_body_on_a_reset_after_the_trailer
     let (status, _) = complete.recv_response().await.expect("response head");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        ends.completed.load(Ordering::SeqCst),
+        count(&ends.completed),
         1,
-        "only the upload that ended with FIN completes at the backend"
+        "only the upload that ended with FIN completes at the backend; {}",
+        ends.summary()
     );
     assert_eq!(
-        ends.aborted.load(Ordering::SeqCst),
+        count(&ends.aborted),
         1,
-        "the reset upload is the only aborted one"
+        "the reset upload is the only aborted one; {}",
+        ends.summary()
     );
     backend_task.abort();
-}
-
-/// Open a streamed upload, send its body and its trailer section, and leave the
-/// request stream open. The pause lets the gateway read the trailer section
-/// before the test ends the stream some other way, then confirms the trailers
-/// alone did not end the backend's request body.
-async fn upload_through_trailers(
-    url: &str,
-    headers: &[(&str, &str)],
-    ends: &StreamedUploadEnds,
-) -> Http3GrpcStream {
-    let mut upload =
-        open_upload_stream_with_headers(url, "application/octet-stream", headers).await;
-    upload
-        .send_raw_data(Bytes::from_static(b"cancelled upload"))
-        .await
-        .expect("send upload");
-    upload
-        .send_request_trailers(upload_trailers())
-        .await
-        .expect("send trailers");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        ends.completed.load(Ordering::SeqCst),
-        0,
-        "a trailer section alone must not end the backend's request body"
-    );
-    upload
-}
-
-/// Wait for the aborted upload, then confirm none completed.
-async fn assert_upload_aborted_never_completed(
-    harness: &GatewayHarness,
-    ends: &StreamedUploadEnds,
-) {
-    wait_for_aborted_upload(harness, ends).await;
-    assert_eq!(
-        ends.completed.load(Ordering::SeqCst),
-        0,
-        "a request cancelled after its trailer section must never complete at the backend"
-    );
 }
 
 /// The cancel shape browsers and most QUIC stacks use: RESET_STREAM on the
@@ -1076,14 +1163,14 @@ async fn assert_upload_aborted_never_completed(
 #[ignore]
 async fn h3_streamed_upload_aborts_the_backend_body_on_reset_and_stop_sending_after_trailers() {
     let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
-    let yaml = gateway_yaml(base_proxy("http", backend_port), Vec::new());
-    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let proxy = base_proxy("http", backend_port);
+    let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
     let url = proxy_url(https_port, UPLOAD_PATH);
 
-    let mut upload = upload_through_trailers(&url, &[], &ends).await;
+    let mut upload = upload_through_trailers(&url, &[], &harness, &ends).await;
     upload.cancel_response_download();
     upload.reset_request_upload(h3::error::Code::H3_NO_ERROR);
-    assert_upload_aborted_never_completed(&harness, &ends).await;
+    assert_upload_aborted(&harness, &ends).await;
     drop(upload);
     backend_task.abort();
 }
@@ -1096,13 +1183,13 @@ async fn h3_streamed_upload_aborts_the_backend_body_on_reset_and_stop_sending_af
 #[ignore]
 async fn h3_streamed_upload_aborts_the_backend_body_on_a_lost_connection_after_trailers() {
     let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
-    let yaml = gateway_yaml(base_proxy("http", backend_port), Vec::new());
-    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let proxy = base_proxy("http", backend_port);
+    let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
     let url = proxy_url(https_port, UPLOAD_PATH);
 
-    let upload = upload_through_trailers(&url, &[], &ends).await;
+    let upload = upload_through_trailers(&url, &[], &harness, &ends).await;
     upload.close_connection();
-    assert_upload_aborted_never_completed(&harness, &ends).await;
+    assert_upload_aborted(&harness, &ends).await;
     drop(upload);
     backend_task.abort();
 }
@@ -1117,14 +1204,15 @@ async fn h3_streamed_upload_aborts_the_backend_body_on_a_lost_connection_after_t
 #[ignore]
 async fn h3_streamed_upload_with_a_declared_length_aborts_the_backend_body_on_a_reset() {
     let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
-    let yaml = gateway_yaml(base_proxy("http", backend_port), Vec::new());
-    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let proxy = base_proxy("http", backend_port);
+    let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
     let url = proxy_url(https_port, UPLOAD_PATH);
 
     // `upload_through_trailers` sends exactly these 16 bytes.
-    let mut upload = upload_through_trailers(&url, &[("content-length", "16")], &ends).await;
+    let headers = [("content-length", "16")];
+    let mut upload = upload_through_trailers(&url, &headers, &harness, &ends).await;
     upload.reset_request_upload(h3::error::Code::H3_NO_ERROR);
-    assert_upload_aborted_never_completed(&harness, &ends).await;
+    assert_upload_aborted(&harness, &ends).await;
     drop(upload);
     backend_task.abort();
 }
@@ -1149,8 +1237,8 @@ async fn h3_streamed_upload_resets_the_http2_backend_stream_on_a_cancel_after_tr
         .step(H2Step::ExpectRequestReset(Duration::from_secs(20)))
         .spawn()
         .expect("spawn h2 tls backend");
-    let yaml = gateway_yaml(base_proxy("https", backend_port), Vec::new());
-    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let proxy = base_proxy("https", backend_port);
+    let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
     let url = proxy_url(https_port, UPLOAD_PATH);
 
     let mut upload = open_upload_stream(&url, "application/octet-stream").await;
@@ -1171,7 +1259,7 @@ async fn h3_streamed_upload_resets_the_http2_backend_stream_on_a_cancel_after_tr
     upload.cancel_response_download();
     upload.reset_request_upload(h3::error::Code::H3_NO_ERROR);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
     while backend.request_reset_codes().is_empty() {
         let errors = backend.step_errors().await;
         assert!(
@@ -1203,18 +1291,17 @@ async fn h3_streamed_upload_header_timeout_aborts_the_backend_body() {
     let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
     let mut proxy = base_proxy("http", backend_port);
     proxy["backend_read_timeout_ms"] = json!(1500);
-    let yaml = gateway_yaml(proxy, Vec::new());
-    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
     let url = proxy_url(https_port, UPLOAD_PATH);
 
-    let mut upload = upload_through_trailers(&url, &[], &ends).await;
+    let mut upload = upload_through_trailers(&url, &[], &harness, &ends).await;
     let (status, _) = upload.recv_response().await.expect("response head");
     assert_eq!(
         status,
         StatusCode::GATEWAY_TIMEOUT,
         "a backend still waiting for the body is answered on the header wait"
     );
-    assert_upload_aborted_never_completed(&harness, &ends).await;
+    assert_upload_aborted(&harness, &ends).await;
     drop(upload);
     backend_task.abort();
 }
