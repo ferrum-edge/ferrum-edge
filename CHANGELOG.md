@@ -110,6 +110,11 @@ before updating operators, custom plugins, mesh charts or contract consumers.
 
 ### Fixed
 
+- **Deployment snapshot responses keep canonical resource order** (#6155).
+  The typed lists, including proxy plugin associations, reuse their sorted
+  evidence representation. Database row order can no longer change the body
+  while its ETag remains equal; snapshot authority and token semantics stay
+  unchanged.
 - **Uploads require the real transport END_STREAM** (issue #6022, PRs
   #6138 / #6139 / #6142). Buffered H1/H2, native H3 and bridge paths no
   longer accept a trailers section followed by a reset as a complete body.
@@ -154,9 +159,17 @@ before updating operators, custom plugins, mesh charts or contract consumers.
   bounded by the configured receive window and a poll cap. These changes
   make the measurements reproducible; they do not change production
   HTTP/2 window or pool-affinity defaults.
+- **Hosted HTTP/2 and gRPC CPU profiling** (#6148, PR #6152) records
+  all-thread context switches and process user/system CPU, with separate
+  instrumented passes and controls before and after. Profiles remain
+  diagnostic evidence and do not enter the performance scoreboard.
 
 ### Documentation
 
+- Diagnostic lookup schemas include `loop_detected` in the gateway-error
+  and token-mapped rejection enums, matching the runtime vocabulary. The
+  pre-routing hop-limit fence retains a null `detail.rejection_phase` and
+  reports its raw `proxy_hop_limit` phase in `detail.rejection.phase`.
 - Error-classification guidance documents that a route-total expiry after
   backend handoff is `backend_timeout`, including during TCP/TLS connection
   establishment (#6073).
