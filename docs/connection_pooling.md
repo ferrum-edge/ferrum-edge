@@ -36,13 +36,17 @@ proxies:
     pool_http2_keep_alive_timeout_seconds: 5
     pool_http2_initial_stream_window_size: 16777216   # 16 MiB
     pool_http2_initial_connection_window_size: 67108864  # 64 MiB
-    # Adaptive is off by default (issue #5464). Set it explicitly only when a
-    # backend connection is known to carry few streams; an explicit window
-    # override without an explicit adaptive setting auto-disables adaptive.
+    # Adaptive is off by default (issue #5464). Enabling it can deadlock a
+    # connection under concurrent large bidirectional streams, especially
+    # when both peers enable adaptive windowing (issue #6073,
+    # https://github.com/hyperium/h2/issues/975). An explicit window override
+    # without an explicit adaptive setting auto-disables adaptive.
     pool_http2_adaptive_window: false
 ```
 
-**Adaptive vs fixed window precedence:** shipped default is adaptive off (`false`, issue #5464), so the fixed 8 MiB / 32 MiB windows apply. When adaptive is enabled, hyper/reqwest adaptive windowing **replaces** `initial_stream_window_size` / `initial_connection_window_size`: both restart at 65535 bytes and the connection window grows only as the link is measured, which fragments hundreds of concurrent streams into sub-256-byte DATA frames and can trip h2's small-frame flood budget (`GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`). Setting an explicit stream or connection window (global env/`ferrum.conf` or per-proxy `pool_http2_initial_*_window_size`) without also setting adaptive explicitly auto-disables adaptive at that config layer so the fixed windows take effect. Setting adaptive explicitly (including `true` alongside window overrides) remains authoritative. Direct `PoolConfig` construction for tests/code paths is unchanged — precedence applies only during env and per-proxy resolution.
+**Adaptive vs fixed window precedence:** shipped default is adaptive off (`false`, issue #5464), so the fixed 8 MiB / 32 MiB windows apply. When adaptive is enabled, hyper/reqwest adaptive windowing **replaces** `initial_stream_window_size` / `initial_connection_window_size`: both restart at 65535 bytes and the connection window grows only as the link is measured, which fragments hundreds of concurrent streams into sub-256-byte DATA frames and can trip h2's small-frame flood budget (`GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`). Its BDP PING/SETTINGS traffic can also permanently deadlock a connection under concurrent large streams sending bodies in both directions, especially when both peers enable adaptive windowing and stop reading while a control-frame write waits for socket capacity (issue #6073, [hyperium/h2#975](https://github.com/hyperium/h2/issues/975)). Keep this option off unless its throughput benefit is needed and the connection workload is understood. Setting an explicit stream or connection window (global env/`ferrum.conf` or per-proxy `pool_http2_initial_*_window_size`) without also setting adaptive explicitly auto-disables adaptive at that config layer so the fixed windows take effect. Setting adaptive explicitly (including `true` alongside window overrides) remains authoritative. Direct `PoolConfig` construction for tests/code paths is unchanged — precedence applies only during env and per-proxy resolution.
+
+The adaptive setting controls the hyper/reqwest backend HTTP/2 pools. HBONE uses a separate raw-`h2` window policy: when adaptive is enabled, it raises its initial stream and connection windows to at least 16 MiB and 64 MiB respectively; it does not enable hyper/reqwest BDP probing or its PING/SETTINGS behavior.
 
 `pool_max_requests_per_connection` is accepted on proxies for backward compatibility, but it is currently a no-op at runtime. The shared reqwest/hyper HTTP client pool does not expose a stable per-connection request cap, so Ferrum validates and persists the field without applying it. DestinationRule `connectionPool.http.maxRequestsPerConnection` no longer projects into this proxy field; it is reported as deferred in Istio status instead. Values must be between 0 and 2,147,483,647; `0` preserves Istio's explicit unlimited value, and omitting the field preserves Ferrum's current unlimited behavior.
 
