@@ -8,13 +8,14 @@
 //! namespace's Pods would reach them without a ReferenceGrant, the same bypass
 //! an `ExternalName` alias gives (#6094). A backendRef to a Service is
 //! admitted only when every endpoint is a Pod of the Service's namespace,
-//! judged by the Pod IPs pod discovery observes. The slice's own `targetRef`
-//! can refuse an endpoint but never vouch for one, except that it can name a
-//! selector-backed Service's same-namespace host-network Pod.
+//! judged by the Pod IPs pod discovery observes (and, for a grace window,
+//! recently observed). The slice's own `targetRef` can refuse an endpoint but
+//! never vouch for one, except that it can name a selector-backed Service's
+//! same-namespace host-network Pod.
 
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    K8sMetadata, K8sObject, K8sTranslationOptions, PodClaimInventory, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
@@ -22,9 +23,11 @@ use ferrum_edge::k8s_controller::status::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::Duration;
 
 const REFUSAL: &str = "is not permitted by EndpointSlice attribution";
 const UNVERIFIED: &str = "is admitted without EndpointSlice attribution";
+const OPT_IN_INACTIVE: &str = "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true is inactive";
 const SERVICE_DNS: &str = "payroll.tenant-a.svc.cluster.local";
 
 fn options() -> K8sTranslationOptions {
@@ -206,9 +209,18 @@ fn host_network_pod(namespace: &str, name: &str, node_ip: &str) -> K8sObject {
 }
 
 fn node(name: &str, address: &str, pod_cidr: &str) -> K8sObject {
-    let mut node = object("Node", name, "", "v1", json!({ "podCIDRs": [pod_cidr] }));
+    node_with_spec(name, address, json!({ "podCIDRs": [pod_cidr] }))
+}
+
+fn node_with_spec(name: &str, address: &str, spec: Value) -> K8sObject {
+    let mut node = object("Node", name, "", "v1", spec);
     node.status = json!({ "addresses": [{ "type": "InternalIP", "address": address }] });
     node
+}
+
+/// An observed Node, which the external-endpoint opt-in needs to be active.
+fn worker() -> K8sObject {
+    node("worker-1", "192.168.10.5", "10.244.3.0/24")
 }
 
 /// A same-namespace HTTPRoute to `tenant-a/payroll`, the Service and its
@@ -393,11 +405,15 @@ fn one_foreign_endpoint_refuses_the_whole_backend() {
 
 #[test]
 fn not_ready_and_terminating_foreign_endpoints_are_still_refused() {
-    // Readiness flips without the slice's author doing anything; a refusal
-    // that came and went with it would hide the foreign endpoint.
+    // Readiness flips without the slice's author doing anything, and
+    // kube-proxy falls back to serving terminating endpoints (reading an
+    // omitted `serving` as true). Only an explicit `ready: false` and
+    // `serving: false` takes an endpoint out of every consumer's reach.
     for conditions in [
         json!({ "ready": false }),
+        json!({ "ready": false, "terminating": true }),
         json!({ "ready": false, "serving": true, "terminating": true }),
+        json!({ "serving": false }),
     ] {
         let objects = same_namespace_fixture(
             json!([
@@ -411,6 +427,93 @@ fn not_ready_and_terminating_foreign_endpoints_are_still_refused() {
         );
         assert_refused(&objects, options(), "10.2.0.20");
     }
+}
+
+#[test]
+fn foreign_endpoint_that_is_neither_ready_nor_serving_does_not_refuse_the_backend() {
+    // Nothing dials it: Ferrum and CoreDNS need `ready`, and kube-proxy's
+    // terminating fallback needs `serving`.
+    for conditions in [
+        json!({ "ready": false, "serving": false }),
+        json!({ "ready": false, "serving": false, "terminating": true }),
+    ] {
+        let objects = same_namespace_fixture(
+            json!([
+                endpoint("10.1.0.10"),
+                { "addresses": ["10.2.0.20"], "conditions": conditions }
+            ]),
+            vec![
+                pod("tenant-a", "payroll-0", "10.1.0.10"),
+                pod("hr", "payroll-db-0", "10.2.0.20"),
+            ],
+        );
+        assert_admitted(&objects, options(), "10.1.0.10");
+    }
+}
+
+/// The controller-managed slice of a selector-backed `tenant-a/payroll` naming
+/// `payroll-0` (ready) and `payroll-1` with `payroll_1` conditions.
+fn payroll_slice(payroll_1: Value) -> K8sObject {
+    controller_slice(json!([
+        endpoint_with_target("10.1.0.10", "tenant-a", "payroll-0"),
+        {
+            "addresses": ["10.1.0.11"],
+            "conditions": payroll_1,
+            "targetRef": { "kind": "Pod", "namespace": "tenant-a", "name": "payroll-1" }
+        }
+    ]))
+}
+
+#[test]
+fn deleted_pods_lingering_terminating_endpoint_is_attributed_within_the_grace_window() {
+    // A Pod leaves the Pod store before the EndpointSlice controller drops
+    // its terminating endpoint. Within the grace window the endpoint still
+    // belongs to the Pod's namespace; after it, it is unattributed.
+    let before = route_fixture(
+        selector_service("10.96.0.60"),
+        vec![
+            payroll_slice(json!({ "ready": true })),
+            pod("tenant-a", "payroll-0", "10.1.0.10"),
+            pod("tenant-a", "payroll-1", "10.1.0.11"),
+        ],
+    );
+    let after = route_fixture(
+        selector_service("10.96.0.60"),
+        vec![
+            payroll_slice(json!({ "ready": false, "serving": true, "terminating": true })),
+            pod("tenant-a", "payroll-0", "10.1.0.10"),
+        ],
+    );
+
+    // A controller that never saw payroll-1 cannot attribute its address.
+    assert_refused(&after, options(), "10.1.0.11");
+
+    let remembering = options().with_pod_claim_inventory(PodClaimInventory::new());
+    assert_admitted(&before, remembering.clone(), SERVICE_DNS);
+    assert_admitted(&after, remembering, SERVICE_DNS);
+
+    let expired = PodClaimInventory::with_grace_window(Duration::ZERO);
+    let forgetting = options().with_pod_claim_inventory(expired);
+    assert_admitted(&before, forgetting.clone(), SERVICE_DNS);
+    assert_refused(&after, forgetting, "10.1.0.11");
+}
+
+#[test]
+fn a_recent_claim_never_outvotes_an_observed_pod_of_another_namespace() {
+    // payroll-1's IP was reused by another namespace's Pod: the Pod observed
+    // now decides, so the lingering endpoint is foreign even within the
+    // grace window.
+    let before = same_namespace_fixture(
+        json!([endpoint("10.1.0.11")]),
+        vec![pod("tenant-a", "payroll-1", "10.1.0.11")],
+    );
+    let after = same_namespace_fixture(
+        json!([endpoint("10.1.0.11")]),
+        vec![pod("hr", "payroll-db-0", "10.1.0.11")],
+    );
+    let remembering = options().with_pod_claim_inventory(PodClaimInventory::new());
+    assert_admitted(&before, remembering.clone(), "10.1.0.11");
+    assert_refused(&after, remembering, "10.1.0.11");
 }
 
 #[test]
@@ -468,9 +571,38 @@ fn host_network_and_terminal_pods_do_not_attribute_an_ip() {
 
 #[test]
 fn unattributed_endpoint_ip_is_refused_unless_the_operator_opts_in() {
-    let objects = same_namespace_fixture(json!([endpoint("203.0.113.10")]), Vec::new());
+    let objects = same_namespace_fixture(json!([endpoint("203.0.113.10")]), vec![worker()]);
     assert_refused(&objects, options(), "203.0.113.10");
     assert_admitted(&objects, opted_in_options(), "203.0.113.10");
+}
+
+#[test]
+fn opt_in_is_inactive_until_the_controller_observes_a_node() {
+    // Without the Node watch, a Node address or an unwatched Pod's IP looks
+    // external, so the opt-in keeps refusing and the translation says why.
+    let unobserved = same_namespace_fixture(json!([endpoint("203.0.113.10")]), Vec::new());
+    assert_refused(&unobserved, opted_in_options(), "203.0.113.10");
+    let translation =
+        translate_k8s_objects(&unobserved, opted_in_options()).expect("translation succeeds");
+    let inactive = translation
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains(OPT_IN_INACTIVE))
+        .count();
+    assert_eq!(inactive, 1, "{:?}", translation.warnings);
+
+    let observed = same_namespace_fixture(json!([endpoint("203.0.113.10")]), vec![worker()]);
+    assert_admitted(&observed, opted_in_options(), "203.0.113.10");
+    let translation =
+        translate_k8s_objects(&observed, opted_in_options()).expect("translation succeeds");
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains(OPT_IN_INACTIVE)),
+        "{:?}",
+        translation.warnings
+    );
 }
 
 #[test]
@@ -505,7 +637,7 @@ fn special_malformed_and_fqdn_endpoints_are_refused_even_when_opted_in() {
         " 203.0.113.10",
         "203.0.113.10 ",
     ] {
-        let objects = same_namespace_fixture(json!([endpoint(address)]), Vec::new());
+        let objects = same_namespace_fixture(json!([endpoint(address)]), vec![worker()]);
         assert_refused(&objects, opted_in_options(), address);
     }
 }
@@ -517,7 +649,7 @@ fn a_pod_reporting_a_special_address_does_not_make_it_a_backend() {
     for address in ["127.0.0.1", "169.254.169.254", "::1", "fd00:ec2::254"] {
         let objects = same_namespace_fixture(
             json!([endpoint(address)]),
-            vec![pod("tenant-a", "payroll-0", address)],
+            vec![pod("tenant-a", "payroll-0", address), worker()],
         );
         assert_refused(&objects, opted_in_options(), address);
     }
@@ -527,13 +659,13 @@ fn a_pod_reporting_a_special_address_does_not_make_it_a_backend() {
 fn nat64_endpoint_follows_its_embedded_ipv4() {
     // 64:ff9b::cb00:710a embeds the external 203.0.113.10 (opt-in admits it);
     // 64:ff9b::a02:14 embeds another namespace's Pod (always refused).
-    let external = same_namespace_fixture(json!([endpoint("64:ff9b::cb00:710a")]), Vec::new());
+    let external = same_namespace_fixture(json!([endpoint("64:ff9b::cb00:710a")]), vec![worker()]);
     assert_refused(&external, options(), "64:ff9b::cb00:710a");
     assert_admitted(&external, opted_in_options(), "64:ff9b::cb00:710a");
 
     let foreign = same_namespace_fixture(
         json!([endpoint("64:ff9b::a02:14")]),
-        vec![pod("hr", "payroll-db-0", "10.2.0.20")],
+        vec![pod("hr", "payroll-db-0", "10.2.0.20"), worker()],
     );
     assert_refused(&foreign, opted_in_options(), "64:ff9b::a02:14");
 }
@@ -554,18 +686,51 @@ fn opt_in_never_admits_cluster_infrastructure() {
             "ports": [{ "name": "http", "port": 8080 }]
         }),
     );
-    let worker = node("worker-1", "192.168.10.5", "10.244.3.0/24");
     for address in ["10.96.7.7", "10.96.0.50", "192.168.10.5", "10.244.3.17"] {
         let objects = same_namespace_fixture(
             json!([endpoint(address)]),
-            vec![ledger.clone(), worker.clone()],
+            vec![ledger.clone(), worker()],
         );
         assert_refused(&objects, opted_in_options(), address);
     }
 
     // A genuinely external IP is still admitted beside that inventory.
-    let objects = same_namespace_fixture(json!([endpoint("203.0.113.10")]), vec![ledger, worker]);
+    let objects = same_namespace_fixture(json!([endpoint("203.0.113.10")]), vec![ledger, worker()]);
     assert_admitted(&objects, opted_in_options(), "203.0.113.10");
+}
+
+#[test]
+fn opt_in_never_admits_an_ip_inside_any_nodes_pod_cidr() {
+    // Every Node's CIDRs count, in both families and whatever their prefix
+    // length, including the single-family `spec.podCIDR` fallback.
+    let dual_stack = node_with_spec(
+        "worker-2",
+        "192.168.10.6",
+        json!({ "podCIDRs": ["10.244.4.0/24", "fd00:10:244:4::/64"] }),
+    );
+    let legacy = node_with_spec(
+        "worker-3",
+        "192.168.10.7",
+        json!({ "podCIDR": "10.245.0.0/16" }),
+    );
+    let nodes = vec![worker(), dual_stack, legacy];
+
+    for address in ["10.244.4.200", "fd00:10:244:4::17", "10.245.200.1"] {
+        let mut slice = endpoint_slice("tenant-a", json!([endpoint(address)]));
+        if address.contains(':') {
+            slice.spec["addressType"] = json!("IPv6");
+        }
+        let mut objects = route_fixture(selectorless_service("tenant-a"), vec![slice]);
+        objects.extend(nodes.clone());
+        assert_refused(&objects, opted_in_options(), address);
+    }
+
+    // Just outside every CIDR is external.
+    for address in ["10.244.5.1", "10.246.0.1"] {
+        let mut objects = same_namespace_fixture(json!([endpoint(address)]), Vec::new());
+        objects.extend(nodes.clone());
+        assert_admitted(&objects, opted_in_options(), address);
+    }
 }
 
 #[test]
@@ -630,7 +795,7 @@ fn extra_slice_on_a_selector_service_is_refused() {
 fn opt_in_does_not_admit_an_unattributed_endpoint_of_a_selector_service() {
     let objects = route_fixture(
         selector_service("10.96.0.60"),
-        vec![extra_slice(json!([endpoint("203.0.113.10")]))],
+        vec![extra_slice(json!([endpoint("203.0.113.10")])), worker()],
     );
     assert_refused(&objects, opted_in_options(), "203.0.113.10");
 }
@@ -640,7 +805,7 @@ fn selector_service_reaches_its_host_network_daemonset_pods() {
     // A host-network Pod reports its Node's IP, which no other Pod claims;
     // the controller-managed endpoint names it by `targetRef`.
     let daemonset_pod = host_network_pod("tenant-a", "payroll-node-a", "192.168.10.5");
-    let worker = node("worker-1", "192.168.10.5", "10.244.3.0/24");
+    let worker = worker();
     let named = json!([endpoint_with_target(
         "192.168.10.5",
         "tenant-a",
@@ -723,7 +888,7 @@ fn granted_reference_reaches_only_pods_of_the_granting_namespace() {
     assert_refused(&route_namespace_pods, options(), "10.1.0.10");
 
     // The opt-in is for same-namespace routes only; a grant never widens it.
-    let unattributed = cross_namespace_fixture(json!([endpoint("203.0.113.10")]), Vec::new());
+    let unattributed = cross_namespace_fixture(json!([endpoint("203.0.113.10")]), vec![worker()]);
     assert_refused(&unattributed, opted_in_options(), "203.0.113.10");
 }
 

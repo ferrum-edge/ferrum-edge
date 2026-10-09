@@ -419,7 +419,8 @@ fn endpoint_slice_backend_message(
             "backendRef to Service {namespace:?}/{name:?} {ENDPOINT_SLICE_REFUSAL}: an \
              EndpointSlice endpoint IP is not the IP of a Pod observed in namespace \
              {namespace:?}; FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true admits such \
-             endpoints of a selector-less Service for routes in the same namespace as the Service"
+             endpoints of a selector-less Service for routes in the same namespace as the \
+             Service, once the controller observes Nodes"
         ),
         EndpointSliceRefusal::Unverifiable => format!(
             "backendRef to Service {namespace:?}/{name:?} {ENDPOINT_SLICE_REFUSAL}: the \
@@ -436,6 +437,17 @@ fn endpoint_slice_backend_message(
 /// `ResolvedRefs` reports `RefNotPermitted`.
 pub(crate) fn message_is_endpoint_slice_refusal(message: &str) -> bool {
     message.contains(ENDPOINT_SLICE_REFUSAL)
+}
+
+/// Translation warning for `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true`
+/// in a translation that observes no Node, which keeps the opt-in inactive.
+pub(crate) fn external_endpoints_opt_in_inactive_warning() -> String {
+    "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true is inactive: the controller observes \
+     no Kubernetes Node, so it cannot tell Node addresses and Node Pod CIDRs from external hosts, \
+     and EndpointSlice IPs no observed Pod claims stay refused; set \
+     FERRUM_K8S_NODE_LOCALITY_ENABLED=true and grant the controller `nodes` list/watch RBAC \
+     (ferrum-mesh chart `controlPlane.rbac.nodeLocality`)"
+        .to_string()
 }
 
 /// Translation warning for a backendRef to a selector-backed Service whose

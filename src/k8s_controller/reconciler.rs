@@ -12,7 +12,7 @@ use crate::config::types::{GatewayConfig, K8sMeshOverlay};
 use crate::config::validation_pipeline::collect_duplicate_resource_id_errors;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, NodeWaypointInventory,
-    translate_k8s_objects_collecting_skips,
+    PodClaimInventory, translate_k8s_objects_collecting_skips,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;
@@ -331,6 +331,7 @@ async fn run_reconcile_loop(
     }
 
     let node_waypoint_inventory = NodeWaypointInventory::new();
+    let pod_claim_inventory = PodClaimInventory::new();
 
     // Initial reconciliation — block until first success.
     do_reconcile(
@@ -367,6 +368,7 @@ async fn run_reconcile_loop(
             metrics: Arc::clone(&metrics),
             revision: Arc::clone(&revision),
             node_waypoint_inventory: node_waypoint_inventory.clone(),
+            pod_claim_inventory: pod_claim_inventory.clone(),
         },
     )
     .await;
@@ -420,6 +422,7 @@ async fn run_reconcile_loop(
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
                         node_waypoint_inventory: node_waypoint_inventory.clone(),
+                        pod_claim_inventory: pod_claim_inventory.clone(),
                     },
                 ).await;
             }
@@ -467,6 +470,7 @@ async fn run_reconcile_loop(
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
                         node_waypoint_inventory: node_waypoint_inventory.clone(),
+                        pod_claim_inventory: pod_claim_inventory.clone(),
                     },
                 ).await;
             }
@@ -665,6 +669,9 @@ struct ReconcileContext {
     /// Last Ready NodeWaypoint endpoint per node, shared across reconciles.
     /// Applied only with same-node trusted replacement evidence.
     node_waypoint_inventory: NodeWaypointInventory,
+    /// Pod IP claims seen within the EndpointSlice attribution grace window,
+    /// shared across reconciles (issue #6108).
+    pod_claim_inventory: PodClaimInventory,
 }
 
 fn namespaces_for_broadcast(
@@ -1155,7 +1162,8 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_selectorless_external_endpoints_allowed(ctx.allow_selectorless_external_endpoints)
         .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced)
         .with_mesh_overlay_authority(ctx.mesh_overlay_authority)
-        .with_node_waypoint_inventory(ctx.node_waypoint_inventory.clone());
+        .with_node_waypoint_inventory(ctx.node_waypoint_inventory.clone())
+        .with_pod_claim_inventory(ctx.pod_claim_inventory.clone());
     let Some((translation, translation_errors)) =
         translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {
