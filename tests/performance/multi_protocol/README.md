@@ -576,6 +576,8 @@ for window in 64k default; do
 done
 ```
 
+**Measured disposition:** the [2026-10-09 isolated affinity comparison](affinity-measurements-2026-10-09.md) supports keeping affinity enabled; it retains all 36 pairs and the precise source/image identities.
+
 **gRPC connection affinity (#5991, #6022 item 6).** Affinity has no runtime
 toggle; it applies to every gRPC pool with more than one connection per host.
 Pair the dispatched `main` against the published image of #5991's parent

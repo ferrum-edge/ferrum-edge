@@ -9,9 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.16] - 2026-10-09
 
-Release preparation started on **2026-10-09 UTC** from main
-`415990315392dee5a52b8c98d998ceaad961b21e`. This release fixes the published
-QUIC advisories affecting 0.9.15 and tightens admin, plugin, Kubernetes and
+This release fixes the published QUIC advisories affecting 0.9.15 and tightens admin, plugin, Kubernetes and
 credential boundaries. Read [Upgrading to 0.9.16](docs/upgrade_guide.md#upgrading-to-0916)
 before updating operators, custom plugins, mesh charts or contract consumers.
 
