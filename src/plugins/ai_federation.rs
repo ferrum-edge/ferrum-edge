@@ -116,6 +116,10 @@ use super::ai_stream_router::{
 use super::utils::ai_model_glob::{
     MAX_MODEL_PATTERNS_PER_PROVIDER, is_valid_model_pattern, matches_model_glob,
 };
+use super::utils::ambient_cloud_credentials::{
+    ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS, AmbientAwsEndpointScope, AwsCredentialSources,
+    AwsService, aws_partition_dns_suffix,
+};
 use super::utils::aws_sigv4;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::openai_error::openai_error_body;
@@ -651,6 +655,11 @@ struct ResolvedProvider {
     /// google_*, aws_region, base_url) is consumed when this is built and
     /// then discarded — we don't need the raw fields at request time.
     url_template: UrlTemplate,
+    /// Set for an `aws_bedrock` provider whose SigV4 credentials came from the
+    /// process environment without the explicit opt-out: the only endpoints
+    /// those credentials may be signed for (issue #6111). Re-checked against
+    /// the rendered URL before every provider call.
+    ambient_endpoint_scope: Option<AmbientAwsEndpointScope>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1073,7 +1082,10 @@ fn build_url_template(
 
         ProviderType::AwsBedrock => {
             let region = aws_region.unwrap_or("us-east-1");
-            let prefix = format!("https://bedrock-runtime.{}.amazonaws.com/model/", region);
+            let prefix = format!(
+                "https://bedrock-runtime.{region}.{}/model/",
+                aws_partition_dns_suffix(region)
+            );
             UrlTemplate::PrefixModelSuffix {
                 prefix: Arc::from(prefix),
                 suffix: Arc::from("/converse"),
@@ -1342,7 +1354,14 @@ impl AiFederation {
             // Validate endpoint material before parsing or retaining
             // credentials. Unsafe authorities therefore fail deterministically
             // even when the same provider also has malformed auth material.
-            let auth = build_auth(provider_type, pv, &name)?;
+            let (auth, credential_sources) = build_auth(provider_type, pv, &name)?;
+            let ambient_endpoint_scope = resolve_ambient_endpoint_scope(
+                pv,
+                &name,
+                credential_sources,
+                aws_region.as_deref(),
+                &url_template,
+            )?;
 
             providers.push(ResolvedProvider {
                 name,
@@ -1359,6 +1378,7 @@ impl AiFederation {
                 circuit,
                 base_url,
                 url_template,
+                ambient_endpoint_scope,
             });
         }
 
@@ -1449,6 +1469,7 @@ const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
     "aws_access_key_id",
     "aws_secret_access_key",
     "aws_session_token",
+    "allow_custom_endpoint_with_ambient_credentials",
     "circuit_breaker",
 ];
 
@@ -1494,6 +1515,7 @@ fn validate_provider_field_types(provider: &Value) -> Result<(), String> {
         optional_str(provider, field)?;
     }
     optional_bool(provider, "allow_plaintext")?;
+    optional_bool(provider, ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS)?;
     Ok(())
 }
 
@@ -1806,13 +1828,16 @@ fn required_api_key(config: &Value, name: &str) -> Result<String, String> {
     Ok(api_key)
 }
 
-/// Build the authentication method for a provider.
+/// Build the authentication method for a provider, together with where each
+/// AWS credential came from (all `false` for every provider but
+/// `aws_bedrock`), so the endpoint scope is decided from the values this
+/// resolution actually used (issue #6111).
 fn build_auth(
     provider_type: ProviderType,
     config: &Value,
     name: &str,
-) -> Result<AuthMethod, String> {
-    match provider_type {
+) -> Result<(AuthMethod, AwsCredentialSources), String> {
+    let auth = match provider_type {
         // Bearer token providers
         ProviderType::OpenAi
         | ProviderType::Mistral
@@ -1820,34 +1845,34 @@ fn build_auth(
         | ProviderType::DeepSeek
         | ProviderType::MetaLlama
         | ProviderType::HuggingFace
-        | ProviderType::Cohere => Ok(AuthMethod::BearerToken {
+        | ProviderType::Cohere => AuthMethod::BearerToken {
             api_key: required_api_key(config, name)?,
-        }),
+        },
 
-        ProviderType::Anthropic => Ok(AuthMethod::CustomHeader {
+        ProviderType::Anthropic => AuthMethod::CustomHeader {
             header_name: "x-api-key".to_string(),
             api_key: required_api_key(config, name)?,
-        }),
+        },
 
-        ProviderType::AzureOpenAi => Ok(AuthMethod::CustomHeader {
+        ProviderType::AzureOpenAi => AuthMethod::CustomHeader {
             header_name: "api-key".to_string(),
             api_key: required_api_key(config, name)?,
-        }),
+        },
 
-        ProviderType::GoogleGemini => Ok(AuthMethod::CustomHeader {
+        ProviderType::GoogleGemini => AuthMethod::CustomHeader {
             header_name: "x-goog-api-key".to_string(),
             api_key: required_api_key(config, name)?,
-        }),
+        },
 
         ProviderType::GoogleVertex => {
             let sa_json = config_or_env_str(config, "google_service_account_json", None).ok_or(
                 format!("ai_federation: provider {name:?} missing `google_service_account_json`"),
             )?;
-            Ok(AuthMethod::GoogleOAuth2 {
+            AuthMethod::GoogleOAuth2 {
                 cache: Arc::new(OAuth2Cache::new(sa_json).map_err(|error| {
                     format!("ai_federation: provider {name:?} OAuth configuration failed: {error}")
                 })?),
-            })
+            }
         }
 
         ProviderType::AwsBedrock => {
@@ -1859,6 +1884,11 @@ fn build_auth(
             .ok_or(format!(
                 "ai_federation: provider {name:?} missing `aws_region`"
             ))?;
+            let mut sources = AwsCredentialSources {
+                access_key_id_from_env: !config_str_present(config, "aws_access_key_id"),
+                secret_access_key_from_env: !config_str_present(config, "aws_secret_access_key"),
+                session_token_from_env: false,
+            };
             let access_key_id =
                 config_or_env_str(config, "aws_access_key_id", Some(&["AWS_ACCESS_KEY_ID"]))
                     .ok_or(format!(
@@ -1872,8 +1902,16 @@ fn build_auth(
             .ok_or(format!(
                 "ai_federation: provider {name:?} missing `aws_secret_access_key`"
             ))?;
-            let session_token =
-                config_or_env_str(config, "aws_session_token", Some(&["AWS_SESSION_TOKEN"]));
+            // An STS session token is bound to its access key, so
+            // `AWS_SESSION_TOKEN` only completes a key pair that also resolved
+            // from the environment; a config key pair uses only the config
+            // `aws_session_token` (issue #6111).
+            let session_token_env = sources
+                .may_use_environment_session_token()
+                .then_some(AWS_SESSION_TOKEN_ENV);
+            let session_token = config_or_env_str(config, "aws_session_token", session_token_env);
+            sources.session_token_from_env =
+                session_token.is_some() && !config_str_present(config, "aws_session_token");
             // SigV4 embeds the access key id in the `Authorization` value and
             // sends the session token as `x-amz-security-token`, so both are
             // static header values and fail the same way at dispatch.
@@ -1882,17 +1920,23 @@ fn build_auth(
                 validate_static_credential_header(name, "aws_session_token", token)?;
             }
 
-            Ok(AuthMethod::AwsSigV4 {
+            let auth = AuthMethod::AwsSigV4 {
                 config: aws_sigv4::AwsSigV4Config {
                     region,
                     access_key_id,
                     secret_access_key,
                     session_token,
                 },
-            })
+            };
+            return Ok((auth, sources));
         }
-    }
+    };
+    Ok((auth, AwsCredentialSources::default()))
 }
+
+/// Environment fallback for `aws_session_token`, consulted only when the
+/// `aws_bedrock` key pair also resolved from the environment.
+const AWS_SESSION_TOKEN_ENV: &[&str] = &["AWS_SESSION_TOKEN"];
 
 /// Read a string value from config, falling back to environment variables.
 fn config_or_env_str(config: &Value, field: &str, env_vars: Option<&[&str]>) -> Option<String> {
@@ -1911,6 +1955,69 @@ fn config_or_env_str(config: &Value, field: &str, env_vars: Option<&[&str]>) -> 
         }
     }
     None
+}
+
+/// Whether the provider config itself carries a non-empty value for `field`,
+/// the same rule [`config_or_env_str`] applies before an environment fallback.
+fn config_str_present(config: &Value, field: &str) -> bool {
+    config
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// Scope the process-environment AWS credentials of an `aws_bedrock` provider
+/// to official Bedrock Runtime endpoints (issue #6111).
+///
+/// `credential_sources` is what `build_auth` actually resolved (all `false` for
+/// other providers). A credential from the environment belongs to the gateway
+/// process, not to the config author, so the endpoint that config selects
+/// (`base_url`, or the host derived from `aws_region`) must be the service
+/// itself unless `allow_custom_endpoint_with_ambient_credentials` is set.
+/// Returns the scope the request path re-checks, or `None` when the
+/// credentials are the config's own or the operator opted out.
+fn resolve_ambient_endpoint_scope(
+    config: &Value,
+    name: &str,
+    credential_sources: AwsCredentialSources,
+    aws_region: Option<&str>,
+    url_template: &UrlTemplate,
+) -> Result<Option<AmbientAwsEndpointScope>, String> {
+    if !credential_sources.is_ambient() {
+        return Ok(None);
+    }
+    if optional_bool(config, ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS)?.unwrap_or(false) {
+        info!(
+            provider = %name,
+            "ai_federation: process-environment AWS credentials may be sent to a custom Bedrock endpoint (`allow_custom_endpoint_with_ambient_credentials` is true)"
+        );
+        return Ok(None);
+    }
+
+    let region = aws_region.ok_or(format!(
+        "ai_federation: provider {name:?} missing `aws_region`"
+    ))?;
+    let scope = AmbientAwsEndpointScope::new(AwsService::BedrockRuntime, region);
+    // The model is a validated path component appended after the authority,
+    // so any placeholder renders the same scheme, host, and port.
+    let rendered = url_template.render("model");
+    if let Ok(url) = Url::parse(&rendered)
+        && scope.permits_url(&url)
+    {
+        return Ok(Some(scope));
+    }
+    Err(format!(
+        "ai_federation: provider {name:?} resolves {} from the process environment, so its \
+         endpoint must be an official Amazon Bedrock Runtime endpoint for the configured region \
+         over HTTPS on the default port (`https://bedrock-runtime[-fips].<region>.amazonaws.com`, \
+         `https://bedrock-runtime[-fips].<region>.api.aws`, or an interface VPC endpoint \
+         `https://vpce-<id>[-<az>].bedrock-runtime[-fips].<region>.vpce.amazonaws.com`, where \
+         `<region>` is a commercial or GovCloud region; a `cn-*` region uses `amazonaws.com.cn` \
+         and the dual-stack `api.amazonwebservices.com.cn` instead); set the AWS credentials in \
+         the provider config, or set `{ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS}: true` on \
+         the provider to send the process credentials to this endpoint deliberately",
+        credential_sources.ambient_field_list()
+    ))
 }
 
 /// Validate provider-specific required config fields.
@@ -4998,12 +5105,30 @@ impl AiFederation {
         body: &[u8],
         latency_accumulator: &AtomicU64,
     ) -> Result<ProviderResponse, ProviderCallFailure> {
-        validate_dispatch_url(url).map_err(|_| ProviderCallFailure {
+        let parsed_url = validate_dispatch_url(url).map_err(|_| ProviderCallFailure {
             kind: ProviderCallFailureKind::PreWire,
             error_class: crate::retry::ErrorClass::DispatchPolicyRejected,
             headers: HashMap::new(),
             circuit_failure: false,
         })?;
+        // Process-environment AWS credentials are scoped to official Bedrock
+        // Runtime endpoints (issue #6111). Construction already refused any
+        // other endpoint; this re-check keeps the invariant at the signing
+        // boundary and fails closed before any byte is sent.
+        if let Some(scope) = provider.ambient_endpoint_scope.as_ref()
+            && !scope.permits_url(&parsed_url)
+        {
+            warn_sampled!(
+                provider = %provider.name,
+                "ai_federation: refused to sign a provider request with process-environment AWS credentials for an endpoint outside the official Amazon Bedrock Runtime scope"
+            );
+            return Err(ProviderCallFailure {
+                kind: ProviderCallFailureKind::PreWire,
+                error_class: crate::retry::ErrorClass::DispatchPolicyRejected,
+                headers: HashMap::new(),
+                circuit_failure: false,
+            });
+        }
         let auth_headers = self
             .build_auth_headers(provider, url, body, latency_accumulator)
             .await
@@ -5136,7 +5261,7 @@ impl AiFederation {
     }
 }
 
-fn validate_dispatch_url(url: &str) -> Result<(), String> {
+fn validate_dispatch_url(url: &str) -> Result<Url, String> {
     let parsed = Url::parse(url)
         .map_err(|_| "ai_federation: rendered provider endpoint is invalid".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https")
@@ -5147,7 +5272,7 @@ fn validate_dispatch_url(url: &str) -> Result<(), String> {
     {
         return Err("ai_federation: rendered provider endpoint violates URL policy".to_string());
     }
-    Ok(())
+    Ok(parsed)
 }
 
 fn safe_provider_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
@@ -5469,8 +5594,7 @@ fn stream_target_for(
     let rendered = build_provider_url(provider, resolved_model);
     // Re-run the dispatch URL policy: the buffered path checks it per request,
     // and a streaming claim must not be weaker.
-    validate_dispatch_url(&rendered).map_err(|_| StreamIneligibility::Endpoint)?;
-    let url = Url::parse(&rendered).map_err(|_| StreamIneligibility::Endpoint)?;
+    let url = validate_dispatch_url(&rendered).map_err(|_| StreamIneligibility::Endpoint)?;
     let scheme = match url.scheme() {
         "https" => BackendScheme::Https,
         "http" => BackendScheme::Http,
@@ -8672,6 +8796,7 @@ pub mod test_helpers {
             circuit: None,
             base_url,
             url_template,
+            ambient_endpoint_scope: None,
         };
         translate_request(&provider, openai_body, model)
     }
@@ -8704,6 +8829,7 @@ pub mod test_helpers {
             circuit: None,
             base_url: None,
             url_template: UrlTemplate::Static(Arc::from("https://example.test/")),
+            ambient_endpoint_scope: None,
         };
         validate_multimodal_translate_support(&provider, openai_body)
     }

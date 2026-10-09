@@ -15,6 +15,7 @@ use ferrum_edge::{
     dns::{DnsCache, DnsConfig},
 };
 use serde_json::{Value, json};
+use serial_test::{parallel, serial};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,6 +114,7 @@ fn test_warmup_hostnames_unbrackets_ipv6_base_url() {
 }
 
 #[test]
+#[parallel(ai_federation_env)]
 fn test_invalid_config_shapes_rejected() {
     let valid_provider = json!({
         "name": "openai",
@@ -517,6 +519,7 @@ async fn final_request_body_revalidation_fails_closed_on_model_and_destination_d
 /// Providers with a provider-native streaming representation or a non-static
 /// credential are fail-closed with a field-specific 501, never relayed raw.
 #[tokio::test]
+#[parallel(ai_federation_env)]
 async fn streaming_ineligible_providers_fail_closed_with_field_specific_diagnostics() {
     for (provider_type, provider_config, model, expected_code) in [
         (
@@ -590,6 +593,7 @@ async fn streaming_ineligible_providers_fail_closed_with_field_specific_diagnost
 /// AWS SigV4 signs the exact final body and Google OAuth2 refreshes a token, so
 /// neither can be committed at claim time.
 #[test]
+#[parallel(ai_federation_env)]
 fn non_static_credentials_are_streaming_ineligible() {
     let plugin = ai_federation::AiFederation::new(
         &json!({"streaming": {"enabled": true}, "providers": [{
@@ -2946,6 +2950,7 @@ fn test_google_vertex_missing_project_rejected() {
 }
 
 #[test]
+#[parallel(ai_federation_env)]
 fn test_bedrock_missing_region_rejected() {
     let config = json!({
         "providers": [{
@@ -4925,6 +4930,20 @@ fn test_url_template_bedrock_embeds_region_and_model() {
     assert_eq!(
         url,
         "https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-3-sonnet/converse"
+    );
+}
+
+#[test]
+fn test_url_template_bedrock_derives_the_china_partition_suffix() {
+    let url = test_helpers::build_provider_url_for_test(
+        "aws_bedrock",
+        &json!({"aws_region": "cn-northwest-1"}),
+        "anthropic.claude-3-sonnet",
+    )
+    .unwrap();
+    assert_eq!(
+        url,
+        "https://bedrock-runtime.cn-northwest-1.amazonaws.com.cn/model/anthropic.claude-3-sonnet/converse"
     );
 }
 
@@ -7185,6 +7204,7 @@ async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
 }
 
 #[tokio::test]
+#[parallel(ai_federation_env)]
 async fn test_before_proxy_rejects_streaming_request_for_translating_providers() {
     for (provider_type, provider_config, model) in streaming_provider_cases() {
         let config = json!({ "providers": [provider_config] });
@@ -8913,6 +8933,7 @@ fn provider_api_key_with_ordinary_characters_still_passes_admission() {
 }
 
 #[test]
+#[parallel(ai_federation_env)]
 fn bedrock_signing_credentials_are_screened_as_header_values_too() {
     for (field, value) in [
         ("aws_access_key_id", "AKIA\nBAD"),
@@ -9200,4 +9221,225 @@ fn service_account_config_errors_keep_fields_without_parser_payloads() {
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains("invalid") || rendered.contains("not a valid URL"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #6111 — process-environment AWS credentials are scoped to official
+// Amazon Bedrock Runtime endpoints
+// ---------------------------------------------------------------------------
+
+const AMBIENT_OPT_IN: &str = "allow_custom_endpoint_with_ambient_credentials";
+
+/// Own the process-wide environment lock with only a process AWS key pair
+/// published and no environment region or session token.
+///
+/// Callers must also be `#[serial(ai_federation_env)]`: the guard excludes
+/// other lock holders, the attribute excludes this file's Bedrock-constructing
+/// readers (`#[parallel(ai_federation_env)]`), which resolve `AWS_*` values
+/// from the environment without taking the lock.
+fn ambient_aws_key_pair_env() -> crate::unit::env_lock::EnvGuard {
+    let env = crate::unit::env_lock::EnvGuard::new(&[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+    ]);
+    env.set("AWS_ACCESS_KEY_ID", "AKIAAMBIENTFIXTURE01");
+    env.set("AWS_SECRET_ACCESS_KEY", "ambient-fixture-secret");
+    env.unset("AWS_SESSION_TOKEN");
+    env.unset("AWS_REGION");
+    env.unset("AWS_DEFAULT_REGION");
+    env
+}
+
+/// A Bedrock provider that carries no credentials of its own.
+fn credential_less_bedrock(base_url: Option<&str>) -> Value {
+    let mut provider = json!({
+        "name": "bedrock",
+        "provider_type": "aws_bedrock",
+        "aws_region": "us-east-1"
+    });
+    if let Some(base_url) = base_url {
+        provider["base_url"] = json!(base_url);
+    }
+    provider
+}
+
+fn build_federation(provider: Value) -> Result<ai_federation::AiFederation, String> {
+    let config = json!({"providers": [provider]});
+    ai_federation::AiFederation::new(&config, create_test_http_client())
+}
+
+fn expect_federation_err(provider: Value) -> String {
+    match build_federation(provider) {
+        Ok(_) => panic!("the provider must be refused"),
+        Err(error) => error,
+    }
+}
+
+#[test]
+#[serial(ai_federation_env)]
+fn ambient_bedrock_credentials_reach_official_runtime_endpoints() {
+    let _env = ambient_aws_key_pair_env();
+
+    build_federation(credential_less_bedrock(None))
+        .expect("the derived regional Bedrock Runtime endpoint is official");
+    for base_url in [
+        "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse",
+        "https://bedrock-runtime-fips.us-east-1.amazonaws.com/model/m/converse",
+        "https://bedrock-runtime.us-east-1.api.aws/model/m/converse",
+        "https://vpce-0abc123.bedrock-runtime.us-east-1.vpce.amazonaws.com/model/m/converse",
+    ] {
+        if let Err(error) = build_federation(credential_less_bedrock(Some(base_url))) {
+            panic!("base_url={base_url} must be accepted: {error}");
+        }
+    }
+
+    // The derived host follows the partition, so a China region is official.
+    let mut provider = credential_less_bedrock(None);
+    provider["aws_region"] = json!("cn-north-1");
+    build_federation(provider).expect("the derived China Bedrock Runtime endpoint is official");
+}
+
+#[test]
+#[serial(ai_federation_env)]
+fn ambient_bedrock_credentials_refuse_custom_endpoints() {
+    let _env = ambient_aws_key_pair_env();
+
+    for base_url in [
+        "https://bedrock-proxy.example.com/model/m/converse",
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/m/converse",
+        "https://bedrock-runtime.us-east-1.amazonaws.com:8443/model/m/converse",
+        "https://bedrock-runtime.us-east-1.amazonaws.com.attacker.example/converse",
+        "https://ec2-203-0-113-10.compute-1.amazonaws.com/converse",
+        // Legacy dash-style S3 hosts of buckets named after the service.
+        "https://bedrock-runtime.s3-us-west-2.amazonaws.com/model/m/converse",
+        "https://bedrock-runtime-fips.s3-external-1.amazonaws.com/model/m/converse",
+        "https://bedrock-runtime.s3-website-us-east-1.amazonaws.com/model/m/converse",
+        // A China suffix for a commercial region.
+        "https://bedrock-runtime.us-east-1.amazonaws.com.cn/model/m/converse",
+    ] {
+        let error = expect_federation_err(credential_less_bedrock(Some(base_url)));
+        assert!(
+            error.contains("resolves `aws_access_key_id`, `aws_secret_access_key` from the"),
+            "base_url={base_url}, got: {error}"
+        );
+        assert!(
+            error.contains(AMBIENT_OPT_IN),
+            "base_url={base_url}, got: {error}"
+        );
+        assert!(
+            !error.contains(base_url),
+            "base_url={base_url}, got: {error}"
+        );
+        assert!(!error.contains("ambient-fixture-secret"), "got: {error}");
+    }
+
+    // A plaintext private endpoint is refused even with `allow_plaintext`.
+    let mut provider = credential_less_bedrock(Some("http://localhost:4566/model/m/converse"));
+    provider["allow_plaintext"] = json!(true);
+    assert!(build_federation(provider).is_err());
+}
+
+#[test]
+#[serial(ai_federation_env)]
+fn ambient_bedrock_credentials_refuse_a_region_outside_the_aws_partitions() {
+    let env = ambient_aws_key_pair_env();
+
+    // A configured region interpolated into the derived host.
+    for region in ["s3-us-west-2", "s3-external-1", "s3-website-us-east-1"] {
+        let mut provider = credential_less_bedrock(None);
+        provider["aws_region"] = json!(region);
+        let error = expect_federation_err(provider);
+        assert!(
+            error.contains(AMBIENT_OPT_IN),
+            "region={region}, got: {error}"
+        );
+        assert!(!error.contains(region), "region={region}, got: {error}");
+    }
+
+    // No configured region: the environment supplies it, and a bucket-shaped
+    // `base_url` is refused whichever region that is.
+    let bucket = "https://bedrock-runtime.s3-us-west-2.amazonaws.com/model/m/converse";
+    for (region, base_url) in [
+        ("us-west-2", Some(bucket)),
+        ("s3-us-west-2", Some(bucket)),
+        ("s3-us-west-2", None),
+    ] {
+        env.set("AWS_REGION", region);
+        let mut provider = credential_less_bedrock(base_url);
+        provider
+            .as_object_mut()
+            .expect("fixture is an object")
+            .remove("aws_region");
+        let error = expect_federation_err(provider);
+        assert!(
+            error.contains(AMBIENT_OPT_IN),
+            "region={region}, got: {error}"
+        );
+        assert!(!error.contains(region), "region={region}, got: {error}");
+    }
+}
+
+#[test]
+#[serial(ai_federation_env)]
+fn ambient_bedrock_custom_endpoint_requires_the_explicit_opt_in() {
+    let _env = ambient_aws_key_pair_env();
+
+    let mut provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    provider[AMBIENT_OPT_IN] = json!(true);
+    build_federation(provider.clone())
+        .expect("the explicit opt-in admits a deliberately chosen private endpoint");
+
+    provider[AMBIENT_OPT_IN] = json!("true");
+    let error = expect_federation_err(provider);
+    assert!(error.contains(AMBIENT_OPT_IN), "got: {error}");
+}
+
+#[test]
+#[serial(ai_federation_env)]
+fn config_bedrock_credentials_may_target_a_custom_endpoint() {
+    // The process key pair is present too; the provider's own credentials win
+    // and are not scoped.
+    let _env = ambient_aws_key_pair_env();
+
+    let mut provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    provider["aws_access_key_id"] = json!("AKIACONFIGFIXTURE01");
+    provider["aws_secret_access_key"] = json!("config-fixture-secret");
+    build_federation(provider).expect("a config-supplied key pair is not scoped");
+}
+
+#[test]
+#[serial(ai_federation_env)]
+fn an_environment_session_token_never_completes_a_config_bedrock_key_pair() {
+    let env = ambient_aws_key_pair_env();
+    env.set("AWS_SESSION_TOKEN", "ambient-session-fixture");
+
+    // An STS session token is bound to its access key, so a config key pair
+    // signs without the process token and is not scoped.
+    let mut provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    provider["aws_access_key_id"] = json!("AKIACONFIGFIXTURE01");
+    provider["aws_secret_access_key"] = json!("config-fixture-secret");
+    build_federation(provider).expect("a config key pair ignores the environment session token");
+
+    // A config key id beside an environment secret is ambient through the
+    // secret alone; the environment token still does not complete it.
+    let mut provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    provider["aws_access_key_id"] = json!("AKIACONFIGFIXTURE01");
+    let error = expect_federation_err(provider);
+    assert!(
+        error.contains("resolves `aws_secret_access_key` from the process environment"),
+        "got: {error}"
+    );
+
+    // An environment key pair is completed by the environment token, and the
+    // diagnostic names all three fields without echoing any value.
+    let provider = credential_less_bedrock(Some("https://bedrock-proxy.example.com/converse"));
+    let error = expect_federation_err(provider);
+    assert!(
+        error.contains("`aws_access_key_id`, `aws_secret_access_key`, `aws_session_token` from"),
+        "got: {error}"
+    );
+    assert!(!error.contains("ambient-session-fixture"), "got: {error}");
 }

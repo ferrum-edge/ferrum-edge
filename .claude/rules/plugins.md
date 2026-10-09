@@ -1000,6 +1000,31 @@ on a native-gRPC request.
   field to `ENV_REFERENCE_FIELDS` in
   `tests/unit/plugins/plugin_secret_env_tests.rs`. `ai_transcript_audit`'s
   `${secret:NAME}` keeps its own `FERRUM_TRANSCRIPT_SINK_SECRET_*` namespace.
+- The standard AWS credential fallbacks (`AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) in `serverless_function`
+  (`aws_lambda`) and `ai_federation` (`aws_bedrock`) are the only remaining
+  ambient credential fallbacks; neither plugin uses the AWS SDK default chain
+  (IMDS, ECS, web identity, SSO, profiles), so keep it that way or extend the
+  scope. Whenever the key id or secret resolves from the environment, the
+  region must pass the partition grammar
+  (`ambient_cloud_credentials::aws_region_partition`, mirroring the SDK
+  `aws` / `aws-cn` / `aws-us-gov` regexes with lowercase letters) and the
+  config-chosen endpoint (derived host, `aws_endpoint_url`, `base_url`) must
+  pass `AmbientAwsEndpointScope` at admission AND again before signing each
+  request (issue #6111). Never relax the region check to a shape check
+  (legacy dash-style S3 hosts like `lambda.s3-us-west-2.amazonaws.com` are
+  customer buckets) and never widen it to generic `*.amazonaws.com`. A `cn-*`
+  region pairs only with `amazonaws.com.cn` / `api.amazonwebservices.com.cn`.
+  Provenance comes from the resolution itself (`AwsCredentialSources`, returned
+  by `ai_federation::build_auth`); never re-read the environment to decide it.
+  `AWS_SESSION_TOKEN` only completes an environment key pair, never config
+  keys. `AWS_LAMBDA_ENDPOINT_URL` (used only without a config
+  `aws_endpoint_url`) is environment-owned and exempt from the endpoint scope,
+  but the region is still screened. CP shape-only admission screens a
+  configured `aws_region` and `aws_endpoint_url` for rows without a key pair.
+  Config-supplied credentials are unscoped; the only bypass is the
+  per-instance `allow_custom_endpoint_with_ambient_credentials` opt-in. A new
+  ambient cloud credential fallback must use the same scope.
 - Shared entrypoint is `plugins::validate_plugin_config(name, config)`.
 - CP admission runs the SAME construction gate over every enabled plugin config
   before a snapshot or delta can be accepted and broadcast
