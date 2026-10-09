@@ -1229,6 +1229,10 @@ wait remain unavailable; correctness disposition and dispatch belong to root.
 
 ## Allocations per request (#6022 item 1)
 
+The [2026-10-09 five-path measurement](allocation-measurements-2026-10-09.md)
+records all 30 observations and separates the cumulative allocation delta from
+individual box attribution.
+
 `alloc_per_request.sh` measures Rust allocator calls per proxied request on
 five dispatch paths. It builds `ferrum-edge` with the default-off
 `bench-h1-profile` feature, whose forwarding global allocator counts every
