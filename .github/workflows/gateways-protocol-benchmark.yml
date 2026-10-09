@@ -480,6 +480,29 @@ jobs:
           path: results/${{ matrix.protocol }}
           retention-days: 90
 
+  dispatch-inputs:
+    # The frozen `benchmark` step pipes the runner through `tee`, so the runner's
+    # refusal of a malformed baseline_image cannot fail that job; this job fails
+    # the run instead. The patterns must equal BASELINE_PUBLISHED and
+    # BASELINE_MIRRORED in run_gateway_protocol_bench.sh
+    # (tests/test_backend_connections.py checks them).
+    name: Validate dispatch inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check baseline_image
+        run: |
+          published='^(docker\.io/)?ferrumedge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+          mirrored='^ghcr\.io/ferrum-edge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+          if [ -z "$FERRUM_BASELINE_IMAGE" ]; then
+            echo "No baseline image requested."
+          elif [[ $FERRUM_BASELINE_IMAGE =~ $published ]] || [[ $FERRUM_BASELINE_IMAGE =~ $mirrored ]]; then
+            echo "Baseline image: $FERRUM_BASELINE_IMAGE"
+          else
+            echo "::error::baseline_image must be ferrumedge/ferrum-edge:main-<40-hex sha>[@sha256:<64-hex>] or its ghcr.io/ferrum-edge copy; this run is invalid."
+            exit 1
+          fi
+
   aggregate:
     # Maximum safe dispatch inputs (full http1-tls: 6 arms x 5 sizes; adaptive off).
     # Planning envelope: iterations * pairs * 30 * (duration + 15) / 60 + 5 minutes.

@@ -135,6 +135,13 @@ cleanup() {
     echo "[cleanup] stopping processes this run started..."
     stop_pid "$GATEWAY_PID"
     stop_pid "$BACKEND_PID"
+    # The baseline worktree and the staged binaries live in this run's temp dir.
+    if [ -n "$WORK" ]; then
+        if [ -d "$WORK/baseline-src" ]; then
+            git -C "$PROJECT_ROOT" worktree remove --force "$WORK/baseline-src" 2>/dev/null || true
+        fi
+        rm -rf "$WORK"
+    fi
 }
 trap cleanup EXIT
 

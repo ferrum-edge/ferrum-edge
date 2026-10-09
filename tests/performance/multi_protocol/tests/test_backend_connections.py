@@ -126,10 +126,32 @@ class RunnerOptionTests(unittest.TestCase):
             self.assertEqual(len(re.findall(
                 r"(?m)^    pool_http2_initial_stream_window_size: *8388608", text)), 1, name)
 
+    def test_window_rewrite_failure_refuses_the_run_before_any_work(self):
+        source = RUNNER.read_text()
+        precheck = source.index('prepare_ferrum_config "$SCRIPT_DIR/configs/$(ferrum_config_name)"')
+        self.assertIn('"/etc/ferrum/tls/ca.pem" > /dev/null || exit 2', source[precheck:])
+        self.assertLess(precheck, source.index('python3 - "$root_output/manifest.json"'))
+        self.assertLess(precheck, source.index("    ensure_baseline_image || exit 2"))
+
+    def test_unpublished_missing_baseline_fails_option_validation(self):
+        for image in ("evil/ferrum-edge:main-" + "0" * 40, "ferrumedge/ferrum-edge:latest"):
+            result = self.run_runner("http2", env={"PATH": "/usr/bin:/bin",
+                                                   "FERRUM_BASELINE_IMAGE": image})
+            self.assertEqual(result.returncode, 2, image)
+            self.assertIn("--baseline-image must be a local image", result.stderr)
+
+    def test_dispatch_job_validates_baseline_with_the_runner_patterns(self):
+        source = RUNNER.read_text()
+        workflow = (REPO_ROOT / ".github/workflows/gateways-protocol-benchmark.yml").read_text()
+        self.assertEqual(re.search(r"BASELINE_PUBLISHED='([^']+)'", source)[1],
+                         re.search(r"published='([^']+)'", workflow)[1])
+        self.assertEqual(re.search(r"BASELINE_MIRRORED='([^']+)'", source)[1],
+                         re.search(r"mirrored='([^']+)'", workflow)[1])
+
     def test_only_published_main_images_are_pulled(self):
         source = RUNNER.read_text()
-        published = re.search(r"local published='([^']+)'", source)[1]
-        mirrored = re.search(r"local mirrored='([^']+)'", source)[1]
+        published = re.search(r"BASELINE_PUBLISHED='([^']+)'", source)[1]
+        mirrored = re.search(r"BASELINE_MIRRORED='([^']+)'", source)[1]
         sha = "0123456789abcdef0123456789abcdef01234567"
         digest = "@sha256:" + "a" * 64
         for image in (f"ferrumedge/ferrum-edge:main-{sha}",

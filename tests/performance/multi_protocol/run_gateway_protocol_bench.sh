@@ -154,6 +154,19 @@ case "$GRPC_CLIENT_CONNECTIONS" in
     pooled|per-rpc) ;;
     *) echo "--grpc-client-connections must be pooled or per-rpc" >&2; exit 2 ;;
 esac
+# Only a revision baseline published by main-latest-image.yml
+# (`ferrumedge/ferrum-edge:main-<sha>`, or its GHCR copy) is ever pulled; any
+# other baseline must already be a local image. Refused here, before any build
+# or manifest. The frozen hosted step pipes this runner through `tee`, so the
+# workflow's `dispatch-inputs` job applies the same patterns to fail the run.
+BASELINE_PUBLISHED='^(docker\.io/)?ferrumedge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+BASELINE_MIRRORED='^ghcr\.io/ferrum-edge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+if [ -n "$BASELINE_IMAGE" ] && [[ ! $BASELINE_IMAGE =~ $BASELINE_PUBLISHED ]] \
+    && [[ ! $BASELINE_IMAGE =~ $BASELINE_MIRRORED ]] \
+    && ! docker image inspect "$BASELINE_IMAGE" >/dev/null 2>&1; then
+    echo "--baseline-image must be a local image or a published main-<40-hex sha> image" >&2
+    exit 2
+fi
 # Each option changes only the H2-family workloads it names. Other protocols in
 # the same dispatch run (and record) their ordinary workload.
 case "$PROTOCOL" in http2|grpcs) ;; *) H2_WINDOW=default ;; esac
@@ -447,19 +460,17 @@ build_binaries() {
     fi
 }
 
-# A revision baseline published by main-latest-image.yml
-# (`ferrumedge/ferrum-edge:main-<sha>`, or its GHCR copy) is pulled when it is
+# A revision baseline published by main-latest-image.yml is pulled when it is
 # not already local, so a hosted dispatch can pair the dispatched ref with an
-# earlier main commit on one VM. Any other baseline must already exist locally:
-# this runner never pulls an arbitrary image.
+# earlier main commit on one VM. Option validation already refused any other
+# missing image; this runner never pulls an arbitrary one.
 ensure_baseline_image() {
     [ -n "$BASELINE_IMAGE" ] || return 0
     if docker image inspect "$BASELINE_IMAGE" >/dev/null 2>&1; then
         return 0
     fi
-    local published='^(docker\.io/)?ferrumedge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
-    local mirrored='^ghcr\.io/ferrum-edge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
-    if [[ ! $BASELINE_IMAGE =~ $published ]] && [[ ! $BASELINE_IMAGE =~ $mirrored ]]; then
+    if [[ ! $BASELINE_IMAGE =~ $BASELINE_PUBLISHED ]] \
+        && [[ ! $BASELINE_IMAGE =~ $BASELINE_MIRRORED ]]; then
         echo "[baseline] $BASELINE_IMAGE is not local and not a published main-<sha> image" >&2
         return 1
     fi
@@ -1443,6 +1454,12 @@ main() {
         && { [ "$H2_WINDOW" != default ] || [ "$GRPC_CLIENT_CONNECTIONS" != pooled ]; }; then
         echo "[experiment] the H2 campaign verifies fixed 8 MiB windows and pooled clients" >&2
         exit 2
+    fi
+    # A route window that cannot be rewritten would fail every Ferrum start and
+    # silently drop the Ferrum arms: refuse the whole run once, before any work.
+    if [ "$H2_WINDOW" != default ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
+        prepare_ferrum_config "$SCRIPT_DIR/configs/$(ferrum_config_name)" \
+            "/etc/ferrum/tls/ca.pem" > /dev/null || exit 2
     fi
     if [ -r /proc/sys/kernel/random/boot_id ]; then
         HOST_ID=$(cat /proc/sys/kernel/random/boot_id)

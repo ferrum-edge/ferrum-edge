@@ -187,6 +187,19 @@ class RunnerContractTests(unittest.TestCase):
         # Ambient FERRUM_* settings cannot change the measured path.
         self.assertIn('case "$name" in FERRUM_*) unset "$name" ;; esac', source)
 
+    def test_cleanup_removes_the_baseline_worktree_and_temp_dir(self):
+        source = RUNNER.read_text()
+        cleanup = source[source.index("cleanup() {"):source.index("trap cleanup EXIT")]
+        self.assertIn('worktree remove --force "$WORK/baseline-src"', cleanup)
+        self.assertIn('rm -rf "$WORK"', cleanup)
+
+    def test_hosted_duration_is_bounded_against_the_job_timeout(self):
+        workflow = (REPO_ROOT / ".github/workflows/alloc-per-request.yml").read_text()
+        duration = workflow[workflow.index("      duration:"):workflow.index("      rounds:")]
+        self.assertIn("type: choice", duration)
+        self.assertIn('options: ["5", "10", "20", "30"]', duration)
+        self.assertIn("timeout-minutes: 240", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

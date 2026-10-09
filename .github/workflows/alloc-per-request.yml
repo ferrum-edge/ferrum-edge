@@ -29,11 +29,15 @@ on:
         default: release
         type: choice
         options: [release, ci-release]
+      # A choice, not free text: 5 paths x 2 revisions x 5 rounds at 30 s plus
+      # warmup, idle and restarts still leaves the two builds most of the
+      # 240-minute job timeout.
       duration:
         description: "Measured seconds per path, revision and round"
         required: false
         default: "20"
-        type: string
+        type: choice
+        options: ["5", "10", "20", "30"]
       rounds:
         description: "Rounds; the candidate/baseline order alternates per round"
         required: false
