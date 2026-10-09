@@ -348,7 +348,11 @@ pub fn effective_outbound_proxy_hops(ctx: &RequestContext) -> Option<u8> {
         return Some(hops);
     };
     let listener_ports = GATEWAY_LISTENER_PORTS.load();
-    Some(forwarded_count(hops, backend_port, listener_ports.as_deref()))
+    Some(forwarded_count(
+        hops,
+        backend_port,
+        listener_ports.as_deref(),
+    ))
 }
 
 /// [`effective_outbound_proxy_hops`] against an explicit listener-port

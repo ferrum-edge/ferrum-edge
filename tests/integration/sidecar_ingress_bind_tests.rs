@@ -458,7 +458,12 @@ fn ingress_endpoint_on_its_own_bind_port_is_refused() {
         AppProtocol::Tcp,
         6379,
         false,
-        vec![ingress_entry(AppProtocol::Tcp, Some("127.0.0.1"), 19003, 19003)],
+        vec![ingress_entry(
+            AppProtocol::Tcp,
+            Some("127.0.0.1"),
+            19003,
+            19003,
+        )],
     );
     let mesh = prepared.mesh.as_deref().expect("mesh");
     assert!(mesh.local_ingress_listeners.is_empty());

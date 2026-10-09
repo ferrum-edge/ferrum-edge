@@ -613,14 +613,19 @@ fn final_backend_header_policy_hooks_cannot_reset_the_count() {
 fn every_final_backend_header_policy_pass_reasserts_the_count() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let proxy = std::fs::read_to_string(root.join("src/proxy/mod.rs")).unwrap();
-    let runner = fn_body(&proxy, "pub(crate) fn run_final_backend_header_policy_hooks(");
+    let runner = fn_body(
+        &proxy,
+        "pub(crate) fn run_final_backend_header_policy_hooks(",
+    );
     assert!(
         runner.contains("hop_limit::reassert_outbound_proxy_hops_in_map(")
             && runner.contains("hop_limit::effective_outbound_proxy_hops(ctx)"),
         "the final backend-header-policy runner must re-assert X-Ferrum-Hops"
     );
     assert_eq!(
-        proxy.matches(".enforce_final_backend_header_policy(").count(),
+        proxy
+            .matches(".enforce_final_backend_header_policy(")
+            .count(),
         1,
         "only the shared runner may invoke the hook in src/proxy/mod.rs"
     );
