@@ -74,12 +74,3 @@ dispatchers do not inspect the cause of a `send_request` failure before response
 from a canceled dispatch of a replayable body, it is `protocol_error`. If the gateway's reset
 surfaces there while the dispatch is still running, it is charged to that target's circuit breaker
 and passive health, as an explicit client `CANCEL` already is.
-
-Regression coverage checks zero backend requests on expiry during TLS checkout and before a cached
-send, and observes backend QUIC resets after complete DATA followed by a stalled frontend (without
-Content-Length), plus buffered flow-control expiry. Paused-clock coverage retains a connect-before-
-client winner on late sidecar readiness wakeups and distinguishes pre-handoff authorization refusal
-from expiry after transmission; a live pooled upload also asserts its post-handoff marker.
-
-The `BackendResponse` handoff field does not change public gateway error/header tokens. It records
-whether the request was handed to the backend independently of the backend-health class.
