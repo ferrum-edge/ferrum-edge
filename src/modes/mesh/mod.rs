@@ -6159,6 +6159,11 @@ fn materialize_sidecar_inbound_proxies(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
+    // Assigned on every apply, before any early return: only the default
+    // service-port path below publishes HTTP application ports (issue #6110).
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.sidecar_inbound_http_app_ports.clear();
+    }
     if runtime.topology != MeshTopology::Sidecar {
         return;
     }
@@ -6496,8 +6501,14 @@ fn materialize_sidecar_inbound_proxies(
     }
 
     let tcp_route_count = tcp_routes.len();
+    // The same HTTP-family claim also refuses a bare authenticated CONNECT
+    // naming one of these ports (issue #6110): an HTTP route serves the port,
+    // so the request must arrive as HTTP and run that route's plugin chain.
+    let mut http_app_ports: Vec<u16> = http_inbound_backend_ports.into_iter().collect();
+    http_app_ports.sort_unstable();
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.local_inbound_tcp_routes = tcp_routes;
+        mesh.sidecar_inbound_http_app_ports = http_app_ports;
     }
 
     if materialized > 0 {

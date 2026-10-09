@@ -1455,7 +1455,7 @@ Terminal transaction logging is independent of ordinary request hooks:
 | --- | --- | --- | --- |
 | Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
 | Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
-| Matched proxy whose native-gRPC or WebSocket plugin view omits an HTTP-only authentication or admission plugin (see [Protocol Support](plugin_execution_order.md#protocol-support)) | 403 (native gRPC: trailers-only `PERMISSION_DENIED`) | Emitted once with `rejection_phase: "route_protocol_admission"` | Not run |
+| Matched proxy whose native-gRPC or WebSocket plugin view omits an HTTP-only authentication or admission plugin, or a plain HTTP or WebSocket request to a gRPC-intended route whose own chain carries a gRPC-only admission plugin such as `grpc_method_router` (see [Protocol Support](plugin_execution_order.md#protocol-support)) | 403 (native gRPC: trailers-only `PERMISSION_DENIED`) | Emitted once with `rejection_phase: "route_protocol_admission"` | Not run |
 | Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
@@ -6293,6 +6293,18 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 
 **Priority:** 275
 **Protocol:** gRPC only
+
+**A route configured with this plugin is gRPC-only.** Every instance is
+request-admission policy, and it cannot run on plain HTTP or WebSocket
+requests, so when a proxy (or its proxy group) carries `grpc_method_router`,
+the gateway refuses a plain HTTP or WebSocket request on that route with `403`
+`{"error":"Request protocol not permitted on this route"}` and
+`rejection_phase: "route_protocol_admission"` before any plugin runs, rather
+than serving it without the method policy. Native gRPC and gRPC-Web requests
+are unaffected. A `global` instance does not refuse anything this way, because
+it applies to every route, gRPC or not. Serve plain HTTP endpoints such as
+health checks from a separate route. See
+[Protocol Support](plugin_execution_order.md#protocol-support).
 
 IP-based rate keys group IPv6 addresses in the same `/64`; IPv4 remains
 per-address. Consumer keys are unaffected.

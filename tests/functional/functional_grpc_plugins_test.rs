@@ -1256,21 +1256,23 @@ async fn test_grpc_deadline_clamped_to_max() {
     println!("test_grpc_deadline_clamped_to_max PASSED");
 }
 
-/// Non-gRPC requests bypass the gRPC plugins entirely.
+/// A route configured with `grpc_method_router` is gRPC-intended, so a plain
+/// HTTP request — which would skip that gRPC-only admission policy — is
+/// refused before any plugin runs (issue #6110). A gRPC-only plugin that is not
+/// admission policy (`grpc_deadline`) still lets plain HTTP through.
 #[ignore]
 #[tokio::test]
-async fn test_grpc_plugins_skip_non_grpc_requests() {
+async fn test_grpc_plugins_on_plain_http_requests() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    // Config with method_router allow_methods — but the request is HTTP, not gRPC
     let config = format!(
         r#"
 version: "1"
 proxies:
-  - id: "http-proxy"
+  - id: "grpc-intended-proxy"
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
@@ -1279,6 +1281,15 @@ proxies:
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-method-router"
+  - id: "grpc-deadline-proxy"
+    listen_path: "/deadline"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "grpc-deadline"
 
 consumers: []
 
@@ -1286,11 +1297,18 @@ plugin_configs:
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
     scope: proxy
-    proxy_id: "http-proxy"
+    proxy_id: "grpc-intended-proxy"
     enabled: true
     config:
       allow_methods:
         - "only.This/Allowed"
+  - id: "grpc-deadline"
+    plugin_name: "grpc_deadline"
+    scope: proxy
+    proxy_id: "grpc-deadline-proxy"
+    enabled: true
+    config:
+      max_deadline_ms: 5000
 "#
     );
 
@@ -1303,23 +1321,36 @@ plugin_configs:
     let (mut gateway, gateway_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
-    // Send a plain HTTP request (not gRPC) — plugin should skip
     let client = reqwest::Client::new();
-    let resp = client
+    let refused = client
         .get(format!("http://127.0.0.1:{}/api/test", gateway_port))
         .send()
         .await
         .expect("HTTP request should complete");
-
-    // The request should NOT be blocked by gRPC method router (plugin skips non-gRPC)
-    assert_ne!(
-        resp.status().as_u16(),
+    assert_eq!(
+        refused.status().as_u16(),
         403,
-        "Non-gRPC HTTP request should not be blocked by gRPC method router"
+        "a plain HTTP request must not skip the route's gRPC method policy"
+    );
+    let body = refused.text().await.expect("refusal body");
+    assert!(
+        body.contains("Request protocol not permitted on this route"),
+        "unexpected refusal body: {body}"
+    );
+
+    let passed = client
+        .get(format!("http://127.0.0.1:{}/deadline/test", gateway_port))
+        .send()
+        .await
+        .expect("HTTP request should complete");
+    assert_ne!(
+        passed.status().as_u16(),
+        403,
+        "grpc_deadline is not admission policy, so plain HTTP is not refused"
     );
 
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
-    println!("test_grpc_plugins_skip_non_grpc_requests PASSED");
+    println!("test_grpc_plugins_on_plain_http_requests PASSED");
 }

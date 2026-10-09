@@ -2648,6 +2648,26 @@ fn inbound_hbone_relay_destination_decision(
     mesh.inbound_relay_destination_decision(host, port, terminator_local_ip)
 }
 
+/// [`inbound_hbone_relay_destination_decision`] for a BYTE-STREAM relay: the
+/// same ownership guard, plus the Sidecar refusal of a port a materialized
+/// HTTP-family inbound route serves (issue #6110, see
+/// [`crate::modes::mesh::config::MeshConfig::inbound_stream_relay_destination_decision`]).
+/// Relay synthesis, the handler's post-plugin re-check, and the admission
+/// fence's sweep all use it, so a reload that turns a port into an HTTP
+/// application port revokes a live byte-stream tunnel to it.
+fn inbound_hbone_stream_relay_destination_decision(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    terminator_local_ip: Option<std::net::IpAddr>,
+) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
+    let Some(mesh) = mesh else {
+        return Err(crate::modes::mesh::config::InboundRelayDenial::NoSlice);
+    };
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.inbound_stream_relay_destination_decision(host, port, terminator_local_ip)
+}
+
 /// Round-robin cursor over an admitted external UDP destination's precomputed
 /// dial endpoints (issue #3263).
 ///
@@ -2813,11 +2833,16 @@ impl InboundConnectRelayRefusal {
 ///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
 ///    original destination the peer asked for — but only when that authority is
 ///    a destination THIS proxy terminates for. Unreachable for a declared
-///    ingress listener port so this can never widen it.
+///    ingress listener port so this can never widen it. On the Sidecar
+///    `:15006` listener a byte-stream CONNECT to a port a materialized
+///    HTTP-family inbound route serves is refused
+///    (`http_application_port`, issue #6110): that port is reached as HTTP so
+///    the route's plugin chain runs.
 ///
 /// Returns an [`InboundConnectRelayRefusal`] when the authority is
 /// missing/portless or is not a destination this terminator owns per
-/// [`inbound_hbone_relay_destination_decision`]. The caller answers it through
+/// [`inbound_hbone_relay_destination_decision`] (byte-stream:
+/// [`inbound_hbone_stream_relay_destination_decision`]). The caller answers it through
 /// [`reject_inbound_connect_relay_synthesis`] (issue #5763): the documented
 /// `403 hbone_relay_destination_denied`, `503 hbone_relay_not_ready` before the
 /// first mesh slice, or the unauthenticated-peer `403` for a peerless CONNECT.
@@ -2879,9 +2904,29 @@ fn build_inbound_hbone_relay_proxy(
         }
     }
 
-    if let Err(denial) =
+    // A byte-stream relay additionally refuses a Sidecar HTTP application port
+    // (issue #6110); the datagram relay keeps the ordinary ownership guard.
+    let decision = if is_udp_connect {
         inbound_hbone_relay_destination_decision(host, port, mesh, accepted_local_ip)
-    {
+    } else {
+        inbound_hbone_stream_relay_destination_decision(host, port, mesh, accepted_local_ip)
+    };
+    if let Err(denial) = decision {
+        if denial == InboundRelayDenial::HttpApplicationPort {
+            // An authenticated peer tunnelled to a port an HTTP route serves:
+            // operator-visible (a peer is bypassing an HTTP route, or a client
+            // is misconfigured), but sampled because a peer can drive it at
+            // request rate. Transport facts only.
+            crate::warn_sampled!(
+                authority_host = host,
+                authority_port = port,
+                denial = denial.as_str(),
+                terminator_local_ip = ?accepted_local_ip,
+                "Refused authenticated inbound CONNECT to a Sidecar HTTP application port; \
+                 HTTP traffic to this port must be sent as HTTP so its inbound route's plugin \
+                 chain runs"
+            );
+        }
         if is_udp_connect
             && let Some((dial_host, dial_port)) =
                 mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
@@ -2913,6 +2958,26 @@ fn build_inbound_hbone_relay_proxy(
         proxy: Arc::new(relay),
         ingress_listener_authz_port: Some(port),
     })
+}
+
+/// Test hook: run inbound CONNECT relay synthesis for `authority` against
+/// `mesh` and return the refusal's `mesh.relay.denial_reason`, or `None` when
+/// a relay proxy is synthesized (issue #6110).
+pub(crate) fn inbound_connect_relay_synthesis_refusal_for_test(
+    authority: &str,
+    mesh: &crate::modes::mesh::config::MeshConfig,
+    is_udp_connect: bool,
+    accepted_local_ip: Option<std::net::IpAddr>,
+) -> Option<&'static str> {
+    let authority = authority.parse::<http::uri::Authority>().ok();
+    build_inbound_hbone_relay_proxy(
+        authority.as_ref(),
+        Some(mesh),
+        is_udp_connect,
+        accepted_local_ip,
+    )
+    .err()
+    .map(|refusal| refusal.reason)
 }
 
 /// Answer a synthesis-time inbound CONNECT relay refusal (issue #5763).

@@ -29,7 +29,8 @@ use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
     build_response, build_response_from_normalized_reject,
     finalize_reject_response_with_after_proxy_hooks, inbound_hbone_relay_destination_decision,
-    log_rejected_request, mesh_egress_udp_destination_allowed, record_request, tcp_proxy,
+    inbound_hbone_stream_relay_destination_decision, log_rejected_request,
+    mesh_egress_udp_destination_allowed, record_request, tcp_proxy,
 };
 use crate::config::EnvConfig;
 use crate::config::env_config::OperatingMode;
@@ -836,7 +837,7 @@ pub(super) fn inbound_hbone_relay_effective_destination_decision(
     terminator_local_ip: Option<std::net::IpAddr>,
 ) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
     let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
-    inbound_hbone_relay_destination_decision(app_host, app_port, mesh, terminator_local_ip)
+    inbound_hbone_stream_relay_destination_decision(app_host, app_port, mesh, terminator_local_ip)
 }
 
 /// Drop loopback DNS answers for the ordinary transparent inbound relay when
@@ -1184,7 +1185,7 @@ pub(super) async fn handle_hbone_request(
             "Rejected inbound CONNECT whose effective destination is not one this proxy \
              terminates for (own pod / NodeWaypoint-enrolled / ServiceWaypoint-bound, or — \
              for a Sidecar ingress[] remap — the exact declared listener → defaultEndpoint \
-             mapping)"
+             mapping), or is a Sidecar HTTP application port that must be reached as HTTP"
         );
         // `no_mesh_slice` is a readiness condition (503), not a denial; every
         // other reason is the documented 403 (issue #5763).

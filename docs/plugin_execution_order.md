@@ -2031,6 +2031,19 @@ plugin scan, and the HBONE admission fence re-checks it on every reload, so a
 live tunnel admitted on a now-refused view is revoked. The composed gRPC-Web
 view below keeps every HTTP plugin and is never refused.
 
+The same refusal protects a gRPC-intended route in the other direction. Plain
+HTTP is also chosen by the client, by leaving out the gRPC `Content-Type`, so a
+route whose OWN chain (proxy or proxy-group scope) carries a
+`gates_request_admission()` instance that runs on native gRPC but not on plain
+HTTP — `grpc_method_router` in every configuration, or a custom gRPC-only
+authentication plugin — refuses plain HTTP and WebSocket requests with the same
+`403` and `route_protocol_admission` phase instead of serving them without that
+policy. Native gRPC and gRPC-Web requests on the route are unaffected. A GLOBAL
+gRPC-only instance does not mark any route: it applies to every route, gRPC or
+not, so it says nothing about one route's intent, and plain HTTP stays served.
+`grpc_deadline` is not admission policy and never marks a route. Serve plain
+HTTP endpoints (health checks, REST) from a separate route.
+
 Recognized H3 gRPC-Web requests retain the ordinary `Http` protocol view so HTTP-only validators, deduplication, and other guardrails keep running. At cache rebuild time the gateway composes `grpc_method_router` and `grpc_deadline` into that same priority-ordered view when those native-gRPC policies are configured. No other gRPC-only plugin is added, and each plugin instance appears at most once.
 
 TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that supports `Tcp` also supports TCP+TLS, and a plugin that supports `Udp` also supports UDP+DTLS.

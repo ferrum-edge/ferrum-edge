@@ -5113,6 +5113,27 @@ pub struct MeshConfig {
     /// [`Self::inbound_relay_destinations`].
     #[serde(skip)]
     pub inbound_relay_own_address_ports: Vec<MeshOwnAddressPortBound>,
+    /// Runtime-only set of the local application (container) ports that a
+    /// materialized Sidecar HTTP-family inbound route serves (issue #6110),
+    /// sorted and deduplicated.
+    ///
+    /// A bare authenticated byte-stream CONNECT on the Sidecar `:15006`
+    /// listener whose authority names one of these ports is refused
+    /// ([`InboundRelayDenial::HttpApplicationPort`]) instead of being relayed
+    /// as opaque bytes: the port is served by an HTTP route, and relaying it
+    /// would skip that route's plugin chain. Stream-family (TCP/opaque) ports
+    /// keep the CONNECT relay. A container port that both an HTTP-family and a
+    /// stream-family service port resolve to is in this set, because the HTTP
+    /// route wins that port.
+    ///
+    /// Populated ONLY by the default Sidecar service-port inbound
+    /// materializer and assigned on every apply (empty on every other
+    /// topology, and when a Sidecar `ingress[]` block is declared, whose
+    /// CONNECT remap already refuses every HTTP-family listener port).
+    /// `serde(skip)` for the same reason as
+    /// [`Self::inbound_relay_destinations`].
+    #[serde(skip)]
+    pub sidecar_inbound_http_app_ports: Vec<u16>,
     /// The authoritative node-local enrolled-pod registry bounding
     /// [`Self::inbound_relay_destinations`] (issue #4249).
     ///
@@ -5240,6 +5261,10 @@ pub enum InboundRelayDenial {
     /// The address IS one this proxy terminates for, but the owning workload
     /// record does not declare the requested port.
     PortNotDeclared,
+    /// A byte-stream CONNECT names a port a materialized Sidecar HTTP-family
+    /// inbound route serves (issue #6110). Relaying it as opaque bytes would
+    /// skip that route's plugin chain, so the peer must send HTTP instead.
+    HttpApplicationPort,
 }
 
 impl InboundRelayDenial {
@@ -5250,6 +5275,7 @@ impl InboundRelayDenial {
             Self::UnresolvableHost => "unresolvable_authority",
             Self::AddressNotTerminated => "address_not_terminated_here",
             Self::PortNotDeclared => "port_not_declared",
+            Self::HttpApplicationPort => "http_application_port",
         }
     }
 }
@@ -5741,6 +5767,35 @@ impl MeshConfig {
         self.inbound_relay_inventory_decision(candidate, address, port)
     }
 
+    /// [`Self::inbound_relay_destination_decision`] for a BYTE-STREAM relay
+    /// (issue #6110): the same ownership guard, then a refusal for a port a
+    /// materialized Sidecar HTTP-family inbound route serves
+    /// ([`Self::sidecar_inbound_http_app_ports`]).
+    ///
+    /// A bare authenticated CONNECT on the Sidecar `:15006` listener is the
+    /// raw-TCP egress lane. An HTTP application port is reached by plain HTTP
+    /// over the same mTLS listener, where the route's plugin chain runs, so a
+    /// CONNECT that would relay it as opaque bytes is refused instead. The
+    /// ownership guard runs first so a destination this terminator does not
+    /// own keeps its existing denial reason. The set is empty on every
+    /// topology but Sidecar, so Ambient and waypoint HBONE relays are
+    /// unchanged. The datagram relay does not call this: `connect-udp` never
+    /// reaches an HTTP route.
+    ///
+    /// Hot path: one binary search over a short sorted slice, no allocation.
+    pub fn inbound_stream_relay_destination_decision(
+        &self,
+        host: &str,
+        port: u16,
+        terminator_local_ip: Option<std::net::IpAddr>,
+    ) -> Result<(), InboundRelayDenial> {
+        self.inbound_relay_destination_decision(host, port, terminator_local_ip)?;
+        if self.sidecar_inbound_http_app_ports.binary_search(&port).is_ok() {
+            return Err(InboundRelayDenial::HttpApplicationPort);
+        }
+        Ok(())
+    }
+
     /// Screen DNS answers for the ordinary inbound HBONE relay before any
     /// TCP or UDP socket opens.
     ///
@@ -6188,6 +6243,7 @@ impl Default for MeshConfig {
             inbound_relay_admits_accepted_local_address: false,
             inbound_relay_admits_loopback_namespace: false,
             inbound_relay_own_address_ports: Vec::new(),
+            sidecar_inbound_http_app_ports: Vec::new(),
             inbound_relay_node_local_registry: Default::default(),
         }
     }

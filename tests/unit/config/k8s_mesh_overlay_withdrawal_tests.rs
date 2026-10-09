@@ -1467,6 +1467,9 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         inbound_relay_admits_accepted_local_address: _,
         inbound_relay_admits_loopback_namespace: _,
         inbound_relay_own_address_ports: _,
+        // Sidecar HTTP application ports a bare CONNECT may not relay (issue
+        // #6110): projected from the materialized inbound routes per apply.
+        sidecar_inbound_http_app_ports: _,
         // Live handle to the node-agent's enrolled-pod registry (issue #4249):
         // installed by the mesh serving runtime, never Kubernetes-owned.
         inbound_relay_node_local_registry: _,

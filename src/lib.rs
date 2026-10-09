@@ -223,6 +223,24 @@ pub mod _test_support {
         .await
     }
 
+    /// Run inbound CONNECT relay synthesis exactly as the dispatcher's
+    /// route-miss arm does (issue #6110): the refusal's
+    /// `mesh.relay.denial_reason`, or `None` when a relay proxy is synthesized.
+    /// `authority` is the CONNECT `:authority` (`host:port`).
+    pub fn inbound_connect_relay_synthesis_refusal_for_test(
+        authority: &str,
+        mesh: &crate::modes::mesh::config::MeshConfig,
+        is_udp_connect: bool,
+        accepted_local_ip: Option<std::net::IpAddr>,
+    ) -> Option<&'static str> {
+        crate::proxy::inbound_connect_relay_synthesis_refusal_for_test(
+            authority,
+            mesh,
+            is_udp_connect,
+            accepted_local_ip,
+        )
+    }
+
     pub fn websocket_backend_path_for_test(
         proxy: &crate::config::types::Proxy,
         path: &str,

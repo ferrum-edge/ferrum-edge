@@ -1062,6 +1062,155 @@ fn custom_plugins_gate_admission_by_the_auth_default() {
     assert!(!NameOnlyPlugin("custom_policy").gates_request_admission());
 }
 
+/// A route configured with a gRPC-only admission plugin (`grpc_method_router`)
+/// is gRPC-intended: its plain HTTP and WebSocket views skip that plugin, so
+/// both are refused, while its native-gRPC and composed gRPC-Web views run it
+/// (issue #6110). A gRPC-only plugin that is not admission policy
+/// (`grpc_deadline`) marks nothing.
+#[test]
+fn a_route_scoped_grpc_admission_policy_marks_its_plain_http_and_websocket_views() {
+    let config = make_config(
+        vec![
+            make_proxy("grpc", "/grpc", vec!["router"]),
+            make_proxy("deadline", "/deadline", vec!["deadline"]),
+        ],
+        vec![
+            make_plugin_config(
+                "router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("grpc"),
+                true,
+            ),
+            make_plugin_config(
+                "deadline",
+                "grpc_deadline",
+                PluginScope::Proxy,
+                Some("deadline"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let omits = |proxy: &str, protocol: ProxyProtocol| {
+        cache
+            .request_view("ferrum", proxy, protocol)
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    };
+
+    assert!(
+        cache
+            .get_plugins_for_protocol("ferrum", "grpc", ProxyProtocol::Grpc)
+            .iter()
+            .any(|plugin| plugin.name() == "grpc_method_router"),
+        "the policy must run on the native-gRPC view"
+    );
+    assert!(omits("grpc", ProxyProtocol::Http));
+    assert!(omits("grpc", ProxyProtocol::WebSocket));
+    assert!(!omits("grpc", ProxyProtocol::Grpc));
+    assert!(
+        !cache
+            .grpc_web_request_view("ferrum", "grpc")
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY),
+        "the composed gRPC-Web view runs grpc_method_router and is never refused"
+    );
+    // Stream views are selected by listener, never by the client.
+    assert!(!omits("grpc", ProxyProtocol::Tcp));
+    assert!(!omits("grpc", ProxyProtocol::Udp));
+
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+    ] {
+        assert!(!omits("deadline", protocol), "{protocol:?}");
+    }
+}
+
+/// A GLOBAL gRPC-only admission instance applies to every route, gRPC or not,
+/// so it makes no route gRPC-intended and plain HTTP stays served (issue
+/// #6110). A route-scoped instance of the same plugin does mark its route,
+/// including after a delta rebuild adds it.
+#[test]
+fn only_a_route_scoped_grpc_admission_policy_marks_plain_http_views() {
+    let global_router = make_plugin_config(
+        "global-router",
+        "grpc_method_router",
+        PluginScope::Global,
+        None,
+        true,
+    );
+    let config = make_config(
+        vec![
+            make_proxy("bare", "/bare", vec![]),
+            make_proxy("scoped", "/scoped", vec![]),
+        ],
+        vec![global_router.clone()],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let omits = |proxy: &str, protocol: ProxyProtocol| {
+        cache
+            .request_view("ferrum", proxy, protocol)
+            .capabilities()
+            .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+    };
+
+    for proxy in ["bare", "scoped"] {
+        assert!(
+            cache
+                .get_plugins_for_protocol("ferrum", proxy, ProxyProtocol::Grpc)
+                .iter()
+                .any(|plugin| plugin.name() == "grpc_method_router"),
+            "{proxy}: the global policy must reach the route's native-gRPC view"
+        );
+        for protocol in [
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+        ] {
+            assert!(!omits(proxy, protocol), "{proxy}: {protocol:?}");
+        }
+    }
+
+    let reloaded = make_config(
+        vec![
+            make_proxy("bare", "/bare", vec![]),
+            make_proxy("scoped", "/scoped", vec!["scoped-router"]),
+        ],
+        vec![
+            global_router,
+            make_plugin_config(
+                "scoped-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("scoped"),
+                true,
+            ),
+        ],
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from([NamespacedResourceId::new("ferrum", "scoped")]),
+            &[],
+            false,
+        )
+        .expect("delta rebuild adds the route-scoped policy");
+
+    assert!(omits("scoped", ProxyProtocol::Http));
+    assert!(omits("scoped", ProxyProtocol::WebSocket));
+    assert!(!omits("scoped", ProxyProtocol::Grpc));
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+    ] {
+        assert!(!omits("bare", protocol), "bare after delta: {protocol:?}");
+    }
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
