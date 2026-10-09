@@ -1094,6 +1094,73 @@ def validate_udp_cleanup_upgrade(results_dir: Path) -> None:
     print("mesh UDP cleanup upgrade capabilities ok")
 
 
+def init_container_block(doc: str, name: str, workload: str) -> str:
+    """Return one rendered pod-level init container, up to its next sibling.
+
+    Pod-level list items sit at eight spaces in a DaemonSet render; env and
+    volumeMount items are deeper, so they cannot end the block early.
+    """
+    match = re.search(
+        rf"(?ms)^        - name:\s*{re.escape(name)}\s*$(.*?)(?=^        - name:|^      [A-Za-z])",
+        doc,
+    )
+    if match is None:
+        fail(
+            "Mesh init container missing from render",
+            f"{workload} must render the {name} init container",
+        )
+        raise AssertionError("unreachable")
+    return match.group(1)
+
+
+def validate_cni_lifecycle_capabilities(results_dir: Path) -> None:
+    """Issue #6122: the CNI lifecycle init containers hold no capabilities.
+
+    They run as uid 0 only to own the root-owned host CNI directories. The
+    installer chmods only staging files it created and never chowns, so
+    CAP_DAC_OVERRIDE / CAP_CHOWN / CAP_FOWNER are not needed; the rollback
+    sidecar only removes and reads in those same directories. The runtime
+    proof is the CNI Lifecycle Live suite's chart install.
+    """
+    captures = (
+        ("cni-lifecycle-rendered.yaml", ("ferrum-cni-rollback", "ferrum-cni-installer")),
+        ("cni-no-rollback.yaml", ("ferrum-cni-installer",)),
+        ("mesh-image-pull-secrets.yaml", ("ferrum-cni-rollback", "ferrum-cni-installer")),
+    )
+    for capture, containers in captures:
+        rendered = require_capture(results_dir, capture).read_text(encoding="utf-8")
+        node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+        for container in containers:
+            block = init_container_block(node_agent, container, f"{capture} node-agent")
+            where = f"{container} in {capture}"
+            if not re.search(
+                r'(?m)^\s*drop:\s*(?:\[\s*"?ALL"?\s*\]|\n\s*- "?ALL"?)\s*$', block
+            ):
+                fail(
+                    "CNI init container keeps capabilities",
+                    f"{where} must render capabilities.drop: [ALL]",
+                )
+            if re.search(r"(?m)^\s*add:", block):
+                fail(
+                    "CNI init container adds capabilities",
+                    f"{where} needs no capability: it owns the root-owned host CNI "
+                    "directories as uid 0, chmods only files it created, and never chowns",
+                )
+            for key, value in (
+                ("allowPrivilegeEscalation", "false"),
+                ("readOnlyRootFilesystem", "true"),
+                ("privileged", "false"),
+            ):
+                require_scalar(
+                    block,
+                    key,
+                    value,
+                    "CNI init container securityContext weakened",
+                    f"{where} must render {key}: {value}",
+                )
+    print("mesh cni lifecycle init container capabilities ok")
+
+
 def validate_image_pull_secrets(results_dir: Path) -> None:
     """Chart-level image.pullSecrets must reach every Ferrum pod spec.
 
@@ -1154,6 +1221,7 @@ def main() -> int:
     validate_node_waypoint_ebpf_caps(results_dir)
     validate_node_waypoint_kernel57_sys_admin(results_dir)
     validate_udp_cleanup_upgrade(results_dir)
+    validate_cni_lifecycle_capabilities(results_dir)
     validate_image_pull_secrets(results_dir)
     print("mesh production-readiness ok")
     return 0

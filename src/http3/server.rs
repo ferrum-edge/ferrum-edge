@@ -3113,6 +3113,32 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Proxy hop limit (HTTP/3, issue #6109): the same decision the H1/H2
+    // frontend takes, on the client's own field lines and after the header
+    // size/count limits above. The forwarded count is stamped on the raw header
+    // block below, before it is stored on the request context. The refusal is
+    // built out of line and heap-pinned like the `boxed_*` dispatch relays so
+    // this handler's state machine does not grow; it runs only when refused.
+    let outbound_proxy_hops = match crate::proxy::hop_limit::decide_proxy_hops(
+        req.headers(),
+        state.env_config.max_proxy_hops,
+    ) {
+        crate::proxy::hop_limit::ProxyHopDecision::Disabled => None,
+        crate::proxy::hop_limit::ProxyHopDecision::Forward(hops) => Some(hops),
+        refused => {
+            let loop_detected = refused == crate::proxy::hop_limit::ProxyHopDecision::LoopDetected;
+            boxed_send_h3_proxy_hop_limit_refusal(
+                &mut stream,
+                &state,
+                http_flavor,
+                grpc_web_response_content_type.is_some(),
+                loop_detected,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
     // Track this request for overload monitoring and graceful drain.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
@@ -3179,6 +3205,13 @@ async fn handle_h3_request(
     // backend-boundary hop-by-hop strip would otherwise remove. `req` keeps the
     // wire block for the protocol-shape checks below.
     let mut raw_headers = req.headers().clone();
+    if let Some(hops) = outbound_proxy_hops {
+        // Replace the client's `X-Ferrum-Hops` with the forwarded count before
+        // anything reads the stored block (issue #6109); the confinement below
+        // leaves the field in place.
+        crate::proxy::hop_limit::stamp_proxy_hops(&mut raw_headers, hops);
+        ctx.outbound_proxy_hops = Some(hops);
+    }
     crate::proxy::headers::confine_connection_nominated_request_headers(
         &mut raw_headers,
         state.env_config.real_ip_header.as_deref(),
@@ -5447,6 +5480,16 @@ async fn handle_h3_request(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // Proxy hop limit (issue #6109): the same `X-Ferrum-Hops` re-assertion the
+    // H1/H2 ladder makes in `src/proxy/mod.rs::handle_proxy_request_inner`, at
+    // the same point; the deferred passes and the finalized-egress overlay
+    // re-assert it again through `refresh_backend_gateway_assertion_headers`.
+    // Keep both call sites in sync.
+    crate::proxy::hop_limit::reassert_outbound_proxy_hops(
+        crate::proxy::hop_limit::effective_outbound_proxy_hops(&ctx),
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    );
     // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647): the same
     // single hop-budget decision the H1/H2 ladder takes in
     // `src/proxy/mod.rs::handle_proxy_request_inner`, at the same point —
@@ -19493,6 +19536,100 @@ where
             }
         },
     }
+}
+
+type BoxedH3RefusalFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>;
+
+/// [`send_h3_proxy_hop_limit_refusal`], CONSTRUCTED OUT OF LINE and returned
+/// boxed, so `handle_h3_request` holds only the pointer across the await.
+#[inline(never)]
+fn boxed_send_h3_proxy_hop_limit_refusal<'a>(
+    stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &'a ProxyState,
+    http_flavor: HttpFlavor,
+    grpc_web: bool,
+    loop_detected: bool,
+) -> BoxedH3RefusalFuture<'a> {
+    let refusal =
+        send_h3_proxy_hop_limit_refusal(stream, state, http_flavor, grpc_web, loop_detected);
+    Box::pin(refusal)
+}
+
+/// The HTTP/3 answer to a request refused by the proxy hop limit (issue
+/// #6109), matching the H1/H2 frontend: `508 Loop Detected` with
+/// `X-Gateway-Error: loop_detected` when the received `X-Ferrum-Hops` count
+/// reached `FERRUM_MAX_PROXY_HOPS`, `400` (no token) when the field is
+/// malformed. Native gRPC gets Trailers-Only `FAILED_PRECONDITION` /
+/// `INVALID_ARGUMENT`. Plain HTTP, WebSocket, and gRPC-Web get the plain JSON
+/// answer for both refusals, exactly as the H1/H2 frontend answers gRPC-Web.
+/// Bodies are compiled-in literals that echo nothing.
+///
+/// `grpc_web` is the frontend's gRPC-Web content-type signal. This handler
+/// promotes a recognized gRPC-Web request to `HttpFlavor::Grpc` for its
+/// request-side decisions, so the refusal flavor is re-derived from the signal
+/// (`hop_limit::refusal_http_flavor`) for the branch, the head status, and the
+/// reject recording alike; without it a gRPC-Web client would get a native
+/// gRPC Trailers-Only answer it cannot read.
+async fn send_h3_proxy_hop_limit_refusal(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &ProxyState,
+    http_flavor: HttpFlavor,
+    grpc_web: bool,
+    loop_detected: bool,
+) -> Result<(), anyhow::Error> {
+    let http_flavor = crate::proxy::hop_limit::refusal_http_flavor(http_flavor, grpc_web);
+    let http_status = if loop_detected {
+        crate::proxy::hop_limit::warn_loop_detected(state.env_config.max_proxy_hops, "http3");
+        StatusCode::LOOP_DETECTED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    crate::diagnostic_ref::record_admission_fence(
+        crate::diagnostic_ref::current_h3_slot().as_ref(),
+        crate::proxy::hop_limit::refusal_rejection_phase(loop_detected),
+        h3_error_head_status(http_flavor, None, http_status),
+    );
+    record_h3_flavor_aware_reject(state, http_flavor, http_status.as_u16());
+    if loop_detected && !matches!(http_flavor, HttpFlavor::Grpc) {
+        // Plain, WebSocket, and gRPC-Web: the JSON body plus the gateway's own
+        // token.
+        return send_h3_reject_flavor_aware(
+            stream,
+            http_flavor,
+            http_status,
+            Bytes::from_static(crate::proxy::hop_limit::LOOP_DETECTED_BODY.as_bytes()),
+            &crate::proxy::loop_detected_reject_headers(),
+            RejectBodyDisposition::WireBody,
+        )
+        .await;
+    }
+    let (http_body, grpc_status, grpc_message) = if loop_detected {
+        (
+            crate::proxy::hop_limit::LOOP_DETECTED_BODY,
+            crate::proxy::grpc_proxy::grpc_status::FAILED_PRECONDITION,
+            crate::proxy::hop_limit::LOOP_DETECTED_GRPC_MESSAGE,
+        )
+    } else {
+        (
+            crate::proxy::hop_limit::INVALID_PROXY_HOPS_BODY,
+            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            crate::proxy::hop_limit::INVALID_PROXY_HOPS_GRPC_MESSAGE,
+        )
+    };
+    // No gRPC-Web content type: gRPC-Web was already mapped to `Plain` above,
+    // so native gRPC gets Trailers-Only and every other flavor gets the plain
+    // JSON `400`.
+    send_h3_error_flavor_aware(
+        stream,
+        http_flavor,
+        None,
+        http_status,
+        http_body,
+        grpc_status,
+        grpc_message,
+    )
+    .await
 }
 
 /// Flavor-aware rejection for H3. When the request is gRPC, emits a

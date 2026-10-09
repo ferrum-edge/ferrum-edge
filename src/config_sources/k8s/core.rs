@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::fips::approved::Sha256;
 use rustls::pki_types::pem::PemObject;
@@ -13,6 +15,7 @@ use crate::modes::mesh::config::{
     WorkloadPort, WorkloadRef, WorkloadSelector, default_node_waypoint_hbone_port,
 };
 
+use super::backend_ref::{EndpointSliceFindings, EndpointSliceGuard};
 use super::{
     K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, K8sTranslationOptions,
     RouteBackend, port_from_u64, string_field,
@@ -25,9 +28,25 @@ pub(super) struct CoreState {
     configmaps: HashMap<K8sServiceKey, CoreConfigMap>,
     pods: HashMap<PodKey, CorePod>,
     pod_by_ip: HashMap<String, PodKey>,
+    /// Namespaces of the non-host-network, non-terminal Pods claiming each IP.
+    ///
+    /// Unlike [`Self::pod_by_ip`] (last writer wins), this keeps every claim,
+    /// so an IP two namespaces' Pods report is never attributed to either one.
+    pod_ip_namespaces: HashMap<IpAddr, BTreeSet<String>>,
     endpoint_slices: Vec<CoreEndpointSlice>,
     node_localities: HashMap<String, String>,
     node_uids: HashMap<String, String>,
+    /// IPs observed Nodes report in `status.addresses`. A Service endpoint on
+    /// one reaches the kubelet and every NodePort, so it is never treated as
+    /// an external host (issue #6108).
+    node_addresses: HashSet<IpAddr>,
+    /// Observed Nodes' `spec.podCIDRs` (fallback `spec.podCIDR`). An endpoint
+    /// IP inside one is a Pod, even one outside the Pod watch scope.
+    node_pod_cidrs: PodCidrIndex,
+    /// At least one Node was observed. Without the Node watch, Node addresses
+    /// and Node Pod CIDRs are unknown, so the selector-less external-endpoint
+    /// opt-in stays inactive (issue #6108).
+    nodes_observed: bool,
     node_waypoints_by_node: HashMap<String, CoreNodeWaypointPod>,
 }
 
@@ -170,6 +189,8 @@ struct CorePod {
     node_name: Option<String>,
     host_network: bool,
     ready: bool,
+    /// `status.phase` is `Succeeded` or `Failed`: the Pod released its IPs.
+    terminal: bool,
     node_waypoint_proxy: bool,
 }
 
@@ -178,6 +199,11 @@ struct CoreEndpointSlice {
     service_key: K8sServiceKey,
     /// Whether this slice backs a core Service or an MCS ServiceImport.
     backend_kind: EndpointSliceBackendKind,
+    /// The core Service its `kubernetes.io/service-name` label names, even
+    /// when the MCS label makes `backend_kind` a ServiceImport: kube-proxy and
+    /// CoreDNS map a slice to a Service by that label alone, so the
+    /// EndpointSlice attribution guard must too (issue #6108).
+    guarded_service_key: Option<K8sServiceKey>,
     ports: Vec<CoreEndpointSlicePort>,
     endpoints: Vec<CoreEndpoint>,
 }
@@ -199,6 +225,12 @@ struct CoreEndpoint {
     pod_key: Option<PodKey>,
     addresses: Vec<String>,
     ready: bool,
+    /// `conditions.ready` and `conditions.serving` are both explicitly
+    /// `false`; see [`endpoint_is_out_of_service`].
+    out_of_service: bool,
+    /// `conditions.terminating` is explicitly `true` and `conditions.ready`
+    /// explicitly `false`; see [`endpoint_is_terminating`].
+    terminating: bool,
     node_name: Option<String>,
 }
 
@@ -277,6 +309,154 @@ impl NodeWaypointInventory {
                 dest.entry(node.clone()).or_insert_with(|| waypoint.clone());
             }
         }
+    }
+}
+
+/// How long a Pod's IP claim outlives the Pod in EndpointSlice attribution
+/// (issue #6108).
+///
+/// The Pod and EndpointSlice watches are not snapshotted together. A Pod
+/// leaves the API, and the Pod store, before the EndpointSlice controller
+/// drops its terminating endpoint, and that lag grows under load or with
+/// `--endpoint-updates-batch-period`. A reconcile in that gap would see an
+/// endpoint no Pod claims and refuse the whole Service backend.
+pub const POD_CLAIM_GRACE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Pod IP claims of the Pods observed now and of those that left the Pod
+/// inventory within the last [`POD_CLAIM_GRACE_WINDOW`], carried across
+/// reconciles like [`NodeWaypointInventory`].
+///
+/// EndpointSlice attribution consults it only for an IP no Pod observed now
+/// claims, and for a `targetRef` naming a Pod that is no longer observed or no
+/// longer reports the address. A current claim always wins: an IP reused by an
+/// observed Pod of another namespace is that namespace's. While the Pod watch
+/// scope covers every namespace it is consulted for every endpoint. With a
+/// restricted scope an IP reused by a Pod outside the scope would still look
+/// like the old Pod's, so it is consulted only for an endpoint reporting
+/// `terminating: true` with an explicit `ready: false`: the EndpointSlice
+/// controller marks a Pod's endpoint that way before the Pod leaves the API,
+/// and nothing but kube-proxy's no-ready-endpoint fallback dials one. A
+/// claim's window starts at the first refresh that no longer observes it,
+/// however long ago the Pod was last observed. Memory is bounded by the Pods
+/// observed now plus those that left within the window; every refresh prunes
+/// the expired claims.
+#[derive(Clone)]
+pub struct PodClaimInventory {
+    grace: Duration,
+    inner: Arc<Mutex<RecentPodClaims>>,
+}
+
+impl Default for PodClaimInventory {
+    fn default() -> Self {
+        Self::with_grace_window(POD_CLAIM_GRACE_WINDOW)
+    }
+}
+
+impl std::fmt::Debug for PodClaimInventory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("PodClaimInventory");
+        debug.field("grace", &self.grace);
+        // `try_lock`: formatting must never wait on, or deadlock against, an
+        // EndpointSlice attribution pass holding the lock.
+        if let Ok(claims) = self.inner.try_lock() {
+            debug
+                .field("ips", &claims.ip_namespaces.len())
+                .field("pods", &claims.pod_addresses.len());
+        }
+        debug.finish()
+    }
+}
+
+impl PodClaimInventory {
+    /// An empty inventory with the [`POD_CLAIM_GRACE_WINDOW`] grace window.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An empty inventory whose claims outlive their Pods by `grace`.
+    pub fn with_grace_window(grace: Duration) -> Self {
+        Self {
+            grace,
+            inner: Arc::new(Mutex::new(RecentPodClaims::default())),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RecentPodClaims> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The claims a [`PodClaimInventory`] remembers. Each is `None` while the
+/// latest refresh observed it, or the time of the first refresh that no longer
+/// did, from which its grace window counts.
+#[derive(Debug, Default)]
+struct RecentPodClaims {
+    /// `ip → namespace → gone since`, from non-host-network Pods, exactly the
+    /// claims [`CoreState::pod_ip_namespaces`] records.
+    ip_namespaces: HashMap<IpAddr, HashMap<String, Option<Instant>>>,
+    /// `pod → ip → gone since`, from every Pod, host-network included, for
+    /// `targetRef` checks.
+    pod_addresses: HashMap<PodKey, HashMap<IpAddr, Option<Instant>>>,
+}
+
+impl RecentPodClaims {
+    /// Record every non-terminal Pod observed now, start the grace window of
+    /// every claim it no longer observes, then drop claims gone `grace` or
+    /// longer.
+    fn refresh(&mut self, pods: &HashMap<PodKey, CorePod>, now: Instant, grace: Duration) {
+        // Mark every claim gone; re-observing it below clears the mark, so
+        // only a claim missing now starts (or keeps) its countdown.
+        for namespaces in self.ip_namespaces.values_mut() {
+            for gone_since in namespaces.values_mut() {
+                gone_since.get_or_insert(now);
+            }
+        }
+        for addresses in self.pod_addresses.values_mut() {
+            for gone_since in addresses.values_mut() {
+                gone_since.get_or_insert(now);
+            }
+        }
+        for (key, pod) in pods {
+            if pod.terminal {
+                continue;
+            }
+            for address in &pod.addresses {
+                let Some(ip) = parse_endpoint_ip(address) else {
+                    continue;
+                };
+                match self.pod_addresses.get_mut(key) {
+                    Some(addresses) => {
+                        addresses.insert(ip, None);
+                    }
+                    None => {
+                        self.pod_addresses
+                            .insert(key.clone(), HashMap::from([(ip, None)]));
+                    }
+                }
+                if !pod.host_network {
+                    let namespaces = self.ip_namespaces.entry(ip).or_default();
+                    match namespaces.get_mut(&pod.namespace) {
+                        Some(gone_since) => *gone_since = None,
+                        None => {
+                            namespaces.insert(pod.namespace.clone(), None);
+                        }
+                    }
+                }
+            }
+        }
+        let live = |gone_since: Option<Instant>| {
+            gone_since.is_none_or(|gone| now.saturating_duration_since(gone) < grace)
+        };
+        self.ip_namespaces.retain(|_, namespaces| {
+            namespaces.retain(|_, gone_since| live(*gone_since));
+            !namespaces.is_empty()
+        });
+        self.pod_addresses.retain(|_, addresses| {
+            addresses.retain(|_, gone_since| live(*gone_since));
+            !addresses.is_empty()
+        });
     }
 }
 
@@ -502,11 +682,7 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
         key,
         CoreService {
             ports: service_ports,
-            has_selector: object
-                .spec
-                .get("selector")
-                .and_then(Value::as_object)
-                .is_some_and(|selector| !selector.is_empty()),
+            has_selector: super::backend_ref::service_object_has_selector(object),
             is_headless: service_spec_is_headless(&object.spec),
             cluster_ips,
             uid: object.metadata.uid.clone(),
@@ -550,6 +726,7 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         node_name: object_node_name(object).map(ToOwned::to_owned),
         host_network: pod_host_network(object),
         ready: pod_is_ready(object),
+        terminal: pod_phase_is_terminal(object),
         node_waypoint_proxy: false,
     };
     // Mark every trusted NodeWaypoint proxy pod, including not-Ready and
@@ -558,6 +735,21 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
     // restart; a missing object on this node is a withdrawal.
     if trusted_node_waypoint_pod_object(&acc.options, object) {
         pod.node_waypoint_proxy = true;
+    }
+    // A host-network Pod reports its node's IP, and a Succeeded/Failed Pod has
+    // released its IP for reuse; neither proves the IP belongs to the Pod's
+    // namespace.
+    if !pod.host_network && !pod.terminal {
+        for address in &pod.addresses {
+            let Some(ip) = parse_endpoint_ip(address) else {
+                continue;
+            };
+            acc.core
+                .pod_ip_namespaces
+                .entry(ip)
+                .or_default()
+                .insert(pod.namespace.clone());
+        }
     }
     if let Some((node_name, address)) = node_waypoint_pod_candidate(acc, object, &pod) {
         pod.node_waypoint_proxy = true;
@@ -579,6 +771,13 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
 }
 
 fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
+    let service_label = object
+        .metadata
+        .labels
+        .get("kubernetes.io/service-name")
+        .cloned()
+        .or_else(|| string_field(&object.spec, "serviceName").map(ToOwned::to_owned))
+        .filter(|name| !name.is_empty());
     // Prefer the MCS ServiceImport label when both are present so an import's
     // derived slices are never mistaken for a same-named local Service.
     let (service_name, backend_kind) = if let Some(name) = object
@@ -589,14 +788,7 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
         .filter(|name| !name.is_empty())
     {
         (name, EndpointSliceBackendKind::ServiceImport)
-    } else if let Some(name) = object
-        .metadata
-        .labels
-        .get("kubernetes.io/service-name")
-        .cloned()
-        .or_else(|| string_field(&object.spec, "serviceName").map(ToOwned::to_owned))
-        .filter(|name| !name.is_empty())
-    {
+    } else if let Some(name) = service_label.clone() {
         (name, EndpointSliceBackendKind::Service)
     } else {
         return;
@@ -605,6 +797,8 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
     else {
         return;
     };
+    let guarded_service_key =
+        service_label.and_then(|name| K8sServiceKey::new(object.metadata.namespace.clone(), name));
 
     let ports = object
         .spec
@@ -648,6 +842,8 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
                 pod_key,
                 addresses: string_array_from_value(endpoint, "addresses"),
                 ready: crate::util::endpointslice::endpoint_slice_endpoint_is_ready(endpoint),
+                out_of_service: endpoint_is_out_of_service(endpoint),
+                terminating: endpoint_is_terminating(endpoint),
                 node_name: nonempty_node_name(string_field(endpoint, "nodeName"))
                     .map(ToOwned::to_owned),
             }
@@ -657,6 +853,7 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
     acc.core.endpoint_slices.push(CoreEndpointSlice {
         service_key,
         backend_kind,
+        guarded_service_key,
         ports,
         endpoints,
     });
@@ -913,6 +1110,402 @@ pub(super) fn endpoint_route_backends_for_service(
     backends
 }
 
+/// Attribute every Service's EndpointSlice endpoints to observed Pods for the
+/// Gateway API backendRef guard (issue #6108).
+///
+/// Every non-ExternalName Service is checked, with or without a selector:
+/// anyone who can write EndpointSlices in a namespace can attach a slice to a
+/// selector-backed Service by its `kubernetes.io/service-name` label, and
+/// kube-proxy and CoreDNS honour it. The slices the EndpointSlice controller
+/// manages name only Pods of the Service's namespace, so a legitimate Service
+/// passes at the cost of one lookup per endpoint address.
+///
+/// Every endpoint counts, ready or not, except one that explicitly reports
+/// both `ready: false` and `serving: false`: no consumer ever dials it (see
+/// [`endpoint_is_out_of_service`]). A Pod's IP claim outlives the Pod by
+/// [`POD_CLAIM_GRACE_WINDOW`] (see [`PodClaimInventory`]), so a terminating
+/// endpoint the EndpointSlice controller has not yet dropped still belongs to
+/// its Pod's namespace. With a restricted Pod watch scope that memory is used
+/// only for endpoints reporting `terminating: true` with an explicit
+/// `ready: false`.
+///
+/// A `targetRef` is authored with the slice, so on its own it can only make an
+/// endpoint look worse. The one thing it can do for a selector-backed Service
+/// is point at a same-namespace Pod whose own status reports the address: a
+/// host-network Pod (a DaemonSet) reports its Node's IP, which no other Pod
+/// claims.
+///
+/// Services in a namespace outside the Pod watch scope are left to the caller,
+/// which records the selector-less ones as unverifiable.
+pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
+    let cluster_ips: HashSet<IpAddr> = acc
+        .core
+        .services
+        .values()
+        .flat_map(|service| service.cluster_ips.iter())
+        .filter_map(|ip| parse_endpoint_ip(ip.as_str()))
+        .collect();
+    // With a restricted Pod watch scope an IP reused by an unwatched Pod
+    // would still look like the departed Pod's, so there the remembered
+    // claims vouch only for terminating endpoints.
+    let remember_every_endpoint = acc.options.watches_every_pod_namespace();
+    let inventory = &acc.options.pod_claim_inventory;
+    let mut recent = inventory.lock();
+    recent.refresh(&acc.core.pods, Instant::now(), inventory.grace);
+    let mut findings_by_service: BTreeMap<&K8sServiceKey, EndpointSliceFindings> = BTreeMap::new();
+    for slice in &acc.core.endpoint_slices {
+        let Some(service_key) = slice.guarded_service_key.as_ref() else {
+            continue;
+        };
+        let Some(service) = acc.core.services.get(service_key) else {
+            continue;
+        };
+        let namespace = service_key.namespace.as_str();
+        if acc.service_is_external_name(namespace, &service_key.name)
+            || !acc.options.includes_pod_namespace(namespace)
+        {
+            continue;
+        }
+        let attribution = EndpointAttribution {
+            state: &acc.core,
+            recent: &recent,
+            remember_every_endpoint,
+            cluster_ips: &cluster_ips,
+            service_namespace: namespace,
+            service_has_selector: service.has_selector,
+        };
+        let findings = findings_by_service.entry(service_key).or_default();
+        findings.selectorless = !service.has_selector;
+        for endpoint in &slice.endpoints {
+            if endpoint.out_of_service {
+                continue;
+            }
+            for address in &endpoint.addresses {
+                if address.is_empty() {
+                    continue;
+                }
+                match attribution.classify(endpoint, address) {
+                    EndpointAddress::NamespacePod => {}
+                    EndpointAddress::Foreign => findings.foreign = true,
+                    EndpointAddress::Unattributed => findings.unattributed = true,
+                }
+            }
+        }
+    }
+    drop(recent);
+    let mut guard = EndpointSliceGuard::new(external_endpoints_opt_in_active(acc));
+    for (key, findings) in findings_by_service {
+        guard.record(&key.namespace, &key.name, findings);
+    }
+    guard
+}
+
+/// Whether `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS` is in effect for
+/// this translation: requested, and at least one Node observed. Without the
+/// Node watch a Node address or an unwatched Pod's IP looks external, so the
+/// opt-in stays inactive (issue #6108).
+pub(super) fn external_endpoints_opt_in_active(acc: &K8sAccumulator) -> bool {
+    acc.options.allow_selectorless_external_endpoints && acc.core.nodes_observed
+}
+
+/// Whether an EndpointSlice endpoint explicitly reports `terminating: true`
+/// together with an explicit `ready: false`.
+///
+/// kube-proxy and CoreDNS treat an endpoint whose `ready` is true or omitted
+/// as a normal endpoint whatever `terminating` says, so only an explicit
+/// `ready: false` keeps it out of normal service. The EndpointSlice
+/// controller always writes `ready: false` on a terminating endpoint.
+fn endpoint_is_terminating(endpoint: &Value) -> bool {
+    let condition = |name: &str| {
+        endpoint
+            .get("conditions")
+            .and_then(|conditions| conditions.get(name))
+            .and_then(Value::as_bool)
+    };
+    condition("terminating") == Some(true) && condition("ready") == Some(false)
+}
+
+/// Whether an EndpointSlice endpoint explicitly reports both `ready: false`
+/// and `serving: false`.
+///
+/// No consumer dials one: Ferrum and CoreDNS use ready endpoints, and
+/// kube-proxy falls back only to serving terminating ones. kube-proxy reads an
+/// omitted condition as true, so only an explicit `false` for both counts.
+fn endpoint_is_out_of_service(endpoint: &Value) -> bool {
+    let condition = |name: &str| {
+        endpoint
+            .get("conditions")
+            .and_then(|conditions| conditions.get(name))
+            .and_then(Value::as_bool)
+    };
+    condition("ready") == Some(false) && condition("serving") == Some(false)
+}
+
+/// One EndpointSlice endpoint address, relative to the Service's namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointAddress {
+    /// A Pod of the Service's namespace, and of no other namespace.
+    NamespacePod,
+    /// Another namespace's Pod, or an address no Pod of the namespace can
+    /// have.
+    Foreign,
+    /// An IP nothing observed claims: an external host, or a Pod the
+    /// controller cannot see that no observed Node's Pod CIDR covers.
+    Unattributed,
+}
+
+/// The inventory one Service's endpoint addresses are judged against.
+struct EndpointAttribution<'a> {
+    state: &'a CoreState,
+    /// Claims of Pods observed now or within [`POD_CLAIM_GRACE_WINDOW`].
+    recent: &'a RecentPodClaims,
+    /// Whether `recent` vouches for every endpoint (the Pod watch scope
+    /// covers every namespace) or only for terminating ones.
+    remember_every_endpoint: bool,
+    /// Every observed Service ClusterIP, in any namespace.
+    cluster_ips: &'a HashSet<IpAddr>,
+    service_namespace: &'a str,
+    service_has_selector: bool,
+}
+
+impl EndpointAttribution<'_> {
+    fn classify(&self, endpoint: &CoreEndpoint, address: &str) -> EndpointAddress {
+        let vouches = self.remember_every_endpoint || endpoint.terminating;
+        let recent = vouches.then_some(self.recent);
+        if endpoint
+            .pod_key
+            .as_ref()
+            .is_some_and(|pod| pod.namespace != self.service_namespace)
+        {
+            return EndpointAddress::Foreign;
+        }
+        // An FQDN endpoint is a DNS alias, exactly like an ExternalName
+        // Service; a zone id, leading zero, or stray whitespace is no IP
+        // either.
+        let Some(ip) = parse_endpoint_ip(address) else {
+            return EndpointAddress::Foreign;
+        };
+        // A NAT64 or IPv4-compatible address is never a Pod's own address; it
+        // reaches whatever its embedded IPv4 reaches.
+        if let Some(embedded) = embedded_ipv4(ip) {
+            let embedded = IpAddr::V4(embedded);
+            if ip_is_never_a_backend(embedded)
+                || self.pod_claim(embedded, recent).is_some()
+                || self.is_cluster_infrastructure(embedded)
+            {
+                return EndpointAddress::Foreign;
+            }
+            return EndpointAddress::Unattributed;
+        }
+        // Checked before any Pod claim: a Pod status reporting loopback,
+        // link-local, or a metadata address does not make it a backend.
+        if ip_is_never_a_backend(ip) {
+            return EndpointAddress::Foreign;
+        }
+        if let Some(only_service_namespace) = self.pod_claim(ip, recent) {
+            return if only_service_namespace {
+                EndpointAddress::NamespacePod
+            } else {
+                EndpointAddress::Foreign
+            };
+        }
+        if self.service_has_selector && self.target_pod_reports(endpoint, ip, recent) {
+            return EndpointAddress::NamespacePod;
+        }
+        if self.is_cluster_infrastructure(ip) {
+            return EndpointAddress::Foreign;
+        }
+        EndpointAddress::Unattributed
+    }
+
+    /// `Some(true)` when only Pods of the Service's namespace claim `ip`,
+    /// `Some(false)` when another namespace's Pod does too, `None` when no
+    /// Pod does. The Pods observed now decide; a claim from within the grace
+    /// window (`recent`, when it may vouch for this endpoint) counts only for
+    /// an IP no observed Pod claims.
+    fn pod_claim(&self, ip: IpAddr, recent: Option<&RecentPodClaims>) -> Option<bool> {
+        let namespace = self.service_namespace;
+        if let Some(namespaces) = self.state.pod_ip_namespaces.get(&ip) {
+            return Some(namespaces.iter().all(|claimant| claimant == namespace));
+        }
+        let namespaces = recent?.ip_namespaces.get(&ip)?;
+        Some(namespaces.keys().all(|claimant| claimant == namespace))
+    }
+
+    /// Whether the endpoint's `targetRef` names a Pod of the Service's
+    /// namespace that reports `ip`: an observed, non-terminal Pod now, or one
+    /// that did within the grace window (`recent`, when it may vouch for this
+    /// endpoint). The caller has already refused a `targetRef` into another
+    /// namespace.
+    fn target_pod_reports(
+        &self,
+        endpoint: &CoreEndpoint,
+        ip: IpAddr,
+        recent: Option<&RecentPodClaims>,
+    ) -> bool {
+        let Some(pod_key) = endpoint.pod_key.as_ref() else {
+            return false;
+        };
+        if let Some(pod) = self.state.pods.get(pod_key)
+            && !pod.terminal
+            && pod
+                .addresses
+                .iter()
+                .any(|address| parse_endpoint_ip(address) == Some(ip))
+        {
+            return true;
+        }
+        recent
+            .and_then(|recent| recent.pod_addresses.get(pod_key))
+            .is_some_and(|addresses| addresses.contains_key(&ip))
+    }
+
+    /// A Service ClusterIP (kube-proxy forwards it to that Service's
+    /// endpoints), a Node address (the kubelet, every NodePort, and
+    /// host-network Pods), or an IP inside a Node's Pod CIDR (a Pod the
+    /// controller does not watch).
+    fn is_cluster_infrastructure(&self, ip: IpAddr) -> bool {
+        let state = self.state;
+        self.cluster_ips.contains(&ip)
+            || state.node_addresses.contains(&ip)
+            || state.node_pod_cidrs.contains(ip)
+    }
+}
+
+/// Observed Nodes' Pod CIDRs, indexed by prefix length so a lookup costs one
+/// hash probe per distinct prefix length (normally one per address family)
+/// rather than one comparison per Node.
+#[derive(Debug, Default)]
+struct PodCidrIndex {
+    v4: BTreeMap<u8, HashSet<u32>>,
+    v6: BTreeMap<u8, HashSet<u128>>,
+}
+
+impl PodCidrIndex {
+    /// Index a `network/prefix` CIDR; one that does not parse is skipped.
+    fn insert(&mut self, cidr: &str) {
+        let Some((network, prefix)) = parse_cidr(cidr) else {
+            return;
+        };
+        match network {
+            IpAddr::V4(network) => {
+                let masked = u32::from(network) & ipv4_prefix_mask(prefix);
+                self.v4.entry(prefix).or_default().insert(masked);
+            }
+            IpAddr::V6(network) => {
+                let masked = u128::from(network) & ipv6_prefix_mask(prefix);
+                self.v6.entry(prefix).or_default().insert(masked);
+            }
+        }
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match ip.to_canonical() {
+            IpAddr::V4(ip) => {
+                let ip = u32::from(ip);
+                for (prefix, networks) in &self.v4 {
+                    if networks.contains(&(ip & ipv4_prefix_mask(*prefix))) {
+                        return true;
+                    }
+                }
+            }
+            IpAddr::V6(ip) => {
+                let ip = u128::from(ip);
+                for (prefix, networks) in &self.v6 {
+                    if networks.contains(&(ip & ipv6_prefix_mask(*prefix))) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// `(network, prefix)` of a `network/prefix` CIDR. An IPv4-mapped IPv6 CIDR
+/// becomes the IPv4 range it maps, matching how endpoint IPs are
+/// canonicalised.
+fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (network, prefix) = cidr.trim().split_once('/')?;
+    let network = network.parse::<IpAddr>().ok()?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    let (network, prefix) = match network {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+            (network.to_canonical(), prefix.checked_sub(96)?)
+        }
+        _ => (network, prefix),
+    };
+    let max_prefix = if network.is_ipv4() { 32 } else { 128 };
+    (prefix <= max_prefix).then_some((network, prefix))
+}
+
+fn ipv4_prefix_mask(prefix: u8) -> u32 {
+    u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
+}
+
+fn ipv6_prefix_mask(prefix: u8) -> u128 {
+    u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0)
+}
+
+fn parse_endpoint_ip(address: &str) -> Option<IpAddr> {
+    address.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+}
+
+/// The IPv4 address a NAT64 (`64:ff9b::/96`, RFC 6052) or deprecated
+/// IPv4-compatible (`::a.b.c.d`, RFC 4291) IPv6 address embeds. IPv4-mapped
+/// addresses are already canonicalised to IPv4 by [`parse_endpoint_ip`].
+fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
+    let IpAddr::V6(ip) = ip else {
+        return None;
+    };
+    let segments = ip.segments();
+    let nat64 = segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    let ipv4_compatible = segments[..6] == [0; 6] && !ip.is_unspecified() && !ip.is_loopback();
+    if !nat64 && !ipv4_compatible {
+        return None;
+    }
+    let [.., a, b, c, d] = ip.octets();
+    Some(Ipv4Addr::new(a, b, c, d))
+}
+
+/// Alibaba Cloud's instance metadata service.
+const ALIBABA_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+/// Azure's WireServer (instance configuration and health).
+const AZURE_WIRESERVER_IPV4: Ipv4Addr = Ipv4Addr::new(168, 63, 129, 16);
+/// AWS's IPv6 instance metadata service.
+const AWS_METADATA_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
+
+/// Addresses that are never a Service backend, whoever claims them: loopback
+/// reaches the gateway itself, link-local and the cloud metadata addresses
+/// reach node and instance services, and the rest are not unicast hosts.
+fn ip_is_never_a_backend(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.octets()[0] == 0
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip == ALIBABA_METADATA_IPV4
+                || ip == AZURE_WIRESERVER_IPV4
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || ip == AWS_METADATA_IPV6
+        }
+    }
+}
+
+fn pod_phase_is_terminal(object: &K8sObject) -> bool {
+    matches!(
+        string_field(&object.status, "phase"),
+        Some("Succeeded" | "Failed")
+    )
+}
+
 /// Dial port used when a Service backend cannot expand onto ready endpoints
 /// and therefore falls back to cluster DNS.
 ///
@@ -1095,10 +1688,29 @@ fn endpoint_backend_port(
 }
 
 fn collect_node(acc: &mut K8sAccumulator, object: &K8sObject) {
+    acc.core.nodes_observed = true;
     if !object.metadata.uid.is_empty() {
         acc.core
             .node_uids
             .insert(object.metadata.name.clone(), object.metadata.uid.clone());
+    }
+    let addresses = object
+        .status
+        .get("addresses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| string_field(entry, "address"))
+        .filter_map(parse_endpoint_ip);
+    acc.core.node_addresses.extend(addresses);
+    let mut pod_cidrs = string_array_from_value(&object.spec, "podCIDRs");
+    if pod_cidrs.is_empty()
+        && let Some(cidr) = string_field(&object.spec, "podCIDR")
+    {
+        pod_cidrs.push(cidr.to_string());
+    }
+    for cidr in &pod_cidrs {
+        acc.core.node_pod_cidrs.insert(cidr);
     }
     let Some(locality) = node_locality(&object.metadata.labels) else {
         return;
@@ -1136,6 +1748,8 @@ fn auto_workloads_for_service(
                     pod_key: Some(pod_key.clone()),
                     addresses: Vec::new(),
                     ready: true,
+                    out_of_service: false,
+                    terminating: false,
                     node_name: endpoint.node_name.clone(),
                 });
             let seen_addresses = seen_endpoint_addresses.entry(pod_key).or_default();

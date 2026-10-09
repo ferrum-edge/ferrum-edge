@@ -7897,6 +7897,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": " x-consumer-trace "}),
         json!({"header_name": "X_Consumer_Trace"}),
         json!({"header_name": "x_consumer-trace"}),
+        json!({"header_name": "X-Ferrum-Hops"}),
+        json!({"header_name": " x_ferrum_hops "}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
         assert!(

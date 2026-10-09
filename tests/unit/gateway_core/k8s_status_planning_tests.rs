@@ -911,7 +911,7 @@ fn namespace_selector_and_cross_namespace_grant_parity() {
             creation_timestamp: None,
             deletion_timestamp: None,
         },
-        spec: json!({ "ports": [{"port": 8080}] }),
+        spec: json!({ "selector": {"app": "api"}, "ports": [{"port": 8080}] }),
         status: Value::Object(serde_json::Map::new()),
     };
 
@@ -1165,7 +1165,7 @@ fn backend_service(namespace: &str, name: &str) -> K8sObject {
             creation_timestamp: None,
             deletion_timestamp: None,
         },
-        spec: json!({ "ports": [{"port": 8080}] }),
+        spec: json!({ "selector": {"app": name}, "ports": [{"port": 8080}] }),
         status: Value::Object(serde_json::Map::new()),
     }
 }

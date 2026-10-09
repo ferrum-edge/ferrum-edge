@@ -287,6 +287,7 @@ fn cluster_ip_service_backend_still_resolves() {
     let objects = external_name_fixture(json!({
         "type": "ClusterIP",
         "clusterIP": "10.96.0.10",
+        "selector": { "app": "payroll" },
         "ports": [{ "name": "http", "port": 8080 }]
     }));
     let translation = translate_k8s_objects(&objects, options()).expect("translation");

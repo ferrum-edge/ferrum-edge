@@ -457,9 +457,12 @@ fn normalize_allowed_header(raw_header: &str, plugin: &str, field: &str) -> Resu
 /// Headers a claim mapping may never write. The whole gateway-owned
 /// `x-consumer-*` namespace is reserved
 /// ([`crate::proxy::headers::is_consumer_assertion_header`]), not only the
-/// two identity fields the gateway itself asserts.
+/// two identity fields the gateway itself asserts, and so is the gateway's
+/// `X-Ferrum-Hops` loop-guard count
+/// ([`crate::proxy::hop_limit::is_proxy_hops_header`]).
 pub fn is_reserved_header(name: &str) -> bool {
     crate::proxy::headers::is_consumer_assertion_header(name)
+        || crate::proxy::hop_limit::is_proxy_hops_header(name)
         || matches!(
             name.to_ascii_lowercase().as_str(),
             "host"

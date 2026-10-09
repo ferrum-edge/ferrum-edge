@@ -2957,6 +2957,16 @@ pub async fn run(
                  FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
             );
         }
+        if let Some(reason) = env_config.k8s_selectorless_external_endpoints_inactive_reason() {
+            warn!(
+                reason,
+                "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true has no effect: it needs \
+                 the Node watch (FERRUM_K8S_POD_DISCOVERY_ENABLED=true and \
+                 FERRUM_K8S_NODE_LOCALITY_ENABLED=true with nodes list/watch RBAC) to tell Node \
+                 addresses and Node Pod CIDRs from external hosts, so EndpointSlice IPs no \
+                 observed Pod claims stay refused"
+            );
+        }
         // T2-B: when `FERRUM_K8S_WATCH_NAMESPACES` isn't set, fall back to the
         // CP's namespace scope (T2-A). `CpScope::Single`/`Set` produce an
         // explicit watch list; `CpScope::All` returns `None` here, which the
@@ -2998,6 +3008,8 @@ pub async fn run(
             watch_mesh_config: env_config.k8s_watch_mesh_config,
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
+            allow_selectorless_external_endpoints: env_config
+                .k8s_selectorless_external_endpoints_active(),
             watch_node_locality: env_config.k8s_node_locality_enabled,
             gateway_api_data_plane_service_namespace: env_config
                 .gateway_api_data_plane_service_namespace
@@ -3061,6 +3073,12 @@ pub async fn run(
         if env_config.k8s_node_locality_enabled {
             warn!(
                 "FERRUM_K8S_NODE_LOCALITY_ENABLED=true has no effect because \
+                 FERRUM_K8S_CONTROLLER_ENABLED=false"
+            );
+        }
+        if env_config.k8s_allow_selectorless_external_endpoints {
+            warn!(
+                "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true has no effect because \
                  FERRUM_K8S_CONTROLLER_ENABLED=false"
             );
         }

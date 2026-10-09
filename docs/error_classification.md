@@ -246,7 +246,7 @@ its empty-bodied automatic `400`. The response uses the same JSON envelope
 handler-layer protocol rejects use: `Content-Type: application/json`, a fixed
 `{"error":"..."}` body matching `check_protocol_headers()`, and
 `Connection: close`. Like the handler-layer protocol `400`s, it carries **no**
-`X-Gateway-Error`: that header is the closed eight-token client-facing
+`X-Gateway-Error`: that header is the closed nine-token client-facing
 vocabulary below, which names why a *backend* attempt failed, and none of its
 tokens describes a client-caused `400` (issue #4543). The parse reject names
 itself only in its `warn`-level log line (`parse_reject_class`,
@@ -312,9 +312,9 @@ HTTP-family 5xx use **two** closed vocabularies across three surfaces:
 
 | Surface | Closed set | Cardinality |
 |---|---|---|
-| `X-Gateway-Error` (client header) | eight coarse tokens below | **8** |
+| `X-Gateway-Error` (client header) | nine coarse tokens below | **9** |
 | Access-log `error_class` | [`ErrorClass::as_str`](../src/retry.rs) | **19** (omitted when unset) |
-| `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus five non-class tokens | **24** (omitted on 2xx/3xx/4xx; an unclassified backend 5xx carries `backend_error`) |
+| `ferrum_requests_total{error_class}` | `ErrorClass::as_str` plus six non-class tokens | **25** (omitted on 2xx/3xx/4xx; an unclassified backend 5xx carries `backend_error`) |
 
 The header is the stable client-facing contract and must not change spelling.
 Metrics and logs keep the granular class so PromQL and log alerts can split
@@ -391,6 +391,7 @@ confirm what the gateway saw, use a diagnostic reference (below).
 | `config_stale` | DP stale-config fence 503 |
 | `concurrency_limit` | `adaptive_concurrency` admission 503 |
 | `request_timeout` | A matched route rule's total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API `timeouts.request`) expired before any backend held the request: during the client upload, a gateway-local phase, admission, or retry backoff (504). The transaction log records `route_request_timeout` as `before_dispatch` or `retry_backoff` |
+| `loop_detected` | The request arrived with an `X-Ferrum-Hops` count at or above `FERRUM_MAX_PROXY_HOPS`, so the gateway refused it before routing with `508 Loop Detected`. Native gRPC gets Trailers-Only `FAILED_PRECONDITION` instead, which carries no HTTP 5xx and therefore no token. No backend was contacted. Only the refusing hop writes this token: an outer Ferrum hop that relays the `508` labels it `backend_error`, like any other backend 5xx. The malformed-field `400` (phase `proxy_hops_invalid`) carries no token. See [Proxy hop limit](routing.md#proxy-hop-limit) |
 
 Do not reuse `backend_error` for a response that never reached a backend, and
 do not reuse `backend_timeout` for a timeout no backend held. A route-deadline
@@ -424,10 +425,11 @@ attempt) stays `backend_timeout`.
 | *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |
 | *(no `ErrorClass`; `rejection_phase=config_stale`)* | `config_stale` |
 | *(no `ErrorClass`; `rejection_phase=adaptive_concurrency`)* | `concurrency_limit` |
+| *(no `ErrorClass`; `rejection_phase=proxy_hop_limit`, status 508)* | `loop_detected` (reserved: the hop-limit fence emits no transaction summary, so no metric row carries it today) |
 | *(no `ErrorClass`; no `rejection_phase`; backend 5xx)* | `backend_error` |
 
-Those five gateway-authored tokens appear on the metric (and the header) when
-there is no `ErrorClass`. The first four are named by a `rejection_phase`;
+Those six gateway-authored tokens appear on the metric (and the header) when
+there is no `ErrorClass`. The first five are named by a `rejection_phase`;
 `backend_error` is the fallback for a backend 5xx the gateway never
 classified and no fence rejected, so the metric never loses a 5xx to an
 empty label. They are omitted from the access log in that case;
@@ -663,7 +665,7 @@ refusal: HTTP **502** with the existing `Response body too large` JSON error
 and numeric `limit`, plus the existing
 gateway-owned `overload` header token. It uses `DispatchPolicyRejected`, not
 `GatewayBufferCapacity` or `ResponseBodyTooLarge`, so the closed sets stay at
-eight header tokens and nineteen error classes. Private request provenance restores
+nine header tokens and nineteen error classes. Private request provenance restores
 the header after mutable hooks and stamps the class in the shared transaction-log
 funnel, including native H3 and cross-protocol paths.
 

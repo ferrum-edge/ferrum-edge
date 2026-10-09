@@ -67,7 +67,8 @@
 //! handle. Removal re-opens the path `O_NOFOLLOW` and refuses unless the
 //! object still carries the device/inode identity the evidence was read from.
 //! Temporary files are created `O_EXCL | O_NOFOLLOW` under an unpredictable
-//! name, so a pre-planted symlink or file cannot be followed or truncated.
+//! name, so a pre-planted symlink or file cannot be followed or truncated, and
+//! their final mode is set through the open handle (`fchmod`), never by path.
 //! Install additionally fail-closes under the lock before any staging or
 //! shared write: an existing target conflist is overwritten only when it is a
 //! bounded regular single-link file whose Ferrum ownership marker names this
@@ -1821,9 +1822,10 @@ struct StagedBinary {
 impl StagedBinary {
     fn stage(source: &Path, target: &Path) -> Result<Self, CniInstallError> {
         let (path, mut file) = create_exclusive_temp(target, "install")?;
-        let staged = copy_and_hash(source, &mut file, &path);
+        let staged = copy_and_hash(source, &mut file, &path)
+            .and_then(|sha256| set_executable(&file, &path).map(|()| sha256));
         drop(file);
-        let sha256 = match staged.and_then(|sha256| set_executable(&path).map(|()| sha256)) {
+        let sha256 = match staged {
             Ok(sha256) => sha256,
             Err(error) => {
                 let _ = fs::remove_file(&path);
@@ -1935,24 +1937,32 @@ pub(crate) fn atomic_write_file(
     mode: Option<u32>,
 ) -> Result<(), CniInstallError> {
     let (tmp_path, mut file) = create_exclusive_temp(target, "tmp")?;
-    let written = file
-        .write_all(contents)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| CniInstallError::Io {
-            path: tmp_path.display().to_string(),
-            source,
-        });
+    let written = write_staged(&mut file, &tmp_path, contents, mode);
     drop(file);
-    let result = written.and_then(|()| {
-        if let Some(mode) = mode {
-            set_mode(&tmp_path, mode)?;
-        }
-        atomic_rename(&tmp_path, target)
-    });
+    let result = written.and_then(|()| atomic_rename(&tmp_path, target));
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Fill a freshly created staging file and give it its final mode, all
+/// through the open handle, then make both durable before the publish.
+fn write_staged(
+    file: &mut File,
+    path: &Path,
+    contents: &[u8],
+    mode: Option<u32>,
+) -> Result<(), CniInstallError> {
+    let io_error = |source: std::io::Error| CniInstallError::Io {
+        path: path.display().to_string(),
+        source,
+    };
+    file.write_all(contents).map_err(io_error)?;
+    if let Some(mode) = mode {
+        set_mode(file, path, mode)?;
+    }
+    file.sync_all().map_err(io_error)
 }
 
 /// Create a temporary sibling of `target` that cannot be pre-planted.
@@ -2024,28 +2034,32 @@ fn atomic_rename(source: &Path, target: &Path) -> Result<(), CniInstallError> {
 }
 
 #[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), CniInstallError> {
-    set_mode(path, 0o755)
+fn set_executable(file: &File, path: &Path) -> Result<(), CniInstallError> {
+    set_mode(file, path, 0o755)
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), CniInstallError> {
+fn set_executable(_file: &File, _path: &Path) -> Result<(), CniInstallError> {
     Ok(())
 }
 
+/// Change the mode of an already-open staging file through its handle
+/// (`fchmod`). A path-based chmod follows symlinks, so a staging name swapped
+/// for a link between creation and chmod would redirect the change onto the
+/// link's target; the handle can only ever name the inode this run created.
+/// `path` is used only to label the error.
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<(), CniInstallError> {
+fn set_mode(file: &File, path: &Path, mode: u32) -> Result<(), CniInstallError> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
-        CniInstallError::Io {
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|source| CniInstallError::Io {
             path: path.display().to_string(),
             source,
-        }
-    })
+        })
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<(), CniInstallError> {
+fn set_mode(_file: &File, _path: &Path, _mode: u32) -> Result<(), CniInstallError> {
     Ok(())
 }
 

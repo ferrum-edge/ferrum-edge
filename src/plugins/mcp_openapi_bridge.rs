@@ -1382,6 +1382,7 @@ const KNOWN_GATEWAY_ERROR_CLASSES: &[&str] = &[
     crate::retry::OBS_CONFIG_STALE,
     crate::retry::OBS_CONCURRENCY_LIMIT,
     crate::retry::OBS_REQUEST_TIMEOUT,
+    crate::retry::OBS_LOOP_DETECTED,
 ];
 
 /// The class a gateway rejection stamped on its own response. Read only when

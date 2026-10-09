@@ -3891,6 +3891,55 @@ fn test_env_config_max_header_count_custom() {
 }
 
 #[test]
+fn test_env_config_max_proxy_hops_defaults_to_ten() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_PROXY_HOPS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_proxy_hops, 10);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_proxy_hops_accepts_zero_through_255() {
+    for (raw, expected) in [("0", 0u8), ("1", 1), ("32", 32), ("255", 255)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_MAX_PROXY_HOPS", raw),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.max_proxy_hops, expected, "{raw}");
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_max_proxy_hops_refuses_out_of_range_values() {
+    for raw in ["256", "-1", "ten"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_MAX_PROXY_HOPS", raw),
+            ],
+            || {
+                let err = EnvConfig::from_env().expect_err("out-of-range hop limit must fail");
+                assert!(err.contains("FERRUM_MAX_PROXY_HOPS"), "{raw}: {err}");
+            },
+        );
+    }
+}
+
+#[test]
 fn test_env_config_max_url_length_bytes_default() {
     with_env_vars(
         &[
@@ -7243,6 +7292,69 @@ fn test_pool_shard_amount_default_is_zero() {
     assert_eq!(
         config.pool_shard_amount, 0,
         "Default 0 means auto-derive from CPU topology"
+    );
+}
+
+#[test]
+fn selectorless_external_endpoints_opt_in_needs_the_node_watch() {
+    // Without the Node watch a Node address, or the IP of a Pod outside the
+    // Pod watch scope, cannot be told from an external host (issue #6108).
+    let watching = EnvConfig {
+        k8s_allow_selectorless_external_endpoints: true,
+        k8s_controller_enabled: true,
+        k8s_pod_discovery_enabled: true,
+        k8s_node_locality_enabled: true,
+        ..EnvConfig::default()
+    };
+    assert!(watching.k8s_selectorless_external_endpoints_active());
+    assert_eq!(
+        watching.k8s_selectorless_external_endpoints_inactive_reason(),
+        None
+    );
+
+    let cases = [
+        (
+            EnvConfig {
+                k8s_controller_enabled: false,
+                ..watching.clone()
+            },
+            "FERRUM_K8S_CONTROLLER_ENABLED=false",
+        ),
+        (
+            EnvConfig {
+                k8s_pod_discovery_enabled: false,
+                ..watching.clone()
+            },
+            "FERRUM_K8S_POD_DISCOVERY_ENABLED=false",
+        ),
+        (
+            EnvConfig {
+                k8s_node_locality_enabled: false,
+                ..watching.clone()
+            },
+            "FERRUM_K8S_NODE_LOCALITY_ENABLED=false",
+        ),
+    ];
+    for (config, reason) in cases {
+        assert!(
+            !config.k8s_selectorless_external_endpoints_active(),
+            "{reason}"
+        );
+        assert_eq!(
+            config.k8s_selectorless_external_endpoints_inactive_reason(),
+            Some(reason)
+        );
+    }
+
+    // Not requested: inactive, with nothing to warn about.
+    let not_requested = EnvConfig {
+        k8s_allow_selectorless_external_endpoints: false,
+        ..watching
+    };
+    assert!(!not_requested.k8s_selectorless_external_endpoints_active());
+    assert_eq!(
+        not_requested.k8s_selectorless_external_endpoints_inactive_reason(),
+        None
     );
 }
 

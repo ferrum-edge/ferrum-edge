@@ -25,6 +25,8 @@ mod cidr_tests;
 mod circuit_breaker_tests;
 mod client_identity_tests;
 mod client_ip_tests;
+#[cfg(unix)]
+mod cni_install_mode_tests;
 mod cni_ownership_tests;
 mod collection_object_admission_tests;
 mod config_delta_namespace_prune_tests;
@@ -175,6 +177,7 @@ mod pool_profile_tests;
 mod pool_sharding_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;
+mod proxy_hop_limit_tests;
 mod proxy_protocol_tests;
 mod proxy_tests;
 mod relay_flush_progress_tests;

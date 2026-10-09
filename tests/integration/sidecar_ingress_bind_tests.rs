@@ -1,6 +1,9 @@
 //! External integration coverage for Sidecar ingress dedicated `bind`
 //! ownership (issue #3266): prepare materializes conflict-checked listen_port
-//! proxies and bind overrides, and withdraws them on reload.
+//! proxies and bind overrides, and withdraws them on reload. Also covers the
+//! proxy hop limit's build-time guard (issue #6109): an `ingress[]`
+//! `defaultEndpoint` or an inbound `targetPort` that names a port the gateway
+//! itself listens on is refused fail-closed.
 
 use std::collections::HashMap;
 
@@ -10,7 +13,7 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarIngress, ServicePort, Workload,
     WorkloadPort, WorkloadRef, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::{MeshTopology, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh};
 
 use super::mesh_test_support::default_mesh_runtime;
 
@@ -102,17 +105,45 @@ fn prepare_sidecar_with_path_parameters(
     endpoint_port: u16,
     allow_path_parameters: bool,
 ) -> GatewayConfig {
+    prepare_sidecar_ingress(
+        namespace,
+        service_name,
+        protocol,
+        endpoint_port,
+        allow_path_parameters,
+        vec![ingress_entry(protocol, bind, listener_port, endpoint_port)],
+    )
+}
+
+fn ingress_entry(
+    protocol: AppProtocol,
+    bind: Option<&str>,
+    listener_port: u16,
+    endpoint_port: u16,
+) -> MeshSidecarIngress {
+    MeshSidecarIngress {
+        port: listener_port,
+        protocol,
+        name: None,
+        bind: bind.map(str::to_string),
+        default_endpoint: format!("127.0.0.1:{endpoint_port}"),
+    }
+}
+
+/// Prepare a Sidecar whose applicable `Sidecar` resource declares exactly
+/// `ingress`. `app_port` is the owner service's and workload's declared port.
+fn prepare_sidecar_ingress(
+    namespace: &str,
+    service_name: &str,
+    protocol: AppProtocol,
+    app_port: u16,
+    allow_path_parameters: bool,
+    ingress: Vec<MeshSidecarIngress>,
+) -> GatewayConfig {
     let spiffe = format!("spiffe://cluster.local/ns/{namespace}/sa/{service_name}");
-    let (workload, mut service) =
-        local_echo(namespace, service_name, &spiffe, endpoint_port, protocol);
+    let (workload, mut service) = local_echo(namespace, service_name, &spiffe, app_port, protocol);
     service.allow_path_parameters = allow_path_parameters;
-    let mut runtime = default_mesh_runtime();
-    runtime.namespace = namespace.to_string();
-    runtime.workload_spiffe_id = Some(spiffe.to_string());
-    runtime.sidecar_enforced = true;
-    runtime.topology = MeshTopology::Sidecar;
-    runtime.inbound_listen_addr = "127.0.0.1:0".parse().expect("addr");
-    runtime.outbound_listen_addr = "127.0.0.1:0".parse().expect("addr");
+    let runtime = sidecar_runtime(namespace, &spiffe);
 
     let config = GatewayConfig {
         mesh: Some(Box::new(MeshConfig {
@@ -126,19 +157,24 @@ fn prepare_sidecar_with_path_parameters(
                 egress: Vec::new(),
                 outbound_traffic_policy: None,
                 ingress_declared: true,
-                ingress: vec![MeshSidecarIngress {
-                    port: listener_port,
-                    protocol,
-                    name: None,
-                    bind: bind.map(str::to_string),
-                    default_endpoint: format!("127.0.0.1:{endpoint_port}"),
-                }],
+                ingress,
             }],
             ..MeshConfig::default()
         })),
         ..GatewayConfig::default()
     };
     prepare_gateway_config_for_mesh(config, &runtime).expect("prepare")
+}
+
+fn sidecar_runtime(namespace: &str, spiffe: &str) -> MeshRuntimeConfig {
+    let mut runtime = default_mesh_runtime();
+    runtime.namespace = namespace.to_string();
+    runtime.workload_spiffe_id = Some(spiffe.to_string());
+    runtime.sidecar_enforced = true;
+    runtime.topology = MeshTopology::Sidecar;
+    runtime.inbound_listen_addr = "127.0.0.1:0".parse().expect("addr");
+    runtime.outbound_listen_addr = "127.0.0.1:0".parse().expect("addr");
+    runtime
 }
 
 fn prepare_in_namespace(
@@ -439,4 +475,135 @@ fn dedicated_bind_stream_listener_sharing_an_http_endpoint_is_not_materialized()
         vec![9082],
         "the capture table applies the same rule"
     );
+}
+
+/// Issue #6109: two dedicated binds whose `defaultEndpoint`s name each other
+/// would bounce a request between two gateway listeners. Both are refused at
+/// prepare, for the whole entry, exactly like a bind conflict.
+#[test]
+fn ingress_binds_pointing_at_each_other_are_refused() {
+    let prepared = prepare_sidecar_ingress(
+        "default",
+        "echo",
+        AppProtocol::Http,
+        6379,
+        false,
+        vec![
+            ingress_entry(AppProtocol::Http, Some("127.0.0.1"), 19001, 19002),
+            ingress_entry(AppProtocol::Http, Some("127.0.0.1"), 19002, 19001),
+        ],
+    );
+    let mesh = prepared.mesh.as_deref().expect("mesh");
+    assert!(
+        mesh.local_ingress_listeners.is_empty(),
+        "neither looping entry may stay admitted"
+    );
+    assert!(mesh.sidecar_ingress_bind_overrides.is_empty());
+    assert!(dedicated_bind_ids(&prepared).is_empty());
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|p| p.id.starts_with("__mesh-ingress-")),
+        "no capture or bind route may target another gateway listener"
+    );
+    assert!(
+        mesh.sidecar_ingress_declared,
+        "the declared ingress block still replaces the service-port defaults"
+    );
+}
+
+/// Issue #6109: a dedicated bind whose `defaultEndpoint` is its own bind port
+/// would forward every request straight back into itself.
+#[test]
+fn ingress_endpoint_on_its_own_bind_port_is_refused() {
+    let prepared = prepare_sidecar_ingress(
+        "default",
+        "echo",
+        AppProtocol::Tcp,
+        6379,
+        false,
+        vec![ingress_entry(
+            AppProtocol::Tcp,
+            Some("127.0.0.1"),
+            19003,
+            19003,
+        )],
+    );
+    let mesh = prepared.mesh.as_deref().expect("mesh");
+    assert!(mesh.local_ingress_listeners.is_empty());
+    assert!(mesh.sidecar_ingress_bind_overrides.is_empty());
+    assert!(mesh.local_inbound_tcp_routes.is_empty());
+    assert!(dedicated_bind_ids(&prepared).is_empty());
+}
+
+/// Issue #6109: a shared-capture entry whose `defaultEndpoint` names another
+/// entry's dedicated bind is refused; the bind itself, which forwards to the
+/// application, is still admitted.
+#[test]
+fn shared_capture_endpoint_on_another_bind_is_refused_and_the_bind_survives() {
+    let prepared = prepare_sidecar_ingress(
+        "default",
+        "echo",
+        AppProtocol::Http,
+        6379,
+        false,
+        vec![
+            ingress_entry(AppProtocol::Http, None, 18080, 19004),
+            ingress_entry(AppProtocol::Http, Some("127.0.0.1"), 19004, 6379),
+        ],
+    );
+    let mesh = prepared.mesh.as_deref().expect("mesh");
+    let admitted: Vec<u16> = mesh
+        .local_ingress_listeners
+        .iter()
+        .map(|listener| listener.port)
+        .collect();
+    assert_eq!(admitted, vec![19004]);
+    assert_eq!(
+        dedicated_bind_ids(&prepared),
+        vec!["__mesh-ingress-bind:default-echo-19004"]
+    );
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|p| p.id == "__mesh-ingress-default-echo-18080"),
+        "the entry targeting the bind listener must not materialize"
+    );
+}
+
+/// Issue #6109: a default service-port inbound route whose resolved local
+/// target is a mesh listener port (here the outbound capture listener) is
+/// refused; an ordinary application port still materializes.
+#[test]
+fn inbound_target_port_on_a_gateway_listener_is_refused() {
+    let spiffe = "spiffe://cluster.local/ns/default/sa/echo";
+    let inbound_routes = |app_port: u16| {
+        let (workload, service) =
+            local_echo("default", "echo", spiffe, app_port, AppProtocol::Http);
+        let mut runtime = sidecar_runtime("default", spiffe);
+        runtime.outbound_listen_addr = "127.0.0.1:19010".parse().expect("addr");
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![workload],
+                services: vec![service],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepare");
+        prepared
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id.starts_with("__mesh-inbound-"))
+            .map(|proxy| proxy.backend_port)
+            .collect::<Vec<u16>>()
+    };
+    assert_eq!(
+        inbound_routes(19010),
+        Vec::<u16>::new(),
+        "an inbound route to the outbound capture listener must be refused"
+    );
+    assert_eq!(inbound_routes(19011), vec![19011]);
 }

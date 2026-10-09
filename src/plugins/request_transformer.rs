@@ -453,6 +453,21 @@ impl RequestTransformer {
                              identity to backends"
                         ));
                     }
+                    // `X-Ferrum-Hops` is the gateway's loop-guard count. Unlike
+                    // the consumer namespace, removing or renaming it away is
+                    // refused too: that would reset the count a later gateway
+                    // hop reads and let a request loop run unbounded.
+                    if crate::proxy::hop_limit::is_proxy_hops_header(&key)
+                        || new_key
+                            .as_deref()
+                            .is_some_and(crate::proxy::hop_limit::is_proxy_hops_header)
+                    {
+                        return Err(format!(
+                            "request_transformer: `rule[{idx}]`: header `x-ferrum-hops` is the \
+                             gateway-owned proxy hop count and cannot be added, updated, \
+                             renamed, or removed"
+                        ));
+                    }
                     header_rules.push(HeaderRule {
                         operation: hop,
                         key,

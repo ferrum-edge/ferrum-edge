@@ -2350,6 +2350,15 @@ pub struct RequestContext {
     /// this with `request_authority` because browsers also trust HTTP localhost
     /// and loopback origins.
     pub request_is_secure: bool,
+    /// Gateway-owned `X-Ferrum-Hops` count the frontend stamped for this
+    /// request (`received + 1`, issue #6109), or `None` when
+    /// `FERRUM_MAX_PROXY_HOPS=0` disables the hop limit. The frontend stamps
+    /// it on the raw header block; the dispatch ladder and every later
+    /// gateway-assertion refresh re-assert
+    /// `proxy::hop_limit::effective_outbound_proxy_hops` on the outbound map
+    /// (the received count for a mesh inbound hop to the local workload).
+    /// Plugins must not rely on it.
+    pub outbound_proxy_hops: Option<u8>,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -4012,6 +4021,7 @@ impl RequestContext {
             raw_path: None,
             request_authority: None,
             request_is_secure: false,
+            outbound_proxy_hops: None,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
@@ -5501,6 +5511,7 @@ impl RequestContext {
             path: self.path.clone(),
             raw_path: self.raw_path.clone(),
             request_authority: self.request_authority.clone(),
+            outbound_proxy_hops: self.outbound_proxy_hops,
             request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
