@@ -462,7 +462,12 @@ fn selector_based_cluster_ip_keeps_service_dns_and_port() {
     service.spec["selector"] = json!({"app": "backend"});
     let slice = ready_manual_slice("backend", "10.1.0.10");
     let translated = translate_k8s_objects(
-        &[service, slice, http_route("/slice", "backend"), backend_pod()],
+        &[
+            service,
+            slice,
+            http_route("/slice", "backend"),
+            backend_pod(),
+        ],
         options(),
     )
     .expect("translate selector Service");
@@ -484,7 +489,12 @@ fn selector_based_headless_service_and_empty_slice_use_the_matching_slice_port()
             empty_manual_slice("backend")
         };
         let translated = translate_k8s_objects(
-            &[service, slice, http_route("/slice", "backend"), backend_pod()],
+            &[
+                service,
+                slice,
+                http_route("/slice", "backend"),
+                backend_pod(),
+            ],
             options(),
         )
         .expect("translate headless selector Service");

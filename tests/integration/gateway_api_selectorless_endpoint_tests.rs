@@ -641,7 +641,11 @@ fn selector_service_reaches_its_host_network_daemonset_pods() {
     // the controller-managed endpoint names it by `targetRef`.
     let daemonset_pod = host_network_pod("tenant-a", "payroll-node-a", "192.168.10.5");
     let worker = node("worker-1", "192.168.10.5", "10.244.3.0/24");
-    let named = json!([endpoint_with_target("192.168.10.5", "tenant-a", "payroll-node-a")]);
+    let named = json!([endpoint_with_target(
+        "192.168.10.5",
+        "tenant-a",
+        "payroll-node-a"
+    )]);
     for (cluster_ip, dial_host) in [("None", "192.168.10.5"), ("10.96.0.60", SERVICE_DNS)] {
         let objects = route_fixture(
             selector_service(cluster_ip),
