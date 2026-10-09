@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        run: [37918132309, 37918126986]
+        run: [37918132309, 37918126986, 37918129651, 37918124571]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -41,7 +41,9 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import re
           import shutil
+          import subprocess
           import sys
           import time
 
@@ -91,6 +93,13 @@ jobs:
               decoded = trace.cpu_decode(folder, {original['identity']['pid']}, mappings, symfs=package)
               seconds = time.monotonic() - before
               trace.write(folder / 'decoded.json', decoded)
+              symbols = sorted({re.sub(r'\+0x[0-9a-f]+$', '', frame['symbol'])
+                  for sample in decoded['callchains'] for frame in sample['frames']
+                  if '[unknown]' not in frame['symbol']})
+              names = subprocess.run(['c++filt', '-s', 'rust'], input='\n'.join(symbols) + '\n',
+                  text=True, capture_output=True, timeout=30, check=True).stdout.splitlines()
+              assert len(names) == len(symbols)
+              trace.write(folder / 'symbol-names.json', dict(zip(symbols, names)))
               blocking = [i for i in decoded['issues'] if i not in (
                   'missing matching ELF/build IDs/CFI', 'partial unwinding/unresolved samples')]
               row = dict(source_run=int(os.environ['SOURCE_RUN']), source_revision=(root / 'revision.txt').read_text().strip(),
