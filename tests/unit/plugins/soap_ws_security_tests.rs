@@ -3283,6 +3283,383 @@ fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
     );
 }
 
+const REPLAY_MESSAGE: &str = "WS-Security: nonce replay detected";
+const SATURATED_MESSAGE: &str = "WS-Security: replay protection state is at capacity";
+
+fn principal_nonce_harness() -> SoapNonceReplayHarness {
+    // A cap of 8 gives each principal a share of 2.
+    SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 8 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap()
+}
+
+/// An expired nonce still stored under another principal is a new use, not a
+/// replay (issue #6106). It is re-admitted under the presenting principal and
+/// its quota charge moves: the new principal's share is charged and the
+/// previous principal's charge is released. A live nonce is a replay for every
+/// principal.
+#[test]
+fn test_expired_nonce_is_readmitted_under_a_new_principal_and_moves_its_charge() {
+    let harness = principal_nonce_harness();
+    let still_live = Duration::from_secs(CLAIM_RETENTION_SECONDS - 1);
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", still_live),
+        Err(REPLAY_MESSAGE.to_string()),
+        "a live nonce is a replay whichever principal presents it"
+    );
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", expired),
+        Ok(()),
+        "an expired nonce stored under another principal must be re-admitted"
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 0);
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 1);
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 1, "the move refreshes in place");
+    assert_eq!(snapshot.age_index_entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+
+    // The refreshed claim is live again for both principals.
+    for principal in ["principal-a", "principal-b"] {
+        assert_eq!(
+            harness.claim_for_principal_at("shared", principal, expired),
+            Err(REPLAY_MESSAGE.to_string())
+        );
+    }
+
+    // The released share is usable again, and both shares still bound.
+    for nonce in ["a-1", "a-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-a", expired)
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        harness.claim_for_principal_at("a-3", "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string())
+    );
+    assert!(
+        harness
+            .claim_for_principal_at("b-1", "principal-b", expired)
+            .is_ok()
+    );
+    assert_eq!(
+        harness.claim_for_principal_at("b-2", "principal-b", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "the moved nonce must count against the new principal's share"
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 2);
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 2);
+}
+
+/// A move the new principal's share cannot absorb is refused without evicting
+/// any of that principal's live nonces. Reclaiming the expired claim returns
+/// the previous principal's charge, so neither principal leaks quota.
+#[test]
+fn test_expired_nonce_move_refused_at_the_new_principals_share_evicts_nothing() {
+    let harness = principal_nonce_harness();
+    let later = Duration::from_secs(1);
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    for nonce in ["b-1", "b-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-b", later)
+                .is_ok()
+        );
+    }
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-b", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a principal at its share cannot take over another principal's expired nonce"
+    );
+    for nonce in ["b-1", "b-2"] {
+        assert_eq!(
+            harness.claim_for_principal_at(nonce, "principal-b", expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused move must never evict a live nonce"
+        );
+    }
+    assert_eq!(
+        harness.principal_entries("principal-a").unwrap(),
+        0,
+        "reclaiming the expired nonce must release its previous principal's charge"
+    );
+    assert_eq!(harness.principal_entries("principal-b").unwrap(), 2);
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+
+    assert_eq!(
+        harness.claim_for_principal_at("shared", "principal-a", expired),
+        Ok(())
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 1);
+}
+
+/// A principal at its share may still refresh its own expired nonce: the
+/// in-place refresh reuses the existing charge.
+#[test]
+fn test_principal_at_its_share_may_refresh_its_own_expired_nonce() {
+    let harness = principal_nonce_harness();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    for nonce in ["a-1", "a-2"] {
+        assert!(
+            harness
+                .claim_for_principal_at(nonce, "principal-a", Duration::ZERO)
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        harness.claim_for_principal_at("a-1", "principal-a", expired),
+        Ok(())
+    );
+    assert_eq!(harness.principal_entries("principal-a").unwrap(), 2);
+    assert_eq!(harness.snapshot().unwrap().entry_count, 2);
+}
+
+/// A refresh that cannot complete changes nothing. With the age-key sequence
+/// exhausted, refreshing an expired nonce fails closed, for a move and for the
+/// stored principal alike, and leaves the claim, the age index and both
+/// principals' charges exactly as they were.
+#[test]
+fn test_failed_expired_nonce_refresh_leaves_the_charges_unchanged() {
+    let harness = principal_nonce_harness();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    assert!(
+        harness
+            .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+            .is_ok()
+    );
+    harness.exhaust_age_sequence().unwrap();
+
+    for principal in ["principal-b", "principal-a"] {
+        assert_eq!(
+            harness.claim_for_principal_at("shared", principal, expired),
+            Err(SATURATED_MESSAGE.to_string()),
+            "a refresh that cannot allocate an age key must fail closed"
+        );
+        assert_eq!(harness.principal_entries("principal-a").unwrap(), 1);
+        assert_eq!(harness.principal_entries("principal-b").unwrap(), 0);
+        let snapshot = harness.snapshot().unwrap();
+        assert_eq!(snapshot.entry_count, 1);
+        assert_eq!(snapshot.age_index_entry_count, 1);
+        assert_eq!(snapshot.shared_key_entries, 1);
+        assert_eq!(snapshot.last_expired_removals, 0);
+        assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+    }
+}
+
+fn principal_scope_config(max_cache_size: u64) -> Value {
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_cache_size"] = json!(max_cache_size);
+    config
+}
+
+/// A reload that lowers `max_cache_size` can leave the shared process state
+/// over the new cap. Moving an expired nonce in place would then recycle an
+/// occupied slot above that cap, so the move takes the fresh-claim path
+/// instead, which refuses rather than evicting a live nonce.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_move_through_a_lowered_cap_is_not_refreshed_in_place() {
+    let scope = "soap-lowered-cap-move";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+    let live = [("b-1", "principal-b"), ("c-1", "principal-c")];
+
+    // A cap of 8 gives each principal a share of 2.
+    let original = SoapNonceReplayHarness::with_scope(&principal_scope_config(8), scope, epoch)
+        .expect("original generation must admit");
+    original
+        .claim_for_principal_at("shared", "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    for (nonce, principal) in live {
+        original
+            .claim_for_principal_at(nonce, principal, Duration::from_secs(1))
+            .expect("the live claim is admitted");
+    }
+
+    // A cap of 2 gives each principal a share of 1; three claims are retained.
+    let lowered = SoapNonceReplayHarness::with_scope(&principal_scope_config(2), scope, epoch)
+        .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at("shared", "principal-d", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a move must not recycle a slot in a store over its cap"
+    );
+    for (nonce, principal) in live {
+        assert_eq!(
+            lowered.claim_for_principal_at(nonce, principal, expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused move must never evict a live nonce"
+        );
+    }
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 0);
+    assert_eq!(lowered.principal_entries("principal-d").unwrap(), 0);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+}
+
+/// The lowered entry cap also stops a principal refreshing its own expired
+/// nonce in place while the store is over the cap.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_same_principal_refresh_through_a_lowered_cap_is_not_in_place() {
+    let scope = "soap-lowered-cap-refresh";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+    let live = [("b-1", "principal-b"), ("c-1", "principal-c")];
+
+    let original = SoapNonceReplayHarness::with_scope(&principal_scope_config(8), scope, epoch)
+        .expect("original generation must admit");
+    original
+        .claim_for_principal_at("a-1", "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    for (nonce, principal) in live {
+        original
+            .claim_for_principal_at(nonce, principal, Duration::from_secs(1))
+            .expect("the live claim is admitted");
+    }
+
+    let lowered = SoapNonceReplayHarness::with_scope(&principal_scope_config(2), scope, epoch)
+        .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at("a-1", "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a refresh must not recycle a slot in a store over its cap"
+    );
+    for (nonce, principal) in live {
+        assert_eq!(
+            lowered.claim_for_principal_at(nonce, principal, expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused refresh must never evict a live nonce"
+        );
+    }
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 0);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+}
+
+/// Lowering the cap lowers every principal's share. A principal left above its
+/// new share may not refresh its own expired nonce in place, and none of its
+/// live nonces is evicted to make room.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_principal_above_a_lowered_share_is_not_refreshed_in_place() {
+    let scope = "soap-lowered-share-refresh";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+
+    // A cap of 8 gives each principal a share of 2.
+    let original = SoapNonceReplayHarness::with_scope(&principal_scope_config(8), scope, epoch)
+        .expect("original generation must admit");
+    original
+        .claim_for_principal_at("a-1", "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    original
+        .claim_for_principal_at("a-2", "principal-a", Duration::from_secs(1))
+        .expect("the live claim is admitted");
+
+    // A cap of 4 gives each principal a share of 1; the store is within the cap.
+    let lowered = SoapNonceReplayHarness::with_scope(&principal_scope_config(4), scope, epoch)
+        .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at("a-1", "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a principal above its share must not refresh in place"
+    );
+    assert_eq!(
+        lowered.claim_for_principal_at("a-2", "principal-a", expired),
+        Err(REPLAY_MESSAGE.to_string()),
+        "a refused refresh must never evict a live nonce"
+    );
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 1);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+}
+
+fn principal_scope_byte_config(max_total_cache_bytes: Option<u64>) -> Value {
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_encoded_length"] = json!(2_048);
+    if let Some(max_total_cache_bytes) = max_total_cache_bytes {
+        config["nonce"]["max_total_cache_bytes"] = json!(max_total_cache_bytes);
+    }
+    config
+}
+
+/// A reload that lowers `max_total_cache_bytes` below the retained bytes stops
+/// in-place refreshes the same way a lowered entry cap does.
+#[tokio::test]
+#[serial_test::serial(soap_nonce_replay_registry)]
+async fn a_soap_refresh_through_a_lowered_byte_cap_is_not_in_place() {
+    let scope = "soap-lowered-byte-cap-refresh";
+    let _lease = SoapNonceReplayScopeLease::for_plugin_config_ids(&[scope]);
+    let epoch = std::time::Instant::now();
+    let expired = Duration::from_secs(CLAIM_RETENTION_SECONDS);
+    let nonces = ["a", "b", "c"].map(|fill| fill.repeat(1_500));
+
+    let original =
+        SoapNonceReplayHarness::with_scope(&principal_scope_byte_config(None), scope, epoch)
+            .expect("original generation must admit");
+    original
+        .claim_for_principal_at(&nonces[0], "principal-a", Duration::ZERO)
+        .expect("the claim is admitted");
+    for nonce in &nonces[1..] {
+        original
+            .claim_for_principal_at(nonce, "principal-b", Duration::from_secs(1))
+            .expect("the live claim is admitted");
+    }
+
+    // 4,500 retained bytes against a lowered 4,096-byte cap.
+    let lowered =
+        SoapNonceReplayHarness::with_scope(&principal_scope_byte_config(Some(4_096)), scope, epoch)
+            .expect("lowered generation must admit");
+    assert_eq!(
+        lowered.claim_for_principal_at(&nonces[0], "principal-a", expired),
+        Err(SATURATED_MESSAGE.to_string()),
+        "a refresh must not recycle a slot in a store over its byte cap"
+    );
+    for nonce in &nonces[1..] {
+        assert_eq!(
+            lowered.claim_for_principal_at(nonce, "principal-b", expired),
+            Err(REPLAY_MESSAGE.to_string()),
+            "a refused refresh must never evict a live nonce"
+        );
+    }
+    assert_eq!(lowered.principal_entries("principal-a").unwrap(), 0);
+    let snapshot = lowered.snapshot().unwrap();
+    assert_eq!(snapshot.entry_count, 2);
+    assert_eq!(snapshot.retained_key_bytes, 3_000);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+}
+
 // ── X.509 signature verification — end-to-end roundtrip ─────────────────────
 //
 // PR #844 fixed `cert.public_key().raw` → `cert.public_key().subject_public_key.data`
