@@ -4595,7 +4595,7 @@ async fn handle_h3_request(
                     &error,
                     start_time,
                     &mut plugin_execution_ns,
-                    &original_request_path,
+                    &path,
                     "client_disconnect_buffered_h3_upload",
                 )
                 .await;
@@ -4823,7 +4823,7 @@ async fn handle_h3_request(
                         &error,
                         start_time,
                         &mut plugin_execution_ns,
-                        &original_request_path,
+                        &path,
                         "client_disconnect_buffered_h3_upload",
                     )
                     .await;
@@ -5128,7 +5128,7 @@ async fn handle_h3_request(
                     &error,
                     start_time,
                     &mut plugin_execution_ns,
-                    &original_request_path,
+                    &path,
                     "client_disconnect_buffered_h3_upload",
                 )
                 .await;
