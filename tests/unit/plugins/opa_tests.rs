@@ -1444,3 +1444,30 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+/// The decision call carries the request's gateway hop count (`received + 1`)
+/// as exactly one `X-Ferrum-Hops` field line, so an OPA host that resolves back
+/// to the gateway is refused at the proxy hop limit like a looping route
+/// (issue #6128). With the limit disabled nothing is stamped.
+#[tokio::test]
+async fn opa_decision_call_carries_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(7), vec!["7"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        mount_opa(&server, 200, json!({"result": true})).await;
+        let plugin = plugin(&server, json!({}));
+
+        let mut ctx = make_ctx();
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        assert_continue(plugin.authorize(&mut ctx).await);
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}

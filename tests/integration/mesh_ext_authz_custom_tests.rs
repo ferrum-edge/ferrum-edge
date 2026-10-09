@@ -172,6 +172,7 @@ async fn check(
                 authority: Some("api.example.com"),
                 body: None,
                 body_proven_empty: true,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -250,10 +251,10 @@ async fn a_provider_denial_forwards_its_status_and_allow_listed_header_only() {
 #[tokio::test]
 async fn a_provider_timeout_fails_closed_with_status_on_error() {
     let stub = start_stub(StubBehavior::Hang).await;
-    let mut provider = provider(stub.port);
+    let mut hop_provider = provider(stub.port);
     provider.timeout_ms = 100;
     provider.status_on_error = 503;
-    let executor = executor(vec![provider]);
+    let executor = executor(vec![hop_provider]);
     let outcome = check(&executor, "sample-ext-authz", &request_headers()).await;
     match outcome {
         MeshExtAuthzOutcome::Deny { status, .. } => assert_eq!(status, 503),
@@ -264,10 +265,10 @@ async fn a_provider_timeout_fails_closed_with_status_on_error() {
 #[tokio::test]
 async fn a_provider_timeout_with_fail_open_continues() {
     let stub = start_stub(StubBehavior::Hang).await;
-    let mut provider = provider(stub.port);
+    let mut hop_provider = provider(stub.port);
     provider.timeout_ms = 100;
     provider.fail_open = true;
-    let executor = executor(vec![provider]);
+    let executor = executor(vec![hop_provider]);
     let outcome = check(&executor, "sample-ext-authz", &request_headers()).await;
     assert!(
         matches!(outcome, MeshExtAuthzOutcome::Allow { .. }),
@@ -684,6 +685,7 @@ async fn a_check_is_never_retried_even_when_shared_plugin_retries_are_configured
                 authority: Some("api.example.com"),
                 body: None,
                 body_proven_empty: true,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -720,6 +722,7 @@ async fn check_with_body(
                 authority: Some("api.example.com"),
                 body: Some(body),
                 body_proven_empty: false,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -813,6 +816,7 @@ async fn an_unavailable_body_remains_a_failed_check_distinct_from_an_oversize_on
                 authority: Some("api.example.com"),
                 body: None,
                 body_proven_empty: false,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -860,6 +864,7 @@ async fn an_oversize_body_and_a_missing_body_fail_closed_with_distinct_reasons()
                 authority: None,
                 body: None,
                 body_proven_empty: false,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -1535,4 +1540,60 @@ async fn a_reload_generation_cannot_reopen_a_fresh_budget() {
         "capacity restored, so the check runs"
     );
     assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
+}
+
+/// Every `X-Ferrum-Hops` field line in the raw check request the stub saw.
+fn seen_proxy_hops(seen: &str) -> Vec<String> {
+    seen.split("\r\n")
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("x-ferrum-hops"))
+        .map(|(_, value)| value.trim().to_string())
+        .collect()
+}
+
+/// A CUSTOM check carries the request's gateway hop count (`received + 1`) as
+/// exactly one `X-Ferrum-Hops` field line, replacing a forwarded copy an
+/// `includeRequestHeadersInCheck` entry names, so a provider that resolves
+/// back to the gateway is refused at the proxy hop limit like a looping route
+/// (issue #6128). With the limit disabled the forwarded value is unchanged.
+#[tokio::test]
+async fn a_check_carries_the_proxy_hop_count() {
+    for (proxy_hops, expected) in [(Some(5), "5"), (None, "1")] {
+        let stub = start_stub(StubBehavior::Allow).await;
+        let mut hop_provider = provider(stub.port);
+        hop_provider
+            .include_request_headers_in_check
+            .push("x-ferrum-hops".to_string());
+        let executor = executor(vec![hop_provider]);
+        let mut headers = request_headers();
+        headers.insert("x-ferrum-hops".to_string(), "1".to_string());
+        let accumulator = AtomicU64::new(0);
+        let outcome = executor
+            .check(
+                "sample-ext-authz",
+                MeshExtAuthzCheckRequest {
+                    method: "GET",
+                    path: "/admin/reports",
+                    headers: &headers,
+                    authority: Some("api.example.com"),
+                    body: None,
+                    body_proven_empty: true,
+                    proxy_hops,
+                },
+                &accumulator,
+            )
+            .await;
+        assert!(
+            matches!(outcome, MeshExtAuthzOutcome::Allow { .. }),
+            "unexpected outcome: {outcome:?}"
+        );
+
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert_eq!(
+            seen_proxy_hops(&seen),
+            vec![expected.to_string()],
+            "proxy_hops={proxy_hops:?}"
+        );
+    }
 }

@@ -615,6 +615,9 @@ struct CorrelationMeta {
     proxy: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    /// The request's gateway hop count, carried as `X-Ferrum-Hops` on the
+    /// approval call. Never part of the approval request body.
+    proxy_hops: Option<u8>,
 }
 
 /// Bundled inputs for one approval evaluation, keeping the resolve/call
@@ -1434,6 +1437,10 @@ impl GovernorEngine {
             .post(&approval.endpoint_url)
             .timeout(timeout)
             .json(&body);
+        // An approval endpoint that resolves back to the gateway is refused at
+        // the proxy hop limit like a looping route (issue #6128).
+        let request =
+            crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, corr.proxy_hops);
 
         let response = self
             .http_client
@@ -1739,6 +1746,7 @@ impl AiToolGovernor {
                 .map(|p| p.name.clone().unwrap_or_else(|| p.id.clone())),
             model,
             provider: provider.map(str::to_string),
+            proxy_hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
         }
     }
 

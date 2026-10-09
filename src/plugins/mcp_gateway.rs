@@ -2762,6 +2762,10 @@ impl McpGateway {
                 self.protocol_version_for_session(downstream_session_id),
             )
             .json(&body);
+        // Every upstream MCP call carries the request's gateway hop count, so
+        // an upstream that resolves back to the gateway is refused at the proxy
+        // hop limit like a looping route (issue #6128).
+        let request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
             .execute_tracked(request, "mcp_gateway.initialize", &ctx.plugin_http_call_ns)
@@ -2891,6 +2895,7 @@ impl McpGateway {
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
         }
+        request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
             .execute_tracked(
@@ -3003,6 +3008,7 @@ impl McpGateway {
                         .as_deref()
                         .unwrap_or(session.protocol_version.as_str()),
                 );
+            let request = stamp_upstream_proxy_hops(request, ctx);
             match self
                 .http_client
                 .execute_tracked(
@@ -3560,6 +3566,7 @@ impl McpGateway {
         if let Some(session_id) = upstream_session_id {
             request = request.header(&self.sessions.upstream_session_header, session_id);
         }
+        request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
             .execute_tracked(
@@ -7958,6 +7965,19 @@ enum ResponseRewriteOutcome {
     Unchanged,
     Changed,
     Ambiguous,
+}
+
+/// Stamp the request's gateway hop count on an upstream MCP call made on its
+/// behalf (initialize, the initialized notification, discovery, session
+/// `DELETE`) through the shared plugin-call helper.
+fn stamp_upstream_proxy_hops(
+    request: reqwest::RequestBuilder,
+    ctx: &RequestContext,
+) -> reqwest::RequestBuilder {
+    crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(
+        request,
+        crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+    )
 }
 
 fn mcp_content_type_is_json(value: &str) -> bool {

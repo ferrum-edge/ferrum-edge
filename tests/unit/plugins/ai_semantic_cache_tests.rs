@@ -8427,3 +8427,47 @@ fn anonymous_scope_rejections_keep_rendered_context_and_withhold_normalized_valu
         assert!(!rendered.contains('\n'), "{rendered}");
     }
 }
+
+/// The embedding call carries the request's gateway hop count (`received + 1`)
+/// as exactly one `X-Ferrum-Hops` field line, so an embedding endpoint that
+/// resolves back to the gateway is refused at the proxy hop limit like a
+/// looping route (issue #6128). With the limit disabled nothing is stamped.
+#[tokio::test]
+async fn embedding_call_carries_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(6), vec!["6"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"embedding": [1.0, 0.0, 0.0]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let plugin = make_plugin(semantic_config(&server));
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let body = semantic_request_body().to_string();
+        ctx.metadata.insert("request_body".to_string(), body);
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        assert!(matches!(
+            drive_cache_lookup(&plugin, &mut ctx, &headers).await,
+            PluginResult::Continue
+        ));
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}

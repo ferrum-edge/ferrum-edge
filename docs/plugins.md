@@ -352,6 +352,26 @@ framing.
 
 ---
 
+## Plugin HTTP calls and the proxy hop limit
+
+An HTTP call a plugin makes on behalf of the current request carries the request's gateway hop count in `X-Ferrum-Hops` (`received + 1`, the same value the proxied request carries), so a plugin target that resolves back to a Ferrum gateway is refused with `508 Loop Detected` at the same `FERRUM_MAX_PROXY_HOPS` limit as a looping route (see [Proxy hop limit](routing.md#proxy-hop-limit)). Every such call goes through one shared helper, `proxy::hop_limit::stamp_plugin_call_proxy_hops`, which adds exactly one field line from a pre-built static value. With `FERRUM_MAX_PROXY_HOPS=0` nothing is stamped.
+
+| Carries the hop count (request-scoped) | Carries none (not request-scoped) |
+|---|---|
+| `serverless_function` invocations | `http_logging`, `loki_logging`, `otel_tracing` exporters |
+| `mcp_gateway` upstream `initialize`, `notifications/initialized`, discovery, and session `DELETE` | `api_chargeback_sink` and the `ai_transcript_audit` collector |
+| `ai_federation` provider calls | `proxy_alerts` and other notification webhooks |
+| `opa` decisions, `oauth2_introspection`, `mesh_authz` `CUSTOM` (ext_authz) checks | JWKS fetches and OIDC / OAuth discovery refreshes |
+| `oidc_relying_party` code exchange, refresh grant, revocation, and UserInfo | the `ai_federation` Vertex service-account token grant |
+| `ai_semantic_firewall` and `ai_semantic_cache` embedding calls, the `ai_tool_governor` approval webhook | the `spec_expose` document fetch |
+| `request_mirror` shadows, `load_testing` replays and fan-out | |
+
+- A coalesced call (an `oauth2_introspection` lookup or `oidc_relying_party` refresh shared by concurrent requests, an `ai_semantic_cache` embedding flight, the `ai_semantic_firewall` rule index built on first use) carries the count of the request that started it.
+- A plugin that forwards a copied header set (`request_mirror`, `load_testing`, an ext_authz `includeRequestHeadersInCheck` entry naming `x-ferrum-hops`) has the copied field, in any spelling, replaced by the gateway's count, so the call never carries two field lines. A plugin call is never the mesh inbound hop to the local workload, so it carries the incremented count even where the proxied request forwards the received one.
+- Plugins that route the request through the proxy itself (`a2a_gateway`, `ai_stream_router`, MCP OpenAPI bridge tools, `mesh_route_dispatch`, route overrides in general) need no extra handling: the proxied request already carries the count.
+- Sinks and shared cache refreshes serve many requests or run on a timer, so there is no single request whose count they could carry. A sink endpoint that routes back through a gateway route running the same sink is a feedback loop at the sink's batch rate that the hop limit cannot stop; point sink endpoints at a destination that does not run the sink.
+- A custom plugin that calls out on behalf of a request should stamp its call the same way: `stamp_plugin_call_proxy_hops(builder, hop_limit::plugin_call_proxy_hops(ctx))`.
+
 ## Logging Plugins
 
 ### Rejection and delivery diagnostics

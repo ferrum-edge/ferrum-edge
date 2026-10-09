@@ -2516,3 +2516,74 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+/// Every `X-Ferrum-Hops` field line in a captured raw HTTP/1.1 request head.
+fn captured_proxy_hops(raw: &[u8]) -> Vec<String> {
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("header terminator");
+    std::str::from_utf8(&raw[..header_end])
+        .expect("headers utf8")
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("x-ferrum-hops"))
+        .map(|(_, value)| value.trim().to_string())
+        .collect()
+}
+
+/// Synthetic replays and the fan-out control request carry the triggering
+/// request's gateway hop count (`received + 1`) as exactly one
+/// `X-Ferrum-Hops` field line through the shared plugin-call helper, not the
+/// copied ingress value, so a cohort re-entering a Ferrum gateway counts as one
+/// more hop (issue #6128).
+#[tokio::test]
+async fn test_replays_and_fanout_carry_the_proxy_hop_count() {
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local_listener.local_addr().unwrap().port();
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_port = remote_listener.local_addr().unwrap().port();
+    let local_capture = tokio::spawn(capture_one_http_request(local_listener));
+    let remote_capture = tokio::spawn(capture_one_http_request(remote_listener));
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": local_port,
+            "gateway_addresses": [format!("http://127.0.0.1:{remote_port}")],
+            "request_timeout_ms": 1000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/hops".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.outbound_proxy_hops = Some(4);
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert("x-ferrum-hops".to_string(), "1".to_string());
+    headers.insert("host".to_string(), "gateway.example".to_string());
+
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let remote_raw = tokio::time::timeout(Duration::from_secs(3), remote_capture)
+        .await
+        .expect("fan-out request timeout")
+        .expect("fan-out capture task");
+    assert_eq!(captured_proxy_hops(&remote_raw), vec!["4".to_string()]);
+    let local_raw = tokio::time::timeout(Duration::from_secs(3), local_capture)
+        .await
+        .expect("local synthetic request timeout")
+        .expect("local capture task");
+    assert_eq!(captured_proxy_hops(&local_raw), vec!["4".to_string()]);
+    let run = wait_for_result(&plugin).await;
+    assert!(run.attempted_requests > 0);
+}

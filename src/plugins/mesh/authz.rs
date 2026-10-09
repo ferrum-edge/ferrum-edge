@@ -2447,6 +2447,7 @@ impl MeshAuthz {
                     authority: authority.as_deref(),
                     body: body.as_deref(),
                     body_proven_empty: ctx.replay_request_body_empty_proven(),
+                    proxy_hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
                 },
                 &ctx.plugin_http_call_ns,
             )

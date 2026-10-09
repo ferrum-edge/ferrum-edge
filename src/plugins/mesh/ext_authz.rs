@@ -527,6 +527,12 @@ pub struct MeshExtAuthzCheckRequest<'a> {
     /// "no body" from "a body exists but was not buffered", which must fail
     /// closed for a provider that inspects bodies.
     pub body_proven_empty: bool,
+    /// The request's gateway hop count
+    /// ([`crate::proxy::hop_limit::plugin_call_proxy_hops`]), carried as
+    /// `X-Ferrum-Hops` on the check so a provider that resolves back to the
+    /// gateway is refused at the proxy hop limit. `None` when the limit is
+    /// disabled.
+    pub proxy_hops: Option<u8>,
 }
 
 /// The PROCESS-WIDE in-flight CUSTOM check budget.
@@ -752,10 +758,18 @@ impl MeshExtAuthzExecutor {
         {
             check_headers.insert(http::header::HOST, value);
         }
+        // The gateway's hop count replaces any forwarded copy: a
+        // `includeRequestHeadersInCheck` entry naming `x-ferrum-hops` must not
+        // leave a second field line beside it (issue #6128).
+        if request.proxy_hops.is_some() {
+            check_headers.remove(crate::proxy::hop_limit::PROXY_HOPS_HEADER);
+        }
         let mut builder = client
             .request(method, url.as_str())
             .timeout(provider.timeout)
             .headers(check_headers);
+        builder =
+            crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(builder, request.proxy_hops);
         // `Content-Length` is set by reqwest from the body, matching the
         // protocol's automatic fields (Host, Method, Path, Content-Length).
         if let Some(body) = body {
@@ -1004,6 +1018,7 @@ mod tests {
             authority: None,
             body,
             body_proven_empty,
+            proxy_hops: None,
         }
     }
 

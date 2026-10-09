@@ -6,8 +6,10 @@
 //! refresh a finalized-egress header overlay runs, and the final
 //! backend-header-policy pass), the mesh inbound forwarded count and its
 //! gateway-listener guard, the `loop_detected` observability token, the
-//! gRPC-Web refusal flavor, plugin admission refusals, and the structural
-//! parity of the two frontends that take the decision. The live loop (a route
+//! gRPC-Web refusal flavor, plugin admission refusals, the structural
+//! parity of the two frontends that take the decision, and the shared stamp
+//! every request-scoped plugin call carries (issue #6128; the per-plugin wire
+//! assertions live beside each plugin's own unit tests). The live loop (a route
 //! whose upstream is the gateway itself) and the HTTP/2 native-gRPC backend
 //! count are exercised in `tests/functional/functional_proxy_hop_limit_test.rs`;
 //! the mesh materializer's refusal of `ingress[]` / inbound targets that name a
@@ -755,4 +757,151 @@ fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
         .find("\n}\n")
         .unwrap_or_else(|| panic!("unterminated `{signature}`"));
     &source[start..start + end]
+}
+
+/// The value list of every `X-Ferrum-Hops` field line on a built plugin call.
+fn plugin_call_hops(hops: Option<u8>, copied: &[(&str, &str)]) -> Vec<String> {
+    let http_client = ferrum_edge::plugins::PluginHttpClient::default();
+    let client = http_client.get().expect("plugin HTTP client");
+    let mut request = client.post("http://127.0.0.1:9/call");
+    for (name, value) in copied {
+        request = request.header(*name, *value);
+    }
+    let request = hop_limit::stamp_plugin_call_proxy_hops(request, hops)
+        .build()
+        .expect("plugin call builds");
+    request
+        .headers()
+        .get_all(HOPS)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect()
+}
+
+/// A request-scoped plugin call (issue #6128) carries the frontend's forwarded
+/// count as exactly one field line, so a plugin target that resolves back to a
+/// Ferrum gateway is refused at the same limit: the next hop reads the stamped
+/// value and refuses once it reaches `FERRUM_MAX_PROXY_HOPS`.
+#[tokio::test]
+async fn plugin_calls_carry_the_forwarded_count() {
+    let ctx = context_with_hops(Some(4));
+    let hops = hop_limit::plugin_call_proxy_hops(&ctx);
+    assert_eq!(plugin_call_hops(hops, &[]), vec!["4".to_string()]);
+
+    let next_hop = headers_with(&["4"]);
+    assert_eq!(
+        hop_limit::decide_proxy_hops(&next_hop, 4),
+        ProxyHopDecision::LoopDetected
+    );
+    assert_eq!(
+        hop_limit::decide_proxy_hops(&next_hop, 10),
+        ProxyHopDecision::Forward(5)
+    );
+
+    // Disabled limit: nothing is stamped.
+    let disabled = context_with_hops(None);
+    assert_eq!(hop_limit::plugin_call_proxy_hops(&disabled), None);
+    assert!(plugin_call_hops(None, &[]).is_empty());
+}
+
+/// A plugin call is never the mesh inbound hop to the local workload, so it
+/// carries the incremented count even where the proxied request forwards the
+/// received one.
+#[test]
+fn plugin_calls_ignore_the_mesh_inbound_exemption() {
+    let ctx = mesh_inbound_context();
+    assert_eq!(forwarded(&ctx), Some(2));
+    assert_eq!(hop_limit::plugin_call_proxy_hops(&ctx), Some(3));
+}
+
+/// A plugin that forwards a copied header set drops every copied spelling of
+/// the field before stamping, so the call carries exactly one field line (two
+/// would be refused as malformed by the next hop). With the limit disabled the
+/// copied client value passes through as an ordinary header.
+#[tokio::test]
+async fn copied_hop_fields_are_replaced_not_duplicated() {
+    let mut stamped = copied_hop_headers();
+    hop_limit::strip_copied_proxy_hops(&mut stamped, Some(3));
+    assert_eq!(stamped, vec![("x-other".to_string(), "kept".to_string())]);
+
+    let mut disabled = copied_hop_headers();
+    hop_limit::strip_copied_proxy_hops(&mut disabled, None);
+    assert_eq!(disabled, copied_hop_headers());
+
+    // Without the strip the stamp would append a second field line.
+    assert_eq!(
+        plugin_call_hops(Some(3), &[(HOPS, "1")]),
+        vec!["1".to_string(), "3".to_string()]
+    );
+}
+
+/// Every plugin that makes an HTTP call on behalf of the current request
+/// stamps the hop count through the one shared helper (issue #6128). Any
+/// plugin source that charges a request's plugin-call accumulator
+/// (`execute_*tracked*`) is request-scoped by construction and must be listed,
+/// so a new request-scoped caller cannot ship without the stamp.
+#[test]
+fn every_request_scoped_plugin_call_stamps_the_hop_count() {
+    const REQUEST_SCOPED_PLUGIN_SOURCES: &[&str] = &[
+        "src/plugins/ai_federation.rs",
+        "src/plugins/ai_semantic_cache.rs",
+        "src/plugins/ai_semantic_firewall.rs",
+        "src/plugins/ai_tool_governor.rs",
+        "src/plugins/load_testing.rs",
+        "src/plugins/mcp_gateway.rs",
+        "src/plugins/mesh/ext_authz.rs",
+        "src/plugins/oauth2_introspection.rs",
+        "src/plugins/oidc_relying_party.rs",
+        "src/plugins/opa.rs",
+        "src/plugins/request_mirror.rs",
+        "src/plugins/serverless_function.rs",
+    ];
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for path in REQUEST_SCOPED_PLUGIN_SOURCES {
+        let source = std::fs::read_to_string(root.join(path)).unwrap();
+        assert!(
+            source.contains("hop_limit::stamp_plugin_call_proxy_hops("),
+            "{path} makes request-scoped plugin calls and must stamp X-Ferrum-Hops"
+        );
+    }
+
+    let mut sources = Vec::new();
+    collect_rust_sources(&root.join("src/plugins"), &mut sources);
+    for file in sources {
+        let relative = file
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "src/plugins/utils/http_client.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&file).unwrap();
+        if source.contains(".execute_tracked(") || source.contains(".execute_redacted_tracked") {
+            assert!(
+                REQUEST_SCOPED_PLUGIN_SOURCES.contains(&relative.as_str()),
+                "{relative} charges a request's plugin-call accumulator; list it and stamp \
+                 X-Ferrum-Hops through hop_limit::stamp_plugin_call_proxy_hops"
+            );
+        }
+    }
+}
+
+fn copied_hop_headers() -> Vec<(String, String)> {
+    vec![
+        (HOPS.to_string(), "1".to_string()),
+        ("X_Ferrum_Hops".to_string(), "0".to_string()),
+        ("x-other".to_string(), "kept".to_string()),
+    ]
+}
+
+fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
 }

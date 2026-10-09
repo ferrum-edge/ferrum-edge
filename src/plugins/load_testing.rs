@@ -1033,7 +1033,14 @@ impl Plugin for LoadTesting {
         // the untouched client view. Reserved control headers are stripped from
         // this snapshot by `filter_outbound_headers` regardless of which map it
         // reads.
-        let synthetic_headers = filter_outbound_headers(&ctx.headers, ctx.forwarding_peer_trusted);
+        let mut synthetic_headers =
+            filter_outbound_headers(&ctx.headers, ctx.forwarding_peer_trusted);
+        // Synthetic and fan-out requests carry the triggering request's gateway
+        // hop count through the shared plugin-call helper instead of the copied
+        // field (issue #6128), so a cohort re-entering this gateway, or a peer,
+        // counts as one more hop.
+        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
+        crate::proxy::hop_limit::strip_copied_proxy_hops(&mut synthetic_headers, proxy_hops);
         // Fan-out starts from the same fully sanitized snapshot and appends one
         // canonical key/marker pair below. Never preserve a transformed alias
         // of either reserved control header.
@@ -1082,7 +1089,7 @@ impl Plugin for LoadTesting {
                         return;
                     };
                     let Ok(mut req) =
-                        build_request(http, &fanout_method, &fanout_url, &fanout_hdrs)
+                        build_request(http, &fanout_method, &fanout_url, &fanout_hdrs, proxy_hops)
                     else {
                         tracing::warn!(
                             remote = %remote_label,
@@ -1134,6 +1141,7 @@ impl Plugin for LoadTesting {
             method,
             headers: synthetic_headers,
             body: request_body,
+            proxy_hops,
         });
 
         info!(
@@ -1201,6 +1209,7 @@ impl Plugin for LoadTesting {
                             &replay_request.method,
                             &replay_request.url,
                             &replay_request.headers,
+                            replay_request.proxy_hops,
                         ) {
                             Ok(req) => req,
                             Err(()) => {
@@ -1425,6 +1434,7 @@ struct ReplayRequest {
     method: String,
     headers: Vec<(String, String)>,
     body: Arc<RetainedRequestBody>,
+    proxy_hops: Option<u8>,
 }
 
 struct RetainedRequestBody {
@@ -1524,13 +1534,14 @@ fn build_request(
     method: &str,
     url: &str,
     headers: &[(String, String)],
+    proxy_hops: Option<u8>,
 ) -> Result<reqwest::RequestBuilder, ()> {
     let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| ())?;
     let mut req = client.request(method, url);
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    Ok(req)
+    Ok(crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(req, proxy_hops))
 }
 
 async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) -> BodyConsumeOutcome {

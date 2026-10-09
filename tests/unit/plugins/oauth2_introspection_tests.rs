@@ -2589,3 +2589,45 @@ async fn external_identity_realm_binds_the_introspection_authority_and_claim() {
         "the identity claim path is part of the realm"
     );
 }
+
+/// The introspection call carries the request's gateway hop count
+/// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so an
+/// introspection endpoint that resolves back to the gateway is refused at the
+/// proxy hop limit like a looping route (issue #6128). With the limit disabled
+/// nothing is stamped.
+#[tokio::test]
+async fn introspection_call_carries_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(2), vec!["2"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "username": "external-user"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let endpoint = format!("{}/introspect", server.uri());
+        let plugin =
+            Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+        let mut ctx = make_ctx("hop-count-token");
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}

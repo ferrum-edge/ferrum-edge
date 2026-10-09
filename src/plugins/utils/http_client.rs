@@ -69,6 +69,18 @@
 //!     }
 //! }
 //! ```
+//!
+//! A call made on behalf of the current request (from a request or response
+//! hook, not a `log` sink) must also carry the gateway's proxy hop count, so a
+//! target that resolves back to the gateway is refused at
+//! `FERRUM_MAX_PROXY_HOPS` instead of looping (issue #6128):
+//!
+//! ```ignore
+//! let req = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(
+//!     client.post(&self.endpoint),
+//!     crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+//! );
+//! ```
 
 use super::log_helpers::redacted_endpoint_url;
 use crate::config::{BackendEgressPolicy, PoolConfig};

@@ -593,6 +593,12 @@ impl Plugin for Opa {
         for (name, value) in &self.custom_headers {
             request = request.header(name.clone(), value.clone());
         }
+        // A decision URL that resolves back to the gateway is refused at the
+        // proxy hop limit like a looping route (issue #6128).
+        request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(
+            request,
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+        );
 
         // The decision is not made until the complete response document has
         // arrived, so the body wait is part of the external I/O this plugin

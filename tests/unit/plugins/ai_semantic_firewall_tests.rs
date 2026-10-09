@@ -10196,3 +10196,39 @@ async fn builtin_tool_abuse_keeps_its_tool_segment_context_gate() {
     let rejected = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(rejected, Some(403));
 }
+
+/// Every embedding call — the rule index built for the first request and the
+/// request's own segments — carries the request's gateway hop count
+/// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so an embedding
+/// endpoint that resolves back to the gateway is refused at the proxy hop limit
+/// like a looping route (issue #6128). With the limit disabled nothing is
+/// stamped.
+#[tokio::test]
+async fn embedding_calls_carry_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(5), vec!["5"]), (None, Vec::new())] {
+        let server = nonmatching_embedding_server().await;
+        let firewall = plugin(&json!({
+            "inspect": {"request": true, "response": false},
+            "on_error": "reject",
+            "provider": provider(&format!("{}/v1/embeddings", server.uri())),
+            "builtins": disabled_builtins_with("prompt_injection")
+        }));
+        let mut ctx = make_post_ctx(&json!({
+            "messages": [{"role": "user", "content": "A harmless governed request."}]
+        }));
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        assert_continue(firewall.before_proxy(&mut ctx, &mut json_headers()).await);
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(!received.is_empty(), "the firewall must call the embedder");
+        for request in &received {
+            let hops: Vec<&str> = request
+                .headers
+                .get_all("x-ferrum-hops")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+        }
+    }
+}
