@@ -32,8 +32,10 @@ case "${H1_TRACE_ACTION:?}" in
       -p "$H1_TRACE_PID" -o "$H1_TRACE_OUT/perf.data" ;;
   perf-script)
     [[ ${H1_TRACE_OUT:?} == /* && ${H1_TRACE_SYMFS:?} == /* ]]
+    # Decode concrete frames without addr2line's default inline expansion. Large
+    # optimized Rust ELFs otherwise exhaust the bounded decoder before samples.
     exec /tmp/ferrum-h1-trace/perf script -i "$H1_TRACE_OUT/perf.data" --symfs "$H1_TRACE_SYMFS" \
-      --ns --show-lost-events --show-task-events --show-mmap-events \
+      --no-inline --ns --show-lost-events --show-task-events --show-mmap-events \
       -F comm,pid,tid,time,event,ip,sym,dso ;;
   perf-raw)
     [[ ${H1_TRACE_OUT:?} == /* ]]

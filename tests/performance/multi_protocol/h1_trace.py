@@ -26,7 +26,7 @@ import time
 
 from process_usage import capture, parse_stat
 from transport_diagnostics import parse_diag
-from h1_trace_contract import (BOUNDS, LOSSES, SYSCALLS, COUNTERS, validate_record,
+from h1_trace_contract import (BOUNDS, ELF_PACKAGE_BYTES, LOSSES, SYSCALLS, COUNTERS, validate_record,
                                syscall_coverage, fd_lifetimes, decode_cpu, clock_receipt_window)
 # The shared hosted artifact scrubber's sibling import is scoped explicitly.
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'h3_proof'))
@@ -772,7 +772,7 @@ def retain_dsos(pid, destination):
             errors.append(str(error))
     if len(mappings) > 128:
         return dict(complete=False, issue='DSO count bound', mappings=raw)
-    budget = dict(remaining=512 * 1024**2, package_remaining=512 * 1024**2)
+    budget = dict(remaining=ELF_PACKAGE_BYTES, package_remaining=ELF_PACKAGE_BYTES)
     deadline = time.monotonic() + 30
     # This one proc magic link is the admitted process's root. Subsequent source
     # and ALL destination components are descriptor-relative and no-follow.
@@ -781,7 +781,7 @@ def retain_dsos(pid, destination):
         root = os.open(f'/proc/{pid}/root', os.O_RDONLY | os.O_DIRECTORY)
         with directory_fd(Path(os.path.abspath(destination)), create=True) as target:
             # Include prior repeats and failed partial files in the shared package
-            # reservation. Never create a fresh per-repeat 512 MiB allowance.
+            # reservation. Never create a fresh per-repeat package allowance.
             entries = 0
             for _, directories, files, directory in os.fwalk('.', dir_fd=target, follow_symlinks=False):
                 for name in directories + files:
@@ -811,8 +811,9 @@ def retain_dsos(pid, destination):
         if root is not None:
             os.close(root)
     return dict(complete=not errors, errors=errors, mappings=raw, dsos=records,
-                acquired_elf_bytes=512 * 1024**2 - budget['remaining'],
-                retained_package_bytes=512 * 1024**2 - budget['package_remaining'],
+                acquired_elf_bytes=ELF_PACKAGE_BYTES - budget['remaining'],
+                retained_package_bytes=ELF_PACKAGE_BYTES - budget['package_remaining'],
+                package_limit_bytes=ELF_PACKAGE_BYTES,
                 package_bytes_basis='existing files plus acquired bytes plus conservative decoder output reservations',
                 source='pinned target-root mapped device/inode; symlinks unsupported; never host libc substitution')
 
@@ -1138,6 +1139,7 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
                   header_status=header, buildid_status=buildids, attributes_status=attributes, attributes_verified=attributes_verified,
                   attribute_validation=attribute_validation,
                   raw_decoder_status=raw_status, unwind_complete=False,
+                  inline_expansion=False,
                   enabled_running_time='PERF_SAMPLE_READ with TOTAL_TIME_ENABLED/RUNNING in raw perf.data; actual attributes retained',
                   kernel_stacks='not selected; user-mode cpu-clock only')
     write(out / 'cpu-coverage.json', {k: v for k, v in result.items() if k not in ('callchains', 'folded')})
