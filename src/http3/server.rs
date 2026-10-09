@@ -4285,11 +4285,37 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
+    // Recognition and policy selection are intentionally unconditional for a
+    // valid gRPC-Web media type, even when no translator is installed. Backend
+    // transport promotion is different: only the grpc_web plugin stamps the
+    // trusted translated marker after rewriting the request to native gRPC.
+    // Without that marker retain the original Plain wire flavor so existing H3
+    // pass-through deployments are not silently moved onto the H2 gRPC pool.
+    let backend_http_flavor = if grpc_web_response_content_type.is_some()
+        && !crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx)
+    {
+        detected_http_flavor
+    } else {
+        http_flavor
+    };
+
+    // Materialize query params before authentication. HTTP/3 historically
+    // exposed raw, non-percent-decoded values to plugins; keep that default
+    // so enabling this PR does not silently change auth/cache keys. Plugins
+    // with query-param semantics that require H1/H2 parity opt in via the
+    // capability bit below.
+    if capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS) {
+        ctx.materialize_query_params();
+    } else {
+        ctx.materialize_query_params_raw();
+    }
+
     // An exempted CORS preflight (issue #6110) exists only so the route's
     // `cors` plugin can answer it, which it does in the phase above. One that
     // reaches here (`cors` forwards it, or a trigger skipped `cors`) gets the
     // view's ordinary refusal rather than reaching the backend without the
-    // route's gRPC-only admission policy. Boxed so this cold arm does not widen
+    // route's gRPC-only admission policy. It runs before any pre-auth body
+    // buffering and before authentication. Boxed so this cold arm does not widen
     // `handle_h3_request`'s frame.
     if cors_preflight_exempted {
         Box::pin(async {
@@ -4319,31 +4345,6 @@ async fn handle_h3_request(
         })
         .await?;
         return Ok(());
-    }
-
-    // Recognition and policy selection are intentionally unconditional for a
-    // valid gRPC-Web media type, even when no translator is installed. Backend
-    // transport promotion is different: only the grpc_web plugin stamps the
-    // trusted translated marker after rewriting the request to native gRPC.
-    // Without that marker retain the original Plain wire flavor so existing H3
-    // pass-through deployments are not silently moved onto the H2 gRPC pool.
-    let backend_http_flavor = if grpc_web_response_content_type.is_some()
-        && !crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx)
-    {
-        detected_http_flavor
-    } else {
-        http_flavor
-    };
-
-    // Materialize query params before authentication. HTTP/3 historically
-    // exposed raw, non-percent-decoded values to plugins; keep that default
-    // so enabling this PR does not silently change auth/cache keys. Plugins
-    // with query-param semantics that require H1/H2 parity opt in via the
-    // capability bit below.
-    if capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS) {
-        ctx.materialize_query_params();
-    } else {
-        ctx.materialize_query_params_raw();
     }
 
     // Some auth plugins (for example `hmac_auth`) verify request body integrity

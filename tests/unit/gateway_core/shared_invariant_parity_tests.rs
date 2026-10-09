@@ -3162,11 +3162,14 @@ fn every_dispatcher_exempts_a_cors_preflight_only_inside_the_route_admission_ref
         );
         let first_hook = position("plugin.on_request_received(&mut ctx)");
         let unanswered = position(UNANSWERED_PREFLIGHT_REFUSAL);
-        let authentication_inputs = position("ctx.materialize_query_params");
+        // Pre-auth body buffering starts here, so the refusal must come first:
+        // it never reads a body, authenticates, or dispatches.
+        let authentication_inputs = position("let authenticate_body_requirements");
         assert!(
             first_hook < unanswered && unanswered < authentication_inputs,
             "{dispatcher}: `{file}` must refuse an exempted preflight no plugin answered \
-             right after `on_request_received`, before authentication or dispatch"
+             right after `on_request_received`, before body buffering, authentication or \
+             dispatch"
         );
         assert_eq!(
             body.matches(UNANSWERED_PREFLIGHT_REFUSAL).count(),
