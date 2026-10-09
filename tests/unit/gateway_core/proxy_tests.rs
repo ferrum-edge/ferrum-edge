@@ -4301,6 +4301,132 @@ fn test_native_h3_streaming_upload_requires_h2_end_stream() {
 }
 
 #[test]
+fn test_native_h3_buffered_collect_requires_h2_end_stream() {
+    // Issue #6022: an HTTP/1.1 or HTTP/2 route whose target is native HTTP/3
+    // buffers the client's `Incoming` when retries or body plugins need it.
+    // hyper reports an HTTP/2 client's RST_STREAM(NO_ERROR) as a clean end of
+    // body, so that collect must check the client's END_STREAM before it hands
+    // the bytes to the H3 pool as a complete request. Behavioural proof of the
+    // predicate: `masked_h2_client_reset_collects_without_end_stream` below.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("async fn proxy_to_backend_http3(")
+        .nth(1)
+        .expect("native-H3 dispatcher")
+        .split("\n}\n")
+        .next()
+        .expect("bounded native-H3 dispatcher");
+    let buffered = dispatch
+        .split("ClientRequestBody::Streaming(original_req) => {")
+        .nth(2)
+        .expect("buffered Streaming arm after the streamed one");
+    let version = buffered
+        .find("let require_end_stream = original_req.version() == hyper::Version::HTTP_2;")
+        .expect("the requirement must come from the frontend request version");
+    let collect = buffered
+        .find("http_body_util::Limited::new(&mut client_body, retained_ceiling)")
+        .expect("the collect must borrow the client body so its receive state stays readable");
+    let gate = buffered
+        .find("if require_end_stream && !hyper::body::Body::is_end_stream(&client_body)")
+        .expect("END_STREAM check after the collect");
+    let dispatched = buffered
+        .find("Ok(Ok(collected)) => collected.to_bytes().to_vec(),")
+        .expect("collected body");
+    assert!(
+        version < collect && collect < gate && gate < dispatched,
+        "the END_STREAM check must run on the collected body before it is accepted"
+    );
+    let refusal = &buffered[gate..dispatched];
+    assert!(
+        refusal.contains("Ok(Err(crate::proxy::body::h2_upload_reset_error()))"),
+        "a masked client reset must take the existing 499 client-disconnect arm"
+    );
+}
+
+/// What a buffered collect of one HTTP/2 client upload saw on a real hyper
+/// server: whether the collect succeeded, and whether the client's own
+/// END_STREAM backed its end.
+async fn buffered_h2_upload_outcome(reset_after_data: bool) -> (bool, bool) {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty, Limited};
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::convert::Infallible;
+    use std::time::Duration;
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::unbounded_channel::<(bool, bool)>();
+    let handler = move |request: hyper::Request<Incoming>| {
+        let started_tx = started_tx.clone();
+        let outcome_tx = outcome_tx.clone();
+        async move {
+            let mut body = request.into_body();
+            let _ = started_tx.send(());
+            // The shape `proxy_to_backend_http3` collects with.
+            let collected = Limited::new(&mut body, 1024 * 1024).collect().await;
+            let ended = hyper::body::Body::is_end_stream(&body);
+            let _ = outcome_tx.send((collected.is_ok(), ended));
+            Ok::<_, Infallible>(hyper::Response::new(Empty::<Bytes>::new()))
+        }
+    };
+    let service = hyper::service::service_fn(handler);
+    tokio::spawn(async move {
+        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(server_io), service)
+            .await;
+    });
+
+    let (mut client, connection) = h2::client::handshake(client_io)
+        .await
+        .expect("h2 client handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://gateway.test/upload")
+        .body(())
+        .expect("request");
+    let (_response, mut upload) = client
+        .send_request(request, false)
+        .expect("request headers");
+    upload
+        .send_data(Bytes::from_static(b"partial"), !reset_after_data)
+        .expect("upload DATA");
+    if reset_after_data {
+        // Reset only once the server is collecting, as a client that gives up
+        // mid-upload does.
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("the server must start collecting")
+            .expect("collect started");
+        upload.send_reset(h2::Reason::NO_ERROR);
+    }
+    tokio::time::timeout(Duration::from_secs(5), outcome_rx.recv())
+        .await
+        .expect("the collect must end")
+        .expect("collect outcome")
+}
+
+#[tokio::test]
+async fn masked_h2_client_reset_collects_without_end_stream() {
+    // hyper ends a client's RST_STREAM(NO_ERROR) as a clean end of body, so
+    // the collect alone cannot tell it from a complete upload. Only the
+    // stream's receive state can, and only once the collect has ended.
+    let (collected, ended) = buffered_h2_upload_outcome(true).await;
+    assert!(collected, "hyper ends a NO_ERROR reset cleanly");
+    assert!(
+        !ended,
+        "a masked reset must leave the client body without END_STREAM"
+    );
+
+    let (collected, ended) = buffered_h2_upload_outcome(false).await;
+    assert!(collected, "a complete upload collects");
+    assert!(ended, "a complete upload ends with END_STREAM");
+}
+
+#[test]
 fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
     // Ordinary and SNI routes share the same body-compat gate; body-size
     // limits no longer fork the predicate.

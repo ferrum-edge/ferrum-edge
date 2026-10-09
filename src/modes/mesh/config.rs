@@ -705,8 +705,9 @@ pub struct MeshExtAuthzBodyCheck {
 /// Hop-by-hop / framing / routing / mesh-identity header names that may never
 /// be forwarded to a provider nor written back from one.
 ///
-/// Names are compared after ASCII-lowercasing. `x-ferrum-` prefixed names are
-/// reserved gateway assertions and are refused by prefix, not by exact name.
+/// Names are compared after ASCII-lowercasing. `x-ferrum-` prefixed names (with
+/// `_` folded to `-`) are reserved gateway assertions and are refused by prefix,
+/// not by exact name.
 const MESH_EXT_AUTHZ_RESERVED_HEADERS: &[&str] = &[
     "connection",
     "content-length",
@@ -756,8 +757,24 @@ fn mesh_ext_authz_header_name_is_wellformed(name: &str) -> bool {
 
 fn mesh_ext_authz_header_is_reserved(lowercase: &str) -> bool {
     MESH_EXT_AUTHZ_RESERVED_HEADERS.contains(&lowercase)
-        || lowercase.starts_with("x-ferrum-")
+        || mesh_ext_authz_header_has_ferrum_prefix(lowercase)
         || lowercase.starts_with("x-forwarded-")
+}
+
+/// `x-ferrum-` gateway assertions are reserved in either spelling: `_` is
+/// folded to `-` before the prefix test, because backends that fold the two
+/// (CGI, nginx `underscores_in_headers`) read `x_ferrum_hops` as the gateway's
+/// `X-Ferrum-Hops` (issue #6128).
+fn mesh_ext_authz_header_has_ferrum_prefix(lowercase: &str) -> bool {
+    const PREFIX: &[u8] = b"x-ferrum-";
+    lowercase
+        .as_bytes()
+        .get(..PREFIX.len())
+        .is_some_and(|head| {
+            head.iter()
+                .zip(PREFIX)
+                .all(|(&byte, &expected)| byte == expected || (byte == b'_' && expected == b'-'))
+        })
 }
 
 /// Validate a header name that will be COPIED FROM the client request INTO the

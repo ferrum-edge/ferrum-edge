@@ -17,6 +17,9 @@
 //! * the relay-destination gate revokes a synthesized inbound relay whose
 //!   destination left this terminator's inventory, and one whose dialled
 //!   address is loopback after the own-namespace privilege is withdrawn;
+//! * the same gate revokes a Sidecar `ingress[]` CONNECT remap once a reload
+//!   adds an HTTP listener on its `defaultEndpoint` port, and keeps it across
+//!   an `ingress[]` reload that leaves its mapping intact;
 //! * a CONNECT declaring a gRPC content type is refused before it can become a
 //!   tunnel, so a peer cannot steer the fence onto a view it was never admitted
 //!   with;
@@ -88,9 +91,9 @@ use ferrum_edge::identity::{
     TrustBundleSet as RuntimeTrustBundleSet, TrustDomain,
 };
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshExtAuthzProvider, MeshInboundRelayDestination, MeshInboundRelayHost,
-    MeshPolicy, MeshRelayEnrollmentEvidence, MeshRule, MtlsMode, OutboundTrafficPolicy,
-    PolicyAction, PolicyScope, RequestMatch,
+    AppProtocol, MeshConfig, MeshExtAuthzProvider, MeshInboundRelayDestination,
+    MeshInboundRelayHost, MeshPolicy, MeshRelayEnrollmentEvidence, MeshRule, MtlsMode,
+    OutboundTrafficPolicy, PolicyAction, PolicyScope, RequestMatch, ResolvedIngressListener,
 };
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
@@ -1341,6 +1344,230 @@ async fn a_reload_that_refuses_matched_http_connects_revokes_a_configured_route_
     wait_for_settled_sweeps(&state).await;
     assert_eq!(outbound.revoked_reason(), None);
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
+}
+
+/// Mesh synthesis builds the Sidecar `ingress[]` CONNECT remap under this
+/// reserved id. Pinned as a literal for the same reason as
+/// `MESH_INBOUND_HBONE_RELAY_PROXY_ID`.
+const MESH_INGRESS_HBONE_RELAY_PROXY_ID: &str = "__mesh-ingress-connect-relay";
+const INGRESS_ENDPOINT_HOST: &str = "127.0.0.1";
+/// The declared stream-family `ingress[]` listener port a peer's CONNECT names,
+/// and the loopback `defaultEndpoint` port the remap dials for it.
+const REMAP_LISTENER_PORT: u16 = 16379;
+const REMAP_ENDPOINT_PORT: u16 = 6379;
+/// A second stream listener with an endpoint port of its own.
+const KEPT_LISTENER_PORT: u16 = 16380;
+const KEPT_ENDPOINT_PORT: u16 = 6380;
+/// An HTTP-family `ingress[]` listener a reload adds, and an endpoint port it
+/// can forward to without sharing a remap's.
+const HTTP_LISTENER_PORT: u16 = 9080;
+const HTTP_ENDPOINT_PORT: u16 = 8080;
+
+/// A resolved Sidecar `ingress[]` listener on `port` forwarding to loopback
+/// `endpoint_port`, owned by a local service so the remap guard can admit it.
+fn ingress_listener(
+    port: u16,
+    endpoint_port: u16,
+    protocol: AppProtocol,
+) -> ResolvedIngressListener {
+    ResolvedIngressListener {
+        port,
+        endpoint_host: INGRESS_ENDPOINT_HOST.to_string(),
+        endpoint_port,
+        protocol,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: false,
+        owner_namespace: DEFAULT_NAMESPACE.to_string(),
+        owner_service: "orders".to_string(),
+        bind: None,
+    }
+}
+
+/// [`relay_destination_config`] carrying a DECLARED Sidecar `ingress[]` block
+/// whose admitted listeners are `listeners`, as the Sidecar inbound
+/// materializer back-projects them onto the prepared mesh block.
+fn ingress_remap_config(
+    listeners: Vec<ResolvedIngressListener>,
+    generation_tag: u16,
+) -> GatewayConfig {
+    let mut config = relay_destination_config(Vec::new(), false, generation_tag);
+    let mesh = config.mesh.as_deref_mut().expect("mesh block");
+    mesh.sidecar_ingress_declared = true;
+    mesh.local_ingress_listeners = listeners;
+    config
+}
+
+/// Whether `config` still maps a CONNECT to `listener_port` onto loopback
+/// `endpoint_port`: the predicate the sweep's ingress-remap gate re-applies.
+/// Asserting it on each generation proves a test's verdict comes from the
+/// mapping it names, not from a fixture the guard never admitted.
+fn remap_admitted(config: &GatewayConfig, listener_port: u16, endpoint_port: u16) -> bool {
+    let mesh = config.mesh.as_deref().expect("mesh block");
+    mesh.sidecar_ingress_connect_relay_endpoint_matches(
+        listener_port,
+        INGRESS_ENDPOINT_HOST,
+        endpoint_port,
+    )
+}
+
+/// Registers what the CONNECT path records for a remapped tunnel: the reserved
+/// remap proxy dialling the listener's loopback `defaultEndpoint`, the
+/// `IngressRelay` gate, and the DECLARED listener port the remap stamps as the
+/// listener authz port, which is the key the sweep re-judges the mapping on.
+fn admit_ingress_remap(
+    state: &ProxyState,
+    listener_port: u16,
+    endpoint_port: u16,
+) -> AdmittedHboneTunnel {
+    let fence = &state.hbone_admission_fence;
+    let mut proxy = create_mesh_proxy(endpoint_port);
+    proxy.id = MESH_INGRESS_HBONE_RELAY_PROXY_ID.to_string();
+    proxy.backend_host = INGRESS_ENDPOINT_HOST.to_string();
+    let mut snapshot = synthetic_snapshot(
+        proxy,
+        HboneRelayDestinationGate::IngressRelay,
+        Some(IpAddr::from([127, 0, 0, 1])),
+        fence.sweep_epoch(),
+    );
+    snapshot.ctx.mesh_inbound_listener_authz_port = Some(listener_port);
+    fence.admit(snapshot)
+}
+
+/// A live Sidecar `ingress[]` CONNECT remap is revoked once a reload adds an
+/// HTTP-family `ingress[]` listener forwarding to the same `defaultEndpoint`
+/// port. HTTP wins a shared port (issue #6110), so the peer's next CONNECT to
+/// the stream listener would be refused `http_application_port`, and the live
+/// tunnel must not keep relaying opaque bytes past the HTTP route's plugin
+/// chain. A remap to a different endpoint port survives the same reload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_adds_an_http_ingress_listener_on_the_endpoint_port_revokes_the_remap() {
+    let remap = ingress_listener(REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT, AppProtocol::Tcp);
+    let kept = ingress_listener(KEPT_LISTENER_PORT, KEPT_ENDPOINT_PORT, AppProtocol::Tcp);
+    let initial = ingress_remap_config(vec![remap.clone(), kept.clone()], 9701);
+    assert!(remap_admitted(
+        &initial,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
+    assert!(remap_admitted(
+        &initial,
+        KEPT_LISTENER_PORT,
+        KEPT_ENDPOINT_PORT
+    ));
+    let state = build_state(initial);
+
+    let shared_tunnel = admit_ingress_remap(&state, REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT);
+    let kept_tunnel = admit_ingress_remap(&state, KEPT_LISTENER_PORT, KEPT_ENDPOINT_PORT);
+    assert_eq!(shared_tunnel.revoked_reason(), None);
+    assert_eq!(kept_tunnel.revoked_reason(), None);
+
+    // Both stream listeners stay declared; only the remap's endpoint port is
+    // now one an HTTP listener also forwards to.
+    let http = ingress_listener(HTTP_LISTENER_PORT, REMAP_ENDPOINT_PORT, AppProtocol::Http);
+    let reloaded = ingress_remap_config(vec![remap, kept, http], 9702);
+    assert!(!remap_admitted(
+        &reloaded,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
+    assert!(remap_admitted(
+        &reloaded,
+        KEPT_LISTENER_PORT,
+        KEPT_ENDPOINT_PORT
+    ));
+    let outcome = state.update_config(reloaded);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&shared_tunnel).await;
+    assert_eq!(
+        shared_tunnel.revoked_reason(),
+        Some(HboneRevocationReason::RelayDestination),
+        "the ingress remap guard must re-apply the HTTP-wins-a-shared-port rule"
+    );
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(kept_tunnel.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
+}
+
+/// A reload that changes the Sidecar `ingress[]` block without touching a live
+/// remap's mapping keeps the tunnel. The added HTTP listener forwards to an
+/// endpoint port of its own, so the peer's next CONNECT to the declared stream
+/// listener would still be remapped exactly as before.
+///
+/// The destination gates have no skip key: every sweep runs every live
+/// tunnel's gate against the generation it publishes. A kept verdict cannot be
+/// seen directly, so the test proves the tunnel stays under that gate after the
+/// first reload. A second reload retargets the HTTP listener onto the remap's
+/// endpoint port, and the same tunnel is revoked `relay_destination`.
+///
+/// `reevaluations()` counts only authorize-chain re-runs. This fixture carries
+/// no authorize plugin that re-evaluates live admission, so the counter must
+/// not move. Both verdicts therefore come from the ingress-remap gate, not
+/// from the authorize chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ingress_reload_that_leaves_the_mapping_intact_keeps_a_live_remap() {
+    let remap = ingress_listener(REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT, AppProtocol::Tcp);
+    let initial = ingress_remap_config(vec![remap.clone()], 9711);
+    assert!(remap_admitted(
+        &initial,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
+    let state = build_state(initial);
+    let fence = &state.hbone_admission_fence;
+
+    let tunnel = admit_ingress_remap(&state, REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT);
+    assert_eq!(tunnel.revoked_reason(), None);
+    let completed_before = fence.sweeps_completed();
+    let reevaluations_before = fence.reevaluations();
+
+    // A real generation change to the same `ingress[]` block whose shared-port
+    // rule does not reach the remap's endpoint.
+    let http = ingress_listener(HTTP_LISTENER_PORT, HTTP_ENDPOINT_PORT, AppProtocol::Http);
+    let reloaded = ingress_remap_config(vec![remap.clone(), http], 9712);
+    assert!(remap_admitted(
+        &reloaded,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
+    let outcome = state.update_config(reloaded);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_sweep_after(&state, completed_before).await;
+    wait_for_settled_sweeps(&state).await;
+
+    assert_eq!(tunnel.revoked_reason(), None);
+    assert_eq!(fence.live_tunnels(), 1);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        fence.reevaluations(),
+        reevaluations_before,
+        "no authorize plugin re-ran, so the kept verdict is the ingress-remap gate's"
+    );
+
+    // The same HTTP listener now forwards to the remap's endpoint port. HTTP
+    // wins the shared port, so the next sweep must revoke the tunnel the first
+    // reload kept.
+    let completed_after_keep = fence.sweeps_completed();
+    let retargeted = ingress_listener(HTTP_LISTENER_PORT, REMAP_ENDPOINT_PORT, AppProtocol::Http);
+    let broken = ingress_remap_config(vec![remap, retargeted], 9713);
+    assert!(!remap_admitted(
+        &broken,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
+    let outcome = state.update_config(broken);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::RelayDestination),
+        "the kept remap must still be re-judged by the ingress-remap gate"
+    );
+    wait_for_sweep_after(&state, completed_after_keep).await;
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
+    assert_eq!(fence.reevaluations(), reevaluations_before);
 }
 
 #[tokio::test(flavor = "multi_thread")]

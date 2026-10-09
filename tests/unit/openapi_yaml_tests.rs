@@ -9773,6 +9773,14 @@ fn opa_schema_matches_runtime_validation_contract() {
     });
     assert_component_validity(&spec, "OpaPluginConfig", &base, true);
 
+    // The decision call stamps the gateway-owned hop count itself, so `headers`
+    // refuses it in any spelling, as `Opa::new` does (issue #6128).
+    for name in ["X-Ferrum-Hops", "x_ferrum_hops"] {
+        let mut hops = base.clone();
+        hops["headers"] = json!({name: "0"});
+        assert_component_validity(&spec, "OpaPluginConfig", &hops, false);
+    }
+
     let mut unknown = base.clone();
     unknown
         .as_object_mut()
@@ -15596,6 +15604,7 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
         json!({"semantic_similarity_enable": true}),
         json!({"sync_mod": "redis"}),
         json!({"redis_ur": "redis://127.0.0.1:6379/0"}),
+        json!({"semantic_embedding_auth_header": "X_Ferrum_Hops"}),
     ] {
         assert_component_validity(&spec, "AiSemanticCacheConfig", &invalid, false);
         assert!(

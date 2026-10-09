@@ -84,6 +84,11 @@ frame past one window, because such a client is still streaming. A client that f
 with smaller frames than that can still be missed: its backend sees `INTERNAL_ERROR`, which is
 still a reset and never a complete body.
 
+The same rule covers the buffered collect on the native HTTP/3 backend path, used when retries or
+body plugins need the whole upload before dispatch. The collect borrows the client body, and when
+it ends the gateway checks the body's receive state. An HTTP/2 upload that ended without the
+client's `END_STREAM` is answered as a `499` client disconnect and never sent to the H3 backend.
+
 The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
 classifier never count this gateway-initiated reset as a backend failure (see
 [error classification](error_classification.md)). The sidecar mesh-mTLS, HBONE, and Unix-socket
@@ -91,12 +96,3 @@ dispatchers do not inspect the cause of a `send_request` failure before response
 from a canceled dispatch of a replayable body, it is `protocol_error`. If the gateway's reset
 surfaces there while the dispatch is still running, it is charged to that target's circuit breaker
 and passive health, as an explicit client `CANCEL` already is.
-
-Regression coverage checks zero backend requests on expiry during TLS checkout and before a cached
-send, and observes backend QUIC resets after complete DATA followed by a stalled frontend (without
-Content-Length), plus buffered flow-control expiry. Paused-clock coverage retains a connect-before-
-client winner on late sidecar readiness wakeups and distinguishes pre-handoff authorization refusal
-from expiry after transmission; a live pooled upload also asserts its post-handoff marker.
-
-The `BackendResponse` handoff field does not change public gateway error/header tokens. It records
-whether the request was handed to the backend independently of the backend-health class.

@@ -318,7 +318,7 @@ An outbound `404` for an un-materialized destination means no route was built fo
 Every mesh data plane runs the gateway's [proxy hop limit](routing.md#proxy-hop-limit) (`FERRUM_MAX_PROXY_HOPS`, default `10`, carried in the gateway-owned `X-Ferrum-Hops` request header):
 
 - **Outbound hops increment.** A request captured on the outbound listener (`:15001`) is checked and forwarded with `received + 1`.
-- **Inbound hops to the local workload check but do not increment.** A request on the Sidecar inbound listener (`:15006`) that is forwarded to the local application through a materialized inbound route (service-port defaults or `ingress[]` listeners) is refused at the limit, but it is forwarded with the received count unchanged. A service call therefore costs one hop, not two, when the application propagates the header to its own outbound calls. The bound still holds: anything the application sends onward leaves through the outbound hop, which increments.
+- **Inbound hops to the local workload check but do not increment.** A request on the Sidecar inbound listener (`:15006`) that is forwarded to the local application through a materialized inbound route (service-port defaults or `ingress[]` listeners) is refused at the limit, but it is forwarded with the received count unchanged. A service call therefore costs one hop, not two, when the application propagates the header to its own outbound calls. The bound still holds: anything the application sends onward leaves through the outbound hop, which increments. The exemption covers only the request forwarded to the local workload: plugin calls made on that same inbound hop, such as `mesh_authz` `CUSTOM` (ext_authz) checks and `request_mirror` shadows, are ordinary gateway hops and carry `received + 1` (see [Plugin HTTP calls and the proxy hop limit](plugins.md#plugin-http-calls-and-the-proxy-hop-limit)).
 - **A target on a gateway listener always counts.** The exemption applies only when the route's loopback target is not a port this data plane listens on: the mesh listeners, Gateway and stream listeners, dedicated `ingress[]` binds, and the admin listeners. The runtime republishes that port set on every accepted slice apply, and an inbound hop increments until the first set is published. Preparation also refuses a Sidecar `ingress[]` `defaultEndpoint` or an inbound `targetPort` that names one of those ports, with a warning and for the whole entry, like a dedicated-bind conflict: two `ingress[]` binds whose `defaultEndpoint`s point at each other are both dropped.
 - **Every other inbound route increments.** A plugin route override, an EgressGateway external route, an operator route, or a loopback target on any gateway listener port is forwarded with `received + 1`. Ambient and waypoint inbound HBONE relays are L4 tunnels and forward no request headers.
 - A looping request is refused with `508 Loop Detected` (native gRPC: `FAILED_PRECONDITION`) at whichever hop first receives a count at the limit. The refusal is a frontend admission fence: it produces no transaction summary and no `ferrum_requests_total` row, and the refusing hop logs a rate-limited warning. Earlier Ferrum hops relay the `508` with `X-Gateway-Error: backend_error`, and none of them retries it.
@@ -1865,7 +1865,14 @@ original **Host** authority, and **Content-Length** when a body is sent.
 Carrying the original authority is a header only — the connection is always
 dialled at the provider's own configured `service`/`port`, so a client-supplied
 authority can never route the provider connection. The query string is **not**
-forwarded (a credential in it must not reach the provider).
+forwarded (a credential in it must not reach the provider). With the
+[proxy hop limit](routing.md#proxy-hop-limit) enabled the check also carries
+the request's gateway hop count as exactly one `X-Ferrum-Hops` field line
+(`received + 1`, also on an inbound hop to the local workload), so a provider
+that resolves back to a Ferrum gateway is refused at the limit. Provider
+configuration cannot add another: `includeRequestHeadersInCheck` and
+`includeAdditionalHeadersInCheck` refuse every `x-ferrum-*` name, in the `_`
+or `-` spelling, at admission.
 `includeAdditionalHeadersInCheck` values are **authoritative**: a fixed
 operator header replaces any same-named client header or
 `includeRequestHeadersInCheck` value rather than being appended beside it, and

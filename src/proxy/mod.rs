@@ -62154,7 +62154,10 @@ async fn proxy_to_backend_http3(
     let (request_body, request_buffer_permit) = match client_request_body {
         ClientRequestBody::Buffered(buffered) => (buffered.body, buffered.budget),
         ClientRequestBody::Streaming(original_req) => {
-            let (_parts, body) = (*original_req).into_parts();
+            // An HTTP/2 client's upload EOF must be its own END_STREAM (issue
+            // #6022), exactly as on the streamed arm above. Never for HTTP/1.1.
+            let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
+            let (_parts, mut client_body) = (*original_req).into_parts();
             // Fail-closed retained ceiling + aggregate admission taken BEFORE
             // the buffer is allocated (issue #4153). `0` on
             // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` stays "unlimited" for
@@ -62190,15 +62193,29 @@ async fn proxy_to_backend_http3(
                         return (request_buffer_capacity_backend_response(resolved_ip), None);
                     }
                 };
-            let limited = http_body_util::Limited::new(body, retained_ceiling);
-            let body = match collect_request_body_under_authorization(
+            // Collected through a borrow so the client body's receive state
+            // is still readable once the collect ends.
+            let limited = http_body_util::Limited::new(&mut client_body, retained_ceiling);
+            let collected = collect_request_body_under_authorization(
                 limited.collect(),
                 grpc_deadline_at,
                 proxy.backend_read_timeout_ms,
                 buffered_upload_auth_deadline.as_ref(),
             )
-            .await
-            {
+            .await;
+            // hyper reports an inbound `RST_STREAM(NO_ERROR)` as a clean end of
+            // body, so a collect that ended without the client's END_STREAM
+            // holds a truncated upload. Refuse it as the client disconnect it
+            // is, never dispatch it to the H3 backend as a complete request.
+            let collected = match collected {
+                Ok(Ok(_))
+                    if require_end_stream && !hyper::body::Body::is_end_stream(&client_body) =>
+                {
+                    Ok(Err(crate::proxy::body::h2_upload_reset_error()))
+                }
+                other => other,
+            };
+            let body = match collected {
                 Ok(Ok(collected)) => collected.to_bytes().to_vec(),
                 // `Limited::collect()` yields either a `LengthLimitError` (the
                 // body really exceeded the ceiling -> 413) or the underlying

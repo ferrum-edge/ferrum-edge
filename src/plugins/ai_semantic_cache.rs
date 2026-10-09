@@ -1554,7 +1554,11 @@ impl AiSemanticCache {
     /// semantic lookup for that follower without evicting the live leader, so it
     /// cannot create duplicate outbound work. One shared success or failure is
     /// published to all waiters on each completed leadership.
-    async fn compute_embedding(&self, input: &str) -> Result<EmbeddingPoint, String> {
+    async fn compute_embedding(
+        &self,
+        input: &str,
+        proxy_hops: Option<u8>,
+    ) -> Result<EmbeddingPoint, String> {
         if self.semantic.is_none() {
             return Err("semantic similarity is disabled".to_string());
         }
@@ -1590,7 +1594,9 @@ impl AiSemanticCache {
                     // Publish admission failures as well as provider outcomes so
                     // followers never wait on a leader stuck behind saturation.
                     let shared = match self.acquire_embedding_permit().await {
-                        Ok(_permit) => Arc::new(self.compute_embedding_inner(input).await),
+                        Ok(_permit) => {
+                            Arc::new(self.compute_embedding_inner(input, proxy_hops).await)
+                        }
                         Err(error) => Arc::new(Err(error)),
                     };
                     // Publish one shared success/failure to every waiter.
@@ -1637,7 +1643,7 @@ impl AiSemanticCache {
         // Exhausted re-election budget under a leader-cancellation storm: still
         // honor the per-instance semaphore for one final bounded attempt.
         let _permit = self.acquire_embedding_permit().await?;
-        self.compute_embedding_inner(input).await
+        self.compute_embedding_inner(input, proxy_hops).await
     }
 
     /// Bound time spent waiting for embedding admission as well as provider I/O.
@@ -1679,7 +1685,11 @@ impl AiSemanticCache {
         leader_budget.min(EMBEDDING_SINGLEFLIGHT_WAIT)
     }
 
-    async fn compute_embedding_inner(&self, input: &str) -> Result<EmbeddingPoint, String> {
+    async fn compute_embedding_inner(
+        &self,
+        input: &str,
+        proxy_hops: Option<u8>,
+    ) -> Result<EmbeddingPoint, String> {
         let semantic = self
             .semantic
             .as_ref()
@@ -1698,6 +1708,10 @@ impl AiSemanticCache {
         if let Some(auth_value) = &semantic.auth_value {
             request = request.header(semantic.auth_header.clone(), auth_value.clone());
         }
+        // An embedding endpoint that resolves back to the gateway is refused at
+        // the proxy hop limit like a looping route (issue #6128). A coalesced
+        // flight carries the hop count of the request that leads it.
+        request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops);
 
         let response = self
             .http_client
@@ -5298,7 +5312,8 @@ impl Plugin for AiSemanticCache {
                 self.build_semantic_input(&json),
             )
         {
-            match self.compute_embedding(&input).await {
+            let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
+            match self.compute_embedding(&input, proxy_hops).await {
                 Ok(embedding) => {
                     if let Some((entry, similarity)) = self.lookup_semantic(&scope_key, &embedding)
                     {
@@ -5802,6 +5817,15 @@ fn parse_semantic_config(
             "ai_semantic_cache: `semantic_embedding_auth_header` must be a valid HTTP header name"
                 .to_string()
         })?;
+    // The embedding call carries the gateway's hop count as exactly one field
+    // line (issue #6128); a credential under that name (any case, `_` or `-`)
+    // would sit beside it.
+    if crate::proxy::hop_limit::is_proxy_hops_header(auth_header.as_str()) {
+        return Err(
+            "ai_semantic_cache: `semantic_embedding_auth_header` must not be `X-Ferrum-Hops`; the gateway owns the proxy hop count"
+                .to_string(),
+        );
+    }
     reqwest::header::HeaderValue::from_str(&auth_scheme).map_err(|_| {
         "ai_semantic_cache: `semantic_embedding_auth_scheme` must be a valid HTTP header value"
             .to_string()

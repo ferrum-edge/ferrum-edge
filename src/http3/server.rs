@@ -358,6 +358,34 @@ pub(crate) fn publish_h3_retained_body(
     }
 }
 
+/// Why a buffered H3 request-body drain ended without a complete upload.
+#[derive(Debug)]
+pub(crate) enum H3UploadReadError {
+    /// The request stream failed: a client reset, a lost connection, or a
+    /// malformed frame sequence h3 detected.
+    Stream(h3::error::StreamError),
+    /// A DATA frame followed the trailer section, which makes the request
+    /// malformed (RFC 9114 §4.1).
+    DataAfterTrailers,
+}
+
+impl From<h3::error::StreamError> for H3UploadReadError {
+    fn from(error: h3::error::StreamError) -> Self {
+        Self::Stream(error)
+    }
+}
+
+impl std::fmt::Display for H3UploadReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stream(error) => std::fmt::Display::fmt(error, f),
+            Self::DataAfterTrailers => f.write_str("request DATA frame after the trailer section"),
+        }
+    }
+}
+
+impl std::error::Error for H3UploadReadError {}
+
 /// Drain an H3 request-body recv half into an admitted, capped buffer.
 ///
 /// The buffer and its charge live inside this future, so timeout/deadline
@@ -370,7 +398,7 @@ pub(crate) async fn drain_h3_request_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut upload: H3RetainedUpload,
     charge: &mut Option<RequestBufferPermit>,
-) -> Result<Option<Vec<u8>>, h3::error::StreamError>
+) -> Result<Option<Vec<u8>>, H3UploadReadError>
 where
     S: RecvStream,
 {
@@ -378,6 +406,14 @@ where
         if !upload.push(chunk.chunk()) {
             return Ok(None);
         }
+    }
+    // `recv_data` also ends at a trailer section, which ends the body but not
+    // the request stream. Read on to the stream's own end, so a client reset
+    // or a lost connection after the trailers is refused as the incomplete
+    // request it is instead of being dispatched as a complete upload (issue
+    // #6022). After a clean FIN this returns at once.
+    if stream.recv_data().await?.is_some() {
+        return Err(H3UploadReadError::DataAfterTrailers);
     }
     let (body, permit) = upload.finish();
     *charge = Some(permit);

@@ -7280,3 +7280,48 @@ fn test_shape_only_admission_screens_a_configured_endpoint_for_ambient_credentia
     config[AMBIENT_OPT_IN] = json!(true);
     shape_only_admission(&config).expect("the explicit opt-in is honored at admission");
 }
+
+/// The function invocation carries the request's gateway hop count
+/// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so a function
+/// URL that resolves back to the gateway is refused at the proxy hop limit like
+/// a looping route (issue #6128). With the limit disabled nothing is stamped.
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_invocation_carries_the_proxy_hop_count() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (outbound_proxy_hops, expected) in [(Some(4), vec!["4"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/func", server.uri()),
+                "mode": "terminate",
+                "timeout_ms": 5000
+            }),
+            default_client(),
+        )
+        .unwrap();
+
+        let mut ctx = create_test_context();
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        let mut headers = HashMap::new();
+        let _ = plugin.finalized_egress(&mut ctx, &mut headers).await;
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}

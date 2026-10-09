@@ -228,6 +228,29 @@ async fn get(base: &str, path: &str) -> Reply {
     send(Method::GET, base, path, &admin_token(), None, None).await
 }
 
+/// Handler-owned admission guards release their database lease from an async
+/// cleanup task after the response returns, so wait briefly before competing.
+async fn acquire_namespace_config_admission_lease_after_handler(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    owner: &str,
+) -> u64 {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(generation) = db
+                .try_acquire_namespace_config_admission_lease(namespace, owner)
+                .await
+                .expect("lease acquisition succeeds after handler response")
+            {
+                return generation;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("handler's admission lease is released within five seconds")
+}
+
 async fn create(base: &str, collection: &str, body: Value) {
     let reply = send(
         Method::POST,
@@ -3230,11 +3253,9 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         // Bypass the handler's initial comparison to exercise the transaction
         // boundary itself, retaining the original representation on both calls.
         let owner = uuid::Uuid::new_v4().to_string();
-        let generation = db
-            .try_acquire_namespace_config_admission_lease(&namespace, &owner)
-            .await
-            .unwrap()
-            .unwrap();
+        let generation =
+            acquire_namespace_config_admission_lease_after_handler(db.as_ref(), &namespace, &owner)
+                .await;
         let precondition = DeploymentPrecondition {
             namespace: &namespace,
             expected: SnapshotDigest::of_representation(&original.body["evidence"]).unwrap(),
@@ -3558,11 +3579,9 @@ async fn assert_issued_deployment_evidence_authorizes_the_transaction(
     );
 
     let owner = uuid::Uuid::new_v4().to_string();
-    let generation = db
-        .try_acquire_namespace_config_admission_lease(&namespace, &owner)
-        .await
-        .unwrap()
-        .unwrap();
+    let generation =
+        acquire_namespace_config_admission_lease_after_handler(db.as_ref(), &namespace, &owner)
+            .await;
     let precondition = DeploymentPrecondition {
         namespace: &namespace,
         expected,

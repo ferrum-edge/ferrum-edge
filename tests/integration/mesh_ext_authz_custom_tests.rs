@@ -172,6 +172,7 @@ async fn check(
                 authority: Some("api.example.com"),
                 body: None,
                 body_proven_empty: true,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -684,6 +685,7 @@ async fn a_check_is_never_retried_even_when_shared_plugin_retries_are_configured
                 authority: Some("api.example.com"),
                 body: None,
                 body_proven_empty: true,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -720,6 +722,7 @@ async fn check_with_body(
                 authority: Some("api.example.com"),
                 body: Some(body),
                 body_proven_empty: false,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -813,6 +816,7 @@ async fn an_unavailable_body_remains_a_failed_check_distinct_from_an_oversize_on
                 authority: Some("api.example.com"),
                 body: None,
                 body_proven_empty: false,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -860,6 +864,7 @@ async fn an_oversize_body_and_a_missing_body_fail_closed_with_distinct_reasons()
                 authority: None,
                 body: None,
                 body_proven_empty: false,
+                proxy_hops: None,
             },
             &accumulator,
         )
@@ -1535,4 +1540,57 @@ async fn a_reload_generation_cannot_reopen_a_fresh_budget() {
         "capacity restored, so the check runs"
     );
     assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
+}
+
+/// Every `X-Ferrum-Hops` field line in the raw check request the stub saw.
+fn seen_proxy_hops(seen: &str) -> Vec<String> {
+    seen.split("\r\n")
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("x-ferrum-hops"))
+        .map(|(_, value)| value.trim().to_string())
+        .collect()
+}
+
+/// A CUSTOM check carries the request's gateway hop count (`received + 1`) as
+/// exactly one `X-Ferrum-Hops` field line, so a provider that resolves back to
+/// the gateway is refused at the proxy hop limit like a looping route (issue
+/// #6128). A provider cannot name `x-ferrum-*` for forwarding (refused at
+/// admission), so a client copy never reaches the check; with the limit
+/// disabled the check carries no hop field at all.
+#[tokio::test]
+async fn a_check_carries_the_proxy_hop_count() {
+    for (proxy_hops, expected) in [(Some(5), vec!["5".to_string()]), (None, Vec::new())] {
+        let stub = start_stub(StubBehavior::Allow).await;
+        let executor = executor(vec![provider(stub.port)]);
+        let mut headers = request_headers();
+        headers.insert("x-ferrum-hops".to_string(), "1".to_string());
+        let accumulator = AtomicU64::new(0);
+        let outcome = executor
+            .check(
+                "sample-ext-authz",
+                MeshExtAuthzCheckRequest {
+                    method: "GET",
+                    path: "/admin/reports",
+                    headers: &headers,
+                    authority: Some("api.example.com"),
+                    body: None,
+                    body_proven_empty: true,
+                    proxy_hops,
+                },
+                &accumulator,
+            )
+            .await;
+        assert!(
+            matches!(outcome, MeshExtAuthzOutcome::Allow { .. }),
+            "unexpected outcome: {outcome:?}"
+        );
+
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert_eq!(
+            seen_proxy_hops(&seen),
+            expected,
+            "proxy_hops={proxy_hops:?}"
+        );
+    }
 }

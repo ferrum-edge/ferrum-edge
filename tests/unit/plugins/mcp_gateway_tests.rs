@@ -16759,3 +16759,50 @@ async fn openapi_bridge_config_matches_the_published_component_schema() {
     assert!(!validator.is_valid(&unknown), "the openapi block is closed");
     assert!(create_plugin("mcp_gateway", &unknown).is_err());
 }
+
+/// Every upstream MCP call made on behalf of a request — the lazy upstream
+/// `initialize`, the `notifications/initialized` notification, and catalog
+/// discovery — carries that request's gateway hop count (`received + 1`) as
+/// exactly one `X-Ferrum-Hops` field line, so an upstream that resolves back
+/// to the gateway is refused at the proxy hop limit like a looping route
+/// (issue #6128). With the limit disabled nothing is stamped.
+#[tokio::test]
+async fn aggregate_upstream_calls_carry_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(8), vec!["8"]), (None, Vec::new())] {
+        let server = start_mcp_catalog_server().await;
+        let plugin = create_plugin(
+            "mcp_gateway",
+            &aggregate_config(&format!("{}/mcp", server.uri())),
+        )
+        .unwrap()
+        .unwrap();
+        let session_id = initialize(&plugin).await;
+        let before = server.received_requests().await.unwrap_or_default().len();
+
+        let (mut ctx, mut headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }));
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        headers.insert("mcp-session-id".to_string(), session_id);
+        let (status, _, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(status, 200);
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(
+            received.len() > before,
+            "tools/list must reach the upstream"
+        );
+        for request in &received[before..] {
+            let hops: Vec<&str> = request
+                .headers
+                .get_all("x-ferrum-hops")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+        }
+    }
+}

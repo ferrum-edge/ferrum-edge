@@ -10868,8 +10868,11 @@ components:
             windowing replaces those fixed sizes: hyper restarts both at 65535 bytes and grows the connection
             window only as the link is measured, which fragments hundreds of concurrent streams into tiny
             DATA frames and can trip h2's small-frame flood budget (GOAWAY ENHANCE_YOUR_CALM). Its BDP
-            PING/SETTINGS traffic can also deadlock a connection carrying large bodies in both directions
-            at once (issue #6073, upstream hyperium/h2#975).
+            PING/SETTINGS traffic can also deadlock a connection carrying large bodies in both directions,
+            especially when both peers enable adaptive windowing; h2 stops reading while a control-frame
+            write waits for socket capacity (issue #6073, upstream https://github.com/hyperium/h2/issues/975).
+            This describes hyper/reqwest HTTP/2 connections; HBONE uses a separate raw-h2 window policy
+            and does not enable this BDP PING/SETTINGS behavior.
             An explicit adaptive choice remains authoritative even alongside window overrides; omit this
             field when setting explicit windows to auto-disable adaptive so fixed sizes apply.
         pool_http2_max_frame_size:
@@ -28127,7 +28130,9 @@ components:
             type: string
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             not:
-              pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
+              anyOf:
+                - pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
+                - pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss]$'
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
@@ -28136,7 +28141,9 @@ components:
             Static HTTP headers sent to OPA on every decision request. Names use
             HTTP token syntax and values are visible ASCII (plus tab). The
             `content-type` header is managed by the plugin and cannot be
-            configured here, case-insensitively.
+            configured here, case-insensitively. Neither can the gateway-owned
+            `X-Ferrum-Hops` proxy hop count (any case, `_` or `-`), which the
+            decision request carries itself.
           example:
             Authorization: "Bearer opa-client-token"
         timeout_ms:
@@ -34916,7 +34923,9 @@ components:
         semantic_embedding_auth_header:
           type: string
           pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+(?![\s\S])'
-          description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key.
+          not:
+            pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss](?![\s\S])'
+          description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key. Must not be the gateway-owned X-Ferrum-Hops proxy hop count (any case, `_` or `-`), which the embedding call carries itself.
         semantic_embedding_auth_scheme:
           type: string
           pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'

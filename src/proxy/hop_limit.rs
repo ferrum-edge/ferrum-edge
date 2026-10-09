@@ -64,6 +64,14 @@
 //! Stream proxies (`tcp`, `tcp_tls`, `udp`, `dtls`) relay opaque bytes and
 //! carry no request headers, so the limit does not apply to them.
 //!
+//! Plugin calls (issue #6128): an HTTP call a plugin makes on behalf of the
+//! current request — a serverless function, an MCP upstream, an AI provider or
+//! classifier, a policy / introspection / ext_authz service, an OIDC token
+//! endpoint, a mirror or load-test replay — carries the same forwarded count
+//! through [`stamp_plugin_call_proxy_hops`], so a plugin target that resolves
+//! back to a Ferrum gateway is refused at the same limit. Batch and background
+//! sinks and shared cache refreshes are not request-scoped and carry none.
+//!
 //! The stamp adds (at most) one field AFTER the frontend's
 //! `FERRUM_MAX_HEADER_COUNT` / header-size limits were checked, like the
 //! gateway's own `X-Forwarded-*` fields: a request exactly at the count limit
@@ -241,6 +249,68 @@ pub fn stamp_proxy_hops(headers: &mut http::HeaderMap, hops: u8) {
 #[inline]
 pub fn is_proxy_hops_header(name: &str) -> bool {
     crate::proxy::headers::field_names_equivalent_for_backends(name, PROXY_HOPS_HEADER)
+}
+
+/// The `X-Ferrum-Hops` count a request-scoped plugin call made on behalf of
+/// `ctx` carries, or `None` when the limit is disabled.
+///
+/// Always the frontend's forwarded count (`received + 1`), never the mesh
+/// inbound exemption of [`effective_outbound_proxy_hops`]: a plugin call goes
+/// to a plugin-configured target, not to the local workload, so it is an
+/// ordinary gateway hop. A request refused at the limit never reaches a
+/// plugin, so the value is at most `FERRUM_MAX_PROXY_HOPS`.
+#[inline]
+pub fn plugin_call_proxy_hops(ctx: &RequestContext) -> Option<u8> {
+    ctx.outbound_proxy_hops
+}
+
+/// Stamp the gateway's hop count on a request-scoped plugin HTTP call.
+///
+/// The ONE helper every plugin call made on behalf of the current request goes
+/// through: `serverless_function`, `mcp_gateway` upstream session and
+/// discovery calls, `ai_federation` provider calls, `opa`,
+/// `oauth2_introspection`, `mesh_authz` `CUSTOM` (ext_authz) checks,
+/// `oidc_relying_party` token / revocation / UserInfo calls, the
+/// `ai_semantic_firewall` / `ai_semantic_cache` embedding calls, the
+/// `ai_tool_governor` approval webhook, `request_mirror`, and `load_testing`
+/// replays and fan-out. A plugin target that resolves back to a Ferrum gateway
+/// is therefore refused at the same `FERRUM_MAX_PROXY_HOPS` limit as a looping
+/// route. `hops` is [`plugin_call_proxy_hops`], captured before the call leaves
+/// the request task. `None` (limit disabled) leaves the request untouched.
+///
+/// The field is appended, so a caller that forwards a copied header set must
+/// drop the copied hop field first ([`strip_copied_proxy_hops`]).
+/// Allocation-free: the name and value are the pre-built static ones.
+///
+/// Not request-scoped, so carrying no hop count: batch and background sinks
+/// (`http_logging`, `loki_logging`, `otel_tracing`, `api_chargeback_sink`,
+/// `ai_transcript_audit`'s collector, notification webhooks) and shared,
+/// coalesced cache refreshes that outlive the request which triggered them
+/// (JWKS and OIDC / OAuth discovery, the `ai_federation` Vertex token grant,
+/// the `spec_expose` document fetch).
+#[inline]
+pub fn stamp_plugin_call_proxy_hops(
+    request: reqwest::RequestBuilder,
+    hops: Option<u8>,
+) -> reqwest::RequestBuilder {
+    match hops {
+        Some(hops) => request.header(
+            PROXY_HOPS_HEADER_NAME.clone(),
+            PROXY_HOPS_VALUES[usize::from(hops)].clone(),
+        ),
+        None => request,
+    }
+}
+
+/// Drop every copied `X-Ferrum-Hops` spelling from a header list a plugin
+/// forwards on a secondary request, so [`stamp_plugin_call_proxy_hops`] leaves
+/// exactly one field line (two would be refused as malformed by the next
+/// Ferrum hop). With the limit disabled (`hops == None`) a client value passes
+/// through as an ordinary header. Allocation-free.
+pub fn strip_copied_proxy_hops(headers: &mut Vec<(String, String)>, hops: Option<u8>) {
+    if hops.is_some() {
+        headers.retain(|(name, _)| !is_proxy_hops_header(name));
+    }
 }
 
 /// Every port this gateway process listens on, as a fixed 65,536-bit set:
