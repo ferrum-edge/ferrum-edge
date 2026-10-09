@@ -1238,6 +1238,9 @@ wait remain unavailable; correctness disposition and dispatch belong to root.
 The [2026-10-09 five-path measurement](allocation-measurements-2026-10-09.md)
 records all 30 observations and separates the cumulative allocation delta from
 individual box attribution.
+The [isolated bounded-box comparison](hot-box-measurements-2026-10-09.md)
+records the selected removals, their stack/correctness evidence, and the
+requested-byte tradeoff separately.
 
 `alloc_per_request.sh` measures Rust allocator calls per proxied request on
 five dispatch paths. It builds `ferrum-edge` with the default-off
@@ -1302,3 +1305,6 @@ controls, and same-revision observer calibration. See
 traffic validity are separate; unpublished tails and scrape failures cannot
 become zero-filled success. Controlled locality/burst/churn remain explicit
 hooks, and `experiment.json` remains disabled.
+
+CPU profiling results and their hardware/coverage limits are recorded in
+[the 2026-10-09 diagnostic report](cpu-profile-measurements-2026-10-09.md).
