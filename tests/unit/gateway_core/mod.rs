@@ -25,6 +25,8 @@ mod cidr_tests;
 mod circuit_breaker_tests;
 mod client_identity_tests;
 mod client_ip_tests;
+#[cfg(unix)]
+mod cni_install_mode_tests;
 mod cni_ownership_tests;
 mod collection_object_admission_tests;
 mod config_delta_namespace_prune_tests;
