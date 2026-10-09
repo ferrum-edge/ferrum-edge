@@ -319,14 +319,20 @@ impl NodeWaypointInventory {
 /// endpoint no Pod claims and refuse the whole Service backend.
 pub const POD_CLAIM_GRACE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Pod IP claims observed within the last [`POD_CLAIM_GRACE_WINDOW`], carried
-/// across reconciles like [`NodeWaypointInventory`].
+/// Pod IP claims of the Pods observed now and of those that left the Pod
+/// inventory within the last [`POD_CLAIM_GRACE_WINDOW`], carried across
+/// reconciles like [`NodeWaypointInventory`].
 ///
 /// EndpointSlice attribution consults it only for an IP no Pod observed now
 /// claims, and for a `targetRef` naming a Pod that is no longer observed or no
 /// longer reports the address. A current claim always wins: an IP reused by an
-/// observed Pod of another namespace is that namespace's. Memory is bounded by
-/// the Pods seen within the window; every refresh prunes older claims.
+/// observed Pod of another namespace is that namespace's. It is consulted only
+/// while the Pod watch scope covers every namespace: with a restricted scope,
+/// an IP reused by a Pod outside the scope would still look like the old
+/// Pod's. A claim's window starts at the first refresh that no longer observes
+/// it, however long ago the Pod was last observed. Memory is bounded by the
+/// Pods observed now plus those that left within the window; every refresh
+/// prunes the expired claims.
 #[derive(Clone)]
 pub struct PodClaimInventory {
     grace: Duration,
@@ -375,22 +381,36 @@ impl PodClaimInventory {
     }
 }
 
-/// The claims a [`PodClaimInventory`] remembers, each with when it was last
-/// observed.
+/// The claims a [`PodClaimInventory`] remembers. Each is `None` while the
+/// latest refresh observed it, or the time of the first refresh that no longer
+/// did, from which its grace window counts.
 #[derive(Debug, Default)]
 struct RecentPodClaims {
-    /// `ip → namespace → last seen`, from non-host-network Pods, exactly the
+    /// `ip → namespace → gone since`, from non-host-network Pods, exactly the
     /// claims [`CoreState::pod_ip_namespaces`] records.
-    ip_namespaces: HashMap<IpAddr, HashMap<String, Instant>>,
-    /// `pod → ip → last seen`, from every Pod, host-network included, for
+    ip_namespaces: HashMap<IpAddr, HashMap<String, Option<Instant>>>,
+    /// `pod → ip → gone since`, from every Pod, host-network included, for
     /// `targetRef` checks.
-    pod_addresses: HashMap<PodKey, HashMap<IpAddr, Instant>>,
+    pod_addresses: HashMap<PodKey, HashMap<IpAddr, Option<Instant>>>,
 }
 
 impl RecentPodClaims {
-    /// Record every non-terminal Pod observed now, then drop claims last seen
-    /// `grace` or longer ago.
+    /// Record every non-terminal Pod observed now, start the grace window of
+    /// every claim it no longer observes, then drop claims gone `grace` or
+    /// longer.
     fn refresh(&mut self, pods: &HashMap<PodKey, CorePod>, now: Instant, grace: Duration) {
+        // Mark every claim gone; re-observing it below clears the mark, so
+        // only a claim missing now starts (or keeps) its countdown.
+        for namespaces in self.ip_namespaces.values_mut() {
+            for gone_since in namespaces.values_mut() {
+                gone_since.get_or_insert(now);
+            }
+        }
+        for addresses in self.pod_addresses.values_mut() {
+            for gone_since in addresses.values_mut() {
+                gone_since.get_or_insert(now);
+            }
+        }
         for (key, pod) in pods {
             if pod.terminal {
                 continue;
@@ -401,31 +421,33 @@ impl RecentPodClaims {
                 };
                 match self.pod_addresses.get_mut(key) {
                     Some(addresses) => {
-                        addresses.insert(ip, now);
+                        addresses.insert(ip, None);
                     }
                     None => {
                         self.pod_addresses
-                            .insert(key.clone(), HashMap::from([(ip, now)]));
+                            .insert(key.clone(), HashMap::from([(ip, None)]));
                     }
                 }
                 if !pod.host_network {
                     let namespaces = self.ip_namespaces.entry(ip).or_default();
                     match namespaces.get_mut(&pod.namespace) {
-                        Some(seen) => *seen = now,
+                        Some(gone_since) => *gone_since = None,
                         None => {
-                            namespaces.insert(pod.namespace.clone(), now);
+                            namespaces.insert(pod.namespace.clone(), None);
                         }
                     }
                 }
             }
         }
-        let fresh = |seen: Instant| now.saturating_duration_since(seen) < grace;
+        let live = |gone_since: Option<Instant>| {
+            gone_since.is_none_or(|gone| now.saturating_duration_since(gone) < grace)
+        };
         self.ip_namespaces.retain(|_, namespaces| {
-            namespaces.retain(|_, seen| fresh(*seen));
+            namespaces.retain(|_, gone_since| live(*gone_since));
             !namespaces.is_empty()
         });
         self.pod_addresses.retain(|_, addresses| {
-            addresses.retain(|_, seen| fresh(*seen));
+            addresses.retain(|_, gone_since| live(*gone_since));
             !addresses.is_empty()
         });
     }
@@ -1095,7 +1117,8 @@ pub(super) fn endpoint_route_backends_for_service(
 /// [`endpoint_is_out_of_service`]). A Pod's IP claim outlives the Pod by
 /// [`POD_CLAIM_GRACE_WINDOW`] (see [`PodClaimInventory`]), so a terminating
 /// endpoint the EndpointSlice controller has not yet dropped still belongs to
-/// its Pod's namespace.
+/// its Pod's namespace. That memory is used only while the Pod watch scope
+/// covers every namespace.
 ///
 /// A `targetRef` is authored with the slice, so on its own it can only make an
 /// endpoint look worse. The one thing it can do for a selector-backed Service
@@ -1113,9 +1136,16 @@ pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
         .flat_map(|service| service.cluster_ips.iter())
         .filter_map(|ip| parse_endpoint_ip(ip.as_str()))
         .collect();
+    // With a restricted Pod watch scope an IP reused by an unwatched Pod
+    // would still look like the departed Pod's, so nothing is remembered.
     let inventory = &acc.options.pod_claim_inventory;
-    let mut recent = inventory.lock();
-    recent.refresh(&acc.core.pods, Instant::now(), inventory.grace);
+    let mut recent = acc
+        .options
+        .watches_every_pod_namespace()
+        .then(|| inventory.lock());
+    if let Some(recent) = recent.as_mut() {
+        recent.refresh(&acc.core.pods, Instant::now(), inventory.grace);
+    }
     let mut findings_by_service: BTreeMap<&K8sServiceKey, EndpointSliceFindings> = BTreeMap::new();
     for slice in &acc.core.endpoint_slices {
         let Some(service_key) = slice.guarded_service_key.as_ref() else {
@@ -1132,7 +1162,7 @@ pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
         }
         let attribution = EndpointAttribution {
             state: &acc.core,
-            recent: &recent,
+            recent: recent.as_deref(),
             cluster_ips: &cluster_ips,
             service_namespace: namespace,
             service_has_selector: service.has_selector,
@@ -1203,8 +1233,9 @@ enum EndpointAddress {
 /// The inventory one Service's endpoint addresses are judged against.
 struct EndpointAttribution<'a> {
     state: &'a CoreState,
-    /// Claims of Pods observed within [`POD_CLAIM_GRACE_WINDOW`].
-    recent: &'a RecentPodClaims,
+    /// Claims of Pods observed now or within [`POD_CLAIM_GRACE_WINDOW`];
+    /// `None` when the Pod watch scope is restricted.
+    recent: Option<&'a RecentPodClaims>,
     /// Every observed Service ClusterIP, in any namespace.
     cluster_ips: &'a HashSet<IpAddr>,
     service_namespace: &'a str,
@@ -1268,7 +1299,7 @@ impl EndpointAttribution<'_> {
         if let Some(namespaces) = self.state.pod_ip_namespaces.get(&ip) {
             return Some(namespaces.iter().all(|claimant| claimant == namespace));
         }
-        let namespaces = self.recent.ip_namespaces.get(&ip)?;
+        let namespaces = self.recent?.ip_namespaces.get(&ip)?;
         Some(namespaces.keys().all(|claimant| claimant == namespace))
     }
 
@@ -1290,8 +1321,7 @@ impl EndpointAttribution<'_> {
             return true;
         }
         self.recent
-            .pod_addresses
-            .get(pod_key)
+            .and_then(|recent| recent.pod_addresses.get(pod_key))
             .is_some_and(|addresses| addresses.contains_key(&ip))
     }
 

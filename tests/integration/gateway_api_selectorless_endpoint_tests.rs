@@ -464,11 +464,9 @@ fn payroll_slice(payroll_1: Value) -> K8sObject {
     ]))
 }
 
-#[test]
-fn deleted_pods_lingering_terminating_endpoint_is_attributed_within_the_grace_window() {
-    // A Pod leaves the Pod store before the EndpointSlice controller drops
-    // its terminating endpoint. Within the grace window the endpoint still
-    // belongs to the Pod's namespace; after it, it is unattributed.
+/// A selector-backed `tenant-a/payroll` with both Pods observed, then with
+/// `payroll-1` gone and its terminating endpoint still in the slice.
+fn grace_window_fixtures() -> (Vec<K8sObject>, Vec<K8sObject>) {
     let before = route_fixture(
         selector_service("10.96.0.60"),
         vec![
@@ -484,6 +482,15 @@ fn deleted_pods_lingering_terminating_endpoint_is_attributed_within_the_grace_wi
             pod("tenant-a", "payroll-0", "10.1.0.10"),
         ],
     );
+    (before, after)
+}
+
+#[test]
+fn deleted_pods_lingering_terminating_endpoint_is_attributed_within_the_grace_window() {
+    // A Pod leaves the Pod store before the EndpointSlice controller drops
+    // its terminating endpoint. Within the grace window the endpoint still
+    // belongs to the Pod's namespace; after it, it is unattributed.
+    let (before, after) = grace_window_fixtures();
 
     // A controller that never saw payroll-1 cannot attribute its address.
     assert_refused(&after, options(), "10.1.0.11");
@@ -496,6 +503,36 @@ fn deleted_pods_lingering_terminating_endpoint_is_attributed_within_the_grace_wi
     let forgetting = options().with_pod_claim_inventory(expired);
     assert_admitted(&before, forgetting.clone(), SERVICE_DNS);
     assert_refused(&after, forgetting, "10.1.0.11");
+}
+
+#[test]
+fn grace_window_counts_from_when_the_pod_leaves_the_inventory() {
+    // The last reconcile that saw payroll-1 ran longer than the window
+    // before the one that finds it gone: the window starts at that later
+    // reconcile, and later reconciles do not restart it.
+    let grace = Duration::from_secs(1);
+    let (before, after) = grace_window_fixtures();
+    let inventory = PodClaimInventory::with_grace_window(grace);
+    let remembering = options().with_pod_claim_inventory(inventory);
+
+    assert_admitted(&before, remembering.clone(), SERVICE_DNS);
+    std::thread::sleep(grace + grace / 2);
+    assert_admitted(&after, remembering.clone(), SERVICE_DNS);
+    assert_admitted(&after, remembering.clone(), SERVICE_DNS);
+    std::thread::sleep(grace + grace / 2);
+    assert_refused(&after, remembering, "10.1.0.11");
+}
+
+#[test]
+fn a_restricted_pod_watch_scope_remembers_no_claims() {
+    // Outside the scope a Pod could reuse the departed Pod's IP unobserved,
+    // so with a restricted scope the lingering endpoint is refused as before.
+    let (before, after) = grace_window_fixtures();
+    let restricted = options()
+        .with_pod_source_namespaces(vec!["tenant-a".to_string()])
+        .with_pod_claim_inventory(PodClaimInventory::new());
+    assert_admitted(&before, restricted.clone(), SERVICE_DNS);
+    assert_refused(&after, restricted, "10.1.0.11");
 }
 
 #[test]

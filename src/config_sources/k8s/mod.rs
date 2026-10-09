@@ -401,6 +401,11 @@ impl K8sTranslationOptions {
             .as_ref()
             .is_none_or(|namespaces| namespaces.contains(namespace))
     }
+
+    /// Whether the Pod watch scope covers every namespace (issue #6108).
+    fn watches_every_pod_namespace(&self) -> bool {
+        self.pod_source_namespaces.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
