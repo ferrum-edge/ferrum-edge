@@ -31,7 +31,10 @@ fn assert_staging_files_gone(dir: &Path) {
             name.ends_with(".tmp") || name.ends_with(".install")
         })
         .collect();
-    assert!(leftovers.is_empty(), "staging files left behind: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "staging files left behind: {leftovers:?}"
+    );
 }
 
 #[test]
