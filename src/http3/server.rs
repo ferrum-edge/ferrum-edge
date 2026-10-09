@@ -5130,7 +5130,8 @@ async fn handle_h3_request(
                     &mut plugin_execution_ns,
                     &original_request_path,
                     "client_disconnect_buffered_h3_upload",
-                ).await;
+                )
+                .await;
                 return Err(error.into());
             }
             // The winner was captured where BOTH instants were known, so a late
@@ -6947,7 +6948,8 @@ async fn handle_h3_request(
                         &mut plugin_execution_ns,
                         &original_request_path,
                         "client_disconnect_buffered_h3_upload",
-                    ).await;
+                    )
+                    .await;
                     return Err(error.into());
                 }
                 // The winner was captured where BOTH instants were known, so a
@@ -9478,7 +9480,8 @@ async fn handle_h3_request(
                     &mut plugin_execution_ns,
                     &original_request_path,
                     "client_disconnect_buffered_h3_upload",
-                ).await;
+                )
+                .await;
                 return Err(error.into());
             }
             // The winner was captured where BOTH instants were known, so a late
