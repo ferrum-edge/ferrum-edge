@@ -1,21 +1,10 @@
 {
-  "enabled": false,
-  "name": "5588-h2-grpc-adaptive-observation",
-  "protocol": ["http2", "grpcs"],
-  "h2_campaign": {
-    "pairs": 4,
-    "duration": 15,
-    "concurrency": 200,
-    "payload_sizes": {"http2": [71680], "grpcs": [10240, 71680]}
-  },
+  "enabled": true,
+  "name": "6063-h2-shards",
+  "protocol": ["http2"],
   "arms": [
-    {
-      "gateway": "ferrum",
-      "FERRUM_EXTRA_ENV": "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true FERRUM_LOG_LEVEL=warn,ferrum_h2_observe=debug FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 FERRUM_ADMIN_HTTP_PORT=9000"
-    },
-    {
-      "gateway": "ferrum-exp-fixed",
-      "FERRUM_EXTRA_ENV": "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false FERRUM_LOG_LEVEL=warn,ferrum_h2_observe=debug FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 FERRUM_ADMIN_HTTP_PORT=9000"
-    }
+    {"gateway": "ferrum", "FERRUM_EXTRA_ENV": "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=4"},
+    {"gateway": "ferrum-exp-cph1", "FERRUM_EXTRA_ENV": "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1"},
+    {"gateway": "ferrum-exp-cph2", "FERRUM_EXTRA_ENV": "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=2"}
   ]
 }
