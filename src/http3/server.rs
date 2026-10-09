@@ -383,6 +383,19 @@ impl std::fmt::Display for H3UploadReadError {
 
 impl std::error::Error for H3UploadReadError {}
 
+impl H3UploadReadError {
+    /// A peer reset/STOP_SENDING or closed transport is a cancelled upload.
+    /// Locally detected frame/header violations retain their malformed-input
+    /// classification; an operator body-read timeout is a separate outer error.
+    pub(crate) fn is_client_disconnect(&self) -> bool {
+        match self {
+            Self::Stream(error) => {
+                crate::http3::stream_util::h3_request_read_error_is_client_abort(error)
+            }
+        }
+    }
+}
+
 /// Drain an H3 request-body recv half into an admitted, capped buffer.
 ///
 /// The buffer and its charge live inside this future, so timeout/deadline
@@ -569,6 +582,8 @@ fn boxed_finalize_h3_dispatch_body_refusal<'a>(
             start_time,
             plugin_execution_ns,
             request_path,
+            "on_final_request_body",
+            false,
         )
         .await;
         send_h3_plugin_reject_flavor_aware(
@@ -651,6 +666,8 @@ async fn finalize_h3_terminal_body_read_rejection(
         start_time,
         plugin_execution_ns,
         request_path,
+        "on_final_request_body",
+        false,
     )
     .await
 }
@@ -670,6 +687,8 @@ async fn finalize_h3_terminal_body_rejection_with_headers(
     start_time: std::time::Instant,
     plugin_execution_ns: &mut u64,
     request_path: &str,
+    phase: &str,
+    client_disconnected: bool,
 ) -> FinalizedH3TerminalBodyRejection {
     ctx.metadata.insert(
         RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
@@ -705,22 +724,95 @@ async fn finalize_h3_terminal_body_rejection_with_headers(
     *plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;
     let log_status =
         h3_reject_log_status_and_metadata(ctx, http_flavor, http_status, &body, &headers);
-    log_rejected_request_with_path(
-        plugins,
-        ctx,
-        log_status,
-        start_time,
-        "on_final_request_body",
-        *plugin_execution_ns,
-        Some(request_path),
-    )
-    .await;
+    if client_disconnected {
+        crate::proxy::log_client_disconnect_rejection_with_path(
+            plugins,
+            ctx,
+            log_status,
+            start_time,
+            phase,
+            *plugin_execution_ns,
+            Some(request_path),
+        )
+        .await;
+    } else {
+        log_rejected_request_with_path(
+            plugins,
+            ctx,
+            log_status,
+            start_time,
+            phase,
+            *plugin_execution_ns,
+            Some(request_path),
+        )
+        .await;
+    }
     record_request(state, log_status);
     FinalizedH3TerminalBodyRejection {
         http_status,
         headers,
         body,
     }
+}
+
+/// Keep failed-read finalization out of the generic H3 request future's frame.
+/// The stream has already failed, but ownership and transaction logging must
+/// still complete even when no response can reach the client.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_h3_upload_read_failure<'a>(
+    state: &'a ProxyState,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    http_flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&'a str>,
+    error: &'a H3UploadReadError,
+    start_time: std::time::Instant,
+    plugin_execution_ns: &'a mut u64,
+    request_path: &'a str,
+    disconnect_phase: &'static str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let disconnected = error.is_client_disconnect();
+        let (status, body, grpc_status, message, phase) = if disconnected {
+            (
+                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                br#"{"error":"Client disconnected"}"#.as_slice(),
+                crate::proxy::grpc_proxy::grpc_status::CANCELLED,
+                "Client disconnected",
+                disconnect_phase,
+            )
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"Malformed request body"}"#.as_slice(),
+                crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                "Malformed request body",
+                "invalid_h3_upload",
+            )
+        };
+        let mut headers = HashMap::new();
+        if matches!(http_flavor, HttpFlavor::Grpc) || grpc_web_response_content_type.is_some() {
+            headers.insert("grpc-status".to_string(), grpc_status.to_string());
+            headers.insert("grpc-message".to_string(), message.to_string());
+        }
+        let _ = finalize_h3_terminal_body_rejection_with_headers(
+            state,
+            plugins,
+            ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            status,
+            headers,
+            Bytes::from_static(body),
+            start_time,
+            plugin_execution_ns,
+            request_path,
+            phase,
+            disconnected,
+        )
+        .await;
+    })
 }
 
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
@@ -4494,6 +4586,19 @@ async fn handle_h3_request(
             }
             Err(H3RequestBodyReadError::Read(error)) => {
                 halt_cancelled_h3_upload(&mut stream);
+                boxed_finalize_h3_upload_read_failure(
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    &error,
+                    start_time,
+                    &mut plugin_execution_ns,
+                    &path,
+                    "client_disconnect_buffered_h3_upload",
+                )
+                .await;
                 return Err(error.into());
             }
             // The winner was captured where BOTH instants were known, so a late
@@ -4709,6 +4814,19 @@ async fn handle_h3_request(
                 }
                 Err(H3RequestBodyReadError::Read(error)) => {
                     halt_cancelled_h3_upload(&mut stream);
+                    boxed_finalize_h3_upload_read_failure(
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type,
+                        &error,
+                        start_time,
+                        &mut plugin_execution_ns,
+                        &path,
+                        "client_disconnect_buffered_h3_upload",
+                    )
+                    .await;
                     return Err(error.into());
                 }
                 // The winner was captured where BOTH instants were known, so a
@@ -5001,6 +5119,19 @@ async fn handle_h3_request(
             }
             Err(H3RequestBodyReadError::Read(error)) => {
                 halt_cancelled_h3_upload(&mut stream);
+                boxed_finalize_h3_upload_read_failure(
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    &error,
+                    start_time,
+                    &mut plugin_execution_ns,
+                    &path,
+                    "client_disconnect_buffered_h3_upload",
+                )
+                .await;
                 return Err(error.into());
             }
             // The winner was captured where BOTH instants were known, so a late
@@ -6236,18 +6367,17 @@ async fn handle_h3_request(
                 }
                 Err(H3RequestBodyReadError::Read(error)) => {
                     halt_cancelled_h3_upload(&mut stream);
-                    let status = StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST);
-                    let _ = finalize_h3_terminal_body_read_rejection(
+                    boxed_finalize_h3_upload_read_failure(
                         &state,
                         &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
-                        status,
-                        Bytes::from_static(br#"{"error":"Client disconnected"}"#),
+                        &error,
                         start_time,
                         &mut plugin_execution_ns,
                         &original_request_path,
+                        "client_disconnect_terminal_request_body",
                     )
                     .await;
                     return Err(error.into());
@@ -6807,6 +6937,19 @@ async fn handle_h3_request(
                 Err(H3RequestBodyReadError::Read(error)) => {
                     halt_cancelled_h3_upload(&mut stream);
                     cb_probe.release_neutral();
+                    boxed_finalize_h3_upload_read_failure(
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type,
+                        &error,
+                        start_time,
+                        &mut plugin_execution_ns,
+                        &original_request_path,
+                        "client_disconnect_buffered_h3_upload",
+                    )
+                    .await;
                     return Err(error.into());
                 }
                 // The winner was captured where BOTH instants were known, so a
@@ -7596,6 +7739,19 @@ async fn handle_h3_request(
                                 false,
                                 backend_start.elapsed(),
                             );
+                            boxed_finalize_h3_upload_read_failure(
+                                &state,
+                                &plugins,
+                                &mut ctx,
+                                http_flavor,
+                                grpc_web_response_content_type,
+                                &error,
+                                start_time,
+                                &mut plugin_execution_ns,
+                                &original_request_path,
+                                "client_disconnect_buffered_h3_upload",
+                            )
+                            .await;
                             return Err(error.into());
                         }
                         // The winner was captured where BOTH instants were
@@ -9313,6 +9469,19 @@ async fn handle_h3_request(
             Err(H3RequestBodyReadError::Read(error)) => {
                 halt_cancelled_h3_upload(&mut stream);
                 cb_probe.release_neutral();
+                boxed_finalize_h3_upload_read_failure(
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    &error,
+                    start_time,
+                    &mut plugin_execution_ns,
+                    &original_request_path,
+                    "client_disconnect_buffered_h3_upload",
+                )
+                .await;
                 return Err(error.into());
             }
             // The winner was captured where BOTH instants were known, so a late
