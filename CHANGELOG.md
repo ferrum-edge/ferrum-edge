@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The scheduled scaling verifier's positive self-test places run identity checks
+  in its production section, matching the production-only admission rule. Event,
+  repository and workflow-path checks remain required before scaling runs.
+
 - H3 live socket-lifecycle observers recognize Linux 7.0's `sockaddr_unsized`
   pointer in `inet_bind`, while retaining exact argument, return and pointer
   checks. Synthetic BTF regressions reject unrelated or changed signatures.
