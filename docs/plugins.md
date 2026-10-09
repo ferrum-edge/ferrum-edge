@@ -6307,8 +6307,10 @@ route also carries a `cors` plugin that answers preflights (one without
 `preflight_continue`): it invokes no gRPC method, and browser gRPC-Web cannot
 start without it, so it reaches that `cors` plugin as before. The preflight must
 have no body on every protocol: no `Transfer-Encoding`, `Content-Length` absent
-or `0`, and on HTTP/2 and HTTP/3 a request stream that ends with no DATA frame.
-An exempted preflight is never forwarded to the backend: if no plugin answers
+or `0`, and on HTTP/2 and HTTP/3 a request stream that ends with no DATA frame
+(HTTP/3 waits at most 2 seconds for that end, or the route's
+`backend_read_timeout_ms` when it is shorter). An exempted preflight is never
+forwarded to the backend: if no plugin answers
 it (for example `cors` forwards an unmatched preflight with
 `unmatched_preflights: forward`, or a trigger skips `cors`), it gets the same
 `403` / `route_protocol_admission` refusal. Serve plain HTTP endpoints such as

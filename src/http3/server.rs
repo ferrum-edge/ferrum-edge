@@ -3964,9 +3964,10 @@ async fn handle_h3_request(
         .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
         .then(|| h3_grpc_intended_refusal_exempts(&req, request_protocol, grpc_web_request, caps));
     // HTTP/3 may carry DATA with no `Content-Length`, so the declared framing
-    // proves nothing: the request stream must also END with no DATA frame.
-    // An exempted preflight is answered by `cors` or refused after the
-    // `on_request_received` phase; it is never forwarded upstream.
+    // proves nothing: the request stream must also END with no DATA frame,
+    // within a fixed small wait. An exempted preflight is answered by `cors`
+    // or refused after the `on_request_received` phase; it is never
+    // forwarded upstream.
     let read_timeout_ms = proxy.backend_read_timeout_ms;
     let cors_preflight_exempted = omitted_policy_exemption == Some(true)
         && boxed_h3_request_stream_ends_without_data(&mut stream, read_timeout_ms).await;
@@ -11150,24 +11151,51 @@ fn h3_grpc_intended_refusal_exempts(
         && crate::proxy::is_cors_preflight_request(req.method(), req.headers())
 }
 
+/// Fixed ceiling, in milliseconds, on how long the H3 dispatcher waits for an
+/// exempted CORS preflight's request stream to end (issue #6110).
+///
+/// The wait runs before any plugin (rate limiting, IP restriction, and `cors`
+/// itself all run later), so it must not depend on the route: the route's
+/// `backend_read_timeout_ms` is a backend upload-stall knob (default 30 s, `0`
+/// = unbounded) and can only shorten this bound. A browser sends a preflight's
+/// FIN with its HEADERS frame, so the wait normally ends at once.
+pub(crate) const H3_PREFLIGHT_END_OF_STREAM_WAIT_MS: u64 = 2_000;
+
 /// Whether the H3 request stream ENDS with no DATA frame: the transport proof
 /// that an exempted CORS preflight carries no body (issue #6110). HTTP/3 allows
 /// DATA without `Content-Length`, so the declared framing alone is not enough.
-/// A DATA frame (even an empty one), a stream error, or no FIN within the
-/// route's `backend_read_timeout_ms` (`0` = unbounded, the same body-read
-/// contract as every H3 upload) is not proof, and the preflight is then
-/// refused like the rest of the view. Built out of line and boxed so the
-/// timer and receive futures do not widen `handle_h3_request`'s frame.
+/// `recv_data` is the stream's next-DATA future: `Ok(None)` is the FIN. A DATA
+/// frame (even an empty one), a stream error, or no FIN within
+/// `min(backend_read_timeout_ms, H3_PREFLIGHT_END_OF_STREAM_WAIT_MS)` (the
+/// fixed cap alone when the route's timeout is `0`) is not proof, and the
+/// preflight is then refused like the rest of the view.
+pub(crate) async fn h3_request_stream_ends_without_data<F, B, E>(
+    recv_data: F,
+    backend_read_timeout_ms: u64,
+) -> bool
+where
+    F: std::future::Future<Output = Result<Option<B>, E>>,
+{
+    let wait_ms = match backend_read_timeout_ms {
+        0 => H3_PREFLIGHT_END_OF_STREAM_WAIT_MS,
+        ms => ms.min(H3_PREFLIGHT_END_OF_STREAM_WAIT_MS),
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_millis(wait_ms), recv_data).await,
+        Ok(Ok(None))
+    )
+}
+
+/// [`h3_request_stream_ends_without_data`] over the live request stream.
+/// Built out of line and boxed so the timer and receive futures do not widen
+/// `handle_h3_request`'s frame.
 #[inline(never)]
 fn boxed_h3_request_stream_ends_without_data(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    read_timeout_ms: u64,
+    backend_read_timeout_ms: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
     Box::pin(async move {
-        matches!(
-            collect_h3_request_body_with_timeout(stream.recv_data(), read_timeout_ms).await,
-            Ok(None)
-        )
+        h3_request_stream_ends_without_data(stream.recv_data(), backend_read_timeout_ms).await
     })
 }
 

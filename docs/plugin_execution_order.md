@@ -2045,8 +2045,11 @@ policy. One request is exempt: a CORS preflight (`OPTIONS` with `Origin` and
 body" holds on every protocol: no `Transfer-Encoding`, `Content-Length` absent
 or `0`, and on HTTP/2 and HTTP/3 a request stream that ends with no DATA frame
 (HTTP/3 may send DATA without `Content-Length`, so the declared framing alone
-does not count). A browser preflights every cross-origin gRPC-Web call, the
-preflight carries no gRPC `Content-Type`, and it invokes no gRPC method, so it
+does not count). HTTP/3 waits at most 2 seconds for that end, or the route's
+`backend_read_timeout_ms` when it is shorter; a stream that has not ended by
+then gets the refusal. A browser ends the preflight's stream with its headers,
+so the wait costs it nothing. A browser preflights every cross-origin gRPC-Web
+call, the preflight carries no gRPC `Content-Type`, and it invokes no gRPC method, so it
 runs the route's HTTP plugins (`cors` among them) as before. An exempted
 preflight is never forwarded to the backend: if no plugin answered it by the
 end of `on_request_received` (`cors` forwards an unmatched preflight under

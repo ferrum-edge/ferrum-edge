@@ -16131,6 +16131,27 @@ pub mod _test_support {
         }
     }
 
+    /// The fixed cap on the H3 CORS preflight end-of-stream wait (issue #6110).
+    pub const H3_PREFLIGHT_END_OF_STREAM_WAIT_MS: u64 =
+        crate::http3::server::H3_PREFLIGHT_END_OF_STREAM_WAIT_MS;
+
+    /// Run the H3 CORS preflight end-of-stream proof (issue #6110) exactly as
+    /// the dispatcher does, over a stand-in for the request stream's next-DATA
+    /// future (`Ok(None)` is the FIN, `Ok(Some(_))` a DATA frame).
+    pub async fn h3_request_stream_ends_without_data_for_test<F>(
+        recv_data: F,
+        backend_read_timeout_ms: u64,
+    ) -> bool
+    where
+        F: std::future::Future<Output = Result<Option<bytes::Bytes>, ()>>,
+    {
+        crate::http3::server::h3_request_stream_ends_without_data(
+            recv_data,
+            backend_read_timeout_ms,
+        )
+        .await
+    }
+
     // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
 
     pub use crate::k8s_controller::reconciler::{

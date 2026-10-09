@@ -7085,6 +7085,25 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
             listener.port,
         );
         let proxy = if listener.is_stream_family() {
+            // The dedicated bind honors the same "HTTP wins a shared port"
+            // rule as the capture table and the CONNECT remap (issue #6110):
+            // relaying it would hand a direct client an opaque byte stream to
+            // the HTTP listener's application socket.
+            if crate::modes::mesh::config::ingress_http_listener_serves_endpoint_port(
+                listeners.iter().copied(),
+                listener.endpoint_port,
+            ) {
+                warn!(
+                    local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                    listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                    endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                    "Sidecar ingress[] stream listener with a dedicated bind forwards to the same \
+                     application port as an HTTP listener; the HTTP route wins the port, so no \
+                     dedicated bind listener is materialized for it. Give it a distinct \
+                     defaultEndpoint port"
+                );
+                continue;
+            }
             let Ok(backend_ip) = listener.endpoint_host.parse::<std::net::IpAddr>() else {
                 continue;
             };
