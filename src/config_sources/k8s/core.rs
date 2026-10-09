@@ -337,8 +337,9 @@ pub const POD_CLAIM_GRACE_WINDOW: Duration = Duration::from_secs(60);
 /// controller marks a Pod's endpoint that way before the Pod leaves the API,
 /// and nothing but kube-proxy's no-ready-endpoint fallback dials one. A
 /// claim's window starts at the first refresh that no longer observes it,
-/// however long ago the Pod was last observed. Memory is bounded by the Pods observed now plus those that left
-/// within the window; every refresh prunes the expired claims.
+/// however long ago the Pod was last observed. Memory is bounded by the Pods
+/// observed now plus those that left within the window; every refresh prunes
+/// the expired claims.
 #[derive(Clone)]
 pub struct PodClaimInventory {
     grace: Duration,
