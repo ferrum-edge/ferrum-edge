@@ -358,14 +358,17 @@ impl Plugin for DeferredCorsPlugin {
 /// How [`crate::plugins::is_builtin_plugin`] sees a plugin type this cache owns
 /// (issue #6022).
 pub(crate) enum CacheOwnedPlugin<'a> {
-    /// A cache-internal built-in sentinel.
+    /// A cache-internal built-in type: the route-dispatch finalizer sentinel,
+    /// or a capability stand-in candidate admission builds in place of a
+    /// configured built-in, so admission sees the built-in standing the
+    /// runtime instance will have.
     Sentinel,
     /// A wrapper whose declarations are the wrapped instance's.
     Wraps(&'a (dyn Plugin + 'static)),
 }
 
-/// Classify `plugin` when it is one of this cache's own wrapper or sentinel
-/// types. Keyed on the concrete type, so no other plugin can claim it.
+/// Classify `plugin` when it is one of this cache's own wrapper, sentinel, or
+/// stand-in types. Keyed on the concrete type, so no other plugin can claim it.
 pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwnedPlugin<'_>> {
     if let Some(wrapper) = plugin.downcast_ref::<PluginInstanceWrapper>() {
         return Some(CacheOwnedPlugin::Wraps(wrapper.inner.as_ref()));
@@ -373,9 +376,11 @@ pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwne
     if let Some(wrapper) = plugin.downcast_ref::<DeferredCorsPlugin>() {
         return Some(CacheOwnedPlugin::Wraps(wrapper.inner.as_ref()));
     }
-    plugin
-        .is::<MeshRouteDispatchFinalizer>()
-        .then_some(CacheOwnedPlugin::Sentinel)
+    let builtin = plugin.is::<MeshRouteDispatchFinalizer>()
+        || plugin.is::<CompositionShapePlugin>()
+        || plugin.is::<ServerlessSecurityCompositionPlugin>()
+        || plugin.is::<FinalizedRequestPolicyCompositionPlugin>();
+    builtin.then_some(CacheOwnedPlugin::Sentinel)
 }
 
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
@@ -388,9 +393,9 @@ fn warn_if_cors_ws_origin_policy_gap(proxy: &Proxy, merged: &[Arc<dyn Plugin>]) 
     if !proxy.allowed_ws_origins.is_empty() {
         return;
     }
-    let has_strict_cors = merged
-        .iter()
-        .any(|plugin| plugin.name() == CORS_NAME && plugin.cors_uses_strict_origin_policy());
+    let has_strict_cors = merged.iter().any(|plugin| {
+        is_builtin_named(plugin, CORS_NAME) && plugin.cors_uses_strict_origin_policy()
+    });
     if !has_strict_cors {
         return;
     }
@@ -2314,13 +2319,16 @@ const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
 
 /// Composition errors for plugins that admit at most one effective instance on
 /// a proxy after global/proxy/proxy_group merge.
-fn exclusive_effective_instance_errors(merged: &[Arc<dyn Plugin>], proxy_id: &str) -> Vec<String> {
+pub(crate) fn exclusive_effective_instance_errors(
+    merged: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+) -> Vec<String> {
     EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS
         .iter()
         .filter_map(|(plugin_name, reason)| {
             let count = merged
                 .iter()
-                .filter(|plugin| plugin.name() == *plugin_name)
+                .filter(|plugin| is_builtin_named(plugin, plugin_name))
                 .count();
             (count > 1).then(|| {
                 format!(
@@ -4496,7 +4504,7 @@ impl Plugin for CompositionShapePlugin {
     }
 }
 
-fn composition_shape_plugin(config: &PluginConfig) -> Option<Arc<dyn Plugin>> {
+pub(crate) fn composition_shape_plugin(config: &PluginConfig) -> Option<Arc<dyn Plugin>> {
     let metadata = crate::plugins::builtin_plugin_parity_meta(&config.plugin_name)?;
     if metadata.classification == crate::plugins::BuiltinPluginClassification::ConfigOnly {
         return None;
@@ -4717,7 +4725,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                 continue;
             };
             if !is_istio_route_transform_consumer(plugin_config, &proxy.id) {
-                remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
+                remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin);
             }
             merged.push(Arc::clone(plugin));
         }
@@ -4746,26 +4754,87 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     }
 }
 
+/// Drop the global instances a scoped plugin replaces on one proxy.
 fn remove_shadowed_global_plugin(
     plugins: &mut Vec<Arc<dyn Plugin>>,
     global_ptrs: &HashSet<usize>,
+    scoped: &Arc<dyn Plugin>,
+) {
+    let builtin = crate::plugins::is_builtin_plugin(scoped.as_ref());
+    remove_shadowed_globals(plugins, global_ptrs, scoped.name(), builtin);
+}
+
+/// [`remove_shadowed_global_plugin`] for a scoped config that built no
+/// instance (an omitted optional plugin), keyed on its registered name.
+fn remove_shadowed_global_plugin_by_name(
+    plugins: &mut Vec<Arc<dyn Plugin>>,
+    global_ptrs: &HashSet<usize>,
     plugin_name: &str,
+) {
+    let builtin = crate::plugins::is_builtin_plugin_name(plugin_name);
+    remove_shadowed_globals(plugins, global_ptrs, plugin_name, builtin);
+}
+
+/// A scoped instance replaces the globals that report its name AND share its
+/// built-in standing. Standing follows the registered type, so a custom plugin
+/// reporting a built-in name cannot remove that built-in's global policy, and a
+/// built-in never removes a custom global that reports the same name (issue
+/// #6022).
+fn remove_shadowed_globals(
+    plugins: &mut Vec<Arc<dyn Plugin>>,
+    global_ptrs: &HashSet<usize>,
+    plugin_name: &str,
+    builtin: bool,
 ) {
     // Size policy is conjunctive, not replaceable configuration. Retain a
     // global limiter beside same-name scoped instances so every hook remains
     // active and the precomputed route ceiling can fold all configured bounds
     // to their minimum. Letting a looser scoped instance shadow a stricter
-    // global one would silently relax a security boundary.
-    if matches!(
+    // global one would silently relax a security boundary. The exception is
+    // the registered built-in limiters': a custom plugin reporting one of
+    // these names follows the ordinary same-standing rule below.
+    let size_limit = matches!(
         plugin_name,
         "request_size_limiting" | "response_size_limiting"
-    ) {
+    );
+    if builtin && size_limit {
         return;
     }
     plugins.retain(|plugin| {
         plugin.name() != plugin_name
             || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
+            || crate::plugins::is_builtin_plugin(plugin.as_ref()) != builtin
     });
+}
+
+/// Test hook: merge `scoped` over `globals` the way every chain build does.
+pub(crate) fn shadow_global_plugins_for_test(
+    globals: &[Arc<dyn Plugin>],
+    scoped: &Arc<dyn Plugin>,
+) -> Vec<Arc<dyn Plugin>> {
+    let mut merged = globals.to_vec();
+    let global_ptrs: HashSet<usize> = merged
+        .iter()
+        .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
+        .collect();
+    remove_shadowed_global_plugin(&mut merged, &global_ptrs, scoped);
+    merged.push(Arc::clone(scoped));
+    merged
+}
+
+/// Test hook: drop the `globals` that a scoped `plugin_name` config which
+/// built no instance replaces, the way every chain build does.
+pub(crate) fn shadow_global_plugins_by_name_for_test(
+    globals: &[Arc<dyn Plugin>],
+    plugin_name: &str,
+) -> Vec<Arc<dyn Plugin>> {
+    let mut merged = globals.to_vec();
+    let global_ptrs: HashSet<usize> = merged
+        .iter()
+        .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
+        .collect();
+    remove_shadowed_global_plugin_by_name(&mut merged, &global_ptrs, plugin_name);
+    merged
 }
 
 /// Whether this is the exact no-static-rules transformer instance emitted by
@@ -5290,11 +5359,22 @@ fn compute_node_waypoint_destination_authz_ready(
         Some(entry) => entry
             .plugins
             .iter()
-            .filter(|p| p.name() == "mesh_authz")
+            .filter(|plugin| is_builtin_named(plugin, "mesh_authz"))
             .count(),
         None => 0,
     };
     node_waypoint_destination_authz_ready_from_counts(managed, enabled_global, built)
+}
+
+/// Test hook: the NodeWaypoint destination-authz readiness `config` gets when
+/// its prebuilt global chain is `globals` (issue #6022).
+pub(crate) fn node_waypoint_destination_authz_ready_over_globals_for_test(
+    config: &GatewayConfig,
+    globals: &[Arc<dyn Plugin>],
+) -> bool {
+    let tcp = build_protocol_entry(globals, globals, ProxyProtocol::Tcp);
+    let global = HashMap::from([(ProxyProtocol::Tcp, tcp)]);
+    compute_node_waypoint_destination_authz_ready(config, &global)
 }
 
 // ---------------------------------------------------------------------------
@@ -5447,6 +5527,16 @@ fn build_protocol_entry(
 
 const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
 
+/// Whether `plugin` is one of the registered native-gRPC policies the composed
+/// gRPC-Web view runs. Keyed on the built-in type, so a custom plugin
+/// reporting one of these names neither joins the view nor exempts it from
+/// the admission refusal (issue #6022).
+fn is_grpc_web_native_policy(plugin: &Arc<dyn Plugin>) -> bool {
+    H3_GRPC_WEB_NATIVE_POLICY_PLUGINS
+        .iter()
+        .any(|name| is_builtin_named(plugin, name))
+}
+
 fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     // The merged proxy list is already in configured priority/config order.
     // Filtering it once preserves that order, retains every ordinary HTTP
@@ -5457,7 +5547,7 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
             .iter()
             .filter(|plugin| {
                 plugin.supported_protocols().contains(&ProxyProtocol::Http)
-                    || (H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+                    || (is_grpc_web_native_policy(plugin)
                         && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
             })
             .cloned()
@@ -5489,7 +5579,7 @@ fn grpc_web_view_omits_grpc_admission_policy(plugins: &[Arc<dyn Plugin>]) -> boo
         plugin.gates_request_admission()
             && protocols.contains(&ProxyProtocol::Grpc)
             && !protocols.contains(&ProxyProtocol::Http)
-            && !H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+            && !is_grpc_web_native_policy(plugin)
     })
 }
 
@@ -5714,17 +5804,15 @@ fn start_background_tasks(
 /// Release staged workers and publish process-global sink state after the
 /// generation has been installed. Must stay infallible and idempotent.
 fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
+    let generation = || {
+        globals
+            .iter()
+            .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
+    };
     let mut committed = HashSet::new();
-    let mut saw_api_chargeback = false;
-    for plugin in globals
-        .iter()
-        .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
-    {
+    for plugin in generation() {
         let pointer = Arc::as_ptr(plugin) as *const () as usize;
         if committed.insert(pointer) {
-            if plugin.name() == "api_chargeback" {
-                saw_api_chargeback = true;
-            }
             plugin.commit_background_tasks();
         }
     }
@@ -5732,9 +5820,21 @@ fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin
     // enabled api_chargeback exists. A generation with zero instances has no
     // plugin callback, so publish absence explicitly after atomic installation
     // (never during candidate construction/validation).
-    if !saw_api_chargeback {
+    if !includes_api_chargeback(generation()) {
         crate::plugins::api_chargeback::publish_render_schema_absence();
     }
+}
+
+/// Whether `plugins` include a registered `api_chargeback`, whose commit
+/// publishes the `/charges` projection. A custom plugin reporting that name
+/// publishes nothing, so it must not suppress the absence publication (issue
+/// #6022).
+pub(crate) fn includes_api_chargeback<'a>(
+    plugins: impl IntoIterator<Item = &'a Arc<dyn Plugin>>,
+) -> bool {
+    plugins
+        .into_iter()
+        .any(|plugin| is_builtin_named(plugin, "api_chargeback"))
 }
 
 // All plugin-cache state swapped as a single unit so a single load observes
@@ -5867,14 +5967,30 @@ fn build_proxy_lifecycle_generations_with_advances(
     Ok((next, high))
 }
 
+/// The global chain without its registered `adaptive_concurrency` instances,
+/// which an adaptive-only rebuild replaces. A custom plugin reporting that
+/// name is not one of them and keeps its place (issue #6022).
+pub(crate) fn globals_without_adaptive_concurrency(
+    globals: &[Arc<dyn Plugin>],
+) -> Vec<Arc<dyn Plugin>> {
+    globals
+        .iter()
+        .filter(|plugin| !is_builtin_named(plugin, "adaptive_concurrency"))
+        .cloned()
+        .collect()
+}
+
 /// Whether the effective set of `proxy_alerts` instances changed for one
 /// continuously present proxy. This catches proxy-group leave/rejoin without
 /// resetting alert ownership for unrelated edits to the same proxy.
-fn proxy_alerts_instances_changed(previous: &[Arc<dyn Plugin>], next: &[Arc<dyn Plugin>]) -> bool {
+pub(crate) fn proxy_alerts_instances_changed(
+    previous: &[Arc<dyn Plugin>],
+    next: &[Arc<dyn Plugin>],
+) -> bool {
     let instance_ids = |plugins: &[Arc<dyn Plugin>]| -> HashSet<usize> {
         plugins
             .iter()
-            .filter(|plugin| plugin.name() == "proxy_alerts")
+            .filter(|plugin| is_builtin_named(plugin, "proxy_alerts"))
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
             .collect()
     };
@@ -7421,12 +7537,7 @@ impl PluginCache {
             // Route compatibility can require a fresh global adaptive view
             // without any global PluginConfig changing. Replace only those
             // wrappers so unrelated stateful globals retain their Arc/state.
-            let mut global_plugins = current
-                .global_plugins
-                .iter()
-                .filter(|plugin| plugin.name() != "adaptive_concurrency")
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut global_plugins = globals_without_adaptive_concurrency(&current.global_plugins);
             for pc in &config.plugin_configs {
                 if !pc.enabled
                     || pc.scope != PluginScope::Global
@@ -7615,14 +7726,14 @@ impl PluginCache {
                                     remove_shadowed_global_plugin(
                                         &mut merged,
                                         &global_ptrs,
-                                        plugin.name(),
+                                        &plugin,
                                     );
                                 }
                                 merged.push(plugin);
                             }
                             Ok(None) => {
                                 if !is_istio_route_transform_consumer(pc, &proxy.id) {
-                                    remove_shadowed_global_plugin(
+                                    remove_shadowed_global_plugin_by_name(
                                         &mut merged,
                                         &global_ptrs,
                                         &pc.plugin_name,
@@ -7652,7 +7763,7 @@ impl PluginCache {
                 if let Some(pc) = proxy_group_configs.get(&group_identity) {
                     if let Some(existing) = group_plugin_instances.get(&group_identity) {
                         let plugin = Arc::clone(&existing.plugin);
-                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
+                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                         merged.push(plugin);
                     } else {
                         match try_create_plugin_for_cache(
@@ -7675,15 +7786,11 @@ impl PluginCache {
                                         config: (*pc).clone(),
                                     },
                                 );
-                                remove_shadowed_global_plugin(
-                                    &mut merged,
-                                    &global_ptrs,
-                                    plugin.name(),
-                                );
+                                remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
                             }
                             Ok(None) => {
-                                remove_shadowed_global_plugin(
+                                remove_shadowed_global_plugin_by_name(
                                     &mut merged,
                                     &global_ptrs,
                                     &pc.plugin_name,
@@ -8412,14 +8519,14 @@ impl PluginCache {
                                     remove_shadowed_global_plugin(
                                         &mut merged,
                                         &global_ptrs,
-                                        plugin.name(),
+                                        &plugin,
                                     );
                                 }
                                 merged.push(plugin);
                             }
                             Ok(None) => {
                                 if !is_istio_route_transform_consumer(pc, &proxy.id) {
-                                    remove_shadowed_global_plugin(
+                                    remove_shadowed_global_plugin_by_name(
                                         &mut merged,
                                         &global_ptrs,
                                         &pc.plugin_name,
@@ -8444,7 +8551,7 @@ impl PluginCache {
                     if let Some(existing) = group_plugin_instances.get(&group_identity) {
                         // Reuse the shared instance (Arc::clone is ~5ns)
                         let plugin = Arc::clone(&existing.plugin);
-                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
+                        remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                         merged.push(plugin);
                     } else {
                         // First proxy to reference this group plugin — create the instance
@@ -8468,15 +8575,11 @@ impl PluginCache {
                                         config: (*pc).clone(),
                                     },
                                 );
-                                remove_shadowed_global_plugin(
-                                    &mut merged,
-                                    &global_ptrs,
-                                    plugin.name(),
-                                );
+                                remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
                             }
                             Ok(None) => {
-                                remove_shadowed_global_plugin(
+                                remove_shadowed_global_plugin_by_name(
                                     &mut merged,
                                     &global_ptrs,
                                     &pc.plugin_name,

@@ -135,11 +135,29 @@ Each proxy's effective plugin list is built by merging global, proxy-scoped, and
 3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
+A scoped instance replaces only a global of the same kind: a built-in replaces
+a built-in, and a custom plugin replaces a custom plugin. Built-in standing
+follows the plugin's registered type, never the name it reports, so a custom
+plugin whose `name()` returns a built-in name (for example `rate_limiting`)
+does not remove that built-in's global instance, and a scoped built-in does
+not remove a custom global that reports its name (issue #6022). Both instances
+then run on the proxy, so the merged chain must still pass the composition
+checks: a reload that would put, for example, a custom late header mutator
+beside a retained `request_deduplication` or `response_caching` global is
+refused. The plugin cache's other per-plugin lookups key on the registered type
+the same way: the single-instance checks (`api_chargeback`,
+`api_chargeback_sink`, `load_testing`), the NodeWaypoint `mesh_authz` readiness
+count, the native-gRPC policies the composed gRPC-Web view runs
+(`grpc_method_router`, `grpc_deadline`), and the adaptive-concurrency,
+`/charges`, `proxy_alerts`, `workload_metrics`, and CORS bookkeeping.
+
 **Size-limit exception:** `request_size_limiting` and
 `response_size_limiting` policies are conjunctive security boundaries. Their
 same-name global and scoped instances all remain active and compose to the
 strictest (minimum) configured limit; a looser scoped instance cannot replace
-or relax a stricter global instance.
+or relax a stricter global instance. The exception covers the registered
+built-in limiters only: a custom plugin that reports one of these names
+follows the ordinary rule above.
 
 **Chargeback exception:** `api_chargeback` follows the same merge steps, but
 the resulting effective list may contain **at most one** instance per proxy,

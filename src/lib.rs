@@ -1523,6 +1523,76 @@ pub mod _test_support {
         crate::plugin_cache::install_mesh_route_dispatch_finalizer(plugins)
     }
 
+    /// Merge one scoped instance over `globals` the way every plugin-chain
+    /// build does, dropping the globals it shadows (issue #6022).
+    pub fn shadow_global_plugins_for_test(
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        scoped: &std::sync::Arc<dyn crate::plugins::Plugin>,
+    ) -> Vec<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::shadow_global_plugins_for_test(globals, scoped)
+    }
+
+    /// Drop the `globals` that a scoped `plugin_name` config which built no
+    /// instance replaces, the way every plugin-chain build does (issue #6022).
+    pub fn shadow_global_plugins_by_name_for_test(
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        plugin_name: &str,
+    ) -> Vec<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::shadow_global_plugins_by_name_for_test(globals, plugin_name)
+    }
+
+    /// The at-most-one-effective-instance errors a proxy's merged chain raises.
+    pub fn exclusive_effective_instance_errors_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+    ) -> Vec<String> {
+        crate::plugin_cache::exclusive_effective_instance_errors(plugins, proxy_id)
+    }
+
+    /// The topology-only stand-in candidate admission builds for a built-in
+    /// config, or `None` when it builds none.
+    pub fn composition_shape_plugin_for_test(
+        config: &crate::config::types::PluginConfig,
+    ) -> Option<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::composition_shape_plugin(config)
+    }
+
+    /// The NodeWaypoint destination-authz readiness `config` gets when its
+    /// prebuilt global chain is `globals` (issue #6022).
+    pub fn node_waypoint_destination_authz_ready_over_globals_for_test(
+        config: &crate::config::types::GatewayConfig,
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::plugin_cache::node_waypoint_destination_authz_ready_over_globals_for_test(
+            config, globals,
+        )
+    }
+
+    /// The global chain an adaptive-only rebuild keeps before it rebuilds the
+    /// `adaptive_concurrency` instances (issue #6022).
+    pub fn globals_without_adaptive_concurrency_for_test(
+        globals: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> Vec<std::sync::Arc<dyn crate::plugins::Plugin>> {
+        crate::plugin_cache::globals_without_adaptive_concurrency(globals)
+    }
+
+    /// Whether a generation of `plugins` keeps the `/charges` projection
+    /// published instead of publishing its absence (issue #6022).
+    pub fn includes_api_chargeback_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::plugin_cache::includes_api_chargeback(plugins)
+    }
+
+    /// Whether the effective `proxy_alerts` instances differ between two
+    /// chains of one proxy, which resets alert ownership (issue #6022).
+    pub fn proxy_alerts_instances_changed_for_test(
+        previous: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        next: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> bool {
+        crate::plugin_cache::proxy_alerts_instances_changed(previous, next)
+    }
+
     /// Whether an incremental rebuild of `proxy_ids_to_rebuild` / globals would
     /// reconstruct an active `ai_response_guard` with a node-local descriptor.
     pub fn ai_response_guard_descriptor_preload_required_for_test(

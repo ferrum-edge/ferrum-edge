@@ -27,7 +27,18 @@ paths:
 - Plugins have `id`, `config`, optional `priority_override`, and a priority where lower runs first.
 - Scopes are `global`, `proxy`, and `proxy_group`.
 - Multiple instances per proxy are allowed.
-- A proxy/group-scoped plugin replaces a same-named global for that proxy.
+- A proxy/group-scoped plugin replaces a same-named global of the SAME built-in
+  standing for that proxy (issue #6022): built-in replaces built-in, custom
+  replaces custom. Standing is the registered type (`is_builtin_plugin`, a
+  `TypeId` check that looks through the cache's wrappers), never `name()`; a
+  custom plugin reporting a built-in name neither removes that built-in global
+  nor is removed by a scoped built-in. Every other per-plugin lookup in
+  `src/plugin_cache.rs` keys on standing too (`is_builtin_named`), and
+  `builtin_plugin_trust_tests.rs` scans that file for any other `.name()` use
+  outside a diagnostic macro — add new legitimate uses to its commented
+  allowlist, never a bare name comparison. The size-limit conjunctive
+  exception applies to the registered `request_size_limiting` /
+  `response_size_limiting` only.
 - Multiple scoped instances of the same type may coexist.
 - Exception: `api_chargeback` admits at most one effective instance per proxy
   after merge (shared `/charges` registry is exactly-once) and requires every
