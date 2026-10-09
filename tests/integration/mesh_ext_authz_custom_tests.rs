@@ -1553,19 +1553,16 @@ fn seen_proxy_hops(seen: &str) -> Vec<String> {
 }
 
 /// A CUSTOM check carries the request's gateway hop count (`received + 1`) as
-/// exactly one `X-Ferrum-Hops` field line, replacing a forwarded copy an
-/// `includeRequestHeadersInCheck` entry names, so a provider that resolves
-/// back to the gateway is refused at the proxy hop limit like a looping route
-/// (issue #6128). With the limit disabled the forwarded value is unchanged.
+/// exactly one `X-Ferrum-Hops` field line, so a provider that resolves back to
+/// the gateway is refused at the proxy hop limit like a looping route (issue
+/// #6128). A provider cannot name `x-ferrum-*` for forwarding (refused at
+/// admission), so a client copy never reaches the check; with the limit
+/// disabled the check carries no hop field at all.
 #[tokio::test]
 async fn a_check_carries_the_proxy_hop_count() {
-    for (proxy_hops, expected) in [(Some(5), "5"), (None, "1")] {
+    for (proxy_hops, expected) in [(Some(5), vec!["5".to_string()]), (None, Vec::new())] {
         let stub = start_stub(StubBehavior::Allow).await;
-        let mut hop_provider = provider(stub.port);
-        hop_provider
-            .include_request_headers_in_check
-            .push("x-ferrum-hops".to_string());
-        let executor = executor(vec![hop_provider]);
+        let executor = executor(vec![provider(stub.port)]);
         let mut headers = request_headers();
         headers.insert("x-ferrum-hops".to_string(), "1".to_string());
         let accumulator = AtomicU64::new(0);
@@ -1592,7 +1589,7 @@ async fn a_check_carries_the_proxy_hop_count() {
         let seen = stub.last_request.lock().expect("stub request").clone();
         assert_eq!(
             seen_proxy_hops(&seen),
-            vec![expected.to_string()],
+            expected,
             "proxy_hops={proxy_hops:?}"
         );
     }

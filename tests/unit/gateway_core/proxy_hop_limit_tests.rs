@@ -836,32 +836,64 @@ async fn copied_hop_fields_are_replaced_not_duplicated() {
 }
 
 /// Every plugin that makes an HTTP call on behalf of the current request
-/// stamps the hop count through the one shared helper (issue #6128). Any
-/// plugin source that charges a request's plugin-call accumulator
-/// (`execute_*tracked*`) is request-scoped by construction and must be listed,
-/// so a new request-scoped caller cannot ship without the stamp.
+/// stamps the hop count through the one shared helper (issue #6128).
+///
+/// Any `src/plugins/**` source with an outbound call site (`.execute*(` or
+/// reqwest's `.send()`, on a non-comment line) must be classified: either
+/// request-scoped, which must stamp on a code line and pins its call-site
+/// count, or deliberately not request-scoped (sinks and shared cache
+/// refreshes). A new call site in a request-scoped file changes the pinned
+/// count, so it cannot ship without someone deciding whether it stamps; an
+/// unclassified file fails outright.
 #[test]
 fn every_request_scoped_plugin_call_stamps_the_hop_count() {
-    const REQUEST_SCOPED_PLUGIN_SOURCES: &[&str] = &[
-        "src/plugins/ai_federation.rs",
-        "src/plugins/ai_semantic_cache.rs",
-        "src/plugins/ai_semantic_firewall.rs",
-        "src/plugins/ai_tool_governor.rs",
-        "src/plugins/load_testing.rs",
-        "src/plugins/mcp_gateway.rs",
-        "src/plugins/mesh/ext_authz.rs",
-        "src/plugins/oauth2_introspection.rs",
-        "src/plugins/oidc_relying_party.rs",
-        "src/plugins/opa.rs",
-        "src/plugins/request_mirror.rs",
-        "src/plugins/serverless_function.rs",
+    // (source, outbound call sites). Sites beyond the stamped ones are the
+    // documented shared refreshes: `ai_federation`'s Vertex token grant and
+    // the `oauth2_introspection` / `oidc_relying_party` discovery fetches.
+    // `mcp_gateway` funnels its four calls through one stamping builder;
+    // `load_testing` and `request_mirror` build each call in one place.
+    const REQUEST_SCOPED_PLUGIN_SOURCES: &[(&str, usize)] = &[
+        ("src/plugins/ai_federation.rs", 2),
+        ("src/plugins/ai_semantic_cache.rs", 1),
+        ("src/plugins/ai_semantic_firewall.rs", 1),
+        ("src/plugins/ai_tool_governor.rs", 1),
+        ("src/plugins/load_testing.rs", 2),
+        ("src/plugins/mcp_gateway.rs", 4),
+        ("src/plugins/mesh/ext_authz.rs", 1),
+        ("src/plugins/oauth2_introspection.rs", 2),
+        ("src/plugins/oidc_relying_party.rs", 3),
+        ("src/plugins/opa.rs", 1),
+        ("src/plugins/request_mirror.rs", 2),
+        ("src/plugins/serverless_function.rs", 1),
     ];
+    // Batch / background sinks and shared, coalesced cache refreshes: no
+    // single request's count to carry (docs/plugins.md, "Plugin HTTP calls
+    // and the proxy hop limit"). `utils/http_client.rs` is the transport the
+    // others call into.
+    const NOT_REQUEST_SCOPED_SOURCES: &[&str] = &[
+        "src/plugins/ai_transcript_audit.rs",
+        "src/plugins/api_chargeback_sink.rs",
+        "src/plugins/http_logging.rs",
+        "src/plugins/jwks_auth.rs",
+        "src/plugins/loki_logging.rs",
+        "src/plugins/otel_tracing.rs",
+        "src/plugins/spec_expose.rs",
+        "src/plugins/utils/http_client.rs",
+        "src/plugins/utils/jwks_store.rs",
+    ];
+    const STAMP_CALL: &str = "hop_limit::stamp_plugin_call_proxy_hops(";
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for path in REQUEST_SCOPED_PLUGIN_SOURCES {
+    for (path, expected_sites) in REQUEST_SCOPED_PLUGIN_SOURCES {
         let source = std::fs::read_to_string(root.join(path)).unwrap();
         assert!(
-            source.contains("hop_limit::stamp_plugin_call_proxy_hops("),
+            code_lines(&source).any(|line| line.contains(STAMP_CALL)),
             "{path} makes request-scoped plugin calls and must stamp X-Ferrum-Hops"
+        );
+        assert_eq!(
+            plugin_call_sites(&source),
+            *expected_sites,
+            "{path}: the outbound call sites changed; stamp every request-scoped call \
+             through hop_limit::stamp_plugin_call_proxy_hops, then update the pinned count"
         );
     }
 
@@ -873,18 +905,50 @@ fn every_request_scoped_plugin_call_stamps_the_hop_count() {
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        if relative == "src/plugins/utils/http_client.rs" {
+        let source = std::fs::read_to_string(&file).unwrap();
+        if plugin_call_sites(&source) == 0 {
             continue;
         }
-        let source = std::fs::read_to_string(&file).unwrap();
-        if source.contains(".execute_tracked(") || source.contains(".execute_redacted_tracked") {
-            assert!(
-                REQUEST_SCOPED_PLUGIN_SOURCES.contains(&relative.as_str()),
-                "{relative} charges a request's plugin-call accumulator; list it and stamp \
-                 X-Ferrum-Hops through hop_limit::stamp_plugin_call_proxy_hops"
-            );
-        }
+        let request_scoped = REQUEST_SCOPED_PLUGIN_SOURCES
+            .iter()
+            .any(|(path, _)| *path == relative);
+        let not_request_scoped = NOT_REQUEST_SCOPED_SOURCES.contains(&relative.as_str());
+        assert!(
+            request_scoped != not_request_scoped,
+            "{relative} makes outbound calls; list it as request-scoped (and stamp \
+             X-Ferrum-Hops through hop_limit::stamp_plugin_call_proxy_hops) or as \
+             deliberately not request-scoped, exactly once"
+        );
     }
+}
+
+/// Source lines that are not `//` comments (doc comments included).
+fn code_lines(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+}
+
+/// Outbound plugin-call sites on code lines: every `.execute*(` (the
+/// `PluginHttpClient` and reqwest entry points) and every `.send()`.
+fn plugin_call_sites(source: &str) -> usize {
+    code_lines(source)
+        .map(|line| line.matches(".send()").count() + execute_calls(line))
+        .sum()
+}
+
+fn execute_calls(line: &str) -> usize {
+    line.match_indices(".execute")
+        .filter(|(index, name)| {
+            line[index + name.len()..]
+                .trim_start_matches(is_identifier_tail)
+                .starts_with('(')
+        })
+        .count()
+}
+
+fn is_identifier_tail(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'
 }
 
 fn copied_hop_headers() -> Vec<(String, String)> {

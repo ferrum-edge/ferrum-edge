@@ -5817,6 +5817,15 @@ fn parse_semantic_config(
             "ai_semantic_cache: `semantic_embedding_auth_header` must be a valid HTTP header name"
                 .to_string()
         })?;
+    // The embedding call carries the gateway's hop count as exactly one field
+    // line (issue #6128); a credential under that name (any case, `_` or `-`)
+    // would sit beside it.
+    if crate::proxy::hop_limit::is_proxy_hops_header(auth_header.as_str()) {
+        return Err(
+            "ai_semantic_cache: `semantic_embedding_auth_header` must not be `X-Ferrum-Hops`; the gateway owns the proxy hop count"
+                .to_string(),
+        );
+    }
     reqwest::header::HeaderValue::from_str(&auth_scheme).map_err(|_| {
         "ai_semantic_cache: `semantic_embedding_auth_scheme` must be a valid HTTP header value"
             .to_string()

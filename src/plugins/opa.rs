@@ -926,6 +926,14 @@ fn parse_header_map(
                 "{plugin_name}: `{field}` must not include `content-type`; OPA decision requests are always sent as JSON"
             ));
         }
+        // The decision call carries the gateway's hop count as exactly one
+        // field line (issue #6128); a configured copy (any case, `_` or `-`)
+        // would sit beside it and reset or duplicate the count.
+        if field == "headers" && crate::proxy::hop_limit::is_proxy_hops_header(key) {
+            return Err(format!(
+                "{plugin_name}: `{field}` must not include `X-Ferrum-Hops`; the gateway owns the proxy hop count"
+            ));
+        }
         let header_value = HeaderValue::from_str(value).map_err(|error| {
             format!("{plugin_name}: invalid `{field}` value for {key:?}: {error}")
         })?;

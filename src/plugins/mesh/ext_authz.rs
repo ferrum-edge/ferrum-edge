@@ -758,9 +758,12 @@ impl MeshExtAuthzExecutor {
         {
             check_headers.insert(http::header::HOST, value);
         }
-        // The gateway's hop count replaces any forwarded copy: a
-        // `includeRequestHeadersInCheck` entry naming `x-ferrum-hops` must not
-        // leave a second field line beside it (issue #6128).
+        // The check carries exactly the gateway's hop count (issue #6128).
+        // Provider admission refuses every `x-ferrum-*` name (either `_` or
+        // `-` spelling) in `includeRequestHeadersInCheck` and
+        // `includeAdditionalHeadersInCheck`, so no forwarded or fixed copy can
+        // reach this map; the remove is defence-in-depth, one cheap lookup,
+        // so the stamp below can never sit beside a second field line.
         if request.proxy_hops.is_some() {
             check_headers.remove(crate::proxy::hop_limit::PROXY_HOPS_HEADER);
         }

@@ -8471,3 +8471,24 @@ async fn embedding_call_carries_the_proxy_hop_count() {
         assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
     }
 }
+
+/// `semantic_embedding_auth_header` cannot name the gateway-owned
+/// `X-Ferrum-Hops` field in any spelling: the embedding call stamps the
+/// request's hop count itself, so a credential under that name would sit
+/// beside it as a second field line (issue #6128).
+#[test]
+fn test_semantic_auth_header_cannot_name_the_proxy_hop_count() {
+    for name in ["X-Ferrum-Hops", "x_ferrum_hops", "X_FERRUM_HOPS"] {
+        let config = json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": "https://embeddings.example/v1/embeddings",
+            "semantic_embedding_api_key": "test-key",
+            "semantic_embedding_auth_header": name,
+        });
+        let error = match AiSemanticCache::new(&config, PluginHttpClient::default()) {
+            Ok(_) => panic!("auth header {name:?} must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("X-Ferrum-Hops"), "{name:?}: {error}");
+    }
+}
