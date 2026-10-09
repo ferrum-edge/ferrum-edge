@@ -167,7 +167,7 @@ depend on which stream a given image logs to.
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available). Every module (`consul`, `ldap`, `kafka`,
+`ubuntu-26.04` (Docker available). Every module (`consul`, `ldap`, `kafka`,
 `mysql`, `oidc`, `oauth2_introspection`, `clickhouse`, `host_port_allocation`,
 `container_start_retry`, `db_tls`) runs in one `cargo nextest run --no-fail-fast` invocation, which keeps
 per-test reporting and continues past a failing backend without a second

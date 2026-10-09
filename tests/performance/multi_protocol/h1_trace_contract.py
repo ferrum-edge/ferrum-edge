@@ -25,7 +25,7 @@ BOUNDS = dict(observer_rss_and_map_bytes=32 * 1024**2, map_reservation_bytes=8 *
               vectors=16, witnesses=4096, lifecycle_rows=8192, metadata_snapshots=64,
               fd_rows_per_snapshot=2048, threads=512)
 # Shared across repeat captures, separately from the raw trace-artifact bound.
-# The production-profile binary with line tables is about 658 MiB. Keep both
+# Production-profile binaries with line tables exceed 512 MiB. Keep both
 # acquisition and evidence reads bounded while retaining its actual mapped ELF.
 ELF_PACKAGE_BYTES = 1024 * 1024**2
 

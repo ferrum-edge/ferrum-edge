@@ -10,7 +10,7 @@
 #   Actions -> "Mesh Performance Baselines" -> Run workflow
 #   Optional suite filter: all | mesh | hbone | dns
 #
-# Runner is pinned to GitHub-hosted ubuntu-24.04 (no arbitrary / self-hosted
+# Runner is pinned to GitHub-hosted ubuntu-26.04 (no arbitrary / self-hosted
 # label input). Publication fails closed when selected-suite gates are false,
 # including undersampled E2E rows, missing DNS rows, malformed/duplicate
 # relevant blobs, unexpected DNS target identities, unsupported suite filters,
@@ -75,7 +75,7 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
   BENCH_BUILD_PROFILE: release
-  BENCH_RUNNER_CLASS: ubuntu-24.04
+  BENCH_RUNNER_CLASS: ubuntu-26.04
   BENCH_ITERATIONS: ${{ inputs.iterations || '3' }}
   BENCH_GATEWAY_FEATURES: default (no --features)
   BENCH_SUITES: ${{ inputs.suites || 'all' }}
@@ -84,7 +84,7 @@ env:
 jobs:
   collect:
     name: Collect mesh / HBONE / DNS baselines
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 240
 
     steps:

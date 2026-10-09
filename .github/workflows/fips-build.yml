@@ -146,7 +146,7 @@ env:
 jobs:
   feature-policy:
     name: FIPS Feature Policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # This job does not install sccache, so clear the checked-in rustc wrapper
     # from `.cargo/config.toml` rather than exec'ing a missing tool.
     env:
@@ -206,7 +206,7 @@ jobs:
 
   fips-plan:
     name: FIPS compile trigger
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
@@ -362,7 +362,7 @@ jobs:
     name: FIPS compile
     needs: fips-plan
     if: needs.fips-plan.outputs.relevant == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -846,7 +846,7 @@ jobs:
   fips-claimed-checks:
     name: FIPS claimed feature combinations (${{ matrix.shard_name }})
     needs: fips-compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -1414,7 +1414,7 @@ jobs:
   fips-clippy:
     name: FIPS clippy
     needs: fips-compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     # The same runner-memory signature issue #4018 documents on
     # `fips-test-build`, one job earlier in the graph: the dependency graph
@@ -1966,7 +1966,7 @@ jobs:
   fips-test-build:
     name: FIPS test binaries
     needs: fips-compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     # Issue #4018: the precompile step below is killed with
     # `exit code 143` and "The runner has received a shutdown signal" on a large
@@ -2645,7 +2645,7 @@ jobs:
   fips-test:
     name: FIPS tests
     needs: fips-test-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -2904,7 +2904,7 @@ jobs:
 
   fips-build:
     name: FIPS Build & Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs:
       - fips-plan
       - fips-compile

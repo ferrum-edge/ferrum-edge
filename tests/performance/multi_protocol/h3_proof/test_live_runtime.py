@@ -17,6 +17,34 @@ from live_contract import (FAMILIES, calibration, measurement_window, measuremen
 NS = 1_000_000_000
 
 
+class ObserverMemoryReservationTests(unittest.TestCase):
+    def test_hosted_ubuntu_26_observations_fit_and_remain_recorded(self):
+        # Run 37906469066: all four smoke arms and three idle fixtures exceeded
+        # the former 32 MiB RSS reservation before their measurement bracket.
+        for rss in (38965248, 38703104, 38739968, 38899712,
+                    38875136, 38817792, 38981632):
+            with self.subTest(rss=rss):
+                record = {}
+                live.observer_memory_checkpoint([SimpleNamespace(sample_cpu=lambda: rss)], record)
+                self.assertEqual(record['observer_peak_combined_rss_bytes'], rss)
+                reservation = record['observer_memory_reservation']
+                self.assertEqual(reservation['kernel_maps_bytes'], 32 * 1024 * 1024)
+                self.assertEqual(reservation['total_bytes'], 80 * 1024 * 1024)
+                self.assertFalse(reservation['kernel_allocator_overhead_measured'])
+
+    def test_combined_boundary_still_rejects_overflow_and_retains_peak(self):
+        cap = 48 * 1024 * 1024
+        record = {}
+        live.observer_memory_checkpoint([SimpleNamespace(sample_cpu=lambda: cap)], record)
+        with self.assertRaisesRegex(RuntimeError, 'observer_RSS_reservation_exceeded'):
+            live.observer_memory_checkpoint([
+                SimpleNamespace(sample_cpu=lambda: cap),
+                SimpleNamespace(sample_cpu=lambda: 1)], record)
+        self.assertEqual(record['observer_peak_combined_rss_bytes'], cap + 1)
+        live.observer_memory_checkpoint([SimpleNamespace(sample_cpu=lambda: 1)], record)
+        self.assertEqual(record['observer_peak_combined_rss_bytes'], cap + 1)
+
+
 class PassiveBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.phases = dict(measurement_secs=30, measurement_elapsed_secs=30,

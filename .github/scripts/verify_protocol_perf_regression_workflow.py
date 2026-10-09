@@ -342,8 +342,8 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        'runs-on: ubuntu-latest' in text or "runs-on: ubuntu-latest" in text,
-        "workflow must document/use ubuntu-latest runner class",
+        'runs-on: ubuntu-26.04' in text or "runs-on: ubuntu-26.04" in text,
+        "workflow must document/use ubuntu-26.04 runner class",
         failures,
     )
     require(
@@ -716,8 +716,8 @@ def validate_repository_contract(failures: list[str]) -> None:
             failures,
         )
         require(
-            budgets.get("runner_class") == "ubuntu-latest",
-            "budgets must document ubuntu-latest runner class",
+            budgets.get("runner_class") == "ubuntu-26.04",
+            "budgets must document ubuntu-26.04 runner class",
             failures,
         )
         require(
@@ -774,7 +774,7 @@ def validate_repository_contract(failures: list[str]) -> None:
     if RUNBOOK_PATH.is_file():
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
         require("ci-release" in runbook, "runbook must document ci-release profile", failures)
-        require("ubuntu-latest" in runbook, "runbook must document runner class", failures)
+        require("ubuntu-26.04" in runbook, "runbook must document runner class", failures)
         require(
             "alert" in runbook.lower(),
             "runbook must document alert/non-block budgets",
@@ -827,7 +827,7 @@ permissions:
   actions: read
 jobs:
   regress:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - uses: ./.github/actions/setup-rust-ci
@@ -835,6 +835,7 @@ jobs:
       - run: python3 tests/performance/multi_protocol/run_protocol_regression_scenarios.py
       - run: python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py
       - run: echo protocol_perf_budgets.json alert trends runner_health
+      - run: python3 -I .github/scripts/latest_trusted_scheduled_runs.py --self-test
       - run: python3 -I .github/scripts/latest_trusted_scheduled_runs.py --workflow protocol-perf-regression.yml --current-sha "$CURRENT_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
 """
@@ -846,7 +847,7 @@ on:
   workflow_dispatch:
 jobs:
   regress:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 """

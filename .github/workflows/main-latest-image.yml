@@ -69,7 +69,7 @@ jobs:
   resolve:
     name: Resolve main commit
     if: github.repository == 'ferrum-edge/ferrum-edge' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.path == '.github/workflows/ci.yml' && github.event.workflow_run.head_repository.full_name == github.repository
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -290,7 +290,7 @@ jobs:
     name: Verify publisher contract
     needs: resolve
     if: needs.resolve.outputs.publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -324,10 +324,10 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             platform: linux/amd64
             arch_dir: amd64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             platform: linux/arm64
             arch_dir: arm64
     steps:
@@ -398,10 +398,10 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             platform: linux/amd64
             arch_dir: amd64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             platform: linux/arm64
             arch_dir: arm64
     steps:
@@ -465,7 +465,7 @@ jobs:
     name: Publish main-sha manifest
     needs: [resolve, build, smoke]
     if: needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -534,7 +534,7 @@ jobs:
     name: Sign and attest main image
     needs: [resolve, contract, manifest]
     if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.contract.result == 'success' && needs.resolve.outputs.publish == 'true' && (needs.manifest.result == 'success' || (needs.manifest.result == 'skipped' && needs.resolve.outputs.build == 'false')) }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       id-token: write
@@ -900,7 +900,7 @@ jobs:
     name: Move latest to the verified digest
     needs: [resolve, contract, attest]
     if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.contract.result == 'success' && needs.attest.result == 'success' && needs.resolve.outputs.publish == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read

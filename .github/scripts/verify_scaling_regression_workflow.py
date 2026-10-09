@@ -567,6 +567,10 @@ SIGNAL_AUTHOR = "github-actions[bot]"
 "creator": SIGNAL_AUTHOR
 if login != SIGNAL_AUTHOR
 if head_branch != "main"
+TRUSTED_RUN_EVENTS = ("schedule", "workflow_dispatch")
+entry.get("event") != event
+head_repository.get("full_name") != repo
+entry.get("path") != f".github/workflows/{WORKFLOW_FILE}"
 def public_issue_reason
 close_blocked_by_recorded_generation
 def latest_run_on_main
@@ -596,10 +600,6 @@ missing head_branch is not on main
 fork run is not trusted
 pull request run is not trusted
 dispatched main run closes
-TRUSTED_RUN_EVENTS = ("schedule", "workflow_dispatch")
-entry.get("event") != event
-head_repository.get("full_name") != repo
-entry.get("path") != f".github/workflows/{WORKFLOW_FILE}"
 """
     signal_failures: list[str] = []
     validate_signal_text(good_signal, signal_failures)

@@ -45,7 +45,7 @@ RELEASE_GATE_FIELDS = (
 )
 RELEASE_GATE_NAME = "Validate release SHA"
 RELEASE_GATE_NEEDS = "validate-release-version"
-RELEASE_GATE_RUNS_ON = "ubuntu-latest"
+RELEASE_GATE_RUNS_ON = "ubuntu-26.04"
 RELEASE_GATE_TIMEOUT = "350"
 RELEASE_GATE_PERMISSIONS = (
     ("actions", "read"),
@@ -2032,12 +2032,12 @@ def _gate_inventory() -> dict:
 def _wrap_release_job(body: str) -> str:
     if not body.endswith("\n"):
         body += "\n"
-    return f"jobs:\n  {RELEASE_GATE_JOB}:\n{body}  next-job:\n    runs-on: ubuntu-latest\n"
+    return f"jobs:\n  {RELEASE_GATE_JOB}:\n{body}  next-job:\n    runs-on: ubuntu-26.04\n"
 
 
 _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
     needs: validate-release-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 350
     permissions:
       actions: read
@@ -2768,7 +2768,7 @@ def self_test() -> list[str]:
         "      - src/**\n"
         "jobs:\n"
         "  gate:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
     )
     expect(
         workflow_identity_errors(
@@ -2942,7 +2942,7 @@ def self_test() -> list[str]:
     release_quoted_before = (
         f'jobs:\n  "{RELEASE_GATE_JOB}":\n    name: Attack\n'
         f"  {RELEASE_GATE_JOB}:\n{_CONFORMING_RELEASE_JOB}"
-        "  next-job:\n    runs-on: ubuntu-latest\n"
+        "  next-job:\n    runs-on: ubuntu-26.04\n"
     )
     expect(
         release_gate_errors(release_quoted_before, _gate_inventory()) != [],

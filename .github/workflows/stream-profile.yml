@@ -48,7 +48,7 @@ permissions:
 jobs:
   stream-profile:
     name: stream profile / ${{ matrix.alpn }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     strategy:
       fail-fast: false

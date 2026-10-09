@@ -27,7 +27,7 @@ concurrency:
 jobs:
   contracts:
     name: Native cache envelope contracts and inert image round trip
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -59,7 +59,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       github.repository == 'ferrum-edge/ferrum-edge'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -96,7 +96,7 @@ jobs:
   anonymous-reader:
     name: Anonymous digest-pinned envelope reader on a fresh runner
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -139,7 +139,7 @@ jobs:
     name: Delete only this invocation's synthetic registry version
     needs: [publish, anonymous-reader]
     if: always() && needs.publish.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       packages: write

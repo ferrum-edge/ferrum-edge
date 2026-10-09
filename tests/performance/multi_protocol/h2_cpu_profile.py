@@ -217,6 +217,7 @@ def report(root):
     result['complete'] = not result['issues'] and all(not row['issues'] for row in result['observations'])
     result['limits'] = ['Shared-runner calibration; two pairs are diagnostic, not a throughput claim.',
                         'User stacks only; kernel cost comes from process CPU counters.',
+                        'Symbolized physical DWARF frames only; inline source frames are not expanded.',
                         'Unresolved/optimized-away/async frames remain explicit in CPU coverage.',
                         'Thread churn makes scheduler deltas unavailable instead of zero.']
     (root / 'h2-cpu-report.json').write_text(json.dumps(result, indent=2) + '\n')

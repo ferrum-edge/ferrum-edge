@@ -56,7 +56,7 @@ env:
 jobs:
   coverage-plan:
     name: Coverage Plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
       shards: ${{ steps.plan.outputs.shards }}
@@ -141,7 +141,7 @@ jobs:
     name: Coverage Shard (${{ matrix.shard }})
     needs: coverage-plan
     if: needs.coverage-plan.outputs.mode != 'skip'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # A cold/partial-cache lib + unit_tests llvm-cov invocation can exceed the
     # old 45- and 75-minute budgets even though warm shards normally finish
     # sooner. Keep the combined invocation so runner loss cannot discard the
@@ -491,7 +491,7 @@ jobs:
 
   coverage-merge:
     name: Merge Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     needs:
       - coverage-plan

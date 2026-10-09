@@ -30,7 +30,7 @@ concurrency:
 jobs:
   attest:
     name: Root merge-gate attestation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
