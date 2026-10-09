@@ -32,7 +32,6 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::config::types::HttpFlavor;
 use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::retry::ErrorClass;
-use std::collections::HashMap;
 
 /// `total_blocks` blocks of budget with a one-block fallback ceiling, so the
 /// floor (`Budget::new` raises the total to at least the fallback) does not
