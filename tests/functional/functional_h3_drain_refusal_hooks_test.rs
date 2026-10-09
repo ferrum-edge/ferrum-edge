@@ -434,6 +434,10 @@ fn assert_reject_hook_ran(answer: &Answer) {
 
 /// Wait for the transaction-log entry `stdout_logging` writes for the refusal.
 async fn wait_for_rejection_log(harness: &GatewayHarness) -> Value {
+    wait_for_rejection_phase(harness, REJECTION_PHASE).await
+}
+
+async fn wait_for_rejection_phase(harness: &GatewayHarness, expected_phase: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let logs = harness.captured_combined().unwrap_or_default();
@@ -443,14 +447,14 @@ async fn wait_for_rejection_log(harness: &GatewayHarness) -> Value {
             .find(|entry| {
                 let phase = entry.pointer("/metadata/rejection_phase");
                 entry.get("proxy_id").and_then(Value::as_str) == Some(PROXY_ID)
-                    && phase.and_then(Value::as_str) == Some(REJECTION_PHASE)
+                    && phase.and_then(Value::as_str) == Some(expected_phase)
             })
         {
             return entry;
         }
         assert!(
             Instant::now() < deadline,
-            "stdout_logging must log the refusal under rejection_phase {REJECTION_PHASE:?}; \
+            "stdout_logging must log the refusal under rejection_phase {expected_phase:?}; \
              logs:\n{logs}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -829,6 +833,10 @@ async fn h3_buffered_drain_refuses_a_reset_after_the_trailer_section() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     reset.cancel_request_upload();
     wait_for_log_line(&harness, REQUEST_ERROR_LOG).await;
+    let entry = wait_for_rejection_phase(&harness, "client_disconnect_buffered_h3_upload").await;
+    assert_eq!(entry["client_disconnected"], true);
+    assert_eq!(entry["error_class"], "client_disconnect");
+    assert_eq!(entry["response_status_code"], 499);
     assert_eq!(
         hits.load(Ordering::SeqCst),
         0,
@@ -854,6 +862,58 @@ async fn h3_buffered_drain_refuses_a_reset_after_the_trailer_section() {
         "only the upload that ended with FIN reaches the backend"
     );
     backend_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_upload_reset_is_cancelled_and_logged_before_write() {
+    let (backend_port, backend) = spawn_grpc_backend().await;
+    let mut proxy = base_proxy("https", backend_port);
+    proxy["response_body_mode"] = json!("buffer");
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(proxy, Vec::new()),
+        &[("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", ONE_BLOCK)],
+    )
+    .await;
+    let streams_before = backend.received_stream_count();
+    let mut upload =
+        open_upload_stream(&proxy_url(https_port, GRPC_PATH), "application/grpc").await;
+    upload
+        .send_raw_data(Bytes::from(grpc_frame(b"cancelled")))
+        .await
+        .expect("upload DATA");
+    // A reset can overtake unaccepted HEADERS and discard the entire stream.
+    // Observe the bridge's real upload reservation before cancelling, so this
+    // exercises an admitted body read and its terminal accounting.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = request_buffer_snapshot(&harness).await;
+        if snapshot["reserved_bytes"].as_u64() == Some(ONE_BLOCK_BYTES) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bridge must admit the upload before cancellation: {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    upload.cancel_request_upload();
+    let entry =
+        wait_for_rejection_phase(&harness, "client_disconnect_buffered_h3_bridge_upload").await;
+    let (status, headers) = upload.recv_response().await.expect("cancellation response");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(
+        headers.get(HOOK_HEADER).and_then(|v| v.to_str().ok()),
+        Some(HOOK_VALUE)
+    );
+    assert_eq!(entry["client_disconnected"], true);
+    assert_eq!(entry["error_class"], "client_disconnect");
+    assert_eq!(entry["metadata"]["grpc_status"], "1");
+    assert_eq!(backend.received_stream_count(), streams_before);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
