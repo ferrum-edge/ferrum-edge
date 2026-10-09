@@ -9475,7 +9475,13 @@ async fn provider_call_carries_the_proxy_hop_count() {
         let headers = json_headers();
         let result = run_federation_final_body(&federation, &mut ctx, &headers).await;
         assert!(
-            matches!(result, PluginResult::RejectBinary { status_code: 200, .. }),
+            matches!(
+                result,
+                PluginResult::RejectBinary {
+                    status_code: 200,
+                    ..
+                }
+            ),
             "expected the provider response, got {result:?}"
         );
 

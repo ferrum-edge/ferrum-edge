@@ -1541,7 +1541,9 @@ fn build_request(
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    Ok(crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(req, proxy_hops))
+    Ok(crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(
+        req, proxy_hops,
+    ))
 }
 
 async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) -> BodyConsumeOutcome {

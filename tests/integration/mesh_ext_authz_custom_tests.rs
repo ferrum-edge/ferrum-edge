@@ -251,10 +251,10 @@ async fn a_provider_denial_forwards_its_status_and_allow_listed_header_only() {
 #[tokio::test]
 async fn a_provider_timeout_fails_closed_with_status_on_error() {
     let stub = start_stub(StubBehavior::Hang).await;
-    let mut hop_provider = provider(stub.port);
+    let mut provider = provider(stub.port);
     provider.timeout_ms = 100;
     provider.status_on_error = 503;
-    let executor = executor(vec![hop_provider]);
+    let executor = executor(vec![provider]);
     let outcome = check(&executor, "sample-ext-authz", &request_headers()).await;
     match outcome {
         MeshExtAuthzOutcome::Deny { status, .. } => assert_eq!(status, 503),
@@ -265,10 +265,10 @@ async fn a_provider_timeout_fails_closed_with_status_on_error() {
 #[tokio::test]
 async fn a_provider_timeout_with_fail_open_continues() {
     let stub = start_stub(StubBehavior::Hang).await;
-    let mut hop_provider = provider(stub.port);
+    let mut provider = provider(stub.port);
     provider.timeout_ms = 100;
     provider.fail_open = true;
-    let executor = executor(vec![hop_provider]);
+    let executor = executor(vec![provider]);
     let outcome = check(&executor, "sample-ext-authz", &request_headers()).await;
     assert!(
         matches!(outcome, MeshExtAuthzOutcome::Allow { .. }),
