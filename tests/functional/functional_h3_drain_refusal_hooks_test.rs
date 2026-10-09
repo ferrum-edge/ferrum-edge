@@ -18,8 +18,12 @@
 //! mesh-tagged targets and stays covered by the `h3_retained_upload_tests`
 //! source guards.
 //!
-//! The last test proves the native-H3 buffered path returns its request-buffer
+//! A charge test proves the native-H3 buffered path returns its request-buffer
 //! charge before the response streams.
+//!
+//! The last test proves a buffered drain reads on past a trailer section to
+//! the stream's own end, so a client that resets after its trailers is
+//! refused instead of dispatched as a complete upload.
 //!
 //! Run with:
 //!
@@ -743,4 +747,92 @@ async fn h3_native_buffered_request_releases_its_charge_before_the_response_stre
             .is_err(),
         "the response must still be open while the charge reads released"
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// End of the request stream after a trailer section
+// ────────────────────────────────────────────────────────────────────────────
+
+/// What the gateway logs when a request task ends with a stream error.
+const REQUEST_ERROR_LOG: &str = "HTTP/3 request error";
+
+fn upload_trailers() -> HeaderMap {
+    let mut trailers = HeaderMap::new();
+    trailers.insert(
+        "x-upload-digest",
+        http::HeaderValue::from_static("sha-256=done"),
+    );
+    trailers
+}
+
+/// Wait until the gateway's captured output contains `needle`.
+async fn wait_for_log_line(harness: &GatewayHarness, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let logs = harness.captured_combined().unwrap_or_default();
+        if logs.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gateway must log {needle:?}; logs:\n{logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A trailer section ends the request body, not the request stream. A client
+/// that sends its trailers and then resets the stream instead of finishing it
+/// cancelled the request, so the buffered drain must read on to the stream's
+/// own end and refuse the upload rather than dispatch it as complete. The
+/// control upload on the same route, trailers then FIN, still reaches the
+/// backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_drain_refuses_a_reset_after_the_trailer_section() {
+    let (backend_port, hits, backend_task) = spawn_counting_http1_backend(UPLOAD_PATH).await;
+    let yaml = gateway_yaml(with_retry(base_proxy("http", backend_port)), Vec::new());
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let url = proxy_url(https_port, UPLOAD_PATH);
+
+    // The pause lets the gateway read the trailer section before the reset
+    // arrives: h3 surfaces a reset ahead of frames it still has buffered, which
+    // would refuse the upload without exercising the end-of-stream read.
+    let mut reset = open_upload_stream(&url, "application/octet-stream").await;
+    reset
+        .send_raw_data(Bytes::from_static(b"cancelled upload"))
+        .await
+        .expect("send upload");
+    reset
+        .send_request_trailers(upload_trailers())
+        .await
+        .expect("send trailers");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    reset.cancel_request_upload();
+    wait_for_log_line(&harness, REQUEST_ERROR_LOG).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a request reset after its trailer section must never reach the backend"
+    );
+    drop(reset);
+
+    let mut complete = open_upload_stream(&url, "application/octet-stream").await;
+    complete
+        .send_raw_data(Bytes::from_static(b"complete upload"))
+        .await
+        .expect("send upload");
+    complete
+        .send_request_trailers(upload_trailers())
+        .await
+        .expect("send trailers");
+    complete.finish().await.expect("finish upload");
+    let (status, _) = complete.recv_response().await.expect("response head");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "only the upload that ended with FIN reaches the backend"
+    );
+    backend_task.abort();
 }
