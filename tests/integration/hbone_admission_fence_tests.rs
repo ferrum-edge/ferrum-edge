@@ -1444,8 +1444,16 @@ async fn a_reload_that_adds_an_http_ingress_listener_on_the_endpoint_port_revoke
     let remap = ingress_listener(REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT, AppProtocol::Tcp);
     let kept = ingress_listener(KEPT_LISTENER_PORT, KEPT_ENDPOINT_PORT, AppProtocol::Tcp);
     let initial = ingress_remap_config(vec![remap.clone(), kept.clone()], 9701);
-    assert!(remap_admitted(&initial, REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT));
-    assert!(remap_admitted(&initial, KEPT_LISTENER_PORT, KEPT_ENDPOINT_PORT));
+    assert!(remap_admitted(
+        &initial,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
+    assert!(remap_admitted(
+        &initial,
+        KEPT_LISTENER_PORT,
+        KEPT_ENDPOINT_PORT
+    ));
     let state = build_state(initial);
 
     let shared_tunnel = admit_ingress_remap(&state, REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT);
@@ -1457,8 +1465,16 @@ async fn a_reload_that_adds_an_http_ingress_listener_on_the_endpoint_port_revoke
     // now one an HTTP listener also forwards to.
     let http = ingress_listener(HTTP_LISTENER_PORT, REMAP_ENDPOINT_PORT, AppProtocol::Http);
     let reloaded = ingress_remap_config(vec![remap, kept, http], 9702);
-    assert!(!remap_admitted(&reloaded, REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT));
-    assert!(remap_admitted(&reloaded, KEPT_LISTENER_PORT, KEPT_ENDPOINT_PORT));
+    assert!(!remap_admitted(
+        &reloaded,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
+    assert!(remap_admitted(
+        &reloaded,
+        KEPT_LISTENER_PORT,
+        KEPT_ENDPOINT_PORT
+    ));
     let outcome = state.update_config(reloaded);
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
@@ -1481,7 +1497,11 @@ async fn a_reload_that_adds_an_http_ingress_listener_on_the_endpoint_port_revoke
 async fn an_ingress_reload_that_leaves_the_mapping_intact_keeps_a_live_remap() {
     let remap = ingress_listener(REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT, AppProtocol::Tcp);
     let initial = ingress_remap_config(vec![remap.clone()], 9711);
-    assert!(remap_admitted(&initial, REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT));
+    assert!(remap_admitted(
+        &initial,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
     let state = build_state(initial);
     let fence = &state.hbone_admission_fence;
 
@@ -1494,7 +1514,11 @@ async fn an_ingress_reload_that_leaves_the_mapping_intact_keeps_a_live_remap() {
     // rule does not reach the remap's endpoint.
     let http = ingress_listener(HTTP_LISTENER_PORT, HTTP_ENDPOINT_PORT, AppProtocol::Http);
     let reloaded = ingress_remap_config(vec![remap, http], 9712);
-    assert!(remap_admitted(&reloaded, REMAP_LISTENER_PORT, REMAP_ENDPOINT_PORT));
+    assert!(remap_admitted(
+        &reloaded,
+        REMAP_LISTENER_PORT,
+        REMAP_ENDPOINT_PORT
+    ));
     let outcome = state.update_config(reloaded);
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
     wait_for_sweep_after(&state, completed_before).await;
