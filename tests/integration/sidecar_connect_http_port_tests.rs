@@ -25,7 +25,9 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort,
     WorkloadRef, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::{MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{
+    MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+};
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener_and_mesh_direction};
 
 use super::mesh_hbone_tests::{

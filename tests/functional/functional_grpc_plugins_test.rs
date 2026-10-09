@@ -1487,7 +1487,11 @@ plugin_configs:
         grpc_web.headers()
     );
     let _ = grpc_web.bytes().await.expect("gRPC-Web body");
-    assert_eq!(hits.echo(), 1, "the allowed gRPC-Web call reaches the backend");
+    assert_eq!(
+        hits.echo(),
+        1,
+        "the allowed gRPC-Web call reaches the backend"
+    );
 
     let denied = client
         .post(format!("{base}/api/my.EchoService/Limited"))
