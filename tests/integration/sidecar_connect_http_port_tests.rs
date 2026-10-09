@@ -22,9 +22,8 @@ use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ResolvedIngressListener,
-    ServicePort, SidecarIngressConnectRelay, Workload, WorkloadPort, WorkloadRef,
-    WorkloadSelector,
+    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ResolvedIngressListener, ServicePort,
+    SidecarIngressConnectRelay, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::{
     MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,

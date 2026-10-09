@@ -1186,7 +1186,10 @@ fn only_a_preflight_answering_cors_lets_a_grpc_intended_view_exempt_preflights()
         );
     }
     assert!(has("answers", PluginCapabilities::ANSWERS_CORS_PREFLIGHTS));
-    assert!(!has("forwards", PluginCapabilities::ANSWERS_CORS_PREFLIGHTS));
+    assert!(!has(
+        "forwards",
+        PluginCapabilities::ANSWERS_CORS_PREFLIGHTS
+    ));
     assert!(!has("no-cors", PluginCapabilities::ANSWERS_CORS_PREFLIGHTS));
 }
 
