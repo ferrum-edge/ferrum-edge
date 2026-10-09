@@ -82,6 +82,11 @@ class H1PerfStagingTests(unittest.TestCase):
 
 
 class H1BuildIDTests(unittest.TestCase):
+    def test_unknown_protocol_cannot_expand_the_elf_package(self):
+        for protocol in ('http3', 'h2', 1024, True, []):
+            with self.subTest(protocol=protocol), self.assertRaisesRegex(ValueError, 'protocol'):
+                trace.retain_dsos(0, '/not-opened', h2_protocol=protocol)
+
     def test_virtual_copy_requires_the_recorded_kernel_mapping(self):
         path = '/tmp/perf-vdso.so-gg5MgC'
         record = 'PERF_RECORD_MMAP2 3035/3035: [0x74361f239000(0x2000) @ 0 00:00 0 0]: r-xp [vdso]'
@@ -854,6 +859,39 @@ class H1DSOAcquisitionTests(unittest.TestCase):
             self.assertEqual(result['bytes'], len(self.payload))
             self.assertTrue(result['eh_frame'])
             self.assertEqual((self.destination / 'usr/lib/libfixture.so').read_bytes(), self.payload)
+
+    def test_symbolized_h2_elf_is_retained_and_reused_with_a_fixed_ceiling(self):
+        # A sparse mapped ELF reproduces the hosted >512 MiB size without a
+        # large in-memory fixture. All copy/hash/inode/reuse checks remain real.
+        size = 600 * 1024**2
+        with self.source.open('r+b') as stream:
+            stream.truncate(size)
+        mapping = self.mapping
+        maps = (f"0-1 r-xp 00000000 {mapping['device_major']:x}:{mapping['device_minor']:x} "
+                f"{mapping['inode']} {mapping['path']}\n")
+        original_open = os.open
+        def open_root(name, *args, **kwargs):
+            return original_open(self.root if name == '/proc/42/root' else name, *args, **kwargs)
+        with patch.object(trace, 'read_metadata', return_value=dict(text=maps, truncated=False)), \
+                patch.object(trace.os, 'open', side_effect=open_root):
+            h1 = trace.retain_dsos(42, self.destination)
+            self.assertFalse(h1['complete'])
+            self.assertEqual(h1['package_limit_bytes'], 512 * 1024**2)
+            self.assertIn('retained ELF package cap/size', ' '.join(h1['errors']))
+            for protocol in ('http2', 'grpcs'):
+                retained = trace.retain_dsos(42, self.destination, h2_protocol=protocol)
+                self.assertTrue(retained['complete'], retained['errors'])
+                self.assertEqual(retained['package_limit_bytes'], 1024**3)
+                self.assertEqual(retained['dsos'][0]['bytes'], size)
+                self.assertEqual(retained['dsos'][0]['inode'], mapping['inode'])
+                self.assertLess(retained['retained_package_bytes'], 1024**3)
+            h1 = trace.retain_dsos(42, self.destination)
+            self.assertIn('existing DSO package cap', ' '.join(h1['errors']))
+            with self.source.open('r+b') as stream:
+                stream.truncate(1024**3 + 1)
+            oversized = trace.retain_dsos(42, self.destination, h2_protocol='http2')
+            self.assertFalse(oversized['complete'])
+            self.assertIn('retained ELF package cap/size', ' '.join(oversized['errors']))
 
     def test_wrong_inode_regular_replacement_never_copies_unmapped_bytes(self):
         self.source.rename(self.source.with_suffix('.old'))

@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - H2/gRPC CPU qualification pulls its pinned Envoy comparison image before
   reusing the prebuilt Ferrum and harness binaries, and retains the resolved
   image identity. Fresh hosted runners no longer stop before their controls.
+  Its mapped-ELF package has a fixed 1 GiB ceiling for the measured 660.7 MiB
+  symbolized production binary. H1 retains its 512 MiB ceiling; mapped inode,
+  byte equality, build ID, deadline and shared-package checks remain enforced.
 
 - The scheduled scaling verifier's positive self-test places run identity checks
   in its production section, matching the production-only admission rule. Event,

@@ -749,8 +749,13 @@ def retain_mapped_elf(root, destination, mapping, budget, deadline):
                 os.close(target)
 
 
-def retain_dsos(pid, destination):
+def retain_dsos(pid, destination, *, h2_protocol=None):
     """Bounded mapped ELF diagnostics; unsupported mappings never use host libc."""
+    if h2_protocol is not None and h2_protocol not in ('http2', 'grpcs'):
+        raise ValueError('unknown DSO package protocol')
+    # The symbolized production H2 binary is about 661 MiB on Ubuntu 26.04.
+    # H1 keeps its existing ceiling; the admitted H2 extension has a fixed cap.
+    package_limit = (1024 if h2_protocol is not None else 512) * 1024**2
     if '..' in Path(destination).parts:
         raise ValueError('unsafe DSO destination traversal')
     raw = read_metadata(f'/proc/{pid}/maps')
@@ -773,7 +778,7 @@ def retain_dsos(pid, destination):
             errors.append(str(error))
     if len(mappings) > 128:
         return dict(complete=False, issue='DSO count bound', mappings=raw)
-    budget = dict(remaining=512 * 1024**2, package_remaining=512 * 1024**2)
+    budget = dict(remaining=package_limit, package_remaining=package_limit)
     deadline = time.monotonic() + 30
     # This one proc magic link is the admitted process's root. Subsequent source
     # and ALL destination components are descriptor-relative and no-follow.
@@ -782,7 +787,7 @@ def retain_dsos(pid, destination):
         root = os.open(f'/proc/{pid}/root', os.O_RDONLY | os.O_DIRECTORY)
         with directory_fd(Path(os.path.abspath(destination)), create=True) as target:
             # Include prior repeats and failed partial files in the shared package
-            # reservation. Never create a fresh per-repeat 512 MiB allowance.
+            # reservation. Never create a fresh per-repeat package allowance.
             entries = 0
             for _, directories, files, directory in os.fwalk('.', dir_fd=target, follow_symlinks=False):
                 for name in directories + files:
@@ -812,8 +817,9 @@ def retain_dsos(pid, destination):
         if root is not None:
             os.close(root)
     return dict(complete=not errors, errors=errors, mappings=raw, dsos=records,
-                acquired_elf_bytes=512 * 1024**2 - budget['remaining'],
-                retained_package_bytes=512 * 1024**2 - budget['package_remaining'],
+                package_limit_bytes=package_limit,
+                acquired_elf_bytes=package_limit - budget['remaining'],
+                retained_package_bytes=package_limit - budget['package_remaining'],
                 package_bytes_basis='existing files plus acquired bytes plus conservative decoder output reservations',
                 source='pinned target-root mapped device/inode; symlinks unsupported; never host libc substitution')
 
@@ -1314,7 +1320,7 @@ def supervise(args):
         # image, with unresolved/stripped symbols reported by the same decoder.
         symbol_package = builds / ('envoy' if envoy_cpu else str(Path(matches[0]).parent)) / 'symfs'
         result['symbol_package'] = str(symbol_package)
-        dsos = retain_dsos(owner['pid'], symbol_package) if mode == 'cpu' else {}
+        dsos = retain_dsos(owner['pid'], symbol_package, h2_protocol=h2_protocol) if mode == 'cpu' else {}
         write(out / 'build-mappings.json', dsos)
         # Do not attach even the initially-unbound BPF programs before admission.
         # Metadata acquisition can take time: check again immediately at attach,
