@@ -17,6 +17,11 @@ use crate::common::{TestGateway, ephemeral_port, spawn_http_identifying};
 
 const NAMESPACE: &str = "default";
 const ROUTE_HOST: &str = "store.example.test";
+/// The imported endpoint the slice names. Translation refuses a loopback
+/// endpoint in an imported slice (issue #6123), so the slice names this
+/// documentation address and the served config is then pointed at the
+/// loopback address the local backend listens on.
+const REMOTE_ENDPOINT: &str = "192.0.2.10";
 
 fn object(api_version: &str, kind: &str, name: &str, spec: Value) -> K8sObject {
     K8sObject {
@@ -57,7 +62,7 @@ fn service_import_snapshot(
         json!({
             "ports": [{ "port": backend_port }],
             "endpoints": [{
-                "addresses": ["127.0.0.1"],
+                "addresses": [REMOTE_ENDPOINT],
                 "conditions": { "ready": true }
             }]
         }),
@@ -65,6 +70,11 @@ fn service_import_snapshot(
     endpoint_slice.metadata.labels.insert(
         "multicluster.kubernetes.io/service-name".to_string(),
         "store".to_string(),
+    );
+    // Expansion uses only slices the MCS controller marks as its own.
+    endpoint_slice.metadata.labels.insert(
+        "endpointslice.kubernetes.io/managed-by".to_string(),
+        "mcs-controller.example.io".to_string(),
     );
 
     vec![
@@ -129,7 +139,7 @@ fn translated_config_yaml(backend_port: u16, listener_port: u16, protocol: &str)
     .expect("ServiceImport snapshot should translate");
 
     if protocol == "TCP" {
-        assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
+        assert_eq!(translated.config.proxies[0].backend_host, REMOTE_ENDPOINT);
         assert_eq!(translated.config.proxies[0].backend_port, backend_port);
     } else {
         let dispatch = translated
@@ -152,6 +162,7 @@ fn translated_config_yaml(backend_port: u16, listener_port: u16, protocol: &str)
         "upstreams": translated.config.upstreams,
     }))
     .expect("serialize translated gateway config")
+    .replace(REMOTE_ENDPOINT, "127.0.0.1")
 }
 
 async fn start_gateway(backend_port: u16, protocol: &str) -> TestGateway {

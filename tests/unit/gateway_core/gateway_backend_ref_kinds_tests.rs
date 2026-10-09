@@ -6,7 +6,7 @@
 //! status/`ResolvedRefs` parity with translation.
 
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    K8sMetadata, K8sObject, K8sTranslation, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::status::{
@@ -91,6 +91,79 @@ fn service_import_with_ports(
             "ports": ports
         }),
     )
+}
+
+/// A `managed-by` value naming an MCS controller rather than one of
+/// Kubernetes' own EndpointSlice controllers.
+const MCS_CONTROLLER: &str = "mcs-controller.example.io";
+
+/// Mark `slice` the way KEP-1645 has the MCS controller mark the imported
+/// slices it manages (issue #6123).
+fn mark_mcs_managed(slice: &mut K8sObject) {
+    slice.metadata.labels.insert(
+        "endpointslice.kubernetes.io/managed-by".to_string(),
+        MCS_CONTROLLER.to_string(),
+    );
+}
+
+/// An MCS-managed EndpointSlice of the `default/store` import.
+fn mcs_slice(endpoints: Value) -> K8sObject {
+    let mut slice = object(
+        "EndpointSlice",
+        "store-mcs",
+        "default",
+        "discovery.k8s.io/v1",
+        json!({ "ports": [{ "port": 8080 }], "endpoints": endpoints }),
+    );
+    slice.metadata.labels.insert(
+        "multicluster.kubernetes.io/service-name".to_string(),
+        "store".to_string(),
+    );
+    mark_mcs_managed(&mut slice);
+    slice
+}
+
+fn ready_endpoint(address: &str) -> Value {
+    json!({ "addresses": [address], "conditions": { "ready": true } })
+}
+
+/// An HTTPRoute in `default` to the `default/store` import on port 8080.
+fn store_import_route() -> K8sObject {
+    http_route(
+        "store",
+        "default",
+        json!([{
+            "group": "multicluster.x-k8s.io",
+            "kind": "ServiceImport",
+            "name": "store",
+            "port": 8080
+        }]),
+    )
+}
+
+/// Every host the translated config can dial.
+fn dial_hosts(translation: &K8sTranslation) -> Vec<&str> {
+    let config = &translation.config;
+    let mut hosts: Vec<&str> = config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.backend_host.as_str())
+        .collect();
+    for upstream in &config.upstreams {
+        hosts.extend(upstream.targets.iter().map(|target| target.host.as_str()));
+    }
+    hosts
+}
+
+fn assert_warned(translation: &K8sTranslation, fragment: &str) {
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(fragment)),
+        "expected a warning containing {fragment:?}: {:?}",
+        translation.warnings
+    );
 }
 
 fn tcp_route(name: &str, namespace: &str, backend_refs: Value) -> K8sObject {
@@ -465,6 +538,7 @@ fn service_import_endpoint_slice_expansion_when_pod_discovery_enabled() {
         "multicluster.kubernetes.io/service-name".to_string(),
         "store".to_string(),
     );
+    mark_mcs_managed(&mut slice);
 
     let opts = options().with_pod_discovery_enabled(true);
 
@@ -515,6 +589,7 @@ fn named_service_import_port_expands_onto_the_slice_container_port() {
         "multicluster.kubernetes.io/service-name".to_string(),
         "store".to_string(),
     );
+    mark_mcs_managed(&mut slice);
 
     let translation = translate_k8s_objects(
         &[route, import, slice],
@@ -567,6 +642,7 @@ fn unmappable_service_import_slice_falls_back_to_clusterset_dns() {
         "multicluster.kubernetes.io/service-name".to_string(),
         "store".to_string(),
     );
+    mark_mcs_managed(&mut slice);
 
     let translation = translate_k8s_objects(
         &[route, import, slice],
@@ -767,5 +843,371 @@ fn supported_route_families_retain_service_import_materialization() {
             "{kind} should keep ClusterSet DNS"
         );
         assert_eq!(translation.config.proxies[0].backend_port, 8080);
+    }
+}
+
+#[test]
+fn service_import_slice_without_an_mcs_managed_by_label_is_not_expanded() {
+    // KEP-1645 has the MCS controller mark every imported slice it manages. A
+    // slice without that mark, or one naming Kubernetes' own EndpointSlice
+    // controllers, is ignored and the backend keeps ClusterSet DNS (issue
+    // #6123).
+    for manager in [
+        None,
+        Some(""),
+        Some("endpointslice-controller.k8s.io"),
+        Some("endpointslicemirroring-controller.k8s.io"),
+    ] {
+        let mut slice = mcs_slice(json!([ready_endpoint("10.0.0.10")]));
+        match manager {
+            Some(manager) => {
+                slice.metadata.labels.insert(
+                    "endpointslice.kubernetes.io/managed-by".to_string(),
+                    manager.to_string(),
+                );
+            }
+            None => {
+                slice
+                    .metadata
+                    .labels
+                    .remove("endpointslice.kubernetes.io/managed-by");
+            }
+        }
+
+        let translation = translate_k8s_objects(
+            &[
+                store_import_route(),
+                service_import("store", "default", 8080),
+                slice,
+            ],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("an unmanaged MCS slice should still translate");
+
+        assert_eq!(
+            dial_hosts(&translation),
+            vec!["store.default.svc.clusterset.local"],
+            "{manager:?}"
+        );
+        assert_warned(&translation, "is ignored");
+    }
+}
+
+#[test]
+fn service_import_slice_refuses_addresses_that_can_never_be_a_backend() {
+    let refused = [
+        "127.0.0.1",
+        "0.0.0.0",
+        "169.254.169.254",
+        "100.100.100.200",
+        "64:ff9b::a9fe:a9fe",
+        "metadata.google.internal",
+    ];
+    let mut endpoints = vec![ready_endpoint("10.0.0.10")];
+    endpoints.extend(refused.into_iter().map(ready_endpoint));
+
+    let translation = translate_k8s_objects(
+        &[
+            store_import_route(),
+            service_import("store", "default", 8080),
+            mcs_slice(Value::Array(endpoints)),
+        ],
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("an MCS slice with special addresses should translate");
+
+    let hosts = dial_hosts(&translation);
+    assert_eq!(hosts, vec!["10.0.0.10"]);
+    assert_warned(&translation, "6 endpoint address(es) refused");
+}
+
+#[test]
+fn service_import_slice_refuses_this_clusters_infrastructure_outside_its_namespace() {
+    // Remote endpoints cannot be checked against local Pods, but an address
+    // this cluster owns can: only a Pod of the import's own namespace is
+    // admitted among them.
+    let mut own_pod = object("Pod", "store-0", "default", "v1", json!({}));
+    own_pod.status = json!({ "phase": "Running", "podIP": "10.244.3.7" });
+    let mut other_pod = object("Pod", "ledger-0", "payments", "v1", json!({}));
+    other_pod.status = json!({ "phase": "Running", "podIP": "10.244.3.20" });
+    let other_service = object(
+        "Service",
+        "payroll",
+        "payments",
+        "v1",
+        json!({
+            "clusterIP": "10.96.0.50",
+            "selector": { "app": "payroll" },
+            "ports": [{ "name": "http", "port": 8080 }]
+        }),
+    );
+    let mut node = object(
+        "Node",
+        "worker-1",
+        "",
+        "v1",
+        json!({ "podCIDRs": ["10.244.3.0/24"] }),
+    );
+    node.status = json!({ "addresses": [{ "type": "InternalIP", "address": "192.168.10.5" }] });
+    let slice = mcs_slice(json!([
+        ready_endpoint("10.0.0.10"),
+        ready_endpoint("10.244.3.7"),
+        ready_endpoint("10.244.3.20"),
+        ready_endpoint("10.96.0.50"),
+        ready_endpoint("192.168.10.5"),
+        ready_endpoint("10.244.3.99"),
+        {
+            "addresses": ["10.0.0.11"],
+            "conditions": { "ready": true },
+            "targetRef": { "kind": "Pod", "namespace": "payments", "name": "ledger-0" }
+        }
+    ]));
+
+    let translation = translate_k8s_objects(
+        &[
+            store_import_route(),
+            service_import("store", "default", 8080),
+            slice,
+            own_pod,
+            other_pod,
+            other_service,
+            node,
+        ],
+        options()
+            .with_source_namespaces(Vec::new())
+            .with_pod_discovery_enabled(true),
+    )
+    .expect("an MCS slice naming local infrastructure should translate");
+
+    let hosts = dial_hosts(&translation);
+    for admitted in ["10.0.0.10", "10.244.3.7"] {
+        assert!(
+            hosts.contains(&admitted),
+            "{admitted} missing from {hosts:?}"
+        );
+    }
+    for refused in [
+        "10.244.3.20",
+        "10.96.0.50",
+        "192.168.10.5",
+        "10.244.3.99",
+        "10.0.0.11",
+    ] {
+        assert!(!hosts.contains(&refused), "{refused} admitted: {hosts:?}");
+    }
+    assert_warned(&translation, "5 endpoint address(es) refused");
+    // Nodes observed and every namespace's Pods watched: nothing unchecked.
+    assert_not_warned(&translation, "without being checked against");
+}
+
+fn assert_not_warned(translation: &K8sTranslation, fragment: &str) {
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains(fragment)),
+        "unexpected warning containing {fragment:?}: {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn service_import_slice_in_the_default_scope_is_admitted_with_an_unchecked_warning() {
+    // The default control plane watches no Node and Pods in one namespace, so
+    // a Node address or another namespace's Pod in an imported slice cannot
+    // be told from a remote endpoint. Imported endpoints are remote by design
+    // and stay admitted, and the reconcile says what went unchecked (issue
+    // #6123).
+    let translation = translate_k8s_objects(
+        &[
+            store_import_route(),
+            service_import("store", "default", 8080),
+            mcs_slice(json!([
+                ready_endpoint("10.0.0.10"),
+                ready_endpoint("192.168.10.5"),
+                ready_endpoint("10.244.3.20"),
+            ])),
+        ],
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("an MCS slice in the default scope should translate");
+
+    let hosts = dial_hosts(&translation);
+    for admitted in ["10.0.0.10", "192.168.10.5", "10.244.3.20"] {
+        assert!(
+            hosts.contains(&admitted),
+            "{admitted} missing from {hosts:?}"
+        );
+    }
+    assert_warned(&translation, "checked against Node addresses");
+    assert_warned(&translation, "FERRUM_K8S_NODE_LOCALITY_ENABLED=true");
+    assert_warned(&translation, "namespaces outside the Pod watch scope");
+    assert_not_warned(&translation, "endpoint address(es) refused");
+}
+
+#[test]
+fn service_import_slice_keeps_the_exported_services_own_cluster_ip() {
+    // Submariner Lighthouse writes the local cluster's export of a
+    // ClusterSetIP Service as a slice holding that Service's ClusterIP. It is
+    // this cluster's own endpoint of the ClusterSet Service; any other
+    // ClusterIP stays refused.
+    let exported = object(
+        "Service",
+        "store",
+        "default",
+        "v1",
+        json!({
+            "clusterIP": "10.96.0.40",
+            "selector": { "app": "store" },
+            "ports": [{ "name": "http", "port": 8080 }]
+        }),
+    );
+    let other = object(
+        "Service",
+        "payroll",
+        "default",
+        "v1",
+        json!({
+            "clusterIP": "10.96.0.50",
+            "selector": { "app": "payroll" },
+            "ports": [{ "name": "http", "port": 8080 }]
+        }),
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            store_import_route(),
+            service_import("store", "default", 8080),
+            mcs_slice(json!([
+                ready_endpoint("10.96.0.40"),
+                ready_endpoint("10.96.0.50"),
+                ready_endpoint("10.0.0.10"),
+            ])),
+            exported,
+            other,
+        ],
+        options().with_pod_discovery_enabled(true),
+    )
+    .expect("a Lighthouse-style local export slice should translate");
+
+    let hosts = dial_hosts(&translation);
+    for admitted in ["10.96.0.40", "10.0.0.10"] {
+        assert!(
+            hosts.contains(&admitted),
+            "{admitted} missing from {hosts:?}"
+        );
+    }
+    assert!(!hosts.contains(&"10.96.0.50"), "{hosts:?}");
+    assert_warned(&translation, "1 endpoint address(es) refused");
+}
+
+#[test]
+fn service_import_slice_refuses_the_exported_cluster_ip_once_its_service_is_refused() {
+    // kube-proxy sends the exported Service's ClusterIP to every slice
+    // labelled with its name, so a forged slice naming another namespace's
+    // Pod makes that ClusterIP reach the Pod. The exemption must not outlive
+    // the EndpointSlice guard's refusal of the Service (issue #6121).
+    let exported = object(
+        "Service",
+        "store",
+        "default",
+        "v1",
+        json!({
+            "clusterIP": "10.96.0.40",
+            "selector": { "app": "store" },
+            "ports": [{ "name": "http", "port": 8080 }]
+        }),
+    );
+    let mut other_pod = object("Pod", "ledger-0", "payments", "v1", json!({}));
+    other_pod.status = json!({ "phase": "Running", "podIP": "10.244.3.20" });
+    let mut forged = object(
+        "EndpointSlice",
+        "store-forged",
+        "default",
+        "discovery.k8s.io/v1",
+        json!({
+            "ports": [{ "port": 8080 }],
+            "endpoints": [ready_endpoint("10.244.3.20")]
+        }),
+    );
+    forged.metadata.labels.insert(
+        "kubernetes.io/service-name".to_string(),
+        "store".to_string(),
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            store_import_route(),
+            service_import("store", "default", 8080),
+            mcs_slice(json!([
+                ready_endpoint("10.96.0.40"),
+                ready_endpoint("10.0.0.10"),
+            ])),
+            exported,
+            forged,
+            other_pod,
+        ],
+        options()
+            .with_source_namespaces(Vec::new())
+            .with_pod_discovery_enabled(true),
+    )
+    .expect("an MCS slice of a refused exported Service should translate");
+
+    let hosts = dial_hosts(&translation);
+    assert!(hosts.contains(&"10.0.0.10"), "{hosts:?}");
+    assert!(!hosts.contains(&"10.96.0.40"), "{hosts:?}");
+    assert!(!hosts.contains(&"10.244.3.20"), "{hosts:?}");
+    assert_warned(&translation, "1 endpoint address(es) refused");
+}
+
+#[test]
+fn service_import_slice_outside_the_pod_watch_scope_falls_back_to_clusterset_dns() {
+    // Outside the Pod watch scope the import's own Pods cannot be told from
+    // anything else, so its slices are unverifiable and the backend keeps its
+    // ClusterSet DNS name.
+    let translation = translate_k8s_objects(
+        &[
+            store_import_route(),
+            service_import("store", "default", 8080),
+            mcs_slice(json!([ready_endpoint("10.0.0.10")])),
+        ],
+        options()
+            .with_pod_discovery_enabled(true)
+            .with_pod_source_namespaces(vec!["payments".to_string()]),
+    )
+    .expect("an MCS slice outside the Pod watch scope should translate");
+
+    assert_eq!(
+        dial_hosts(&translation),
+        vec!["store.default.svc.clusterset.local"]
+    );
+    assert_warned(&translation, "outside the controller's Pod watch scope");
+    assert_not_warned(&translation, "without being checked against");
+}
+
+#[test]
+fn slice_of_an_unobserved_service_import_is_never_verified_or_expanded() {
+    // A slice whose ServiceImport is missing, or exists only in another
+    // namespace, backs no backendRef: it is neither expanded nor reported.
+    let mut unmanaged = mcs_slice(json!([ready_endpoint("10.0.0.10")]));
+    unmanaged
+        .metadata
+        .labels
+        .remove("endpointslice.kubernetes.io/managed-by");
+
+    for imports in [vec![], vec![service_import("store", "payments", 8080)]] {
+        let mut objects = vec![store_import_route(), unmanaged.clone()];
+        objects.extend(imports);
+        let opts = options().with_pod_discovery_enabled(true);
+        let translation = translate_k8s_objects(&objects, opts)
+            .expect("a slice of an unobserved ServiceImport should translate");
+
+        assert!(
+            !dial_hosts(&translation).contains(&"10.0.0.10"),
+            "{:?}",
+            translation.warnings
+        );
+        assert_not_warned(&translation, "MCS EndpointSlice");
+        assert_not_warned(&translation, "without being checked against");
     }
 }

@@ -371,6 +371,16 @@ impl EndpointSliceGuard {
         self.record(namespace, name, findings);
     }
 
+    /// Whether no finding is recorded for the Service `namespace/name`, so
+    /// every backendRef to it is admitted whatever the opt-in and the route's
+    /// namespace. [`Self::record`] stores only findings that refuse something.
+    pub(crate) fn admits_every_route(&self, namespace: &str, name: &str) -> bool {
+        self.findings
+            .get(namespace)
+            .and_then(|services| services.get(name))
+            .is_none()
+    }
+
     /// The refusal for a backendRef from `route_namespace` to the Service
     /// `service_namespace/service_name`, or `None` when it is admitted.
     pub(crate) fn refusal(
