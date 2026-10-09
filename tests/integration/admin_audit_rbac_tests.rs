@@ -2149,6 +2149,7 @@ async fn scoped_caller_cannot_file_global_tls_mutation_under_another_tenant() {
     let tenant_a = token_with_ns("tenant-a-admin", Some("admin"), json!("tenant-a"));
     let tenant_b = token_with_ns("tenant-b-admin", Some("admin"), json!("tenant-b"));
     let global = token_with_ns("global-admin", Some("admin"), json!(DEFAULT_NAMESPACE));
+    let fleet = token("fleet-admin", Some("admin"));
     let bundle_id = format!("audit-ca-{}", uuid::Uuid::new_v4().simple());
     let body = json!({
         "id": bundle_id,
@@ -2156,9 +2157,25 @@ async fn scoped_caller_cannot_file_global_tls_mutation_under_another_tenant() {
         "ca_bundle_pem": test_ca_bundle_pem(),
     });
 
-    let response = reqwest::Client::new()
+    // A token carrying an `ns` claim cannot reach the fleet-global TLS surface.
+    let refused = reqwest::Client::new()
         .post(format!("{base}/admin/tls/ca-bundles"))
         .bearer_auth(&tenant_a)
+        .header("X-Ferrum-Namespace", "tenant-a")
+        .json(&body)
+        .send()
+        .await
+        .expect("POST ca-bundle");
+    assert_eq!(
+        refused.status().as_u16(),
+        403,
+        "a namespace-scoped admin must not create fleet-global TLS material"
+    );
+
+    // A fleet token may, and a spoofed header still cannot pick the audit bucket.
+    let response = reqwest::Client::new()
+        .post(format!("{base}/admin/tls/ca-bundles"))
+        .bearer_auth(&fleet)
         .header("X-Ferrum-Namespace", "tenant-b")
         .json(&body)
         .send()
@@ -2168,7 +2185,7 @@ async fn scoped_caller_cannot_file_global_tls_mutation_under_another_tenant() {
     let create_body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     assert_eq!(
         status, 201,
-        "global TLS create must succeed for a scoped admin: {create_body:?}"
+        "global TLS create must succeed for a fleet admin: {create_body:?}"
     );
 
     let audit_path = format!("/audit?resource_type=tls_ca_bundle&resource_id={bundle_id}");
@@ -2263,10 +2280,25 @@ async fn mesh_config_revision_reset_audit_ignores_request_namespace_header() {
     let tenant_a = token_with_ns("tenant-a-admin", Some("admin"), json!("tenant-a"));
     let tenant_b = token_with_ns("tenant-b-admin", Some("admin"), json!("tenant-b"));
     let global = token_with_ns("global-admin", Some("admin"), json!(DEFAULT_NAMESPACE));
+    let fleet = token("fleet-admin", Some("admin"));
+
+    // A token carrying an `ns` claim cannot reset the fleet-wide revision gate.
+    let refused = reqwest::Client::new()
+        .post(format!("{base}/mesh/config-revision/reset?confirm=true"))
+        .bearer_auth(&tenant_a)
+        .header("X-Ferrum-Namespace", "tenant-a")
+        .send()
+        .await
+        .expect("POST mesh reset");
+    assert_eq!(
+        refused.status().as_u16(),
+        403,
+        "a namespace-scoped admin must not reset fleet-wide mesh state"
+    );
 
     let response = reqwest::Client::new()
         .post(format!("{base}/mesh/config-revision/reset?confirm=true"))
-        .bearer_auth(&tenant_a)
+        .bearer_auth(&fleet)
         .header("X-Ferrum-Namespace", "tenant-b")
         .send()
         .await

@@ -24,6 +24,16 @@
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #   --pool-profile calibration|profile (separate fixed-window H2/gRPC lane)
 #   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
+#   --h2-window default|64k     (http2/grpcs only; default $BENCH_H2_WINDOW or `default`)
+#   --grpc-client-connections pooled|per-rpc
+#                               (grpcs only; default $BENCH_GRPC_CLIENT_CONNECTIONS or `pooled`)
+#
+# `--h2-window 64k` sets a 65,535-byte initial HTTP/2 stream window on the
+# client, the echo backend, Ferrum's frontend and Ferrum's backend pool (env and
+# route YAML), so every hop of the upload and the download is window-limited
+# (#6038). Connection windows and competitor gateways keep their settings.
+# `--grpc-client-connections per-rpc` makes the gRPC client open and close one
+# connection per call (#6022 item 6). Both are recorded in manifest.json.
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -79,6 +89,7 @@ EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
 H1_PROFILE=""
+H2_CPU_PROFILE=""
 H1_TRACE=none
 H1_TRACE_BUILDS=""
 h1_trace_pid=""
@@ -86,6 +97,10 @@ h1_trace_output=""
 POOL_PROFILE=""
 UDP_PROFILE=""
 H2_GUARD_OBSERVE=0
+# Workflow-level dispatch inputs arrive as environment because the hosted
+# benchmark job that invokes this runner is frozen (see the workflow header).
+H2_WINDOW="${BENCH_H2_WINDOW:-default}"
+GRPC_CLIENT_CONNECTIONS="${BENCH_GRPC_CLIENT_CONNECTIONS:-pooled}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -103,10 +118,14 @@ while [[ $# -gt 0 ]]; do
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
+        --h2-profile) H2_CPU_PROFILE="$2"; shift 2 ;;
+        --profile-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
         --h1-trace) H1_TRACE="$2"; shift 2 ;;
         --h1-trace-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
         --pool-profile) POOL_PROFILE="$2"; shift 2 ;;
         --udp-profile) UDP_PROFILE="$2"; shift 2 ;;
+        --h2-window) H2_WINDOW="$2"; shift 2 ;;
+        --grpc-client-connections) GRPC_CLIENT_CONNECTIONS="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -130,6 +149,40 @@ if [[ ! $WALLCLOCK_BUDGET =~ ^[1-9][0-9]{0,4}$ ]]; then
     echo "--wallclock-budget-seconds must be a positive integer (at most 99999)" >&2
     exit 2
 fi
+case "$H2_WINDOW" in
+    default|64k) ;;
+    *) echo "--h2-window must be default or 64k" >&2; exit 2 ;;
+esac
+case "$GRPC_CLIENT_CONNECTIONS" in
+    pooled|per-rpc) ;;
+    *) echo "--grpc-client-connections must be pooled or per-rpc" >&2; exit 2 ;;
+esac
+# Only a revision baseline published by main-latest-image.yml
+# (`ferrumedge/ferrum-edge:main-<sha>`, or its GHCR copy) is ever pulled; any
+# other baseline must already be a local image. Refused here, before any build
+# or manifest. The frozen hosted step pipes this runner through `tee`, so the
+# workflow's `dispatch-inputs` job applies the same patterns to fail the run.
+BASELINE_PUBLISHED='^(docker\.io/)?ferrumedge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+BASELINE_MIRRORED='^ghcr\.io/ferrum-edge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+if [ -n "$BASELINE_IMAGE" ] && [[ ! $BASELINE_IMAGE =~ $BASELINE_PUBLISHED ]] \
+    && [[ ! $BASELINE_IMAGE =~ $BASELINE_MIRRORED ]] \
+    && ! docker image inspect "$BASELINE_IMAGE" >/dev/null 2>&1; then
+    echo "--baseline-image must be a local image or a published main-<40-hex sha> image" >&2
+    exit 2
+fi
+# Each option changes only the H2-family workloads it names. Other protocols in
+# the same dispatch run (and record) their ordinary workload.
+case "$PROTOCOL" in http2|grpcs) ;; *) H2_WINDOW=default ;; esac
+[ "$PROTOCOL" = grpcs ] || GRPC_CLIENT_CONNECTIONS=pooled
+H2_STREAM_WINDOW=8388608
+[ "$H2_WINDOW" = default ] || H2_STREAM_WINDOW=65535
+# The profile lanes verify their own fixed-window, pooled-client environment.
+if [ "$H2_WINDOW" != default ] || [ "$GRPC_CLIENT_CONNECTIONS" != pooled ]; then
+    if [ -n "$H1_PROFILE" ] || [ -n "$POOL_PROFILE" ] || [ -n "$UDP_PROFILE" ]; then
+        echo "--h2-window/--grpc-client-connections cannot be combined with a profile lane" >&2
+        exit 2
+    fi
+fi
 if [ ! -r /proc/self/stat ] || [ ! -r /proc/sys/kernel/random/boot_id ]; then
     PROCESS_USAGE=false
 fi
@@ -145,11 +198,25 @@ if [ -n "$H1_PROFILE" ]; then
     [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
 fi
 
+# Fixed manual H2/gRPC diagnostic lane. Keep ordinary experiment arms and
+# benchmark leaderboards separate, and calibrate the same runtime policy.
+if [ -n "$H2_CPU_PROFILE" ]; then
+    case "$H2_CPU_PROFILE" in off|counters|cpu) ;; *) exit 2 ;; esac
+    case "$PROTOCOL" in http2|grpcs) ;; *) exit 2 ;; esac
+    case "$PAYLOAD_SIZES" in 10240|71680) ;; *) exit 2 ;; esac
+    [ "$DURATION" = 15 ] && [ "$CONCURRENCY" = 200 ] && [ "$PAIRS" = 2 ] || exit 2
+    [ "$GATEWAYS" = 'ferrum envoy' ] && [ "$PROCESS_USAGE" = true ] && [ "$ADAPTIVE" = false ] || exit 2
+    [ -z "$H1_PROFILE$POOL_PROFILE$UDP_PROFILE$BASELINE_IMAGE${FERRUM_EXTRA_ENV:-}" ] || exit 2
+    [ "$H1_TRACE" = none ] && [ "$H2_WINDOW" = default ] && [ "$GRPC_CLIENT_CONNECTIONS" = pooled ] || exit 2
+    [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || exit 2
+    if [ "$H2_CPU_PROFILE" = cpu ]; then H1_TRACE=cpu; fi
+fi
+
 case "$H1_TRACE" in none|syscalls|cpu) ;; *) exit 2 ;; esac
 if [ "$H1_TRACE" != none ]; then
     # One existing payload shard per bounded collector lifetime; all five shards
     # remain required. Direct controls are never profiled.
-    [[ "$H1_PROFILE" == trace-calibration || "$H1_PROFILE" == cutoff ]] || exit 2
+    [[ "$H1_PROFILE" == trace-calibration || "$H1_PROFILE" == cutoff || "$H2_CPU_PROFILE" == cpu ]] || exit 2
     [[ "$PAYLOAD_SIZES" != *" "* && -d "$H1_TRACE_BUILDS" ]] || exit 2
     [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || exit 2
 fi
@@ -410,6 +477,24 @@ build_binaries() {
     fi
 }
 
+# A revision baseline published by main-latest-image.yml is pulled when it is
+# not already local, so a hosted dispatch can pair the dispatched ref with an
+# earlier main commit on one VM. Option validation already refused any other
+# missing image; this runner never pulls an arbitrary one.
+ensure_baseline_image() {
+    [ -n "$BASELINE_IMAGE" ] || return 0
+    if docker image inspect "$BASELINE_IMAGE" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ ! $BASELINE_IMAGE =~ $BASELINE_PUBLISHED ]] \
+        && [[ ! $BASELINE_IMAGE =~ $BASELINE_MIRRORED ]]; then
+        echo "[baseline] $BASELINE_IMAGE is not local and not a published main-<sha> image" >&2
+        return 1
+    fi
+    echo "[baseline] pulling $BASELINE_IMAGE..."
+    docker pull "$BASELINE_IMAGE"
+}
+
 # ── Backend ──────────────────────────────────────────────────────────────────
 start_backend() {
     echo "[backend] starting proto_backend..."
@@ -430,6 +515,7 @@ start_backend() {
     saved_pwd="$(pwd)"
     cd "$SCRIPT_DIR"
     BENCH_H2_OBSERVE="$H2_OBSERVE" H3_PROFILE="$H3_BUDGET" \
+        BENCH_H2_STREAM_WINDOW="$H2_STREAM_WINDOW" \
         ./target/release/proto_backend > "$backend_log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
@@ -459,6 +545,19 @@ prepare_ferrum_config() {
 
     sed -e "s|CA_PATH|${ca_path}|g" \
         "$src_config" > "$runtime_config"
+    if [ "$H2_WINDOW" != default ]; then
+        # A route's own pool window overrides FERRUM_POOL_HTTP2_*; lower it in
+        # the mounted copy and require exactly one rewritten route.
+        sed -E "s|^(    pool_http2_initial_stream_window_size:) *8388608.*$|\1 ${H2_STREAM_WINDOW}|" \
+            "$runtime_config" > "$runtime_config.window"
+        mv "$runtime_config.window" "$runtime_config"
+        if [ "$(grep -cE "^    pool_http2_initial_stream_window_size: ${H2_STREAM_WINDOW}$" \
+            "$runtime_config")" != 1 ] \
+            || grep -qE '^    pool_http2_initial_stream_window_size: *8388608' "$runtime_config"; then
+            echo "[ferrum] could not set the route stream window in $(basename "$src_config")" >&2
+            return 2
+        fi
+    fi
 
     echo "$runtime_config"
 }
@@ -466,7 +565,7 @@ prepare_ferrum_config() {
 start_ferrum() {
     local config_src="$SCRIPT_DIR/configs/$(ferrum_config_name)"
     local config_file
-    config_file=$(prepare_ferrum_config "$config_src" "/etc/ferrum/tls/ca.pem")
+    config_file=$(prepare_ferrum_config "$config_src" "/etc/ferrum/tls/ca.pem") || return 2
     if [ "$H2_OBSERVE" -eq 1 ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         config_file="$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
@@ -482,6 +581,7 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    if [ -n "$H2_CPU_PROFILE" ]; then extra_env+=(--user 65532:65532 --cap-drop ALL); fi
     local response_cutoff=0
     case "$PROTOCOL" in
         http3)
@@ -517,6 +617,10 @@ start_ferrum() {
                     -e FERRUM_ADMIN_HTTP_PORT=9000
                     -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32)
     fi
+    if [ "$H2_WINDOW" != default ]; then
+        # The client-to-gateway hop: Ferrum's frontend window (default 256 KiB).
+        extra_env+=(-e "FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE=$H2_STREAM_WINDOW")
+    fi
 
     if [ "$H1_PROFILE" = diagnostic ]; then
         extra_env+=(--name "$H1_DIAGNOSTIC_CONTAINER_PREFIX-$gw")
@@ -545,7 +649,7 @@ start_ferrum() {
         -e "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true" \
         -e "FERRUM_POOL_WARMUP_ENABLED=true" \
         -e "FERRUM_WEBSOCKET_TUNNEL_MODE=true" \
-        -e "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608" \
+        -e "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=$H2_STREAM_WINDOW" \
         -e "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432" \
         -e "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false" \
         -e "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576" \
@@ -575,28 +679,26 @@ start_ferrum() {
                 "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file" \
                 "$PAIR" "$gw" "$HOST_ID" "$H1_PROFILE"
     fi
-    if [ "$H1_TRACE" != none ]; then
-        python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output" \
-            --runtime "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
-            --config "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" \
-            --sample "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" \
-            --arm "$gw" --pair "$PAIR" --payload "$PAYLOAD_SIZES" \
-            --raw-sample "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" \
-            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit"
-        local trace_wait=0
-        while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
-            [ ! -s "$h1_trace_output/stopped.json" ] || return 1
-            sleep 0.05
-            trace_wait=$(( trace_wait + 1 ))
-        done
-        [ -s "$h1_trace_output/ready.json" ] || return 1
+    if [ -n "$H2_CPU_PROFILE" ]; then
+        wait_for_gateway || return 1
+        h2_profile_runtime "$config_file" || return 2
     fi
+    trace_bind || return 1
+
     if [ -n "$UDP_PROFILE" ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
         docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
             python3 "$SCRIPT_DIR/udp_internal_profile.py" runtime \
                 "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" "$config_file"
+    fi
+    if [ "$H2_WINDOW" != default ]; then
+        # Evidence of the mounted route window and the container's window env.
+        mkdir -p "$OUTPUT_DIR/diagnostics"
+        cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+        docker inspect "$GATEWAY_CID" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            | grep -E '^FERRUM_(POOL|FRONTEND)_H(TTP)?2_' \
+            > "$OUTPUT_DIR/diagnostics/${gw}_h2_window_env.txt" || true
     fi
     wait_for_gateway
 }
@@ -638,13 +740,20 @@ start_envoy() {
     fi
 
     echo "[envoy] starting..."
-    GATEWAY_CID=$(docker run -d --rm --network host \
+    local profile_args=()
+    if [ -n "$H2_CPU_PROFILE" ]; then profile_args+=(--user 65532:65532 --cap-drop ALL); fi
+    GATEWAY_CID=$(docker run -d --rm --network host "${profile_args[@]}" \
         -v "$cfg_dst:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
         "$ENVOY_IMAGE" \
         envoy -c /etc/envoy/envoy.yaml --concurrency "$(nproc 2>/dev/null || echo 4)" \
         -l "$GATEWAY_LOG_LEVEL" --disable-hot-restart)
 
+    if [ -n "$H2_CPU_PROFILE" ]; then
+        wait_for_gateway || return 1
+        h2_profile_runtime "$cfg_dst" || return 2
+        trace_bind || return 1
+    fi
     wait_for_gateway
 }
 
@@ -968,14 +1077,47 @@ wait_for_gateway() {
     return 1
 }
 
+h2_profile_runtime() {
+    local config_file="$1"
+    mkdir -p "$OUTPUT_DIR/diagnostics"
+    cp "$config_file" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+    docker inspect "$GATEWAY_CID" --format '{{json .}}' | \
+        python3 "$SCRIPT_DIR/h2_cpu_profile.py" runtime --protocol "$PROTOCOL" \
+            --gateway "$gw" --pair "$PAIR" --config "$config_file" \
+            --output "$OUTPUT_DIR/diagnostics/${gw}_runtime.json"
+}
+
+trace_bind() {
+    if [ "$H1_TRACE" != none ]; then
+        local protocol_args=()
+        if [ -n "$H2_CPU_PROFILE" ]; then protocol_args+=(--h2-protocol "$PROTOCOL"); fi
+        python3 "$SCRIPT_DIR/h1_trace.py" bind --output "$h1_trace_output" \
+            --runtime "$OUTPUT_DIR/diagnostics/${gw}_runtime.json" \
+            --config "$OUTPUT_DIR/diagnostics/${gw}_config.yaml" \
+            --sample "$OUTPUT_DIR/${gw}_${PROTOCOL}_${PAYLOAD_SIZES}.json" \
+            --arm "$gw" --pair "$PAIR" --payload "$PAYLOAD_SIZES" \
+            --raw-sample "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.raw.json" \
+            --client-exit "$OUTPUT_DIR/diagnostics/${gw}_${PAYLOAD_SIZES}_client.exit" "${protocol_args[@]}"
+        local trace_wait=0
+        while [ ! -s "$h1_trace_output/ready.json" ] && [ "$trace_wait" -lt 600 ]; do
+            [ ! -s "$h1_trace_output/stopped.json" ] || return 1
+            sleep 0.05
+            trace_wait=$(( trace_wait + 1 ))
+        done
+        [ -s "$h1_trace_output/ready.json" ] || return 1
+    fi
+}
+
 h1_trace_start() {
     [ "$H1_TRACE" != none ] && [ "$gw" != direct ] || return 0
     h1_trace_output="$OUTPUT_DIR/traces/${gw}_${PAYLOAD_SIZES}"
     mkdir -p "$h1_trace_output"
     local enabled=(--enabled)
+    local protocol_args=()
+    if [ -n "$H2_CPU_PROFILE" ]; then protocol_args+=(--h2-protocol "$PROTOCOL"); fi
     if [ "$H1_PROFILE" = trace-calibration ] && [ "$gw" = ferrum-baseline ]; then enabled=(); fi
     sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
-        python3 "$SCRIPT_DIR/h1_trace.py" supervise --mode "$H1_TRACE" "${enabled[@]}" \
+        python3 "$SCRIPT_DIR/h1_trace.py" supervise --mode "$H1_TRACE" "${enabled[@]}" "${protocol_args[@]}" \
         --parent "$$" --builds "$H1_TRACE_BUILDS" --artifact-root "$(dirname "$H1_TRACE_BUILDS")" --output "$h1_trace_output" \
         > "$h1_trace_output/supervisor.stdout" 2> "$h1_trace_output/supervisor.stderr" &
     h1_trace_pid=$!
@@ -1039,6 +1181,12 @@ run_bench() {
         bench_target="${params[1]}"
     fi
     local extra_args=("${params[@]:3}")
+    if [ "$H2_WINDOW" != default ]; then
+        extra_args+=(--h2-stream-window "$H2_STREAM_WINDOW")
+    fi
+    if [ "$GRPC_CLIENT_CONNECTIONS" = per-rpc ]; then
+        extra_args+=(--connection-per-request)
+    fi
     if [ "$H2_OBSERVE" -eq 1 ]; then
         extra_args+=(--h2-observe)
         if [ "$PROTOCOL" = http2 ]; then
@@ -1075,6 +1223,9 @@ run_bench() {
     fi
     local usage="$diagnostics/${gateway}_${payload}_process_usage.json"
     local sampler_args=()
+    if [ -n "$H2_CPU_PROFILE" ] && [ "$H2_CPU_PROFILE" != off ]; then
+        sampler_args+=(--scheduler-counters)
+    fi
     if [ -n "$H1_PROFILE" ] && [ "$target" = gateway ]; then
         sampler_args+=(--h1-profile --h1-runtime "$diagnostics/${gateway}_runtime.json"
                       --h1-container-id "$GATEWAY_CID")
@@ -1155,6 +1306,14 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
             --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
     fi
+    # Backend connection/echo counters around the client, H2 family only
+    # (#6022 item 6). Best effort: a missing snapshot marks the stamp unavailable.
+    local backend_stats_before="$diagnostics/${gateway}_${payload}_backend_stats_before.json"
+    local backend_stats_after="$diagnostics/${gateway}_${payload}_backend_stats_after.json"
+    if [ "$PROTOCOL" = http2 ] || [ "$PROTOCOL" = grpcs ]; then
+        curl -sf --max-time 5 http://127.0.0.1:3010/bench-stats \
+            > "$backend_stats_before" 2>/dev/null || true
+    fi
     if [ "$H1_PROFILE" = diagnostic ]; then
         # Write directly to retained raw stdout so campaign termination during
         # the client/readers/logging cannot lose the original partial output.
@@ -1187,6 +1346,10 @@ run_bench() {
     if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
         python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
             --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
+    fi
+    if [ "$PROTOCOL" = http2 ] || [ "$PROTOCOL" = grpcs ]; then
+        curl -sf --max-time 5 http://127.0.0.1:3010/bench-stats \
+            > "$backend_stats_after" 2>/dev/null || true
     fi
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
@@ -1241,6 +1404,11 @@ run_bench() {
     python3 "$SCRIPT_DIR/benchmark_plan.py" stamp \
         "$out" "$gateway" "$payload" "$effective_concurrency" \
         "$PAIR" "$ORDER_POSITION" "$HOST_ID" "$usage" "$GATEWAY_ORDER"
+    if [ "$PROTOCOL" = http2 ] || [ "$PROTOCOL" = grpcs ]; then
+        python3 "$SCRIPT_DIR/backend_connections.py" stamp "$out" "$PROTOCOL" \
+            "$backend_stats_before" "$backend_stats_after" \
+            "$H2_WINDOW" "$GRPC_CLIENT_CONNECTIONS" || true
+    fi
     if [ "$H2_OBSERVE" -eq 1 ]; then
         python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
             "$diagnostics/${gateway}_${payload}_backend.log"
@@ -1261,6 +1429,9 @@ run_bench() {
         echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
         head -10 "$err_file" | sed 's/^/[bench]     /'
     fi
+    if [ -n "$H2_CPU_PROFILE" ]; then
+        python3 "$SCRIPT_DIR/h2_cpu_profile.py" stamp "$out" "$H2_CPU_PROFILE"
+    fi
     if [ -n "$h1_trace_pid" ]; then
         # The synchronous client has returned and its raw result/exit and stamped
         # sample are retained. The supervisor validates full request drain and
@@ -1275,6 +1446,8 @@ run_bench() {
 main() {
     mkdir -p "$OUTPUT_DIR"
     echo "[main] protocol=$PROTOCOL sizes=$PAYLOAD_SIZES gateways=$GATEWAYS"
+    echo "[main] h2_window=$H2_WINDOW (${H2_STREAM_WINDOW} B stream window)" \
+        "grpc_client_connections=$GRPC_CLIENT_CONNECTIONS baseline_image=${BASELINE_IMAGE:-none}"
 
     # Refuse to start on a host that already has any benchmark port bound rather
     # than silently killing the unrelated listener later.
@@ -1298,7 +1471,7 @@ main() {
     if [ "$H1_PROFILE" = cutoff ] || [ "$H1_PROFILE" = diagnostic ]; then
         expected_gateways+=" ferrum-exp-cutoff-one"
     fi
-    if [ -z "$H1_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -z "$UDP_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
+    if [ -z "$H1_PROFILE$H2_CPU_PROFILE" ] && [ -z "$POOL_PROFILE" ] && [ -z "$UDP_PROFILE" ] && [ -f "$EXPERIMENT_MANIFEST" ]; then
         EXPERIMENT_ARMS=$(python3 "$SCRIPT_DIR/experiment_arms.py" names \
             "$EXPERIMENT_MANIFEST" "$PROTOCOL")
         if [ -n "$EXPERIMENT_ARMS" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
@@ -1331,6 +1504,17 @@ main() {
             EXPERIMENT_ARMS=""
         fi
     fi
+    if [ "$H2_OBSERVE" -eq 1 ] \
+        && { [ "$H2_WINDOW" != default ] || [ "$GRPC_CLIENT_CONNECTIONS" != pooled ]; }; then
+        echo "[experiment] the H2 campaign verifies fixed 8 MiB windows and pooled clients" >&2
+        exit 2
+    fi
+    # A route window that cannot be rewritten would fail every Ferrum start and
+    # silently drop the Ferrum arms: refuse the whole run once, before any work.
+    if [ "$H2_WINDOW" != default ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
+        prepare_ferrum_config "$SCRIPT_DIR/configs/$(ferrum_config_name)" \
+            "/etc/ferrum/tls/ca.pem" > /dev/null || exit 2
+    fi
     if [ -r /proc/sys/kernel/random/boot_id ]; then
         HOST_ID=$(cat /proc/sys/kernel/random/boot_id)
     else
@@ -1341,7 +1525,7 @@ main() {
     if [ -n "$H1_PROFILE" ]; then
         h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
     fi
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" "$H1_TRACE" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" "$H1_TRACE" "$H2_WINDOW" "$H2_STREAM_WINDOW" "$GRPC_CLIENT_CONNECTIONS" "$BASELINE_IMAGE" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
@@ -1353,6 +1537,11 @@ with open(sys.argv[1], "w") as manifest:
                    "duration": int(sys.argv[9]), "offered_workers": int(sys.argv[10]),
                    "h1_revision": sys.argv[11], "h1_trace_mode": sys.argv[12]}
                   if sys.argv[7] else {}),
+               # Workload labels (#6038, #6022): what this run's H2 hops and
+               # gRPC client used, and the requested revision baseline.
+               "h2_window": sys.argv[13], "h2_stream_window_bytes": int(sys.argv[14]),
+               "grpc_client_connections": sys.argv[15],
+               "baseline_image": sys.argv[16] or None,
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
@@ -1371,6 +1560,7 @@ PYEOF
         cp "$SCRIPT_DIR/udp_profile_manifest.json" "$root_output/udp_profile_manifest.json"
         cp "$SCRIPT_DIR/udp_profile_schema.json" "$root_output/udp_profile_schema.json"
     fi
+    ensure_baseline_image || exit 2
     build_binaries
     # Save immutable image IDs as well as operator-supplied tags for revision A/B.
     docker image inspect "$FERRUM_IMAGE" ${BASELINE_IMAGE:+"$BASELINE_IMAGE"} \

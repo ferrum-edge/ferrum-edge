@@ -362,11 +362,9 @@ pub(crate) fn publish_h3_retained_body(
 #[derive(Debug)]
 pub(crate) enum H3UploadReadError {
     /// The request stream failed: a client reset, a lost connection, or a
-    /// malformed frame sequence h3 detected.
+    /// malformed frame sequence h3 detected, a known frame after the trailer
+    /// section (RFC 9114 §4.1) or an undecodable trailer section included.
     Stream(h3::error::StreamError),
-    /// A DATA frame followed the trailer section, which makes the request
-    /// malformed (RFC 9114 §4.1).
-    DataAfterTrailers,
 }
 
 impl From<h3::error::StreamError> for H3UploadReadError {
@@ -379,7 +377,6 @@ impl std::fmt::Display for H3UploadReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stream(error) => std::fmt::Display::fmt(error, f),
-            Self::DataAfterTrailers => f.write_str("request DATA frame after the trailer section"),
         }
     }
 }
@@ -411,10 +408,11 @@ where
     // the request stream. Read on to the stream's own end, so a client reset
     // or a lost connection after the trailers is refused as the incomplete
     // request it is instead of being dispatched as a complete upload (issue
-    // #6022). After a clean FIN this returns at once.
-    if stream.recv_data().await?.is_some() {
-        return Err(H3UploadReadError::DataAfterTrailers);
-    }
+    // #6022). `recv_trailers` waits for the FIN and refuses any known frame
+    // after the trailers, an empty DATA frame or a second HEADERS frame
+    // included (RFC 9114 §4.1). No buffered path forwards request trailers, so
+    // they are consumed here. After a clean FIN this returns at once.
+    stream.recv_trailers().await?;
     let (body, permit) = upload.finish();
     *charge = Some(permit);
     Ok(Some(body))
@@ -13969,7 +13967,9 @@ async fn run_h3_grpc_upload_pump(
         // never emit an all-reserved block that collapses to nothing. A DECODE
         // error means the inbound request is malformed: fail the upload closed
         // rather than silently finishing the backend stream as if the client had
-        // sent no trailing metadata.
+        // sent no trailing metadata. `recv_trailers` reads on to the request
+        // stream's own end, so a reset or a lost connection after the trailers is
+        // a client abort (issue #6022), never a FIN on the backend stream.
         let trailers = match h3_grpc_upload_await_until_authorization(
             auth_deadline_plan,
             shutdown.as_ref(),
@@ -14016,6 +14016,11 @@ async fn run_h3_grpc_upload_pump(
                 }
             }
             Some(Ok(_)) => {}
+            Some(Err(error))
+                if crate::http3::stream_util::h3_request_read_error_is_client_abort(&error) =>
+            {
+                upload.publish_fault(H3GrpcUploadFault::ClientAbort);
+            }
             Some(Err(_error)) => {
                 upload.publish_fault(H3GrpcUploadFault::MalformedTrailers);
             }

@@ -531,6 +531,27 @@ where
     stream.stop_sending(Code::H3_NO_ERROR);
 }
 
+/// Whether a failed request-stream read means the client abandoned the upload
+/// rather than sent a malformed one.
+///
+/// After a trailer section the request-upload paths read on to the stream's own
+/// end (`recv_trailers` waits for it). A client that resets the stream there
+/// (any code, `H3_NO_ERROR` included) or loses its connection has cancelled the
+/// request: a client disconnect, not a malformed trailer block (issue #6022).
+/// A locally detected protocol error (an undecodable trailer section, a known
+/// frame after the trailers) stays malformed, unless the local close was the
+/// gateway's own graceful `H3_NO_ERROR`.
+pub(crate) fn h3_request_read_error_is_client_abort(error: &h3::error::StreamError) -> bool {
+    match error {
+        h3::error::StreamError::RemoteTerminate { .. } => true,
+        h3::error::StreamError::ConnectionError { 0: connection, .. } => {
+            !matches!(connection, h3::error::ConnectionError::Local { .. })
+                || connection.is_h3_no_error()
+        }
+        _ => false,
+    }
+}
+
 /// Watch peer cancellation of this H3 request's response (send) direction.
 ///
 /// Quinn's `SendStream::stopped` is `&self` and `'static`, so this future does

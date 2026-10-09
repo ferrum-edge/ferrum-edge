@@ -24,6 +24,7 @@ RUNNERS = [
     "tests/performance/multi_protocol/run_protocol_test.sh",
     "tests/performance/multi_protocol/run_gateway_protocol_bench.sh",
     "tests/performance/multi_protocol/run_connection_saturation_bench.sh",
+    "tests/performance/multi_protocol/alloc_per_request.sh",
     "tests/performance/mesh-dns-e2e/run.sh",
     "tests/performance/mesh-hbone-e2e/run.sh",
 ]
@@ -36,6 +37,7 @@ RUNNER_TOKENS = {
     "run_protocol_test.sh",
     "run_gateway_protocol_bench.sh",
     "run_connection_saturation_bench.sh",
+    "alloc_per_request.sh",
     "mesh-dns-e2e/run.sh",
     "mesh-hbone-e2e/run.sh",
 }

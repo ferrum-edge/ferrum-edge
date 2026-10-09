@@ -17,11 +17,11 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 | Endpoint | Unauthenticated | Authenticated |
 | --- | --- | --- |
 | `/live` | `{"status":"ok"}` (always; minimal liveness) | same |
-| `/health`, `/status` | `status` + `ready` only, with the correct status code (200 / 503 starting or unavailable) | full diagnostics (mode, DB/pool, cached-config counts, polling degradation, mesh state, sanitized listener failures, bounded `gateway_listeners` realization status, fixed-cardinality `jwks_trust`, the bounded `replay_authority` shared single-use aggregate, per-upstream `service_discovery` lifecycle/staleness) |
+| `/health`, `/status` | `status` + `ready` only, with the correct status code (200 / 503 starting or unavailable); a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens) | full diagnostics (mode, DB/pool, cached-config counts, polling degradation, mesh state, sanitized listener failures, bounded `gateway_listeners` realization status, fixed-cardinality `jwks_trust`, the bounded `replay_authority` shared single-use aggregate, per-upstream `service_discovery` lifecycle/staleness) |
 | `/overload` | coarse `{level}` + status code (503 at critical) | full pressure/counter and sanitized listener-failure snapshots |
-| `/metrics` | **401** unless the client IP is in `FERRUM_METRICS_ALLOWED_CIDRS` | 200 Prometheus text |
+| `/metrics` | **401** unless the client IP is in `FERRUM_METRICS_ALLOWED_CIDRS`; **403** for a namespace-bounded JWT from any source IP | 200 Prometheus text |
 
-"Authenticated" here means **any** of: a primary admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT with a namespace ceiling does not itself authorize detail: without another authorization method, it receives the minimal health/status and overload projections. The same rule applies on all three routes. A matching metrics bearer token or allowlisted source IP keeps the detail it would receive with no JWT; the ceiling-bound JWT never adds detail. Ceiling-bound viewer-key tokens receive `403` from detailed metrics routes. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
+"Authenticated" here means **any** of: an admin JWT that is not namespace-bounded, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. A namespace-bounded JWT — a viewer-key JWT with a namespace ceiling, or any admin JWT carrying an `ns` claim — does not itself authorize detail: without another authorization method, it receives the [tenant tier](#tenant-tier-for-namespace-bounded-tokens) of `/health` and `/status` and the coarse `{level}` of `/overload`. On those three routes an allowlisted source IP keeps the detail it would receive with no JWT; the namespace-bounded JWT never adds detail. `/metrics` and the other metrics routes are fleet-global: a namespace-bounded JWT receives `403` there, **even from a `FERRUM_METRICS_ALLOWED_CIDRS` source IP**. The source-IP allowance authorizes only scrapes that present no such token, so a scraper on an allowlisted subnet must scrape without one (or with `FERRUM_METRICS_BEARER_TOKEN`). This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
@@ -40,21 +40,49 @@ on namespace-scoped routes; it never silently selects the default. Invalid
 backup attempts retain the canonical audit bucket and fixed
 `namespace_status: invalid` metadata without storing the rejected value.
 
-On a single-namespace deployment, admin JWTs are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace.
+On a single-namespace deployment, admin JWTs **without an `ns` claim** are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. A token that **carries** an `ns` claim is always bounded by it: it may address only the namespaces it lists, and it is refused on fleet-global routes (see [Namespace-scoped tokens and fleet-global routes](#namespace-scoped-tokens-and-fleet-global-routes)). Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` additionally makes namespace-scoped admin routes refuse tokens that carry no `ns` claim.
 
 **Enforcement also engages automatically on a multi-namespace control plane.** When `FERRUM_CP_NAMESPACES` names more than one namespace (e.g. `"prod,staging"`) or is `*`, `cp` mode turns namespace-claim enforcement on for the admin plane regardless of `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` — the same rule the CP↔DP gRPC plane applies to `ConfigSync`, `MeshConfigSync`, and xDS streams. On such a CP, **admin tokens without an `ns` claim are refused with `403` on namespace-scoped routes**, including `GET /backup` (which serialises consumer credentials) and `POST /restore`. Mint admin tokens with an explicit `ns` claim before pointing them at a multi-namespace CP. `database`, `file`, `dp`, `mesh`, and `node_agent` modes have no CP scope and keep the flag's `false` default.
 
 Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
-- A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/export` and `/backend-egress-policy` also check a present `ns` claim when enforcement is off. `/config/apply-status` is not namespace-scoped.
-- The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, `GET /namespaces` is **filtered** to the JWT `ns` claim — a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
-- Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected: `X-Ferrum-Namespace` does not select a tenant there. Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
+- A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`, whether or not enforcement is on. With enforcement on, tokens without an `ns` claim are also rejected on namespace-scoped routes — tenancy intent must be explicit.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/apply-status` is not namespace-scoped.
+- The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, or the token carries an `ns` claim, `GET /namespaces` is **filtered** to the JWT `ns` claim — with the flag on, a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
+- Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) are not selected by `X-Ferrum-Namespace`; a token without an `ns` claim reaches them whatever the flag says, and a token with one is refused (see below). Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
 - With enforcement on, an `operator` creating or updating a proxy or upstream may introduce only inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace in `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path`. The gateway resolves these references with its own credentials, so another namespace's Secret, a secret-manager or managed/ACME/PKCS#11 store, and a gateway-local file are refused with `400` before anything is loaded; the answer does not depend on whether the material exists. A value already stored on the resource is left alone, and `admin` tokens are unaffected. The check maps the Ferrum namespace an operator is scoped to onto the Kubernetes namespace of the same name: `k8s://<that namespace>/…` is admitted and is read with the gateway's own ServiceAccount, so do not give a Ferrum tenant namespace the name of a Kubernetes namespace that tenant must not read (for example `kube-system` or a platform namespace).
 
-With enforcement off — the flag unset and the CP scope single-namespace — the namespace header remains a routing selector only.
+With enforcement off — the flag unset and the CP scope single-namespace — the namespace header remains a routing selector only for tokens without an `ns` claim.
+
+#### Namespace-scoped tokens and fleet-global routes
+
+An admin JWT that carries an `ns` claim is a tenant credential. Whatever
+`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` says, the dispatcher refuses it with
+`403 Forbidden` on every fleet-global route before the route runs, and the
+refusal depends only on the credential and the route, never on the
+`X-Ferrum-Namespace` header or on any resource. Fleet-global routes need an
+admin JWT **without** an `ns` claim; there is no claim that re-grants fleet
+scope to a token that names its namespaces. A `scope` claim (for example
+`diagnostics:read`) does not widen it either.
+
+| Route class | Token with an `ns` claim |
+| --- | --- |
+| Namespace-scoped routes (listed above) | Allowed for the claimed namespaces only; `403` for any other, including the `ferrum` default when the header is omitted |
+| `GET /plugins` (plugin type catalog) | Allowed |
+| `GET /live`, `/health`, `/status`, `/overload` | Allowed. `/health` and `/status` return the [tenant tier](#tenant-tier-for-namespace-bounded-tokens); `/overload` returns only `{level}`, like an unauthenticated probe. An allowlisted source IP still grants the detail it grants on its own |
+| `GET /namespaces` | Allowed, filtered to the claim |
+| `GET`/`PUT`/`DELETE /namespaces/{name}`, `POST /namespaces` | Allowed for claimed names only (rename checks both names); role checks still apply |
+| `GET /diagnostics/v1/refs/{ref}` | Allowed; the lookup checks the reference against the claim itself |
+| Everything else: `/charges`, `/charges/sink/status`, `/metrics`, `/admin/metrics`, `/metrics/runtime`, `/cluster`, `/config/apply-status`, `/backend-capabilities` (including `POST /backend-capabilities/refresh`), every `/mesh/*` route (including `POST /mesh/config-revision/reset`), `/node-waypoint/identities`, `/service-waypoint/services`, every `/admin/tls/*` route, and any route not listed in this table | `403` |
+
+The list is explicit and fails closed: a global route added later is refused
+to `ns`-claim tokens until it is classified here. Viewer-key tokens under
+`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` follow the stricter ceiling allowlist
+described under [Namespace ceiling](#namespace-ceiling-ferrum_admin_jwt_viewer_namespaces).
+Refusals are logged as `audit.event = "admin_namespace_authz"` with
+`namespace_claim = "global_route_denied"`.
 
 | Role | Access |
 | --- | --- |
@@ -158,12 +186,12 @@ are never affected.
 - For a ceiling-bound viewer-key token, global routes fail closed with `403`
   unless they are `GET /namespaces`, `GET /namespaces/{name}`, `GET /plugins`
   (plugin type catalog), or health/liveness/readiness probes (`GET /health`,
-  `/live`, `/status`, `/overload`). Without a separate metrics bearer token or
-  allowlisted source IP, these tokens receive only the minimal `status`/`ready`
-  body from `/health` and `/status`, and only `{level}` from `/overload`,
-  matching an unauthenticated probe. A metrics bearer token or allowlisted IP
-  retains the detail it would receive without the viewer token, consistently
-  across all three routes. Detailed `/metrics` routes return `403`. Other
+  `/live`, `/status`, `/overload`). Without an allowlisted source IP, these
+  tokens receive the [tenant tier](#tenant-tier-for-namespace-bounded-tokens)
+  from `/health` and `/status`, and only `{level}` from `/overload`. An
+  allowlisted IP retains the detail it would receive without the viewer token,
+  consistently across all three routes. Detailed `/metrics` routes return
+  `403`, even from an allowlisted source IP. Other
   denied routes include `/charges`, `/admin/metrics`,
   `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
   and all other global routes. The namespace registry remains filtered as
@@ -432,7 +460,7 @@ Service-discovery task lifecycle and bounded staleness drive the same coarse fie
 
 A terminating process reports `status: "draining"`, `ready: false`, and HTTP 503. The verdict is published the moment SIGTERM/SIGINT is observed — ahead of the accept-loop close — so an orchestrator or load balancer can withdraw the replica from its endpoint set before a new connection is refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` keeps every listener (proxy and admin) accepting for that window. `draining` is terminal and wins over every other status. `/live` is deliberately unaffected and keeps returning 200: a liveness probe pointed at a draining pod must not trigger a SIGKILL mid-drain. See [graceful_shutdown.md](graceful_shutdown.md).
 
-Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state. The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In **data-plane mode**, authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect). In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. Both **database** and **cp** modes expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing. In **cp** mode, unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`. In **database** mode the poll task is respawned after an unexpected exit while last-known-good config continues to serve. When the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
+Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state. The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require an admin JWT that is not namespace-bounded, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP (a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens)). In **data-plane mode**, authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect). In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. Both **database** and **cp** modes expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing. In **cp** mode, unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`. In **database** mode the poll task is respawned after an unexpected exit while last-known-good config continues to serve. When the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
 
 In mesh mode, authenticated health detail includes
 `mesh.egress_scope.sidecar_admitted_services` and
@@ -502,6 +530,52 @@ A **shared single-use replay authority** outage is a readiness failure, not a co
 In **file, database, and data-plane modes**, a *dynamic Gateway API listener port* that cannot be bound is reported separately and is **recoverable**, not sticky. Every HTTP-family proxy carrying a `listen_port` gets its own socket; a port that is occupied, reserved by another Ferrum listener, claimed by a stream proxy, declared TLS without frontend TLS material, or whose TCP accept loop died after a successful bind is refused fail closed for routing and retried every 30 seconds while every healthy listener keeps serving. A route whose `listen_port` is a process-global proxy port (`FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`) of the other listener class, or that puts a dedicated Sidecar ingress bind on one, is rejected by config validation instead (the database-mode Admin API answers `409`); if a data plane receives one anyway, only the routes scoped to that port are refused and the process-global frontend keeps serving its port-agnostic routes. A dead **HTTP/3 (QUIC)** listener task is scoped to its own half: it is reaped and retried without stopping the port's TCP accept loop, so HTTP/1.1 and HTTP/2 keep serving and the port's routes stay admitted while `Alt-Svc` simply stops advertising HTTP/3. While any such failure is active, `/health` reports `status: "degraded"`, and authenticated callers additionally receive `gateway_listeners`: `desired_listeners` / `active_listeners` / `failed_ports` counts, a fixed-cardinality `active_by_category` breakdown, and up to 64 bounded entries carrying `port`, `protocol` (`tcp` or `quic` — a QUIC-only failure leaves HTTP/1.1 and HTTP/2 serving on that port), a closed-set `category`, an `admission`/`runtime` `origin`, the deciding `config_generation`, a sanitized 200-character `detail`, first/last observation timestamps, and an `observations` retry count. The 64-entry cap bounds the *detail* only: a private text-free ledger tracks the first-seen time and observation count of every active `(port, protocol half, reason)` identity up to a hard bound of 4096, so `active_failures`, `failed_ports`, `active_by_category`, and the cumulative counters stay exact for identities whose detail was dropped — a retry never re-counts an onset, and an identity that recovers is counted once whether or not it was ever shown. A pass that exceeds that ledger bound sets `overflowed: true` and says its identity accounting is incomplete rather than publishing corrupted totals. The entry disappears — and `ferrum_gateway_listener_recoveries_total` increments — as soon as a retry binds the port. By default the response stays 200 with `ready: true`, because one unbindable port must not withdraw a replica whose other listeners are serving; `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true` makes it 503 with `ready: false` while keeping `status: "degraded"` rather than `"unavailable"`. `/live` is unaffected in both cases, and unauthenticated `/health` still carries only `status` and `ready` — never a port, error string, or configuration detail. The matching fixed-cardinality metrics are documented in [prometheus_metrics.md](prometheus_metrics.md#dynamic-gateway-api-listener-realization).
 
 **Recommended split:** point liveness at `/live` and readiness at `/health`; route detailed diagnostics scraping through an authenticated path.
+
+#### Tenant tier for namespace-bounded tokens
+
+A namespace-bounded admin JWT — one carrying an `ns` claim, or a viewer-key
+token under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` — that has no independent
+detail authorization (an allowlisted source IP) receives a bounded **tenant
+tier** from `/health` and `/status`: the unauthenticated `status` and `ready`
+plus three top-level fields, under exactly the names and shapes of the detailed
+tier.
+
+| Field | Shape | Present |
+| --- | --- | --- |
+| `status`, `ready` | as in every tier | always |
+| `mode` | string, the operating mode (`database`, `file`, `cp`, `dp`, `mesh`, `node_agent`) | always |
+| `admin_writes_enabled` | boolean, the config-database mutation signal | always |
+| `namespace` | the [serving-scope object](#admin-is-multi-namespace-one-processs-data-plane-serves-one-namespace) (`active`, `serving_scope`, `data_plane_single_namespace`) | always; `active` is `null` when the token's bound does not admit the namespace this data plane routes |
+
+The `namespace` object is always present, but it never names another tenant's
+namespace. When this process's data plane routes a namespace outside the
+token's `ns` claim (or outside the viewer-key ceiling), `active` is redacted to
+`null` while `serving_scope` and `data_plane_single_namespace` keep the values
+the detailed tier derives from the mode:
+
+```json
+{"active": null, "serving_scope": "single-namespace-data-plane", "data_plane_single_namespace": true}
+```
+
+The detailed tier never produces `active: null` together with
+`data_plane_single_namespace: true`, so a client reads this combination as
+"the namespace routed here is not one this token can address" and treats its
+own namespace as unserved. On `cp` and `node_agent`, where `active` is `null`
+anyway, the block is identical to the detailed tier's.
+
+Every other detailed field (timestamp, database and pool state, cached-config
+counts, polling, mesh, listener, trust, and sink detail) describes the whole
+process and is withheld. The status code is the
+same as in the other tiers. Tokens without an `ns` claim (and without a
+viewer-key ceiling) keep the full detailed tier; unauthenticated probes keep
+`status` + `ready`.
+
+```bash
+curl -H "Authorization: Bearer $TENANT_TOKEN" http://localhost:9000/health
+# Returns: {"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true,
+#           "namespace":{"active":"tenant-a","serving_scope":"single-namespace-data-plane",
+#                        "data_plane_single_namespace":true}}
+```
 
 ## TLS Inventory
 
@@ -804,7 +878,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9000/status \
 
 The block is authenticated-tier only (the namespace name is operator-supplied
 deployment topology); the unauthenticated probe still carries only `status` and
-`ready`.
+`ready`. A namespace-bounded token always receives the block in the
+[tenant tier](#tenant-tier-for-namespace-bounded-tokens), with `active`
+redacted to `null` when its bound does not admit the namespace routed here.
 
 **2. Detect it per write.** An **accepted** mutation (`2xx` on
 `POST`/`PUT`/`DELETE`) to a namespace-scoped route under a namespace this
@@ -2421,7 +2497,7 @@ See [admin_metrics.md](admin_metrics.md) for the full `/admin/metrics` field ref
 
 ### Prometheus `/metrics` (gated)
 
-The exact `/metrics` endpoint returns Prometheus text exposition for scrapers. **It is gated by default** — a scraper must present a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or originate from a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Without one of these, `/metrics` returns `401` with a `WWW-Authenticate: Bearer` header. Unauthenticated scraping is an explicit operator opt-in.
+The exact `/metrics` endpoint returns Prometheus text exposition for scrapers. **It is gated by default** — a scraper must present a valid admin JWT that is not namespace-bounded, a matching `FERRUM_METRICS_BEARER_TOKEN`, or originate from a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Without one of these, `/metrics` returns `401` with a `WWW-Authenticate: Bearer` header. Unauthenticated scraping is an explicit operator opt-in. A namespace-bounded admin JWT (an `ns` claim, or a viewer-key namespace ceiling) is refused with `403` from every source IP: the CIDR allowance covers only scrapes that present no such token.
 
 Safe Prometheus scrape configurations:
 

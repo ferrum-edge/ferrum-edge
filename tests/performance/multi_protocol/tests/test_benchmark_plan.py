@@ -193,7 +193,8 @@ class PairedPlanTests(unittest.TestCase):
         fields[0] = "S"
         fields[11], fields[12], fields[19], fields[21] = "120", "30", "999", "16"
         record = parse_stat("42 (worker (echo)) " + " ".join(fields), 100, 4096)
-        self.assertEqual(record, dict(start_ticks=999, cpu_seconds=1.5, rss_bytes=65536))
+        self.assertEqual(record, dict(start_ticks=999, cpu_seconds=1.5, rss_bytes=65536,
+                                      user_cpu_seconds=1.2, system_cpu_seconds=0.3))
 
     def test_measurement_cpu_brackets_and_pid_reuse_are_explicit(self):
         timeline = [dict(unix_secs=t, processes=[dict(
