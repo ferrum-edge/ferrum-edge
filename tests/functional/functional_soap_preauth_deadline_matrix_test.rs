@@ -1592,7 +1592,10 @@ async fn drive_h3_upload(
 /// What a client saw first on an HTTP/3 request stream.
 enum FirstOnStream {
     /// The response head, and the `STOP_SENDING` watch still to come.
-    Head(Result<Response<()>, h3::error::StreamError>, StopSendingWatch),
+    Head(
+        Result<Response<()>, h3::error::StreamError>,
+        StopSendingWatch,
+    ),
     /// The peer's `STOP_SENDING`, while no response head had been received.
     StopSending(Result<Option<u64>, StreamErrorIncoming>),
 }
@@ -1868,7 +1871,11 @@ async fn a_ready_message_whose_total_elapsed_before_its_collector_ran_is_refused
 
     let control = bearer_uploads(
         &Upload::soap("/control/op", BodyScript::complete(valid_envelope())),
-        ["Bearer control-h1", "Bearer control-h2", "Bearer control-h3"],
+        [
+            "Bearer control-h1",
+            "Bearer control-h2",
+            "Bearer control-h3",
+        ],
     );
     let (outcomes, ()) = tokio::join!(
         gateway.upload_each(&control),
@@ -1886,7 +1893,11 @@ async fn a_ready_message_whose_total_elapsed_before_its_collector_ran_is_refused
     // calls this long after the last one elapses every request's total.
     let expired = bearer_uploads(
         &Upload::soap("/expired/op", BodyScript::complete(valid_envelope())),
-        ["Bearer expired-h1", "Bearer expired-h2", "Bearer expired-h3"],
+        [
+            "Bearer expired-h1",
+            "Bearer expired-h2",
+            "Bearer expired-h3",
+        ],
     );
     let (outcomes, ()) = tokio::join!(
         gateway.upload_each(&expired),
@@ -1895,7 +1906,9 @@ async fn a_ready_message_whose_total_elapsed_before_its_collector_ran_is_refused
     for outcome in outcomes {
         assert_route_timeout(&outcome, ms(TOTAL_MS), "ready message, elapsed total");
     }
-    backend.assert_untouched("ready message, elapsed total").await;
+    backend
+        .assert_untouched("ready message, elapsed total")
+        .await;
 }
 
 // ---------------------------------------------------------------------------
