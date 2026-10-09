@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- H3 live socket-lifecycle observers recognize Linux 7.0's `sockaddr_unsized`
+  pointer in `inet_bind`, while retaining exact argument, return and pointer
+  checks. Synthetic BTF regressions reject unrelated or changed signatures.
+
+- The scheduled vendored-patch audit distinguishes an unreviewed upstream merge
+  from a reviewed fix that has not shipped. Release holds bind the exact merge
+  and latest stable version, expire within 30 days, and fail on changed or unknown
+  upstream identities. SQLx's typed-float NULL patch remains vendored until a
+  compatible release passes the existing PostgreSQL regression.
+
+- Ambient host-UDP live qualification passes its four harness inputs explicitly
+  across sudo on Ubuntu 26.04; namespace isolation and required live tests remain
+  enforced. It no longer depends on whole-environment preservation.
+
 - Manual protocol and payload benchmarks keep their standalone harnesses on
   `release`, while the selected build profile applies to the gateway. Selecting
   `ci-release` or `max-perf` no longer asks harnesses for undefined profiles.

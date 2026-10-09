@@ -69,6 +69,8 @@ jobs:
       - name: Required syntax and semantic contracts
         run: |
           set -euo pipefail
+          cc -std=gnu11 -O2 -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/btf_prototype_test.c -lbpf -lelf -lz -o "$RUNNER_TEMP/h3-build/btf_prototype_test"
+          "$RUNNER_TEMP/h3-build/btf_prototype_test"
           cc -std=gnu11 -O2 -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/decoder_test.c -o "$RUNNER_TEMP/h3-build/decoder_test"
           "$RUNNER_TEMP/h3-build/decoder_test"
           cp "$RUNNER_TEMP/h3-build/decoder_test" "$RUNNER_TEMP/h3-proof/build/decoder_test"

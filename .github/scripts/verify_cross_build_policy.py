@@ -2538,7 +2538,14 @@ AMBIENT_HOST_UDP_LIVE_STEP = r"""      - name: Run ambient host-UDP live gate as
           # creates its own proven disposable outer netns for every ordinary
           # root execution (including ad-hoc), so isolation does not depend on
           # a forgeable environment flag.
-          sudo -E unshare --net -- bash -c '
+          # sudo-rs on Ubuntu 26.04 does not preserve the whole environment.
+          # Pass only the four inputs required by the prebuilt live harness.
+          sudo env \
+            "FERRUM_LIVE_TESTS_REQUIRED=$FERRUM_LIVE_TESTS_REQUIRED" \
+            "FERRUM_HOST_UDP_LIB_TEST_BIN=$FERRUM_HOST_UDP_LIB_TEST_BIN" \
+            "FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN=$FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN" \
+            "FERRUM_HOST_UDP_LIVE_RESULTS=$FERRUM_HOST_UDP_LIVE_RESULTS" \
+            unshare --net -- bash -c '
             set -euo pipefail
             ip link set lo up
             if [[ -w /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then

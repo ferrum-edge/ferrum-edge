@@ -37,6 +37,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +92,71 @@ WRAPPER_EXEC = (
     'exec python3 "$SCRIPT_DIR/check_vendored_patch_lifecycle.py" --upstream-status'
 )
 USER_AGENT = "ferrum-edge-dependency-audit (github.com/ferrum-edge/ferrum-edge)"
+MAX_MERGED_RELEASE_HOLD_DAYS = 30
+
+
+def merged_release_hold_shape_errors(patch: dict[str, Any]) -> list[str]:
+    retirement = patch.get("retirement")
+    if not isinstance(retirement, dict):
+        return []  # The enclosing shape validator reports invalid retirement.
+    hold = retirement.get("merged_release_hold")
+    if hold is None:
+        return []
+    prefix = f"{patch.get('id')}.retirement.merged_release_hold"
+    if not isinstance(hold, dict):
+        return [f"{prefix}: must be an object"]
+    errors: list[str] = []
+    fields = {"reviewed_on", "expires_on", "owner", "latest_release", "merge_commit", "reason", "evidence"}
+    if set(hold) != fields:
+        errors.append(f"{prefix}: must contain exactly {sorted(fields)}")
+    for field in fields - {"evidence"}:
+        _require_nonempty_str(hold.get(field), f"{prefix}.{field}", errors)
+    _require_nonempty_str_list(hold.get("evidence"), f"{prefix}.evidence", errors)
+    if hold.get("owner") != patch.get("owner"):
+        errors.append(f"{prefix}.owner: must match the patch owner")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(hold.get("merge_commit", ""))):
+        errors.append(f"{prefix}.merge_commit: must be a full commit SHA")
+    if not CRATES_IO_VERSION_RE.fullmatch(str(hold.get("latest_release", ""))):
+        errors.append(f"{prefix}.latest_release: must be a registry version")
+    upstream = patch.get("upstream")
+    if not isinstance(upstream, dict) or upstream.get("filing") != "filed":
+        errors.append(f"{prefix}: requires a filed upstream PR")
+    compatible = retirement.get("compatible_release_test")
+    if not isinstance(compatible, dict) or compatible.get("status") != "blocked":
+        errors.append(f"{prefix}: requires compatible_release_test.status=blocked")
+    try:
+        if any(not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(hold.get(field)))
+               for field in ("reviewed_on", "expires_on")):
+            raise ValueError("non-calendar review date")
+        reviewed = date.fromisoformat(hold["reviewed_on"])
+        expires = date.fromisoformat(hold["expires_on"])
+        if not 0 < (expires - reviewed).days <= MAX_MERGED_RELEASE_HOLD_DAYS:
+            errors.append(f"{prefix}: review window must be 1..{MAX_MERGED_RELEASE_HOLD_DAYS} days")
+    except (KeyError, TypeError, ValueError):
+        errors.append(f"{prefix}: review dates must be ISO calendar dates")
+    return errors
+
+
+def merged_release_hold_errors(
+    patch: dict[str, Any], latest_release: str | None, *, today: date | None = None
+) -> list[str]:
+    """A reviewed unreleased fix remains visible and must be reviewed again soon."""
+    hold = patch["retirement"].get("merged_release_hold")
+    if hold is None:
+        return ["no reviewed release hold"]
+    errors = merged_release_hold_shape_errors(patch)
+    if errors:
+        return errors
+    today = today or datetime.now(timezone.utc).date()
+    if today < date.fromisoformat(hold["reviewed_on"]):
+        errors.append("release hold review is in the future")
+    if today >= date.fromisoformat(hold["expires_on"]):
+        errors.append("release hold expired")
+    if latest_release is None:
+        errors.append("latest stable release could not be confirmed")
+    elif latest_release != hold["latest_release"]:
+        errors.append("latest stable release changed; repeat compatibility review")
+    return errors
 
 
 def load_lifecycle() -> Any:
@@ -372,6 +438,7 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
                         f"{prefix}.retirement.compatible_release_test.notes: "
                         "must be null or a string"
                     )
+            errors.extend(merged_release_hold_shape_errors(patch))
 
     checklist = data.get("retirement_checklist")
     _require_nonempty_str_list(checklist, "retirement_checklist", errors)
@@ -693,6 +760,14 @@ def parity_errors(data: Any) -> list[str]:
         if readme is None:
             errors.append(f"{pid}: missing README under {docs_path}")
             continue
+        hold = patch["retirement"].get("merged_release_hold")
+        if hold is not None:
+            errors.extend(f"{pid}: {message}" for message in
+                          merged_release_hold_errors(patch, hold["latest_release"]))
+            marker = (f"Release hold reviewed {hold['reviewed_on']} by {hold['owner']}; "
+                      f"latest stable {hold['latest_release']}; expires {hold['expires_on']}.")
+            if marker not in readme.read_text(encoding="utf-8"):
+                errors.append(f"{pid}: README lacks matching release hold review")
         errors.extend(
             reaffirmation_parity_errors(
                 pid,
@@ -788,7 +863,27 @@ def fetch_json(request: urllib.request.Request) -> tuple[Any, str | None]:
         return None, "malformed JSON response"
 
 
-def github_pr_state(repo: str, pr_number: int) -> tuple[str | None, str | None]:
+def github_payload_state(
+    payload: Any, expected_merge_commit: str | None = None
+) -> tuple[str | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, "unexpected response shape"
+    if expected_merge_commit is not None:
+        if not payload.get("merged_at") or payload.get("merge_commit_sha") != expected_merge_commit:
+            return None, "reviewed upstream merge could not be confirmed"
+    if payload.get("merged_at"):
+        return "MERGED", None
+    state = payload.get("state")
+    if state == "open":
+        return "OPEN", None
+    if state == "closed":
+        return "CLOSED", None
+    return None, "unrecognized pull-request state"
+
+
+def github_pr_state(
+    repo: str, pr_number: int, *, expected_merge_commit: str | None = None
+) -> tuple[str | None, str | None]:
     """Return (OPEN|CLOSED|MERGED, failure reason); both None-safe for callers."""
     if not _is_github_repo(repo) or not _is_positive_int(pr_number):
         return None, "invalid repository or pull-request number"
@@ -799,18 +894,9 @@ def github_pr_state(repo: str, pr_number: int) -> tuple[str | None, str | None]:
     payload, reason = fetch_json(request)
     if reason is not None:
         return None, reason
-    if not isinstance(payload, dict):
-        return None, "unexpected response shape"
-    if payload.get("merged_at"):
-        return "MERGED", None
-    state = payload.get("state")
-    if state == "open":
-        return "OPEN", None
-    if state == "closed":
-        return "CLOSED", None
     # Never echo the raw field: an untrusted string in the log could forge a
     # `::error::` workflow command.
-    return None, "unrecognized pull-request state"
+    return github_payload_state(payload, expected_merge_commit)
 
 
 def crates_io_latest(crate: str) -> str | None:
@@ -832,9 +918,10 @@ def crates_io_latest(crate: str) -> str | None:
     return version
 
 
-def run_upstream_status(data: dict[str, Any]) -> int:
+def run_upstream_status(data: dict[str, Any], *, today: date | None = None) -> int:
     retire_signal = 0
     query_failed = 0
+    held_count = 0
     print("## Vendored patch upstream status")
     print("")
     for patch in data["patches"]:
@@ -884,7 +971,11 @@ def run_upstream_status(data: dict[str, Any]) -> int:
                     "dated reaffirmation in the lifecycle inventory."
                 )
         elif pr is not None:
-            state, reason = github_pr_state(upstream["github_repo"], pr)
+            hold = patch["retirement"].get("merged_release_hold")
+            state, reason = github_pr_state(
+                upstream["github_repo"], pr,
+                expected_merge_commit=hold["merge_commit"] if hold else None,
+            )
             if not state:
                 print(
                     f"  ::warning::could not query upstream PR "
@@ -894,13 +985,21 @@ def run_upstream_status(data: dict[str, Any]) -> int:
             else:
                 print(f"- upstream PR {upstream['github_repo']}#{pr}: state={state}")
                 if state == "MERGED":
-                    print(
-                        f"  ::warning::ACTION — {patch['crate']} PR "
-                        f"{upstream['github_repo']}#{pr} merged upstream. Run the "
-                        "compatible-release test on a branch without the patch before "
-                        f"retiring per {patch['docs_path']}."
-                    )
-                    retire_signal = 1
+                    hold_errors = merged_release_hold_errors(patch, latest, today=today)
+                    if not hold_errors:
+                        held_count += 1
+                        print(f"- merged fix retained pending a compatible release; "
+                              f"review expires {hold['expires_on']}: {hold['reason']}")
+                    else:
+                        if hold:
+                            print("  ::warning::release hold invalid: " + "; ".join(hold_errors))
+                        print(
+                            f"  ::warning::ACTION — {patch['crate']} PR "
+                            f"{upstream['github_repo']}#{pr} merged upstream. Run the "
+                            "compatible-release test on a branch without the patch before "
+                            f"retiring per {patch['docs_path']}."
+                        )
+                        retire_signal = 1
                 elif state == "CLOSED":
                     print(
                         f"  ::warning::{patch['crate']} PR {upstream['github_repo']}#{pr} "
@@ -923,7 +1022,7 @@ def run_upstream_status(data: dict[str, Any]) -> int:
             "::error::One or more upstream PR statuses could not be queried; failing closed."
         )
         return 1
-    print("No vendored patch has merged upstream yet; nothing to retire.")
+    print(f"No unreviewed merged patches; {held_count} bounded release holds remain active.")
     return 0
 
 
@@ -1653,6 +1752,67 @@ true
         "lifecycle inventory header is missing",
         "unrelated nine-column table must not be treated as lifecycle inventory",
     )
+
+    # A merge alone is not a released fix. A hold must be bounded, match the
+    # live release/merge identities, and remain blocked on compatibility.
+    hold = {
+        "reviewed_on": "2050-01-01", "expires_on": "2050-01-31",
+        "owner": _valid_patch()["owner"], "latest_release": "1.0.0", "merge_commit": "a" * 40,
+        "reason": "merged fix not released", "evidence": ["https://example.com/source"],
+    }
+    held = _valid_patch(retirement={
+        "compatible_release_test": {"status": "blocked"}, "merged_release_hold": hold,
+    })
+    review_day = date(2050, 1, 1)
+    expect_empty(validate_lifecycle_shape({**base, "patches": [held]}), "valid release hold")
+    expect_empty(merged_release_hold_errors(held, "1.0.0", today=review_day), "active hold")
+    for latest, day, needle in [
+        ("1.0.1", review_day, "release changed"),
+        (None, review_day, "could not be confirmed"),
+        ("1.0.0", date(2050, 1, 31), "expired"),
+        ("1.0.0", date(2049, 12, 31), "in the future"),
+    ]:
+        expect_contains(merged_release_hold_errors(held, latest, today=day), needle, needle)
+    for field, value, needle in [
+        ("expires_on", "2050-02-01", "review window"),
+        ("reviewed_on", "20500101", "ISO calendar"),
+        ("owner", "different owner", "patch owner"),
+        ("merge_commit", "not-a-sha", "full commit SHA"),
+        ("evidence", [], "non-empty list"),
+    ]:
+        mutated = _valid_patch(retirement={
+            "compatible_release_test": {"status": "blocked"},
+            "merged_release_hold": {**hold, field: value},
+        })
+        expect_contains(validate_lifecycle_shape({**base, "patches": [mutated]}), needle, needle)
+    for status in ("not_started", "passed"):
+        mutated = _valid_patch(retirement={
+            "compatible_release_test": {"status": status}, "merged_release_hold": hold,
+        })
+        expect_contains(validate_lifecycle_shape({**base, "patches": [mutated]}),
+                        "status=blocked", "hold cannot hide compatibility outcome")
+
+    # Exercise the whole upstream decision with synthetic responses, never live
+    # network access. Other merged patches still fail without a reviewed hold.
+    import contextlib
+    import io
+    from unittest import mock
+    payload = {"merged_at": "2050-01-01", "merge_commit_sha": "a" * 40, "state": "closed"}
+    cases = [
+        (held, "1.0.0", payload, 0, "reviewed unreleased fix"),
+        (held, "1.0.1", payload, 1, "new release requires review"),
+        (held, None, payload, 1, "unknown release fails closed"),
+        (held, "1.0.0", {**payload, "merge_commit_sha": "b" * 40}, 1, "merge mismatch"),
+        (held, "1.0.0", {"state": "open"}, 1, "unconfirmed merge"),
+        (_valid_patch(), "1.0.0", payload, 1, "unreviewed merge still fails"),
+    ]
+    for fixture, latest, response, expected, label in cases:
+        with mock.patch(f"{__name__}.fetch_json", return_value=(response, None)), \
+             mock.patch(f"{__name__}.crates_io_latest", return_value=latest), \
+             contextlib.redirect_stdout(io.StringIO()):
+            actual = run_upstream_status({"patches": [fixture]}, today=review_day)
+        if actual != expected:
+            failures.append(f"{label}: expected status {expected}, got {actual}")
 
     if failures:
         for message in failures:
