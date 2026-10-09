@@ -610,7 +610,7 @@ where
     } else {
         r#"{"error":"Backend timeout"}"#
     };
-    let mut outcome = write_plain_gateway_error(
+    let mut outcome = match write_plain_gateway_error(
         stream,
         request_ctx,
         StatusCode::GATEWAY_TIMEOUT,
@@ -619,7 +619,23 @@ where
         args.backend_start,
         args.bytes_sent,
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // STOP_SENDING can make an uploading client close before the 504
+            // HEADERS arrive. The backend timeout has already been charged;
+            // retain that outcome so the caller still emits its one summary.
+            crate::http3::stream_util::abort_response_stream(stream);
+            terminal_deadline_write_aborted_outcome(
+                StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                0,
+                args.backend_start,
+                args.bytes_sent,
+                true,
+            )
+        }
+    };
     outcome.backend_target = Some(strip_query_from_backend_url(args.current_url));
     outcome.connection_error = false;
     outcome.error_class = Some(ErrorClass::ReadWriteTimeout);
