@@ -14087,6 +14087,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         // `apply_destination_rules`; SQL backends do not persist them, so SQL
         // rows always start with an empty map.
         resolved_subset_tls: std::collections::HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via

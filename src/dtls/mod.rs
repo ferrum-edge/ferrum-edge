@@ -1133,6 +1133,15 @@ pub fn build_backend_dtls_config(
     global_ca_bundle_path: Option<&str>,
     tls_policy: Option<&crate::tls::TlsPolicy>,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
+    // Checked before anything else, so neither `FERRUM_TLS_NO_VERIFY`, the
+    // global CA, nor an ephemeral client certificate can stand in for backend
+    // TLS material this node refused.
+    if proxy.resolved_tls.tls_refused {
+        crate::tls::backend::record_backend_tls_refusal(
+            crate::tls::backend::BackendTlsRefusalSurface::DtlsBuild,
+        );
+        return Err(anyhow::Error::new(crate::tls::backend::TlsError::Refused));
+    }
     // An explicit `system://` trust selection never inherits the global
     // `FERRUM_TLS_NO_VERIFY` opt-out.
     let skip_verify = !proxy.resolved_tls.verify_server_cert

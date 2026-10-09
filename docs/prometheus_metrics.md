@@ -209,7 +209,7 @@ A single reconcile whose `last_reconcile_duration_milliseconds` dwarfs its neigh
 
 Sampled on the authenticated `/metrics` scrape from state the gateway already maintains — the `OverloadState` atomics, the two-layer `HealthChecker` maps, the shared circuit-breaker cache, and each pool's own resident count. Nothing is added to the proxy hot path to publish them, and no series is keyed by a resolved endpoint address, peer IP, SNI, or certificate field.
 
-Everything except `ferrum_backend_retry_attempts_total` and `ferrum_frontend_tls_handshake_failures_total` requires a running data path, so `cp` and `node_agent` scrapes stay silent rather than reporting zeros for listeners they never bind.
+Everything except `ferrum_backend_retry_attempts_total`, `ferrum_frontend_tls_handshake_failures_total`, and `ferrum_backend_tls_reload_validation_failures_total` requires a running data path, so `cp` and `node_agent` scrapes stay silent rather than reporting zeros for listeners they never bind.
 
 #### Load shedding
 
@@ -257,6 +257,15 @@ Label sets are bounded by *configuration*, never by traffic or endpoint churn:
 - `action`, `resource`, `state`, `pool`, and `reason` are closed compiled-in sets.
 - `upstream_id` and `proxy_id` are configured resource identities — the same cardinality tier `ferrum_requests_total` already uses.
 - Per-target health and per-target breaker state are reduced to a **count** per upstream / per proxy. A resolved endpoint address is never a label, so pod churn cannot grow the series count. Per-target detail stays on authenticated `GET /admin/metrics`.
+
+### Backend TLS refusals and live-reload validation
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_backend_tls_refusals_total` | counter | `surface`, `gateway_namespace` | Mesh only. Builds refused for a destination whose DestinationRule TLS material this node refused. `slice_apply` counts once per refused upstream per slice apply, so it tracks how many destinations are refused. `client_build` counts refused build **attempts**: the reqwest, direct HTTP/2, gRPC, HTTP/3, and `wss://` WebSocket pools refuse at their entry point, before any pool lookup or TLS build queue work, and capability probes and TCP+TLS stream listeners refuse inside the shared builder. It therefore scales with traffic to refused destinations; read it as a rate, not as a destination count. `dtls_build` and `health_probe` count refused DTLS builds and health-probe client builds. |
+| `ferrum_backend_tls_reload_validation_failures_total` | counter | `kind`, `namespace` | Destinations skipped by a backend TLS live reload (`FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`) because their material no longer builds. `kind` is the closed set `proxy` (a TLS-scheme proxy), `route_dispatch_rule` (a `mesh_route_dispatch` rule-level `destination.backend_tls`), and `route_dispatch_config` (a `mesh_route_dispatch` config that did not parse, so none of its rules were validated). Refused destinations are not counted here. Every other destination still reloads; a skipped destination fails closed until its material is fixed (see [backend_mtls.md](backend_mtls.md#operational-contract-for-backend-tls-sources)). Rendered in every mode; it stays at zero where no backend TLS live reload runs. |
+
+**Suggested alert:** `increase(ferrum_backend_tls_reload_validation_failures_total[15m]) > 0` after a certificate rotation. The per-destination `WARN` lines name the proxy or plugin; the metric deliberately carries no destination label.
 
 ### `error_class` on request and stream counters
 
@@ -430,6 +439,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_api_stream_connections_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total stream sessions (TCP/UDP/DTLS) per consumer. |
 | `ferrum_backend_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Backend response time in milliseconds. |
 | `ferrum_backend_retry_attempts_total` | counter | `namespace` | `backend_retry` | `documented_only` | `always` | Backend request retries scheduled by the retry policy across every dispatch transport. |
+| `ferrum_backend_tls_refusals_total` | counter | `surface`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Backend TLS refusals for destinations whose DestinationRule TLS material this node refused, by surface. |
+| `ferrum_backend_tls_reload_validation_failures_total` | counter | `kind`, `namespace` | `tls` | `documented_only` | `always` | Backend TLS destinations skipped by a backend TLS live reload because their material failed validation, by bounded kind. |
 | `ferrum_circuit_breaker_cache_admission_refused_total` | counter | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Requests refused a cached breaker because the shared breaker cache was at its admission ceiling; each one ran on a transient breaker whose failures never accumulate. |
 | `ferrum_circuit_breaker_cache_entries` | gauge | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Circuit breakers resident in the shared breaker cache. |
 | `ferrum_circuit_breaker_cache_max_entries` | gauge | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Admission ceiling for the shared breaker cache; new keys are refused at this count. |

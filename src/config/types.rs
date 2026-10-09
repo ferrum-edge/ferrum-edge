@@ -1786,6 +1786,24 @@ pub struct BackendTlsConfig {
     pub san_allow_list: Vec<String>,
     #[serde(skip)]
     pub san_allow_list_key_digest: Option<String>,
+    /// Runtime-only refusal marker. `true` when this node refused the TLS
+    /// material a namespace-authored DestinationRule named for this
+    /// destination (see `modes::mesh::fail_closed_upstream_backend_tls`).
+    ///
+    /// Every backend TLS builder checks it FIRST and refuses to build: the
+    /// shared [`crate::tls::backend::BackendTlsConfigBuilder`] (proxy pools,
+    /// capability probes, stream TLS, live-reload validation), the backend
+    /// DTLS builder, and the health-check probe builders. Checking it before
+    /// anything else is what keeps `FERRUM_TLS_NO_VERIFY`, the global
+    /// `FERRUM_TLS_CA_BUNDLE_PATH`, and the global
+    /// `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_KEY_PATH` pair from standing
+    /// in for the refused material. It is part of every backend TLS pool and
+    /// config-cache key, so a client built before the refusal is never reused.
+    ///
+    /// Never accepted from or emitted to config: it is stamped in-process at
+    /// mesh slice apply, like `Upstream::resolved_subset_tls`.
+    #[serde(skip)]
+    pub tls_refused: bool,
 }
 
 impl BackendTlsConfig {
@@ -1799,6 +1817,16 @@ impl BackendTlsConfig {
             sni: None,
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
+            tls_refused: false,
+        }
+    }
+
+    /// A destination whose backend TLS was refused on this node: no material,
+    /// verification on, and [`Self::tls_refused`] set so every builder refuses.
+    pub fn refused() -> Self {
+        Self {
+            tls_refused: true,
+            ..Self::default_verify()
         }
     }
 
@@ -1813,6 +1841,7 @@ impl BackendTlsConfig {
             sni: upstream.backend_tls_sni.clone(),
             san_allow_list: upstream.backend_tls_san_allow_list.clone(),
             san_allow_list_key_digest: digest,
+            tls_refused: upstream.backend_tls_refused,
         }
     }
 
@@ -1826,6 +1855,7 @@ impl BackendTlsConfig {
             sni: None,
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
+            tls_refused: false,
         }
     }
 
@@ -2019,6 +2049,14 @@ pub struct Upstream {
     /// `Upstream.subsets[].traffic_policy.tls`.
     #[serde(skip)]
     pub resolved_subset_tls: HashMap<String, ResolvedSubsetTrafficPolicy>,
+    /// Runtime-only: this node refused the TLS material a tenant
+    /// DestinationRule named for this upstream, so every backend TLS build for
+    /// it must fail. Projected onto [`BackendTlsConfig::tls_refused`] by
+    /// [`BackendTlsConfig::from_upstream`]; per-port and subset TLS slots carry
+    /// [`BackendTlsConfig::refused`] themselves. Stamped by mesh slice apply
+    /// (`fail_closed_upstream_backend_tls`); never an operator input field.
+    #[serde(skip)]
+    pub backend_tls_refused: bool,
     /// Inherited (non-`portLevelSettings`) DestinationRule
     /// `connectionPool.http` overlay.
     ///

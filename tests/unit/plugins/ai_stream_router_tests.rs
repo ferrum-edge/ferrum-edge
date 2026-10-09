@@ -2245,6 +2245,7 @@ async fn test_backend_tls_default_and_inherit() {
         sni: Some("llm.internal.example.com".to_string()),
         san_allow_list: vec!["llm.internal.example.com".to_string()],
         san_allow_list_key_digest: Some("digest".to_string()),
+        tls_refused: false,
     };
     let mut proxy = create_test_proxy();
     proxy.resolved_tls = inherited_tls.clone();
@@ -6309,6 +6310,7 @@ async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_muta
         sni: Some("llm.internal.example.com".to_string()),
         san_allow_list: vec!["spiffe://internal/llm".to_string()],
         san_allow_list_key_digest: None,
+        tls_refused: false,
     };
     let inherited = proxy.resolved_tls.clone();
 

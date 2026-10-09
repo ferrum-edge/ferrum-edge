@@ -152,6 +152,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         port_overrides: HashMap::new(),
         source_locality: None,

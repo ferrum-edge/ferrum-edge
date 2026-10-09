@@ -78,6 +78,7 @@ fn tls_for_port(tag: &str) -> BackendTlsConfig {
         sni: None,
         san_allow_list: vec![format!("spiffe://example.org/ns/default/sa/{tag}")],
         san_allow_list_key_digest: None,
+        tls_refused: false,
     }
 }
 

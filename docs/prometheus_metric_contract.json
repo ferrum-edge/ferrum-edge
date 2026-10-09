@@ -1050,6 +1050,32 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_backend_tls_refusals_total",
+    "type": "counter",
+    "help": "Backend TLS refusals for destinations whose DestinationRule TLS material this node refused, by surface.",
+    "labels": [
+      "surface",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_backend_tls_reload_validation_failures_total",
+    "type": "counter",
+    "help": "Backend TLS destinations skipped by a backend TLS live reload because their material failed validation, by bounded kind.",
+    "labels": [
+      "kind",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_circuit_breaker_cache_admission_refused_total",
     "type": "counter",
     "help": "Requests refused a cached breaker because the shared breaker cache was at its admission ceiling; each one ran on a transient breaker whose failures never accumulate.",

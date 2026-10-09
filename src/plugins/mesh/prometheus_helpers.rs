@@ -20,6 +20,7 @@ use crate::modes::mesh::metric_tag_cel::{
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
+use crate::tls::backend::{BackendTlsRefusalSurface, backend_tls_refusal_count};
 
 const MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS: u64 = 6 * 60 * 60;
 const MESH_CERT_EXPIRY_EVICTION_INTERVAL_SECONDS: u64 = 60;
@@ -1444,6 +1445,26 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
                 escape_label_value(entry.key().reason),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    // Backend TLS refusals (issue #6105). `surface` is a closed enum, so no
+    // destination, rule, namespace, or path can become a label.
+    if BackendTlsRefusalSurface::ALL
+        .iter()
+        .any(|surface| backend_tls_refusal_count(*surface) > 0)
+    {
+        output.push_str(
+            "# HELP ferrum_backend_tls_refusals_total Backend TLS refusals for destinations whose DestinationRule TLS material this node refused, by surface.\n",
+        );
+        output.push_str("# TYPE ferrum_backend_tls_refusals_total counter\n");
+        for surface in BackendTlsRefusalSurface::ALL {
+            output.push_str(&format!(
+                "ferrum_backend_tls_refusals_total{{surface=\"{}\"{}}} {}\n",
+                surface.as_metric_label(),
+                gateway_ns_label,
+                backend_tls_refusal_count(surface)
             ));
         }
     }

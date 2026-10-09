@@ -138,12 +138,12 @@
 //! `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED` (default `true`), a refreshable CRL
 //! source, and the poll cadence — `FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS`
 //! (default 30s) for file-backed sources, the source's own `?poll=` or
-//! `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` otherwise. One consequence is worth
-//! stating plainly: that task validates the WHOLE backend TLS surface before it
-//! publishes anything, so a backend TLS validation failure with nothing to do
-//! with the CRL withholds the mesh inbound publication as well, and disabling
-//! backend live reload pins the mesh inbound enforced set at its startup
-//! snapshot.
+//! `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` otherwise. That task validates the
+//! backend TLS surface one destination at a time (issue #6105): a destination
+//! whose material no longer builds is warned and skipped, so it cannot withhold
+//! the mesh inbound publication; only a CRL candidate that fails to load does.
+//! Disabling backend live reload pins the mesh inbound enforced set at its
+//! startup snapshot.
 //!
 //! ALL THREE PUBLISHERS SHARE ONE FENCE-OWNED LOCK
 //! ([`HboneAdmissionFence::publication_lock`]), taken by the trust install, the
