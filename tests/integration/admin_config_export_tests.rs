@@ -821,8 +821,18 @@ async fn ceiling_bound_viewers_are_denied_global_routes_except_the_explicit_allo
             // A bounded viewer gets the tenant tier, including an explicit
             // serving block, without the fleet-global detailed fields.
             assert_eq!(reply.body.as_object().map(|body| body.len()), Some(5));
-            for field in ["status", "ready", "mode", "admin_writes_enabled", "namespace"] {
-                assert!(reply.body.get(field).is_some(), "GET {path}: {}", reply.text);
+            for field in [
+                "status",
+                "ready",
+                "mode",
+                "admin_writes_enabled",
+                "namespace",
+            ] {
+                assert!(
+                    reply.body.get(field).is_some(),
+                    "GET {path}: {}",
+                    reply.text
+                );
             }
         }
     }
