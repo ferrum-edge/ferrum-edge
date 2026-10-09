@@ -767,11 +767,14 @@ fn mesh_ext_authz_header_is_reserved(lowercase: &str) -> bool {
 /// `X-Ferrum-Hops` (issue #6128).
 fn mesh_ext_authz_header_has_ferrum_prefix(lowercase: &str) -> bool {
     const PREFIX: &[u8] = b"x-ferrum-";
-    lowercase.as_bytes().get(..PREFIX.len()).is_some_and(|head| {
-        head.iter()
-            .zip(PREFIX)
-            .all(|(&byte, &expected)| byte == expected || (byte == b'_' && expected == b'-'))
-    })
+    lowercase
+        .as_bytes()
+        .get(..PREFIX.len())
+        .is_some_and(|head| {
+            head.iter()
+                .zip(PREFIX)
+                .all(|(&byte, &expected)| byte == expected || (byte == b'_' && expected == b'-'))
+        })
 }
 
 /// Validate a header name that will be COPIED FROM the client request INTO the
