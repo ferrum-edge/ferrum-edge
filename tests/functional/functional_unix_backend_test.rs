@@ -466,13 +466,16 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
         placeholder_port,
     );
     if grpc_web {
-        config = config.replace("plugin_configs: []", r#"plugin_configs:
+        config = config.replace(
+            "plugin_configs: []",
+            r#"plugin_configs:
   - id: "grpc-web"
     plugin_name: "grpc_web"
     scope: "proxy"
     proxy_id: "unix-grpc"
     enabled: true
-    config: {}"#);
+    config: {}"#,
+        );
     }
     let env = EnvConfig {
         pool_warmup_enabled: false,
@@ -507,7 +510,14 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("http://127.0.0.1:{port}/grpc/echo.Echo/Upload"))
-        .header("content-type", if grpc_web { "application/grpc-web+proto" } else { "application/grpc" })
+        .header(
+            "content-type",
+            if grpc_web {
+                "application/grpc-web+proto"
+            } else {
+                "application/grpc"
+            },
+        )
         .header("te", "trailers")
         .body(())
         .expect("request");
@@ -528,25 +538,38 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
             .map(str::to_owned)
     };
     if grpc_web {
-        assert_eq!(header("content-type").as_deref(), Some("application/grpc-web+proto"));
+        assert_eq!(
+            header("content-type").as_deref(),
+            Some("application/grpc-web+proto")
+        );
         assert_eq!(header("grpc-status"), None);
     } else {
         assert_eq!(header("grpc-status").as_deref(), Some("8"));
-        assert_eq!(header("grpc-message").as_deref(), Some("Request buffering capacity exceeded"));
+        assert_eq!(
+            header("grpc-message").as_deref(),
+            Some("Request buffering capacity exceeded")
+        );
     }
     let mut body = response.into_body();
     let data = tokio::time::timeout(Duration::from_secs(5), async {
         let mut bytes = Vec::new();
         while let Some(chunk) = body.data().await {
             let chunk = chunk.expect("response DATA");
-            body.flow_control().release_capacity(chunk.len()).expect("release capacity");
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .expect("release capacity");
             bytes.extend_from_slice(&chunk);
         }
         bytes
-    }).await.expect("response body timeout");
+    })
+    .await
+    .expect("response body timeout");
     if grpc_web {
         assert_eq!(data[0], 0x80, "one gRPC-Web trailer frame");
-        assert_eq!(u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize, data.len() - 5);
+        assert_eq!(
+            u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize,
+            data.len() - 5
+        );
         let trailers = std::str::from_utf8(&data[5..]).expect("terminal metadata");
         assert!(trailers.contains("grpc-status: 8\r\n"));
         assert!(trailers.contains("grpc-message: Request buffering capacity exceeded\r\n"));

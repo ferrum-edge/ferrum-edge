@@ -389,7 +389,9 @@ impl H3UploadReadError {
     /// classification; an operator body-read timeout is a separate outer error.
     pub(crate) fn is_client_disconnect(&self) -> bool {
         match self {
-            Self::Stream(error) => crate::http3::stream_util::h3_request_read_error_is_client_abort(error),
+            Self::Stream(error) => {
+                crate::http3::stream_util::h3_request_read_error_is_client_abort(error)
+            }
         }
     }
 }
@@ -724,12 +726,26 @@ async fn finalize_h3_terminal_body_rejection_with_headers(
         h3_reject_log_status_and_metadata(ctx, http_flavor, http_status, &body, &headers);
     if client_disconnected {
         crate::proxy::log_client_disconnect_rejection_with_path(
-            plugins, ctx, log_status, start_time, phase, *plugin_execution_ns, Some(request_path),
-        ).await;
+            plugins,
+            ctx,
+            log_status,
+            start_time,
+            phase,
+            *plugin_execution_ns,
+            Some(request_path),
+        )
+        .await;
     } else {
         log_rejected_request_with_path(
-            plugins, ctx, log_status, start_time, phase, *plugin_execution_ns, Some(request_path),
-        ).await;
+            plugins,
+            ctx,
+            log_status,
+            start_time,
+            phase,
+            *plugin_execution_ns,
+            Some(request_path),
+        )
+        .await;
     }
     record_request(state, log_status);
     FinalizedH3TerminalBodyRejection {
@@ -781,10 +797,21 @@ fn boxed_finalize_h3_upload_read_failure<'a>(
             headers.insert("grpc-message".to_string(), message.to_string());
         }
         let _ = finalize_h3_terminal_body_rejection_with_headers(
-            state, plugins, ctx, http_flavor, grpc_web_response_content_type,
-            status, headers, Bytes::from_static(body), start_time, plugin_execution_ns,
-            request_path, phase, disconnected,
-        ).await;
+            state,
+            plugins,
+            ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            status,
+            headers,
+            Bytes::from_static(body),
+            start_time,
+            plugin_execution_ns,
+            request_path,
+            phase,
+            disconnected,
+        )
+        .await;
     })
 }
 
@@ -4570,7 +4597,8 @@ async fn handle_h3_request(
                     &mut plugin_execution_ns,
                     &original_request_path,
                     "client_disconnect_buffered_h3_upload",
-                ).await;
+                )
+                .await;
                 return Err(error.into());
             }
             // The winner was captured where BOTH instants were known, so a late
@@ -4797,7 +4825,8 @@ async fn handle_h3_request(
                         &mut plugin_execution_ns,
                         &original_request_path,
                         "client_disconnect_buffered_h3_upload",
-                    ).await;
+                    )
+                    .await;
                     return Err(error.into());
                 }
                 // The winner was captured where BOTH instants were known, so a
@@ -6348,7 +6377,8 @@ async fn handle_h3_request(
                         &mut plugin_execution_ns,
                         &original_request_path,
                         "client_disconnect_terminal_request_body",
-                    ).await;
+                    )
+                    .await;
                     return Err(error.into());
                 }
                 Err(H3RequestBodyReadError::TimedOut) => {
@@ -7718,7 +7748,8 @@ async fn handle_h3_request(
                                 &mut plugin_execution_ns,
                                 &original_request_path,
                                 "client_disconnect_buffered_h3_upload",
-                            ).await;
+                            )
+                            .await;
                             return Err(error.into());
                         }
                         // The winner was captured where BOTH instants were

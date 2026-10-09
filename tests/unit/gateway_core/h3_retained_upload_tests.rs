@@ -278,23 +278,45 @@ fn every_h3_dispatch_publishes_the_charge_with_the_body() {
 #[test]
 fn failed_h3_uploads_finalize_once_and_bridge_logs_before_sending() {
     let server = include_str!("../../../src/http3/server.rs");
-    let arms: Vec<_> = server.split("Err(H3RequestBodyReadError::Read(error)) => {")
-        .skip(1).collect();
+    let arms: Vec<_> = server
+        .split("Err(H3RequestBodyReadError::Read(error)) => {")
+        .skip(1)
+        .collect();
     assert_eq!(arms.len(), 7);
     for arm in arms {
         let arm = arm.split("return Err(error.into());").next().unwrap();
-        assert_eq!(arm.matches("boxed_finalize_h3_upload_read_failure(").count(), 1);
+        assert_eq!(
+            arm.matches("boxed_finalize_h3_upload_read_failure(")
+                .count(),
+            1
+        );
     }
-    let classify = server.split("pub(crate) fn is_client_disconnect(&self)").nth(1).unwrap()
-        .split("/// Drain an H3 request-body").next().unwrap();
+    let classify = server
+        .split("pub(crate) fn is_client_disconnect(&self)")
+        .nth(1)
+        .unwrap()
+        .split("/// Drain an H3 request-body")
+        .next()
+        .unwrap();
     assert!(classify.contains("h3_request_read_error_is_client_abort(error)"));
 
     let bridge = include_str!("../../../src/http3/cross_protocol.rs");
-    let finalizer = bridge.split("async fn write_final_body_reject<S>(").nth(1).unwrap()
-        .split("fn normalize_h3_grpc_reject(").next().unwrap();
-    let commit = finalizer.find("run_cross_protocol_reject_committed_hooks(").unwrap();
-    let log = finalizer.find("log_client_disconnect_rejection_with_path(").unwrap();
-    let send = finalizer.find("write_reject_with_headers_and_recv_halt(").unwrap();
+    let finalizer = bridge
+        .split("async fn write_final_body_reject<S>(")
+        .nth(1)
+        .unwrap()
+        .split("fn normalize_h3_grpc_reject(")
+        .next()
+        .unwrap();
+    let commit = finalizer
+        .find("run_cross_protocol_reject_committed_hooks(")
+        .unwrap();
+    let log = finalizer
+        .find("log_client_disconnect_rejection_with_path(")
+        .unwrap();
+    let send = finalizer
+        .find("write_reject_with_headers_and_recv_halt(")
+        .unwrap();
     assert!(commit < log && log < send);
 }
 

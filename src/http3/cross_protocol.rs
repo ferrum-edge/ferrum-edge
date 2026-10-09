@@ -3594,15 +3594,26 @@ where
                 cb_probe.release_neutral();
                 if error.is_client_disconnect() {
                     return Box::pin(write_bridge_upload_client_disconnect(
-                        stream, HttpFlavor::Plain, plugins, ctx,
-                        response_committed_plugins, initial_response_header_policy_plugins,
+                        stream,
+                        HttpFlavor::Plain,
+                        plugins,
+                        ctx,
+                        response_committed_plugins,
+                        initial_response_header_policy_plugins,
                         backend_start,
-                    )).await;
+                    ))
+                    .await;
                 }
                 return write_plain_gateway_error(
-                    stream, ctx, StatusCode::BAD_REQUEST,
-                    r#"{"error":"Malformed request body"}"#, None, backend_start, 0,
-                ).await;
+                    stream,
+                    ctx,
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Malformed request body"}"#,
+                    None,
+                    backend_start,
+                    0,
+                )
+                .await;
             }
             Err(super::server::H3RequestBodyReadError::TimedOut) => {
                 cb_probe.release_neutral();
@@ -8324,10 +8335,15 @@ where
                 cb_probe.release_neutral();
                 if e.is_client_disconnect() {
                     return Box::pin(write_bridge_upload_client_disconnect(
-                        stream, HttpFlavor::Grpc, plugins, ctx,
-                        response_committed_plugins, initial_response_header_policy_plugins,
+                        stream,
+                        HttpFlavor::Grpc,
+                        plugins,
+                        ctx,
+                        response_committed_plugins,
+                        initial_response_header_policy_plugins,
                         backend_start,
-                    )).await;
+                    ))
+                    .await;
                 }
                 return write_grpc_error_for_request(
                     stream,
@@ -12830,20 +12846,34 @@ where
     );
     let mut headers = HashMap::new();
     if matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
-        headers.insert("grpc-status".to_string(), grpc_proxy::grpc_status::CANCELLED.to_string());
-        headers.insert("grpc-message".to_string(), "Client disconnected".to_string());
+        headers.insert(
+            "grpc-status".to_string(),
+            grpc_proxy::grpc_status::CANCELLED.to_string(),
+        );
+        headers.insert(
+            "grpc-message".to_string(),
+            "Client disconnected".to_string(),
+        );
     }
     let mut outcome = write_final_body_reject(
-        stream, flavor, plugins, ctx,
+        stream,
+        flavor,
+        plugins,
+        ctx,
         PluginResult::Reject {
             status_code: 499,
             body: r#"{"error":"Client disconnected"}"#.to_string(),
             headers,
         },
-        response_committed_plugins, initial_response_header_policy_plugins,
-        RejectWriteAccounting { backend_start, bytes_sent: 0 },
+        response_committed_plugins,
+        initial_response_header_policy_plugins,
+        RejectWriteAccounting {
+            backend_start,
+            bytes_sent: 0,
+        },
         FinalRejectHooks::UploadClientDisconnect,
-    ).await?;
+    )
+    .await?;
     outcome.client_disconnected = true;
     outcome.error_class = Some(ErrorClass::ClientDisconnect);
     outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
@@ -12921,7 +12951,10 @@ where
         };
     };
     let mut headers = parts.headers;
-    if matches!(hooks, FinalRejectHooks::Standard | FinalRejectHooks::UploadClientDisconnect) {
+    if matches!(
+        hooks,
+        FinalRejectHooks::Standard | FinalRejectHooks::UploadClientDisconnect
+    ) {
         crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
             plugins,
             ctx,
@@ -12969,9 +13002,15 @@ where
             normalized.http_status.as_u16()
         };
         crate::proxy::log_client_disconnect_rejection_with_path(
-            plugins, ctx, log_status, backend_start,
-            "client_disconnect_buffered_h3_bridge_upload", 0, None,
-        ).await;
+            plugins,
+            ctx,
+            log_status,
+            backend_start,
+            "client_disconnect_buffered_h3_bridge_upload",
+            0,
+            None,
+        )
+        .await;
     }
     // Pending committed observers continue on owned state under a post-response
     // bound, while the downstream terminal write remains best-effort: it must

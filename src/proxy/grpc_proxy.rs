@@ -6121,9 +6121,9 @@ pub(crate) async fn collect_grpc_request_body(
             Err(e) => {
                 if is_length_limit_error(e.as_ref()) {
                     return Err(GrpcRequestBodyCollectError::ResourceExhausted(format!(
-                            "gRPC request payload size exceeds maximum of {} bytes",
-                            max_grpc_recv_size_bytes
-                        )));
+                        "gRPC request payload size exceeds maximum of {} bytes",
+                        max_grpc_recv_size_bytes
+                    )));
                 }
                 return Err(grpc_request_body_client_disconnected(e.as_ref()));
             }

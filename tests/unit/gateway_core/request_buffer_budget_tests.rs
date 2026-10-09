@@ -277,7 +277,8 @@ fn backend_seam_refusal_is_trailers_only_resource_exhausted_for_grpc() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/rpc".into());
     set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
     // Outbound header transforms cannot change the client-visible protocol.
-    ctx.headers.insert("content-type".into(), "application/json".into());
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
     let grpc = request_buffer_capacity_backend_response_for_test(
         Some(&ctx),
         Some("192.0.2.7".to_string()),
@@ -305,7 +306,9 @@ fn backend_seam_refusal_is_trailers_only_resource_exhausted_for_grpc() {
 
     // Conversely, a plain request cannot become gRPC by rewriting a header.
     let mut plain = RequestContext::new("127.0.0.1".into(), "POST".into(), "/".into());
-    plain.headers.insert("content-type".into(), "application/grpc".into());
+    plain
+        .headers
+        .insert("content-type".into(), "application/grpc".into());
     for ctx in [None, Some(&plain)] {
         let http = request_buffer_capacity_backend_response_for_test(ctx, None);
         assert_eq!(http.status_code, REQUEST_BUFFER_OVERLOAD_STATUS);
@@ -325,16 +328,24 @@ fn backend_seam_refusal_frames_passthrough_grpc_web_resource_exhausted() {
         set_request_grpc_web_upload_for_test(&mut ctx, text_mode);
         let response = request_buffer_capacity_backend_response_for_test(Some(&ctx), None);
         assert_eq!(response.status_code, 200);
-        assert_eq!(response.error_class, Some(REQUEST_BUFFER_OVERLOAD_ERROR_CLASS));
+        assert_eq!(
+            response.error_class,
+            Some(REQUEST_BUFFER_OVERLOAD_ERROR_CLASS)
+        );
         assert!(!response.connection_error && !response.request_on_wire);
         assert!(!response.headers.contains_key("grpc-status"));
         let body = if text_mode {
-            base64::engine::general_purpose::STANDARD.decode(response.body_bytes()).unwrap()
+            base64::engine::general_purpose::STANDARD
+                .decode(response.body_bytes())
+                .unwrap()
         } else {
             response.body_bytes().to_vec()
         };
         assert_eq!(body[0], 0x80, "exactly one terminal frame");
-        assert_eq!(u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize, body.len() - 5);
+        assert_eq!(
+            u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize,
+            body.len() - 5
+        );
         let trailers = std::str::from_utf8(&body[5..]).unwrap();
         assert!(trailers.contains("grpc-status: 8\r\n"));
         assert!(trailers.contains("grpc-message: Request buffering capacity exceeded\r\n"));

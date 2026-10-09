@@ -872,14 +872,25 @@ async fn h3_buffered_grpc_upload_reset_is_cancelled_and_logged_before_write() {
     proxy["response_body_mode"] = json!("buffer");
     let (harness, https_port) = spawn_h3_gateway(gateway_yaml(proxy, Vec::new()), &[]).await;
     let streams_before = backend.received_stream_count();
-    let mut upload = open_upload_stream(&proxy_url(https_port, GRPC_PATH), "application/grpc").await;
-    upload.send_raw_data(Bytes::from(grpc_frame(b"cancelled"))).await.expect("upload DATA");
+    let mut upload =
+        open_upload_stream(&proxy_url(https_port, GRPC_PATH), "application/grpc").await;
+    upload
+        .send_raw_data(Bytes::from(grpc_frame(b"cancelled")))
+        .await
+        .expect("upload DATA");
     upload.cancel_request_upload();
     let (status, headers) = upload.recv_response().await.expect("cancellation response");
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers.get("grpc-status").and_then(|v| v.to_str().ok()), Some("1"));
-    assert_eq!(headers.get(HOOK_HEADER).and_then(|v| v.to_str().ok()), Some(HOOK_VALUE));
-    let entry = wait_for_rejection_phase(&harness, "client_disconnect_buffered_h3_bridge_upload").await;
+    assert_eq!(
+        headers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(
+        headers.get(HOOK_HEADER).and_then(|v| v.to_str().ok()),
+        Some(HOOK_VALUE)
+    );
+    let entry =
+        wait_for_rejection_phase(&harness, "client_disconnect_buffered_h3_bridge_upload").await;
     assert_eq!(entry["client_disconnected"], true);
     assert_eq!(entry["error_class"], "client_disconnect");
     assert_eq!(entry["metadata"]["grpc_status"], "1");

@@ -37834,7 +37834,9 @@ async fn handle_proxy_request_inner(
                             )
                             .await);
                         }
-                        Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(message)) => {
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(
+                            message,
+                        )) => {
                             record_request(&state, StatusCode::OK.as_u16());
                             return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                                 grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -38345,10 +38347,12 @@ async fn handle_proxy_request_inner(
                         if effective_max_grpc_recv_size_bytes > 0
                             && buffered.body.len() > effective_max_grpc_recv_size_bytes
                         {
-                            Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(format!(
+                            Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(
+                                format!(
                                     "gRPC request payload size exceeds maximum of {} bytes",
                                     effective_max_grpc_recv_size_bytes
-                                )))
+                                ),
+                            ))
                         } else {
                             Ok((
                                 buffered.method,
@@ -38498,9 +38502,10 @@ async fn handle_proxy_request_inner(
                         )
                         .await);
                     }
-                    Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(message)) => {
-                        (Err(GrpcProxyError::ResourceExhausted(message)), Bytes::new())
-                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(message)) => (
+                        Err(GrpcProxyError::ResourceExhausted(message)),
+                        Bytes::new(),
+                    ),
                     // A client reset mid-upload is the client's CANCELLED, never
                     // a dispatch error charged through the retry loop (issue
                     // #6022). Same cleanup as the split-path arm.
@@ -53691,19 +53696,19 @@ pub(crate) fn request_buffer_capacity_backend_response(
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
     let passthrough_web = ctx.filter(|ctx| {
-        ctx.request_is_grpc_web()
-            && !crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+        ctx.request_is_grpc_web() && !crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
     });
     let is_grpc = ctx.is_some_and(|ctx| {
         ctx.request_http_flavor() == HttpFlavor::Grpc || ctx.request_is_grpc_web()
     });
     let (status_code, body, response_headers) = if let Some(ctx) = passthrough_web {
-        let content_type = crate::plugins::grpc_web::retained_response_content_type(ctx)
-            .unwrap_or(if ctx.request_is_grpc_web_text() {
+        let content_type = crate::plugins::grpc_web::retained_response_content_type(ctx).unwrap_or(
+            if ctx.request_is_grpc_web_text() {
                 "application/grpc-web-text+proto"
             } else {
                 "application/grpc-web+proto"
-            });
+            },
+        );
         let response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
             response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
@@ -62487,7 +62492,10 @@ async fn proxy_to_backend_http3(
                     Some(permit) => permit,
                     None => {
                         return (
-                            request_buffer_capacity_backend_response(Some(request_ctx), resolved_ip),
+                            request_buffer_capacity_backend_response(
+                                Some(request_ctx),
+                                resolved_ip,
+                            ),
                             None,
                         );
                     }
