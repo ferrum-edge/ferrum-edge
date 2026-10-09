@@ -4897,6 +4897,12 @@ impl PluginCapabilities {
     /// `preflight_continue`. Gates the one CORS-preflight exemption from
     /// [`Self::OMITS_ROUTE_ADMISSION_POLICY`] (issue #6110).
     pub const ANSWERS_CORS_PREFLIGHTS: u32 = 1 << 19;
+    /// The view runs the BUILT-IN `grpc_web` translator, keyed on the type the
+    /// plugin was registered with, never on the name it reports (issue
+    /// #6022). The buffered H1/H2 response path relabels a native-gRPC
+    /// response as gRPC-Web for that translator's body transform only when
+    /// this is set, so a custom plugin reporting `grpc_web` cannot select it.
+    pub const RUNS_BUILTIN_GRPC_WEB: u32 = 1 << 20;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -5170,6 +5176,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.answers_cors_preflights() {
             caps |= PluginCapabilities::ANSWERS_CORS_PREFLIGHTS;
+        }
+        if is_builtin_named(p, "grpc_web") {
+            caps |= PluginCapabilities::RUNS_BUILTIN_GRPC_WEB;
         }
         // Strictest active client-facing body ceiling across the matched set.
         // Multiple instances (and a global plus a proxy-scoped instance) compose

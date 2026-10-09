@@ -2218,6 +2218,120 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
 }
 
 #[test]
+fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
+    // Issue #6022 (#6139 review): a client reset or disconnect during the
+    // buffered native-gRPC / gRPC-Web read is the client's CANCELLED with
+    // client-disconnect accounting. It is neither the split path's INTERNAL
+    // terminal nor, on the mixed path, a dispatch error the retry loop and
+    // backend accounting would see. Behavioural proof that the collect reports
+    // it: `buffered_upload_end_stream_tests`.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let arms: Vec<&str> = source
+        .split("Err(grpc_proxy::GrpcRequestBodyCollectError::ClientDisconnected) => {")
+        .skip(1)
+        .map(|arm| {
+            let end = arm.find(".await);").expect("the arm awaits its terminal");
+            &arm[..end]
+        })
+        .collect();
+    assert_eq!(arms.len(), 2, "split and mixed buffered gRPC arms");
+    for arm in arms {
+        let release = arm
+            .find("cb_probe.release_neutral()")
+            .expect("the HALF_OPEN probe is released neutrally");
+        let admission = arm
+            .find("preacquired_backend_admission.take_if_acquired()")
+            .expect("body-phase admission is returned");
+        let terminal = arm
+            .find("Ok(boxed_finalize_grpc_upload_client_disconnect(")
+            .expect("the out-of-line client-disconnect terminal");
+        assert!(release < terminal && admission < terminal);
+        assert!(arm.contains("GRPC_UPLOAD_CLIENT_DISCONNECT_PHASE"));
+    }
+    assert_eq!(
+        source
+            .matches("Ok(finalize_grpc_upload_client_disconnect(")
+            .count(),
+        0,
+        "the rejection future must not be materialized in the generic request future's frame"
+    );
+    let factory = source
+        .split("fn boxed_finalize_grpc_upload_client_disconnect<'a>(")
+        .next()
+        .expect("the out-of-line rejection factory");
+    assert!(factory.ends_with("#[allow(clippy::too_many_arguments)]\n#[inline(never)]\n"));
+
+    let normalized = source
+        .split("fn normalized_grpc_client_disconnect(")
+        .nth(1)
+        .expect("client-disconnect terminal")
+        .split("\n}\n")
+        .next()
+        .expect("bounded client-disconnect terminal");
+    assert!(normalized.contains("grpc_proxy::grpc_status::CANCELLED.to_string()"));
+    assert!(normalized.contains("GRPC_CLIENT_DISCONNECT_MESSAGE.to_string()"));
+
+    let finalizer = source
+        .split("async fn finalize_grpc_upload_client_disconnect(")
+        .nth(1)
+        .expect("client-disconnect finalizer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded client-disconnect finalizer");
+    let decorate = finalizer
+        .find("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+        .expect("reject-path hooks");
+    let log = finalizer
+        .find("log_client_disconnect_rejection_with_path(")
+        .expect("client-disconnect transaction log");
+    let record = finalizer
+        .find("record_request(state, log_status);")
+        .expect("request accounting");
+    assert!(decorate < log && log < record);
+    assert!(!finalizer.contains("log_rejected_request_with_path("));
+
+    let funnel = source
+        .split("async fn log_rejected_request_with_path_and_backend_state(")
+        .nth(1)
+        .expect("rejection-log funnel")
+        .split("\n}\n")
+        .next()
+        .expect("bounded rejection-log funnel");
+    assert!(funnel.contains("client_disconnected: client_disconnect,"));
+    let error_class =
+        "error_class: client_disconnect.then_some(retry::ErrorClass::ClientDisconnect),";
+    assert!(funnel.contains(error_class));
+    let wrapper = source
+        .split("async fn log_client_disconnect_rejection_with_path(")
+        .nth(1)
+        .expect("client-disconnect log wrapper")
+        .split("\n}\n")
+        .next()
+        .expect("bounded client-disconnect log wrapper");
+    assert!(wrapper.contains("        true,\n        true,\n    )"));
+
+    let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let collect = grpc
+        .split("pub(crate) async fn collect_grpc_request_body(")
+        .nth(1)
+        .expect("buffered gRPC collect")
+        .split("\n}\n")
+        .next()
+        .expect("bounded buffered gRPC collect");
+    assert!(
+        !collect.contains("GrpcProxyError::Internal"),
+        "a failed read of the client's upload is never a gateway INTERNAL"
+    );
+    assert_eq!(
+        collect
+            .matches("grpc_request_body_client_disconnected(e.as_ref())")
+            .count(),
+        2,
+        "both the size-limited and unlimited collects report a client disconnect"
+    );
+}
+
+#[test]
 fn streaming_deadline_wraps_client_visible_body_after_inspection() {
     let source = include_str!("../../../src/proxy/mod.rs");
     // Issue #3731 takes a Unix HTTP/1.1 pool lease from response extensions
@@ -3414,6 +3528,25 @@ fn test_map_http_reject_status_to_grpc_status_uses_semantic_codes() {
         map_http_reject_status_to_grpc_status(StatusCode::BAD_GATEWAY),
         grpc_status::UNAVAILABLE
     );
+    // The gateway's 499 client-disconnect terminal is the client's own
+    // cancellation, never a gateway INTERNAL (issue #6022).
+    let client_closed = StatusCode::from_u16(499).expect("499");
+    assert_eq!(
+        map_http_reject_status_to_grpc_status(client_closed),
+        grpc_status::CANCELLED
+    );
+    let normalized = normalize_reject_response(
+        client_closed,
+        br#"{"error":"Client disconnected"}"#,
+        &HashMap::new(),
+        true,
+    );
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert_eq!(normalized.grpc_status, Some(grpc_status::CANCELLED));
+    assert_eq!(
+        normalized.grpc_message.as_deref(),
+        Some("Client disconnected")
+    );
 }
 
 #[test]
@@ -4165,7 +4298,9 @@ fn test_buffered_h2_request_collectors_require_h2_end_stream() {
     // would otherwise dispatch the truncated body. Behavioural proof for the
     // early prebuffer and the native-gRPC collect:
     // `buffered_upload_end_stream_tests`. The H1/H2 retry/body-plugin collect
-    // in `proxy_to_backend` has no test seam, so it is pinned here.
+    // in `proxy_to_backend` and the native-H3 backend collect in
+    // `proxy_to_backend_http3` have no test seam, so they are pinned here: all
+    // four share the one gate.
     let source = include_str!("../../../src/proxy/mod.rs");
     let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
     // (source, function signature, frontend version expression, gated body)
@@ -4181,6 +4316,12 @@ fn test_buffered_h2_request_collectors_require_h2_end_stream() {
             "async fn proxy_to_backend(",
             "original_req.version() == hyper::Version::HTTP_2",
             "body::H2EndStreamGated::new((*original_req).into_body(), require_end_stream)",
+        ),
+        (
+            source,
+            "async fn proxy_to_backend_http3(",
+            "original_req.version() == hyper::Version::HTTP_2",
+            "body::H2EndStreamGated::new(client_body, require_end_stream)",
         ),
         (
             grpc,
@@ -4300,49 +4441,6 @@ fn test_native_h3_streaming_upload_requires_h2_end_stream() {
     );
 }
 
-#[test]
-fn test_native_h3_buffered_collect_requires_h2_end_stream() {
-    // Issue #6022: an HTTP/1.1 or HTTP/2 route whose target is native HTTP/3
-    // buffers the client's `Incoming` when retries or body plugins need it.
-    // hyper reports an HTTP/2 client's RST_STREAM(NO_ERROR) as a clean end of
-    // body, so that collect must check the client's END_STREAM before it hands
-    // the bytes to the H3 pool as a complete request. Behavioural proof of the
-    // predicate: `masked_h2_client_reset_collects_without_end_stream` below.
-    let source = include_str!("../../../src/proxy/mod.rs");
-    let dispatch = source
-        .split("async fn proxy_to_backend_http3(")
-        .nth(1)
-        .expect("native-H3 dispatcher")
-        .split("\n}\n")
-        .next()
-        .expect("bounded native-H3 dispatcher");
-    let buffered = dispatch
-        .split("ClientRequestBody::Streaming(original_req) => {")
-        .nth(2)
-        .expect("buffered Streaming arm after the streamed one");
-    let version = buffered
-        .find("let require_end_stream = original_req.version() == hyper::Version::HTTP_2;")
-        .expect("the requirement must come from the frontend request version");
-    let collect = buffered
-        .find("http_body_util::Limited::new(&mut client_body, retained_ceiling)")
-        .expect("the collect must borrow the client body so its receive state stays readable");
-    let gate = buffered
-        .find("if require_end_stream && !hyper::body::Body::is_end_stream(&client_body)")
-        .expect("END_STREAM check after the collect");
-    let dispatched = buffered
-        .find("Ok(Ok(collected)) => collected.to_bytes().to_vec(),")
-        .expect("collected body");
-    assert!(
-        version < collect && collect < gate && gate < dispatched,
-        "the END_STREAM check must run on the collected body before it is accepted"
-    );
-    let refusal = &buffered[gate..dispatched];
-    assert!(
-        refusal.contains("Ok(Err(crate::proxy::body::h2_upload_reset_error()))"),
-        "a masked client reset must take the existing 499 client-disconnect arm"
-    );
-}
-
 /// What a buffered collect of one HTTP/2 client upload saw on a real hyper
 /// server: whether the collect succeeded, and whether the client's own
 /// END_STREAM backed its end.
@@ -4363,7 +4461,7 @@ async fn buffered_h2_upload_outcome(reset_after_data: bool) -> (bool, bool) {
         async move {
             let mut body = request.into_body();
             let _ = started_tx.send(());
-            // The shape `proxy_to_backend_http3` collects with.
+            // `body::H2EndStreamGated` asks `is_end_stream()` at this EOF.
             let collected = Limited::new(&mut body, 1024 * 1024).collect().await;
             let ended = hyper::body::Body::is_end_stream(&body);
             let _ = outcome_tx.send((collected.is_ok(), ended));

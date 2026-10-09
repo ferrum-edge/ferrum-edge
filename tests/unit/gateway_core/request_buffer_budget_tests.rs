@@ -25,9 +25,11 @@ use ferrum_edge::_test_support::{
     RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
     buffered_request_body_ceiling_for_test, effective_request_body_limit_for_test,
     error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
-    normalize_reject_response, request_buffer_capacity_reject_headers_for_test,
+    normalize_reject_response, request_buffer_capacity_backend_response_for_test,
+    request_buffer_capacity_reject_headers_for_test,
 };
 use ferrum_edge::retry::ErrorClass;
+use std::collections::HashMap;
 
 /// `total_blocks` blocks of budget with a one-block fallback ceiling, so the
 /// floor (`Budget::new` raises the total to at least the fallback) does not
@@ -260,6 +262,51 @@ fn terminal_drain_refusal_is_resource_exhausted_for_grpc() {
         proxy_source.contains("request_buffer_capacity_reject_headers(is_grpc_request),"),
         "the H1/H2 terminal-drain refusal must hand these headers to the reject pipeline"
     );
+}
+
+#[test]
+fn backend_seam_refusal_is_trailers_only_resource_exhausted_for_grpc() {
+    // Issue #6022: the backend-dispatch seams (mesh / Unix-socket body
+    // preparation, the H1/H2 retry/body-plugin collect, the native-H3 backend
+    // collect) answered a bare 503, which a gRPC client reads as UNAVAILABLE.
+    // A native gRPC request now gets the same Trailers-Only RESOURCE_EXHAUSTED
+    // as the terminal drain and the native H3 refusal.
+    let grpc_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc+proto".to_string(),
+    )]);
+    let grpc = request_buffer_capacity_backend_response_for_test(
+        &grpc_headers,
+        Some("192.0.2.7".to_string()),
+    );
+    assert_eq!(grpc.status_code, 200, "gRPC errors ride HTTP 200");
+    assert_eq!(
+        grpc.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        grpc.headers.get("grpc-status").map(String::as_str),
+        Some(REQUEST_BUFFER_OVERLOAD_GRPC_STATUS.to_string().as_str())
+    );
+    assert_eq!(
+        grpc.headers.get("grpc-message").map(String::as_str),
+        Some("Request buffering capacity exceeded")
+    );
+    assert!(grpc.body_bytes().is_empty(), "Trailers-Only carries no body");
+    assert_eq!(grpc.error_class, Some(REQUEST_BUFFER_OVERLOAD_ERROR_CLASS));
+    assert!(!grpc.connection_error && !grpc.request_on_wire);
+    assert_eq!(grpc.backend_resolved_ip.as_deref(), Some("192.0.2.7"));
+
+    // Plain HTTP, and pass-through gRPC-Web (not wire-native gRPC), keep the
+    // 503 and its fixed JSON body with no gRPC metadata.
+    for content_type in ["application/json", "application/grpc-web+proto"] {
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        let http = request_buffer_capacity_backend_response_for_test(&headers, None);
+        assert_eq!(http.status_code, REQUEST_BUFFER_OVERLOAD_STATUS);
+        assert_eq!(http.body_bytes(), REQUEST_BUFFER_OVERLOAD_BODY.as_bytes());
+        assert!(http.headers.is_empty(), "{content_type}");
+        assert_eq!(http.error_class, Some(REQUEST_BUFFER_OVERLOAD_ERROR_CLASS));
+    }
 }
 
 #[test]

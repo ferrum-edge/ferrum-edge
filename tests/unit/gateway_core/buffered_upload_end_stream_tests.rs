@@ -10,7 +10,9 @@
 //! native-gRPC buffered collect, both with and without a size limit) over real
 //! hyper connections:
 //!
-//! * a masked reset ends the collect as a client disconnect / failed read;
+//! * a masked reset, like a client `CANCEL`, ends the collect as a client
+//!   disconnect, which the native-gRPC collect reports as such rather than as
+//!   a failed read the dispatcher would answer `INTERNAL`;
 //! * an HTTP/2 END_STREAM and an HTTP/1.1 chunked EOF still complete the body.
 //!
 //! The H1/H2 retry/body-plugin collect inside `proxy_to_backend` has no test
@@ -64,7 +66,7 @@ const COLLECTORS: [Collector; 3] = [
 enum Verdict {
     /// The body was accepted as complete, with this many bytes.
     Complete(usize),
-    /// The collect failed as a client disconnect / failed read.
+    /// The collect failed as a client disconnect.
     Refused,
     /// Any other terminal; never expected here.
     Unexpected,
@@ -88,7 +90,7 @@ async fn run_collector(collector: Collector, request: Request<Incoming>) -> Verd
             };
             match collect_grpc_request_body_for_test(request, max, 0).await {
                 GrpcOutcome::Collected(len) => Verdict::Complete(len),
-                GrpcOutcome::ReadFailed => Verdict::Refused,
+                GrpcOutcome::ClientDisconnected => Verdict::Refused,
                 _ => Verdict::Unexpected,
             }
         }
@@ -163,6 +165,8 @@ enum ClientEnd {
     EndStream,
     /// `RST_STREAM(NO_ERROR)` right after the DATA frame.
     NoErrorReset,
+    /// `RST_STREAM(CANCEL)` right after the DATA frame: a client that gives up.
+    CancelReset,
 }
 
 /// Every client handle for one upload. Held until the test ends: dropping the
@@ -199,6 +203,10 @@ async fn h2_upload(io: DuplexStream, end: ClientEnd) -> ClientUpload {
             stream.send_data(data, false).expect("partial DATA");
             stream.send_reset(h2::Reason::NO_ERROR);
         }
+        ClientEnd::CancelReset => {
+            stream.send_data(data, false).expect("partial DATA");
+            stream.send_reset(h2::Reason::CANCEL);
+        }
     }
     ClientUpload {
         _client: client,
@@ -224,6 +232,24 @@ async fn masked_h2_reset_is_never_a_complete_buffered_body() {
             verdict(report, &format!("{collector:?}")).await,
             Verdict::Refused,
             "{collector:?}: a client RST_STREAM(NO_ERROR) must not complete the body"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h2_cancel_reset_is_a_client_disconnect() {
+    // Issue #6022 (#6139 review): a client that cancels mid-upload is a client
+    // disconnect on every buffered collector. The native-gRPC collect used to
+    // report it as a failed read, which the dispatcher answered `INTERNAL` and
+    // counted as a gateway error.
+    for collector in COLLECTORS {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let report = serve_h2_detached(server_io, collector);
+        let _upload = h2_upload(client_io, ClientEnd::CancelReset).await;
+        assert_eq!(
+            verdict(report, &format!("{collector:?}")).await,
+            Verdict::Refused,
+            "{collector:?}: a client RST_STREAM(CANCEL) is a client disconnect"
         );
     }
 }
