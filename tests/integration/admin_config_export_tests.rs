@@ -818,9 +818,22 @@ async fn ceiling_bound_viewers_are_denied_global_routes_except_the_explicit_allo
         let reply = get(&base, path, Some(&ceiling_viewer), None).await;
         assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
         if path == "/health" || path == "/status" {
-            assert_eq!(reply.body.as_object().map(|body| body.len()), Some(2));
-            assert!(reply.body.get("status").is_some(), "{}", reply.text);
-            assert!(reply.body.get("ready").is_some(), "{}", reply.text);
+            // A bounded viewer gets the tenant tier, including an explicit
+            // serving block, without the fleet-global detailed fields.
+            assert_eq!(reply.body.as_object().map(|body| body.len()), Some(5));
+            for field in [
+                "status",
+                "ready",
+                "mode",
+                "admin_writes_enabled",
+                "namespace",
+            ] {
+                assert!(
+                    reply.body.get(field).is_some(),
+                    "GET {path}: {}",
+                    reply.text
+                );
+            }
         }
     }
     let overload = get(&base, "/overload", Some(&ceiling_viewer), None).await;

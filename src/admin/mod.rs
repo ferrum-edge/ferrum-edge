@@ -237,9 +237,11 @@ where
 ///
 /// These surfaces are **not** unauthenticated by default. A caller is granted
 /// the detailed/scrape view only when one of the following holds:
-///   1. a valid admin JWT is presented (`Authorization: Bearer <jwt>`), or
+///   1. a valid admin JWT that is not namespace-bounded is presented
+///      (`Authorization: Bearer <jwt>`), or
 ///   2. a dedicated metrics bearer token is configured and matches, or
-///   3. the request originates from an operator-allowlisted CIDR.
+///   3. the request originates from an operator-allowlisted CIDR (on
+///      `/metrics`, only when it presents no namespace-bounded admin JWT).
 ///
 /// When none apply, `/metrics` returns `401` and `/health` / `/overload`
 /// fall back to a minimal, LB-safe projection that reveals no operational
@@ -2413,6 +2415,23 @@ fn active_data_plane_namespace(state: &AdminState) -> Option<&str> {
         .map(|proxy| proxy.env_config.namespace.as_str())
 }
 
+/// The `namespace` block of `/health` and `/status`: `active` is the namespace
+/// the local data plane routes (`null` when this process has none),
+/// `serving_scope` the closed-set [`NamespaceServingScope`] label, and
+/// `data_plane_single_namespace` whether anything outside `active` is unrouted
+/// here. The detailed and tenant tiers share this one builder so the shape
+/// cannot drift between them.
+fn namespace_serving_block(state: &AdminState) -> serde_json::Value {
+    let namespace_scope = namespace_serving_scope(state);
+    let data_plane_single_namespace =
+        namespace_scope == NamespaceServingScope::SingleNamespaceDataPlane;
+    json!({
+        "active": active_data_plane_namespace(state),
+        "serving_scope": namespace_scope.as_str(),
+        "data_plane_single_namespace": data_plane_single_namespace,
+    })
+}
+
 /// Documented spelling of the response header marking an accepted Admin
 /// mutation whose `X-Ferrum-Namespace` names a namespace this process's data
 /// plane does not route (issue #5447).
@@ -2705,9 +2724,11 @@ fn enforce_viewer_namespace_ceiling(
 /// Namespace authorization for a request that addresses `namespace`: the
 /// viewer-key namespace ceiling first, always, then the `ns` claim when
 /// `require_claim` (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`, or its automatic
-/// engagement on a multi-namespace CP). Every namespace-scoped route and the
-/// namespace registry authorize through here, so the ceiling is enforced in
-/// one place, exactly as the role ceiling is.
+/// engagement on a multi-namespace CP) or whenever the token carries one. A
+/// token that declares its namespaces is bounded by them whatever the flag
+/// says; the flag only decides whether a claim-less token is refused. Every
+/// namespace-scoped route and the namespace registry authorize through here,
+/// so the ceiling is enforced in one place, exactly as the role ceiling is.
 fn authorize_request_namespace(
     require_claim: bool,
     auth: &AuditActor,
@@ -2717,7 +2738,7 @@ fn authorize_request_namespace(
     if let Some(resp) = enforce_viewer_namespace_ceiling(auth, namespace, path) {
         return Some(resp);
     }
-    if require_claim {
+    if require_claim || auth.allowed_namespaces.is_present() {
         return enforce_namespace_claim(auth, namespace, path);
     }
     None
@@ -2732,68 +2753,144 @@ fn ceiling_global_route_is_allowed(method: &Method, segments: &[&str]) -> bool {
         || (*method == Method::GET && matches!(segments, ["namespaces"] | ["namespaces", _]))
 }
 
-/// Refuse a ceiling-bound viewer key on every global route except the small
-/// allowlist. Namespace-scoped routes have their own name-based authorization
-/// through [`authorize_request_namespace`].
-fn authorize_ceiling_global_route(
+/// Global routes that remain available to tokens carrying an `ns` claim: the
+/// viewer-key allowlist plus the routes whose handlers authorize the claim
+/// themselves, namely the namespace registry writes (each path or body name)
+/// and the diagnostic reference lookup (the reference's own namespace). Keep
+/// this list explicit: a new global route is denied by default.
+fn ns_claim_global_route_is_allowed(method: &Method, segments: &[&str]) -> bool {
+    ceiling_global_route_is_allowed(method, segments)
+        || (*method == Method::POST && matches!(segments, ["namespaces"]))
+        || ((*method == Method::PUT || *method == Method::DELETE)
+            && matches!(segments, ["namespaces", _]))
+        || (*method == Method::GET && matches!(segments, ["diagnostics", "v1", "refs", _]))
+}
+
+/// Refuse a namespace-bounded token ([`AuditActor::is_namespace_bounded`]) on
+/// every fleet-global route outside its allowlist: a viewer-key token under a
+/// namespace ceiling is held to [`ceiling_global_route_is_allowed`], any other
+/// token carrying an `ns` claim to [`ns_claim_global_route_is_allowed`].
+/// Fleet-global routes need a token with neither. Namespace-scoped routes have
+/// their own name-based authorization through [`authorize_request_namespace`].
+fn authorize_namespace_bounded_global_route(
     method: &Method,
     segments: &[&str],
     path: &str,
     auth: &AuditActor,
 ) -> Option<Response<Full<Bytes>>> {
-    if auth.namespace_ceiling.is_none()
-        || is_namespace_scoped_route(segments)
-        || ceiling_global_route_is_allowed(method, segments)
-    {
+    if is_namespace_scoped_route(segments) {
         return None;
     }
 
+    if auth.namespace_ceiling.is_some() {
+        if ceiling_global_route_is_allowed(method, segments) {
+            return None;
+        }
+        warn!(
+            audit.event = "admin_namespace_authz",
+            actor = %auth.sub,
+            key_tier = auth.key_tier.as_str(),
+            path = %path,
+            namespace_ceiling = "global_route_denied",
+            result = "denied",
+            "Admin request rejected: viewer-key tokens with a namespace ceiling cannot access this global route"
+        );
+        return Some(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": format!(
+                "global route '{path}' is unavailable to viewer-key tokens with a namespace \
+                 ceiling (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES)"
+            )}),
+        ));
+    }
+
+    let claim_bounded = auth.allowed_namespaces.is_present();
+    if !claim_bounded || ns_claim_global_route_is_allowed(method, segments) {
+        return None;
+    }
     warn!(
         audit.event = "admin_namespace_authz",
         actor = %auth.sub,
         key_tier = auth.key_tier.as_str(),
         path = %path,
-        namespace_ceiling = "global_route_denied",
+        namespace_claim = "global_route_denied",
         result = "denied",
-        "Admin request rejected: viewer-key tokens with a namespace ceiling cannot access this global route"
+        "Admin request rejected: tokens with an `ns` claim cannot access this fleet-global route"
     );
     Some(json_response(
         StatusCode::FORBIDDEN,
         &json!({"error": format!(
-            "global route '{path}' is unavailable to viewer-key tokens with a namespace ceiling \
-             (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES)"
+            "global route '{path}' is unavailable to admin JWTs with an `ns` claim; fleet-global \
+             routes require a token without one"
         )}),
     ))
 }
 
 /// Whether the caller may see the detailed observability views (`/metrics`
 /// scrape body, full `/health`, full `/overload`). Granted on any of: a valid
-/// primary admin JWT, a matching metrics bearer token, or an allowlisted source
-/// IP. A namespace-ceiling viewer JWT is not itself detail authorization, but
-/// does not revoke independent bearer-token or source-IP authorization.
+/// admin JWT that is not namespace-bounded, a matching metrics bearer token, or
+/// an allowlisted source IP. A namespace-bounded admin JWT (a viewer-key token
+/// under a namespace ceiling, or any token carrying an `ns` claim) is not
+/// itself detail authorization. On `/health`, `/status` and `/overload` it does
+/// not revoke source-IP authorization either. `/metrics` is different: it is a
+/// fleet-global route, so a presented namespace-bounded JWT is refused with
+/// `403` before this check runs, and the source-IP allowance covers only
+/// scrapes that present no such token.
 ///
 /// `/metrics` turns a `false` here into `401`; `/health` and `/overload` turn
-/// it into a minimal, LB-safe projection instead.
+/// it into a minimal, LB-safe projection instead (`/health` and `/status` give
+/// a namespace-bounded JWT the tenant tier).
 fn observability_detail_allowed(
     state: &AdminState,
     auth_header: Option<&str>,
     client_ip: &std::net::IpAddr,
 ) -> bool {
-    admin_jwt_detail_allowed(state, auth_header)
+    observability_detail_allowed_with(
+        state,
+        admin_jwt_detail_allowed(state, auth_header),
+        auth_header,
+        client_ip,
+    )
+}
+
+/// [`observability_detail_allowed`] with the admin-JWT half already decided
+/// ([`admin_jwt_detail_allowed`]), so `/health` verifies the token only once.
+fn observability_detail_allowed_with(
+    state: &AdminState,
+    admin_jwt_detail: bool,
+    auth_header: Option<&str>,
+    client_ip: &std::net::IpAddr,
+) -> bool {
+    admin_jwt_detail
         || state.metrics_auth.token_matches(auth_header)
         || state.metrics_auth.ip_allowed(client_ip)
 }
 
-/// Whether the caller presented a valid Admin API JWT. Some detailed health
-/// fields are derived using the Admin API signing secret and must not be
-/// exposed through the broader metrics-token/CIDR observability tier.
+/// Whether the caller presented a valid Admin API JWT that is not
+/// namespace-bounded ([`AuditActor::is_namespace_bounded`]): the detail tier
+/// describes the whole process, not one tenant. Some detailed health fields are
+/// derived using the Admin API signing secret and must not be exposed through
+/// the broader metrics-token/CIDR observability tier.
 fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bool {
+    verified_admin_actor(state, auth_header).is_some_and(|actor| !actor.is_namespace_bounded())
+}
+
+/// The actor of a valid Admin API JWT in `auth_header`, or `None` when none was
+/// presented or it does not verify.
+fn verified_admin_actor(state: &AdminState, auth_header: Option<&str>) -> Option<AuditActor> {
     state
         .jwt_manager
         .verify_request(auth_header)
         .ok()
         .and_then(|token| AuditActor::from_verified(&token).ok())
-        .is_some_and(|actor| actor.namespace_ceiling.is_none())
+}
+
+/// Whether a namespace-bounded token's bound admits `namespace`: inside the
+/// viewer-key namespace ceiling when one applies, and inside the `ns` claim
+/// when the token carries one.
+fn namespace_bound_admits(auth: &AuditActor, namespace: &str) -> bool {
+    auth.namespace_ceiling_decision(namespace) != NamespaceCeilingDecision::Outside
+        && (!auth.allowed_namespaces.is_present() || auth.allowed_namespaces.allows(namespace))
 }
 
 /// Throttles the `diagnostic_ref_lookup` audit event for refused (`403`) and
@@ -3048,8 +3145,18 @@ async fn handle_admin_request_inner(
 
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
-        let admin_jwt_detail = admin_jwt_detail_allowed(&state, auth_header.as_deref());
-        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
+        // The admin JWT is verified once: the detail decision and the tenant
+        // tier below both derive from this actor.
+        let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
+        let admin_jwt_detail = admin_actor
+            .as_ref()
+            .is_some_and(|actor| !actor.is_namespace_bounded());
+        let detailed = observability_detail_allowed_with(
+            &state,
+            admin_jwt_detail,
+            auth_header.as_deref(),
+            &client_ip,
+        );
         let mut health_status = json!({
             "status": "ok",
             "timestamp": Utc::now().to_rfc3339(),
@@ -3339,14 +3446,7 @@ async fn handle_admin_request_inner(
         // allocation, no lock and no I/O — and skipped entirely for an
         // unauthenticated probe flood.
         if detailed {
-            let namespace_scope = namespace_serving_scope(&state);
-            let data_plane_single_namespace =
-                namespace_scope == NamespaceServingScope::SingleNamespaceDataPlane;
-            health_status["namespace"] = json!({
-                "active": active_data_plane_namespace(&state),
-                "serving_scope": namespace_scope.as_str(),
-                "data_plane_single_namespace": data_plane_single_namespace,
-            });
+            health_status["namespace"] = namespace_serving_block(&state);
         }
 
         // Admin audit delivery pipeline (issue #2421). An unavailable or
@@ -3593,9 +3693,39 @@ async fn handle_admin_request_inner(
         // unauthenticated caller — e.g. a load-balancer / orchestrator probe —
         // receives only liveness + readiness, which is enough to drive health
         // checks without leaking operational internals. Authorized callers
-        // (admin JWT / metrics token / allowlisted CIDR) get the full body.
+        // (admin JWT that is not namespace-bounded / metrics token /
+        // allowlisted CIDR) get the full body.
         if detailed {
             return Ok(json_response(response_code, &health_status));
+        }
+        // Tenant tier (issue #6095): a namespace-bounded admin JWT
+        // ([`AuditActor::is_namespace_bounded`]) without independent detail
+        // authorization gets the minimal body plus `mode`,
+        // `admin_writes_enabled`, and the `namespace` serving block, under the
+        // detailed tier's own field names and shapes. The serving block is
+        // always present but never names a namespace outside the token's
+        // bound: when the bound does not admit the namespace this data plane
+        // routes, `active` is `null` while `serving_scope` and
+        // `data_plane_single_namespace` keep their mode-derived values, which
+        // reads as "unserved for this token". Every other detailed field
+        // describes the whole process and stays out. An unauthenticated probe
+        // has no token, so `verified_admin_actor` returned before any
+        // signature work.
+        if let Some(actor) = admin_actor.filter(AuditActor::is_namespace_bounded) {
+            let mut block = namespace_serving_block(&state);
+            if active_data_plane_namespace(&state)
+                .is_some_and(|namespace| !namespace_bound_admits(&actor, namespace))
+            {
+                block["active"] = serde_json::Value::Null;
+            }
+            let tenant = json!({
+                "status": health_status["status"],
+                "ready": health_status["ready"],
+                "mode": health_status["mode"],
+                "admin_writes_enabled": health_status["admin_writes_enabled"],
+                "namespace": block,
+            });
+            return Ok(json_response(response_code, &tenant));
         }
         let minimal = json!({
             "status": health_status["status"],
@@ -3659,10 +3789,13 @@ async fn handle_admin_request_inner(
     // from `FERRUM_METRICS_ALLOWED_CIDRS`. Unauthenticated scraping is an
     // explicit operator opt-in (token or CIDR), not the default.
     if path == "/metrics" && method == Method::GET {
+        // A presented namespace-bounded JWT is refused here even from an
+        // allowlisted source IP: `/metrics` is fleet-global, and the CIDR
+        // allowance authorizes only scrapes that present no such token.
         if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
             && let Ok(actor) = AuditActor::from_verified(&token_data)
             && let Some(response) =
-                authorize_ceiling_global_route(&method, &["metrics"], &path, &actor)
+                authorize_namespace_bounded_global_route(&method, &["metrics"], &path, &actor)
         {
             return Ok(response);
         }
@@ -3801,7 +3934,9 @@ async fn handle_admin_request_inner(
     audit::note_request_actor(&auth, &audit_request_ctx);
 
     let route_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if let Some(response) = authorize_ceiling_global_route(&method, &route_segments, &path, &auth) {
+    if let Some(response) =
+        authorize_namespace_bounded_global_route(&method, &route_segments, &path, &auth)
+    {
         drop(req.into_body());
         return Ok(response);
     }
@@ -3941,11 +4076,14 @@ async fn handle_admin_request_inner(
     // option B). Opt-in via FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM and engaged
     // automatically on a multi-namespace CP (issue #4529); mirrors the CP↔DP
     // gRPC `ns` claim so a staging-scoped operator token cannot address prod by
-    // swapping X-Ferrum-Namespace. Applies only to namespace-scoped
+    // swapping X-Ferrum-Namespace. A token that carries an `ns` claim is
+    // held to it whatever the flag says; the flag decides only whether a
+    // claim-less token is refused. Applies only to namespace-scoped
     // resource routes — global admin surfaces (TLS management, /cluster,
     // /namespaces registry, metrics, mesh introspection) are not selected
-    // by X-Ferrum-Namespace. Registry handlers apply the claim to the
-    // path/body name themselves.
+    // by X-Ferrum-Namespace, and a namespace-bounded token is refused on
+    // them earlier (`authorize_namespace_bounded_global_route`). Registry
+    // handlers apply the claim to the path/body name themselves.
     //
     // The viewer-key namespace ceiling (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES,
     // issue #5929) is enforced here too, and unconditionally: a token verified
@@ -11395,11 +11533,12 @@ async fn handle_audit_list(
 
 // ---- Namespaces ----
 
-/// When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on, `GET /namespaces` is
-/// filtered to the token's claimed names (missing/empty claim → empty list)
-/// rather than 403, because the list route is a global surface. A viewer-key
-/// token under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is always filtered to that
-/// ceiling as well, whatever the claim setting.
+/// When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on, or the token carries an
+/// `ns` claim, `GET /namespaces` is filtered to the token's claimed names
+/// (missing/empty claim → empty list) rather than 403, because the list route
+/// is a global surface. A viewer-key token under
+/// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is always filtered to that ceiling as
+/// well, whatever the claim setting.
 fn filter_listed_namespaces(
     require_claim: bool,
     auth: &AuditActor,
@@ -11408,22 +11547,24 @@ fn filter_listed_namespaces(
     if !listed_namespaces_filtered(require_claim, auth) {
         return names;
     }
+    let claim_applies = require_claim || auth.allowed_namespaces.is_present();
     names
         .into_iter()
         .filter(|name| {
             auth.namespace_ceiling_decision(name) != NamespaceCeilingDecision::Outside
-                && (!require_claim || auth.allowed_namespaces.allows(name))
+                && (!claim_applies || auth.allowed_namespaces.allows(name))
         })
         .collect()
 }
 
 /// Whether [`filter_listed_namespaces`] would drop anything for this caller.
 fn listed_namespaces_filtered(require_claim: bool, auth: &AuditActor) -> bool {
-    require_claim || auth.namespace_ceiling.is_some()
+    require_claim || auth.is_namespace_bounded()
 }
 
 /// Namespace-registry authorization for `name`: the viewer-key namespace
-/// ceiling always, and the `ns` claim when claim enforcement is on.
+/// ceiling always, and the `ns` claim when claim enforcement is on or the token
+/// carries one.
 fn maybe_enforce_namespace_claim(
     state: &AdminState,
     auth: &AuditActor,
@@ -12859,6 +13000,44 @@ mod tests {
             assert!(
                 !ceiling_global_route_is_allowed(&method, &segs),
                 "{} /{} should be denied by default",
+                method,
+                segs.join("/")
+            );
+        }
+
+        // Tokens with an `ns` claim additionally reach the routes whose
+        // handlers authorize the claim themselves, and nothing else global.
+        for (method, segs) in [
+            (Method::GET, vec!["plugins"]),
+            (Method::GET, vec!["namespaces"]),
+            (Method::POST, vec!["namespaces"]),
+            (Method::PUT, vec!["namespaces", "tenant-a"]),
+            (Method::DELETE, vec!["namespaces", "tenant-a"]),
+            (Method::GET, vec!["diagnostics", "v1", "refs", "fd1_00"]),
+            (Method::GET, vec!["health"]),
+        ] {
+            assert!(
+                ns_claim_global_route_is_allowed(&method, &segs),
+                "{} /{} should be allowlisted for ns-claim tokens",
+                method,
+                segs.join("/")
+            );
+        }
+        for (method, segs) in [
+            (Method::GET, vec!["charges"]),
+            (Method::GET, vec!["metrics"]),
+            (Method::GET, vec!["cluster"]),
+            (Method::GET, vec!["config", "apply-status"]),
+            (Method::POST, vec!["mesh", "config-revision", "reset"]),
+            (Method::POST, vec!["backend-capabilities", "refresh"]),
+            (Method::GET, vec!["admin", "tls", "inventory"]),
+            (Method::POST, vec!["admin", "tls", "ca-bundles"]),
+            (Method::POST, vec!["plugins"]),
+            (Method::GET, vec!["unclassified"]),
+        ] {
+            assert!(
+                !ns_claim_global_route_is_allowed(&method, &segs),
+                "{} /{} should be denied to ns-claim tokens by default",
                 method,
                 segs.join("/")
             );

@@ -591,6 +591,16 @@ impl AuditActor {
         })
     }
 
+    /// Whether the token is bounded to a set of namespaces: it carries an
+    /// `ns` claim, or it is a viewer-key token under
+    /// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`. A namespace-bounded token reaches
+    /// only namespace-scoped routes and a short allowlist of global ones, and
+    /// never the detailed observability tier; fleet-global surfaces need a
+    /// token that is neither.
+    pub fn is_namespace_bounded(&self) -> bool {
+        self.namespace_ceiling.is_some() || self.allowed_namespaces.is_present()
+    }
+
     /// The viewer-key namespace ceiling's verdict on `namespace`.
     pub fn namespace_ceiling_decision(&self, namespace: &str) -> NamespaceCeilingDecision {
         match &self.namespace_ceiling {
