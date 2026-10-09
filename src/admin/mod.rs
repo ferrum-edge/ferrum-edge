@@ -3148,8 +3148,9 @@ async fn handle_admin_request_inner(
         // The admin JWT is verified once: the detail decision and the tenant
         // tier below both derive from this actor.
         let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
-        let admin_jwt_detail =
-            admin_actor.as_ref().is_some_and(|actor| !actor.is_namespace_bounded());
+        let admin_jwt_detail = admin_actor
+            .as_ref()
+            .is_some_and(|actor| !actor.is_namespace_bounded());
         let detailed = observability_detail_allowed_with(
             &state,
             admin_jwt_detail,
