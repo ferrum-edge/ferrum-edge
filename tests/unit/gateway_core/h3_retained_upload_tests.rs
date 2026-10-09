@@ -397,17 +397,16 @@ fn every_h3_drain_reads_to_the_end_of_the_request_stream() {
     let body_loop = drain
         .find("while let Some(chunk) = stream.recv_data().await? {")
         .expect("body loop");
+    // `recv_trailers`, not a second `recv_data`: it waits for the FIN and
+    // refuses any known frame after the trailers, where a second `recv_data`
+    // takes an empty DATA frame or a second HEADERS frame as a clean end.
     let end_of_stream = drain
-        .find("if stream.recv_data().await?.is_some() {")
+        .find("stream.recv_trailers().await?;")
         .expect("end-of-stream read after the body loop");
     let finish = drain.find("upload.finish()").expect("upload hand-over");
     assert!(
         body_loop < end_of_stream && end_of_stream < finish,
         "the drain must confirm the stream ended before it hands the body over"
-    );
-    assert!(
-        drain[end_of_stream..finish].contains("H3UploadReadError::DataAfterTrailers"),
-        "DATA after the trailer section must be refused"
     );
     let bridge = include_str!("../../../src/http3/cross_protocol.rs");
     assert!(
