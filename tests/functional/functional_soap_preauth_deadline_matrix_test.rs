@@ -9,23 +9,33 @@
 //! with scripted clients that control every chunk's timing, and check:
 //!
 //! - all three SOAP identity modes (UsernameToken, X.509 signature, SAML);
-//! - stalled and trickling uploads, and a complete upload whose total elapses
-//!   after it was collected but before dispatch;
+//! - stalled and trickling uploads, a complete upload whose total elapses
+//!   after it was collected but before dispatch, and a complete message whose
+//!   total elapsed before its collector ran (expired-ready: refused unread);
 //! - read/route deadline ordering, and a chunk that is ready when the route
 //!   total elapses (late wake: refused, never collected);
 //! - `backend_read_timeout_ms: 0` still bounded by the route total, for plain
 //!   requests and as gRPC `DEADLINE_EXCEEDED`;
 //! - the candidate-max profile for rules that cannot be decided before
 //!   authentication, including an untimed sibling;
-//! - a config reload during collection keeps the pinned generation's total;
+//! - a config reload during collection, and one that lands after receipt but
+//!   before the collector previews its total, both keep the pinned
+//!   generation's total;
 //! - open HTTP/2 DATA without `Content-Length`;
-//! - HTTP/3 response-before-`STOP_SENDING` ordering and the release of the
-//!   retained-request permit.
+//! - HTTP/3 response-before-`STOP_SENDING` ordering, observed as QUIC events,
+//!   and the release of the retained-request permit.
+//!
+//! The pre-authentication collect cannot be held from outside the gateway.
+//! The expired-ready and reload-before-preview cases therefore park requests
+//! in `oauth2_introspection` (see `IntrospectionGate`) ahead of a
+//! timestamp-only `soap_ws_security` collect, which runs the same collector.
 //!
 //! Every assertion checks the status, that the backend was never reached, and
-//! a lower bound on the time to the answer. The client's clock starts before
-//! the request leaves, so a receipt-anchored deadline can only fire later than
-//! the bound; there are no tight upper bounds.
+//! a lower bound on the time to the answer. The backend counts every request
+//! on every connection its listener accepts, HTTP/1.1 and h2c alike. The
+//! client's clock starts before the request leaves, so a receipt-anchored
+//! deadline can only fire later than the bound; there are no tight upper
+//! bounds.
 //!
 //! Run:
 //! ```bash
@@ -38,12 +48,18 @@ use crate::scaffolding::clients::{Http3Client, bind_quinn_client_endpoint};
 use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
 
 use bytes::{Buf, Bytes};
+use h3::quic::{
+    Connection as QuicConnection, ConnectionErrorIncoming, OpenStreams as QuicOpenStreams,
+    StreamErrorIncoming,
+};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
-use http::{HeaderMap, Method, Request};
+use http::{HeaderMap, Method, Request, Response};
 use serde_json::{Value, json};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -60,6 +76,9 @@ const EXCHANGE_LIMIT: Duration = Duration::from_secs(30);
 const LONG_READ_TIMEOUT_MS: u64 = 30_000;
 /// The route total most scenarios arm.
 const ROUTE_TOTAL_MS: u64 = 1_500;
+/// How long past a route total a parked request is held, so that total has
+/// certainly elapsed at the gateway.
+const HELD_PAST_TOTAL: Duration = Duration::from_millis(200);
 
 const SOAP_CONTENT_TYPE: &str = "text/xml; charset=utf-8";
 const PASSWORD_TEXT: &str = concat!(
@@ -166,6 +185,11 @@ enum Collector {
     /// `ai_request_guard` + `request_mirror`: collect before `before_proxy`,
     /// for native gRPC uploads.
     GrpcMirror,
+    /// `oauth2_introspection` against the gate on this port, then a
+    /// timestamp-only `soap_ws_security` that collects before `before_proxy`.
+    /// A message without a `wsu:Timestamp` that this collector reads is
+    /// refused `401`.
+    IntrospectedSoapTimestamp(u16),
 }
 
 struct Route {
@@ -207,6 +231,21 @@ impl Route {
             rules,
         }
     }
+
+    fn introspected_soap(
+        id: &'static str,
+        listen_path: &'static str,
+        introspection_port: u16,
+        rules: Vec<Value>,
+    ) -> Self {
+        Self {
+            id,
+            listen_path,
+            read_timeout_ms: LONG_READ_TIMEOUT_MS,
+            collector: Collector::IntrospectedSoapTimestamp(introspection_port),
+            rules,
+        }
+    }
 }
 
 /// A `mesh_route_dispatch` rule whose destination is the proxy's own
@@ -231,6 +270,20 @@ fn identity_rule(backend_port: u16, total_ms: Option<u64>) -> Value {
         json!({"headers": {"x-consumer-username": "alice"}}),
         total_ms,
     )
+}
+
+/// Introspection against the gate, with no answer cached, so every request
+/// makes its own call. The timeout outlasts any hold a test needs.
+fn introspection_config(port: u16) -> Value {
+    json!({
+        "providers": [{
+            "introspection_endpoint": format!("http://127.0.0.1:{port}/introspect"),
+            "client_auth": {"method": "none"},
+            "positive_cache_ttl_secs": 0,
+            "negative_cache_ttl_secs": 0,
+            "request_timeout_ms": 30_000
+        }]
+    })
 }
 
 fn plugin_config(id: String, proxy_id: &str, plugin_name: &str, config: Value) -> Value {
@@ -283,6 +336,24 @@ fn gateway_yaml(backend_port: u16, routes: &[Route]) -> String {
                 ));
                 ids.push(guard);
                 ids.push(mirror);
+            }
+            Collector::IntrospectedSoapTimestamp(introspection_port) => {
+                let auth = format!("{}-introspection", route.id);
+                plugin_configs.push(plugin_config(
+                    auth.clone(),
+                    route.id,
+                    "oauth2_introspection",
+                    introspection_config(introspection_port),
+                ));
+                let soap = format!("{}-soap", route.id);
+                plugin_configs.push(plugin_config(
+                    soap.clone(),
+                    route.id,
+                    "soap_ws_security",
+                    json!({"timestamp": {"require": true}}),
+                ));
+                ids.push(auth);
+                ids.push(soap);
             }
         }
         let dispatch = format!("{}-dispatch", route.id);
@@ -353,9 +424,16 @@ fn soap_yaml(backend_port: u16, total_ms: u64) -> String {
 // Backend
 // ---------------------------------------------------------------------------
 
-/// A plaintext backend that answers every HTTP/1.1 client request `200 ok`
-/// and counts it. It also counts every request stream a gateway opens over
-/// h2c (a native gRPC dispatch), so a gRPC upload that reached it is seen.
+/// A plaintext backend that counts every request on every connection its
+/// listener accepts. A connection that opens with the h2c preface is served by
+/// a real HTTP/2 server, so a native gRPC dispatch completes its handshake and
+/// its request stream is counted whether or not the gateway waits for the
+/// server's SETTINGS first. Any other connection is HTTP/1.1. Every request is
+/// answered `200` (`ok`, or an empty gRPC `OK`).
+///
+/// The file-mode capability probe (at startup and after a reload) opens an h2c
+/// connection and completes the handshake but sends no request, so it is never
+/// counted.
 struct CountingBackend {
     port: u16,
     hits: Arc<AtomicUsize>,
@@ -409,7 +487,28 @@ async fn fill(stream: &mut TcpStream, buf: &mut Vec<u8>) -> bool {
     }
 }
 
-async fn serve_counted_connection(mut stream: TcpStream, hits: Arc<AtomicUsize>) {
+/// The first bytes of the h2c connection preface. Every HTTP/1.1 request line
+/// starts with a method instead.
+const H2C_PREFACE_START: [u8; 4] = *b"PRI ";
+
+async fn serve_counted_connection(stream: TcpStream, hits: Arc<AtomicUsize>) {
+    // Peek, so the HTTP/2 server reads the whole preface itself.
+    let mut start = [0u8; 4];
+    loop {
+        match stream.peek(&mut start).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) if read == start.len() => break,
+            Ok(_) => sleep(ms(1)).await,
+        }
+    }
+    if start == H2C_PREFACE_START {
+        serve_h2c_connection(stream, hits).await;
+    } else {
+        serve_h1_connection(stream, hits).await;
+    }
+}
+
+async fn serve_h1_connection(mut stream: TcpStream, hits: Arc<AtomicUsize>) {
     let mut buf = Vec::new();
     loop {
         let head_end = loop {
@@ -420,17 +519,7 @@ async fn serve_counted_connection(mut stream: TcpStream, hits: Arc<AtomicUsize>)
                 return;
             }
         };
-        // The h2c preface's `PRI * HTTP/2.0` line also ends in a blank line.
-        // Only its request streams are requests: the file-mode capability
-        // probe opens the preface too, but sends no HEADERS.
-        if buf.starts_with(b"PRI * HTTP/2.0") {
-            count_h2c_requests(stream, buf, hits).await;
-            return;
-        }
-        // Every upload under test is a POST; anything else is a probe.
-        if buf.starts_with(b"POST ") {
-            hits.fetch_add(1, Ordering::SeqCst);
-        }
+        hits.fetch_add(1, Ordering::SeqCst);
         let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
         let body_end = if head.contains("transfer-encoding: chunked") {
             loop {
@@ -442,11 +531,7 @@ async fn serve_counted_connection(mut stream: TcpStream, hits: Arc<AtomicUsize>)
                 }
             }
         } else {
-            let length = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
+            let length = content_length(&head);
             while buf.len() < head_end + length {
                 if !fill(&mut stream, &mut buf).await {
                     return;
@@ -461,41 +546,57 @@ async fn serve_counted_connection(mut stream: TcpStream, hits: Arc<AtomicUsize>)
     }
 }
 
-const H2C_PREFACE_LEN: usize = 24;
-/// How long an h2c connection may stay quiet before it is closed. The
-/// capability probe waits for SETTINGS that never come, so it then sees the
-/// close and classifies h2c unsupported, as it would against any HTTP/1.1
-/// backend.
-const H2C_QUIET: Duration = Duration::from_millis(250);
-const H2_FRAME_HEADER_LEN: usize = 9;
-const H2_FRAME_HEADERS: u8 = 0x1;
+/// Serve an h2c connection, counting each request stream as it is accepted.
+async fn serve_h2c_connection(stream: TcpStream, hits: Arc<AtomicUsize>) {
+    let Ok(mut connection) = h2::server::handshake(stream).await else {
+        return;
+    };
+    while let Some(Ok((request, respond))) = connection.accept().await {
+        hits.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(answer_h2c_request(request, respond));
+    }
+}
 
-/// Count each client HEADERS frame on an h2c connection as one request, and
-/// close the connection once it goes quiet. Nothing is answered.
-async fn count_h2c_requests(mut stream: TcpStream, mut buf: Vec<u8>, hits: Arc<AtomicUsize>) {
-    while buf.len() < H2C_PREFACE_LEN {
-        if !fill(&mut stream, &mut buf).await {
-            return;
-        }
+async fn answer_h2c_request(
+    request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+) {
+    let grpc = header_str(request.headers(), "content-type")
+        .is_some_and(|value| value.starts_with("application/grpc"));
+    let mut body = request.into_body();
+    while let Some(Ok(chunk)) = body.data().await {
+        let _ = body.flow_control().release_capacity(chunk.len());
     }
-    buf.drain(..H2C_PREFACE_LEN);
-    loop {
-        while buf.len() >= H2_FRAME_HEADER_LEN {
-            let length = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
-            let frame_end = H2_FRAME_HEADER_LEN + length;
-            if buf.len() < frame_end {
-                break;
-            }
-            if buf[3] == H2_FRAME_HEADERS {
-                hits.fetch_add(1, Ordering::SeqCst);
-            }
-            buf.drain(..frame_end);
-        }
-        match timeout(H2C_QUIET, fill(&mut stream, &mut buf)).await {
-            Ok(true) => {}
-            Ok(false) | Err(_) => return,
-        }
+    let content_type = if grpc {
+        "application/grpc"
+    } else {
+        "text/plain"
+    };
+    let Ok(head) = Response::builder()
+        .status(200)
+        .header(CONTENT_TYPE, content_type)
+        .body(())
+    else {
+        return;
+    };
+    let Ok(mut send) = respond.send_response(head, false) else {
+        return;
+    };
+    if grpc {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let _ = send.send_trailers(trailers);
+    } else {
+        let _ = send.send_data(Bytes::from_static(b"ok"), true);
     }
+}
+
+/// The `content-length` of a lowercased HTTP/1.1 head, `0` when absent.
+fn content_length(head: &str) -> usize {
+    head.lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 const BACKEND_RESPONSE: &[u8] =
@@ -505,6 +606,111 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+// ---------------------------------------------------------------------------
+// Introspection gate
+// ---------------------------------------------------------------------------
+
+/// An `oauth2_introspection` endpoint that answers each call only when the
+/// test releases it. A request is received, and pinned to its plugin-cache
+/// generation, before `authenticate` runs, and every collector that runs after
+/// `authenticate` previews its route total only once the call is answered. So
+/// holding a call parks the request inside that window, which nothing else
+/// outside the gateway can reach.
+struct IntrospectionGate {
+    port: u16,
+    calls: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl IntrospectionGate {
+    async fn spawn() -> Self {
+        let reservation = reserve_port().await.expect("reserve introspection port");
+        let port = reservation.port;
+        let listener = reservation.into_listener();
+        let (calls_tx, calls) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(answer_introspection_call(stream, calls_tx.clone()));
+            }
+        });
+        Self { port, calls, task }
+    }
+
+    /// The next introspection call, held until the returned handle is sent.
+    async fn next_call(&mut self) -> oneshot::Sender<()> {
+        timeout(EXCHANGE_LIMIT, self.calls.recv())
+            .await
+            .expect("an introspection call in time")
+            .expect("the introspection gate is open")
+    }
+
+    /// Take the next `calls` calls, hold them until `hold` has passed since the
+    /// last one arrived, then answer them all.
+    async fn release(&mut self, calls: usize, hold: Duration) {
+        let mut held = Vec::with_capacity(calls);
+        for _ in 0..calls {
+            held.push(self.next_call().await);
+        }
+        sleep(hold).await;
+        for call in held {
+            let _ = call.send(());
+        }
+    }
+}
+
+impl Drop for IntrospectionGate {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Read one introspection request, report it, and answer `active` once
+/// released.
+async fn answer_introspection_call(
+    mut stream: TcpStream,
+    calls: mpsc::UnboundedSender<oneshot::Sender<()>>,
+) {
+    let mut buf = Vec::new();
+    let head_end = loop {
+        if let Some(index) = find(&buf, b"\r\n\r\n") {
+            break index + 4;
+        }
+        if !fill(&mut stream, &mut buf).await {
+            return;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let length = content_length(&head);
+    while buf.len() < head_end + length {
+        if !fill(&mut stream, &mut buf).await {
+            return;
+        }
+    }
+    let (release, released) = oneshot::channel();
+    if calls.send(release).is_err() || released.await.is_err() {
+        return;
+    }
+    let claims = r#"{"active":true,"username":"soap-client"}"#;
+    let answer = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{claims}",
+        claims.len()
+    );
+    let _ = stream.write_all(answer.as_bytes()).await;
+}
+
+/// The same upload once per protocol, each under its own bearer token. The
+/// introspection plugin shares one call between concurrent requests for the
+/// same token, and every upload has to park its own call at the gate.
+fn bearer_uploads(upload: &Upload, tokens: [&'static str; 3]) -> [(Proto, Upload); 3] {
+    let [h1, h2, h3] = tokens;
+    [
+        (Proto::H1, upload.clone().header("authorization", h1)),
+        (Proto::H2, upload.clone().header("authorization", h2)),
+        (Proto::H3, upload.clone().header("authorization", h3)),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +800,50 @@ impl MatrixGateway {
         );
         [h1, h2, h3]
     }
+
+    /// Each upload on its own protocol, all at once.
+    async fn upload_each(&self, uploads: &[(Proto, Upload); 3]) -> [Outcome; 3] {
+        let [(first, a), (second, b), (third, c)] = uploads;
+        let (a, b, c) = tokio::join!(
+            self.upload(*first, a),
+            self.upload(*second, b),
+            self.upload(*third, c),
+        );
+        [a, b, c]
+    }
+}
+
+/// Rewrite the file-mode config and SIGHUP the gateway. Returns once the new
+/// generation is applied.
+#[cfg(unix)]
+async fn reload(gateway: &MatrixGateway, yaml: String) {
+    const APPLIED: &str = "Configuration reloaded successfully";
+    let gateway = &gateway.gateway;
+    let applied_before = gateway
+        .read_combined_captured_output()
+        .unwrap_or_default()
+        .matches(APPLIED)
+        .count();
+    let config_path = gateway.config_path.clone().expect("file-mode config path");
+    std::fs::write(config_path, yaml).expect("write the new generation");
+    let pid = gateway.pid().expect("gateway pid");
+    let signalled = std::process::Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status()
+        .expect("run kill -HUP");
+    assert!(signalled.success(), "SIGHUP failed: {signalled:?}");
+    let logs = gateway
+        .wait_for_captured_output(
+            |output| output.matches(APPLIED).count() > applied_before,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap_or_default();
+    assert!(
+        logs.matches(APPLIED).count() > applied_before,
+        "the new generation must apply; gateway output:\n{}",
+        gateway.diagnostic_captured_output()
+    );
 }
 
 /// Wait until the QUIC listener answers, on a path no proxy routes, so the
@@ -1064,10 +1314,109 @@ fn spawn_h2_writer(
 
 // ---- HTTP/3: native QUIC streams with independently driven halves ----
 
-type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+type H3SendRequest = h3::client::SendRequest<StopTapOpenStreams, Bytes>;
 type H3ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 type H3SendHalf = h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 type H3RecvHalf = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+/// Completes when QUIC processes the peer's `STOP_SENDING` for one request
+/// stream, with its code.
+type StopSendingWatch =
+    Pin<Box<dyn Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send>>;
+
+/// The `h3_quinn` connection with one addition: as h3 opens each request
+/// stream, the stream's `STOP_SENDING` watch is handed to the session. The h3
+/// client keeps the QUIC stream private. The watch fires as soon as QUIC
+/// processes the frame, whereas a failed write only notices it at the next
+/// write.
+struct StopTapConnection {
+    inner: h3_quinn::Connection,
+    watches: mpsc::UnboundedSender<StopSendingWatch>,
+}
+
+impl QuicOpenStreams<Bytes> for StopTapConnection {
+    type BidiStream = h3_quinn::BidiStream<Bytes>;
+    type SendStream = h3_quinn::SendStream<Bytes>;
+
+    fn poll_open_bidi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
+        QuicOpenStreams::<Bytes>::poll_open_bidi(&mut self.inner, cx)
+    }
+
+    fn poll_open_send(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
+        QuicOpenStreams::<Bytes>::poll_open_send(&mut self.inner, cx)
+    }
+
+    fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
+        QuicOpenStreams::<Bytes>::close(&mut self.inner, code, reason);
+    }
+}
+
+impl QuicConnection<Bytes> for StopTapConnection {
+    type RecvStream = h3_quinn::RecvStream;
+    type OpenStreams = StopTapOpenStreams;
+
+    fn poll_accept_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
+        QuicConnection::<Bytes>::poll_accept_recv(&mut self.inner, cx)
+    }
+
+    fn poll_accept_bidi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
+        QuicConnection::<Bytes>::poll_accept_bidi(&mut self.inner, cx)
+    }
+
+    fn opener(&self) -> StopTapOpenStreams {
+        StopTapOpenStreams {
+            inner: QuicConnection::<Bytes>::opener(&self.inner),
+            watches: self.watches.clone(),
+        }
+    }
+}
+
+/// The request-stream opener of a `StopTapConnection`.
+struct StopTapOpenStreams {
+    inner: h3_quinn::OpenStreams,
+    watches: mpsc::UnboundedSender<StopSendingWatch>,
+}
+
+impl QuicOpenStreams<Bytes> for StopTapOpenStreams {
+    type BidiStream = h3_quinn::BidiStream<Bytes>;
+    type SendStream = h3_quinn::SendStream<Bytes>;
+
+    fn poll_open_bidi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
+        let opened = QuicOpenStreams::<Bytes>::poll_open_bidi(&mut self.inner, cx);
+        let opened = ready!(opened);
+        if let Ok(stream) = &opened {
+            let watch = h3::quic::SendStreamStopped::stopped(stream);
+            let _ = self.watches.send(Box::pin(watch));
+        }
+        Poll::Ready(opened)
+    }
+
+    fn poll_open_send(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
+        QuicOpenStreams::<Bytes>::poll_open_send(&mut self.inner, cx)
+    }
+
+    fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
+        QuicOpenStreams::<Bytes>::close(&mut self.inner, code, reason);
+    }
+}
 
 #[derive(Debug)]
 struct DangerAcceptAny;
@@ -1111,6 +1460,7 @@ impl rustls::client::danger::ServerCertVerifier for DangerAcceptAny {
 
 struct H3Session {
     send_request: H3SendRequest,
+    stop_watches: mpsc::UnboundedReceiver<StopSendingWatch>,
     driver: JoinHandle<()>,
     endpoint: quinn::Endpoint,
     https_port: u16,
@@ -1138,21 +1488,27 @@ impl H3Session {
             .await
             .expect("QUIC handshake in time")
             .expect("QUIC handshake");
-        let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(connection))
-            .await
-            .expect("h3 client");
+        let (watches, stop_watches) = mpsc::unbounded_channel();
+        let connection = StopTapConnection {
+            inner: h3_quinn::Connection::new(connection),
+            watches,
+        };
+        let (mut driver, send_request) = h3::client::new(connection).await.expect("h3 client");
         let driver = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
         Self {
             send_request,
+            stop_watches,
             driver,
             endpoint,
             https_port,
         }
     }
 
-    async fn open_stream(&mut self, upload: &Upload) -> H3ClientStream {
+    /// Open a request stream for `upload`'s head, with the stream's
+    /// `STOP_SENDING` watch.
+    async fn open_stream(&mut self, upload: &Upload) -> (H3ClientStream, StopSendingWatch) {
         let url = format!("https://127.0.0.1:{}{}", self.https_port, upload.path);
         let mut builder = Request::builder()
             .method(Method::POST)
@@ -1162,15 +1518,22 @@ impl H3Session {
             builder = builder.header(*name, *value);
         }
         let request = builder.body(()).expect("h3 request");
-        timeout(EXCHANGE_LIMIT, self.send_request.send_request(request))
+        let stream = timeout(EXCHANGE_LIMIT, self.send_request.send_request(request))
             .await
             .expect("h3 request stream in time")
-            .expect("open the h3 request stream")
+            .expect("open the h3 request stream");
+        // Opening a request stream sends its watch before h3 returns it.
+        let watch = self
+            .stop_watches
+            .try_recv()
+            .expect("the request stream's STOP_SENDING watch");
+        (stream, watch)
     }
 
     async fn upload(&mut self, upload: &Upload, started: Instant) -> Outcome {
-        let (send, mut recv) = self.open_stream(upload).await.split();
-        let (writer, _stopped) = spawn_h3_writer(send, upload.script.clone(), started);
+        let (stream, _stop_sending) = self.open_stream(upload).await;
+        let (send, mut recv) = stream.split();
+        let writer = spawn_h3_writer(send, upload.script.clone(), started);
         let head = timeout(EXCHANGE_LIMIT, recv.recv_response())
             .await
             .expect("h3 response head in time")
@@ -1196,30 +1559,13 @@ impl Drop for H3Session {
     }
 }
 
-/// How the gateway ended an HTTP/3 upload direction.
-struct UploadStopped {
-    at: Instant,
-    error: h3::error::StreamError,
-}
-
-/// Drive `script` on an HTTP/3 request's send half. Reports the error that
-/// ended the upload, then holds the send half until aborted.
-fn spawn_h3_writer(
-    mut send: H3SendHalf,
-    script: BodyScript,
-    started: Instant,
-) -> (JoinHandle<()>, oneshot::Receiver<UploadStopped>) {
-    let (stopped_tx, stopped_rx) = oneshot::channel();
-    let writer = tokio::spawn(async move {
-        if let Err(error) = drive_h3_upload(&mut send, script, started).await {
-            let _ = stopped_tx.send(UploadStopped {
-                at: Instant::now(),
-                error,
-            });
-        }
+/// Drive `script` on an HTTP/3 request's send half, then hold the send half
+/// until aborted. A write the gateway stopped ends the script early.
+fn spawn_h3_writer(mut send: H3SendHalf, script: BodyScript, started: Instant) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = drive_h3_upload(&mut send, script, started).await;
         std::future::pending::<()>().await;
-    });
-    (writer, stopped_rx)
+    })
 }
 
 async fn drive_h3_upload(
@@ -1241,6 +1587,43 @@ async fn drive_h3_upload(
         }
     }
     Ok(())
+}
+
+/// What a client saw first on an HTTP/3 request stream.
+enum FirstOnStream {
+    /// The response head, and the `STOP_SENDING` watch still to come.
+    Head(
+        Result<Response<()>, h3::error::StreamError>,
+        StopSendingWatch,
+    ),
+    /// The peer's `STOP_SENDING`, while no response head had been received.
+    StopSending(Result<Option<u64>, StreamErrorIncoming>),
+}
+
+/// Wait for the response head or the `STOP_SENDING`, whichever QUIC delivers
+/// first, polling the head first on every wake. QUIC applies all of a
+/// received packet's frames to the stream state before it wakes any task. So
+/// a head the gateway wrote before `STOP_SENDING`, in an earlier packet or the
+/// same one, is always readable by the time the watch fires. Only a
+/// `STOP_SENDING` sent ahead of the head can win, with no grace for either.
+async fn head_or_stop_sending(
+    recv: &mut H3RecvHalf,
+    mut stop_sending: StopSendingWatch,
+) -> FirstOnStream {
+    let first = {
+        let mut head = std::pin::pin!(recv.recv_response());
+        std::future::poll_fn(|cx| {
+            if let Poll::Ready(head) = head.as_mut().poll(cx) {
+                return Poll::Ready(Ok(head));
+            }
+            stop_sending.as_mut().poll(cx).map(Err)
+        })
+        .await
+    };
+    match first {
+        Ok(head) => FirstOnStream::Head(head, stop_sending),
+        Err(code) => FirstOnStream::StopSending(code),
+    }
 }
 
 async fn read_h3_body(recv: &mut H3RecvHalf) -> (Bytes, Option<HeaderMap>) {
@@ -1412,12 +1795,12 @@ async fn a_chunk_ready_when_the_route_total_elapses_is_refused_not_collected() {
 /// refusal of an elapsed total, the route-timeout `504` with the
 /// `request_timeout` token, and no backend is dialed.
 ///
-/// This cannot exercise the collector's refuse-before-poll of an elapsed,
-/// ready body. Nothing the gateway does between receipt and the collector's
-/// first poll reliably outlasts even a 1 ms total, so a host fast enough
-/// collects that body, authenticates it, and hands it to the backend before
-/// the total elapses: a 504 the backend held, correctly `backend_timeout`.
-/// The deterministic collector tests pin that property
+/// This passes under a refusal made only before dispatch as well. The
+/// pre-authentication collect cannot be delayed from outside the gateway, so
+/// nothing here can make its total elapse while the body is ready.
+/// `a_ready_message_whose_total_elapsed_before_its_collector_ran_is_refused_unread`
+/// does that for the collector that runs after `authenticate`. The
+/// deterministic collector tests pin it for both
 /// (`tests/unit/gateway_core/early_route_upload_tests.rs`,
 /// `*_an_elapsed_*_refuses_a_ready_body_without_polling_it`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1444,6 +1827,88 @@ async fn a_ready_upload_whose_total_elapses_before_dispatch_never_reaches_the_ba
         assert_route_timeout(&outcome, ms(FAULT_DELAY_MS), "elapsed before dispatch");
     }
     backend.assert_untouched("elapsed before dispatch").await;
+}
+
+/// Expired-ready: a complete message is ready with the request head, and its
+/// route total elapses before the collector runs. Only a collector that checks
+/// an elapsed total before it reads a ready body answers the `504`.
+///
+/// The route authenticates through `oauth2_introspection`, and a timestamp-only
+/// `soap_ws_security` collects the message after that, before `before_proxy`.
+/// That is the same deadline-first collector, previewing the same route total
+/// from receipt, as the identity-mode collect. The gate holds each
+/// introspection call until the total has elapsed for every request it parks.
+/// The message carries no `wsu:Timestamp`, so a collector that read it would
+/// hand it to the timestamp policy and answer `401`. That includes a refusal
+/// made only before dispatch, since it comes after that policy. The control
+/// route, under a total that cannot elapse, shows that `401`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn a_ready_message_whose_total_elapsed_before_its_collector_ran_is_refused_unread() {
+    const TOTAL_MS: u64 = 300;
+    const CONTROL_TOTAL_MS: u64 = 30_000;
+    let backend = CountingBackend::spawn().await;
+    let mut gate = IntrospectionGate::spawn().await;
+    let port = backend.port;
+    let yaml = gateway_yaml(
+        port,
+        &[
+            Route::introspected_soap(
+                "expired",
+                "/expired",
+                gate.port,
+                vec![rule(port, json!({}), Some(TOTAL_MS))],
+            ),
+            Route::introspected_soap(
+                "control",
+                "/control",
+                gate.port,
+                vec![rule(port, json!({}), Some(CONTROL_TOTAL_MS))],
+            ),
+        ],
+    );
+    let gateway = MatrixGateway::spawn(yaml, &[]).await;
+
+    let control = bearer_uploads(
+        &Upload::soap("/control/op", BodyScript::complete(valid_envelope())),
+        [
+            "Bearer control-h1",
+            "Bearer control-h2",
+            "Bearer control-h3",
+        ],
+    );
+    let (outcomes, ()) = tokio::join!(
+        gateway.upload_each(&control),
+        gate.release(control.len(), Duration::ZERO),
+    );
+    for outcome in outcomes {
+        assert_eq!(
+            outcome.status, 401,
+            "control on {:?}: a collected message reaches the timestamp policy, got {outcome:?}",
+            outcome.proto
+        );
+    }
+
+    // Every request is received before its introspection call, so holding the
+    // calls this long after the last one elapses every request's total.
+    let expired = bearer_uploads(
+        &Upload::soap("/expired/op", BodyScript::complete(valid_envelope())),
+        [
+            "Bearer expired-h1",
+            "Bearer expired-h2",
+            "Bearer expired-h3",
+        ],
+    );
+    let (outcomes, ()) = tokio::join!(
+        gateway.upload_each(&expired),
+        gate.release(expired.len(), ms(TOTAL_MS) + HELD_PAST_TOTAL),
+    );
+    for outcome in outcomes {
+        assert_route_timeout(&outcome, ms(TOTAL_MS), "ready message, elapsed total");
+    }
+    backend
+        .assert_untouched("ready message, elapsed total")
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,18 +2083,15 @@ async fn an_untimed_candidate_leaves_only_the_read_bound() {
 /// reload; a request received afterwards takes the new total.
 ///
 /// The collector previews its total just before that first poll, so here the
-/// bound is already armed when the reload lands. A reload between receipt and
-/// the preview cannot be timed from outside the gateway; that the preview
-/// reads the received generation is pinned by
-/// `the_preview_reads_the_generation_the_request_was_received_on`
-/// (`tests/unit/gateway_core/early_route_upload_tests.rs`).
+/// bound is already armed when the reload lands.
+/// `a_reload_before_the_collector_previews_its_total_keeps_the_pinned_generation`
+/// lands the reload before the preview.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn a_reload_during_collection_keeps_the_pinned_generation_total() {
     const PINNED_MS: u64 = 6_000;
     const RELOADED_MS: u64 = 600;
-    const APPLIED: &str = "Configuration reloaded successfully";
     let backend = CountingBackend::spawn().await;
     let gateway = MatrixGateway::spawn(soap_yaml(backend.port, PINNED_MS), &[]).await;
     let port = gateway.proxy_port();
@@ -1646,32 +2108,7 @@ async fn a_reload_during_collection_keeps_the_pinned_generation_total() {
         .expect("the collector must poll the body")
         .expect("100 Continue observed");
 
-    let config_path = gateway
-        .gateway
-        .config_path
-        .clone()
-        .expect("file-mode config path");
-    let reloaded = soap_yaml(backend.port, RELOADED_MS);
-    std::fs::write(config_path, reloaded).expect("write the new generation");
-    let pid = gateway.gateway.pid().expect("gateway pid");
-    let signalled = std::process::Command::new("kill")
-        .args(["-HUP", &pid.to_string()])
-        .status()
-        .expect("run kill -HUP");
-    assert!(signalled.success(), "SIGHUP failed: {signalled:?}");
-    let logs = gateway
-        .gateway
-        .wait_for_captured_output(
-            |output| output.contains(APPLIED) || output.contains("Configuration reload"),
-            Duration::from_secs(20),
-        )
-        .await
-        .unwrap_or_default();
-    assert!(
-        logs.contains(APPLIED),
-        "the new generation must apply; gateway output:\n{}",
-        gateway.gateway.diagnostic_captured_output()
-    );
+    reload(&gateway, soap_yaml(backend.port, RELOADED_MS)).await;
     assert!(
         !in_flight.is_finished(),
         "the reload must land while the pinned upload is still being collected"
@@ -1691,6 +2128,83 @@ async fn a_reload_during_collection_keeps_the_pinned_generation_total() {
         fresh.elapsed
     );
     backend.assert_untouched("pinned reload").await;
+}
+
+/// A reload that lands after a request was received but before its collector
+/// previews the route total does not change that total. The gate parks each
+/// upload inside `authenticate`, after receipt and before the collector that
+/// runs once `authenticate` returns. The reload replaces the pinned total with
+/// one that has already elapsed by the time the calls are released. A
+/// collector that read the live generation would refuse at once, so each
+/// stalled upload has to run to the pinned total instead. A request received
+/// after the reload takes the new total.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn a_reload_before_the_collector_previews_its_total_keeps_the_pinned_generation() {
+    const PINNED_MS: u64 = 8_000;
+    const RELOADED_MS: u64 = 600;
+    let backend = CountingBackend::spawn().await;
+    let mut gate = IntrospectionGate::spawn().await;
+    let (port, gate_port) = (backend.port, gate.port);
+    let yaml = |total_ms| {
+        gateway_yaml(
+            port,
+            &[Route::introspected_soap(
+                "pinned",
+                "/pinned",
+                gate_port,
+                vec![rule(port, json!({}), Some(total_ms))],
+            )],
+        )
+    };
+    let gateway = MatrixGateway::spawn(yaml(PINNED_MS), &[]).await;
+    let stalled = bearer_uploads(
+        &Upload::soap("/pinned/op", BodyScript::stalled(stalled_prefix())),
+        ["Bearer pinned-h1", "Bearer pinned-h2", "Bearer pinned-h3"],
+    );
+
+    let started = Instant::now();
+    let reload_while_parked = async {
+        let mut parked = Vec::with_capacity(stalled.len());
+        for _ in 0..stalled.len() {
+            parked.push(gate.next_call().await);
+        }
+        reload(&gateway, yaml(RELOADED_MS)).await;
+        // Each request was received before its call, and every call arrived
+        // before the reload, so the reloaded total has elapsed for all of them.
+        sleep(ms(RELOADED_MS) + HELD_PAST_TOTAL).await;
+        let released_after = started.elapsed();
+        for call in parked {
+            let _ = call.send(());
+        }
+        released_after
+    };
+    let (outcomes, released_after) =
+        tokio::join!(gateway.upload_each(&stalled), reload_while_parked);
+    // A live-generation preview would answer at about `released_after`.
+    assert!(
+        released_after + ms(1_000) < ms(PINNED_MS),
+        "the parked uploads must be released well inside the pinned total to tell the \
+         generations apart, released after {released_after:?}"
+    );
+    for outcome in outcomes {
+        assert_route_timeout(&outcome, ms(PINNED_MS), "previewed after the reload");
+    }
+
+    let fresh = Upload::soap("/pinned/op", BodyScript::stalled(stalled_prefix()))
+        .header("authorization", "Bearer fresh-h1");
+    let (fresh, ()) = tokio::join!(
+        gateway.upload(Proto::H1, &fresh),
+        gate.release(1, Duration::ZERO),
+    );
+    assert_route_timeout(&fresh, ms(RELOADED_MS), "received after the reload");
+    assert!(
+        fresh.elapsed < ms(PINNED_MS),
+        "a request received after the reload takes the new {RELOADED_MS}ms total, got {:?}",
+        fresh.elapsed
+    );
+    backend.assert_untouched("reload before the preview").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,11 +2247,13 @@ async fn h2_open_data_without_content_length_is_cut_and_the_connection_stays_usa
 // ---------------------------------------------------------------------------
 
 /// Over native HTTP/3 the gateway writes the `504` before it retires the
-/// upload direction with `STOP_SENDING(H3_NO_ERROR)`: when the client learns
-/// its upload was stopped, the response is already there. The budget admits
-/// one buffered upload at a time, so the follow-up upload on the same
-/// connection is admitted only if the cut upload released its permit. Two
-/// rounds show the release repeats.
+/// upload direction with `STOP_SENDING(H3_NO_ERROR)`. The client watches the
+/// stream's `STOP_SENDING` as QUIC processes it and polls the response head
+/// first on every wake, so the head has to be readable no later than the
+/// `STOP_SENDING` is: there is no grace period. The budget admits one buffered
+/// upload at a time, so the follow-up upload on the same connection is
+/// admitted only if the cut upload released its permit. Two rounds show the
+/// release repeats.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn h3_route_timeout_answers_before_stop_sending_and_releases_the_upload_permit() {
@@ -1753,35 +2269,33 @@ async fn h3_route_timeout_answers_before_stop_sending_and_releases_the_upload_pe
 
     for round in 1..=2 {
         let started = Instant::now();
-        let (send, mut recv) = session.open_stream(&open).await.split();
-        let (writer, stopped) = spawn_h3_writer(send, open.script.clone(), started);
-        let stopped = timeout(EXCHANGE_LIMIT, stopped)
+        let (stream, stop) = session.open_stream(&open).await;
+        let (send, mut recv) = stream.split();
+        let writer = spawn_h3_writer(send, open.script.clone(), started);
+        let first = timeout(EXCHANGE_LIMIT, head_or_stop_sending(&mut recv, stop))
             .await
-            .unwrap_or_else(|_| panic!("round {round}: the gateway never stopped the upload"))
-            .unwrap_or_else(|_| panic!("round {round}: the writer exited without a report"));
-        let stop_code = match &stopped.error {
-            h3::error::StreamError::RemoteTerminate { code, .. } => Some(*code),
-            _ => None,
+            .unwrap_or_else(|_| panic!("round {round}: neither a response nor STOP_SENDING"));
+        let (head, stop) = match first {
+            FirstOnStream::Head(head, stop) => (head, stop),
+            FirstOnStream::StopSending(code) => panic!(
+                "round {round}: STOP_SENDING ({code:?}) arrived while no response head had \
+                 been received"
+            ),
         };
+        let head = head.unwrap_or_else(|error| panic!("round {round}: response head: {error}"));
+        let answered_after = started.elapsed();
+        let stop_code = timeout(EXCHANGE_LIMIT, stop)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the gateway never stopped the upload"));
         assert_eq!(
-            stop_code,
-            Some(h3::error::Code::H3_NO_ERROR),
-            "round {round}: the upload must end with STOP_SENDING(H3_NO_ERROR), got {:?}",
-            stopped.error
+            stop_code.as_ref().ok().copied().flatten(),
+            Some(h3::error::Code::H3_NO_ERROR.value()),
+            "round {round}: the upload must end with STOP_SENDING(H3_NO_ERROR), got {stop_code:?}"
         );
         assert!(
-            stopped.at.duration_since(started) + TIMER_SLACK >= ms(ROUTE_TOTAL_MS),
-            "round {round}: the upload was stopped before the route total, after {:?}",
-            stopped.at.duration_since(started)
+            answered_after + TIMER_SLACK >= ms(ROUTE_TOTAL_MS),
+            "round {round}: answered before the route total, after {answered_after:?}"
         );
-        // The grace covers only client-side scheduling of bytes that already
-        // arrived: the response precedes STOP_SENDING on the wire.
-        let head = timeout(Duration::from_secs(1), recv.recv_response())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("round {round}: STOP_SENDING arrived before the response head")
-            })
-            .unwrap_or_else(|error| panic!("round {round}: response head: {error}"));
         let (body, _) = read_h3_body(&mut recv).await;
         writer.abort();
         assert_eq!(head.status().as_u16(), 504, "round {round}");
