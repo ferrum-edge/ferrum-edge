@@ -75,7 +75,8 @@ impl Snapshot {
             user_cpu_seconds: end.user_cpu_seconds - self.user_cpu_seconds,
             system_cpu_seconds: end.system_cpu_seconds - self.system_cpu_seconds,
             voluntary_ctxt_switches: end.voluntary_ctxt_switches - self.voluntary_ctxt_switches,
-            nonvoluntary_ctxt_switches: end.nonvoluntary_ctxt_switches - self.nonvoluntary_ctxt_switches,
+            nonvoluntary_ctxt_switches: end.nonvoluntary_ctxt_switches
+                - self.nonvoluntary_ctxt_switches,
             peak_rss_bytes: end.peak_rss_bytes,
             rss_scope: "process lifetime high-water mark at measurement end",
             bracket_secs: elapsed,
