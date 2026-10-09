@@ -125,8 +125,9 @@ before updating operators, custom plugins, mesh charts or contract consumers.
   summary** (issue #6022, PRs #6146 / #6150). Early H1/H2 prebuffers,
   terminal-body drains and buffered H3/gRPC bridges classify client
   cancellation as `client_disconnect`, with HTTP `499` or gRPC `CANCELLED`,
-  without charging backend health. Malformed buffered H3 input stays a
-  distinct `400` / `INVALID_ARGUMENT`; read timeouts stay `408` /
+  without charging backend health. Malformed buffered H3 input is recorded as
+  `400` / `INVALID_ARGUMENT`; the failed stream is halted without sending
+  that synthesized response. Read timeouts stay `408` /
   `DEADLINE_EXCEEDED`. Native H3 mid-body stream resets surface as
   `502` / `protocol_error`, or gRPC `UNAVAILABLE` with client-disconnect
   accounting; dashboards must account for the changed 5xx mix.
