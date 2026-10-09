@@ -687,10 +687,8 @@ fn opt_in_never_admits_cluster_infrastructure() {
         }),
     );
     for address in ["10.96.7.7", "10.96.0.50", "192.168.10.5", "10.244.3.17"] {
-        let objects = same_namespace_fixture(
-            json!([endpoint(address)]),
-            vec![ledger.clone(), worker()],
-        );
+        let objects =
+            same_namespace_fixture(json!([endpoint(address)]), vec![ledger.clone(), worker()]);
         assert_refused(&objects, opted_in_options(), address);
     }
 

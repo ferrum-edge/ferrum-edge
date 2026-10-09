@@ -16,8 +16,8 @@ mod mesh_config;
 // instead of a binary-unused `pub use` re-export.
 pub mod udp_amplification_policy;
 
-pub use core::{NodeWaypointInventory, POD_CLAIM_GRACE_WINDOW, PodClaimInventory};
 pub(crate) use core::secret_object_is_valid_tls_certificate;
+pub use core::{NodeWaypointInventory, POD_CLAIM_GRACE_WINDOW, PodClaimInventory};
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
     backend_lb_policy_conflict_losers, backend_lb_policy_status, gateway_api_section_name_is_valid,
