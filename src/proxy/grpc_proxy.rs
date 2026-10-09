@@ -2679,7 +2679,7 @@ pub enum GrpcProxyError {
 /// operator stall-timeout and client RPC-deadline wire messages while both let
 /// their pre-dispatch probe guard settle neutrally.
 pub(crate) enum GrpcRequestBodyCollectError {
-    Proxy(GrpcProxyError),
+    ResourceExhausted(String),
     TimedOut,
     DeadlineExceeded,
     /// The admitted stream's authorization lifetime elapsed while the gateway was
@@ -6120,12 +6120,10 @@ pub(crate) async fn collect_grpc_request_body(
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
                 if is_length_limit_error(e.as_ref()) {
-                    return Err(GrpcRequestBodyCollectError::Proxy(
-                        GrpcProxyError::ResourceExhausted(format!(
+                    return Err(GrpcRequestBodyCollectError::ResourceExhausted(format!(
                             "gRPC request payload size exceeds maximum of {} bytes",
                             max_grpc_recv_size_bytes
-                        )),
-                    ));
+                        )));
                 }
                 return Err(grpc_request_body_client_disconnected(e.as_ref()));
             }

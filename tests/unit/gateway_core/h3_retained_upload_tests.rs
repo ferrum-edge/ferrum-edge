@@ -276,6 +276,32 @@ fn every_h3_dispatch_publishes_the_charge_with_the_body() {
 }
 
 #[test]
+fn failed_h3_uploads_finalize_once_and_bridge_logs_before_sending() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let arms: Vec<_> = server.split("Err(H3RequestBodyReadError::Read(error)) => {")
+        .skip(1).collect();
+    assert_eq!(arms.len(), 7);
+    for arm in arms {
+        let arm = arm.split("return Err(error.into());").next().unwrap();
+        assert_eq!(arm.matches("boxed_finalize_h3_upload_read_failure(").count(), 1);
+    }
+    let classify = server.split("pub(crate) fn is_client_disconnect(&self)").nth(1).unwrap()
+        .split("/// Drain an H3 request-body").next().unwrap();
+    assert!(classify.contains("StreamError::RemoteTerminate { .. }"));
+    assert!(classify.contains("ConnectionError::Remote(_)"));
+    assert!(!classify.contains("StreamError::StreamError {"));
+    assert!(!classify.contains("ConnectionError::Local {"));
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let finalizer = bridge.split("async fn write_final_body_reject<S>(").nth(1).unwrap()
+        .split("fn normalize_h3_grpc_reject(").next().unwrap();
+    let commit = finalizer.find("run_cross_protocol_reject_committed_hooks(").unwrap();
+    let log = finalizer.find("log_client_disconnect_rejection_with_path(").unwrap();
+    let send = finalizer.find("write_reject_with_headers_and_recv_halt(").unwrap();
+    assert!(commit < log && log < send);
+}
+
+#[test]
 fn every_dispatch_stage_h3_drain_refusal_runs_the_reject_hooks_and_the_log() {
     // Issue #6022: a native-H3 drain after `before_proxy` refuses an oversized
     // upload through the same finalizer as its capacity refusal, so the

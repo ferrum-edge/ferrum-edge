@@ -3469,8 +3469,21 @@ where
                 )
                 .await;
             }
-            Err(super::server::H3RequestBodyReadError::TimedOut)
-            | Err(super::server::H3RequestBodyReadError::Read(_)) => {
+            Err(super::server::H3RequestBodyReadError::Read(error)) => {
+                cb_probe.release_neutral();
+                if error.is_client_disconnect() {
+                    return Box::pin(write_bridge_upload_client_disconnect(
+                        stream, HttpFlavor::Plain, plugins, ctx,
+                        response_committed_plugins, initial_response_header_policy_plugins,
+                        backend_start,
+                    )).await;
+                }
+                return write_plain_gateway_error(
+                    stream, ctx, StatusCode::BAD_REQUEST,
+                    r#"{"error":"Malformed request body"}"#, None, backend_start, 0,
+                ).await;
+            }
+            Err(super::server::H3RequestBodyReadError::TimedOut) => {
                 cb_probe.release_neutral();
                 return write_plain_gateway_error(
                     stream,
@@ -8155,6 +8168,13 @@ where
                     "cross-protocol H3→gRPC: request body read failed"
                 );
                 cb_probe.release_neutral();
+                if e.is_client_disconnect() {
+                    return Box::pin(write_bridge_upload_client_disconnect(
+                        stream, HttpFlavor::Grpc, plugins, ctx,
+                        response_committed_plugins, initial_response_header_policy_plugins,
+                        backend_start,
+                    )).await;
+                }
                 return write_grpc_error_for_request(
                     stream,
                     ctx,
@@ -12628,12 +12648,59 @@ where
     Ok(outcome)
 }
 
+/// Settle an aborted bridge upload before any backend handoff. Logging happens
+/// inside the shared finalizer after commit and before the bounded wire write,
+/// so a failed response write cannot discard the cancellation summary.
+#[allow(clippy::too_many_arguments)]
+async fn write_bridge_upload_client_disconnect<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    flavor: HttpFlavor,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_committed_plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    backend_start: Instant,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    ctx.metadata.insert(
+        crate::plugins::RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    if matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
+        headers.insert("grpc-status".to_string(), grpc_proxy::grpc_status::CANCELLED.to_string());
+        headers.insert("grpc-message".to_string(), "Client disconnected".to_string());
+    }
+    let mut outcome = write_final_body_reject(
+        stream, flavor, plugins, ctx,
+        PluginResult::Reject {
+            status_code: 499,
+            body: r#"{"error":"Client disconnected"}"#.to_string(),
+            headers,
+        },
+        response_committed_plugins, initial_response_header_policy_plugins,
+        RejectWriteAccounting { backend_start, bytes_sent: 0 },
+        FinalRejectHooks::UploadClientDisconnect,
+    ).await?;
+    outcome.client_disconnected = true;
+    outcome.error_class = Some(ErrorClass::ClientDisconnect);
+    outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
+    outcome.body_completed = false;
+    outcome.rejection_logged = true;
+    Ok(outcome)
+}
+
 /// How [`write_final_body_reject`] runs the reject-path hooks over its terminal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FinalRejectHooks {
     /// `after_proxy` and the committed observers, bounded by the RPC deadline
     /// in force, or as over the gateway deadline terminal once one is selected.
     Standard,
+    /// An aborted upload commits and logs its cancellation before the
+    /// best-effort terminal write, which receives a bounded grace period.
+    UploadClientDisconnect,
     /// A charged backend deadline terminal (#5744): every hook is bounded as
     /// over the gateway deadline terminal even with no RPC deadline in force,
     /// and the terminal keeps its `Backend deadline exceeded` wording.
@@ -12659,7 +12726,10 @@ async fn write_final_body_reject<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let charged_backend_deadline = hooks != FinalRejectHooks::Standard;
+    let charged_backend_deadline = matches!(
+        hooks,
+        FinalRejectHooks::ChargedBackendDeadline | FinalRejectHooks::ChargedAfterDecoratedHead
+    );
     let RejectWriteAccounting {
         backend_start,
         bytes_sent,
@@ -12691,7 +12761,7 @@ where
         };
     };
     let mut headers = parts.headers;
-    if hooks == FinalRejectHooks::Standard {
+    if matches!(hooks, FinalRejectHooks::Standard | FinalRejectHooks::UploadClientDisconnect) {
         crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
             plugins,
             ctx,
@@ -12732,6 +12802,17 @@ where
         &mut grpc_web_reject,
     )
     .await;
+    if hooks == FinalRejectHooks::UploadClientDisconnect {
+        let log_status = if grpc_web_reject.is_some() {
+            StatusCode::OK.as_u16()
+        } else {
+            normalized.http_status.as_u16()
+        };
+        crate::proxy::log_client_disconnect_rejection_with_path(
+            plugins, ctx, log_status, backend_start,
+            "client_disconnect_buffered_h3_bridge_upload", 0, None,
+        ).await;
+    }
     // Pending committed observers continue on owned state under a post-response
     // bound, while the downstream terminal write remains best-effort: it must
     // not park forever on exhausted QUIC flow-control credit. Already-selected
@@ -12743,8 +12824,9 @@ where
     // charged backend deadline terminal (`charged_backend_deadline`) is not the
     // gateway's deadline response but is written after a deadline passed too,
     // so it takes the same bounded write.
-    let terminal_gateway_deadline =
-        charged_backend_deadline || ctx.gateway_deadline_response_selected();
+    let terminal_gateway_deadline = charged_backend_deadline
+        || ctx.gateway_deadline_response_selected()
+        || hooks == FinalRejectHooks::UploadClientDisconnect;
     if let Some(translated) = grpc_web_reject {
         if terminal_gateway_deadline {
             let write = write_reject_with_headers_and_recv_halt(

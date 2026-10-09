@@ -291,9 +291,18 @@ Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classif
 
 | Field | Source | When populated |
 |---|---|---|
-| `error_class: Option<ErrorClass>` | per-protocol classifier | gateway-side failure reaching the backend |
-| `body_error_class: Option<ErrorClass>` | `classify_body_error` | error during streaming-response-body delivery |
-| `client_disconnected: bool` | `classify_body_error` returns `(_, true)` | client gave up after headers were sent |
+| `error_class: Option<ErrorClass>` | per-protocol classifier or upload rejection finalizer | gateway-side failure reaching the backend, or `ClientDisconnect` when the client resets or abandons a buffered upload before dispatch |
+| `body_error_class: Option<ErrorClass>` | `classify_body_error` or H3 bridge upload outcome | error during streaming-response-body delivery, or `ClientDisconnect` for an aborted buffered H3 bridge upload |
+| `client_disconnected: bool` | response-body classifier or upload rejection finalizer | client gave up during response delivery or before dispatch while an early, terminal, or buffered gRPC/H3 request body was being collected |
+
+Upload cancellations use dedicated `client_disconnect_*` rejection phases,
+including `client_disconnect_buffered_grpc_upload`,
+`client_disconnect_buffered_h3_upload`, and
+`client_disconnect_buffered_h3_bridge_upload`. The buffered native-gRPC collect
+and H3 gRPC bridge report `CANCELLED`; plain HTTP records 499. These events are neutral to backend health
+and never cause a retry. H3 framing/header violations remain malformed-input
+errors (`invalid_h3_upload` on native drains), and an operator body-read timeout
+keeps its timeout classification.
 
 ### `StreamTransactionSummary` (TCP / UDP / DTLS)
 

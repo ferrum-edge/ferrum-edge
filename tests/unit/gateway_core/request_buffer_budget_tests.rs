@@ -26,8 +26,11 @@ use ferrum_edge::_test_support::{
     buffered_request_body_ceiling_for_test, effective_request_body_limit_for_test,
     error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
     normalize_reject_response, request_buffer_capacity_backend_response_for_test,
-    request_buffer_capacity_reject_headers_for_test,
+    request_buffer_capacity_reject_headers_for_test, set_request_grpc_web_upload_for_test,
+    set_request_http_flavor_for_test,
 };
+use ferrum_edge::config::types::HttpFlavor;
+use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::retry::ErrorClass;
 use std::collections::HashMap;
 
@@ -271,12 +274,12 @@ fn backend_seam_refusal_is_trailers_only_resource_exhausted_for_grpc() {
     // collect) answered a bare 503, which a gRPC client reads as UNAVAILABLE.
     // A native gRPC request now gets the same Trailers-Only RESOURCE_EXHAUSTED
     // as the terminal drain and the native H3 refusal.
-    let grpc_headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/grpc+proto".to_string(),
-    )]);
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/rpc".into());
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+    // Outbound header transforms cannot change the client-visible protocol.
+    ctx.headers.insert("content-type".into(), "application/json".into());
     let grpc = request_buffer_capacity_backend_response_for_test(
-        &grpc_headers,
+        Some(&ctx),
         Some("192.0.2.7".to_string()),
     );
     assert_eq!(grpc.status_code, 200, "gRPC errors ride HTTP 200");
@@ -300,15 +303,41 @@ fn backend_seam_refusal_is_trailers_only_resource_exhausted_for_grpc() {
     assert!(!grpc.connection_error && !grpc.request_on_wire);
     assert_eq!(grpc.backend_resolved_ip.as_deref(), Some("192.0.2.7"));
 
-    // Plain HTTP, and pass-through gRPC-Web (not wire-native gRPC), keep the
-    // 503 and its fixed JSON body with no gRPC metadata.
-    for content_type in ["application/json", "application/grpc-web+proto"] {
-        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
-        let http = request_buffer_capacity_backend_response_for_test(&headers, None);
+    // Conversely, a plain request cannot become gRPC by rewriting a header.
+    let mut plain = RequestContext::new("127.0.0.1".into(), "POST".into(), "/".into());
+    plain.headers.insert("content-type".into(), "application/grpc".into());
+    for ctx in [None, Some(&plain)] {
+        let http = request_buffer_capacity_backend_response_for_test(ctx, None);
         assert_eq!(http.status_code, REQUEST_BUFFER_OVERLOAD_STATUS);
         assert_eq!(http.body_bytes(), REQUEST_BUFFER_OVERLOAD_BODY.as_bytes());
-        assert!(http.headers.is_empty(), "{content_type}");
+        assert!(http.headers.is_empty());
         assert_eq!(http.error_class, Some(REQUEST_BUFFER_OVERLOAD_ERROR_CLASS));
+    }
+}
+
+#[test]
+fn backend_seam_refusal_frames_passthrough_grpc_web_resource_exhausted() {
+    use base64::Engine;
+
+    for text_mode in [false, true] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/rpc".into());
+        set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Plain);
+        set_request_grpc_web_upload_for_test(&mut ctx, text_mode);
+        let response = request_buffer_capacity_backend_response_for_test(Some(&ctx), None);
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.error_class, Some(REQUEST_BUFFER_OVERLOAD_ERROR_CLASS));
+        assert!(!response.connection_error && !response.request_on_wire);
+        assert!(!response.headers.contains_key("grpc-status"));
+        let body = if text_mode {
+            base64::engine::general_purpose::STANDARD.decode(response.body_bytes()).unwrap()
+        } else {
+            response.body_bytes().to_vec()
+        };
+        assert_eq!(body[0], 0x80, "exactly one terminal frame");
+        assert_eq!(u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize, body.len() - 5);
+        let trailers = std::str::from_utf8(&body[5..]).unwrap();
+        assert!(trailers.contains("grpc-status: 8\r\n"));
+        assert!(trailers.contains("grpc-message: Request buffering capacity exceeded\r\n"));
     }
 }
 

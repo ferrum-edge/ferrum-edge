@@ -3253,7 +3253,7 @@ fn both_buffered_grpc_authorization_exits_release_their_admission_state() {
         .skip(1)
         .map(|branch| {
             branch
-                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy")
+                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted")
                 .next()
                 .expect("bounded buffered gRPC authorization branch")
         })
