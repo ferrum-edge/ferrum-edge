@@ -99,38 +99,41 @@ def load_samples(out, expected_runs, expected):
             if path.is_symlink() or not path.is_dir():
                 raise ValueError(f"unexpected entry in raw/{suite}/: {path.name}")
             actual_run_dirs.add(path.name)
-        if actual_run_dirs != expected_run_dirs:
-            missing = sorted(expected_run_dirs - actual_run_dirs)
-            extra = sorted(actual_run_dirs - expected_run_dirs)
+        # A planned run that never wrote a directory is reported as incomplete
+        # (runs_complete < runs_expected); anything the manifest did not plan
+        # is refused so stale samples can never mix into this summary.
+        extra = sorted(actual_run_dirs - expected_run_dirs)
+        if extra:
             raise ValueError(
-                f"run directories in raw/{suite}/ do not match manifest "
-                f"(missing={missing}, extra={extra})"
+                f"run directories in raw/{suite}/ do not match manifest (extra={extra})"
             )
 
         per_protocol = {protocol: [] for protocol in protocols}
         for run in range(1, expected_runs + 1):
             run_name = f"run{run}"
             run_dir = suite_dir / run_name
+            if run_name not in actual_run_dirs:
+                continue
             expected_files = {
                 name
                 for protocol in protocols
                 for name in (f"{protocol}.log", f"{protocol}.cpu.jsonl")
             }
-            required_logs = {f"{protocol}.log" for protocol in protocols}
             actual_files = set()
             for path in run_dir.iterdir():
                 if path.is_symlink() or not path.is_file():
                     raise ValueError(f"unexpected entry in raw/{suite}/{run_name}/: {path.name}")
                 actual_files.add(path.name)
-            missing = sorted(required_logs - actual_files)
             extra = sorted(actual_files - expected_files)
-            if missing or extra:
+            if extra:
                 raise ValueError(
-                    f"files in raw/{suite}/{run_name}/ do not match manifest "
-                    f"(missing={missing}, extra={extra})"
+                    f"files in raw/{suite}/{run_name}/ do not match manifest (extra={extra})"
                 )
             for protocol in protocols:
                 log = run_dir / f"{protocol}.log"
+                if log.name not in actual_files:
+                    # Reported as incomplete for this protocol.
+                    continue
                 legs = split_legs(extract_json(log.read_text(errors="replace")))
                 sample = {"run": run_dir.name, "gateway": legs.get("gateway"),
                           "direct": legs.get("direct"),

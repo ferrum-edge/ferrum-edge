@@ -96,7 +96,7 @@ class PublishedBenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(udp["payload_bytes"], 2048)
         self.assertIn("| UDP |", markdown)
 
-    def test_missing_manifest_matrix_entry_fails(self):
+    def test_missing_manifest_matrix_entry_is_reported_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_manifest(root, 3, ["http1", "grpc"], [64])
@@ -104,18 +104,24 @@ class PublishedBenchmarkSummaryTests(unittest.TestCase):
             write_run(root, "throughput_64b", 1, "http1",
                       report("http://127.0.0.1:8000/echo", 100_000, 1, 1),
                       report("http://127.0.0.1:3001/echo", 200_000, 1, 1))
-            with self.assertRaisesRegex(ValueError, "run directories.*missing"):
-                summary.summarize(root)
+            result = summary.summarize(root)
+            http1 = result["suites"]["throughput_64b"]["http1"]
+            self.assertEqual(http1["runs_complete"], 1)
+            self.assertEqual(http1["runs_expected"], 3)
+            grpc = result["suites"]["throughput_64b"]["grpc"]
+            self.assertEqual(grpc["runs_complete"], 0)
+            self.assertEqual(grpc["runs_expected"], 3)
 
-    def test_missing_protocol_log_fails(self):
+    def test_missing_protocol_log_is_reported_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_manifest(root, 1, ["http1", "grpc"], [64])
             write_run(root, "throughput_64b", 1, "http1",
                       report("http://127.0.0.1:8000/echo", 10, 1, 1),
                       report("http://127.0.0.1:3001/echo", 20, 1, 1))
-            with self.assertRaisesRegex(ValueError, "grpc.log"):
-                summary.summarize(root)
+            result = summary.summarize(root)
+            self.assertEqual(result["suites"]["throughput_64b"]["http1"]["runs_complete"], 1)
+            self.assertEqual(result["suites"]["throughput_64b"]["grpc"]["runs_complete"], 0)
 
     def test_stale_run_directory_fails_instead_of_mixing_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
