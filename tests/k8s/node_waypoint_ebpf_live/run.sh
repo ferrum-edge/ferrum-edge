@@ -383,11 +383,6 @@ render_chart_assertions() {
     grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostNetwork:|dnsPolicy:' <<<"$rendered" >&2 || true
     exit 1
   fi
-  if [[ "$(grep -c "hostPID: true" <<<"$rendered" || true)" -lt 2 ]]; then
-    echo "NodeWaypoint eBPF render did not grant hostPID to both ambient and node-agent daemonsets" >&2
-    grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostPID:|hostNetwork:' <<<"$rendered" >&2 || true
-    exit 1
-  fi
   local ambient_ds node_agent_ds
   # Select whole rendered documents by kind and metadata name: label lines
   # such as `app.kubernetes.io/name: ferrum-mesh-node-agent` appear in other
@@ -402,9 +397,24 @@ render_chart_assertions() {
     echo "NodeWaypoint eBPF render is missing the ambient or node-agent DaemonSet" >&2
     exit 1
   fi
+  # Issue #6112: only the ambient proxy enters pod network namespaces, so only
+  # it keeps hostPID + SYS_ADMIN. The node-agent resolves veths from host
+  # routes and host sysfs and must render neither; this live gate then proves
+  # its NodeWaypoint enrollment, tc redirect, and SOCK_OPS bridge work without
+  # them.
+  if ! grep -q "hostPID: true" <<<"$ambient_ds"; then
+    echo "NodeWaypoint eBPF render did not grant hostPID to the ambient daemonset" >&2
+    grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostPID:|hostNetwork:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+  if grep -q "hostPID:" <<<"$node_agent_ds"; then
+    echo "NodeWaypoint eBPF render granted hostPID to the node-agent daemonset" >&2
+    grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostPID:|hostNetwork:' <<<"$rendered" >&2 || true
+    exit 1
+  fi
   for cap in BPF PERFMON SYS_ADMIN; do
-    if ! grep -q -- "- ${cap}" <<<"$ambient_ds" || ! grep -q -- "- ${cap}" <<<"$node_agent_ds"; then
-      echo "NodeWaypoint eBPF render did not grant ${cap} to both proxy and node-agent" >&2
+    if ! grep -q -- "- ${cap}" <<<"$ambient_ds"; then
+      echo "NodeWaypoint eBPF render did not grant ${cap} to the node-waypoint proxy" >&2
       grep -nE "kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|capabilities:|add:|- ${cap}" <<<"$rendered" >&2 || true
       exit 1
     fi
@@ -414,11 +424,16 @@ render_chart_assertions() {
       exit 1
     fi
   done
-  if [[ "$(grep -c -- '- BPF' <<<"$rendered" || true)" -lt 2 ]] ||
-    [[ "$(grep -c -- '- PERFMON' <<<"$rendered" || true)" -lt 2 ]] ||
-    [[ "$(grep -c -- '- SYS_ADMIN' <<<"$rendered" || true)" -lt 2 ]]; then
-    echo "NodeWaypoint eBPF render did not grant BPF/PERFMON/SYS_ADMIN to both proxy and node-agent" >&2
-    grep -nE 'capabilities:|add:|- SYS_ADMIN|- BPF|- NET_ADMIN|- PERFMON|- SYS_PTRACE' <<<"$rendered" >&2 || true
+  for cap in BPF NET_ADMIN PERFMON; do
+    if ! grep -q -- "- ${cap}" <<<"$node_agent_ds"; then
+      echo "NodeWaypoint eBPF render did not grant ${cap} to the node-agent" >&2
+      grep -nE "kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|capabilities:|add:|- ${cap}" <<<"$rendered" >&2 || true
+      exit 1
+    fi
+  done
+  if grep -qE -- '- "?SYS_ADMIN"?$' <<<"$node_agent_ds"; then
+    echo "NodeWaypoint eBPF render granted SYS_ADMIN to the node-agent" >&2
+    grep -nE 'kind: DaemonSet|name: ferrum-mesh-node-agent|capabilities:|add:|- SYS_ADMIN' <<<"$rendered" >&2 || true
     exit 1
   fi
   if ! grep -q -- '- SYS_PTRACE' <<<"$rendered"; then

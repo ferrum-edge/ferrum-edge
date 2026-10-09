@@ -8,11 +8,21 @@
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $addPerfmon := true -}}
 {{- if hasKey $sec "addCapPerfmon" }}{{ $addPerfmon = get $sec "addCapPerfmon" }}{{ end -}}
-{{- $dropSysAdmin := false -}}
-{{- if hasKey $sec "dropCapSysAdmin" }}{{ $dropSysAdmin = get $sec "dropCapSysAdmin" }}{{ end -}}
+{{- /* Secure default: only an explicit dropCapSysAdmin=false grants SYS_ADMIN.
+       A missing or null key (or a nulled security block) keeps it dropped. */ -}}
+{{- $dropSysAdmin := true -}}
+{{- if and (hasKey $sec "dropCapSysAdmin") (kindIs "bool" (get $sec "dropCapSysAdmin")) }}{{ $dropSysAdmin = get $sec "dropCapSysAdmin" }}{{ end -}}
 {{- $caps := list "BPF" "NET_ADMIN" -}}
 {{- if $addPerfmon }}{{ $caps = append $caps "PERFMON" }}{{ end -}}
-{{- if or (not $dropSysAdmin) (eq $nodeAgentProxyMode "node_waypoint") }}{{ $caps = append $caps "SYS_ADMIN" }}{{ end -}}
+{{- /* SYS_ADMIN is only the kernel < 5.8 BPF back-compat grant
+       (dropCapSysAdmin=false). No proxy mode adds it: node_waypoint once did so
+       the agent could setns() into pod network namespaces for veth discovery,
+       but veth resolution now reads only host route tables and host sysfs
+       (`veth::discover_dedicated_veth_for_pod`), and every eBPF operation
+       node_waypoint adds (SOCK_OPS cgroup attach, tc ingress redirect, map
+       pinning) is the same CAP_BPF/CAP_NET_ADMIN class local_pod already runs
+       without SYS_ADMIN. */ -}}
+{{- if not $dropSysAdmin }}{{ $caps = append $caps "SYS_ADMIN" }}{{ end -}}
 {{- $readOnlyRoot := true -}}
 {{- if hasKey $sec "readOnlyRootFilesystem" }}{{ $readOnlyRoot = get $sec "readOnlyRootFilesystem" }}{{ end -}}
 {{- $allowEsc := false -}}
@@ -252,7 +262,11 @@ spec:
       {{- with .Values.nodeAgent.priorityClassName }}
       priorityClassName: {{ . | quote }}
       {{- end }}
-      hostPID: true
+      {{- /* No hostPID: the node agent reads no per-pod /proc/<pid> state
+             and enters no pod namespace. Veth resolution uses the host netns
+             route tables (hostNetwork) plus host sysfs, cgroups come from the
+             host cgroup mount, and boot identity from the kernel-global
+             /proc/sys/kernel/random/boot_id. */}}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       securityContext:

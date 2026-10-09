@@ -853,7 +853,6 @@ pub fn pod_event_from_request<'a>(
         // (`pod_uses_host_network`) once the kube-rs watcher reconciles, so a
         // host-network pod that somehow reached here is skipped there.
         host_network: false,
-        pod_pid: None,
         veth_iface_override: None,
     }
 }
@@ -912,7 +911,6 @@ mod tests {
             event.pod_source_ips,
             crate::modes::node_agent::PodSourceIps::default()
         );
-        assert!(event.pod_pid.is_none());
     }
 
     #[test]

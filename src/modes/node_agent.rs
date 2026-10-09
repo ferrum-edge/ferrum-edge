@@ -3698,7 +3698,6 @@ fn apply_cni_add_from_pod(
         pod_source_ips,
         node_probe_ports,
         inbound_redirect_ports,
-        pod_pid: None,
         veth_iface_override: None,
         host_network: pod_uses_host_network(pod),
     };
@@ -4532,7 +4531,6 @@ fn handle_kube_pod_applied(
         pod_source_ips,
         node_probe_ports,
         inbound_redirect_ports,
-        pod_pid: None,
         veth_iface_override: None,
         host_network: pod_uses_host_network(pod),
     };
@@ -4561,7 +4559,6 @@ pub struct PodEvent<'a> {
     /// grants kubelet a *direct* path that deliberately does NOT go through
     /// the relay.
     pub inbound_redirect_ports: Vec<u16>,
-    pub pod_pid: Option<u32>,
     /// Pre-resolved host-side veth interface name for this pod, bypassing
     /// the production resolver. Production always sets this to `None` and
     /// relies on the dedicated host-route lookup keyed by the pod address
@@ -4602,7 +4599,7 @@ struct PodEnrollmentAttemptSignature {
 /// it succeeds (or the pod is removed / no longer matches enrollment).
 ///
 /// `veth_iface_override` is intentionally not captured: production always sets
-/// it to `None` and relies on the live procfs/sysfs resolver, so the rebuilt
+/// it to `None` and relies on the live host-route resolver, so the rebuilt
 /// `PodEvent` re-resolves the interface on each retry.
 #[derive(Debug, Clone)]
 struct RetryablePodEnrollment {
@@ -4616,7 +4613,6 @@ struct RetryablePodEnrollment {
     pod_source_ips: PodSourceIps,
     node_probe_ports: Vec<u16>,
     inbound_redirect_ports: Vec<u16>,
-    pod_pid: Option<u32>,
     host_network: bool,
 }
 
@@ -4633,7 +4629,6 @@ impl RetryablePodEnrollment {
             pod_source_ips: event.pod_source_ips,
             node_probe_ports: event.node_probe_ports.clone(),
             inbound_redirect_ports: event.inbound_redirect_ports.clone(),
-            pod_pid: event.pod_pid,
             host_network: event.host_network,
         }
     }
@@ -4653,7 +4648,6 @@ impl RetryablePodEnrollment {
             pod_source_ips: self.pod_source_ips,
             node_probe_ports: self.node_probe_ports.clone(),
             inbound_redirect_ports: self.inbound_redirect_ports.clone(),
-            pod_pid: self.pod_pid,
             // Production always re-resolves the veth on retry (see struct docs).
             veth_iface_override: None,
             host_network: self.host_network,
@@ -10901,7 +10895,6 @@ mod tests {
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             host_network: false,
         }
     }
@@ -11574,7 +11567,6 @@ mod tests {
                 pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: ports,
-                pod_pid: None,
                 veth_iface_override: Some("veth-mock"),
                 host_network: false,
             };
@@ -11659,7 +11651,6 @@ mod tests {
                 },
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: ports,
-                pod_pid: None,
                 veth_iface_override: Some("veth-mock"),
                 host_network: false,
             };
@@ -11711,7 +11702,6 @@ mod tests {
                 pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: ports,
-                pod_pid: None,
                 veth_iface_override: Some("veth-mock"),
                 host_network: false,
             };
@@ -12814,7 +12804,6 @@ mod tests {
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
-                pod_pid: None,
                 host_network: false,
             },
             &failed_cleanup_state,
@@ -12936,7 +12925,6 @@ mod tests {
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
-                pod_pid: None,
                 host_network: false,
             },
             &failed_cleanup_state,
@@ -13173,7 +13161,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.31")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-test"),
             host_network: false,
         };
@@ -13316,7 +13303,6 @@ mod tests {
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
-                pod_pid: None,
                 host_network: false,
             },
         );
@@ -13820,7 +13806,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -14371,7 +14356,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -14396,13 +14380,13 @@ mod tests {
 
     #[test]
     fn handle_pod_added_refuses_pod_without_dedicated_host_route() {
-        // A live pod PID used to resolve the veth from the pod's own sysfs
-        // view, which the workload controls. Only a dedicated host route keyed
-        // by the pod address may name the attachment device now, so a pod
-        // with a PID but no such route is refused and nothing attaches to a
-        // shared CNI device in its place. No `TestOverrideGuard` is pinned, so
-        // this exercises the production resolver against the test host's own
-        // route tables, which carry no route to the documentation address.
+        // A pod's own sysfs view is controlled by the workload, so it never
+        // names the attachment device. Only a dedicated host route keyed by
+        // the pod address may, so a pod with no such route is refused and
+        // nothing attaches to a shared CNI device in its place. No
+        // `TestOverrideGuard` is pinned, so this exercises the production
+        // resolver against the test host's own route tables, which carry no
+        // route to the documentation address.
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -14433,7 +14417,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("203.0.113.77")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: Some(std::process::id()),
             veth_iface_override: None,
             host_network: false,
         };
@@ -14493,7 +14476,6 @@ mod tests {
                 pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
-                pod_pid: None,
                 veth_iface_override: Some("veth-udp"),
                 host_network: false,
             };
@@ -14559,7 +14541,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.10")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-udp"),
             host_network: false,
         };
@@ -14609,7 +14590,6 @@ mod tests {
             },
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -14686,7 +14666,6 @@ mod tests {
             pod_source_ips,
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -14748,7 +14727,6 @@ mod tests {
             pod_source_ips,
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -14838,7 +14816,6 @@ mod tests {
             pod_source_ips: source_ips,
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -14918,7 +14895,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some(veth),
             host_network: false,
         };
@@ -15049,7 +15025,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15124,7 +15099,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15201,7 +15175,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15285,7 +15258,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.6")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15363,7 +15335,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.7")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15417,7 +15388,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15458,7 +15428,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15499,7 +15468,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: vec![8080],
             inbound_redirect_ports: Vec::new(),
-            pod_pid: Some(4242),
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15515,7 +15483,6 @@ mod tests {
         assert_eq!(rebuilt.annotations, &annotations);
         assert_eq!(rebuilt.pod_ip_str, Some("10.0.0.5"));
         assert_eq!(rebuilt.node_probe_ports, vec![8080]);
-        assert_eq!(rebuilt.pod_pid, Some(4242));
         // Production re-resolves the veth on every retry, so the snapshot never
         // carries the override.
         assert_eq!(rebuilt.veth_iface_override, None);
@@ -15570,7 +15537,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             // None mirrors production and the retry snapshot; veth resolves via
             // the override guard above.
             veth_iface_override: None,
@@ -15715,7 +15681,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-new"),
             host_network: false,
         };
@@ -15777,7 +15742,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: vec![8080],
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15840,7 +15804,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: vec![9090],
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15914,7 +15877,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
             node_probe_ports: vec![9090],
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -15985,7 +15947,6 @@ mod tests {
             },
             node_probe_ports: vec![8080],
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -16065,7 +16026,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: vec![8080],
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -16328,7 +16288,6 @@ mod tests {
                 pod_source_ips: PodSourceIps::from_primary_str(Some(ip)),
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
-                pod_pid: None,
                 veth_iface_override: None,
                 host_network: false,
             };
@@ -16440,7 +16399,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: None,
             host_network: false,
         };
@@ -16487,7 +16445,6 @@ mod tests {
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -16543,7 +16500,6 @@ mod tests {
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -16606,7 +16562,6 @@ mod tests {
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-test"),
             host_network: false,
         };
@@ -16646,7 +16601,6 @@ mod tests {
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -18891,7 +18845,6 @@ mod tests {
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -18965,7 +18918,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-new"),
             host_network: false,
         };
@@ -19057,7 +19009,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -19128,7 +19079,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -19749,7 +19699,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-a"),
             host_network: false,
         };
@@ -20205,7 +20154,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -20274,7 +20222,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -20345,7 +20292,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -20414,7 +20360,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -20470,7 +20415,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -20525,7 +20469,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -20575,7 +20518,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         };
@@ -20642,7 +20584,6 @@ mod tests {
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
-            pod_pid: None,
             veth_iface_override: Some("veth-mock"),
             host_network: false,
         }
