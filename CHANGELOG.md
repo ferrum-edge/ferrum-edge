@@ -44,12 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Manual protocol and payload benchmarks keep their standalone harnesses on
+  `release`, while the selected build profile applies to the gateway. Selecting
+  `ci-release` or `max-perf` no longer asks harnesses for undefined profiles.
+
 - Scheduled benchmark history selectors can run `--self-test` without live-run
   arguments; ordinary history queries still require the workflow and commit.
 
 - H1 hosted profiling installs Ubuntu 26.04's `linux-perf` package and stages
   its `/usr/bin/perf` ELF, retaining its package origin and checksum. The former
   kernel-specific `linux-tools` path is no longer populated on this image.
+  CPU sample verification accepts its `PERF_TYPE_SOFTWARE` annotation while
+  retaining the numeric event type and all required sampling checks.
 
 - **BREAKING — HTTP/2 WebSocket early data is gated on the wire method
   `CONNECT`** (issue #6107). An RFC 8441 Extended CONNECT WebSocket carrying

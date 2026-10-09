@@ -72,4 +72,4 @@ jobs:
       - name: Build native Linux binaries
         run: cargo build --locked --bin ferrum-edge --bin ferrum-cni
       - name: Start the native gateway
-        run: ./target/debug/ferrum-edge --version
+        run: cargo run --locked --bin ferrum-edge -- --version

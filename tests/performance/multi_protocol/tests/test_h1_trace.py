@@ -131,6 +131,16 @@ class H1CPUAttributeTests(unittest.TestCase):
         raw = raw.replace('sample_stack_user: 8192', 'sample_stack_user: 0x2000')
         self.assertTrue(self.verify(raw)['verified'])
 
+    def test_ubuntu_26_perf_enum_annotation_preserves_required_numeric_type(self):
+        # Verbatim hosted run 37897150252, artifact 11601220812, checkout
+        # c1e381cdf6643ec82d6baa18e9e941cc1271d0d9: linux-perf on Ubuntu 26.04.
+        raw = (HERE / 'tests/fixtures/h1-perf-evlist-ubuntu-26.04.txt').read_bytes()
+        self.assertTrue(self.verify(raw)['verified'])
+        self.rejected(raw.replace(b'type: 1 (PERF_TYPE_SOFTWARE)',
+                                  b'type: 0 (PERF_TYPE_SOFTWARE)'), 'type: expected 1')
+        self.rejected(raw.replace(b'type: 1 (PERF_TYPE_SOFTWARE)',
+                                  b'type: 1 (PERF_TYPE_HARDWARE)'), 'invalid numeric attribute type')
+
     def test_missing_attributes_are_not_borrowed_from_dummy(self):
         fragments = {
             'type': 'type: 1 (software), ',

@@ -1014,7 +1014,9 @@ def read_cpu_attributes(path, status):
         if value is None:
             issues.append('cpu-clock:uS missing attribute ' + key)
             return None
-        suffix = r'(?:[ \t]+\(' + re.escape(annotation) + r'\))?' if annotation else ''
+        annotations = (annotation,) if isinstance(annotation, str) else annotation
+        suffix = (r'(?:[ \t]+\((?:' + '|'.join(re.escape(a) for a in annotations) + r')\))?'
+                  if annotations else '')
         match = re.fullmatch(r'(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})' + suffix, value)
         if match:
             token = match[1]
@@ -1024,7 +1026,7 @@ def read_cpu_attributes(path, status):
         issues.append(f'cpu-clock:uS invalid numeric attribute {key}: {value}')
         return None
 
-    required = {'type': (1, 'software'), 'config': (0, 'PERF_COUNT_SW_CPU_CLOCK'),
+    required = {'type': (1, ('software', 'PERF_TYPE_SOFTWARE')), 'config': (0, 'PERF_COUNT_SW_CPU_CLOCK'),
                 union: (99, None), 'freq': (1, None), 'inherit': (1, None),
                 'exclude_kernel': (1, None), 'use_clockid': (1, None),
                 'clockid': (1, None), 'sample_stack_user': (8192, None)}
