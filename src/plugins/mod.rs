@@ -5508,6 +5508,7 @@ impl RequestContext {
             path: self.path.clone(),
             raw_path: self.raw_path.clone(),
             request_authority: self.request_authority.clone(),
+            outbound_proxy_hops: self.outbound_proxy_hops,
             request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
