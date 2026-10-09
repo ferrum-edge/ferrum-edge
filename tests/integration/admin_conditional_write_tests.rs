@@ -3356,7 +3356,14 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         assert!(unchanged.etag == original.etag);
         assert!(
             unchanged.body == original.body,
-            "pre-commit persistence failure changed complete typed/raw evidence"
+            "pre-commit persistence failure changed complete typed/raw evidence; differing keys: {:?}",
+            original
+                .body
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| unchanged.body.get(*key) != original.body.get(*key))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             db.latest_change_sequence(&namespace).await.unwrap(),
