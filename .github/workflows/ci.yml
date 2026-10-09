@@ -30,12 +30,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 3
       - name: Record immutable source and apply one isolated experiment
         run: |
           mkdir -p stack-results
           git rev-parse HEAD > stack-results/revision.txt
           printf '%s\n' "$STACK_VARIANT" > stack-results/variant.txt
           python3 tests/performance/multi_protocol/stack_box_experiment.py
+          # The gateway unit suite checks the production CI policy as data.
+          # Restore that exact baseline file on the ephemeral runner.
+          git show d2a0052f9e9ca7fbb6caf8c855254ffbb4f93c92:.github/workflows/ci.yml > .github/workflows/ci.yml
           git diff --no-ext-diff > stack-results/experiment.patch
       - name: Extend runner swap
         run: |
