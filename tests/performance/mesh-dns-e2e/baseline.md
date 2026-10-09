@@ -19,6 +19,10 @@ self-relative trends; do not promote opportunistic laptop numbers into CI floors
 > `tests/performance/mesh/baseline.md`); that run's failed DNS portion must not
 > be used as DNS evidence.
 
+New hosted collections use `ubuntu-26.04`. The published measurements below
+retain their original Ubuntu 24.04 provenance and must not be compared as
+absolute regression gates across runner images.
+
 ## Reference environment (DNS-only collection)
 
 | Field | Value |

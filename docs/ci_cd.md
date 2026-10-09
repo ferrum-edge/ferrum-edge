@@ -75,7 +75,7 @@ adding, removing, or materially changing a workflow.
 | `performance-regression.yml` | Performance Regression | Daily schedule on `main`, manual | Out-of-band self-relative overhead benchmark, Criterion microbenchmarks, and the protocol-perf / mesh-baseline static contracts. Not a PR or main-push check; a red run marks the daily `main` tip as regressed. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `h1-tls-post-regression.yml` | H1 TLS POST Historical Baseline | Daily schedule on `main`, manual | Paired same-runner HTTP/1.1 TLS POST/echo throughput of the `main` tip against the historical reference pinned in `tests/performance/multi_protocol/h1_tls_post_reference.json`; gates the paired ratio per payload size, alerts on rolling-ratio drift, downgrades noisy-runner verdicts to provisional. Manual dispatch accepts a reference SHA override for matched-host bisects. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md#historical-baseline-h1-tls-post-check). |
-| `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-24.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
+| `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-26.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
 | `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
 | `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. |
@@ -1562,7 +1562,7 @@ trusted-base classifiers; they are not part of these three `ci.yml` jobs.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 The workflow triggers unconditionally on `workflow_dispatch`, `pull_request`,
 `merge_group` (`checks_requested`), and `push` to `main`, with **no
@@ -1627,7 +1627,7 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 #### 5a. Istio Status CAS Live Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 `istio-status-cas-live.yml` is a Kind/apiserver lane for issue #3838. It is
 **not** a required live-suite check and is not wired into the `ci.yml` `Tests`
@@ -1652,7 +1652,7 @@ substitute for this lane.
 
 #### 5b. Ambient Host-Network UDP Live-Kernel Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 `ambient-host-udp-live` triggers on **every** pull request and merge-group run —
 it carries no top-level `paths:` filter, because a required check that can
@@ -1800,7 +1800,7 @@ is observed; no local execution can establish these acceptance criteria.
 
 #### 5c. CNI Install Lifecycle Live Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 `cni-lifecycle-live.yml` is the live install/uninstall recovery proof for issue
 #3609. Logic lives in `tests/k8s/cni_lifecycle_live/run.sh`; the workflow stays
@@ -4003,7 +4003,7 @@ trusted-main writer in this workflow. All package and billing settings stay as-i
 Netns Source Capture, Two-Cluster Mesh Live and Ambient host-UDP live-kernel
 use the existing `ci-netns-capture-live` key. All use `setup-rust-ci`, default
 features, the default Cargo profile, native dependencies, workspace and
-compiler flags. Ambient pins Ubuntu 24.04; the other two use `ubuntu-26.04`,
+compiler flags. All three pin `ubuntu-26.04`,
 which currently resolves to the same image family. The cache still includes
 its platform/toolchain/environment hash, and Cargo checks build fingerprints.
 All three build the gateway and `functional_tests`; Netns and Ambient also

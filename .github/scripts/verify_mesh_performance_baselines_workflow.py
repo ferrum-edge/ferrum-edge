@@ -2,7 +2,7 @@
 """Static contract checks for the mesh performance baselines workflow (#3332).
 
 Does not execute benchmarks. Validates workflow wiring, pinned actions, suite
-coverage, provenance/summary scripts, ubuntu-24.04 pin, acceptance step,
+coverage, provenance/summary scripts, ubuntu-26.04 pin, acceptance step,
 mesh/HBONE/DNS interval evidence, and docs inventory pointers.
 """
 
@@ -377,9 +377,9 @@ def _check_hbone_trusted_fixture_contract(
 def check_workflow(text: str, failures: list[str]) -> None:
     require("name: Mesh Performance Baselines" in text, "workflow display name missing", failures)
     require("workflow_dispatch:" in text, "workflow_dispatch trigger required", failures)
-    require("runs-on: ubuntu-24.04" in text, "collection must pin runs-on ubuntu-24.04", failures)
-    require("BENCH_RUNNER_CLASS: ubuntu-24.04" in text, "BENCH_RUNNER_CLASS must be ubuntu-24.04", failures)
-    require("ubuntu-24.04" in text, "default runner class must be ubuntu-24.04", failures)
+    require("runs-on: ubuntu-26.04" in text, "collection must pin runs-on ubuntu-26.04", failures)
+    require("BENCH_RUNNER_CLASS: ubuntu-26.04" in text, "BENCH_RUNNER_CLASS must be ubuntu-26.04", failures)
+    require("ubuntu-26.04" in text, "default runner class must be ubuntu-26.04", failures)
     require("inputs:\n      runner:" not in text and "runner:" not in _workflow_inputs_block(text), "arbitrary runner input must be removed", failures)
     require(
         "runs-on: self-hosted" not in text.lower()
@@ -579,7 +579,7 @@ def check_scripts(failures: list[str]) -> None:
     require(STEP_SUMMARY_SCRIPT.is_file(), "step summary script missing", failures)
 
     provenance = PROVENANCE_SCRIPT.read_text(encoding="utf-8")
-    require("ubuntu-24.04" in provenance, "provenance default runner class must be ubuntu-24.04", failures)
+    require("ubuntu-26.04" in provenance, "provenance default runner class must be ubuntu-26.04", failures)
     require("::error::suite command ledger" in provenance, "provenance must fail closed on malformed suite ledgers", failures)
     require("::error::BENCH_ITERATIONS" in provenance, "provenance must fail closed on malformed BENCH_ITERATIONS", failures)
     require(
@@ -1014,7 +1014,7 @@ def check_docs_and_baselines(failures: list[str]) -> None:
     protocol = PROTOCOL_DOC.read_text(encoding="utf-8")
     require("mesh-performance-baselines.yml" in protocol, "protocol_perf_regression.md missing workflow pointer", failures)
     require("#3332" in protocol, "protocol_perf_regression.md must keep #3332 pointer", failures)
-    require("ubuntu-24.04" in protocol, "protocol_perf_regression.md must document ubuntu-24.04 pin", failures)
+    require("ubuntu-26.04" in protocol, "protocol_perf_regression.md must document ubuntu-26.04 pin", failures)
     require(
         "workload-interval" in protocol,
         "protocol_perf_regression.md must describe per-E2E workload-interval steal probes",
@@ -1081,7 +1081,7 @@ def check_docs_and_baselines(failures: list[str]) -> None:
         require("refresh" in text.lower() or "cadence" in text.lower(), f"{path} missing refresh cadence", failures)
         require("directional" in text.lower(), f"{path} missing directional hardware caveat", failures)
         require("bottleneck" in text.lower(), f"{path} missing bottleneck review note", failures)
-        require("ubuntu-24.04" in text, f"{path} must pin runner class ubuntu-24.04", failures)
+        require("ubuntu-24.04" in text, f"{path} must preserve published runner class ubuntu-24.04", failures)
         check_baseline_publication_state(path, text, suite, failures)
         require("5.0%" in text or "5%" in text, f"{path} must document CPU steal publication threshold", failures)
         require(
@@ -1408,11 +1408,11 @@ concurrency:
   cancel-in-progress: false
 env:
   BENCH_BUILD_PROFILE: release
-  BENCH_RUNNER_CLASS: ubuntu-24.04
+  BENCH_RUNNER_CLASS: ubuntu-26.04
   BENCH_MAX_CPU_STEAL_PERCENT: "5.0"
 jobs:
   collect:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup-rust-ci

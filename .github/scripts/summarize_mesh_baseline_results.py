@@ -183,7 +183,7 @@ def provenance_complete(
         for key in ("class", "name", "os", "arch", "cpu_model", "lscpu_raw", "uname", "kernel")
     ):
         return False
-    if runner.get("class") != "ubuntu-24.04":
+    if runner.get("class") != "ubuntu-26.04":
         return False
     nproc = parse_non_negative_int(runner.get("nproc"))
     topology = runner.get("cpu_topology")
@@ -1165,7 +1165,7 @@ def write_draft_markdown(
         "# Mesh Performance Baseline (draft from hosted collection)",
         "",
         "**Directional reference numbers only.** Hardware-specific — GitHub-hosted",
-        f"`{runner.get('class', 'ubuntu-24.04')}` results are not universal product targets.",
+        f"`{runner.get('class', 'ubuntu-26.04')}` results are not universal product targets.",
         "",
         "## Reference environment",
         "",
@@ -1517,7 +1517,7 @@ def _self_test_provenance(required_reps: int) -> dict[str, Any]:
             "server_url": "https://github.com",
         },
         "runner": {
-            "class": "ubuntu-24.04",
+            "class": "ubuntu-26.04",
             "name": "GitHub Actions 1",
             "os": "Linux",
             "arch": "X64",
@@ -1625,7 +1625,7 @@ def self_test() -> int:
         (root / "runner_health.json").write_text(
             json.dumps(
                 {
-                    "runner_class": "ubuntu-24.04",
+                    "runner_class": "ubuntu-26.04",
                     "avg_steal_percent": 1.0,
                     "threshold_percent": MAX_CPU_STEAL_PERCENT,
                 }
@@ -2106,7 +2106,7 @@ def self_test() -> int:
         for run in range(1, 4):
             _write_full_dns_run(valid / "dns" / f"run_{run}.txt")
         (valid / "runner_health.json").write_text(
-            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-24.04"}) + "\n",
+            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-26.04"}) + "\n",
             encoding="utf-8",
         )
         (valid / "logs").mkdir(parents=True, exist_ok=True)
@@ -2170,7 +2170,7 @@ def self_test() -> int:
 
         # successful exact-interval evidence with a real 0.0% steal is valid.
         (valid / "runner_health.json").write_text(
-            json.dumps({"avg_steal_percent": 0.0, "runner_class": "ubuntu-24.04"}) + "\n",
+            json.dumps({"avg_steal_percent": 0.0, "runner_class": "ubuntu-26.04"}) + "\n",
             encoding="utf-8",
         )
         zero_probes = [
@@ -2218,7 +2218,7 @@ def self_test() -> int:
 
         # parse failure cannot become healthy evidence
         (valid / "runner_health.json").write_text(
-            json.dumps({"avg_steal_percent": None, "runner_class": "ubuntu-24.04"}) + "\n",
+            json.dumps({"avg_steal_percent": None, "runner_class": "ubuntu-26.04"}) + "\n",
             encoding="utf-8",
         )
         probes_path.write_text(_self_test_health_probes(3), encoding="utf-8")
@@ -2232,7 +2232,7 @@ def self_test() -> int:
         assert summary_null_pre["ready_to_publish_baselines"] is False
 
         (valid / "runner_health.json").write_text(
-            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-24.04"}) + "\n",
+            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-26.04"}) + "\n",
             encoding="utf-8",
         )
         probes_path.write_text("", encoding="utf-8")
@@ -2358,7 +2358,7 @@ def self_test() -> int:
 
         # Restore healthy steal evidence for subsequent suite-selection checks.
         (valid / "runner_health.json").write_text(
-            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-24.04"}) + "\n",
+            json.dumps({"avg_steal_percent": 2.5, "runner_class": "ubuntu-26.04"}) + "\n",
             encoding="utf-8",
         )
 

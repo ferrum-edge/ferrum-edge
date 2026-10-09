@@ -365,7 +365,7 @@ as live E2E harnesses that spin up `ferrum-edge` plus stub peers:
 Hosted collection (stage 1) lives in
 `.github/workflows/mesh-performance-baselines.yml` and is dispatched after the
 trusted workflow lands on `main`. Collection is pinned to GitHub-hosted
-`ubuntu-24.04` (no arbitrary/self-hosted runner
+`ubuntu-26.04` (no arbitrary/self-hosted runner
 input). It records provenance, Criterion trees, HBONE/DNS JSON (≥3 repetitions),
 `runner_health.json` + per-E2E and per-mesh Criterion workload-interval steal probes, `summary.json`, and draft markdown
 under the `mesh-performance-baselines-<sha>` artifact. Selected-suite acceptance

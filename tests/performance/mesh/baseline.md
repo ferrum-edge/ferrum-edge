@@ -34,6 +34,10 @@ was **not** globally green.
 | HBONE E2E | `5c3a58cd5fc1083911796621d5f2cd0237946c09` | [31820671032](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31820671032) | `mesh-performance-baselines-5c3a58cd5fc1083911796621d5f2cd0237946c09` |
 | DNS E2E | `a7921ea2176360c7812da6d2c2dff356ad99f5d8` | [31917782760](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31917782760) | `mesh-performance-baselines-a7921ea2176360c7812da6d2c2dff356ad99f5d8` |
 
+New hosted collections use `ubuntu-26.04`. The published measurements below
+retain their original Ubuntu 24.04 provenance and must not be compared as
+absolute regression gates across runner images.
+
 ## Reference environment (mesh Criterion collection)
 
 | Field | Value |
