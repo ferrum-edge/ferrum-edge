@@ -818,7 +818,7 @@ Everything else in the directory — the primary CNI's config, another
 meta-plugin's config, another Ferrum release's chain — is retained and
 reported, not deleted.
 
-The rollback watcher and cleanup hook run with all capabilities dropped,
+The CNI installer, rollback watcher and cleanup hook run with all capabilities dropped,
 `allowPrivilegeEscalation: false`, and `readOnlyRootFilesystem: true`. They
 run as UID 0 because `/etc/cni/net.d` and `/opt/cni/bin` are root-owned on
 every supported distribution; they hold no Linux capability that would let
