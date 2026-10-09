@@ -693,13 +693,13 @@ When proxying to upstream targets, the gateway adds response headers that help c
 ### `X-Gateway-Error`
 
 Set on 5xx responses to categorize the failure. This is the **stable
-client-facing contract** — a closed set of eight `&'static str` tokens.
+client-facing contract** — a closed set of nine `&'static str` tokens.
 Access-log `error_class` and `ferrum_requests_total{error_class}` use the
 **granular** `ErrorClass::as_str` spelling when a class exists
-(`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus five
+(`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus six
 gateway-authored tokens when there is no `ErrorClass` (`circuit_breaker_open`,
-`overload`, `config_stale`, `concurrency_limit`, and `backend_error` for an
-unclassified backend 5xx). Map
+`overload`, `config_stale`, `concurrency_limit`, `loop_detected`, and
+`backend_error` for an unclassified backend 5xx). Map
 each granular class to its header token in
 [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 The header is omitted on 2xx/3xx/4xx.
@@ -714,6 +714,7 @@ The header is omitted on 2xx/3xx/4xx.
 | `config_stale` | Data-plane stale-config fence; the gateway returned 503 without contacting a backend |
 | `concurrency_limit` | `adaptive_concurrency` admission shed; the gateway returned 503 without contacting a backend |
 | `request_timeout` | A matched route rule's total request deadline expired before any backend held the request (client upload, gateway-local phases, admission, or retry backoff); the gateway returned 504 |
+| `loop_detected` | The request already crossed `FERRUM_MAX_PROXY_HOPS` Ferrum gateway hops (`X-Ferrum-Hops`), so the gateway returned 508 Loop Detected before routing; usually a route whose upstream resolves back to the gateway. Only the refusing hop writes this token: an outer Ferrum hop that relays the `508` labels it `backend_error`, so a client at the far end of a loop sees `508` with `backend_error`. See [Proxy hop limit](routing.md#proxy-hop-limit) |
 
 `request_timeout` is distinct from `backend_timeout`: no backend saw the
 request, so on-call should not look for it in backend logs.
@@ -795,7 +796,7 @@ HTTP/1.1 200 OK
 
 ### Use Cases
 
-- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. PromQL on `ferrum_requests_total{error_class}` uses the granular spelling (`dns_lookup_error` vs `connection_refused` vs `read_write_timeout`) plus the five gateway-authored tokens; it does **not** emit `connection_failure` or `backend_timeout`, and it emits `backend_error` only for a backend 5xx the gateway never classified.
+- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. PromQL on `ferrum_requests_total{error_class}` uses the granular spelling (`dns_lookup_error` vs `connection_refused` vs `read_write_timeout`) plus the six gateway-authored tokens; it does **not** emit `connection_failure` or `backend_timeout`, and it emits `backend_error` only for a backend 5xx the gateway never classified.
 - **Client-side retry**: Clients can decide whether to retry based on the error type — connection failures may resolve quickly, while backend errors suggest the service itself is unhealthy.
 - **Dashboards**: Track `X-Gateway-Upstream-Status: degraded` to monitor when upstreams are operating in fallback mode.
 - **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open`, `overload`, `config_stale`, or `concurrency_limit` means the gateway short-circuited the request locally. A `request_timeout` means the route's total deadline ran out before any backend held the request.
@@ -836,6 +837,7 @@ proxies:
 - **Connection failures** (TCP refused, DNS, TLS, timeout) are retried for **all HTTP methods** — the request never reached the backend so idempotency is not a concern.
 - **HTTP status-code failures** (e.g., 502, 503) are only retried for methods in `retryable_methods` — `POST` and `PATCH` are excluded by default.
 - **Status-code retries are opt-in** — `retryable_status_codes` defaults to empty. Set it explicitly to enable (e.g., `[502, 503, 504]`).
+- **A backend `508 Loop Detected` is never retried**, even when listed in `retryable_status_codes`: it is the deterministic [proxy hop limit](routing.md#proxy-hop-limit) refusal of a downstream Ferrum gateway, and retrying it at every hop of a chain would amplify traffic geometrically.
 - When combined with an upstream, retries **exclude the previously tried target** so each attempt goes to a different backend. HTTP/H3 exclusion uses the full configured routing/policy identity (`host`, `port`, declared Service port / policy lane, tags, locality, path) — not merely `host:port` — so two `backendRefs` that share a network endpoint but differ by Service, subset, or path stay distinct. For wildcard-hosted targets the shared retry helper reconciles the just-tried dial clone back to that configured identity, then returns the next candidate already re-concretized with the request's validated authority (failing closed if that authority is missing or unmatched). TCP/stream connect-retry retains only the live `(host, dial port, policy lane)` tuple, so it uses a separate endpoint-lane exclude contract: every configured entry on that effective lane is dropped (including ordinary targets whose `service_port_policy_key` is `None` but whose `dispatch_policy_port()` equals the dial port), and ambiguous same-lane identity siblings are not reselected.
 - Retries apply to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket protocols. TCP stream proxies rotate to an alternate target only for connection-phase failures when `retry_on_connect_failure` is enabled; UDP stream proxies do not use retry logic.
 

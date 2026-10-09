@@ -140,6 +140,12 @@ status appears in `retryable_status_codes`. This includes request/response body
 limits, client disconnects, dispatch-policy rejections, and pre-dispatch final
 request-body hook rejections such as marker-sanitation worker exhaustion.
 
+A backend `508 Loop Detected` is never retried either, even when `508` is listed
+in `retryable_status_codes`. It is the deterministic [proxy hop limit](routing.md#proxy-hop-limit)
+refusal of a downstream Ferrum gateway, so a replay meets the same refusal, and
+retrying it at every hop of a gateway chain would multiply traffic by
+`(max_retries + 1)` per hop.
+
 ### Method Filtering
 
 The `retryable_methods` filter applies **only to HTTP status-code retries**, not to connection failure retries:

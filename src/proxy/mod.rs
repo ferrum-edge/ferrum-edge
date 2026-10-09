@@ -95,6 +95,7 @@ mod hbone_proxy;
 // Used by external tests; unused in the separately compiled bin target.
 pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
+pub mod hop_limit;
 pub mod host_udp_capture;
 /// Privileged live-kernel gate for Ambient host-network UDP capture (#3705).
 /// Ignored by default; the hosted `ambient-host-udp-live` job runs it with
@@ -309,6 +310,14 @@ static CONFIG_STALE_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>>
         HashMap::from([(
             X_GATEWAY_ERROR_HEADER.to_string(),
             X_GATEWAY_ERROR_CONFIG_STALE.to_string(),
+        )])
+    });
+
+static LOOP_DETECTED_REJECT_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_LOOP_DETECTED.to_string(),
         )])
     });
 
@@ -6752,15 +6761,29 @@ async fn run_finalized_request_egress_hooks_inner(
 /// [`crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`]
 /// where the bitset is already in scope; the internal scan keeps the rarely
 /// reached call sites correct without threading the capability set to them.
+///
+/// These hooks are the last plugin code that can write the outbound map, so
+/// when any of them ran the gateway-owned `X-Ferrum-Hops` count (issue #6109)
+/// is re-asserted after them: a built-in or custom implementation cannot reset
+/// it either. Every H1/H2 and H3 caller, including both finalized-egress
+/// overlay helpers, goes through this function.
 pub(crate) fn run_final_backend_header_policy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
+    let mut ran = false;
     for plugin in plugins {
         if plugin.enforces_final_backend_header_policy() {
             plugin.enforce_final_backend_header_policy(ctx, headers);
+            ran = true;
         }
+    }
+    if ran {
+        hop_limit::reassert_outbound_proxy_hops_in_map(
+            hop_limit::effective_outbound_proxy_hops(ctx),
+            headers,
+        );
     }
 }
 
@@ -17501,6 +17524,11 @@ fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, Str
 /// `x-consumer-username`; only the authenticated `x-consumer-username` /
 /// `x-consumer-custom-id` are written back.
 ///
+/// The gateway-owned `X-Ferrum-Hops` count (issue #6109) is re-asserted here
+/// too, so a deferred `before_proxy` pass or a finalized-egress header overlay
+/// (a `serverless_function` `pre_proxy` header copy) cannot reset it after the
+/// main dispatch-ladder re-assertion.
+///
 /// `pub` (rather than `pub(crate)`) only so the external
 /// `tests/unit/gateway_core` target can exercise it; not a supported API.
 #[doc(hidden)]
@@ -17508,6 +17536,10 @@ pub fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
+    hop_limit::reassert_outbound_proxy_hops_in_map(
+        hop_limit::effective_outbound_proxy_hops(ctx),
+        headers,
+    );
     let principal_username = ctx.backend_consumer_username().map(str::to_string);
     let external_identity = ctx.backend_authenticated_identity().map(str::to_string);
     let principal_custom_id = principal_username
@@ -27023,6 +27055,9 @@ pub(crate) const X_GATEWAY_ERROR_CONFIG_STALE: &str = crate::retry::OBS_CONFIG_S
 /// gateway-local phases, admission, or retry backoff), so no backend is to
 /// blame for the `504`.
 pub(crate) const X_GATEWAY_ERROR_REQUEST_TIMEOUT: &str = crate::retry::OBS_REQUEST_TIMEOUT;
+/// The request had already crossed `FERRUM_MAX_PROXY_HOPS` gateway hops and
+/// was refused with `508 Loop Detected` before routing; no backend was asked.
+pub(crate) const X_GATEWAY_ERROR_LOOP_DETECTED: &str = crate::retry::OBS_LOOP_DETECTED;
 
 /// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
 /// that run before a proxy is matched, so no per-route `allowed_methods`
@@ -27148,6 +27183,10 @@ pub(crate) fn overload_reject_headers() -> HashMap<String, String> {
 
 pub(crate) fn config_stale_reject_headers() -> HashMap<String, String> {
     CONFIG_STALE_REJECT_HEADERS.clone()
+}
+
+pub(crate) fn loop_detected_reject_headers() -> HashMap<String, String> {
+    LOOP_DETECTED_REJECT_HEADERS.clone()
 }
 
 /// Whether `method` is in the route's configured `allowed_methods`.
@@ -32669,6 +32708,53 @@ fn retired_gateway_listener_response(
     response
 }
 
+/// The answer to a request refused by the proxy hop limit (issue #6109):
+/// `508 Loop Detected` with `X-Gateway-Error: loop_detected` when the received
+/// `X-Ferrum-Hops` count reached `FERRUM_MAX_PROXY_HOPS`, or `400` (no token)
+/// when the field is malformed. Native gRPC gets Trailers-Only
+/// `FAILED_PRECONDITION` / `INVALID_ARGUMENT`; gRPC-Web gets the plain JSON
+/// answer, like every other frontend admission fence. Bodies are compiled-in
+/// literals that echo nothing. Out of line so the request handler's state
+/// machine does not grow.
+#[inline(never)]
+fn proxy_hop_limit_refusal_response(
+    state: &ProxyState,
+    ctx: &RequestContext,
+    is_grpc: bool,
+    loop_detected: bool,
+) -> Response<ProxyBody> {
+    let status = if loop_detected {
+        hop_limit::warn_loop_detected(state.env_config.max_proxy_hops, "http1_http2");
+        StatusCode::LOOP_DETECTED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    record_request(state, status.as_u16());
+    crate::diagnostic_ref::record_admission_fence(
+        ctx.diagnostic_slot(),
+        hop_limit::refusal_rejection_phase(loop_detected),
+        admission_fence_head_status(is_grpc, status),
+    );
+    match (is_grpc, loop_detected) {
+        (true, true) => grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::FAILED_PRECONDITION,
+            hop_limit::LOOP_DETECTED_GRPC_MESSAGE,
+        ),
+        (true, false) => grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            hop_limit::INVALID_PROXY_HOPS_GRPC_MESSAGE,
+        ),
+        (false, true) => build_response_with_gateway_error(
+            StatusCode::LOOP_DETECTED,
+            hop_limit::LOOP_DETECTED_BODY,
+            X_GATEWAY_ERROR_LOOP_DETECTED,
+        ),
+        (false, false) => {
+            build_response(StatusCode::BAD_REQUEST, hop_limit::INVALID_PROXY_HOPS_BODY)
+        }
+    }
+}
+
 /// Connection-scoped and process-wide admission fences, then the routed
 /// request pipeline. Only [`handle_proxy_request_on_frontend_port`] calls this.
 #[allow(clippy::too_many_arguments)]
@@ -33069,6 +33155,29 @@ async fn handle_proxy_request_inner(
                 state.max_header_count
             ),
         ));
+    }
+
+    // Proxy hop limit (issue #6109). Decided on the client's own field lines,
+    // after the header size/count limits (the stamp below must not push a
+    // request at the count limit over it) and before the `Connection`
+    // confinement (which leaves `x-ferrum-hops` in place). The forwarded count
+    // replaces the client's value in the raw block every backend builder reads
+    // from, so the incremented count reaches the backend on every transport and
+    // retry. One header lookup and no allocation; nothing at all when disabled.
+    match hop_limit::decide_proxy_hops(req.headers(), state.env_config.max_proxy_hops) {
+        hop_limit::ProxyHopDecision::Disabled => {}
+        hop_limit::ProxyHopDecision::Forward(hops) => {
+            hop_limit::stamp_proxy_hops(req.headers_mut(), hops);
+            ctx.outbound_proxy_hops = Some(hops);
+        }
+        refused => {
+            return Ok(proxy_hop_limit_refusal_response(
+                &state,
+                &ctx,
+                grpc_proxy::is_grpc_request(&req),
+                refused == hop_limit::ProxyHopDecision::LoopDetected,
+            ));
+        }
     }
 
     // Resolve the client's `Connection` nominations against the client's own
@@ -35403,6 +35512,20 @@ async fn handle_proxy_request_inner(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // Proxy hop limit (issue #6109): re-assert the forwarded `X-Ferrum-Hops`
+    // count on the authoritative outbound map now that every request-phase
+    // plugin has run, so no plugin can reset the count the next gateway hop
+    // reads. Later deferred passes and the finalized-egress overlay re-assert
+    // it again through `refresh_backend_gateway_assertion_headers`. A mesh
+    // inbound hop to the local workload forwards the received count unchanged
+    // (`effective_outbound_proxy_hops`). One lookup on the common path; the
+    // native HTTP/3 frontend does the same at the same point — keep both call
+    // sites in sync.
+    hop_limit::reassert_outbound_proxy_hops(
+        hop_limit::effective_outbound_proxy_hops(&ctx),
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    );
     // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647). One checked,
     // bounded hop-budget decision, taken here — after authentication,
     // authorization, the `cors` plugin's local preflight answer, and every

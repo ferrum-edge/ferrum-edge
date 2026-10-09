@@ -37,6 +37,7 @@ range policy; the future refused stream reservation uses `reserve_future_tcp_por
 | `functional_node_agent_test.rs` | 1 admin listener |
 | `functional_openapi_client_contract_test.rs` | 1 HTTPS/H3 frontend |
 | `functional_overload_test.rs` | 1 H3 frontend |
+| `functional_proxy_hop_limit_test.rs` | 1 plaintext proxy frontend (the self-loop route names it) |
 | `functional_response_caching_conditional_test.rs` | 2 colocated TCP/UDP halves |
 | `functional_response_mock_grpc_exclusion_test.rs` | 1 H3 frontend |
 | `functional_retry_test.rs` | 1 H3 frontend |

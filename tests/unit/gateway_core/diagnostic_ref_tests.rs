@@ -444,7 +444,7 @@ fn stamp_ignores_an_out_of_vocabulary_gateway_error_value() {
     let stamped = stamp(&store, DiagnosticProtocol::Http1, 502, &mut headers);
     assert!(
         stamped.is_none(),
-        "only the closed eight-token vocabulary is gateway-authored"
+        "only the closed nine-token vocabulary is gateway-authored"
     );
     assert!(!headers.contains_key(DIAGNOSTIC_REF_HEADER));
     assert_eq!(store.minted_total(), 0);
