@@ -43952,6 +43952,21 @@ async fn handle_proxy_request_inner(
 
     record_request(&state, response_status);
 
+    // Buffered translated gRPC-Web carries terminal metadata in its body
+    // trailer frame. The generic mesh/Unix path may start with a gateway's
+    // native Trailers-Only refusal, so retire its initial-header copy after
+    // the response hooks and terminal accounting have consumed it. Native
+    // gRPC keeps its legitimate empty-body Trailers-Only encoding.
+    if grpc_request_is_web_translated
+        && let ResponseBody::Buffered(data) = &response_body
+        && !data.is_empty()
+        && response_headers
+            .get("content-type")
+            .is_some_and(|ct| crate::plugins::grpc_web::is_grpc_web_content_type(ct))
+    {
+        grpc_proxy::strip_grpc_terminal_metadata_from_initial(&mut response_headers);
+    }
+
     // A streaming deadline can replace an as-yet-unpolled backend body with a
     // differently sized gRPC-Web frame or native trailers. Strip the backend
     // length before response headers are committed. H1/H2 builders below then

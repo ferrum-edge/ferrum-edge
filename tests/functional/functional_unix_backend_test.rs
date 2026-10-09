@@ -547,6 +547,8 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
             Some("application/grpc-web+proto")
         );
         assert_eq!(header("grpc-status"), None);
+        assert_eq!(header("grpc-message"), None);
+        assert_eq!(header("grpc-status-details-bin"), None);
     } else {
         assert_eq!(header("grpc-status").as_deref(), Some("8"));
         assert_eq!(
@@ -569,6 +571,7 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
     .await
     .expect("response body timeout");
     if grpc_web {
+        assert!(data.len() >= 5, "a complete gRPC-Web frame header");
         assert_eq!(data[0], 0x80, "one gRPC-Web trailer frame");
         assert_eq!(
             u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize,
@@ -577,6 +580,7 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
         let trailers = std::str::from_utf8(&data[5..]).expect("terminal metadata");
         assert!(trailers.contains("grpc-status: 8\r\n"));
         assert!(trailers.contains("grpc-message: Request buffering capacity exceeded\r\n"));
+        assert!(body.trailers().await.expect("HTTP trailers").is_none());
     } else {
         assert!(data.is_empty(), "a Trailers-Only response has no DATA");
     }
