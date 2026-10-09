@@ -1289,6 +1289,99 @@ pub(crate) fn build_plain_request_builder(
     req_builder
 }
 
+/// The error a streamed plain-bridge request body ends with when the client's
+/// upload ended without its clean FIN, or the gateway gave up on the request
+/// before a backend response (issue #6022). reqwest then aborts the backend
+/// upload instead of ending it cleanly: an HTTP/1.1 backend never sees the
+/// terminal chunk and an HTTP/2 backend sees its stream reset.
+fn plain_upload_aborted_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "client aborted the request body upload",
+    )
+}
+
+/// The state the plain bridge's request-body reader and dispatch loop share
+/// with the streamed body reqwest polls.
+#[doc(hidden)]
+pub struct PlainUploadBodySignals {
+    /// The reader has stopped and will queue nothing more.
+    pub reader_finished: Arc<AtomicBool>,
+    /// Woken on every change the body stream must observe.
+    pub reader_done_notify: Arc<tokio::sync::Notify>,
+    /// The reader gave up on `backend_write_timeout_ms`.
+    pub write_timed_out: Arc<AtomicBool>,
+    /// Set on the first poll: the transport is consuming the upload.
+    pub transport_consuming: Arc<AtomicBool>,
+    /// The upload must not end cleanly at the backend (issue #6022).
+    pub upload_aborted: Arc<AtomicBool>,
+}
+
+/// The streamed plain-bridge request body: the chunks the reader queues, then
+/// the end the shared state decides. It ends cleanly only once the reader has
+/// finished without an abort and every queued chunk is out. An abort, a write
+/// timeout, or a channel that closes without that clean finish ends it with an
+/// error, so reqwest aborts the backend upload instead of completing it.
+fn plain_upload_body_stream(
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    signals: PlainUploadBodySignals,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    futures_util::stream::unfold((rx, signals), |(mut rx, signals)| async move {
+        signals.transport_consuming.store(true, Ordering::Release);
+        loop {
+            let next = {
+                // Registered before the flags are read, so a `notify_waiters`
+                // that lands between those reads and the wait below is not lost.
+                let reader_done = signals.reader_done_notify.notified();
+                tokio::pin!(reader_done);
+                reader_done.as_mut().enable();
+                // Read before the abort flag: the reader and the dispatch loop
+                // publish an abort before the reader finishes, so a finished
+                // reader's abort is always seen here.
+                let finished = signals.reader_finished.load(Ordering::Acquire);
+                if signals.write_timed_out.load(Ordering::Acquire) {
+                    Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend request body write timeout",
+                    )))
+                } else if signals.upload_aborted.load(Ordering::Acquire) {
+                    Some(Err(plain_upload_aborted_error()))
+                } else if finished && rx.is_empty() {
+                    return None;
+                } else {
+                    tokio::select! {
+                        item = rx.recv() => match item {
+                            Some(item) => Some(item),
+                            // Every sender is gone. Only a reader that saw the
+                            // client's clean FIN may end the body cleanly; any
+                            // other close aborts the backend upload.
+                            None if signals.reader_finished.load(Ordering::Acquire)
+                                && !signals.upload_aborted.load(Ordering::Acquire) =>
+                            {
+                                return None;
+                            }
+                            None => Some(Err(plain_upload_aborted_error())),
+                        },
+                        _ = &mut reader_done => None,
+                    }
+                }
+            };
+            if let Some(item) = next {
+                return Some((item, (rx, signals)));
+            }
+        }
+    })
+}
+
+/// Drive the plain bridge's streamed request body without a backend.
+#[doc(hidden)]
+pub fn plain_upload_body_stream_for_test(
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    signals: PlainUploadBodySignals,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    plain_upload_body_stream(rx, signals)
+}
+
 /// Why one prebuffered plain-bridge attempt produced no response head.
 enum PlainAttemptFailure {
     /// The backend exchange itself failed.
@@ -4943,94 +5036,22 @@ where
                 // stopped reading". `backend_connect_timeout_ms` bounds that
                 // window.
                 let transport_consuming = Arc::new(AtomicBool::new(false));
-                // Set by the reader when the client's upload ended without its
-                // clean FIN: a reset or lost connection, mid-body or after the
-                // trailer section (issue #6022). The body stream then ends with
-                // an error, never the clean end that would complete a truncated
-                // request at the backend.
+                // Set when the upload must not end cleanly at the backend
+                // (issue #6022): by the reader when the client's upload ended
+                // without its clean FIN (a reset or lost connection, mid-body
+                // or after the trailer section), and by the dispatch loop when
+                // it gives up on the request before a backend response. The
+                // body stream then ends with an error, never the clean end that
+                // would complete a truncated request at the backend.
                 let reader_peer_reset = Arc::new(AtomicBool::new(false));
-                let body_stream_reader_finished = Arc::clone(&reader_finished);
-                let body_stream_reader_done_notify = Arc::clone(&reader_done_notify);
-                let body_stream_write_timed_out = Arc::clone(&write_timed_out);
-                let body_stream_transport_consuming = Arc::clone(&transport_consuming);
-                let body_stream_upload_aborted = Arc::clone(&reader_peer_reset);
-                let body_stream = futures_util::stream::unfold(
-                    (
-                        rx,
-                        body_stream_reader_finished,
-                        body_stream_reader_done_notify,
-                        body_stream_write_timed_out,
-                        body_stream_transport_consuming,
-                        body_stream_upload_aborted,
-                    ),
-                    |(
-                        mut rx,
-                        reader_finished,
-                        reader_done_notify,
-                        write_timed_out,
-                        transport_consuming,
-                        upload_aborted,
-                    )| async move {
-                        transport_consuming.store(true, Ordering::Release);
-                        loop {
-                            if write_timed_out.load(Ordering::Acquire) {
-                                return Some((
-                                    Err(std::io::Error::new(
-                                        std::io::ErrorKind::TimedOut,
-                                        "backend request body write timeout",
-                                    )),
-                                    (
-                                        rx,
-                                        reader_finished,
-                                        reader_done_notify,
-                                        write_timed_out,
-                                        transport_consuming,
-                                        upload_aborted,
-                                    ),
-                                ));
-                            }
-                            // Read before the abort flag: the reader publishes an
-                            // abort before it finishes, so a finished reader's
-                            // abort is always seen here.
-                            let finished = reader_finished.load(Ordering::Acquire);
-                            if upload_aborted.load(Ordering::Acquire) {
-                                return Some((
-                                    Err(std::io::Error::new(
-                                        std::io::ErrorKind::ConnectionAborted,
-                                        "client aborted the request body upload",
-                                    )),
-                                    (
-                                        rx,
-                                        reader_finished,
-                                        reader_done_notify,
-                                        write_timed_out,
-                                        transport_consuming,
-                                        upload_aborted,
-                                    ),
-                                ));
-                            }
-                            if finished && rx.is_empty() {
-                                return None;
-                            }
-                            tokio::select! {
-                                item = rx.recv() => {
-                                    return item.map(|item| {
-                                        (
-                                            item,
-                                            (
-                                                rx,
-                                                reader_finished,
-                                                reader_done_notify,
-                                                write_timed_out,
-                                                transport_consuming,
-                                                upload_aborted,
-                                            ),
-                                        )
-                                    });
-                                }
-                                _ = reader_done_notify.notified() => {}
-                            }
-                        }
+                let body_stream = plain_upload_body_stream(
+                    rx,
+                    PlainUploadBodySignals {
+                        reader_finished: Arc::clone(&reader_finished),
+                        reader_done_notify: Arc::clone(&reader_done_notify),
+                        write_timed_out: Arc::clone(&write_timed_out),
+                        transport_consuming: Arc::clone(&transport_consuming),
+                        upload_aborted: Arc::clone(&reader_peer_reset),
                     },
                 );
                 let req_body = reqwest::Body::wrap_stream(body_stream);
@@ -5184,10 +5205,15 @@ where
                                         // end cleanly, so a reset or a lost
                                         // connection after the trailers aborts
                                         // the backend upload instead of
-                                        // completing it (issue #6022). A DATA
-                                        // frame after the trailers is malformed
-                                        // (RFC 9114 §4.1) and aborts it too.
-                                        // After a clean FIN this returns at once.
+                                        // completing it (issue #6022).
+                                        // `recv_trailers` waits for the FIN and
+                                        // refuses any known frame after the
+                                        // trailers, an empty DATA frame or a
+                                        // second HEADERS frame included (RFC
+                                        // 9114 §4.1), so those abort it too.
+                                        // The trailers themselves are not
+                                        // forwarded. After a clean FIN this
+                                        // returns at once.
                                         let end = tokio::select! {
                                             biased;
                                             _ = reader_halt.notified() => {
@@ -5195,9 +5221,9 @@ where
                                                 finish_reader();
                                                 return;
                                             }
-                                            end = stream.recv_data() => end,
+                                            end = stream.recv_trailers() => end,
                                         };
-                                        if !matches!(end, Ok(None)) {
+                                        if end.is_err() {
                                             reader_reset_flag.store(true, Ordering::Release);
                                         }
                                         finish_reader();
@@ -5261,6 +5287,14 @@ where
                 // stack if each terminal carries its own copy of the
                 // `timeout(.., &mut reader_future)` await.
                 let mut halt_reader_after_loop = false;
+                // Set by every pre-header terminal that is not a backend
+                // response: the gateway gave up on the request, so the upload
+                // must not end cleanly at the backend (issue #6022). Applied
+                // once, with the halt below. The halt after an early successful
+                // backend response leaves it unset: that body ends cleanly,
+                // because erroring it would cut the HTTP/1.1 response the
+                // backend has already committed.
+                let mut abort_backend_upload = false;
                 let peer_signal = ctx.peer_connection.clone();
                 let mut peer_gone = peer_signal
                     .as_ref()
@@ -5327,23 +5361,30 @@ where
                                 upload_auth_expired = plain_write_bound.expired_authorization();
                                 upload_deadline_after_handoff = true;
                                 drop(pending_slot.take());
+                                abort_backend_upload = true;
                                 break None;
                             }
                             _ = optional_sleep_elapsed(header_wait.as_mut()), if header_wait_active => {
                                 header_wait_expired = true;
                                 drop(pending_slot.take());
                                 halt_reader_after_loop = true;
+                                abort_backend_upload = true;
                                 break None;
                             }
+                            // STOP_SENDING on the response, or the connection
+                            // lost: either can win this biased race before the
+                            // reader sees its own read error.
                             _ = &mut stream_cancelled => {
                                 drop(pending_slot.take());
                                 peer_gone = true;
                                 halt_reader_after_loop = true;
+                                abort_backend_upload = true;
                                 break None;
                             }
                             _ = &mut peer_closed => {
                                 drop(pending_slot.take());
                                 peer_gone = true;
+                                abort_backend_upload = true;
                                 break None;
                             }
                             result = &mut send_future => {
@@ -5415,6 +5456,14 @@ where
                             }
                         }
                     };
+                    // Published before the halt and while `send_future` is
+                    // still alive, so the body stream ends with an error rather
+                    // than the clean end the halted reader's finish would give
+                    // it, whichever hyper task polls it next.
+                    if abort_backend_upload {
+                        reader_peer_reset.store(true, Ordering::Release);
+                        reader_done_notify.notify_waiters();
+                    }
                     // The one halt sequence shared by every pre-header terminal
                     // that left the reader running. `halt_notify` makes the
                     // reader stop the recv half itself (STOP_SENDING +

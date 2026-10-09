@@ -492,6 +492,7 @@ impl Http3Client {
         )
         .await
         .map_err(|_| "QUIC handshake timed out")??;
+        let connection = conn.clone();
         let h3_conn = h3_quinn::Connection::new(conn);
         let (mut driver, mut send_request) = h3::client::new(h3_conn)
             .await
@@ -518,6 +519,7 @@ impl Http3Client {
         Ok(Http3GrpcStream {
             stream,
             _send_request: send_request,
+            connection,
             driver_task,
         })
     }
@@ -838,6 +840,7 @@ impl Http3Response {
 pub struct Http3GrpcStream {
     stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    connection: quinn::Connection,
     driver_task: JoinHandle<()>,
 }
 
@@ -900,6 +903,13 @@ impl Http3GrpcStream {
     /// code that most resembles a clean end.
     pub fn reset_request_upload(&mut self, code: h3::error::Code) {
         self.stream.stop_stream(code);
+    }
+
+    /// Close the whole QUIC connection while the request stream is still open,
+    /// neither finished nor reset: a client that goes away mid-request.
+    /// Dropping the stream instead would let quinn FIN its send half first.
+    pub fn close_connection(&self) {
+        self.connection.close(0u32.into(), b"test-client-gone");
     }
 
     /// Cancel only the response-download direction while leaving the request

@@ -9,13 +9,24 @@
 //!
 //! The four paths are the native-H3 pool upload (`do_request_streaming_body`),
 //! the native-H3 gRPC upload pump, the H3-to-gRPC bridge pump, and the plain
-//! H3-to-HTTP bridge reader. The first three already wait for the stream's end
-//! through `recv_trailers`; these guards pin how they classify a reset there.
-//! The plain bridge reads with `recv_data` only, so it must take a second read.
+//! H3-to-HTTP bridge reader. All four wait for the stream's end through
+//! `recv_trailers`; the plain bridge reader takes it as a second read after its
+//! `recv_data` loop.
 //!
-//! h3's error variants cannot be built outside the crate, so the guards are
-//! structural. On-the-wire proof for the plain bridge:
-//! `h3_streamed_upload_aborts_the_backend_body_on_a_reset_after_the_trailer_section`.
+//! h3's error variants cannot be built outside the crate, so the read and
+//! classification guards are structural. The plain bridge's streamed body,
+//! which decides whether the backend upload ends cleanly, is driven directly.
+//! On-the-wire proof: the `h3_streamed_upload_*` tests in
+//! `functional_h3_drain_refusal_hooks_test.rs`.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use bytes::Bytes;
+use ferrum_edge::http3::cross_protocol::{self as bridge, PlainUploadBodySignals};
+use futures_util::StreamExt;
+use tokio::sync::Notify;
 
 const STREAM_UTIL: &str = include_str!("../../../src/http3/stream_util.rs");
 const CLIENT: &str = include_str!("../../../src/http3/client.rs");
@@ -152,52 +163,228 @@ fn the_plain_bridge_reader_reads_to_the_end_of_the_stream_before_the_body_ends()
         "// Race resolution:",
     );
     let body_end = find_after(reader, 0, "Ok(None) => {");
-    let end_of_stream = find_after(reader, body_end, "end = stream.recv_data() => end,");
-    let clean_end = find_after(reader, end_of_stream, "if !matches!(end, Ok(None)) {");
-    let abort = find_after(
+    // `recv_trailers`, not a second `recv_data`: a second `recv_data` takes an
+    // empty DATA frame or a second HEADERS frame after the trailers as a clean
+    // end.
+    let end_of_stream = find_after(reader, body_end, "end = stream.recv_trailers() => end,");
+    let abort = find_after(reader, end_of_stream, "if end.is_err() {");
+    let flag = find_after(
         reader,
-        clean_end,
+        abort,
         "reader_reset_flag.store(true, Ordering::Release);",
     );
-    let finish = find_after(reader, abort, "finish_reader();");
+    let finish = find_after(reader, flag, "finish_reader();");
     assert!(
-        body_end < end_of_stream && end_of_stream < clean_end && abort < finish,
+        body_end < end_of_stream && end_of_stream < abort && flag < finish,
         "the reader must confirm the stream's own end, and flag anything else as an \
          abort, before it lets the body end"
     );
 }
 
 #[test]
-fn the_plain_bridge_body_ends_with_an_error_on_an_aborted_upload() {
-    let body = region(
+fn the_plain_bridge_aborts_the_upload_on_every_gateway_terminal_before_the_halt() {
+    // The response-cancel watcher (STOP_SENDING or a lost connection), the
+    // connection-closed signal, the response-header wait and the upload
+    // deadline can each win the dispatch race before the reader sees its own
+    // read error. Each must abort the backend upload, and the abort must be
+    // published before the halt that makes the reader finish.
+    let dispatch = region(
         CROSS_PROTOCOL,
-        "let body_stream = futures_util::stream::unfold(",
-        "let req_body = reqwest::Body::wrap_stream(body_stream);",
+        "async fn dispatch_plain<S>(",
+        "let bytes_sent = bytes_read.load(Ordering::Relaxed);",
     );
-    let finished = find_after(
+    let race = find_after(dispatch, 0, "let resolved = loop {");
+    let backend_arm = find_after(dispatch, race, "result = &mut send_future => {");
+    assert_eq!(
+        dispatch[race..backend_arm]
+            .matches("abort_backend_upload = true;")
+            .count(),
+        4,
+        "every gateway terminal ahead of the backend arm must abort the upload"
+    );
+    let publish = find_after(dispatch, backend_arm, "if abort_backend_upload {");
+    let store = find_after(
+        dispatch,
+        publish,
+        "reader_peer_reset.store(true, Ordering::Release);",
+    );
+    let notify = find_after(dispatch, store, "reader_done_notify.notify_waiters();");
+    let halt = find_after(
+        dispatch,
+        notify,
+        "if halt_reader_after_loop && !reader_done {",
+    );
+    assert!(
+        publish < store && store < notify && notify < halt,
+        "the abort must reach the body stream before the halted reader finishes"
+    );
+    let body = find_after(dispatch, 0, "let body_stream = plain_upload_body_stream(");
+    find_after(
+        dispatch,
         body,
+        "upload_aborted: Arc::clone(&reader_peer_reset),",
+    );
+    find_after(
+        dispatch,
         0,
-        "let finished = reader_finished.load(Ordering::Acquire);",
+        "let reader_reset_flag = Arc::clone(&reader_peer_reset);",
     );
-    let aborted = find_after(
-        body,
-        finished,
-        "if upload_aborted.load(Ordering::Acquire) {",
-    );
-    let error = find_after(body, aborted, "std::io::ErrorKind::ConnectionAborted");
-    let clean_end = find_after(body, error, "if finished && rx.is_empty() {");
+}
+
+// ── Behaviour of the plain bridge's streamed request body ──────────────────
+
+struct BodySignals {
+    finished: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    write_timed_out: Arc<AtomicBool>,
+    consuming: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl BodySignals {
+    fn new() -> Self {
+        Self {
+            finished: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+            write_timed_out: Arc::new(AtomicBool::new(false)),
+            consuming: Arc::new(AtomicBool::new(false)),
+            aborted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn shared(&self) -> PlainUploadBodySignals {
+        PlainUploadBodySignals {
+            reader_finished: Arc::clone(&self.finished),
+            reader_done_notify: Arc::clone(&self.notify),
+            write_timed_out: Arc::clone(&self.write_timed_out),
+            transport_consuming: Arc::clone(&self.consuming),
+            upload_aborted: Arc::clone(&self.aborted),
+        }
+    }
+
+    /// The reader's clean finish: the client's FIN was seen.
+    fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// An abort published by the reader or the dispatch loop.
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+type BodyItem = Option<Result<Bytes, std::io::Error>>;
+
+/// The next body item, or `None` when the stream is still waiting.
+async fn next_within<S>(stream: &mut S, wait: Duration) -> Option<BodyItem>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    tokio::time::timeout(wait, stream.next()).await.ok()
+}
+
+const SETTLE: Duration = Duration::from_millis(50);
+const WAKE: Duration = Duration::from_secs(5);
+
+fn assert_aborted(item: Option<BodyItem>) {
+    match item {
+        Some(Some(Err(error))) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        }
+        Some(Some(Ok(_))) => panic!("an aborted upload yielded more body"),
+        Some(None) => panic!("an aborted upload ended cleanly"),
+        None => panic!("an aborted upload was never woken"),
+    }
+}
+
+#[tokio::test]
+async fn the_plain_body_ends_cleanly_only_after_the_reader_finishes() {
+    let signals = BodySignals::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let body = bridge::plain_upload_body_stream_for_test(rx, signals.shared());
+    let mut body = Box::pin(body);
+    tx.send(Ok(Bytes::from_static(b"chunk"))).await.unwrap();
+    let first = next_within(&mut body, WAKE).await;
+    assert!(matches!(first, Some(Some(Ok(ref chunk))) if &chunk[..] == b"chunk"));
     assert!(
-        finished < aborted && aborted < error && error < clean_end,
-        "the abort flag must be read after the reader's finish and win over the clean end"
+        signals.consuming.load(Ordering::Acquire),
+        "the first poll marks the transport as consuming the upload"
     );
     assert!(
-        !body.contains("reader_finished.load(Ordering::Acquire) && rx.is_empty()"),
-        "a clean end decided without the abort flag would complete a truncated upload"
+        next_within(&mut body, SETTLE).await.is_none(),
+        "a drained channel is not the end of the body until the reader finishes"
     );
-    let upload_aborted = "let body_stream_upload_aborted = Arc::clone(&reader_peer_reset);";
-    let reset_flag = "let reader_reset_flag = Arc::clone(&reader_peer_reset);";
-    assert!(
-        CROSS_PROTOCOL.contains(upload_aborted) && CROSS_PROTOCOL.contains(reset_flag),
-        "the body stream must watch the flag the reader sets"
-    );
+    signals.finish();
+    assert!(matches!(next_within(&mut body, WAKE).await, Some(None)));
+    drop(tx);
+}
+
+#[tokio::test]
+async fn the_plain_body_aborts_when_the_channel_closes_without_a_clean_finish() {
+    let signals = BodySignals::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let body = bridge::plain_upload_body_stream_for_test(rx, signals.shared());
+    let mut body = Box::pin(body);
+    assert!(next_within(&mut body, SETTLE).await.is_none());
+    drop(tx);
+    assert_aborted(next_within(&mut body, WAKE).await);
+}
+
+#[tokio::test]
+async fn the_plain_body_ends_cleanly_when_the_channel_closes_after_a_clean_finish() {
+    let signals = BodySignals::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let body = bridge::plain_upload_body_stream_for_test(rx, signals.shared());
+    let mut body = Box::pin(body);
+    assert!(next_within(&mut body, SETTLE).await.is_none());
+    // Finished without a wake-up, then the channel closes: the close is what
+    // the waiting body sees, and the reader's clean finish makes it a clean end.
+    signals.finished.store(true, Ordering::Release);
+    drop(tx);
+    assert!(matches!(next_within(&mut body, WAKE).await, Some(None)));
+}
+
+#[tokio::test]
+async fn the_plain_body_aborts_on_a_published_abort_while_it_waits() {
+    let signals = BodySignals::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let body = bridge::plain_upload_body_stream_for_test(rx, signals.shared());
+    let mut body = Box::pin(body);
+    assert!(next_within(&mut body, SETTLE).await.is_none());
+    // The dispatch loop's order: abort, then the halted reader's finish.
+    signals.abort();
+    signals.finish();
+    assert_aborted(next_within(&mut body, WAKE).await);
+    drop(tx);
+}
+
+#[tokio::test]
+async fn the_plain_body_abort_wins_over_queued_chunks_and_a_finished_reader() {
+    let signals = BodySignals::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(Ok(Bytes::from_static(b"queued"))).await.unwrap();
+    signals.abort();
+    signals.finish();
+    let body = bridge::plain_upload_body_stream_for_test(rx, signals.shared());
+    let mut body = Box::pin(body);
+    assert_aborted(next_within(&mut body, WAKE).await);
+    drop(tx);
+}
+
+#[tokio::test]
+async fn the_plain_body_reports_a_write_timeout_as_a_timeout() {
+    let signals = BodySignals::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let body = bridge::plain_upload_body_stream_for_test(rx, signals.shared());
+    let mut body = Box::pin(body);
+    assert!(next_within(&mut body, SETTLE).await.is_none());
+    signals.write_timed_out.store(true, Ordering::Release);
+    signals.finish();
+    match next_within(&mut body, WAKE).await {
+        Some(Some(Err(error))) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+        _ => panic!("a write timeout must end the body with a timeout error"),
+    }
+    drop(tx);
 }

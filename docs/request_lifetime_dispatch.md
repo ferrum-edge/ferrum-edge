@@ -91,23 +91,38 @@ client's `END_STREAM` is answered as a `499` client disconnect and never sent to
 
 An HTTP/3 frontend upload has its own form of the rule. A trailer section ends the request body
 but not the request stream, so a streamed HTTP/3 upload ends the backend upload only after the
-client's FIN. A client that resets the stream after its trailers, with any code including
-`H3_NO_ERROR`, or loses its connection there, has cancelled the request. Every streaming path
-records it as a client disconnect, never as malformed trailers or a backend failure:
+client's FIN, read with `recv_trailers`. A client that resets the stream after its trailers, with
+any code including `H3_NO_ERROR`, or loses its connection there, has cancelled the request. No
+streaming path completes it at the backend, and none charges it to backend health. Each path keeps
+the outcome it already gives a reset in the middle of the body:
 
-- Native HTTP/3 backend and native HTTP/3 gRPC: the backend request stream is reset with
-  `H3_REQUEST_CANCELLED`, never finished.
-- HTTP/3 to gRPC bridge: the channel body resets the HTTP/2 backend stream instead of sending
-  `END_STREAM`.
+- Native HTTP/3 backend: the backend request stream is reset with `H3_REQUEST_CANCELLED`, never
+  finished. The client sees a `502` and request metrics count a `502`; the transaction log's error
+  class comes from the HTTP/3 error classifier (`ProtocolError` for a stream reset,
+  `ConnectionTimeout` for an idle timeout). Backend health, the circuit breaker, and the HTTP/3
+  capability are not charged.
+- Native HTTP/3 gRPC and the HTTP/3 to gRPC bridge: the backend stream is reset
+  (`H3_REQUEST_CANCELLED`, or an HTTP/2 reset instead of `END_STREAM`). The RPC is answered
+  `UNAVAILABLE` with error class `ClientDisconnect`.
 - Plain HTTP/3 to HTTP bridge: the request body ends with an error. An HTTP/1.1 backend sees an
   aborted body and a closed connection, never the terminal chunk. An HTTP/2 backend sees its stream
-  reset. A reset in the middle of the body takes the same path.
+  reset. The request is recorded as a client disconnect with no response status.
 
-An undecodable trailer section is still answered as malformed trailers (`400` /
-`INVALID_ARGUMENT`). When the client declared a `Content-Length`, an HTTP/1.1 backend behind the
-plain bridge ends the body by that length, so it can receive the whole declared body before the
-reset arrives. The buffered HTTP/3 drains apply the same end-of-stream read before dispatch (see
-[HTTP/3](http3.md)).
+Before this change the native paths and the gRPC bridge answered this reset as malformed trailers
+(`400` / `INVALID_ARGUMENT`), so alerts keyed on `5xx` or gRPC `UNAVAILABLE` can see more of these
+requests. An undecodable trailer section, or a known frame after it, is still malformed.
+
+On the plain bridge the dispatch loop also aborts the backend body itself whenever it gives up on
+the request before a backend response: the client's STOP_SENDING on the response, a lost
+connection, the response-header wait or route deadline (`504`), and the upload deadline. A backend
+still receiving the upload when the gateway answers `504` therefore sees it aborted, never a
+truncated body accepted as complete. The one halt that still ends the body cleanly follows an early
+backend response head: the backend has committed its response, and an erroring HTTP/1.1 request
+body would cut it. The plain bridge never forwards the client's `Content-Length`, so the backend
+body is chunked (HTTP/1.1) or ended by `END_STREAM` (HTTP/2) and a declared length cannot complete
+it before the reset arrives. A client that sends trailers but delays its FIN holds that body open
+until the response-header wait answers `504`, as on the native paths. The buffered HTTP/3 drains
+apply the same end-of-stream read before dispatch (see [HTTP/3](http3.md)).
 
 The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
 classifier never count this gateway-initiated reset as a backend failure (see

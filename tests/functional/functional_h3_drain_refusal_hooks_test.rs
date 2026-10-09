@@ -23,9 +23,12 @@
 //!
 //! A drain test proves a buffered drain reads on past a trailer section to
 //! the stream's own end, so a client that resets after its trailers is
-//! refused instead of dispatched as a complete upload. The last test proves
-//! the same for a streamed upload over the plain bridge: the backend sees the
-//! upload aborted, never completed.
+//! refused instead of dispatched as a complete upload. The streamed-upload
+//! tests prove the same for an upload streamed over the plain bridge, for every
+//! way the request can end without the client's FIN after its trailers: a
+//! reset, a reset together with STOP_SENDING, a lost connection, a declared
+//! `Content-Length`, an HTTP/2 backend, and the gateway's own response-header
+//! timeout. Each backend sees the upload aborted, never completed.
 //!
 //! Run with:
 //!
@@ -48,8 +51,8 @@ use tokio::task::JoinHandle;
 use crate::scaffolding::port_registry::TestSocket;
 
 use crate::scaffolding::backends::{
-    GrpcStep, H3Step, H3TlsConfig, MatchRpc, ScriptedGrpcBackend, ScriptedH3Backend,
-    ScriptedTlsBackend, TcpStep, TlsConfig,
+    GrpcStep, H2Step, H3Step, H3TlsConfig, MatchHeaders, MatchRpc, ScriptedGrpcBackend,
+    ScriptedH2Backend, ScriptedH3Backend, ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
@@ -351,11 +354,20 @@ impl Answer {
 /// Open a client-driven H3 POST stream, retrying the QUIC handshake briefly so
 /// the test does not race the listener coming up.
 async fn open_upload_stream(url: &str, content_type: &str) -> Http3GrpcStream {
+    open_upload_stream_with_headers(url, content_type, &[]).await
+}
+
+/// [`open_upload_stream`] with extra request headers.
+async fn open_upload_stream_with_headers(
+    url: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+) -> Http3GrpcStream {
     let client = Http3Client::insecure().expect("H3 client");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         match client
-            .open_request_stream_with_content_type(url, content_type, &[])
+            .open_request_stream_with_content_type(url, content_type, headers)
             .await
         {
             Ok(stream) => return stream,
@@ -857,12 +869,29 @@ fn chunked_body_complete(body: &[u8]) -> bool {
     body.starts_with(b"0\r\n\r\n") || body.windows(7).any(|window| window == b"\r\n0\r\n\r\n")
 }
 
-/// A plain HTTP/1.1 backend that reads every upload to `path` to its end. The
-/// uploads carry no `Content-Length`, so the gateway sends them chunked and the
-/// terminal chunk is their only clean end. A body that reaches it counts as
-/// completed and is answered `200`; a connection that closes first counts as
-/// aborted. Requests to any other target (the capability probe) are answered
-/// and not counted.
+/// Whether the request body framed by `head` is complete in `body`: by its
+/// `Content-Length` when the head declares one, by the terminal chunk
+/// otherwise.
+fn request_body_complete(head: &str, body: &[u8]) -> bool {
+    let declared_length = head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("content-length") {
+            return None;
+        }
+        value.trim().parse::<usize>().ok()
+    });
+    match declared_length {
+        Some(length) => body.len() >= length,
+        None => chunked_body_complete(body),
+    }
+}
+
+/// A plain HTTP/1.1 backend that reads every upload to `path` to its end by the
+/// upload's own framing: its `Content-Length` if the gateway forwarded one, the
+/// terminal chunk otherwise. A body that reaches its end counts as completed
+/// and is answered `200`; a connection that closes first counts as aborted.
+/// Requests to any other target (the capability probe) are answered and not
+/// counted.
 async fn spawn_streamed_upload_backend(
     path: &'static str,
 ) -> (u16, Arc<StreamedUploadEnds>, JoinHandle<()>) {
@@ -897,7 +926,7 @@ async fn spawn_streamed_upload_backend(
                     return;
                 }
                 loop {
-                    if chunked_body_complete(&received[head_end..]) {
+                    if request_body_complete(&head, &received[head_end..]) {
                         ends.completed.fetch_add(1, Ordering::SeqCst);
                         let _ = socket.write_all(OK_RESPONSE).await;
                         return;
@@ -994,5 +1023,198 @@ async fn h3_streamed_upload_aborts_the_backend_body_on_a_reset_after_the_trailer
         1,
         "the reset upload is the only aborted one"
     );
+    backend_task.abort();
+}
+
+/// Open a streamed upload, send its body and its trailer section, and leave the
+/// request stream open. The pause lets the gateway read the trailer section
+/// before the test ends the stream some other way, then confirms the trailers
+/// alone did not end the backend's request body.
+async fn upload_through_trailers(
+    url: &str,
+    headers: &[(&str, &str)],
+    ends: &StreamedUploadEnds,
+) -> Http3GrpcStream {
+    let mut upload =
+        open_upload_stream_with_headers(url, "application/octet-stream", headers).await;
+    upload
+        .send_raw_data(Bytes::from_static(b"cancelled upload"))
+        .await
+        .expect("send upload");
+    upload
+        .send_request_trailers(upload_trailers())
+        .await
+        .expect("send trailers");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        ends.completed.load(Ordering::SeqCst),
+        0,
+        "a trailer section alone must not end the backend's request body"
+    );
+    upload
+}
+
+/// Wait for the aborted upload, then confirm none completed.
+async fn assert_upload_aborted_never_completed(
+    harness: &GatewayHarness,
+    ends: &StreamedUploadEnds,
+) {
+    wait_for_aborted_upload(harness, ends).await;
+    assert_eq!(
+        ends.completed.load(Ordering::SeqCst),
+        0,
+        "a request cancelled after its trailer section must never complete at the backend"
+    );
+}
+
+/// The cancel shape browsers and most QUIC stacks use: RESET_STREAM on the
+/// upload and STOP_SENDING on the response, usually in one packet. The
+/// gateway's response-cancel watcher can then win the dispatch race before the
+/// reader sees its own read error, so the gateway must abort the backend upload
+/// itself rather than let the halted reader end it cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streamed_upload_aborts_the_backend_body_on_reset_and_stop_sending_after_trailers() {
+    let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
+    let yaml = gateway_yaml(base_proxy("http", backend_port), Vec::new());
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let url = proxy_url(https_port, UPLOAD_PATH);
+
+    let mut upload = upload_through_trailers(&url, &[], &ends).await;
+    upload.cancel_response_download();
+    upload.reset_request_upload(h3::error::Code::H3_NO_ERROR);
+    assert_upload_aborted_never_completed(&harness, &ends).await;
+    drop(upload);
+    backend_task.abort();
+}
+
+/// A client that loses its connection after its trailers, without finishing or
+/// resetting the request stream, cancelled the request too. The lost connection
+/// can reach the gateway's connection watchers before the reader, and either
+/// way the backend sees the upload aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streamed_upload_aborts_the_backend_body_on_a_lost_connection_after_trailers() {
+    let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
+    let yaml = gateway_yaml(base_proxy("http", backend_port), Vec::new());
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let url = proxy_url(https_port, UPLOAD_PATH);
+
+    let upload = upload_through_trailers(&url, &[], &ends).await;
+    upload.close_connection();
+    assert_upload_aborted_never_completed(&harness, &ends).await;
+    drop(upload);
+    backend_task.abort();
+}
+
+/// A client that declared its `Content-Length` and sent every declared byte
+/// before its trailers and reset. The streamed bridge never forwards the
+/// client's `Content-Length`, so the backend's body ends only with the
+/// terminal chunk, which a cancelled upload never gets. The backend reads by
+/// whichever framing it receives, so a forwarded length would show up here as
+/// a completed upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streamed_upload_with_a_declared_length_aborts_the_backend_body_on_a_reset() {
+    let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
+    let yaml = gateway_yaml(base_proxy("http", backend_port), Vec::new());
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let url = proxy_url(https_port, UPLOAD_PATH);
+
+    // `upload_through_trailers` sends exactly these 16 bytes.
+    let mut upload = upload_through_trailers(&url, &[("content-length", "16")], &ends).await;
+    upload.reset_request_upload(h3::error::Code::H3_NO_ERROR);
+    assert_upload_aborted_never_completed(&harness, &ends).await;
+    drop(upload);
+    backend_task.abort();
+}
+
+/// The HTTP/2 backend variant. Its request body ends only with END_STREAM, and
+/// hyper's HTTP/2 pipe can deliver a clean body end before the dropped request
+/// is cancelled, so this is the backend that exposes a body stream ending
+/// cleanly. A cancel after the trailers, here both directions together, must
+/// reset the backend's request stream instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streamed_upload_resets_the_http2_backend_stream_on_a_cancel_after_trailers() {
+    const ENDED_CLEANLY: &str = "request body ended without a reset";
+    let ca = TestCa::new("h3-streamed-upload-h2").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("h2 backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls builder")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::path(UPLOAD_PATH)))
+        .step(H2Step::ExpectRequestReset(Duration::from_secs(20)))
+        .spawn()
+        .expect("spawn h2 tls backend");
+    let yaml = gateway_yaml(base_proxy("https", backend_port), Vec::new());
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let url = proxy_url(https_port, UPLOAD_PATH);
+
+    let mut upload = open_upload_stream(&url, "application/octet-stream").await;
+    upload
+        .send_raw_data(Bytes::from_static(b"cancelled upload"))
+        .await
+        .expect("send upload");
+    upload
+        .send_request_trailers(upload_trailers())
+        .await
+        .expect("send trailers");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ended_cleanly = |errors: &[String]| errors.iter().any(|e| e.contains(ENDED_CLEANLY));
+    assert!(
+        !ended_cleanly(backend.step_errors().await.as_slice()),
+        "a trailer section alone must not end the backend's request stream"
+    );
+    upload.cancel_response_download();
+    upload.reset_request_upload(h3::error::Code::H3_NO_ERROR);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while backend.request_reset_codes().is_empty() {
+        let errors = backend.step_errors().await;
+        assert!(
+            !ended_cleanly(errors.as_slice()),
+            "the HTTP/2 backend saw the cancelled upload end cleanly: {errors:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the HTTP/2 backend must see its request stream reset; errors = {errors:?}; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let errors = backend.step_errors().await;
+    assert!(
+        !ended_cleanly(errors.as_slice()),
+        "the HTTP/2 backend saw the cancelled upload end cleanly: {errors:?}"
+    );
+    drop(upload);
+}
+
+/// The gateway's own halt. A client that sends its trailers but never its FIN
+/// leaves the backend's body open, so the response-header wait answers `504`.
+/// The gateway gave up on that request, so the backend must see the upload
+/// aborted, not ended cleanly as a truncated body it would accept as complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streamed_upload_header_timeout_aborts_the_backend_body() {
+    let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
+    let mut proxy = base_proxy("http", backend_port);
+    proxy["backend_read_timeout_ms"] = json!(1500);
+    let yaml = gateway_yaml(proxy, Vec::new());
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    let url = proxy_url(https_port, UPLOAD_PATH);
+
+    let mut upload = upload_through_trailers(&url, &[], &ends).await;
+    let (status, _) = upload.recv_response().await.expect("response head");
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "a backend still waiting for the body is answered on the header wait"
+    );
+    assert_upload_aborted_never_completed(&harness, &ends).await;
+    drop(upload);
     backend_task.abort();
 }
