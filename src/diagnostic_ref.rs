@@ -227,6 +227,7 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "client_trust_withdrawn",
     "overload",
     crate::proxy::hop_limit::PROXY_HOP_LIMIT_REJECTION_PHASE,
+    crate::proxy::hop_limit::PROXY_HOPS_INVALID_REJECTION_PHASE,
     "allowed_methods",
     "max_forwards",
     "backend_max_connections",

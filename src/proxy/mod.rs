@@ -17510,6 +17510,11 @@ fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, Str
 /// `x-consumer-username`; only the authenticated `x-consumer-username` /
 /// `x-consumer-custom-id` are written back.
 ///
+/// The gateway-owned `X-Ferrum-Hops` count (issue #6109) is re-asserted here
+/// too, so a deferred `before_proxy` pass or a finalized-egress header overlay
+/// (a `serverless_function` `pre_proxy` header copy) cannot reset it after the
+/// main dispatch-ladder re-assertion.
+///
 /// `pub` (rather than `pub(crate)`) only so the external
 /// `tests/unit/gateway_core` target can exercise it; not a supported API.
 #[doc(hidden)]
@@ -17517,6 +17522,10 @@ pub fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
+    hop_limit::reassert_outbound_proxy_hops_in_map(
+        hop_limit::effective_outbound_proxy_hops(ctx),
+        headers,
+    );
     let principal_username = ctx.backend_consumer_username().map(str::to_string);
     let external_identity = ctx.backend_authenticated_identity().map(str::to_string);
     let principal_custom_id = principal_username
@@ -32687,10 +32696,12 @@ fn retired_gateway_listener_response(
 
 /// The answer to a request refused by the proxy hop limit (issue #6109):
 /// `508 Loop Detected` with `X-Gateway-Error: loop_detected` when the received
-/// `X-Ferrum-Hops` count reached `FERRUM_MAX_PROXY_HOPS`, or `400` when the
-/// field is malformed. gRPC gets Trailers-Only `RESOURCE_EXHAUSTED` /
-/// `INVALID_ARGUMENT`. Bodies are compiled-in literals that echo nothing.
-/// Out of line so the request handler's state machine does not grow.
+/// `X-Ferrum-Hops` count reached `FERRUM_MAX_PROXY_HOPS`, or `400` (no token)
+/// when the field is malformed. Native gRPC gets Trailers-Only
+/// `FAILED_PRECONDITION` / `INVALID_ARGUMENT`; gRPC-Web gets the plain JSON
+/// answer, like every other frontend admission fence. Bodies are compiled-in
+/// literals that echo nothing. Out of line so the request handler's state
+/// machine does not grow.
 #[inline(never)]
 fn proxy_hop_limit_refusal_response(
     state: &ProxyState,
@@ -32707,12 +32718,12 @@ fn proxy_hop_limit_refusal_response(
     record_request(state, status.as_u16());
     crate::diagnostic_ref::record_admission_fence(
         ctx.diagnostic_slot(),
-        hop_limit::PROXY_HOP_LIMIT_REJECTION_PHASE,
+        hop_limit::refusal_rejection_phase(loop_detected),
         admission_fence_head_status(is_grpc, status),
     );
     match (is_grpc, loop_detected) {
         (true, true) => grpc_proxy::build_grpc_error_response(
-            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            grpc_proxy::grpc_status::FAILED_PRECONDITION,
             hop_limit::LOOP_DETECTED_GRPC_MESSAGE,
         ),
         (true, false) => grpc_proxy::build_grpc_error_response(
@@ -35490,10 +35501,14 @@ async fn handle_proxy_request_inner(
     // Proxy hop limit (issue #6109): re-assert the forwarded `X-Ferrum-Hops`
     // count on the authoritative outbound map now that every request-phase
     // plugin has run, so no plugin can reset the count the next gateway hop
-    // reads. One lookup on the common path; the native HTTP/3 frontend does
-    // the same at the same point — keep both call sites in sync.
+    // reads. Later deferred passes and the finalized-egress overlay re-assert
+    // it again through `refresh_backend_gateway_assertion_headers`. A mesh
+    // inbound hop to the local workload forwards the received count unchanged
+    // (`effective_outbound_proxy_hops`). One lookup on the common path; the
+    // native HTTP/3 frontend does the same at the same point — keep both call
+    // sites in sync.
     hop_limit::reassert_outbound_proxy_hops(
-        ctx.outbound_proxy_hops,
+        hop_limit::effective_outbound_proxy_hops(&ctx),
         &mut owned_proxy_headers,
         &mut ctx.headers,
     );

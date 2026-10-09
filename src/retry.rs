@@ -223,8 +223,16 @@ pub const OBS_CONCURRENCY_LIMIT: &str = "concurrency_limit";
 pub const OBS_REQUEST_TIMEOUT: &str = "request_timeout";
 /// The request had already crossed `FERRUM_MAX_PROXY_HOPS` gateway hops
 /// (`X-Ferrum-Hops`), so the gateway refused it with `508 Loop Detected`
-/// before routing (issue #6109). No backend was contacted.
+/// before routing (issue #6109). No backend was contacted. Only the refusing
+/// hop authors it: an outer Ferrum hop that relays that `508` labels it
+/// `backend_error` like any other backend 5xx.
 pub const OBS_LOOP_DETECTED: &str = "loop_detected";
+
+/// `508 Loop Detected` (RFC 5842). A backend answer with this status is never
+/// retried, whatever `retryable_status_codes` lists: it is the deterministic
+/// proxy-hop-limit refusal (issue #6109), and replaying it at every hop of a
+/// chain would multiply the traffic by `(max_retries + 1)^depth`.
+pub const LOOP_DETECTED_STATUS: u16 = 508;
 
 /// Closed `X-Gateway-Error` vocabulary. Cardinality bound: **9**.
 /// Header spelling is independent of `ferrum_requests_total{error_class}`
@@ -325,7 +333,9 @@ pub fn x_gateway_error_token_for_class(class: ErrorClass) -> &'static str {
 
 /// Intern a gateway-authored rejection-phase name onto the five metrics
 /// tokens that have no [`ErrorClass`]. Unknown phases return `None` so
-/// attacker-controlled strings cannot become metrics labels.
+/// attacker-controlled strings cannot become metrics labels. The
+/// malformed-`X-Ferrum-Hops` phase (`proxy_hops_invalid`) deliberately maps
+/// to nothing: that `400` is client-caused.
 #[inline]
 pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
     match phase {
@@ -1953,7 +1963,8 @@ impl BackendResponse {
 ///    POST).
 ///
 /// Both paths respect `max_retries`; only the HTTP status path respects
-/// `retryable_methods` and `retryable_status_codes`.
+/// `retryable_methods` and `retryable_status_codes`. A backend
+/// [`LOOP_DETECTED_STATUS`] (`508`) is never retried, even when listed.
 pub fn should_retry(
     config: &RetryConfig,
     method: &str,
@@ -1985,6 +1996,13 @@ pub fn should_retry(
     // idempotency is not a concern.
     if response.connection_error {
         return config.retry_on_connect_failure;
+    }
+
+    // A `508 Loop Detected` is the deterministic proxy-hop-limit refusal of a
+    // downstream gateway: a replay meets the same refusal, and retrying it at
+    // every hop of a gateway chain would amplify traffic geometrically.
+    if response.status_code == LOOP_DETECTED_STATUS {
+        return false;
     }
 
     // HTTP status-code retries only apply to configured methods (guards

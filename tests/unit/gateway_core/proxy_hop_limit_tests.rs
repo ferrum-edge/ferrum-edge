@@ -2,14 +2,20 @@
 //! issue #6109).
 //!
 //! These tests pin the shared parser/decision helper, the allocation-free
-//! stamp, the outbound re-assertion, the `loop_detected` observability token,
-//! plugin admission refusals, and the structural parity of the two frontends
-//! that take the decision. The live loop (a route whose upstream is the gateway
-//! itself) is exercised in `tests/functional/functional_proxy_hop_limit_test.rs`.
+//! stamp, the outbound re-assertion (including the later gateway-assertion
+//! refresh a finalized-egress header overlay runs), the mesh inbound
+//! forwarded count, the `loop_detected` observability token, plugin admission
+//! refusals, and the structural parity of the two frontends that take the
+//! decision. The live loop (a route whose upstream is the gateway itself) and
+//! the HTTP/2 native-gRPC backend count are exercised in
+//! `tests/functional/functional_proxy_hop_limit_test.rs`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use ferrum_edge::plugins::validate_plugin_config;
+use ferrum_edge::config::types::Proxy;
+use ferrum_edge::modes::mesh::MeshTrafficDirection;
+use ferrum_edge::plugins::{RequestContext, validate_plugin_config};
 use ferrum_edge::proxy::hop_limit::{self, ProxyHopDecision};
 use ferrum_edge::retry::{
     HTTP_METRICS_GATEWAY_ERROR_CLASSES, HTTP_OBSERVABILITY_ERROR_CLASSES, OBS_LOOP_DETECTED,
@@ -19,6 +25,7 @@ use serde_json::json;
 
 const HOPS: &str = hop_limit::PROXY_HOPS_HEADER;
 const PHASE: &str = hop_limit::PROXY_HOP_LIMIT_REJECTION_PHASE;
+const INVALID_PHASE: &str = hop_limit::PROXY_HOPS_INVALID_REJECTION_PHASE;
 
 fn headers_with(values: &[&str]) -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
@@ -229,8 +236,192 @@ fn loop_detected_is_a_closed_gateway_token() {
         http_metrics_error_class(None, 508, Some(PHASE)),
         Some(OBS_LOOP_DETECTED)
     );
-    // The malformed-field `400` shares the phase but carries no 5xx label.
-    assert_eq!(http_metrics_error_class(None, 400, Some(PHASE)), None);
+}
+
+#[test]
+fn malformed_field_refusal_has_its_own_phase_and_no_token() {
+    assert_eq!(INVALID_PHASE, "proxy_hops_invalid");
+    assert_ne!(INVALID_PHASE, PHASE);
+    assert_eq!(hop_limit::refusal_rejection_phase(true), PHASE);
+    assert_eq!(hop_limit::refusal_rejection_phase(false), INVALID_PHASE);
+    // The `400` is client-caused: its phase maps to no gateway token, so no
+    // surface can ever label it `loop_detected`.
+    assert_eq!(token_for_rejection_phase(INVALID_PHASE), None);
+    assert_eq!(
+        http_metrics_error_class(None, 400, Some(INVALID_PHASE)),
+        None
+    );
+}
+
+#[test]
+fn stamped_values_are_the_decimal_count() {
+    for hops in 0..=u8::MAX {
+        let mut headers = http::HeaderMap::new();
+        hop_limit::stamp_proxy_hops(&mut headers, hops);
+        assert_eq!(
+            headers.get(HOPS).unwrap().as_bytes(),
+            hops.to_string().as_bytes(),
+            "{hops}"
+        );
+    }
+}
+
+/// A finalized-egress header overlay (a `serverless_function` `pre_proxy`
+/// header copy) or a deferred `before_proxy` pass writes headers after the
+/// main re-assertion. Both re-run the gateway-assertion refresh, which must
+/// restore the forwarded count.
+#[test]
+fn gateway_assertion_refresh_restores_the_count_over_an_overlay() {
+    let mut ctx = context_with_hops(Some(3));
+    let mut outbound = HashMap::from([
+        ("x-other".to_string(), "kept".to_string()),
+        (HOPS.to_string(), "3".to_string()),
+    ]);
+    // The overlay merge: a function response resets the count and adds case
+    // and underscore variants.
+    outbound.insert(HOPS.to_string(), "0".to_string());
+    outbound.insert("X-Ferrum-Hops".to_string(), "0".to_string());
+    outbound.insert("x_ferrum_hops".to_string(), "0".to_string());
+    ferrum_edge::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
+    assert_eq!(outbound.get(HOPS).map(String::as_str), Some("3"));
+    assert_eq!(outbound.get("x-other").map(String::as_str), Some("kept"));
+    assert_eq!(
+        outbound.len(),
+        2,
+        "case and underscore variants are dropped"
+    );
+
+    // A removed count is restored too.
+    outbound.remove(HOPS);
+    ferrum_edge::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
+    assert_eq!(outbound.get(HOPS).map(String::as_str), Some("3"));
+
+    // With the limit disabled the refresh leaves the field alone.
+    ctx.outbound_proxy_hops = None;
+    outbound.insert(HOPS.to_string(), "0".to_string());
+    ferrum_edge::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
+    assert_eq!(outbound.get(HOPS).map(String::as_str), Some("0"));
+}
+
+#[test]
+fn reassert_in_map_rewrites_a_changed_value_in_place() {
+    let mut headers = HashMap::from([(HOPS.to_string(), "10".to_string())]);
+    hop_limit::reassert_outbound_proxy_hops_in_map(Some(9), &mut headers);
+    assert_eq!(headers.get(HOPS).map(String::as_str), Some("9"));
+    hop_limit::reassert_outbound_proxy_hops_in_map(Some(100), &mut headers);
+    assert_eq!(headers.get(HOPS).map(String::as_str), Some("100"));
+    hop_limit::reassert_outbound_proxy_hops_in_map(None, &mut headers);
+    assert_eq!(headers.get(HOPS).map(String::as_str), Some("100"));
+}
+
+fn forwarded(ctx: &RequestContext) -> Option<u8> {
+    hop_limit::effective_outbound_proxy_hops(ctx)
+}
+
+fn context_with_hops(hops: Option<u8>) -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.outbound_proxy_hops = hops;
+    ctx
+}
+
+fn route(id: &str, backend_port: u16) -> Arc<Proxy> {
+    let proxy = serde_json::from_value::<Proxy>(json!({
+        "id": id,
+        "namespace": "default",
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "listen_path": "/",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port
+    }))
+    .expect("hop-limit test route must deserialize");
+    Arc::new(proxy)
+}
+
+/// A mesh inbound context: accepted on the Sidecar inbound listener (`15006`),
+/// matched the materialized inbound route to the local app on `9080`, and the
+/// frontend stamped `received + 1 = 3`.
+fn mesh_inbound_context() -> RequestContext {
+    let mut ctx = context_with_hops(Some(3));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx.frontend_listen_port = Some(15006);
+    ctx.matched_proxy = Some(route("__mesh-inbound-default-reviews-9080", 9080));
+    ctx
+}
+
+#[test]
+fn mesh_inbound_hop_to_the_local_workload_forwards_the_received_count() {
+    let ctx = mesh_inbound_context();
+    assert_eq!(forwarded(&ctx), Some(2));
+
+    // Sidecar `ingress[]` routes are local-workload routes too.
+    let mut ingress = mesh_inbound_context();
+    ingress.matched_proxy = Some(route("__mesh-ingress-default-reviews-8443", 8443));
+    assert_eq!(forwarded(&ingress), Some(2));
+
+    // The outbound map carries the unchanged count after the re-assertion,
+    // and the gateway-assertion refresh agrees with it.
+    let mut outbound = HashMap::from([(HOPS.to_string(), "3".to_string())]);
+    hop_limit::reassert_outbound_proxy_hops_in_map(forwarded(&ctx), &mut outbound);
+    assert_eq!(outbound.get(HOPS).map(String::as_str), Some("2"));
+    ferrum_edge::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
+    assert_eq!(outbound.get(HOPS).map(String::as_str), Some("2"));
+}
+
+#[test]
+fn every_other_hop_increments_the_count() {
+    // Ordinary gateway hop.
+    let ctx = context_with_hops(Some(3));
+    assert_eq!(forwarded(&ctx), Some(3));
+
+    // Mesh outbound hop.
+    let mut outbound = mesh_inbound_context();
+    outbound.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    assert_eq!(forwarded(&outbound), Some(3));
+
+    // An inbound listener serving a non-mesh route (EgressGateway external
+    // routes, operator routes) still forwards somewhere other than the local
+    // workload.
+    let mut operator = mesh_inbound_context();
+    operator.matched_proxy = Some(route("operator-route", 9080));
+    assert_eq!(forwarded(&operator), Some(3));
+
+    // An outbound mesh route matched on an inbound listener.
+    let mut wrong_direction = mesh_inbound_context();
+    wrong_direction.matched_proxy = Some(route("__mesh-outbound-default-ratings-9080", 9080));
+    assert_eq!(forwarded(&wrong_direction), Some(3));
+
+    // A plugin route override can send the request anywhere.
+    let mut overridden = mesh_inbound_context();
+    overridden.route_override_backend_port = Some(9090);
+    assert_eq!(forwarded(&overridden), Some(3));
+
+    // A loopback target on the accepting listener's own port would re-enter
+    // the same inbound listener: it must still count.
+    let mut self_target = mesh_inbound_context();
+    self_target.matched_proxy = Some(route("__mesh-inbound-default-reviews-15006", 15006));
+    assert_eq!(forwarded(&self_target), Some(3));
+
+    // No matched route yet (frontend refusals, HBONE CONNECT relays).
+    let mut unrouted = mesh_inbound_context();
+    unrouted.matched_proxy = None;
+    assert_eq!(forwarded(&unrouted), Some(3));
+
+    // Disabled limit.
+    let mut disabled = mesh_inbound_context();
+    disabled.outbound_proxy_hops = None;
+    assert_eq!(forwarded(&disabled), None);
+}
+
+/// A mesh inbound hop still CHECKS the received count: the frontend decision
+/// is direction-blind, so a looped request reaching an inbound sidecar at the
+/// limit is refused there.
+#[test]
+fn mesh_inbound_hop_still_refuses_at_the_limit() {
+    assert_eq!(decide(&["10"], 10), ProxyHopDecision::LoopDetected);
+    let mut ctx = mesh_inbound_context();
+    ctx.outbound_proxy_hops = Some(10);
+    assert_eq!(forwarded(&ctx), Some(9));
 }
 
 #[test]
@@ -280,6 +471,7 @@ fn both_http_frontends_take_the_decision_and_reassert_the_count() {
             "hop_limit::decide_proxy_hops(",
             "hop_limit::stamp_proxy_hops(",
             "hop_limit::reassert_outbound_proxy_hops(",
+            "hop_limit::refusal_rejection_phase(",
         ] {
             assert_eq!(
                 source.matches(needle).count(),
@@ -294,4 +486,41 @@ fn both_http_frontends_take_the_decision_and_reassert_the_count() {
             "{path}: the stamp must precede the Connection confinement"
         );
     }
+}
+
+/// The deferred `before_proxy` passes and both finalized-egress overlay
+/// helpers restore gateway assertions through
+/// `refresh_backend_gateway_assertion_headers`; that refresh must re-assert the
+/// hop count with the same effective value as the main dispatch point.
+#[test]
+fn every_gateway_assertion_refresh_reasserts_the_count() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src/proxy/mod.rs")).unwrap();
+    let refresh = fn_body(&source, "pub fn refresh_backend_gateway_assertion_headers(");
+    assert!(
+        refresh.contains("hop_limit::reassert_outbound_proxy_hops_in_map(")
+            && refresh.contains("hop_limit::effective_outbound_proxy_hops(ctx)"),
+        "the gateway-assertion refresh must re-assert X-Ferrum-Hops"
+    );
+    for overlay in [
+        "pub(crate) fn apply_finalized_request_egress_header_overlay(",
+        "pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(",
+    ] {
+        assert!(
+            fn_body(&source, overlay).contains("refresh_"),
+            "`{overlay}` must re-run the gateway-assertion refresh after its merge"
+        );
+    }
+}
+
+/// The text of the top-level function starting at `signature`, up to its
+/// closing brace.
+fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing `{signature}`"));
+    let end = source[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("unterminated `{signature}`"));
+    &source[start..start + end]
 }

@@ -391,7 +391,7 @@ confirm what the gateway saw, use a diagnostic reference (below).
 | `config_stale` | DP stale-config fence 503 |
 | `concurrency_limit` | `adaptive_concurrency` admission 503 |
 | `request_timeout` | A matched route rule's total request deadline (`mesh_route_dispatch` `request_timeout_ms`, Gateway API `timeouts.request`) expired before any backend held the request: during the client upload, a gateway-local phase, admission, or retry backoff (504). The transaction log records `route_request_timeout` as `before_dispatch` or `retry_backoff` |
-| `loop_detected` | The request arrived with an `X-Ferrum-Hops` count at or above `FERRUM_MAX_PROXY_HOPS`, so the gateway refused it before routing with `508 Loop Detected` (gRPC: Trailers-Only `RESOURCE_EXHAUSTED`, which carries no HTTP 5xx and therefore no token). No backend was contacted. See [Proxy hop limit](routing.md#proxy-hop-limit) |
+| `loop_detected` | The request arrived with an `X-Ferrum-Hops` count at or above `FERRUM_MAX_PROXY_HOPS`, so the gateway refused it before routing with `508 Loop Detected`. Native gRPC gets Trailers-Only `FAILED_PRECONDITION` instead, which carries no HTTP 5xx and therefore no token. No backend was contacted. Only the refusing hop writes this token: an outer Ferrum hop that relays the `508` labels it `backend_error`, like any other backend 5xx. The malformed-field `400` (phase `proxy_hops_invalid`) carries no token. See [Proxy hop limit](routing.md#proxy-hop-limit) |
 
 Do not reuse `backend_error` for a response that never reached a backend, and
 do not reuse `backend_timeout` for a timeout no backend held. A route-deadline
@@ -425,7 +425,7 @@ attempt) stays `backend_timeout`.
 | *(no `ErrorClass`; `rejection_phase=overload`)* | `overload` |
 | *(no `ErrorClass`; `rejection_phase=config_stale`)* | `config_stale` |
 | *(no `ErrorClass`; `rejection_phase=adaptive_concurrency`)* | `concurrency_limit` |
-| *(no `ErrorClass`; `rejection_phase=proxy_hop_limit`, status 508)* | `loop_detected` |
+| *(no `ErrorClass`; `rejection_phase=proxy_hop_limit`, status 508)* | `loop_detected` (reserved: the hop-limit fence emits no transaction summary, so no metric row carries it today) |
 | *(no `ErrorClass`; no `rejection_phase`; backend 5xx)* | `backend_error` |
 
 Those six gateway-authored tokens appear on the metric (and the header) when

@@ -6,18 +6,37 @@
 //! The gateway therefore carries its own hop count on every HTTP-family
 //! request it forwards, in the gateway-owned `X-Ferrum-Hops` request header,
 //! and refuses a request that already crossed `FERRUM_MAX_PROXY_HOPS` gateway
-//! hops with `508 Loop Detected` (gRPC: Trailers-Only `RESOURCE_EXHAUSTED`).
+//! hops with `508 Loop Detected` (gRPC: Trailers-Only `FAILED_PRECONDITION`,
+//! which clients do not retry by convention: the refusal is deterministic).
 //!
 //! The decision is taken ONCE per inbound request at the frontend, before
 //! routing or any plugin runs, by both frontends: the H1/H2 handler (which
 //! also serves gRPC and the HTTP/1.1 and RFC 8441 WebSocket upgrades) and the
 //! native HTTP/3 handler (gRPC, the H3 bridge, and RFC 9220 WebSocket). The
-//! forwarded value is always `received + 1`, written over the client's raw
-//! header block before it is stored on the request context, so every backend
-//! builder — reqwest, direct HTTP/2, native gRPC (raw-map merge), the HTTP/3
-//! client and bridge, WebSocket handshakes, HBONE / mesh-mTLS replay, retries
-//! — forwards the incremented count and the client's own value never reaches
-//! a backend. A client can only RAISE the count, never reset it.
+//! frontend stamps `received + 1` over the client's raw header block before
+//! it is stored on the request context, so every backend builder — reqwest,
+//! direct HTTP/2, native gRPC (raw-map merge), the HTTP/3 client and bridge,
+//! WebSocket handshakes, HBONE / mesh-mTLS replay, retries — forwards the
+//! incremented count and the client's own value never reaches a backend. A
+//! client can only RAISE the count, never reset it.
+//!
+//! The count is re-asserted on the outbound header map after the request-phase
+//! plugins run AND inside every later gateway-assertion refresh (the deferred
+//! `before_proxy` passes and the finalized-egress header overlay, through
+//! `refresh_backend_gateway_assertion_headers`), so no plugin output — a
+//! custom plugin or a `serverless_function` `pre_proxy` header copy — can
+//! reset it before dispatch.
+//!
+//! Mesh inbound exception: a mesh inbound hop that forwards to the LOCAL
+//! workload through a materialized mesh inbound route (Sidecar inbound or
+//! `ingress[]` loopback routes) still CHECKS the received count but forwards
+//! it unchanged ([`effective_outbound_proxy_hops`]), so one service call costs
+//! one hop (its outbound side) instead of two. Termination is preserved: such
+//! a route leaves the gateway only for the local application, and anything
+//! the application sends onward re-enters through an incrementing hop. Every
+//! other route on an inbound listener — a plugin route override, an
+//! EgressGateway external route, an operator route, a loopback target on the
+//! accepting listener's own port — increments as usual.
 //!
 //! Field-value policy (documented in `docs/routing.md`):
 //!
@@ -26,10 +45,11 @@
 //! - An absent field is hop `0`.
 //! - A malformed field — empty, signed, fractional, non-decimal, or repeated
 //!   (more than one field line) — is REFUSED with `400 Bad Request` (gRPC:
-//!   `INVALID_ARGUMENT`) rather than treated as `0`: the gateway never writes
-//!   a malformed value itself, so one can only come from a client or a foreign
-//!   intermediary, and resetting it would let a loop through an intermediary
-//!   that mangles the field run unbounded.
+//!   `INVALID_ARGUMENT`; rejection phase [`PROXY_HOPS_INVALID_REJECTION_PHASE`],
+//!   no `X-Gateway-Error` token) rather than treated as `0`: the gateway never
+//!   writes a malformed value itself, so one can only come from a client or a
+//!   foreign intermediary, and resetting it would let a loop through an
+//!   intermediary that mangles the field run unbounded.
 //! - `FERRUM_MAX_PROXY_HOPS=0` disables the whole feature: no refusal, and the
 //!   field is neither parsed nor written (a client value passes through as an
 //!   ordinary header).
@@ -37,12 +57,21 @@
 //! Stream proxies (`tcp`, `tcp_tls`, `udp`, `dtls`) relay opaque bytes and
 //! carry no request headers, so the limit does not apply to them.
 //!
+//! The stamp adds (at most) one field AFTER the frontend's
+//! `FERRUM_MAX_HEADER_COUNT` / header-size limits were checked, like the
+//! gateway's own `X-Forwarded-*` fields: a request exactly at the count limit
+//! can therefore be refused with `431` at the next Ferrum hop that enforces
+//! the same limit.
+//!
 //! Hot path: the decision is one `HeaderMap` lookup by a pre-built
 //! `HeaderName` plus a bounded digit scan, and stamping inserts a pre-built
-//! `HeaderValue` — neither allocates.
+//! `HeaderValue` backed by static bytes — no allocation and no shared
+//! reference count (cloning a `from_static` value copies a pointer).
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+use crate::plugins::RequestContext;
 
 /// Lowercase wire name of the gateway-owned hop-count request header.
 pub const PROXY_HOPS_HEADER: &str = "x-ferrum-hops";
@@ -50,10 +79,15 @@ pub const PROXY_HOPS_HEADER: &str = "x-ferrum-hops";
 /// Default `FERRUM_MAX_PROXY_HOPS`.
 pub const DEFAULT_MAX_PROXY_HOPS: u8 = 10;
 
-/// Rejection-phase label for both refusals (loop detected and malformed
-/// field). It is also the diagnostic-reference fence phase and maps to the
-/// `loop_detected` metrics token for the `508`.
+/// Rejection-phase label of the `508 Loop Detected` refusal. It is a
+/// diagnostic-reference fence phase and the only phase that maps to the
+/// `loop_detected` metrics token.
 pub const PROXY_HOP_LIMIT_REJECTION_PHASE: &str = "proxy_hop_limit";
+
+/// Rejection-phase label of the malformed / repeated `X-Ferrum-Hops` `400`.
+/// A diagnostic-reference fence phase of its own that maps to NO
+/// `X-Gateway-Error` or metrics token: the request is client-caused.
+pub const PROXY_HOPS_INVALID_REJECTION_PHASE: &str = "proxy_hops_invalid";
 
 /// Client-visible body of the `508 Loop Detected` refusal.
 pub const LOOP_DETECTED_BODY: &str = r#"{"error":"Proxy hop limit exceeded"}"#;
@@ -72,8 +106,32 @@ pub const INVALID_PROXY_HOPS_GRPC_MESSAGE: &str = "Invalid X-Ferrum-Hops header"
 /// interior-mutable constant copied at every use.
 static PROXY_HOPS_HEADER_NAME: http::HeaderName = http::HeaderName::from_static(PROXY_HOPS_HEADER);
 
-/// Pre-built decimal values `0..=255`, so stamping a hop count clones a shared
-/// `HeaderValue` instead of formatting one per request.
+/// Decimal spellings of `0..=255`, indexed by hop count.
+const PROXY_HOPS_LITERALS: [&str; 256] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
+    "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48",
+    "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61", "62", "63", "64",
+    "65", "66", "67", "68", "69", "70", "71", "72", "73", "74", "75", "76", "77", "78", "79", "80",
+    "81", "82", "83", "84", "85", "86", "87", "88", "89", "90", "91", "92", "93", "94", "95", "96",
+    "97", "98", "99", "100", "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+    "111", "112", "113", "114", "115", "116", "117", "118", "119", "120", "121", "122", "123",
+    "124", "125", "126", "127", "128", "129", "130", "131", "132", "133", "134", "135", "136",
+    "137", "138", "139", "140", "141", "142", "143", "144", "145", "146", "147", "148", "149",
+    "150", "151", "152", "153", "154", "155", "156", "157", "158", "159", "160", "161", "162",
+    "163", "164", "165", "166", "167", "168", "169", "170", "171", "172", "173", "174", "175",
+    "176", "177", "178", "179", "180", "181", "182", "183", "184", "185", "186", "187", "188",
+    "189", "190", "191", "192", "193", "194", "195", "196", "197", "198", "199", "200", "201",
+    "202", "203", "204", "205", "206", "207", "208", "209", "210", "211", "212", "213", "214",
+    "215", "216", "217", "218", "219", "220", "221", "222", "223", "224", "225", "226", "227",
+    "228", "229", "230", "231", "232", "233", "234", "235", "236", "237", "238", "239", "240",
+    "241", "242", "243", "244", "245", "246", "247", "248", "249", "250", "251", "252", "253",
+    "254", "255",
+];
+
+/// Pre-built values `0..=255` backed by the static literals above, so stamping
+/// a hop count clones a `HeaderValue` whose bytes are `'static`: no per-request
+/// formatting and no shared reference count touched by every worker.
 static PROXY_HOPS_VALUES: LazyLock<[http::HeaderValue; 256]> = LazyLock::new(proxy_hops_values);
 
 fn proxy_hops_values() -> [http::HeaderValue; 256] {
@@ -82,7 +140,7 @@ fn proxy_hops_values() -> [http::HeaderValue; 256] {
 
 fn proxy_hops_value(hops: usize) -> http::HeaderValue {
     // `hops < 256` by construction of the table.
-    http::HeaderValue::from(u16::try_from(hops).unwrap_or(u16::MAX))
+    http::HeaderValue::from_static(PROXY_HOPS_LITERALS[hops])
 }
 
 /// Outcome of the hop-limit check for one inbound request.
@@ -173,42 +231,109 @@ pub fn is_proxy_hops_header(name: &str) -> bool {
     crate::proxy::headers::field_names_equivalent_for_backends(name, PROXY_HOPS_HEADER)
 }
 
+/// The `X-Ferrum-Hops` value this request forwards, or `None` when the limit
+/// is disabled.
+///
+/// Normally the count the frontend stamped (`received + 1`). A mesh inbound
+/// hop that forwards to the LOCAL workload — the request arrived on a mesh
+/// inbound listener, matched a materialized mesh inbound route (Sidecar
+/// inbound or `ingress[]` loopback route), no plugin overrode the route's
+/// destination, and the route's loopback target is not the accepting listener's
+/// own port — forwards the RECEIVED count unchanged instead. The received count
+/// was still checked against the limit at the frontend.
+///
+/// Pure function of the request context, so every re-assertion site (the main
+/// dispatch point and each later gateway-assertion refresh) agrees even when a
+/// deferred plugin pass changes the destination. Costs nothing outside the
+/// mesh inbound direction.
+pub fn effective_outbound_proxy_hops(ctx: &RequestContext) -> Option<u8> {
+    let hops = ctx.outbound_proxy_hops?;
+    if forwards_to_local_mesh_workload(ctx) {
+        // `hops = received + 1 >= 1`, so this is exactly `received`.
+        Some(hops.saturating_sub(1))
+    } else {
+        Some(hops)
+    }
+}
+
+fn forwards_to_local_mesh_workload(ctx: &RequestContext) -> bool {
+    if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound) {
+        return false;
+    }
+    if ctx.has_route_overrides() {
+        return false;
+    }
+    let Some(proxy) = ctx.matched_proxy.as_deref() else {
+        return false;
+    };
+    crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
+        && proxy.upstream_id.is_none()
+        && ctx.frontend_listen_port != Some(proxy.backend_port)
+}
+
 /// Re-assert the gateway's forwarded hop count on the authoritative outbound
 /// header map after every request-phase plugin has run.
 ///
-/// `outbound_hops` is the count the frontend stamped (`None` when the limit is
-/// disabled). `owned_proxy_headers` is the plugin-transformed outbound map
-/// when one exists; otherwise `ctx_headers` IS the outbound map. Built-in
-/// plugins cannot be configured to touch the field, so this is defence in
-/// depth: the common request pays one map lookup and one scan of the key
-/// lengths, and allocates only when a plugin rewrote, removed, or re-cased
-/// the field.
+/// `outbound_hops` is [`effective_outbound_proxy_hops`] (`None` when the limit
+/// is disabled). `owned_proxy_headers` is the plugin-transformed outbound map
+/// when one exists; otherwise `ctx_headers` IS the outbound map.
 pub fn reassert_outbound_proxy_hops(
     outbound_hops: Option<u8>,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
     ctx_headers: &mut HashMap<String, String>,
 ) {
+    let headers = owned_proxy_headers.as_mut().unwrap_or(ctx_headers);
+    reassert_outbound_proxy_hops_in_map(outbound_hops, headers);
+}
+
+/// [`reassert_outbound_proxy_hops`] on one outbound header map. Also called
+/// from every gateway-assertion refresh (deferred `before_proxy` passes and
+/// the finalized-egress header overlay), so a header written after the main
+/// re-assertion cannot reset the count either.
+///
+/// Built-in plugins cannot be configured to touch the field, so this is
+/// defence in depth: the common request pays one map lookup and one scan of
+/// the key lengths. A changed value is rewritten in place (no allocation when
+/// the new value is not longer); only a removed field or a case / underscore
+/// variant allocates.
+pub fn reassert_outbound_proxy_hops_in_map(
+    outbound_hops: Option<u8>,
+    headers: &mut HashMap<String, String>,
+) {
     let Some(hops) = outbound_hops else {
         return;
     };
-    let headers = owned_proxy_headers.as_mut().unwrap_or(ctx_headers);
-    let expected = PROXY_HOPS_VALUES[usize::from(hops)].as_bytes();
-    let intact = headers
-        .get(PROXY_HOPS_HEADER)
-        .is_some_and(|value| value.as_bytes() == expected);
+    let expected = PROXY_HOPS_LITERALS[usize::from(hops)];
     let has_variant = headers.keys().any(|name| {
         name.len() == PROXY_HOPS_HEADER.len()
             && name != PROXY_HOPS_HEADER
             && is_proxy_hops_header(name)
     });
-    if intact && !has_variant {
-        return;
-    }
     if has_variant {
-        headers.retain(|name, _| !is_proxy_hops_header(name));
+        headers.retain(|name, _| name == PROXY_HOPS_HEADER || !is_proxy_hops_header(name));
     }
-    if let Ok(value) = std::str::from_utf8(expected) {
-        headers.insert(PROXY_HOPS_HEADER.to_string(), value.to_string());
+    match headers.get_mut(PROXY_HOPS_HEADER) {
+        Some(value) => {
+            if *value != expected {
+                value.clear();
+                value.push_str(expected);
+            }
+        }
+        None => {
+            headers.insert(PROXY_HOPS_HEADER.to_string(), expected.to_string());
+        }
+    }
+}
+
+/// Rejection phase recorded for a hop-limit refusal: the `508` and the
+/// malformed-field `400` are distinct phases, so only the `508` can ever map
+/// to the `loop_detected` token.
+#[inline]
+pub fn refusal_rejection_phase(loop_detected: bool) -> &'static str {
+    if loop_detected {
+        PROXY_HOP_LIMIT_REJECTION_PHASE
+    } else {
+        PROXY_HOPS_INVALID_REJECTION_PHASE
     }
 }
 

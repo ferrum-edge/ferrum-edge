@@ -274,7 +274,11 @@ Label sets are bounded by *configuration*, never by traffic or endpoint churn:
 (`dns_lookup_error`, `connection_refused`, `tls_error`, `read_write_timeout`,
 …). When a gateway-authored 5xx has no `ErrorClass`, the label is one of
 `circuit_breaker_open` / `overload` / `config_stale` / `concurrency_limit` /
-`loop_detected`.
+`loop_detected`. `loop_detected` is reserved in the closed set: the proxy hop
+limit `508` is a frontend admission fence that emits no transaction summary,
+so it records no `ferrum_requests_total` row today, and an outer Ferrum hop
+that relays that `508` labels its own row `backend_error` (see
+[Proxy hop limit](routing.md#proxy-hop-limit)).
 A backend 5xx with neither a class nor a gateway phase carries
 `backend_error`, matching its `X-Gateway-Error` header so the two can be
 joined. 2xx/3xx/4xx omit the label. Cardinality bound is **25** compiled-in

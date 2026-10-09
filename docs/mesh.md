@@ -313,6 +313,15 @@ The inbound listener terminates mTLS from peer sidecars and forwards plaintext t
 
 An outbound `404` for an un-materialized destination means no route was built for it — not that mTLS/HBONE is unavailable. Both egress datapaths are exercised end-to-end (two gateways, captured request at A → mesh transport → backend behind B) by the `functional_mesh_*_egress_*` functional tests.
 
+#### Proxy hop limit on mesh hops
+
+Every mesh data plane runs the gateway's [proxy hop limit](routing.md#proxy-hop-limit) (`FERRUM_MAX_PROXY_HOPS`, default `10`, carried in the gateway-owned `X-Ferrum-Hops` request header):
+
+- **Outbound hops increment.** A request captured on the outbound listener (`:15001`) is checked and forwarded with `received + 1`.
+- **Inbound hops to the local workload check but do not increment.** A request on the Sidecar inbound listener (`:15006`) that is forwarded to the local application through a materialized inbound route (service-port defaults or `ingress[]` listeners) is refused at the limit, but it is forwarded with the received count unchanged. A service call therefore costs one hop, not two, when the application propagates the header to its own outbound calls. The bound still holds: anything the application sends onward leaves through the outbound hop, which increments.
+- **Every other inbound route increments.** A plugin route override, an EgressGateway external route, an operator route, or a loopback target on the accepting listener's own port is forwarded with `received + 1`. Ambient and waypoint inbound HBONE relays are L4 tunnels and forward no request headers.
+- A looping request is refused with `508 Loop Detected` (native gRPC: `FAILED_PRECONDITION`) at whichever hop first receives a count at the limit. The refusal is a frontend admission fence: it produces no transaction summary and no `ferrum_requests_total` row, and the refusing hop logs a rate-limited warning. Earlier Ferrum hops relay the `508` with `X-Gateway-Error: backend_error`, and none of them retries it.
+
 ### Ambient
 
 Ztunnel-style ambient mesh proxy that terminates HBONE (HTTP/2 CONNECT over mTLS) traffic. Does not require a per-pod sidecar.

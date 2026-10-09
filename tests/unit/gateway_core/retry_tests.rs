@@ -3053,3 +3053,20 @@ fn trust_withdrawal_refusal_is_pre_wire_and_health_neutral_on_every_mesh_transpo
         ErrorClass::ConnectionPoolError
     ));
 }
+
+/// A backend `508 Loop Detected` is the deterministic proxy-hop-limit refusal
+/// of a downstream gateway (issue #6109): it is never retried, even when an
+/// operator lists it, so a looped request cannot multiply at every hop.
+#[test]
+fn backend_loop_detected_is_never_retried_even_when_listed() {
+    let mut config = default_config();
+    config.retryable_status_codes = vec![502, 508];
+    assert_eq!(ferrum_edge::retry::LOOP_DETECTED_STATUS, 508);
+    assert!(should_retry(&config, "GET", &http_response(502), 0));
+    for attempt in 0..config.max_retries {
+        assert!(
+            !should_retry(&config, "GET", &http_response(508), attempt),
+            "attempt {attempt}: a backend 508 must not be retried"
+        );
+    }
+}
