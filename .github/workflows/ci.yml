@@ -3,6 +3,12 @@ name: Stack Boxing Experiment
 # Branch-only diagnostic experiment. Never merge this workflow replacement.
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: Isolated variants or their combined removal
+        type: choice
+        options: [all, combined]
+        default: all
 permissions:
   contents: read
 concurrency:
@@ -23,14 +29,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [control, frontend, routing-dispatch, direct-h1, direct-h2, h3-exchange]
+        variant: ${{ fromJSON(inputs.variant == 'combined' && '["control", "combined"]' || '["control", "frontend", "routing-dispatch", "direct-h1", "direct-h2", "h3-exchange"]') }}
     env:
       STACK_VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 0
       - name: Record immutable source and apply one isolated experiment
         run: |
           mkdir -p stack-results
