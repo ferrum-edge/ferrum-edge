@@ -168,26 +168,60 @@ deadlock:
   receive credit is released one chunk earlier. This is the envelope Hyper had
   before this patch; it is bounded by the client's own advertised window and
   by the inbound frame size, never by an unbounded queue.
-- **Chunks larger than the window (unmeasured).** Before this patch, a ready
-  chunk went to h2 whole and h2 framed the rest itself as WINDOW_UPDATEs
-  arrived. Now the pipe hands h2 only the assigned capacity, so each
-  WINDOW_UPDATE that reopens a window-limited stream wakes the pipe to hand
-  over the next piece: one extra hop from the connection task to the pipe
-  and back per update. This is the cost #6038 asked to measure with a 64 KiB
-  stream window, and it has not been measured. Reasoning only: an h2 peer
-  (hyper, tonic, the benchmark client and backend) sends a WINDOW_UPDATE once
-  its unclaimed capacity reaches half of its remaining window, so against a
-  64 KiB window each update opens about a third of it, roughly 21 KiB. That
-  is far above 256 bytes, so no hold happens: the pipe wakes, compares,
-  splits the `Bytes` without copying and returns. The count is about one
-  extra wake per 21 KiB sent, around 50,000 per second for each GB/s on a
-  window-limited stream, each paying a task wake and a `send_data` call.
-  With the benchmark's 8 MiB stream windows a chunk rarely exceeds its
-  window, so this case does not arise in the default protocol matrix (the
-  send-buffer case above did). The protocol benchmark's `h2_window=64k`
-  dispatch input now runs that case on every hop (see
-  `tests/performance/multi_protocol/README.md`); the measurement itself is
-  still pending.
+- **Chunks larger than the window.** Before this patch, a ready chunk went
+  to h2 whole and h2 framed the rest as WINDOW_UPDATEs arrived. Now each update
+  that reopens a window-limited stream wakes the pipe to hand over the next
+  piece. Against a 64 KiB window, ordinary hyper/tonic credit updates open
+  roughly 21 KiB at a time: well above 256 bytes, so this adds a task wake and
+  a zero-copy `Bytes` split, without the coalescing hold. The theoretical count
+  is about 50,000 extra pipe wakes per GB/s; the measurement below measures
+  throughput and sampled CPU cost, not individual wake events.
+
+#### Hosted 64 KiB measurement (2026-10-09)
+
+Runs [37896050877 (64 KiB)](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37896050877)
+and [37896053244 (default)](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37896053244)
+compare main `415990315392dee5a52b8c98d998ceaad961b21e` with the published
+pre-#6036 image `main-7dec94b86d0d13b665d1bf0f85fd267aa9c483e2`, pinned to
+`sha256:13d3112f09a4c0ff63ad6271debb6022121c461734b717ddcd8b4c06ea3f4273`.
+The baseline's keyless signature was verified against the main-image workflow.
+Both use TLS on both legs, upload and download, 15-second measurement windows,
+two iterations of two counterbalanced pairs, and concurrency 100 at 10/70/500 KiB,
+50 at 1 MiB and 25 at 5 MiB. All 240 samples, including direct controls,
+have zero request/transport errors and complete measurement/resource records.
+
+Each throughput ratio is the geometric mean of four paired main/baseline RPS
+ratios on one runner. The last column divides the 64 KiB ratio by the default
+ratio and subtracts one. The [per-pair observations](window-cost-2026-10-09.csv)
+retain RPS, p99, sampled gateway CPU/request and backend connection counts.
+
+| Protocol | Payload | 64 KiB RPS ratio | Default RPS ratio | Relative change |
+|---|---:|---:|---:|---:|
+| HTTP/2 | 10 KiB | 0.976 | 1.021 | -4.4% |
+| HTTP/2 | 70 KiB | 0.996 | 1.005 | -0.8% |
+| HTTP/2 | 500 KiB | 1.011 | 1.000 | +1.2% |
+| HTTP/2 | 1 MiB | 1.003 | 0.994 | +0.9% |
+| HTTP/2 | 5 MiB | 0.990 | 1.002 | -1.2% |
+| gRPC | 10 KiB | 0.972 | 0.964 | +0.9% |
+| gRPC | 70 KiB | 1.011 | 0.979 | +3.3% |
+| gRPC | 500 KiB | 1.009 | 0.989 | +2.0% |
+| gRPC | 1 MiB | 1.001 | 1.003 | -0.2% |
+| gRPC | 5 MiB | 0.995 | 0.984 | +1.2% |
+
+No consistent large-payload throughput penalty appears in this campaign.
+At 70 KiB–5 MiB, the sampled gateway CPU/request ratios at 64 KiB are
+0.989–1.010. This is an end-to-end comparison of two revisions, not an isolated
+measurement of patch 005: other gateway changes and their interaction with
+windows remain. HTTP/2's 64 KiB runner was an EPYC 9V74 and its default runner
+an EPYC 9V45; both gRPC runners were EPYC 7763, on separate VMs. Four pairs on
+shared runners do not establish a portable zero-cost result.
+
+Tail latency is less stable. At gRPC 5 MiB/64 KiB, the geometric-mean paired
+p99 ratio is 1.185, but individual ratios range from 0.986 to 1.930; three of
+four are close to one. The default-window p99 ratio is 0.949. These observations
+are retained rather than discarded as outliers. They justify checking latency
+on a dedicated host before making a tail-latency guarantee; they do not justify
+removing the small-window framing protection.
 
 ### Not covered
 

@@ -79,7 +79,11 @@ way and to give scrapers a credential rather than opening the tier.
 | `/metrics` | `401` | full metrics |
 
 "Authenticated" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`,
-or a source IP inside `FERRUM_METRICS_ALLOWED_CIDRS`.
+or a source IP inside `FERRUM_METRICS_ALLOWED_CIDRS`. An admin JWT carrying an
+`ns` claim is a tenant credential: it never unlocks the detailed tier (it gets
+the bounded tenant tier of `/health` and `/status`) and is refused on
+fleet-global admin routes, `/metrics` included, even from an allowlisted
+source IP.
 
 | Do this | Setting | Secure value | Reference |
 |---|---|---|---|

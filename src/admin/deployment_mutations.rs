@@ -5,9 +5,8 @@ use super::crud::{self, NamespaceConfigAdmissionGuard};
 use super::preconditions;
 use super::{AdminState, json_response};
 use crate::config::db_backend::{
-    ApiSpecSnapshotView, ConditionalNamespaceSnapshot, DatabaseBackend, DbWriteTopologyPermit,
-    NamespacePreconditionFailed, NamespaceSnapshotTooLarge, SnapshotDigest,
-    is_namespace_snapshot_too_large,
+    DatabaseBackend, DbWriteTopologyPermit, NamespacePreconditionFailed, NamespaceSnapshotTooLarge,
+    SnapshotDigest, is_namespace_snapshot_too_large,
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, ExternalSpecUpstreamConflict,
@@ -258,7 +257,7 @@ pub(super) async fn snapshot(
     // order or collation the store returned them in.
     let mut specs: Vec<&ApiSpec> = snapshot.api_specs.iter().collect();
     specs.sort_by(|a, b| a.id.cmp(&b.id));
-    let Ok([proxies, plugin_configs, upstreams, api_specs]) = typed_lists(&snapshot, &specs) else {
+    let Some([proxies, plugin_configs, upstreams, api_specs]) = typed_lists(&representation) else {
         return unavailable("not_started");
     };
     let event = audit::AuditEvent::new(
@@ -310,22 +309,20 @@ pub(super) async fn snapshot(
     response
 }
 
-/// The response's typed inspection lists. `api_specs` repeats the evidence
-/// view, stored documents as digests; `api_spec_contents` carries their bytes
-/// once, outside the evidence.
-fn typed_lists(
-    snapshot: &ConditionalNamespaceSnapshot,
-    specs: &[&ApiSpec],
-) -> Result<[Value; 4], serde_json::Error> {
-    let api_specs = specs
-        .iter()
-        .map(|spec| serde_json::to_value(ApiSpecSnapshotView::from(*spec)))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok([
-        serde_json::to_value(&snapshot.config.proxies)?,
-        serde_json::to_value(&snapshot.config.plugin_configs)?,
-        serde_json::to_value(&snapshot.config.upstreams)?,
-        Value::Array(api_specs),
+/// Reuse the canonical evidence for the response's typed inspection lists,
+/// including resource and proxy-plugin ordering. Store iteration order must
+/// not change the response while its ETag stays the same. Spec documents remain
+/// digests here; `api_spec_contents` carries their bytes once, outside evidence.
+fn typed_lists(representation: &Value) -> Option<[Value; 4]> {
+    let resources = representation.get("resources")?.as_array()?;
+    let [proxies, _, upstreams, plugin_configs, _, api_specs, _, _] = resources.as_slice() else {
+        return None;
+    };
+    Some([
+        proxies.clone(),
+        plugin_configs.clone(),
+        upstreams.clone(),
+        api_specs.clone(),
     ])
 }
 
@@ -561,5 +558,83 @@ pub(super) async fn remove(
     {
         Ok(response) => response,
         Err(_) => unavailable("unknown"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::db_backend::ConditionalNamespaceSnapshot;
+    use crate::config::deployment_mutation::DeploymentSnapshot;
+    use crate::config::types::GatewayConfig;
+
+    #[test]
+    fn typed_lists_are_stable_across_store_iteration_orders() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [
+                {"id": "z", "plugins": [
+                    {"plugin_config_id": "z"}, {"plugin_config_id": "a"}
+                ]},
+                {"id": "a"}
+            ],
+            "plugin_configs": [
+                {"id": "z", "plugin_name": "cors", "scope": "proxy"},
+                {"id": "a", "plugin_name": "cors", "scope": "proxy"}
+            ],
+            "upstreams": [{"id": "z", "targets": []}, {"id": "a", "targets": []}]
+        }))
+        .unwrap();
+        let mut specs: Vec<ApiSpec> = ["z", "a"]
+            .into_iter()
+            .map(|id| {
+                serde_json::from_value(json!({
+                    "id": id, "proxy_id": id, "spec_version": "3.0.3",
+                    "spec_format": "json", "spec_content": [1, 2, 3],
+                    "content_encoding": "gzip", "uncompressed_size": 3,
+                    "content_hash": "fixture", "external_ref_snapshot": [4, 5]
+                }))
+                .unwrap()
+            })
+            .collect();
+        let mut first = None;
+        for reverse in [false, true] {
+            if reverse {
+                config.proxies.reverse();
+                config.plugin_configs.reverse();
+                config.upstreams.reverse();
+                for proxy in &mut config.proxies {
+                    proxy.plugins.reverse();
+                }
+                specs.reverse();
+            }
+            let deployment = DeploymentSnapshot::new(
+                ConditionalNamespaceSnapshot {
+                    config: config.clone(),
+                    api_specs: specs.clone(),
+                    namespace_record: None,
+                    change_sequence: 42,
+                },
+                json!({}),
+            );
+            let digest = deployment.digest().unwrap();
+            let (evidence, _) = deployment.into_representation().unwrap();
+            let lists = typed_lists(&evidence).unwrap();
+            for (list, resource_index) in lists.iter().zip([0, 3, 2, 5]) {
+                assert_eq!(list, &evidence["resources"][resource_index]);
+                assert_eq!(list[0]["id"], "a");
+                assert_eq!(list[1]["id"], "z");
+            }
+            assert_eq!(lists[0][1]["plugins"][0]["plugin_config_id"], "a");
+            assert_eq!(lists[0][1]["plugins"][1]["plugin_config_id"], "z");
+            assert_eq!(lists[3][0]["spec_content"]["len"], 3);
+            assert_eq!(lists[3][0]["external_ref_snapshot"]["len"], 2);
+            if let Some((first_digest, first_lists)) = &first {
+                assert_eq!(&digest, first_digest);
+                assert_eq!(&lists, first_lists);
+            } else {
+                first = Some((digest, lists));
+            }
+        }
     }
 }

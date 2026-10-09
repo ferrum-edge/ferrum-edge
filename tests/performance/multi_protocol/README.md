@@ -558,9 +558,13 @@ samples on the same arm are in `accepted_since_backend_start`.
 only when a body chunk exceeds the stream window. Pair the dispatched `main`
 with the newest published image before #6036 (`main-7dec94b8…`, whose only
 later change before #6036 is #6035), once with `h2_window=64k` and once with
-`h2_window=default` as the control. The patch's window-limited cost is the
-change in the `ferrum-baseline → ferrum` ratio between the two runs; the
-default run absorbs the other commits since that image.
+`h2_window=default` as the control. Compare the `ferrum-baseline → ferrum`
+ratios between the two runs, retaining runner CPU models, pair dispersion and
+latency. This is an end-to-end estimate: the default run cannot remove every
+interaction between later commits and window size, and separate hosted VMs can
+have different CPUs. Isolating the patch requires otherwise identical builds
+and matched runners. [Recorded results](../../../docs/upstream-hyper-patches/005-h2-small-window-coalescing/README.md#hosted-64-kib-measurement-2026-10-09)
+include these limitations and the raw paired observations.
 
 ```bash
 for window in 64k default; do

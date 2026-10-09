@@ -20,11 +20,59 @@ def parse_stat(contents, ticks, page_size):
     fields = contents[contents.rfind(")") + 2:].split()
     return {"start_ticks": int(fields[19]),
             "cpu_seconds": (int(fields[11]) + int(fields[12])) / ticks,
+            "user_cpu_seconds": int(fields[11]) / ticks,
+            "system_cpu_seconds": int(fields[12]) / ticks,
             "rss_bytes": int(fields[21]) * page_size}
 
 
 IO_FIELDS = ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes",
              "cancelled_write_bytes")
+SWITCH_FIELDS = ("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")
+CPU_FIELDS = ("user_cpu_seconds", "system_cpu_seconds")
+
+
+def parse_context_switches(contents):
+    fields = dict(line.split(":", 1) for line in contents.splitlines() if ":" in line)
+    result = {key: int(fields[key].strip()) for key in SWITCH_FIELDS}
+    if any(value < 0 for value in result.values()):
+        raise ValueError("negative context-switch counter")
+    return result
+
+
+def capture_scheduler(pid, ticks, page_size, proc_root=Path("/proc")):
+    # /proc/PID/status covers only the leader. Include every live worker and
+    # retain thread generations; a changing set cannot support a complete delta.
+    task = proc_root / str(pid) / "task"
+    threads = sorted(path for path in task.iterdir() if path.name.isdecimal())
+    if len(threads) > 512:
+        raise ValueError("scheduler thread inventory exceeds 512 threads")
+    result = {}
+    for thread in threads:
+        before = parse_stat((thread / "stat").read_text(), ticks, page_size)
+        counters = parse_context_switches((thread / "status").read_text())
+        after = parse_stat((thread / "stat").read_text(), ticks, page_size)
+        if before["start_ticks"] != after["start_ticks"]:
+            raise ValueError("thread generation changed during scheduler capture")
+        result[thread.name] = dict(start_ticks=before["start_ticks"], **counters)
+    if not result or {path.name for path in task.iterdir() if path.name.isdecimal()} != set(result):
+        raise ValueError("thread set changed during scheduler capture")
+    return result
+
+
+def scheduler_delta(bracket):
+    snapshots = [item.get("scheduler_threads") for item in bracket]
+    if not all(isinstance(item, dict) and item for item in snapshots):
+        raise ValueError("scheduler counters unavailable at one or more samples")
+    first, last = snapshots[0], snapshots[-1]
+    for snapshot in snapshots:
+        if set(snapshot) != set(first) or any(
+                snapshot[tid]["start_ticks"] != first[tid]["start_ticks"] for tid in first):
+            raise ValueError("thread set or generation changed within measurement bracket")
+    if any(b[tid][key] < a[tid][key] for a, b in zip(snapshots, snapshots[1:])
+           for tid in first for key in SWITCH_FIELDS):
+        raise ValueError("context-switch counter decreased")
+    return {key: sum(last[tid][key] - first[tid][key] for tid in first)
+            for key in SWITCH_FIELDS}
 
 
 def parse_io(contents):
@@ -35,7 +83,7 @@ def parse_io(contents):
     return result
 
 
-def capture(pid, ticks, page_size):
+def capture(pid, ticks, page_size, *, scheduler=False):
     try:
         state = parse_stat(Path(f"/proc/{pid}/stat").read_text(), ticks, page_size)
     except (OSError, ValueError, IndexError):
@@ -46,6 +94,15 @@ def capture(pid, ticks, page_size):
         # /proc/io has stricter access rules than stat. Never invent zero I/O
         # when ptrace permissions deny a container PID owned by another UID.
         state["io_error"] = str(error)
+    if scheduler:
+        try:
+            state["scheduler_threads"] = capture_scheduler(pid, ticks, page_size)
+            after = parse_stat(Path(f"/proc/{pid}/stat").read_text(), ticks, page_size)
+            if after["start_ticks"] != state["start_ticks"]:
+                raise ValueError("process generation changed during scheduler capture")
+        except (OSError, ValueError, KeyError, IndexError) as error:
+            state.pop("scheduler_threads", None)
+            state["scheduler_error"] = str(error)
     return state
 
 
@@ -84,6 +141,19 @@ def measurement_usage(usage, phases):
                           bracket_secs=right[0] - left[0],
                           boundary_slack_secs=(start - left[0]) + (right[0] - end))
             bracket = [item[1] for item in values if left[0] <= item[0] <= right[0]]
+            if all(all(key in item for key in CPU_FIELDS) for item in bracket):
+                if record["complete_bracket"] and all(
+                        b[key] >= a[key] for a, b in zip(bracket, bracket[1:]) for key in CPU_FIELDS):
+                    record.update({key: right[1][key] - left[1][key] for key in CPU_FIELDS})
+                else:
+                    record["cpu_split_error"] = "counter decreased or process bracket incomplete"
+            if any("scheduler_threads" in item or "scheduler_error" in item for item in bracket):
+                try:
+                    if not record["complete_bracket"]:
+                        raise ValueError("process bracket incomplete")
+                    record["context_switches"] = dict(scope="all process threads", **scheduler_delta(bracket))
+                except ValueError as error:
+                    record["scheduler_error"] = str(error)
             if all(isinstance(item.get("io"), dict) for item in bracket):
                 monotonic = all(b["io"][key] >= a["io"][key]
                                 for a, b in zip(bracket, bracket[1:]) for key in IO_FIELDS)
@@ -128,7 +198,7 @@ def client_pids(parent, proc_root=Path("/proc")):
 
 def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, stop_file=None,
                      *, http3=False, envoy=False, h2_gauges=False, h1_profile=False,
-                     pool_profile=False, udp_profile=False,
+                     pool_profile=False, udp_profile=False, scheduler_counters=False,
                      h1_runtime=None, h1_container_id=None):
     """Observe processes until signalled; never launch or control the client."""
     if not math.isfinite(interval) or interval <= 0:
@@ -181,7 +251,8 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
                     "clock_domain": "CLOCK_MONOTONIC", "sampler_pid": os.getpid(),
                     "time_namespace": Path("/proc/self/ns/time").stat().st_ino}
         for pid, role in roles.items():
-            state = capture(pid, ticks, page_size)
+            state = (capture(pid, ticks, page_size, scheduler=True) if scheduler_counters
+                     else capture(pid, ticks, page_size))
             if state is None:
                 continue
             key = (pid, state["start_ticks"])
@@ -272,6 +343,7 @@ if __name__ == "__main__":
     parser.add_argument("--h1-profile", action="store_true")
     parser.add_argument("--pool-profile", action="store_true")
     parser.add_argument("--udp-profile", action="store_true")
+    parser.add_argument("--scheduler-counters", action="store_true")
     parser.add_argument("--h1-runtime")
     parser.add_argument("--h1-container-id")
     parser.add_argument("--parent-pid", type=int)
@@ -282,4 +354,5 @@ if __name__ == "__main__":
                      stop_file=args.stop_file, http3=args.http3, envoy=args.envoy,
                      h2_gauges=args.h2_gauges, h1_profile=args.h1_profile,
                      h1_runtime=args.h1_runtime, h1_container_id=args.h1_container_id,
-                     pool_profile=args.pool_profile, udp_profile=args.udp_profile)
+                     pool_profile=args.pool_profile, udp_profile=args.udp_profile,
+                     scheduler_counters=args.scheduler_counters)

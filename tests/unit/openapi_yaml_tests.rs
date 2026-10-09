@@ -1973,6 +1973,77 @@ fn admin_shared_namespace_and_id_gates_document_bad_request() {
     );
 }
 
+/// Global operations (not selected by `X-Ferrum-Namespace`) that stay reachable
+/// to namespace-bounded admin JWTs: tokens carrying an `ns` claim, and
+/// viewer-key tokens under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`. Mirrors the
+/// global-route allowlists in `src/admin/mod.rs`; registry writes and the
+/// diagnostic lookup are allowlisted there but document `403` for their own
+/// name and claim checks.
+const NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST: &[(&str, &str)] = &[
+    ("GET", "/live"),
+    ("GET", "/health"),
+    ("GET", "/status"),
+    ("GET", "/overload"),
+    ("GET", "/plugins"),
+    ("GET", "/namespaces"),
+];
+
+/// First path segments of the namespace-scoped resource surfaces, mirroring
+/// `namespace_scoped_resource_kind` in `src/admin/mod.rs`.
+const NAMESPACE_SCOPED_FIRST_SEGMENTS: &[&str] = &[
+    "proxies",
+    "consumers",
+    "upstreams",
+    "api-specs",
+    "batch",
+    "backup",
+    "deployment-snapshot",
+    "restore",
+    "audit",
+    "gateway-trust-bundles",
+    "gateway-trust",
+];
+
+/// Whether an OpenAPI path is a namespace-scoped resource surface.
+fn is_namespace_scoped_openapi_path(path: &str) -> bool {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["plugins", _, ..] | ["config", "export"] | ["backend-egress-policy"] => true,
+        [first, ..] => NAMESPACE_SCOPED_FIRST_SEGMENTS.contains(first),
+        [] => false,
+    }
+}
+
+#[test]
+fn fleet_global_operations_document_the_namespace_bounded_refusal() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let allowlisted: BTreeSet<(String, String)> = NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST
+        .iter()
+        .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
+        .collect();
+    let documented = normalized_operation_set(&openapi_operations_with_status(&spec, "403"));
+    let missing: Vec<_> = openapi_operations(&spec)
+        .into_iter()
+        .filter(|(_, path)| !is_namespace_scoped_openapi_path(path))
+        .filter(|operation| !allowlisted.contains(operation))
+        .filter(|operation| !documented.contains(operation))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "fleet-global operations refuse namespace-bounded admin JWTs with 403 and must \
+         document it: {missing:?}"
+    );
+
+    for (method, path) in NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST {
+        assert!(
+            !is_namespace_scoped_openapi_path(path),
+            "{method} {path} is global"
+        );
+    }
+}
+
 #[test]
 fn operator_gated_refresh_and_egress_test_document_forbidden() {
     let spec: serde_json::Value =
@@ -18504,6 +18575,111 @@ fn health_namespace_serving_report_is_a_fixed_authenticated_detail_block() {
         description.contains("`namespace`"),
         "the detailed-tier field list must name the serving report: {description}"
     );
+}
+
+/// The `/health` and `/status` tenant tier (issue #6095) is a closed schema
+/// whose every field reuses the detailed tier's top-level name and shape:
+/// downstream clients read `mode`, `admin_writes_enabled`, and `namespace` by
+/// those names whichever tier answered, so the two must never drift.
+#[test]
+fn health_tenant_tier_reuses_the_detailed_tier_field_shapes() {
+    const TENANT_FIELDS: &[&str] = &[
+        "admin_writes_enabled",
+        "mode",
+        "namespace",
+        "ready",
+        "status",
+    ];
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let tenant = spec
+        .pointer("/components/schemas/HealthTenantResponse")
+        .expect("HealthTenantResponse exists");
+    let health = spec
+        .pointer("/components/schemas/HealthResponse")
+        .expect("HealthResponse exists");
+
+    assert_eq!(tenant["additionalProperties"], json!(false));
+    assert_eq!(
+        tenant["required"],
+        json!([
+            "status",
+            "ready",
+            "mode",
+            "admin_writes_enabled",
+            "namespace"
+        ])
+    );
+    let mut fields: Vec<&str> = tenant["properties"]
+        .as_object()
+        .expect("the tenant tier declares properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, TENANT_FIELDS);
+    for field in ["status", "ready", "mode", "admin_writes_enabled"] {
+        for keyword in ["type", "enum"] {
+            assert_eq!(
+                tenant["properties"][field].get(keyword),
+                health["properties"][field].get(keyword),
+                "tenant `{field}` must keep the detailed tier's `{keyword}`"
+            );
+        }
+    }
+    assert_eq!(
+        tenant["properties"]["namespace"]["$ref"],
+        health["properties"]["namespace"]["$ref"]
+    );
+
+    let tenant_body = json!({
+        "status": "ok",
+        "ready": true,
+        "mode": "database",
+        "admin_writes_enabled": true,
+        "namespace": {
+            "active": "tenant-a",
+            "serving_scope": "single-namespace-data-plane",
+            "data_plane_single_namespace": true
+        }
+    });
+    assert_component_validity(&spec, "HealthTenantResponse", &tenant_body, true);
+    let mut detailed_only = tenant_body.clone();
+    detailed_only["timestamp"] = json!("2026-10-09T00:00:00Z");
+    assert_component_validity(&spec, "HealthTenantResponse", &detailed_only, false);
+    // A bound that does not admit the routed namespace withholds only `active`;
+    // the block itself is never omitted.
+    let mut withheld = tenant_body.clone();
+    withheld["namespace"]["active"] = json!(null);
+    assert_component_validity(&spec, "HealthTenantResponse", &withheld, true);
+    let mut without_namespace = tenant_body.clone();
+    without_namespace
+        .as_object_mut()
+        .expect("object body")
+        .remove("namespace");
+    assert_component_validity(&spec, "HealthTenantResponse", &without_namespace, false);
+
+    // Both probe routes publish both tiers on every body-carrying status.
+    for operation_id in ["getHealth", "getStatus"] {
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        for status in ["200", "503"] {
+            let content = &operation["responses"][status]["content"];
+            let tiers: Vec<&str> = content["application/json"]["schema"]["anyOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{method} {path} {status} must list both tiers"))
+                .iter()
+                .filter_map(|schema| schema["$ref"].as_str())
+                .collect();
+            assert_eq!(
+                tiers,
+                [
+                    "#/components/schemas/HealthResponse",
+                    "#/components/schemas/HealthTenantResponse",
+                ],
+                "{method} {path} {status}"
+            );
+        }
+    }
 }
 
 /// The published `RestoreRequest` must be the complete, closed restore wire
