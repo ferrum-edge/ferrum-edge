@@ -147,6 +147,13 @@ Multi-protocol echo backend that starts all servers on fixed ports:
 
 Self-signed TLS certificates are generated at startup into `./certs/` (gitignored).
 
+`BENCH_H2_STREAM_WINDOW` (default 8388608) sets the initial stream window of
+the h2c, HTTPS/H2 and both gRPC listeners; a value outside 65535..2147483647
+refuses to start. `GET /bench-stats` on the health port returns cumulative
+counters: TCP connections accepted on 3443 and 50053, completed TLS handshakes
+on 3443 (tonic owns the 50053 handshake, so that listener counts accepts), and
+`/echo` and `UnaryEcho` requests served on any listener.
+
 ### proto_bench
 
 Load testing binary with subcommands for each protocol:
@@ -161,7 +168,12 @@ Options:
   --payload-size <BYTES>  Payload for echo tests (default: 64)
   --tls                   Use TLS/DTLS for TCP/UDP tests
   --json                  Output JSON instead of text
+  --h2-stream-window <N>  http2/grpc initial stream window (default 8388608)
+  --connection-per-request
+                          grpc only: a new connection (TCP, TLS, HTTP/2) per call
 ```
+
+An option a protocol would ignore is refused rather than silently dropped.
 
 ## Configuration
 
@@ -383,8 +395,9 @@ The reference appears as `ferrum-baseline`. Keep configuration identical except
 for the stated experiment; `images.txt` records immutable image IDs and labels.
 Never compare separate hosted VMs as revision pairs. Without a baseline image,
 the suite compares direct/gateway and Ferrum/competitor pairs; it does **not**
-claim a revision A/B. The existing frozen workflow has no baseline-image input;
-revision experiments require a runner with both images provisioned separately.
+claim a revision A/B. On the hosted workflow, the `baseline_image` dispatch
+input supplies the reference (see
+[Window, client and revision inputs](#window-client-and-revision-inputs-6038-6022)).
 
 `paired_comparisons.json` uses matched per-pair log throughput ratios and a
 two-sided Student-t 95% interval, requiring an even count of at least two clean pairs with equal
@@ -502,6 +515,116 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   request the full-matrix extension; its real-world frequency remains unmeasured.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
+
+#### Window, client and revision inputs (#6038, #6022)
+
+The hosted `benchmark` job is held byte-for-byte by the trusted Cross build
+policy, so these `gateways-protocol-benchmark.yml` dispatch inputs reach the
+runner as workflow-level environment instead of arguments. Their defaults are
+behaviourally equivalent to earlier runs: the timed workload is unchanged, but
+the backend now increments a relaxed atomic per accept and per echo, each
+`http2`/`grpcs` sample is bracketed by two `/bench-stats` reads outside the
+client run, and `manifest.json` and every HTTP/2 and gRPC sample carry the new
+labels and `backend_connections` fields. Every value is validated by the runner
+before any build or manifest, and each run's `manifest.json`, every HTTP/2 and
+gRPC sample (`workload`), the run name and the combined summary record them. A
+`baseline_image` that is not a published `main-<sha>` image also fails the
+workflow's `Validate dispatch inputs` job, because the frozen benchmark step
+cannot surface the runner's refusal.
+
+| Input | Runner option / environment | Effect |
+|---|---|---|
+| `h2_window` (`default`, `64k`) | `--h2-window` / `BENCH_H2_WINDOW` | `64k` sets a 65,535-byte initial stream window on every hop of the `http2` and `grpcs` workloads: `proto_bench --h2-stream-window`, `BENCH_H2_STREAM_WINDOW` for the backend, `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` and `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` for Ferrum, and the route's own `pool_http2_initial_stream_window_size` (which overrides the env) in the mounted YAML; a config whose route window cannot be rewritten refuses the whole run. Connection windows are unchanged (Ferrum's pool keeps 32 MiB, its frontend its 2 MiB default). The echo exercises the upload and the download on each request. |
+| `grpc_client_connections` (`pooled`, `per-rpc`) | `--grpc-client-connections` / `BENCH_GRPC_CLIENT_CONNECTIONS` | `per-rpc` makes the `grpcs` client open a TCP+TLS+HTTP/2 connection for every call and close it after the response; latency includes the handshakes. |
+| `baseline_image` | `--baseline-image` / `FERRUM_BASELINE_IMAGE` | Adds a same-run `ferrum-baseline` arm and its paired `ferrum-baseline → ferrum` ratios. A missing local image is pulled only when it is a published `ferrumedge/ferrum-edge:main-<40-hex sha>` (or its `ghcr.io/ferrum-edge/ferrum-edge` copy, optionally `@sha256:` pinned); anything else is refused. |
+
+Other protocols in the same dispatch keep their ordinary workload and record
+it. The options cannot be combined with the profile lanes or an enabled H2
+campaign manifest, which verify their own fixed-window, pooled environment.
+Only Ferrum's windows change: Envoy and Tyk keep their shipped settings while
+their client and backend drop to 64 KiB, so skip them for a Ferrum-only
+reading. The published `main-<sha>` image is built from the same `Dockerfile`
+target and `FEATURES=cloud-secrets` as the locally built `ferrum-edge:bench`
+image, but by `main-latest-image.yml` rather than in this job.
+
+For `http2` and `grpcs`, each sample also records `backend_connections`: the
+connections the echo backend accepted (and, on 3443, TLS handshakes it
+completed) while that sample ran, its echoes, and connections per 1,000
+echoes. The combined summary prints them with each pair's p99. They count
+connections a gateway opened during the sample; pool warmup and earlier
+samples on the same arm are in `accepted_since_backend_start`.
+
+**64 KiB-window cost (#6038).** The pipe-wake cost of hyper patch 005 appears
+only when a body chunk exceeds the stream window. Pair the dispatched `main`
+with the newest published image before #6036 (`main-7dec94b8…`, whose only
+later change before #6036 is #6035), once with `h2_window=64k` and once with
+`h2_window=default` as the control. The patch's window-limited cost is the
+change in the `ferrum-baseline → ferrum` ratio between the two runs; the
+default run absorbs the other commits since that image.
+
+```bash
+for window in 64k default; do
+  gh workflow run gateways-protocol-benchmark.yml --ref main \
+    -f h2_window="$window" -f duration=15 -f iterations=2 \
+    -f skip_protocols="http1-tls http3 wss tcp-tls udp udp-dtls" \
+    -f skip_gateways="envoy kong tyk krakend" \
+    -f baseline_image=ferrumedge/ferrum-edge:main-7dec94b86d0d13b665d1bf0f85fd267aa9c483e2@sha256:13d3112f09a4c0ff63ad6271debb6022121c461734b717ddcd8b4c06ea3f4273
+done
+```
+
+**gRPC connection affinity (#5991, #6022 item 6).** Affinity has no runtime
+toggle; it applies to every gRPC pool with more than one connection per host.
+Pair the dispatched `main` against the published image of #5991's parent
+(`main-cc2499b2…`), pooled and per-RPC, at 10 KiB and 5 MiB; `http2` covers the
+direct HTTP/2 pool, which keeps round-robin:
+
+```bash
+gh workflow run gateways-protocol-benchmark.yml --ref main \
+  -f duration=15 -f iterations=3 \
+  -f skip_protocols="http1-tls http3 wss tcp-tls udp udp-dtls" \
+  -f skip_gateways="envoy kong tyk krakend" \
+  -f skip_payload_sizes="71680 512000 1048576" \
+  -f baseline_image=ferrumedge/ferrum-edge:main-cc2499b25a03c52fa7238eee2fe53ba563bfba68@sha256:7bf4da1c4bf4b5922b6b88bc7e2cf7c87f808f1f222821601f2dce91a5001b5c
+gh workflow run gateways-protocol-benchmark.yml --ref main \
+  -f grpc_client_connections=per-rpc -f duration=15 -f iterations=3 \
+  -f skip_protocols="http1-tls http2 http3 wss tcp-tls udp udp-dtls" \
+  -f skip_gateways="envoy kong tyk krakend" \
+  -f skip_payload_sizes="71680 512000 1048576" \
+  -f baseline_image=ferrumedge/ferrum-edge:main-cc2499b25a03c52fa7238eee2fe53ba563bfba68@sha256:7bf4da1c4bf4b5922b6b88bc7e2cf7c87f808f1f222821601f2dce91a5001b5c
+```
+
+That baseline also lacks everything merged after #5991. To isolate affinity
+alone, push a branch with only the affinity revert on top of `main`, dispatch
+the same commands with `--ref` set to that branch, and pass the published
+`main-<sha>` image of the commit it is based on as `baseline_image` (the
+`ferrum-baseline` arm then has affinity and the `ferrum` arm does not). Pick a
+base commit whose `main-<sha>` tag exists on Docker Hub; `main-latest-image.yml`
+can skip intermediate commits. Pin and verify its digest as below.
+
+**Pinned, signed baselines.** Both recipes pin the image index digest after the
+tag (`main-<sha>@sha256:<digest>`; Docker resolves the digest and ignores the
+tag), so a re-pushed tag cannot change the baseline. `main-latest-image.yml` can
+leave an unsigned `main-<sha>` behind when it fails between `manifest` and
+signing, so verify the keyless Cosign signature of each pinned digest before
+dispatching, with the identity that workflow signs under (see
+[`docs/ci_cd.md` → "Main latest image"](../../../docs/ci_cd.md#main-latest-image)):
+
+```bash
+for ref in \
+  ferrumedge/ferrum-edge@sha256:13d3112f09a4c0ff63ad6271debb6022121c461734b717ddcd8b4c06ea3f4273 \
+  ferrumedge/ferrum-edge@sha256:7bf4da1c4bf4b5922b6b88bc7e2cf7c87f808f1f222821601f2dce91a5001b5c
+do
+  cosign verify \
+    --certificate-identity "https://github.com/ferrum-edge/ferrum-edge/.github/workflows/main-latest-image.yml@refs/heads/main" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "$ref" > /dev/null && echo "verified $ref"
+done
+```
+
+For another baseline, resolve its digest with
+`docker buildx imagetools inspect ferrumedge/ferrum-edge:main-<sha> --format '{{json .Manifest}}' | jq -r .digest`,
+verify that digest the same way, and pass `main-<sha>@<digest>`. The runner
+itself checks only the reference format, not the signature.
 
 ### H2/gRPC transport observation campaign (#5588, section 3)
 
@@ -1103,6 +1226,61 @@ both protocols at 10/70/500 KiB and 1/5 MiB with fixed adaptive=false. The repor
 retains failed/missing observations and distinguishes useful traffic from profile
 completeness. CPU stacks, hardware cache evidence and downstream stream-credit
 wait remain unavailable; correctness disposition and dispatch belong to root.
+
+## Allocations per request (#6022 item 1)
+
+`alloc_per_request.sh` measures Rust allocator calls per proxied request on
+five dispatch paths. It builds `ferrum-edge` with the default-off
+`bench-h1-profile` feature, whose forwarding global allocator counts every
+allocator call in the process and appends the totals to `/metrics` (see
+[the allocator contract](../../../docs/h1_internal_profile.md)); the feature
+changes nothing else on the request path. Each run starts the gateway natively
+with its defaults (plus admin/metrics on loopback and pool warmup, so the
+capability registry routes `h2` and `h3` to the direct pools), warms it,
+scrapes the counters and the backend's `/bench-stats`, runs a closed-loop
+`proto_bench` load, and scrapes both again. The result is
+(`alloc` + `alloc_zeroed` calls) ÷ backend echoes; `realloc`, requested bytes,
+the unpublished-event bound and an idle background estimate are reported
+beside it.
+
+| Path | Client → gateway → backend | Ferrum dispatch |
+|---|---|---|
+| `h1` | HTTP/1.1 → HTTP/1.1 (`http1_perf.yaml`) | direct hyper HTTP/1.1 pool (default) |
+| `h1-reqwest` | the same, `FERRUM_POOL_HTTP1_DIRECT=false` | reqwest |
+| `h2` | HTTP/2+TLS → HTTP/2+TLS (`http2_perf.yaml`) | direct HTTP/2 pool |
+| `grpc` | gRPC+TLS → gRPC+TLS (`grpcs_e2e_perf.yaml`) | gRPC pool |
+| `h3` | HTTP/3 → HTTP/3 (`http3_perf.yaml`) | native HTTP/3 pool |
+
+With `--baseline SHA` it builds that commit the same way in a worktree and
+alternates candidate/baseline order per round on the same host; the harness
+tools always come from the dispatched revision. The baseline must already have
+the `bench-h1-profile` feature (added well before #5993). The hosted lane is the
+manual `Allocations Per Request` workflow (`.github/workflows/alloc-per-request.yml`);
+the summary table lands in the job summary and every raw scrape, client result
+and per-run `result.json` in the `alloc-per-request-<sha>-<attempt>` artifact.
+To compare against the commit before #5993 (`67a57af8e`):
+
+```bash
+gh workflow run alloc-per-request.yml --ref main \
+  -f baseline_sha=67a57af8ea31e9e126c22381cdd7d01b6ea5f837
+```
+
+Defaults are all five paths, the shipping `release` profile, 20-second runs at
+concurrency 32 with 1 KiB echoes, and three rounds; `profile=ci-release`
+trades fidelity for a faster build. The hosted `duration` is a choice of 5, 10,
+20 or 30 seconds so the largest run still fits the 240-minute job timeout with
+its two builds. The measurement step fails when any run
+errored or lost counter events; the artifact still uploads. Counts are
+steady-state per-request costs under a closed-loop keep-alive load, not a
+per-request trace: connection setup is amortized, and allocations other
+threads make during the window (timers, admin, the metrics scrape) are in the
+total, which the idle estimate bounds. Locally on Linux (the baseline worktree
+and the temp dir are removed on exit):
+
+```bash
+bash tests/performance/multi_protocol/alloc_per_request.sh --output /tmp/alloc \
+  --baseline <sha> --paths "h1 h2" --profile ci-release --rounds 1
+```
 
 ## UDP internal profile campaign
 

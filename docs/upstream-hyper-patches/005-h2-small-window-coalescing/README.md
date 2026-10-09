@@ -184,10 +184,10 @@ deadlock:
   window-limited stream, each paying a task wake and a `send_data` call.
   With the benchmark's 8 MiB stream windows a chunk rarely exceeds its
   window, so this case does not arise in the default protocol matrix (the
-  send-buffer case above did). The peer
-  windows are fixed in `proto_bench` and `proto_backend`
-  (`tests/performance/multi_protocol/`), so no hosted benchmark workflow can
-  run the 64 KiB case yet; measuring it needs a window option there first.
+  send-buffer case above did). The protocol benchmark's `h2_window=64k`
+  dispatch input now runs that case on every hop (see
+  `tests/performance/multi_protocol/README.md`); the measurement itself is
+  still pending.
 
 ### Not covered
 

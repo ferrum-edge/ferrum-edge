@@ -47,6 +47,64 @@ use bench_proto::{EchoRequest, EchoResponse};
 // keep client (proto_bench) and server (proto_backend) in lockstep here.
 const GRPC_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Initial HTTP/2 stream window of every h2/gRPC listener when
+/// `BENCH_H2_STREAM_WINDOW` is unset: the historical fixed 8 MiB.
+const DEFAULT_H2_STREAM_WINDOW: u32 = 8_388_608;
+
+/// The h2/gRPC listeners' initial stream window. The harness sets
+/// `BENCH_H2_STREAM_WINDOW=65535` for the small-window cost run (#6038); any
+/// other value must be a legal HTTP/2 window, or the backend refuses to start.
+fn h2_stream_window() -> anyhow::Result<u32> {
+    let Ok(raw) = std::env::var("BENCH_H2_STREAM_WINDOW") else {
+        return Ok(DEFAULT_H2_STREAM_WINDOW);
+    };
+    let window: u32 = raw
+        .parse()
+        .with_context(|| format!("BENCH_H2_STREAM_WINDOW={raw:?} is not an integer"))?;
+    if !(65_535..=2_147_483_647).contains(&window) {
+        anyhow::bail!("BENCH_H2_STREAM_WINDOW={window} is outside 65535..=2147483647");
+    }
+    Ok(window)
+}
+
+/// Cumulative counters the harness reads from `GET /bench-stats` before and
+/// after each sample (#6022). The differences are the backend connections a
+/// gateway opened during that sample and the echoes it forwarded.
+struct BackendStats {
+    /// TCP connections accepted on the HTTPS/H2 listener (3443).
+    h2_tls_accepted: AtomicU64,
+    /// Of those, TLS handshakes that completed.
+    h2_tls_handshakes: AtomicU64,
+    /// TCP connections accepted on the gRPC+TLS listener (50053). Tonic owns
+    /// that TLS handshake, so this counts accepts, not completed handshakes.
+    grpcs_accepted: AtomicU64,
+    /// `/echo` requests on every HTTP listener, HTTP/3 included.
+    http_echo_requests: AtomicU64,
+    /// `UnaryEcho` calls on both gRPC listeners.
+    grpc_echo_requests: AtomicU64,
+}
+
+static STATS: BackendStats = BackendStats {
+    h2_tls_accepted: AtomicU64::new(0),
+    h2_tls_handshakes: AtomicU64::new(0),
+    grpcs_accepted: AtomicU64::new(0),
+    http_echo_requests: AtomicU64::new(0),
+    grpc_echo_requests: AtomicU64::new(0),
+};
+
+fn stats_json() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "h2_tls_accepted": STATS.h2_tls_accepted.load(Ordering::Relaxed),
+            "h2_tls_handshakes": STATS.h2_tls_handshakes.load(Ordering::Relaxed),
+            "grpcs_accepted": STATS.grpcs_accepted.load(Ordering::Relaxed),
+            "http_echo_requests": STATS.http_echo_requests.load(Ordering::Relaxed),
+            "grpc_echo_requests": STATS.grpc_echo_requests.load(Ordering::Relaxed),
+        })
+        .to_string(),
+    )
+}
+
 #[derive(Default)]
 struct BenchServiceImpl;
 
@@ -56,6 +114,7 @@ impl BenchService for BenchServiceImpl {
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
+        STATS.grpc_echo_requests.fetch_add(1, Ordering::Relaxed);
         let payload = request.into_inner().payload;
         let timestamp_us = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -139,8 +198,14 @@ async fn handle_http(req: Request<Incoming>) -> Result<Response<BackendBody>, In
                 b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}",
             )))
             .unwrap_or_else(|_| Response::new(one_shot(Bytes::new()))),
+        (_, "/bench-stats") => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(one_shot(stats_json()))
+            .unwrap_or_else(|_| Response::new(one_shot(Bytes::new()))),
         (_, "/echo") => {
             use http_body_util::BodyExt;
+            STATS.http_echo_requests.fetch_add(1, Ordering::Relaxed);
             let body = req
                 .into_body()
                 .collect()
@@ -243,7 +308,7 @@ async fn run_http1_health_server(addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
-async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
+async fn run_h2c_server(addr: SocketAddr, stream_window: u32) -> anyhow::Result<()> {
     let observer = Observer::new(
         std::env::var("BENCH_H2_OBSERVE").as_deref() == Ok("1"),
         "backend_h2c",
@@ -263,7 +328,7 @@ async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
             // Fixed windows only: `adaptive_window(true)` resets both to 65,535
             // and intermittently stalls streams (see `run_http2` in proto_bench).
             let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .initial_stream_window_size(8_388_608) // 8 MiB
+                .initial_stream_window_size(stream_window) // 8 MiB unless lowered
                 .initial_connection_window_size(33_554_432) // 32 MiB
                 .max_frame_size(1_048_576) // 1 MiB
                 .max_concurrent_streams(1000)
@@ -307,6 +372,7 @@ async fn run_h1_tls_server(
 async fn run_h2_tls_server(
     addr: SocketAddr,
     tls_cfg: Arc<rustls::ServerConfig>,
+    stream_window: u32,
 ) -> anyhow::Result<()> {
     let observer = Observer::new(
         std::env::var("BENCH_H2_OBSERVE").as_deref() == Ok("1"),
@@ -319,6 +385,7 @@ async fn run_h2_tls_server(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
     loop {
         let (stream, _) = listener.accept().await?;
+        STATS.h2_tls_accepted.fetch_add(1, Ordering::Relaxed);
         let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         let observer = observer.clone();
@@ -327,12 +394,13 @@ async fn run_h2_tls_server(
             let Ok(tls_stream) = acceptor.accept(stream).await else {
                 return;
             };
+            STATS.h2_tls_handshakes.fetch_add(1, Ordering::Relaxed);
             observer.record(connection_id, None, None, "connection_opened", None);
             let io = TokioIo::new(tls_stream);
             // Fixed windows only: `adaptive_window(true)` resets both to 65,535
             // and intermittently stalls streams (see `run_http2` in proto_bench).
             let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .initial_stream_window_size(8_388_608) // 8 MiB
+                .initial_stream_window_size(stream_window) // 8 MiB unless lowered
                 .initial_connection_window_size(33_554_432) // 32 MiB
                 .max_frame_size(1_048_576) // 1 MiB
                 .max_concurrent_streams(1000)
@@ -401,9 +469,9 @@ async fn run_wss_server(
     }
 }
 
-async fn run_grpc_server(addr: SocketAddr) -> anyhow::Result<()> {
+async fn run_grpc_server(addr: SocketAddr, stream_window: u32) -> anyhow::Result<()> {
     tonic::transport::Server::builder()
-        .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
+        .initial_stream_window_size(stream_window) // 8 MiB unless lowered (vs 64 KB default)
         .initial_connection_window_size(33_554_432) // 32 MiB
         .tcp_nodelay(true)
         .add_service(
@@ -424,24 +492,38 @@ async fn run_grpcs_server(
     addr: SocketAddr,
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
+    stream_window: u32,
 ) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
     let cert_pem = std::fs::read(cert_path).context("reading grpcs cert")?;
     let key_pem = std::fs::read(key_path).context("reading grpcs key")?;
     let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
     let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+    // Bind the listener here instead of `serve(addr)` so every accepted TCP
+    // connection is counted. Tonic still runs the TLS handshake on these
+    // streams; `with_nodelay` replaces the builder's `tcp_nodelay`, which
+    // `serve_with_incoming` ignores.
+    let incoming = tonic::transport::server::TcpIncoming::bind(addr)
+        .context("binding grpcs listener")?
+        .with_nodelay(Some(true))
+        .inspect(|accepted| {
+            if accepted.is_ok() {
+                STATS.grpcs_accepted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
 
     tonic::transport::Server::builder()
         .tls_config(tls)
         .context("configuring grpcs TLS")?
-        .initial_stream_window_size(8_388_608)
+        .initial_stream_window_size(stream_window)
         .initial_connection_window_size(33_554_432)
-        .tcp_nodelay(true)
         .add_service(
             BenchServiceServer::new(BenchServiceImpl)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES),
         )
-        .serve(addr)
+        .serve_with_incoming(incoming)
         .await
         .context("grpcs server error")
 }
@@ -558,6 +640,7 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
                     let path = req.uri().path().to_string();
 
                     if path == "/echo" {
+                        STATS.http_echo_requests.fetch_add(1, Ordering::Relaxed);
                         if profile {
                             accepted.fetch_add(1, Ordering::Relaxed);
                         }
@@ -773,6 +856,7 @@ async fn main() -> anyhow::Result<()> {
         [flag] if flag == "--h3-only" => true,
         _ => anyhow::bail!("usage: proto_backend [--h3-only]"),
     };
+    let h2_window = h2_stream_window()?;
     // Generate self-signed certs for TLS/DTLS servers
     let cert_dir = std::env::current_dir()?.join("certs");
     let (cert_path, key_path) =
@@ -815,6 +899,7 @@ async fn main() -> anyhow::Result<()> {
     println!("UDP Echo:          127.0.0.1:3005");
     println!("HTTP/3 (QUIC):     127.0.0.1:3445");
     println!("DTLS Echo:         127.0.0.1:3006");
+    println!("HTTP/2 stream window: {h2_window} bytes");
     println!("=============================");
 
     let cert_str = cert_path.to_string_lossy().to_string();
@@ -831,8 +916,8 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("http1 health error: {e}");
         }
     });
-    tokio::spawn(async {
-        if let Err(e) = run_h2c_server("127.0.0.1:3002".parse().unwrap()).await {
+    tokio::spawn(async move {
+        if let Err(e) = run_h2c_server("127.0.0.1:3002".parse().unwrap(), h2_window).await {
             eprintln!("h2c server error: {e}");
         }
     });
@@ -849,7 +934,9 @@ async fn main() -> anyhow::Result<()> {
                 .context("building h2-tls server config")?,
         );
         tokio::spawn(async move {
-            if let Err(e) = run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), h2_tls).await {
+            if let Err(e) =
+                run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), h2_tls, h2_window).await
+            {
                 eprintln!("h2-tls server error: {e}");
             }
         });
@@ -890,8 +977,8 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    tokio::spawn(async {
-        if let Err(e) = run_grpc_server("127.0.0.1:50052".parse().unwrap()).await {
+    tokio::spawn(async move {
+        if let Err(e) = run_grpc_server("127.0.0.1:50052".parse().unwrap(), h2_window).await {
             eprintln!("grpc server error: {e}");
         }
     });
@@ -899,8 +986,13 @@ async fn main() -> anyhow::Result<()> {
         let grpcs_cert = cert_path.clone();
         let grpcs_key = key_path.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_grpcs_server("127.0.0.1:50053".parse().unwrap(), &grpcs_cert, &grpcs_key).await
+            if let Err(e) = run_grpcs_server(
+                "127.0.0.1:50053".parse().unwrap(),
+                &grpcs_cert,
+                &grpcs_key,
+                h2_window,
+            )
+            .await
             {
                 eprintln!("grpcs server error: {e}");
             }
