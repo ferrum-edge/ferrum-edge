@@ -1,0 +1,118 @@
+name: Retained CPU Decode Experiment
+
+on:
+  push:
+    branches: [bench/cpu-profile-decode-codex]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  replay:
+    name: Decode retained run ${{ matrix.run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [37918132309, 37918126986]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Install the distribution decoder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-generic linux-tools-common binutils
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          run-id: ${{ matrix.run }}
+          github-token: ${{ github.token }}
+          pattern: h2-cpu-*
+          merge-multiple: true
+          path: retained
+      - name: Replay verified raw samples through the bounded shared decoder
+        env:
+          SOURCE_RUN: ${{ matrix.run }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          import time
+
+          root = Path('retained').resolve()
+          output = Path('replayed').resolve()
+          output.mkdir()
+          sys.path.insert(0, str(Path('tests/performance/multi_protocol').resolve()))
+          import h1_trace as trace
+
+          candidates = sorted({p.resolve() for p in Path('/usr/lib/linux-tools').glob('*/perf') if p.is_file()})
+          assert candidates
+          perf = candidates[-1]
+          with perf.open('rb') as stream:
+              assert stream.read(4) == b'\x7fELF'
+          trace.STAGE.mkdir(mode=0o755)
+          shutil.copyfile(perf, trace.STAGE / 'perf')
+          (trace.STAGE / 'perf').chmod(0o755)
+          (trace.STAGE / 'buildid-cache').mkdir(mode=0o700)
+          trace.command('perf-version', output / 'perf-version.txt')
+
+          def digest(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+          def within(path):
+              path = path.resolve()
+              assert path.is_relative_to(root)
+              return path
+
+          rows = []
+          manifests = sorted((root / 'cpu').rglob('trace-manifest.json'))
+          assert len(manifests) == 4
+          for path in manifests:
+              original = json.loads(path.read_text())
+              raw = path.parent / 'perf.data'
+              assert digest(raw) == original['artifacts']['perf.data']['sha256']
+              mappings = json.loads((path.parent / 'build-mappings.json').read_text())
+              package = within(root / original['symbol_package'].split('/h2-cpu-evidence/', 1)[1])
+              for dso in mappings['dsos']:
+                  binary = within(package / dso['path'].lstrip('/'))
+                  assert binary.stat().st_size == dso['bytes']
+                  assert digest(binary) == dso['sha256']
+              folder = output / path.parent.relative_to(root)
+              folder.mkdir(parents=True)
+              shutil.copyfile(raw, folder / 'perf.data')
+              before = time.monotonic()
+              decoded = trace.cpu_decode(folder, {original['identity']['pid']}, mappings, symfs=package)
+              seconds = time.monotonic() - before
+              trace.write(folder / 'decoded.json', decoded)
+              blocking = [i for i in decoded['issues'] if i not in (
+                  'missing matching ELF/build IDs/CFI', 'partial unwinding/unresolved samples')]
+              row = dict(source_run=int(os.environ['SOURCE_RUN']), source_revision=(root / 'revision.txt').read_text().strip(),
+                  decoder_revision=os.environ['GITHUB_SHA'], source_manifest_sha256=digest(path),
+                  raw_sha256=digest(raw), path=str(path.parent.relative_to(root)),
+                  original_capture_complete=original['capture_complete'], original_issues=original['issues'],
+                  replay_seconds=seconds, blocking_issues=blocking,
+                  samples=decoded['samples'], raw_sample_records=decoded['raw_sample_records'],
+                  multi_frame_samples=decoded['multi_frame_samples'], unresolved_samples=decoded['unresolved_samples'],
+                  inline_expansion=decoded['inline_expansion'], decoder_status=decoded['decoder_status'])
+              rows.append(row)
+              print(json.dumps(row), flush=True)
+          trace.write(output / 'replay-summary.json', dict(experiment_only=True, observations=rows,
+              limits=['Offline decoding does not repeat traffic or change control drift.',
+                      'Original capture results remain retained; this is new decoding evidence.',
+                      'Inline expansion is disabled; partial/unresolved frames remain explicit.']))
+          assert all(not row['blocking_issues'] for row in rows)
+          PY
+      - name: Retain replay outputs even on failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cpu-decode-replay-${{ matrix.run }}-${{ github.sha }}
+          path: replayed/
+          retention-days: 14
