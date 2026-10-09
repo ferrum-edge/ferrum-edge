@@ -4489,6 +4489,10 @@ pub(crate) async fn buffer_request_body_for_before_proxy(
     // cancellation alike.
     let budget_permit = response_buffer_budget::RequestBufferPermit::reserve(ceiling)
         .ok_or(RequestBodyBufferError::BufferCapacityExceeded)?;
+    // An HTTP/2 client's masked reset is a client disconnect here, never a
+    // complete body (issue #6022).
+    let require_end_stream = parts.version == hyper::Version::HTTP_2;
+    let body = body::H2EndStreamGated::new(body, require_end_stream);
     let limited = http_body_util::Limited::new(body, ceiling);
     let collected = match route_deadline_at {
         None => {
@@ -49582,8 +49586,12 @@ async fn proxy_to_backend(
                             );
                         }
                     };
-                let limited =
-                    http_body_util::Limited::new((*original_req).into_body(), retained_ceiling);
+                // A masked HTTP/2 client reset is a disconnect, not a complete
+                // body (issue #6022); see `body::H2EndStreamGated`.
+                let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
+                let gated =
+                    body::H2EndStreamGated::new((*original_req).into_body(), require_end_stream);
+                let limited = http_body_util::Limited::new(gated, retained_ceiling);
                 let body_bytes = match collect_request_body_under_authorization(
                     limited.collect(),
                     request_ctx.grpc_deadline_at(),

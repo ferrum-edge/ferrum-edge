@@ -7138,13 +7138,21 @@ impl EnvConfig {
     /// still be rejected by a later check, and the non-serving
     /// `ferrum-edge validate` command must not touch the live process at all.
     ///
-    /// Currently one setting: the finite authenticated-stream maximum that
-    /// bounds every admitted authenticated non-WebSocket stream
-    /// (`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`). `validate` has
-    /// already constrained it to `1..=86400`.
+    /// Two settings:
+    ///
+    /// * the finite authenticated-stream maximum that bounds every admitted
+    ///   authenticated non-WebSocket stream
+    ///   (`FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS`). `validate` has
+    ///   already constrained it to `1..=86400`.
+    /// * the frontend HTTP/2 initial stream window
+    ///   (`FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE`, already clamped at
+    ///   parse), which sizes the upload pump's post-cancel reset probe.
     pub(crate) fn publish_process_wide_stream_settings(&self) {
         crate::proxy::auth_lifetime::publish_authenticated_stream_max_lifetime_seconds(
             self.authenticated_stream_max_lifetime_seconds,
+        );
+        crate::proxy::upload_pump::publish_frontend_h2_stream_window(
+            self.frontend_h2_initial_stream_window_size,
         );
     }
 

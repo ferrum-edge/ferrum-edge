@@ -15000,6 +15000,58 @@ pub mod _test_support {
         }
     }
 
+    /// Terminal outcome of the PRODUCTION buffered native-gRPC request collect
+    /// (`collect_grpc_request_body`), projected from the crate-private error.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GrpcBufferedCollectOutcomeForTest {
+        Collected(usize),
+        ResourceExhausted,
+        ReadFailed,
+        TimedOut,
+        DeadlineExceeded,
+        AuthorizationExpired,
+        OtherProxyError,
+    }
+
+    /// Run the PRODUCTION buffered native-gRPC collect over a real hyper
+    /// request: unauthenticated and with no client RPC deadline.
+    pub async fn collect_grpc_request_body_for_test(
+        request: hyper::Request<hyper::body::Incoming>,
+        max_grpc_recv_size_bytes: usize,
+        request_body_read_timeout_ms: u64,
+    ) -> GrpcBufferedCollectOutcomeForTest {
+        use crate::proxy::grpc_proxy::{GrpcProxyError, GrpcRequestBodyCollectError};
+        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body(
+            request,
+            max_grpc_recv_size_bytes,
+            request_body_read_timeout_ms,
+            None,
+            None,
+        )
+        .await;
+        match collected {
+            Ok((_, _, body)) => GrpcBufferedCollectOutcomeForTest::Collected(body.len()),
+            Err(GrpcRequestBodyCollectError::Proxy(GrpcProxyError::ResourceExhausted(_))) => {
+                GrpcBufferedCollectOutcomeForTest::ResourceExhausted
+            }
+            Err(GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(_))) => {
+                GrpcBufferedCollectOutcomeForTest::ReadFailed
+            }
+            Err(GrpcRequestBodyCollectError::Proxy(_)) => {
+                GrpcBufferedCollectOutcomeForTest::OtherProxyError
+            }
+            Err(GrpcRequestBodyCollectError::TimedOut) => {
+                GrpcBufferedCollectOutcomeForTest::TimedOut
+            }
+            Err(GrpcRequestBodyCollectError::DeadlineExceeded) => {
+                GrpcBufferedCollectOutcomeForTest::DeadlineExceeded
+            }
+            Err(GrpcRequestBodyCollectError::AuthorizationExpired(_)) => {
+                GrpcBufferedCollectOutcomeForTest::AuthorizationExpired
+            }
+        }
+    }
+
     /// Split a previewed route total as every early collector does: gRPC
     /// folds it into the RPC deadline, every other request keeps it apart.
     pub fn early_upload_deadlines_for_test(

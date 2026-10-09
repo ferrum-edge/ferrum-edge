@@ -20,8 +20,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::{BoxError, PUMP_CANCELLED, PUMP_SOURCE_ERROR, PUMP_SOURCE_RESET};
 use super::{UploadPumpJoin, UploadPumpOutcome, UploadPumpSource};
 use super::{
-    is_h2_source_cancel, spawn_upload_pump, spawn_upload_pump_with_deferred_write,
-    upload_pump_error_message,
+    is_h2_source_cancel, source_already_reset, source_reset_probe_polls, spawn_upload_pump,
+    spawn_upload_pump_with_deferred_write, upload_pump_error_message,
 };
 
 const PRIVATE_DETAIL: &str = "private client detail: CANCEL credential=must-not-escape";
@@ -444,4 +444,143 @@ fn production_incoming_and_infallible_bodies_satisfy_both_spawn_bounds() {
     accepts::<http_body_util::Empty<Bytes>>();
     accepts::<ProbeBody<BoxError>>();
     accepts::<ProbeBody<std::io::Error>>();
+}
+
+/// How a probed client body ends after its buffered DATA.
+#[derive(Clone, Copy, Debug)]
+enum ProbeEnd {
+    /// An explicit `RST_STREAM(CANCEL)`.
+    Cancel,
+    /// A masked `RST_STREAM(NO_ERROR)`: EOF without END_STREAM.
+    MaskedReset,
+    /// The client's own END_STREAM.
+    EndStream,
+}
+
+/// `frames` DATA frames of `frame_len` bytes, already received, then `end`.
+fn buffered_upload(
+    frames: usize,
+    frame_len: usize,
+    end: ProbeEnd,
+) -> (ProbeBody<h2::Error>, Arc<BodyState>) {
+    let state = Arc::new(BodyState::default());
+    let chunk = Bytes::from(vec![0u8; frame_len]);
+    let mut queued = VecDeque::with_capacity(frames + 1);
+    for _ in 0..frames {
+        queued.push_back(Ok(Frame::data(chunk.clone())));
+    }
+    if matches!(end, ProbeEnd::Cancel) {
+        queued.push_back(Err(h2::Error::from(h2::Reason::CANCEL)));
+    }
+    let body = ProbeBody {
+        frames: queued,
+        state: Arc::clone(&state),
+        clean_end: matches!(end, ProbeEnd::EndStream),
+    };
+    (body, state)
+}
+
+#[test]
+fn reset_probe_budget_is_sized_from_the_stream_window() {
+    // One poll per 4 KiB of window plus 16 slack polls; the old fixed bound
+    // was 16 polls at every window.
+    assert_eq!(source_reset_probe_polls(65_535), 16 + 16);
+    assert_eq!(source_reset_probe_polls(256 * 1024), 64 + 16);
+    assert_eq!(source_reset_probe_polls(8 * 1024 * 1024), 2_048 + 16);
+    // Capped at one window of 16 KiB frames at the 128 MiB maximum.
+    assert_eq!(source_reset_probe_polls(128 * 1024 * 1024), 8_192 + 16);
+    assert_eq!(source_reset_probe_polls(u32::MAX), 8_192 + 16);
+}
+
+/// Issue #6038 (from the #6043 review): a client that filled its window while
+/// the backend stalled has a full window of DATA buffered ahead of its
+/// RST_STREAM. With the default 256 KiB window and 16 KiB frames that is 16
+/// frames, and the old 16-poll probe stopped one short of the reset, so the
+/// backend got INTERNAL_ERROR instead of the client's CANCEL. The probe must
+/// reach the reset behind a full window at every window size and frame size it
+/// budgets for.
+#[test]
+fn reset_probe_reaches_a_reset_behind_a_full_window() {
+    for window in [65_535u32, 256 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
+        for frame_len in [16_384usize, 8_192, 4_096] {
+            let window_len = usize::try_from(window).unwrap();
+            let frames = window_len / frame_len;
+            for end in [ProbeEnd::Cancel, ProbeEnd::MaskedReset] {
+                let (mut body, state) = buffered_upload(frames, frame_len, end);
+                assert!(
+                    source_already_reset(&mut body, window),
+                    "window {window}, {frames} x {frame_len} B, {end:?}"
+                );
+                assert_eq!(state.polls.load(Ordering::Relaxed), frames + 1);
+            }
+            let (mut body, _) = buffered_upload(frames, frame_len, ProbeEnd::EndStream);
+            assert!(
+                !source_already_reset(&mut body, window),
+                "a clean END_STREAM is not a reset (window {window}, {frame_len} B)"
+            );
+        }
+    }
+}
+
+#[test]
+fn reset_probe_stops_after_one_window_of_a_live_upload() {
+    // More DATA than one window cannot all be buffered ahead of a reset: the
+    // client is still streaming on released credit. The probe stops on the
+    // frame that overruns the window instead of draining the live upload.
+    let window = 256 * 1024;
+    let (mut body, state) = buffered_upload(17, 16_384, ProbeEnd::Cancel);
+    assert!(!source_already_reset(&mut body, window));
+    assert_eq!(state.polls.load(Ordering::Relaxed), 17);
+    assert_eq!(body.frames.len(), 1, "the reset after the overrun is not read");
+}
+
+#[test]
+fn reset_probe_poll_budget_bounds_tiny_frames() {
+    // Documented gap: a full window of frames smaller than the budget assumes
+    // reaches the backend as the gateway's own cancellation. Still a reset.
+    let window = 256 * 1024;
+    let budget = source_reset_probe_polls(window);
+    let (mut body, state) = buffered_upload(budget, 1_024, ProbeEnd::Cancel);
+    assert!(!source_already_reset(&mut body, window));
+    assert_eq!(state.polls.load(Ordering::Relaxed), budget);
+}
+
+#[test]
+fn reset_probe_never_waits_for_data_not_yet_received() {
+    let reset = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(BodyState::default());
+    let mut body = LateResetBody {
+        reset: Arc::clone(&reset),
+        state: Arc::clone(&state),
+    };
+    assert!(!source_already_reset(&mut body, 256 * 1024));
+    assert_eq!(state.polls.load(Ordering::Relaxed), 1);
+    reset.store(true, Ordering::Release);
+    assert!(source_already_reset(&mut body, 256 * 1024));
+}
+
+/// End to end through a pump parked on a stalled backend: the bridge holds one
+/// frame, so the rest of a full window of 8 KiB frames plus the client's
+/// CANCEL are still buffered when the dispatcher cancels. The pump must report
+/// the client's reset; the old 16-poll probe stopped 15 frames short of it.
+#[tokio::test]
+async fn cancelled_pump_behind_a_stalled_backend_keeps_the_clients_reset() {
+    // The published window is the 256 KiB default in this process: 32 frames
+    // of 8 KiB fill it.
+    let (body, state) = buffered_upload(32, 8_192, ProbeEnd::Cancel);
+    let (source, join) = spawn_upload_pump(body, None, 0, true);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let polled = state.polls.load(Ordering::Relaxed);
+    assert!(
+        (1..32).contains(&polled),
+        "the pump is parked on the full bridge ({polled} polls)"
+    );
+    assert_eq!(
+        join.cancel_and_join().await,
+        Some(UploadPumpOutcome::Cancelled)
+    );
+    assert_eq!(state.releases.load(Ordering::Acquire), 1);
+    assert_eq!(source.terminal.load(Ordering::Acquire), PUMP_SOURCE_RESET);
 }
