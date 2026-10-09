@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - H3 live socket-lifecycle observers recognize Linux 7.0's `sockaddr_unsized`
   pointer in `inet_bind`, while retaining exact argument, return and pointer
   checks. Synthetic BTF regressions reject unrelated or changed signatures.
+  Classic selection correlates through the typed lookup socket's captured cookie,
+  avoiding a flexible-array read rejected by the new kernel verifier.
 
 - The scheduled vendored-patch audit distinguishes an unreviewed upstream merge
   from a reviewed fix that has not shipped. Release holds bind the exact merge
