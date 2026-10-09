@@ -6822,36 +6822,6 @@ impl EnvConfig {
         }
     }
 
-    /// The settings that keep Gateway API expansion of MCS `ServiceImport`
-    /// EndpointSlices from refusing every address that belongs to this
-    /// cluster (issue #6123), or `None` when expansion does not run or both
-    /// the Node watch and a cluster-wide Pod watch are configured.
-    ///
-    /// Imported endpoints are remote by design, so they are admitted either
-    /// way; without the Node watch a Node address or Node Pod CIDR, and
-    /// without a cluster-wide Pod watch another namespace's Pod, looks like
-    /// one. `pod_watch_cluster_wide` is whether the controller's Pod watch
-    /// scope covers every namespace.
-    pub fn k8s_service_import_unchecked_reason(
-        &self,
-        pod_watch_cluster_wide: bool,
-    ) -> Option<&'static str> {
-        if !self.k8s_controller_enabled
-            || !self.k8s_pod_discovery_enabled
-            || !self.k8s_watch_gateway_api_crds
-        {
-            None
-        } else if !self.k8s_node_locality_enabled && !pod_watch_cluster_wide {
-            Some("FERRUM_K8S_NODE_LOCALITY_ENABLED=false and a restricted Pod watch scope")
-        } else if !self.k8s_node_locality_enabled {
-            Some("FERRUM_K8S_NODE_LOCALITY_ENABLED=false")
-        } else if !pod_watch_cluster_wide {
-            Some("a restricted Pod watch scope")
-        } else {
-            None
-        }
-    }
-
     /// Whether `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true` was
     /// requested and the Node watch it needs is configured. Each reconcile
     /// additionally requires at least one observed Node.

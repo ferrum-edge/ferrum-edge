@@ -1098,15 +1098,16 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
   watch scope, and its addresses are refused when they can never be a backend
   (loopback, link-local, cloud metadata, FQDNs) or are this cluster's
   infrastructure without being a Pod of the import's namespace (another
-  namespace's Pod, a Service ClusterIP other than the exported Service's own,
-  a Node address or Pod CIDR). Node addresses and Pod CIDRs need the Node
-  watch, and other namespaces' Pods a cluster-wide Pod watch; without them
-  the CP warns that imported addresses go unchecked. Remote endpoints cannot
-  be checked against local Pods, so imported slices are trusted as far as the
-  MCS controller and EndpointSlice write RBAC are. Cross-namespace imports
-  require a ReferenceGrant whose `to` names that group/kind. Missing imports and
-  unknown kinds stay fail-closed with `ResolvedRefs=False`
-  (`BackendNotFound` / `InvalidKind`).
+  namespace's Pod, a Service ClusterIP other than the exported Service's own
+  while that Service's EndpointSlices pass attribution, a Node address or Pod
+  CIDR). Node addresses and Pod CIDRs need the Node watch, and other
+  namespaces' Pods a cluster-wide Pod watch; without them each reconcile that
+  admits an imported slice warns that its addresses went unchecked. Remote
+  endpoints cannot be checked against local Pods, so imported slices are
+  trusted as far as the MCS controller and EndpointSlice write RBAC are.
+  Cross-namespace imports require a ReferenceGrant whose `to` names that
+  group/kind. Missing imports and unknown kinds stay fail-closed with
+  `ResolvedRefs=False` (`BackendNotFound` / `InvalidKind`).
 - **Zero-weight-only rule** (every `backendRef` in a matched rule has
   `weight: 0`) is *not* dropped. Ferrum keeps the route materialized and applies
   the same synthesized 100% fault-abort used for wholly invalid/unresolved

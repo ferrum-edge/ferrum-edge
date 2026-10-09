@@ -1279,7 +1279,9 @@ pub(super) fn observed_cluster_ips(acc: &K8sAccumulator) -> HashSet<IpAddr> {
 ///   or an IP inside an observed Node's Pod CIDR. The ClusterIP of the
 ///   exported Service itself (the same-named Service of the import's
 ///   namespace) is this cluster's own endpoint of the ClusterSet Service, as
-///   Submariner Lighthouse writes it, and stays admitted.
+///   Submariner Lighthouse writes it, and stays admitted while
+///   [`endpoint_slice_guard`] recorded no finding for that Service: kube-proxy
+///   also sends that ClusterIP to any extra slice labelled with its name.
 ///
 /// Any other address is admitted as a remote endpoint. Node addresses and
 /// Pod CIDRs are known only with the Node watch, and other namespaces' Pods
@@ -1334,10 +1336,17 @@ pub(super) fn verify_service_import_endpoint_slices(
             ));
             continue;
         }
+        // kube-proxy sends the exported Service's ClusterIP to every slice
+        // labelled with its name, so it is exempt only while the guard found
+        // nothing wrong with that Service's own slices (issue #6121).
+        let exported_clean = acc
+            .endpoint_slice_guard()
+            .admits_every_route(namespace, import);
         let exported_cluster_ips: Vec<IpAddr> = acc
             .core
             .services
             .get(&slice.service_key)
+            .filter(|_| exported_clean)
             .map(|service| {
                 service
                     .cluster_ips

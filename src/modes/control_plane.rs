@@ -2997,18 +2997,6 @@ pub async fn run(
                 }
             }
         };
-        if let Some(reason) =
-            env_config.k8s_service_import_unchecked_reason(watch_namespaces.is_empty())
-        {
-            warn!(
-                reason,
-                "Gateway API routes to MCS ServiceImports admit imported EndpointSlice addresses \
-                 without checking them against Node addresses and Node Pod CIDRs (needs \
-                 FERRUM_K8S_NODE_LOCALITY_ENABLED=true with nodes list/watch RBAC) or against \
-                 Pods of other namespaces (needs a cluster-wide Pod watch: \
-                 FERRUM_CP_NAMESPACES=\"*\" with FERRUM_K8S_WATCH_NAMESPACES unset)"
-            );
-        }
         let controller_config = crate::k8s_controller::K8sControllerConfig {
             namespace: env_config.namespace.clone(),
             controller_namespace: env_config.k8s_controller_namespace.clone(),

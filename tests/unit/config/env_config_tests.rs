@@ -7310,56 +7310,6 @@ fn selectorless_external_endpoints_opt_in_needs_the_node_watch() {
 }
 
 #[test]
-fn service_import_expansion_names_the_watches_its_local_checks_need() {
-    // Imported endpoints are remote by design and stay admitted; without the
-    // Node watch and a cluster-wide Pod watch, a Node address or another
-    // namespace's Pod in an imported slice looks remote too (issue #6123).
-    let watching = EnvConfig {
-        k8s_controller_enabled: true,
-        k8s_pod_discovery_enabled: true,
-        k8s_watch_gateway_api_crds: true,
-        k8s_node_locality_enabled: true,
-        ..EnvConfig::default()
-    };
-    assert_eq!(watching.k8s_service_import_unchecked_reason(true), None);
-    assert_eq!(
-        watching.k8s_service_import_unchecked_reason(false),
-        Some("a restricted Pod watch scope")
-    );
-
-    let no_nodes = EnvConfig {
-        k8s_node_locality_enabled: false,
-        ..watching.clone()
-    };
-    assert_eq!(
-        no_nodes.k8s_service_import_unchecked_reason(true),
-        Some("FERRUM_K8S_NODE_LOCALITY_ENABLED=false")
-    );
-    assert_eq!(
-        no_nodes.k8s_service_import_unchecked_reason(false),
-        Some("FERRUM_K8S_NODE_LOCALITY_ENABLED=false and a restricted Pod watch scope")
-    );
-
-    // Expansion onto imported slices does not run: nothing to warn about.
-    for config in [
-        EnvConfig {
-            k8s_controller_enabled: false,
-            ..no_nodes.clone()
-        },
-        EnvConfig {
-            k8s_pod_discovery_enabled: false,
-            ..no_nodes.clone()
-        },
-        EnvConfig {
-            k8s_watch_gateway_api_crds: false,
-            ..no_nodes
-        },
-    ] {
-        assert_eq!(config.k8s_service_import_unchecked_reason(false), None);
-    }
-}
-
-#[test]
 fn test_k8s_pod_discovery_default_disabled() {
     let config = EnvConfig::default();
     assert!(

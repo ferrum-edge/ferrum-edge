@@ -1102,6 +1102,65 @@ fn service_import_slice_keeps_the_exported_services_own_cluster_ip() {
 }
 
 #[test]
+fn service_import_slice_refuses_the_exported_cluster_ip_once_its_service_is_refused() {
+    // kube-proxy sends the exported Service's ClusterIP to every slice
+    // labelled with its name, so a forged slice naming another namespace's
+    // Pod makes that ClusterIP reach the Pod. The exemption must not outlive
+    // the EndpointSlice guard's refusal of the Service (issue #6121).
+    let exported = object(
+        "Service",
+        "store",
+        "default",
+        "v1",
+        json!({
+            "clusterIP": "10.96.0.40",
+            "selector": { "app": "store" },
+            "ports": [{ "name": "http", "port": 8080 }]
+        }),
+    );
+    let mut other_pod = object("Pod", "ledger-0", "payments", "v1", json!({}));
+    other_pod.status = json!({ "phase": "Running", "podIP": "10.244.3.20" });
+    let mut forged = object(
+        "EndpointSlice",
+        "store-forged",
+        "default",
+        "discovery.k8s.io/v1",
+        json!({
+            "ports": [{ "port": 8080 }],
+            "endpoints": [ready_endpoint("10.244.3.20")]
+        }),
+    );
+    forged.metadata.labels.insert(
+        "kubernetes.io/service-name".to_string(),
+        "store".to_string(),
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            store_import_route(),
+            service_import("store", "default", 8080),
+            mcs_slice(json!([
+                ready_endpoint("10.96.0.40"),
+                ready_endpoint("10.0.0.10"),
+            ])),
+            exported,
+            forged,
+            other_pod,
+        ],
+        options()
+            .with_source_namespaces(Vec::new())
+            .with_pod_discovery_enabled(true),
+    )
+    .expect("an MCS slice of a refused exported Service should translate");
+
+    let hosts = dial_hosts(&translation);
+    assert!(hosts.contains(&"10.0.0.10"), "{hosts:?}");
+    assert!(!hosts.contains(&"10.96.0.40"), "{hosts:?}");
+    assert!(!hosts.contains(&"10.244.3.20"), "{hosts:?}");
+    assert_warned(&translation, "1 endpoint address(es) refused");
+}
+
+#[test]
 fn service_import_slice_outside_the_pod_watch_scope_falls_back_to_clusterset_dns() {
     // Outside the Pod watch scope the import's own Pods cannot be told from
     // anything else, so its slices are unverifiable and the backend keeps its
