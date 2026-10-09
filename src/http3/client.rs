@@ -40,6 +40,14 @@ use crate::tls::backend::{
     backend_svid_generation_for_client_cert,
 };
 
+/// Construct a bounded per-request exchange without a heap allocation.
+/// Connection setup keeps its separate boxed boundaries; exchanges retain
+/// their original task, stream ownership, and cancellation guards.
+#[inline(never)]
+fn construct_h3_future<F: std::future::Future>(construct: impl FnOnce() -> F) -> F {
+    construct()
+}
+
 /// Construct a concrete child outside the caller's construction/poll frame.
 /// An async boxing trampoline would still retain the wide child inline. Keep
 /// the same task and guards: dropping the returned pointer cancels the child.
@@ -2631,7 +2639,7 @@ impl Http3ConnectionPool {
         let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
-            match Self::boxed_do_request(
+            match Self::construct_request(
                 &mut sr,
                 proxy,
                 method,
@@ -2668,7 +2676,7 @@ impl Http3ConnectionPool {
             && let Some(pooled) = self.pool.cached(&key)
         {
             let mut sr = pooled.send_request;
-            match Self::boxed_do_request(
+            match Self::construct_request(
                 &mut sr,
                 proxy,
                 method,
@@ -2697,7 +2705,7 @@ impl Http3ConnectionPool {
                     self.pool_key_with_generation(proxy, fallback_index, svid_generation);
                 if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                     let mut fallback_sr = fallback_pooled.send_request;
-                    match Self::boxed_do_request(
+                    match Self::construct_request(
                         &mut fallback_sr,
                         proxy,
                         method,
@@ -2747,7 +2755,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::boxed_do_request(
+        Self::construct_request(
             &mut sr_for_request,
             proxy,
             method,
@@ -2815,7 +2823,7 @@ impl Http3ConnectionPool {
         // request and bypassing the gateway's retry_on_methods policy.
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::boxed_do_request(
+            match Self::construct_request(
                 &mut sr,
                 proxy,
                 method,
@@ -2847,7 +2855,7 @@ impl Http3ConnectionPool {
                         );
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::boxed_do_request(
+                            match Self::construct_request(
                                 &mut fallback_sr,
                                 proxy,
                                 method,
@@ -2915,7 +2923,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::boxed_do_request(
+        Self::construct_request(
             &mut sr_for_request,
             proxy,
             method,
@@ -3246,7 +3254,7 @@ impl Http3ConnectionPool {
     /// request headers (and possibly body bytes) are committed and the
     /// backend may have processed the request, so the gateway must
     /// respect `retry_on_methods` instead of replaying blindly.
-    fn boxed_do_request<'a>(
+    fn construct_request<'a>(
         send_request: &'a mut H3SendRequest,
         proxy: &'a Proxy,
         method: &'a str,
@@ -3255,7 +3263,7 @@ impl Http3ConnectionPool {
         body: bytes::Bytes,
         max_response_body_size_bytes: usize,
     ) -> impl std::future::Future<Output = H3PoolResult<H3BufferedResponse>> + 'a {
-        boxed_h3_future(|| {
+        construct_h3_future(|| {
             Self::do_request(
                 send_request,
                 proxy,
@@ -3370,7 +3378,7 @@ impl Http3ConnectionPool {
     ///
     /// Body-on-wire semantics match [`do_request`] — `request_on_wire`
     /// flips to `true` once `send_request().await` succeeds.
-    fn boxed_do_request_streaming<'a>(
+    fn construct_streaming_request<'a>(
         send_request: &'a mut H3SendRequest,
         proxy: &'a Proxy,
         method: &'a str,
@@ -3379,7 +3387,7 @@ impl Http3ConnectionPool {
         body: bytes::Bytes,
         auth: H3Authorization<'a>,
     ) -> impl std::future::Future<Output = H3PoolResult<H3StreamingResponse>> + 'a {
-        boxed_h3_future(|| {
+        construct_h3_future(|| {
             Self::do_request_streaming(
                 send_request,
                 proxy,
@@ -4855,7 +4863,7 @@ impl Http3ConnectionPool {
         let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
-            match Self::boxed_do_request_streaming(
+            match Self::construct_streaming_request(
                 &mut sr,
                 proxy,
                 method,
@@ -4886,7 +4894,7 @@ impl Http3ConnectionPool {
             && let Some(pooled) = self.pool.cached(&key)
         {
             let mut sr = pooled.send_request;
-            match Self::boxed_do_request_streaming(
+            match Self::construct_streaming_request(
                 &mut sr,
                 proxy,
                 method,
@@ -4914,7 +4922,7 @@ impl Http3ConnectionPool {
                     self.pool_key_with_generation(proxy, fallback_index, svid_generation);
                 if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                     let mut fallback_sr = fallback_pooled.send_request;
-                    match Self::boxed_do_request_streaming(
+                    match Self::construct_streaming_request(
                         &mut fallback_sr,
                         proxy,
                         method,
@@ -4971,7 +4979,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::boxed_do_request_streaming(
+        Self::construct_streaming_request(
             &mut sr_for_request,
             proxy,
             method,
@@ -5066,7 +5074,7 @@ impl Http3ConnectionPool {
         // `request()`).
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::boxed_do_request_streaming(
+            match Self::construct_streaming_request(
                 &mut sr,
                 proxy,
                 method,
@@ -5097,7 +5105,7 @@ impl Http3ConnectionPool {
                         );
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::boxed_do_request_streaming(
+                            match Self::construct_streaming_request(
                                 &mut fallback_sr,
                                 proxy,
                                 method,
@@ -5171,7 +5179,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::boxed_do_request_streaming(
+        Self::construct_streaming_request(
             &mut sr_for_request,
             proxy,
             method,

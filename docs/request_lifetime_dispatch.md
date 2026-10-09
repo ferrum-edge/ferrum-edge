@@ -134,3 +134,19 @@ dispatchers do not inspect the cause of a `send_request` failure before response
 from a canceled dispatch of a replayable body, it is `protocol_error`. If the gateway's reset
 surfaces there while the dispatch is still running, it is charged to that target's circuit breaker
 and passive health, as an explicit client `CANCEL` already is.
+
+## Request-future stack boundaries
+
+The frontend admission wrapper, ordinary backend dispatch, direct H1/H2
+dispatch, and H3 request exchanges construct their bounded futures out of
+line without a per-request box. The large routing handler and the remaining
+large transport and connection-setup children keep their boxed boundaries.
+These factories are synchronous and do not spawn tasks: request guards,
+task-local affinity, deadlines, and cancellation remain with the same task.
+
+The frontend and backend state-budget test measures the concrete futures as
+well as the frontend boundary. H3 has separate request and connection-setup
+state budgets and cold-dispatch tests on ordinary Tokio worker stacks.
+Coroutine-state size is not a measurement of the compiled poll-frame size;
+real listener, cancellation, and protocol tests remain required alongside
+the state ceilings when changing these boundaries.

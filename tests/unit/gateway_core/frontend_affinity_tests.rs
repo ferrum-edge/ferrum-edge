@@ -238,13 +238,13 @@ async fn a_cancelled_handler_closes_its_stream() {
 /// listener requests also run on ordinary Tokio stacks in the lib suite.
 #[test]
 fn frontend_and_backend_future_state_stays_within_the_stack_budget() {
-    let [boxed_frontend, frontend, handler, backend] =
+    let [frontend_boundary, frontend, handler, backend] =
         ferrum_edge::proxy::request_stack_test_support::future_sizes();
-    assert_eq!(boxed_frontend, std::mem::size_of::<usize>());
     // These are coroutine-state ceilings, not measurements of poll frames.
     // Keep ample room on a default worker stack for debug-build temporaries,
     // the Hyper driver, task-local scopes, and the selected transport's poll.
     for (name, actual, ceiling) in [
+        ("frontend boundary", frontend_boundary, 8 * 1024),
         ("frontend", frontend, 8 * 1024),
         ("routing handler", handler, 128 * 1024),
         ("backend attempt", backend, 64 * 1024),
