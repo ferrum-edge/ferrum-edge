@@ -1053,6 +1053,25 @@ def read_cpu_attributes(path, status):
     return result
 
 
+def build_id_gaps(build_ids, retained_ids, records):
+    """Separate missing target ELFs from perf's unretained kernel vDSO copy.
+
+    Neither category can certify complete CPU samples. The virtual mapping
+    category is the same partial-unwind limitation as [vdso] on older perf.
+    """
+    virtual_mapping = any(record.startswith('PERF_RECORD_MMAP2 ')
+                          and record.endswith(': r-xp [vdso]') for record in records)
+    missing, virtual = [], {}
+    for path, build_id in build_ids.items():
+        if not path.startswith('/') or build_id in retained_ids.get(path, []):
+            continue
+        if virtual_mapping and re.fullmatch(r'/tmp/perf-vdso\.so-[A-Za-z0-9]{6}', path):
+            virtual[path] = build_id
+        else:
+            missing.append(path)
+    return missing, virtual
+
+
 def cpu_decode(out, owners, dsos, *, symfs=None):
     symfs = out / "symfs" if symfs is None else symfs
     decoded = command('perf-script', out / 'stacks.txt', limit=16 * 1024**2, timeout=30,
@@ -1109,9 +1128,8 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
             build_id_by_path[parts[1].strip()] = parts[0].lower()
     retained_ids = {d['path']: [line.rsplit(' ', 1)[-1].lower() for line in d['build_id_lines']]
                     for d in dsos.get('dsos', [])}
-    for path, build_id in build_id_by_path.items():
-        if path.startswith('/') and build_id not in retained_ids.get(path, []):
-            issues.append('recorded DSO build ID lacks matching retained ELF: ' + path)
+    missing_elves, virtual_dsos = build_id_gaps(build_id_by_path, retained_ids, records)
+    issues.extend('recorded DSO build ID lacks matching retained ELF: ' + path for path in missing_elves)
     if not build_id_by_path or buildids['returncode'] or buildids['incomplete']:
         issues.append('recorded build IDs unavailable')
     if decoded['returncode'] or decoded['incomplete'] or raw_status['returncode'] or raw_error:
@@ -1122,13 +1140,14 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
         issues.append('lost or throttled samples')
     if result['foreign_samples']:
         issues.append('samples outside admitted process generations')
-    if not dsos.get('complete') or any(not d['build_id_lines'] or not d['eh_frame'] for d in dsos.get('dsos', [])):
+    if virtual_dsos or not dsos.get('complete') or any(not d['build_id_lines'] or not d['eh_frame'] for d in dsos.get('dsos', [])):
         issues.append('missing matching ELF/build IDs/CFI')
     if not result['mmap_records'] or not result['task_records']:
         issues.append('missing mapping/task provenance')
     if result['unresolved_samples'] or result['multi_frame_samples'] != result['samples']:
         issues.append('partial unwinding/unresolved samples')
     result.update(issues=issues, samples_complete=not issues, decoder_status=decoded,
+                  unretained_virtual_dsos=virtual_dsos,
                   header_status=header, buildid_status=buildids, attributes_status=attributes, attributes_verified=attributes_verified,
                   attribute_validation=attribute_validation,
                   raw_decoder_status=raw_status, unwind_complete=False,

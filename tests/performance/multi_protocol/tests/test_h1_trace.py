@@ -81,6 +81,24 @@ class H1PerfStagingTests(unittest.TestCase):
                     self.assertFalse(staged.exists())
 
 
+class H1BuildIDTests(unittest.TestCase):
+    def test_virtual_copy_requires_the_recorded_kernel_mapping(self):
+        path = '/tmp/perf-vdso.so-gg5MgC'
+        record = 'PERF_RECORD_MMAP2 3035/3035: [0x74361f239000(0x2000) @ 0 00:00 0 0]: r-xp [vdso]'
+        self.assertEqual(trace.build_id_gaps({path: '12345678'}, {}, [record]),
+                         ([], {path: '12345678'}))
+        self.assertEqual(trace.build_id_gaps({path: '12345678'}, {}, []), ([path], {}))
+
+    def test_other_missing_or_mismatched_elf_remains_a_hard_gap(self):
+        record = 'PERF_RECORD_MMAP2 7/7: [0x1000(0x2000) @ 0 00:00 0 0]: r-xp [vdso]'
+        for path in ('/fixture', '/tmp/perf-vdso.so-bad', '/tmp/perf-vdso.so-gg5MgC/extra'):
+            with self.subTest(path=path):
+                self.assertEqual(trace.build_id_gaps({path: '12345678'},
+                                                     {path: ['87654321']}, [record]), ([path], {}))
+        self.assertEqual(trace.build_id_gaps({'/fixture': '12345678'},
+                                             {'/fixture': ['12345678']}, [record]), ([], {}))
+
+
 class H1CPUAttributeTests(unittest.TestCase):
     # Verbatim cpu/perf-attributes.txt, hosted run 35422193763, artifact
     # 10577439767, head 61e5dbd46197c3dca06e46585d2ad19a1309569c.
@@ -258,14 +276,20 @@ class H1CPUAttributeTests(unittest.TestCase):
                   '        3456 fixture_outer (/fixture)\n'
                   '        4567 [unknown] (/fixture)\n\n')
         records = b'PERF_RECORD_SAMPLE\nPERF_RECORD_MMAP2\nPERF_RECORD_COMM\n'
-        for valid in (True, False):
-            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as folder:
+        for valid, virtual in ((True, False), (False, False), (True, True)):
+            with self.subTest(valid=valid, virtual=virtual), tempfile.TemporaryDirectory() as folder:
                 out = Path(folder)
                 raw = self.raw if valid else self.raw.replace(b'freq: 1', b'freq: 0', 1)
+                decoded_stacks = stacks.replace('        4567 [unknown] (/fixture)\n', '') if virtual else stacks
+                recorded_ids = b'12345678 /fixture\n'
+                raw_records = records
+                if virtual:
+                    recorded_ids += b'87654321 /tmp/perf-vdso.so-gg5MgC\n'
+                    raw_records += b'PERF_RECORD_MMAP2 7/7: [0x1000(0x2000) @ 0 00:00 0 0]: r-xp [vdso]\n'
 
                 def metadata(action, destination, **kwargs):
-                    content = {'perf-script': stacks.encode('ascii'), 'perf-attributes': raw,
-                               'perf-buildids': b'12345678 /fixture\n', 'perf-header': b'header\n'}[action]
+                    content = {'perf-script': decoded_stacks.encode('ascii'), 'perf-attributes': raw,
+                               'perf-buildids': recorded_ids, 'perf-header': b'header\n'}[action]
                     destination.write_bytes(content)
                     return dict(returncode=0, forced=False, incomplete=None,
                                 stdout_sha256=hashlib.sha256(content).hexdigest())
@@ -273,12 +297,12 @@ class H1CPUAttributeTests(unittest.TestCase):
                 process = Mock()
                 process.poll.return_value = 0
                 process.wait.return_value = 0
-                dsos = dict(complete=False, dsos=[dict(path='/fixture', eh_frame=False,
+                dsos = dict(complete=virtual, dsos=[dict(path='/fixture', eh_frame=virtual,
                                                       build_id_lines=['Build ID: 12345678'])])
                 with patch.object(trace, 'command', side_effect=metadata), \
                         patch.object(trace, 'launch', return_value=process), \
                         patch.object(trace.os, 'set_blocking'), \
-                        patch.object(trace.os, 'read', side_effect=[records, b'']):
+                        patch.object(trace.os, 'read', side_effect=[raw_records, b'']):
                     result = trace.cpu_decode(out, {7}, dsos)
                 self.assertEqual(result['attributes_verified'], valid)
                 self.assertEqual(result['attribute_validation']['verified'], valid)
@@ -288,11 +312,15 @@ class H1CPUAttributeTests(unittest.TestCase):
                 self.assertFalse(result['unwind_complete'])
                 self.assertFalse(result['samples_complete'])
                 self.assertIn('missing matching ELF/build IDs/CFI', result['issues'])
-                self.assertIn('partial unwinding/unresolved samples', result['issues'])
+                if virtual:
+                    self.assertEqual(result['unretained_virtual_dsos'],
+                                     {'/tmp/perf-vdso.so-gg5MgC': '87654321'})
+                else:
+                    self.assertIn('partial unwinding/unresolved samples', result['issues'])
                 saved = json.loads((out / 'cpu-coverage.json').read_text())
                 self.assertEqual(saved['attribute_validation'], result['attribute_validation'])
                 if valid:
-                    self.assertEqual(len(result['issues']), 2)
+                    self.assertEqual(len(result['issues']), 1 if virtual else 2)
                 else:
                     self.assertIn('actual software sample attributes not verified', result['issues'])
                     self.assertIn('CPU attributes: cpu-clock:uS freq: expected 1, got 0', result['issues'])
