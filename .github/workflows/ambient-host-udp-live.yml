@@ -37,7 +37,7 @@ concurrency:
 jobs:
   changes:
     name: Ambient host-UDP trigger
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -211,7 +211,7 @@ jobs:
     name: Ambient host-network UDP live-kernel
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       CARGO_NET_RETRY: "10"
@@ -317,7 +317,7 @@ jobs:
     if: needs.changes.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
     permissions:
       contents: read
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
 
     steps:
@@ -442,7 +442,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
 
     steps:
@@ -579,7 +579,7 @@ jobs:
     if: always()
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Verify selected production image contract
         env:
@@ -612,7 +612,7 @@ jobs:
       - ambient-host-udp-live
       - ambient-host-udp-image
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Summarize ambient host-UDP live result
         run: |

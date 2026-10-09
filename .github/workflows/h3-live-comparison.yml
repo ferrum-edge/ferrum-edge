@@ -35,7 +35,7 @@ concurrency:
 jobs:
   prepare:
     name: H3 feature compile, contracts and real observer fixtures
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       RUSTC_WRAPPER: ''
@@ -144,7 +144,7 @@ jobs:
   smoke:
     name: H3 short four-arm gateway smoke
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -181,7 +181,7 @@ jobs:
   fairness:
     name: H3 actual TLS identity and long idle-retirement fixtures
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -220,7 +220,7 @@ jobs:
     name: H3 calibrated payload ${{ matrix.payload }}
     if: github.event_name == 'workflow_dispatch'
     needs: [prepare, smoke, fairness]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     strategy:
       fail-fast: false

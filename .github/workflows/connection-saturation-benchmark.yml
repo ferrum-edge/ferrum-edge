@@ -10,10 +10,10 @@
 # independently of the calling shell). The host gets sysctl tuning
 # (somaxconn, ip_local_port_range, syn_backlog) via sudo.
 #
-# GitHub-hosted ubuntu-latest runners cap both soft and hard FD limits at
+# GitHub-hosted ubuntu-26.04 runners cap both soft and hard FD limits at
 # 65536 and an unprivileged shell can't raise either, so this workflow
 # inspects+validates the host FD ceiling rather than trying to modify it. The
-# practical ceiling for N on ubuntu-latest is ~50K (leaves headroom for the
+# practical ceiling for N on ubuntu-26.04 is ~50K (leaves headroom for the
 # proto_bench client + base FDs); requesting more will fail-fast with an
 # actionable message. For larger N values use a self-hosted runner — see
 # the `runner` input below.
@@ -51,9 +51,9 @@ on:
         default: "1000"
         type: string
       runner:
-        description: "GitHub runner label (ubuntu-latest is fine up to ~50K conn)"
+        description: "GitHub runner label (ubuntu-26.04 is fine up to ~50K conn)"
         required: false
-        default: "ubuntu-latest"
+        default: "ubuntu-26.04"
         type: string
       stop_at_first_break:
         description: "Skip higher N values once a gateway breaks"
@@ -95,7 +95,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler lsof jq
 
       # ── Host inspection / sanity ────────────────────────────────────────────
-      # GitHub-hosted ubuntu-latest runners cap both soft and hard FD limits
+      # GitHub-hosted ubuntu-26.04 runners cap both soft and hard FD limits
       # at 65536 (verified 2026-05-03) and the runner doesn't grant the
       # capability needed to raise the hard cap from sudo, so an unprivileged
       # shell can't `ulimit -n` past it. Rather than fight the runner, print
@@ -128,7 +128,7 @@ jobs:
           echo "required FD (highest N + 1024 headroom): $REQUIRED_FD"
 
           if [ "$SOFT_FD" -lt "$REQUIRED_FD" ]; then
-            echo "::error::Soft FD limit ($SOFT_FD) is below the required $REQUIRED_FD for the configured connection levels (highest N = $HIGHEST_N). GitHub-hosted ubuntu-latest caps soft and hard FD limits at 65536 and unprivileged shells cannot raise them. Lower connection_levels (recommend ≤ 50000 to leave headroom) or run on a self-hosted runner where you can raise the cap."
+            echo "::error::Soft FD limit ($SOFT_FD) is below the required $REQUIRED_FD for the configured connection levels (highest N = $HIGHEST_N). GitHub-hosted ubuntu-26.04 caps soft and hard FD limits at 65536 and unprivileged shells cannot raise them. Lower connection_levels (recommend ≤ 50000 to leave headroom) or run on a self-hosted runner where you can raise the cap."
             exit 1
           fi
 

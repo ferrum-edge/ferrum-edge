@@ -24,7 +24,7 @@ pass-through (`shared-key: ci-perf`). Other `setup-rust-ci` callers omit
 
 | Setting | Value | Notes |
 |---|---|---|
-| Runner class | `ubuntu-latest` | GitHub-hosted; expect noisy-neighbor variance |
+| Runner class | `ubuntu-26.04` | GitHub-hosted; expect noisy-neighbor variance |
 | Gateway build profile | `ci-release` | Stable CI-oriented release profile from root `Cargo.toml` |
 | Harness build profile | `release` | `tests/performance/multi_protocol` is not a workspace member and uses its local `release` profile |
 | Workflow | `.github/workflows/protocol-perf-regression.yml` | `schedule` (Sundays 05:00 UTC) + `workflow_dispatch` |
@@ -68,7 +68,7 @@ Versioned budgets live in
   Finite measured product regressions such as zero RPS or large latency stay
   alert-only under `enforcement=alert`.
 - Absolute `min_gateway_rps` / `max_p*_us` floors are intentionally `null`
-  until operators measure variance on `ubuntu-latest` + `ci-release` and fill
+  until operators measure variance on `ubuntu-26.04` + `ci-release` and fill
   them in. Do not invent floors from unexecuted local runs.
 - When prior trend artifacts exist, the evaluator also applies a rolling
   median ± MAD comparison (`rolling` block in the budgets file). History is

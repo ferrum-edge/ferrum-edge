@@ -3,7 +3,7 @@
 # runs every gateway that supports that protocol at 5 payload sizes
 # (10KB, 70KB, 500KB, 1MB, 5MB). UDP and UDP+DTLS are fixed at 1KB.
 #
-# Each protocol runs in its own ubuntu-latest runner (strategy.matrix), so the 8
+# Each protocol runs in its own ubuntu-26.04 runner (strategy.matrix), so the 8
 # protocols execute in parallel with isolated CPU / filesystem state. Per-protocol
 # artifacts are uploaded, then a final aggregate job downloads them all and posts
 # a combined markdown summary to the GitHub Actions step summary.
@@ -67,7 +67,7 @@ on:
 jobs:
   benchmark:
     name: bench / ${{ matrix.protocol }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The full five-payload matrix at three iterations does not fit 90 minutes:
     # run 35497385452 lost http1-tls, wss and grpcs to the inner step timeout
     # with iteration 3 partly written, and a truncated protocol still uploads
@@ -215,7 +215,7 @@ jobs:
 
       # buildx with the docker-container driver is required for
       # cache-from/cache-to type=gha — the default docker driver on
-      # ubuntu-latest only supports inline cache and will error out with
+      # ubuntu-26.04 only supports inline cache and will error out with
       # "Cache export is not supported for the docker driver".
       - name: Set up Docker Buildx
         if: steps.skip_check.outputs.skip != 'true'
@@ -455,7 +455,7 @@ jobs:
     # Reserve >=10 minutes; 15s/call overhead is an estimate, not a timeout guarantee.
     # The frozen dispatcher cannot set pairs/adaptive: defaults are 2/off.
     name: Aggregate Results
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: benchmark
     if: always()
     timeout-minutes: 10

@@ -34,7 +34,7 @@ env:
 jobs:
   advisories:
     name: Advisories & exception expiry
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -141,7 +141,7 @@ jobs:
 
   upstream-patch-status:
     name: Vendored patch upstream status
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:

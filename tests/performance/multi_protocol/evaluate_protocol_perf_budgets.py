@@ -887,7 +887,7 @@ def _clean_results_fixture() -> dict[str, Any]:
         "commit": "0123456789abcdef0123456789abcdef01234567",
         "run_id": "1234",
         "timestamp": "2026-07-26T12:00:00+00:00",
-        "runner_class": "ubuntu-latest",
+        "runner_class": "ubuntu-26.04",
         "build_profile": "ci-release",
         "iterations": "1",
         "protocols": "http1",
@@ -946,7 +946,7 @@ def _clean_results_fixture() -> dict[str, Any]:
             },
         },
         "runner_health": {
-            "runner_class": "ubuntu-latest",
+            "runner_class": "ubuntu-26.04",
             "build_profile": "ci-release",
             "avg_steal_percent": 0.0,
             "sleep_1ms_avg_us": 1100.0,
@@ -963,7 +963,7 @@ def self_test() -> int:
     budgets = {
         "schema_version": 1,
         "budget_version": "test",
-        "runner_class": "ubuntu-latest",
+        "runner_class": "ubuntu-26.04",
         "build_profile": "ci-release",
         "enforcement": "alert",
         "rolling": {"window": 8, "mad_multiplier": 5.0, "min_samples": 3},

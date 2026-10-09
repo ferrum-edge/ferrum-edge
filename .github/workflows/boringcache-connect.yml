@@ -15,7 +15,7 @@ jobs:
   connect:
     name: Enroll BoringCache Machine connection
     if: github.event_name == 'workflow_dispatch' && github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read

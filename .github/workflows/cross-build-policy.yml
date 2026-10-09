@@ -18,7 +18,7 @@ permissions:
 jobs:
   verify:
     name: Trusted Cross Build Policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       # pull_request_target loads this workflow from the base branch and keeps
