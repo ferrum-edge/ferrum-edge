@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Scheduled benchmark history selectors can run `--self-test` without live-run
+  arguments; ordinary history queries still require the workflow and commit.
+
 - H1 hosted profiling installs Ubuntu 26.04's `linux-perf` package and stages
   its `/usr/bin/perf` ELF, retaining its package origin and checksum. The former
   kernel-specific `linux-tools` path is no longer populated on this image.
