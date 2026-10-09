@@ -981,9 +981,10 @@ nodeAgent:
     # so admission controllers see the requested posture). Set to false
     # only if an admission webhook rejects PERFMON in your environment.
     addCapPerfmon: true
-    # Drop CAP_SYS_ADMIN for local_pod capture. NodeWaypoint capture always
-    # adds SYS_ADMIN because the agent must setns() into pod network namespaces
-    # to resolve host-side veth peers before attaching inbound tc programs.
+    # Drop CAP_SYS_ADMIN from the node agent in every proxy mode. Set false
+    # only on kernels < 5.8, where BPF still needs SYS_ADMIN. NodeWaypoint no
+    # longer adds it: veth resolution reads host route tables and host sysfs
+    # and never setns()s into a pod network namespace.
     dropCapSysAdmin: true
     # Pod-wide seccomp profile. RuntimeDefault is the containerd default
     # and permits every syscall the agent needs (bpf, setsockopt, sh -c
