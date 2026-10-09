@@ -52,16 +52,28 @@ fn object(api_version: &str, kind: &str, name: &str, namespace: &str, spec: Valu
     }
 }
 
-/// A Pod in `default` owning `127.0.0.1`, where the test backends listen.
+/// Pod IP the fixtures' EndpointSlices name for the locally spawned backends.
 ///
-/// The fixtures route through selector-less Services with manual
-/// EndpointSlices, and the backendRef guard admits only endpoints that are
-/// Pods of the Service's namespace (issue #6108). A real cluster never
-/// reports a loopback Pod IP, so this exists only to reach a local backend.
-fn loopback_backend_pod(name: &str) -> K8sObject {
+/// The backendRef guard admits only endpoints that are Pods of the Service's
+/// namespace, and never a loopback address (issue #6108). The slices therefore
+/// name this ordinary Pod IP, [`stand_in_backend_pod`] reports it, and
+/// [`served_config_yaml`] points the served config at `127.0.0.1`, where the
+/// backends listen.
+const STAND_IN_BACKEND_POD_IP: &str = "10.244.0.250";
+
+/// A Pod in `default` owning [`STAND_IN_BACKEND_POD_IP`].
+fn stand_in_backend_pod(name: &str) -> K8sObject {
     let mut pod = object("v1", "Pod", name, "default", json!({}));
-    pod.status = json!({"phase": "Running", "podIP": "127.0.0.1"});
+    pod.status = json!({"phase": "Running", "podIP": STAND_IN_BACKEND_POD_IP});
     pod
+}
+
+/// Serialize a translated config for the file-mode harness, with every
+/// [`STAND_IN_BACKEND_POD_IP`] destination pointed at the local backends.
+fn served_config_yaml(config: &ferrum_edge::config::types::GatewayConfig) -> String {
+    serde_yaml::to_string(config)
+        .expect("serialize translated config")
+        .replace(STAND_IN_BACKEND_POD_IP, "127.0.0.1")
 }
 
 fn route_status_update() -> GatewayApiStatusUpdate {
@@ -2896,7 +2908,7 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         json!({
             "addressType": "IPv4",
             "ports": [{"name": "http", "port": backend_port}],
-            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+            "endpoints": [{"addresses": [STAND_IN_BACKEND_POD_IP], "conditions": {"ready": true}}]
         }),
     );
     endpoints
@@ -2923,7 +2935,7 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
         service,
         endpoints,
-        loopback_backend_pod("api-0"),
+        stand_in_backend_pod("api-0"),
         object(
             "gateway.networking.k8s.io/v1",
             "HTTPRoute",
@@ -2959,7 +2971,10 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         assert_eq!(accepted_condition(update)["status"], expected);
     }
     assert_eq!(translation.config.proxies.len(), 1);
-    assert_eq!(translation.config.proxies[0].backend_host, "127.0.0.1");
+    assert_eq!(
+        translation.config.proxies[0].backend_host,
+        STAND_IN_BACKEND_POD_IP
+    );
     assert_eq!(translation.config.proxies[0].backend_port, backend_port);
     // The harness owns an ephemeral listener instead of binding Gateway port
     // 80. Keep the translated route, destination and filter configuration.
@@ -2967,7 +2982,7 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
     // Translation returns an internal snapshot; the file-mode fixture needs
     // the versioned envelope normally supplied by its configuration source.
     translation.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
-    let yaml = serde_yaml::to_string(&translation.config).expect("serialize translated config");
+    let yaml = served_config_yaml(&translation.config);
     let harness = GatewayHarness::builder()
         .mode_in_process()
         .file_config(yaml)
@@ -3031,7 +3046,7 @@ fn route_filter_cluster_objects(
         json!({
             "addressType": "IPv4",
             "ports": [{"name": "http", "port": backend_port}],
-            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+            "endpoints": [{"addresses": [STAND_IN_BACKEND_POD_IP], "conditions": {"ready": true}}]
         }),
     );
     endpoints
@@ -3043,7 +3058,7 @@ fn route_filter_cluster_objects(
         cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
         service,
         endpoints,
-        loopback_backend_pod("api-0"),
+        stand_in_backend_pod("api-0"),
     ]
 }
 
@@ -3100,7 +3115,7 @@ async fn spawn_translated_route_gateway_with(
     translation.config.plugin_configs.extend(extra_plugins);
     edit(&mut translation.config);
     translation.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
-    let yaml = serde_yaml::to_string(&translation.config).expect("serialize translated config");
+    let yaml = served_config_yaml(&translation.config);
     GatewayHarness::builder()
         .mode_in_process()
         .file_config(yaml)
@@ -3824,8 +3839,9 @@ fn removing_a_rule_filter_withdraws_its_generated_resources() {
     let translate = |filters: serde_json::Value| {
         let mut objects = route_filter_cluster_objects(19_999);
         objects.push(route_with(filters));
+        let opts = options().with_pod_discovery_enabled(true);
         let (translation, skipped) =
-            translate_k8s_objects_collecting_skips(&objects, options()).expect("translate route");
+            translate_k8s_objects_collecting_skips(&objects, opts).expect("translate route");
         assert!(skipped.is_empty(), "{skipped:?}");
         translation.config
     };
@@ -4122,14 +4138,14 @@ fn scripted_service_objects(
         json!({
             "addressType": "IPv4",
             "ports": [{"name": "http", "port": backend_port}],
-            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+            "endpoints": [{"addresses": [STAND_IN_BACKEND_POD_IP], "conditions": {"ready": true}}]
         }),
     );
     endpoints
         .metadata
         .labels
         .insert("kubernetes.io/service-name".to_string(), name.to_string());
-    let pod = loopback_backend_pod(&format!("{name}-0"));
+    let pod = stand_in_backend_pod(&format!("{name}-0"));
     vec![service, endpoints, pod]
 }
 

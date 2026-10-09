@@ -154,10 +154,12 @@ pub struct K8sTranslationOptions {
     pub pod_discovery_enabled: bool,
     /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. When true, a
     /// Gateway API backendRef to a selector-less Service in the route's own
-    /// namespace may reach EndpointSlice IPs that are not Pod IPs (an
-    /// external database or VM). Default false: only Pods of the Service's
-    /// namespace are reachable. Never admits another namespace's Pods, FQDN
-    /// endpoints, or loopback/link-local/unspecified/multicast addresses.
+    /// namespace may reach EndpointSlice IPs that no observed Pod, Service
+    /// ClusterIP, Node address, or Node Pod CIDR claims (an external database
+    /// or VM). Default false: only observed Pods of the Service's namespace
+    /// are reachable. Never admits another namespace's observed Pods, FQDN
+    /// endpoints, loopback/link-local/unspecified/multicast/cloud-metadata
+    /// addresses, or a Service it cannot check because pod discovery is off.
     pub allow_selectorless_external_endpoints: bool,
     /// Whether Sidecar `ingress[]` custom inbound listeners are actually
     /// MATERIALIZED on the data plane (F6 §6.2) — the effective enforcement gate
@@ -489,11 +491,10 @@ pub struct K8sTranslation {
     /// whenever it keeps serving through any other listener or claim. A refused
     /// claim therefore never withdraws a surviving parent or listener.
     pub refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
-    /// Verdicts for Gateway API backendRefs to selector-less Services whose
-    /// EndpointSlices reach outside the Service's namespace (issue #6108).
-    /// The status writer reads this so `ResolvedRefs` matches what
-    /// translation refused.
-    pub(crate) selectorless_endpoints: backend_ref::SelectorlessEndpointGuard,
+    /// EndpointSlice attribution verdicts for Gateway API backendRefs to core
+    /// Services (issue #6108). The status writer reads this so `ResolvedRefs`
+    /// matches what translation refused.
+    pub(crate) endpoint_slices: backend_ref::EndpointSliceGuard,
 }
 
 /// One refused Gateway API listener claim, in the shape
@@ -995,12 +996,14 @@ pub(crate) struct K8sAccumulator {
     /// loopback — without any ReferenceGrant being consulted.
     external_name_services: HashSet<(String, String)>,
     /// `(namespace, name)` of every collected Service without a `spec.selector`
-    /// (ExternalName excluded). Used to warn when pod discovery is disabled
-    /// and their EndpointSlices therefore cannot be attributed.
+    /// (ExternalName excluded). Gateway API backendRefs refuse one whose
+    /// EndpointSlices cannot be attributed to observed Pods.
     selectorless_services: HashSet<(String, String)>,
-    /// Gateway API backendRef verdicts for selector-less Services, built from
-    /// the collected Pod/EndpointSlice inventory before routes translate.
-    selectorless_endpoint_guard: backend_ref::SelectorlessEndpointGuard,
+    /// Gateway API backendRef EndpointSlice attribution verdicts, built from
+    /// the collected Pod/Node/EndpointSlice inventory before routes translate.
+    endpoint_slice_guard: backend_ref::EndpointSliceGuard,
+    /// Warnings already queued by [`Self::push_warning_once`].
+    queued_warnings: HashSet<String>,
     pub(crate) mesh_config_registry: mesh_config::MeshConfigProviderRegistry,
     core: core::CoreState,
     explicit_workload_services: HashSet<K8sServiceKey>,
@@ -1128,7 +1131,8 @@ impl K8sAccumulator {
             service_port_specs: HashMap::new(),
             external_name_services: HashSet::new(),
             selectorless_services: HashSet::new(),
-            selectorless_endpoint_guard: backend_ref::SelectorlessEndpointGuard::default(),
+            endpoint_slice_guard: backend_ref::EndpointSliceGuard::default(),
+            queued_warnings: HashSet::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
             core: core::CoreState::default(),
             explicit_workload_services: HashSet::new(),
@@ -1207,13 +1211,14 @@ impl K8sAccumulator {
             .contains(&(namespace.to_string(), service.to_string()))
     }
 
-    pub(crate) fn selectorless_endpoint_guard(&self) -> &backend_ref::SelectorlessEndpointGuard {
-        &self.selectorless_endpoint_guard
+    pub(crate) fn endpoint_slice_guard(&self) -> &backend_ref::EndpointSliceGuard {
+        &self.endpoint_slice_guard
     }
 
-    /// Push a translation warning unless an identical one is already queued.
+    /// Push a translation warning unless this method already queued an
+    /// identical one.
     pub(crate) fn push_warning_once(&mut self, warning: String) {
-        if !self.warnings.iter().any(|existing| existing == &warning) {
+        if self.queued_warnings.insert(warning.clone()) {
             self.warnings.push(warning);
         }
     }
@@ -1783,7 +1788,7 @@ impl K8sAccumulator {
             listener_conflicts: self.gateway_api_listener_conflicts,
             frontend_tls_hostname_conflicts: self.gateway_api_frontend_tls_hostname_conflicts,
             refused_route_attachments,
-            selectorless_endpoints: self.selectorless_endpoint_guard,
+            endpoint_slices: self.endpoint_slice_guard,
         }
     }
 }
@@ -1911,6 +1916,31 @@ pub(crate) fn gateway_api_status_conflict_context(
     acc
 }
 
+/// The Gateway API backendRef EndpointSlice guard for one translation
+/// (issue #6108).
+///
+/// With pod discovery on, every Service's EndpointSlices are attributed to the
+/// observed Pods. A selector-less Service the controller cannot check — pod
+/// discovery is off, or its namespace is outside the Pod watch scope — is
+/// recorded as unverifiable and refused: nothing manages its slices, and
+/// nothing here can tell where they point. A selector-backed Service in that
+/// position stays admitted (Kubernetes manages its slices) and the Gateway API
+/// translator warns about it instead.
+fn endpoint_slice_guard(acc: &K8sAccumulator) -> backend_ref::EndpointSliceGuard {
+    let pod_discovery_enabled = acc.options.pod_discovery_enabled;
+    let mut guard = if pod_discovery_enabled {
+        core::endpoint_slice_guard(acc)
+    } else {
+        backend_ref::EndpointSliceGuard::new(acc.options.allow_selectorless_external_endpoints)
+    };
+    for (namespace, name) in &acc.selectorless_services {
+        if !pod_discovery_enabled || !acc.options.includes_pod_namespace(namespace) {
+            guard.record_unverifiable(namespace, name);
+        }
+    }
+    guard
+}
+
 pub(crate) fn translate_k8s_objects_with_filter<F>(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
@@ -2001,12 +2031,10 @@ where
     // data plane and `status.ancestors` cannot disagree.
     gateway_api::finalize_backend_lb_policies(&mut acc);
 
-    // Selector-less Service EndpointSlices are attributed to observed Pods
-    // only once every Pod and EndpointSlice is indexed, and before any route
+    // EndpointSlices are attributed to observed Pods only once every Pod,
+    // Node, Service, and EndpointSlice is indexed, and before any route
     // resolves a backendRef against them (issue #6108).
-    if acc.options.pod_discovery_enabled {
-        acc.selectorless_endpoint_guard = core::selectorless_endpoint_guard(&acc);
-    }
+    acc.endpoint_slice_guard = endpoint_slice_guard(&acc);
 
     // WorkloadEntry cross-namespace attachment admission depends on the full
     // ReferenceGrant and Service indexes. Collect explicit-service ownership in

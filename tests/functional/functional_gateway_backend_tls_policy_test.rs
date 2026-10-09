@@ -258,6 +258,7 @@ fn k8s_objects(
             "Service",
             "reviews",
             json!({
+                "selector": { "app": "reviews" },
                 "ports": [{ "name": "https", "port": backend_port, "targetPort": backend_port }]
             }),
         ),

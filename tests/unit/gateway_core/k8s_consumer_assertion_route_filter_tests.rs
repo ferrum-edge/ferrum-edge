@@ -78,7 +78,10 @@ fn service() -> K8sObject {
         "v1",
         "default",
         "api",
-        json!({"ports": [{"name": "http", "port": 8080, "targetPort": 8080}]}),
+        json!({
+            "selector": {"app": "api"},
+            "ports": [{"name": "http", "port": 8080, "targetPort": 8080}]
+        }),
     )
 }
 

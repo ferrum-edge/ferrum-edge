@@ -8285,7 +8285,7 @@ fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
             message.contains("ReferenceGrant")
                 || super::backend_ref::message_is_unsupported_backend_kind(message)
                 || super::backend_ref::message_is_external_name_backend(message)
-                || super::backend_ref::message_is_selectorless_endpoint_refusal(message)
+                || super::backend_ref::message_is_endpoint_slice_refusal(message)
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -9109,32 +9109,44 @@ fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8
 }
 
 /// [`super::backend_ref::checked_backend_namespace`] plus the structured
-/// translation warning for a selector-less Service backend: refused, or (with
-/// pod discovery disabled) admitted without its EndpointSlices being checked.
+/// translation warning for EndpointSlice attribution: a refused Service
+/// backend, or a selector-backed one admitted without its EndpointSlices being
+/// checked because the controller observes no Pods in its namespace.
 fn checked_backend_namespace(
     object: &K8sObject,
     backend_ref: &Value,
     acc: &mut K8sAccumulator,
     from_kind: &str,
 ) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
-    use super::backend_ref::{BackendKind, selectorless_endpoint_unverified_warning};
+    use super::backend_ref::{
+        BackendKind, endpoint_slice_unverified_warning, message_is_endpoint_slice_refusal,
+    };
 
     let checked =
         super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind);
     match &checked {
         Err(K8sTranslateError::InvalidResource { message, .. })
-            if super::backend_ref::message_is_selectorless_endpoint_refusal(message) =>
+            if message_is_endpoint_slice_refusal(message) =>
         {
             acc.push_warning_once(format!(
                 "Gateway API {from_kind} {:?}/{:?}: {message}",
                 object.metadata.namespace, object.metadata.name
             ));
         }
-        Ok((BackendKind::Service, backend_namespace)) if !acc.options.pod_discovery_enabled => {
-            if let Some(name) = string_field(backend_ref, "name")
-                && acc.service_is_selectorless(backend_namespace, name)
+        Ok((BackendKind::Service, backend_namespace)) => {
+            let pod_discovery_enabled = acc.options.pod_discovery_enabled;
+            let pods_unobserved =
+                !pod_discovery_enabled || !acc.options.includes_pod_namespace(backend_namespace);
+            if pods_unobserved
+                && let Some(name) = string_field(backend_ref, "name")
+                && acc.service_exists(backend_namespace, name)
+                && !acc.service_is_selectorless(backend_namespace, name)
             {
-                let warning = selectorless_endpoint_unverified_warning(backend_namespace, name);
+                let warning = endpoint_slice_unverified_warning(
+                    backend_namespace,
+                    name,
+                    pod_discovery_enabled,
+                );
                 acc.push_warning_once(warning);
             }
         }
@@ -10107,8 +10119,8 @@ mod tests {
         slice
     }
 
-    /// A Running Pod in `default` owning `ip`, so a selector-less Service's
-    /// manual EndpointSlice endpoint is a Pod of its namespace (issue #6108).
+    /// A Running Pod in `default` owning `ip`, so a Service's EndpointSlice
+    /// endpoint is a Pod of its namespace (issue #6108).
     fn core_pod(name: &str, ip: &str) -> K8sObject {
         let mut pod = object("Pod", serde_json::json!({}));
         pod.api_version = "v1".to_string();
@@ -11896,8 +11908,10 @@ mod tests {
             }),
         );
 
+        let pod_a = core_pod("headless-0", "10.1.0.11");
+        let pod_b = core_pod("headless-1", "10.1.0.12");
         let result = translate_k8s_objects(
-            &[service, endpoint_slice, route],
+            &[service, endpoint_slice, route, pod_a, pod_b],
             options().with_pod_discovery_enabled(true),
         )
         .expect("headless EndpointSlice service should translate");
@@ -16379,6 +16393,7 @@ mod tests {
         let service = core_service(
             "api",
             serde_json::json!({
+                "selector": {"app": "api"},
                 "ports": [{"name": "http", "port": 8080}]
             }),
         );

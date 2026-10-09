@@ -1464,6 +1464,7 @@ async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend
         .step(HttpStep::RespondBodyEnd)
         .spawn()
         .expect("spawn endpoint backend");
+    const POD_IP: &str = "10.244.0.250";
     for (case_index, target_port) in [json!(service_port.port), json!("container-http")]
         .into_iter()
         .enumerate()
@@ -1483,7 +1484,7 @@ async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend
             "manual-ip4",
             json!({
                 "addressType": "IPv4", "ports": [{"name": "http", "port": backend_port}],
-                "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+                "endpoints": [{"addresses": [POD_IP], "conditions": {"ready": true}}]
             }),
         );
         slice
@@ -1500,22 +1501,25 @@ async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend
             }),
         );
         route.api_version = "gateway.networking.k8s.io/v1".into();
-        // The backendRef guard admits a selector-less Service's endpoints
-        // only when they are Pods of its namespace (issue #6108); this Pod
-        // owns the loopback address the local backend listens on.
+        // The backendRef guard admits a Service's endpoints only when they are
+        // Pods of its namespace, and never a loopback address (issue #6108).
+        // The slice names this Pod's ordinary IP; the served config is then
+        // pointed at the loopback address the local backend listens on.
         let mut pod = object("Pod", "default", "manual-0", json!({}));
-        pod.status = json!({"phase": "Running", "podIP": "127.0.0.1"});
+        pod.status = json!({"phase": "Running", "podIP": POD_IP});
         let mut translated = translate_k8s_objects(
             &[service, slice, route, pod],
             options_for_namespace("default"),
         )
         .expect("translate manual endpoint route");
         assert_eq!(translated.config.proxies.len(), 1);
-        assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
+        assert_eq!(translated.config.proxies[0].backend_host, POD_IP);
         assert_eq!(translated.config.proxies[0].backend_port, backend_port);
         translated.config.proxies[0].listen_port = None;
         translated.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
-        let yaml = serde_yaml::to_string(&translated.config).expect("serialize translated config");
+        let yaml = serde_yaml::to_string(&translated.config)
+            .expect("serialize translated config")
+            .replace(POD_IP, "127.0.0.1");
         let gateway = GatewayHarness::builder()
             .mode_in_process()
             .file_config(yaml)

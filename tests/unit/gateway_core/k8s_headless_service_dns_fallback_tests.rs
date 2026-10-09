@@ -6,8 +6,8 @@
 //! empty slices, Ferrum falls back to Service DNS. CoreDNS later returns the
 //! pod IP; the container listens on `targetPort` (3000), not `port` (8080).
 //! Selectorless ClusterIP Services keep `port` because kube-proxy DNAT maps it.
-//! Ready manual endpoints are backed by a Pod in the Service's namespace: the
-//! backendRef guard refuses selector-less endpoints that are not (issue #6108).
+//! Ready endpoints are backed by a Pod in the Service's namespace: the
+//! backendRef guard refuses EndpointSlice endpoints that are not (issue #6108).
 
 use std::collections::HashMap;
 
@@ -93,9 +93,9 @@ fn ready_manual_slice(service_name: &str, address: &str) -> K8sObject {
     slice
 }
 
-/// A Running Pod in `default` that owns `ip`. A selector-less Service's
-/// manual EndpointSlice is admitted only when its endpoints are Pods of the
-/// Service's namespace (issue #6108).
+/// A Running Pod in `default` that owns `ip`. A Service's EndpointSlice is
+/// admitted only when its endpoints are Pods of the Service's namespace
+/// (issue #6108).
 fn pod(name: &str, ip: &str) -> K8sObject {
     let mut pod = object("Pod", "v1", name, json!({}));
     pod.status = json!({"phase": "Running", "podIP": ip});
@@ -462,7 +462,7 @@ fn selector_based_cluster_ip_keeps_service_dns_and_port() {
     service.spec["selector"] = json!({"app": "backend"});
     let slice = ready_manual_slice("backend", "10.1.0.10");
     let translated = translate_k8s_objects(
-        &[service, slice, http_route("/slice", "backend")],
+        &[service, slice, http_route("/slice", "backend"), backend_pod()],
         options(),
     )
     .expect("translate selector Service");
@@ -484,7 +484,7 @@ fn selector_based_headless_service_and_empty_slice_use_the_matching_slice_port()
             empty_manual_slice("backend")
         };
         let translated = translate_k8s_objects(
-            &[service, slice, http_route("/slice", "backend")],
+            &[service, slice, http_route("/slice", "backend"), backend_pod()],
             options(),
         )
         .expect("translate headless selector Service");

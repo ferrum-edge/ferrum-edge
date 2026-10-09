@@ -1,14 +1,16 @@
-//! Gateway API backendRefs to selector-less Services stay inside the Service's
-//! namespace (issue #6108).
+//! Gateway API backendRefs to core Services stay inside the Service's
+//! namespace, judged by EndpointSlice attribution (issue #6108).
 //!
 //! Kubernetes never manages the EndpointSlices of a Service without a
-//! `spec.selector`, so whoever can write EndpointSlices in that namespace
-//! decides which addresses the Service publishes. Pointing one at another
+//! `spec.selector`, and anyone who can write EndpointSlices can attach an extra
+//! slice to a selector-backed Service by its `kubernetes.io/service-name`
+//! label; kube-proxy and CoreDNS honour both. Pointing such a slice at another
 //! namespace's Pods would reach them without a ReferenceGrant, the same bypass
-//! an `ExternalName` alias gives (#6094). A backendRef to a selector-less
-//! Service is admitted only when every endpoint is a Pod of the Service's
-//! namespace, judged by the Pod IPs pod discovery observes. The slice's own
-//! `targetRef` can refuse an endpoint but never vouch for one.
+//! an `ExternalName` alias gives (#6094). A backendRef to a Service is
+//! admitted only when every endpoint is a Pod of the Service's namespace,
+//! judged by the Pod IPs pod discovery observes. The slice's own `targetRef`
+//! can refuse an endpoint but never vouch for one, except that it can name a
+//! selector-backed Service's same-namespace host-network Pod.
 
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config_sources::k8s::{
@@ -21,7 +23,9 @@ use ferrum_edge::k8s_controller::status::{
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-const REFUSAL: &str = "backendRef to selector-less Service";
+const REFUSAL: &str = "is not permitted by EndpointSlice attribution";
+const UNVERIFIED: &str = "is admitted without EndpointSlice attribution";
+const SERVICE_DNS: &str = "payroll.tenant-a.svc.cluster.local";
 
 fn options() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
@@ -34,6 +38,10 @@ fn options() -> K8sTranslationOptions {
 
 fn opted_in_options() -> K8sTranslationOptions {
     options().with_selectorless_external_endpoints_allowed(true)
+}
+
+fn discovery_off_options() -> K8sTranslationOptions {
+    options().with_pod_discovery_enabled(false)
 }
 
 fn object(kind: &str, name: &str, namespace: &str, api_version: &str, spec: Value) -> K8sObject {
@@ -100,13 +108,14 @@ fn http_route(backend_ref: Value) -> K8sObject {
     )
 }
 
+fn payroll_service(namespace: &str, spec: Value) -> K8sObject {
+    object("Service", "payroll", namespace, "v1", spec)
+}
+
 /// A selector-less ClusterIP Service: its EndpointSlices are hand-written.
 fn selectorless_service(namespace: &str) -> K8sObject {
-    object(
-        "Service",
-        "payroll",
+    payroll_service(
         namespace,
-        "v1",
         json!({
             "clusterIP": "10.96.0.50",
             "ports": [{ "name": "http", "port": 8080, "targetPort": 8080 }]
@@ -114,10 +123,22 @@ fn selectorless_service(namespace: &str) -> K8sObject {
     )
 }
 
-fn endpoint_slice(namespace: &str, endpoints: Value) -> K8sObject {
+/// A selector-backed Service; `cluster_ip` is `"None"` for a headless one.
+fn selector_service(cluster_ip: &str) -> K8sObject {
+    payroll_service(
+        "tenant-a",
+        json!({
+            "clusterIP": cluster_ip,
+            "selector": { "app": "payroll" },
+            "ports": [{ "name": "http", "port": 8080, "targetPort": 8080 }]
+        }),
+    )
+}
+
+fn named_endpoint_slice(namespace: &str, name: &str, endpoints: Value) -> K8sObject {
     let mut slice = object(
         "EndpointSlice",
-        "payroll-manual",
+        name,
         namespace,
         "discovery.k8s.io/v1",
         json!({
@@ -129,6 +150,32 @@ fn endpoint_slice(namespace: &str, endpoints: Value) -> K8sObject {
     slice.metadata.labels.insert(
         "kubernetes.io/service-name".to_string(),
         "payroll".to_string(),
+    );
+    slice
+}
+
+fn endpoint_slice(namespace: &str, endpoints: Value) -> K8sObject {
+    named_endpoint_slice(namespace, "payroll-manual", endpoints)
+}
+
+/// The slice the EndpointSlice controller writes for a selector-backed
+/// Service.
+fn controller_slice(endpoints: Value) -> K8sObject {
+    let mut slice = named_endpoint_slice("tenant-a", "payroll-abcde", endpoints);
+    slice.metadata.labels.insert(
+        "endpointslice.kubernetes.io/managed-by".to_string(),
+        "endpointslice-controller.k8s.io".to_string(),
+    );
+    slice
+}
+
+/// An extra slice attached to the Service by label alone; the EndpointSlice
+/// controller leaves it untouched and kube-proxy still uses it.
+fn extra_slice(endpoints: Value) -> K8sObject {
+    let mut slice = named_endpoint_slice("tenant-a", "payroll-extra", endpoints);
+    slice.metadata.labels.insert(
+        "endpointslice.kubernetes.io/managed-by".to_string(),
+        "someone-else".to_string(),
     );
     slice
 }
@@ -151,18 +198,38 @@ fn pod(namespace: &str, name: &str, ip: &str) -> K8sObject {
     pod
 }
 
-/// A same-namespace HTTPRoute to `tenant-a/payroll` whose one manual slice
-/// carries `endpoints`, plus `pods`.
-fn same_namespace_fixture(endpoints: Value, pods: Vec<K8sObject>) -> Vec<K8sObject> {
+/// A host-network Pod: it reports its Node's IP.
+fn host_network_pod(namespace: &str, name: &str, node_ip: &str) -> K8sObject {
+    let mut pod = pod(namespace, name, node_ip);
+    pod.spec = json!({ "hostNetwork": true });
+    pod
+}
+
+fn node(name: &str, address: &str, pod_cidr: &str) -> K8sObject {
+    let mut node = object("Node", name, "", "v1", json!({ "podCIDRs": [pod_cidr] }));
+    node.status = json!({ "addresses": [{ "type": "InternalIP", "address": address }] });
+    node
+}
+
+/// A same-namespace HTTPRoute to `tenant-a/payroll`, the Service and its
+/// slices, plus `extra` objects.
+fn route_fixture(service: K8sObject, extra: Vec<K8sObject>) -> Vec<K8sObject> {
     let mut objects = vec![
         gateway_class(),
         gateway(),
         http_route(json!({ "name": "payroll", "port": 8080 })),
-        selectorless_service("tenant-a"),
-        endpoint_slice("tenant-a", endpoints),
+        service,
     ];
-    objects.extend(pods);
+    objects.extend(extra);
     objects
+}
+
+/// A same-namespace HTTPRoute to the selector-less `tenant-a/payroll` whose
+/// one manual slice carries `endpoints`, plus `pods`.
+fn same_namespace_fixture(endpoints: Value, pods: Vec<K8sObject>) -> Vec<K8sObject> {
+    let mut extra = vec![endpoint_slice("tenant-a", endpoints)];
+    extra.extend(pods);
+    route_fixture(selectorless_service("tenant-a"), extra)
 }
 
 /// Every host the translated config can dial.
@@ -210,37 +277,51 @@ fn resolved_refs(
 }
 
 /// The HTTPRoute translates (the refused backend fails its rule closed), never
-/// dials `address`, warns, and reports `ResolvedRefs=False/RefNotPermitted`.
-fn assert_refused(objects: &[K8sObject], options: K8sTranslationOptions, address: &str) {
+/// dials `address` or the Service, warns, and reports
+/// `ResolvedRefs=False/RefNotPermitted`. Returns the refusal warnings.
+fn assert_refused(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    address: &str,
+) -> Vec<String> {
     let translation =
         translate_k8s_objects(objects, options.clone()).expect("translation succeeds");
+    let hosts = dial_hosts(&translation.config);
     assert!(
-        !dial_hosts(&translation.config).contains(&address),
-        "refused endpoint {address} must never become a dial target"
+        !hosts.contains(&address),
+        "refused endpoint {address:?} must never become a dial target: {hosts:?}"
     );
     assert!(
-        translation
-            .warnings
-            .iter()
-            .any(|warning| warning.contains(REFUSAL)),
-        "refusal must be warned about: {:?}",
+        hosts.iter().all(|host| !host.starts_with("payroll.")),
+        "a refused Service must not be dialed through its DNS name either: {hosts:?}"
+    );
+    let refusals: Vec<String> = translation
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains(REFUSAL))
+        .cloned()
+        .collect();
+    assert!(
+        !refusals.is_empty(),
+        "refusal of {address:?} must be warned about: {:?}",
         translation.warnings
     );
     let (status, reason) = resolved_refs(objects, options);
-    assert_eq!(status, "False", "endpoint {address}");
+    assert_eq!(status, "False", "endpoint {address:?}");
     assert_eq!(
         reason.as_deref(),
         Some("RefNotPermitted"),
-        "endpoint {address}"
+        "endpoint {address:?}"
     );
+    refusals
 }
 
-fn assert_admitted(objects: &[K8sObject], options: K8sTranslationOptions, address: &str) {
+fn assert_admitted(objects: &[K8sObject], options: K8sTranslationOptions, dial_host: &str) {
     let translation =
         translate_k8s_objects(objects, options.clone()).expect("translation succeeds");
     assert!(
-        dial_hosts(&translation.config).contains(&address),
-        "admitted endpoint {address} must be dialed: {:?}",
+        dial_hosts(&translation.config).contains(&dial_host),
+        "admitted backend {dial_host:?} must be dialed: {:?}",
         dial_hosts(&translation.config)
     );
     assert!(
@@ -311,6 +392,28 @@ fn one_foreign_endpoint_refuses_the_whole_backend() {
 }
 
 #[test]
+fn not_ready_and_terminating_foreign_endpoints_are_still_refused() {
+    // Readiness flips without the slice's author doing anything; a refusal
+    // that came and went with it would hide the foreign endpoint.
+    for conditions in [
+        json!({ "ready": false }),
+        json!({ "ready": false, "serving": true, "terminating": true }),
+    ] {
+        let objects = same_namespace_fixture(
+            json!([
+                endpoint("10.1.0.10"),
+                { "addresses": ["10.2.0.20"], "conditions": conditions }
+            ]),
+            vec![
+                pod("tenant-a", "payroll-0", "10.1.0.10"),
+                pod("hr", "payroll-db-0", "10.2.0.20"),
+            ],
+        );
+        assert_refused(&objects, options(), "10.2.0.20");
+    }
+}
+
+#[test]
 fn ip_claimed_by_pods_in_two_namespaces_is_refused() {
     let objects = same_namespace_fixture(
         json!([endpoint("10.1.0.10")]),
@@ -323,17 +426,44 @@ fn ip_claimed_by_pods_in_two_namespaces_is_refused() {
 }
 
 #[test]
+fn every_ip_a_dual_stack_pod_reports_is_attributed() {
+    let mut dual_stack = pod("tenant-a", "payroll-0", "10.1.0.10");
+    dual_stack.status["podIPs"] = json!([{ "ip": "10.1.0.10" }, { "ip": "fd00:10::a" }]);
+    let mut slice = endpoint_slice("tenant-a", json!([endpoint("fd00:10::a")]));
+    slice.spec["addressType"] = json!("IPv6");
+    let objects = route_fixture(selectorless_service("tenant-a"), vec![slice, dual_stack]);
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains(REFUSAL)),
+        "{:?}",
+        translation.warnings
+    );
+    assert_eq!(resolved_refs(&objects, options()).0, "True");
+}
+
+#[test]
 fn host_network_and_terminal_pods_do_not_attribute_an_ip() {
     // A host-network Pod reports its node's IP; a Succeeded Pod has released
     // its IP for reuse. Neither makes the address a Pod of the namespace.
-    let mut host_network = pod("tenant-a", "node-agent", "10.0.0.5");
-    host_network.spec = json!({ "hostNetwork": true });
+    let host_network = host_network_pod("tenant-a", "node-agent", "10.0.0.5");
     let mut completed = pod("tenant-a", "job-0", "10.1.0.30");
     completed.status["phase"] = json!("Succeeded");
     for (address, owner) in [("10.0.0.5", host_network), ("10.1.0.30", completed)] {
         let objects = same_namespace_fixture(json!([endpoint(address)]), vec![owner]);
         assert_refused(&objects, options(), address);
     }
+
+    // A selector-less Service's slice cannot vouch for a host-network Pod by
+    // `targetRef` either; only a selector-backed Service's can.
+    let objects = same_namespace_fixture(
+        json!([endpoint_with_target("10.0.0.5", "tenant-a", "node-agent")]),
+        vec![host_network_pod("tenant-a", "node-agent", "10.0.0.5")],
+    );
+    assert_refused(&objects, options(), "10.0.0.5");
 }
 
 #[test]
@@ -344,20 +474,206 @@ fn unattributed_endpoint_ip_is_refused_unless_the_operator_opts_in() {
 }
 
 #[test]
-fn special_and_fqdn_endpoints_are_refused_even_when_opted_in() {
+fn special_malformed_and_fqdn_endpoints_are_refused_even_when_opted_in() {
     for address in [
         "127.0.0.1",
         "169.254.169.254",
         "0.0.0.0",
+        "0.1.2.3",
         "224.0.0.1",
+        "255.255.255.255",
+        "100.100.100.200",
+        "168.63.129.16",
         "::1",
+        "::",
         "fe80::1",
+        "ff02::1",
+        "fd00:ec2::254",
         "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254",
+        // NAT64 and deprecated IPv4-compatible spellings of special addresses.
+        "64:ff9b::7f00:1",
+        "64:ff9b::a9fe:a9fe",
+        "64:ff9b::6464:64c8",
+        "::127.0.0.1",
+        "::169.254.169.254",
+        // Not IP addresses at all: an FQDN, a zone id, leading zeros, and
+        // surrounding whitespace.
         "payroll.hr.svc.cluster.local",
+        "fe80::1%eth0",
+        "010.0.0.1",
+        " 203.0.113.10",
+        "203.0.113.10 ",
     ] {
         let objects = same_namespace_fixture(json!([endpoint(address)]), Vec::new());
         assert_refused(&objects, opted_in_options(), address);
     }
+}
+
+#[test]
+fn a_pod_reporting_a_special_address_does_not_make_it_a_backend() {
+    // Only someone able to patch `pods/status` can make a non-host-network Pod
+    // report these; the deny list is checked before any Pod claim.
+    for address in ["127.0.0.1", "169.254.169.254", "::1", "fd00:ec2::254"] {
+        let objects = same_namespace_fixture(
+            json!([endpoint(address)]),
+            vec![pod("tenant-a", "payroll-0", address)],
+        );
+        assert_refused(&objects, opted_in_options(), address);
+    }
+}
+
+#[test]
+fn nat64_endpoint_follows_its_embedded_ipv4() {
+    // 64:ff9b::cb00:710a embeds the external 203.0.113.10 (opt-in admits it);
+    // 64:ff9b::a02:14 embeds another namespace's Pod (always refused).
+    let external = same_namespace_fixture(json!([endpoint("64:ff9b::cb00:710a")]), Vec::new());
+    assert_refused(&external, options(), "64:ff9b::cb00:710a");
+    assert_admitted(&external, opted_in_options(), "64:ff9b::cb00:710a");
+
+    let foreign = same_namespace_fixture(
+        json!([endpoint("64:ff9b::a02:14")]),
+        vec![pod("hr", "payroll-db-0", "10.2.0.20")],
+    );
+    assert_refused(&foreign, opted_in_options(), "64:ff9b::a02:14");
+}
+
+#[test]
+fn opt_in_never_admits_cluster_infrastructure() {
+    // Another Service's ClusterIP (kube-proxy forwards it to that Service's
+    // Pods), a Node address (the kubelet and every NodePort), and an IP in a
+    // Node's Pod CIDR (a Pod outside the watch scope) are never "external".
+    let ledger = object(
+        "Service",
+        "ledger",
+        "hr",
+        "v1",
+        json!({
+            "clusterIP": "10.96.7.7",
+            "selector": { "app": "ledger" },
+            "ports": [{ "name": "http", "port": 8080 }]
+        }),
+    );
+    let worker = node("worker-1", "192.168.10.5", "10.244.3.0/24");
+    for address in ["10.96.7.7", "10.96.0.50", "192.168.10.5", "10.244.3.17"] {
+        let objects = same_namespace_fixture(
+            json!([endpoint(address)]),
+            vec![ledger.clone(), worker.clone()],
+        );
+        assert_refused(&objects, opted_in_options(), address);
+    }
+
+    // A genuinely external IP is still admitted beside that inventory.
+    let objects = same_namespace_fixture(json!([endpoint("203.0.113.10")]), vec![ledger, worker]);
+    assert_admitted(&objects, opted_in_options(), "203.0.113.10");
+}
+
+#[test]
+fn slice_labelled_for_both_a_service_and_a_service_import_is_still_checked() {
+    // kube-proxy and CoreDNS map a slice to a Service by
+    // `kubernetes.io/service-name` alone; the MCS label must not hide it.
+    let mut slice = endpoint_slice("tenant-a", json!([endpoint("10.2.0.20")]));
+    slice.metadata.labels.insert(
+        "multicluster.kubernetes.io/service-name".to_string(),
+        "payroll".to_string(),
+    );
+    let objects = route_fixture(
+        selectorless_service("tenant-a"),
+        vec![slice, pod("hr", "payroll-db-0", "10.2.0.20")],
+    );
+    assert_refused(&objects, options(), "10.2.0.20");
+}
+
+#[test]
+fn controller_managed_slices_of_a_selector_service_are_admitted() {
+    let endpoints = Value::Array(vec![
+        endpoint_with_target("10.1.0.10", "tenant-a", "payroll-0"),
+        endpoint_with_target("10.1.0.11", "tenant-a", "payroll-1"),
+    ]);
+    let pods = vec![
+        pod("tenant-a", "payroll-0", "10.1.0.10"),
+        pod("tenant-a", "payroll-1", "10.1.0.11"),
+    ];
+
+    let mut headless = vec![controller_slice(endpoints.clone())];
+    headless.extend(pods.clone());
+    let headless = route_fixture(selector_service("None"), headless);
+    assert_admitted(&headless, options(), "10.1.0.10");
+
+    let mut cluster_ip = vec![controller_slice(endpoints)];
+    cluster_ip.extend(pods);
+    let cluster_ip = route_fixture(selector_service("10.96.0.60"), cluster_ip);
+    assert_admitted(&cluster_ip, options(), SERVICE_DNS);
+}
+
+#[test]
+fn extra_slice_on_a_selector_service_is_refused() {
+    // Ferrum dials a headless Service's endpoints itself, and kube-proxy
+    // load-balances a ClusterIP Service onto the extra slice: either way the
+    // label-attached slice reaches another namespace's Pod.
+    let named = json!([endpoint_with_target("10.1.0.10", "tenant-a", "payroll-0")]);
+    for cluster_ip in ["None", "10.96.0.60"] {
+        let objects = route_fixture(
+            selector_service(cluster_ip),
+            vec![
+                controller_slice(named.clone()),
+                extra_slice(json!([endpoint("10.2.0.20")])),
+                pod("tenant-a", "payroll-0", "10.1.0.10"),
+                pod("hr", "payroll-db-0", "10.2.0.20"),
+            ],
+        );
+        assert_refused(&objects, options(), "10.2.0.20");
+    }
+}
+
+#[test]
+fn opt_in_does_not_admit_an_unattributed_endpoint_of_a_selector_service() {
+    let objects = route_fixture(
+        selector_service("10.96.0.60"),
+        vec![extra_slice(json!([endpoint("203.0.113.10")]))],
+    );
+    assert_refused(&objects, opted_in_options(), "203.0.113.10");
+}
+
+#[test]
+fn selector_service_reaches_its_host_network_daemonset_pods() {
+    // A host-network Pod reports its Node's IP, which no other Pod claims;
+    // the controller-managed endpoint names it by `targetRef`.
+    let daemonset_pod = host_network_pod("tenant-a", "payroll-node-a", "192.168.10.5");
+    let worker = node("worker-1", "192.168.10.5", "10.244.3.0/24");
+    let named = json!([endpoint_with_target("192.168.10.5", "tenant-a", "payroll-node-a")]);
+    for (cluster_ip, dial_host) in [("None", "192.168.10.5"), ("10.96.0.60", SERVICE_DNS)] {
+        let objects = route_fixture(
+            selector_service(cluster_ip),
+            vec![
+                controller_slice(named.clone()),
+                daemonset_pod.clone(),
+                worker.clone(),
+            ],
+        );
+        assert_admitted(&objects, options(), dial_host);
+    }
+
+    // Without the `targetRef`, or naming a Pod that reports another address,
+    // the Node address is refused.
+    let unnamed = route_fixture(
+        selector_service("None"),
+        vec![
+            controller_slice(json!([endpoint("192.168.10.5")])),
+            daemonset_pod.clone(),
+            worker.clone(),
+        ],
+    );
+    assert_refused(&unnamed, options(), "192.168.10.5");
+    let mismatched = route_fixture(
+        selector_service("None"),
+        vec![
+            controller_slice(named),
+            host_network_pod("tenant-a", "payroll-node-a", "192.168.10.6"),
+            worker,
+        ],
+    );
+    assert_refused(&mismatched, options(), "192.168.10.5");
 }
 
 fn cross_namespace_fixture(endpoints: Value, pods: Vec<K8sObject>) -> Vec<K8sObject> {
@@ -408,27 +724,68 @@ fn granted_reference_reaches_only_pods_of_the_granting_namespace() {
 }
 
 #[test]
-fn selectorless_endpoint_refusal_refuses_an_l4_route() {
-    let objects = vec![
+fn endpoint_slice_refusal_refuses_a_grpc_route_backend() {
+    let mut objects = same_namespace_fixture(
+        json!([endpoint("10.2.0.20")]),
+        vec![pod("hr", "payroll-db-0", "10.2.0.20")],
+    );
+    objects.retain(|object| object.kind != "HTTPRoute");
+    objects.push(object(
+        "GRPCRoute",
+        "rpc",
+        "tenant-a",
+        "gateway.networking.k8s.io/v1",
+        json!({
+            "parentRefs": [{ "name": "shared" }],
+            "hostnames": ["rpc.example.com"],
+            "rules": [{ "backendRefs": [{ "name": "payroll", "port": 8080 }] }]
+        }),
+    ));
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+    assert!(!dial_hosts(&translation.config).contains(&"10.2.0.20"));
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(REFUSAL)),
+        "{:?}",
+        translation.warnings
+    );
+    let (status, reason) = route_condition(&objects, options(), "GRPCRoute", "rpc", "ResolvedRefs");
+    assert_eq!(status, "False");
+    assert_eq!(reason.as_deref(), Some("RefNotPermitted"));
+}
+
+fn l4_fixture(listener: Value, route: K8sObject) -> Vec<K8sObject> {
+    vec![
         gateway_class(),
         object(
             "Gateway",
             "shared",
             "tenant-a",
             "gateway.networking.k8s.io/v1",
-            json!({
-                "gatewayClassName": "ferrum",
-                "listeners": [{
-                    "name": "postgres",
-                    "port": 5432,
-                    "protocol": "TCP",
-                    "allowedRoutes": {
-                        "namespaces": { "from": "Same" },
-                        "kinds": [{ "kind": "TCPRoute" }]
-                    }
-                }]
-            }),
+            json!({ "gatewayClassName": "ferrum", "listeners": [listener] }),
         ),
+        route,
+        selectorless_service("tenant-a"),
+        endpoint_slice("tenant-a", json!([endpoint("10.2.0.20")])),
+        pod("hr", "payroll-db-0", "10.2.0.20"),
+    ]
+}
+
+#[test]
+fn endpoint_slice_refusal_refuses_l4_routes() {
+    let tcp = l4_fixture(
+        json!({
+            "name": "postgres",
+            "port": 5432,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "namespaces": { "from": "Same" },
+                "kinds": [{ "kind": "TCPRoute" }]
+            }
+        }),
         object(
             "TCPRoute",
             "db",
@@ -439,65 +796,114 @@ fn selectorless_endpoint_refusal_refuses_an_l4_route() {
                 "rules": [{ "backendRefs": [{ "name": "payroll", "port": 8080 }] }]
             }),
         ),
-        selectorless_service("tenant-a"),
-        endpoint_slice("tenant-a", json!([endpoint("10.2.0.20")])),
-        pod("hr", "payroll-db-0", "10.2.0.20"),
-    ];
-
-    let error = translate_k8s_objects(&objects, options())
-        .expect_err("an L4 route to a cross-namespace selector-less endpoint");
-    assert!(
-        error.to_string().contains(REFUSAL),
-        "unexpected refusal: {error}"
     );
-    let (status, reason) = route_condition(&objects, options(), "TCPRoute", "db", "ResolvedRefs");
-    assert_eq!(status, "False");
-    assert_eq!(reason.as_deref(), Some("RefNotPermitted"));
+    let udp = l4_fixture(
+        json!({
+            "name": "dns",
+            "port": 5353,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "namespaces": { "from": "Same" },
+                "kinds": [{ "kind": "UDPRoute" }]
+            }
+        }),
+        object(
+            "UDPRoute",
+            "db",
+            "tenant-a",
+            "gateway.networking.k8s.io/v1alpha2",
+            json!({
+                "parentRefs": [{ "name": "shared", "sectionName": "dns" }],
+                "rules": [{ "backendRefs": [{ "name": "payroll", "port": 8080 }] }]
+            }),
+        ),
+    );
+
+    for (kind, objects) in [("TCPRoute", tcp), ("UDPRoute", udp)] {
+        let error = translate_k8s_objects(&objects, options())
+            .expect_err("an L4 route to a cross-namespace endpoint is rejected");
+        assert!(
+            error.to_string().contains(REFUSAL),
+            "{kind}: unexpected refusal: {error}"
+        );
+        let (status, reason) = route_condition(&objects, options(), kind, "db", "ResolvedRefs");
+        assert_eq!(status, "False", "{kind}");
+        assert_eq!(reason.as_deref(), Some("RefNotPermitted"), "{kind}");
+    }
 }
 
 #[test]
-fn without_pod_discovery_the_backend_is_admitted_with_a_warning() {
-    // No Pod or EndpointSlice inventory: the controller cannot attribute the
-    // endpoints, so it keeps routing through Service DNS and says so.
+fn without_pod_discovery_a_selectorless_service_is_refused_as_unverifiable() {
+    // No Pod or EndpointSlice inventory: nothing manages the slices and
+    // nothing here can tell where they point, so the backend fails closed.
+    // The opt-in promises that other namespaces' Pods stay refused, which an
+    // unchecked slice cannot keep, so it does not admit it either.
     let objects = same_namespace_fixture(
         json!([endpoint("10.2.0.20")]),
         vec![pod("hr", "payroll-db-0", "10.2.0.20")],
     );
-    let options = options().with_pod_discovery_enabled(false);
-    let translation =
-        translate_k8s_objects(&objects, options.clone()).expect("translation succeeds");
-    assert!(
-        dial_hosts(&translation.config).contains(&"payroll.tenant-a.svc.cluster.local"),
-        "{:?}",
-        dial_hosts(&translation.config)
-    );
-    assert!(
-        translation
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("admitted unverified")),
-        "{:?}",
-        translation.warnings
-    );
-    assert_eq!(resolved_refs(&objects, options).0, "True");
+    for options in [
+        discovery_off_options(),
+        discovery_off_options().with_selectorless_external_endpoints_allowed(true),
+    ] {
+        let refusals = assert_refused(&objects, options, SERVICE_DNS);
+        assert!(
+            refusals
+                .iter()
+                .any(|warning| warning.contains("cannot be checked")),
+            "{refusals:?}"
+        );
+    }
 }
 
 #[test]
-fn selector_backed_service_is_not_subject_to_the_guard() {
-    let mut objects = same_namespace_fixture(json!([endpoint("10.1.0.10")]), Vec::new());
-    let service = objects
-        .iter_mut()
-        .find(|object| object.kind == "Service")
-        .expect("Service");
-    service.spec["selector"] = json!({ "app": "payroll" });
-    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
-    assert!(
-        translation
-            .warnings
-            .iter()
-            .all(|warning| !warning.contains(REFUSAL)),
-        "{:?}",
-        translation.warnings
+fn outside_the_pod_watch_scope_a_selectorless_service_is_refused_as_unverifiable() {
+    let objects = same_namespace_fixture(
+        json!([endpoint("10.1.0.10")]),
+        vec![pod("tenant-a", "payroll-0", "10.1.0.10")],
     );
-    assert_eq!(resolved_refs(&objects, options()).0, "True");
+    let options = options().with_pod_source_namespaces(vec!["tenant-b".to_string()]);
+    let refusals = assert_refused(&objects, options, "10.1.0.10");
+    assert!(
+        refusals
+            .iter()
+            .any(|warning| warning.contains("cannot be checked")),
+        "{refusals:?}"
+    );
+}
+
+#[test]
+fn without_pod_discovery_a_selector_service_is_admitted_with_a_warning() {
+    // Kubernetes manages a selector-backed Service's slices, so it keeps
+    // routing through Service DNS; an extra slice cannot be checked, and the
+    // translation says so once per Service.
+    let mut objects = route_fixture(
+        selector_service("10.96.0.60"),
+        vec![extra_slice(json!([endpoint("10.2.0.20")]))],
+    );
+    objects.push(object(
+        "HTTPRoute",
+        "store-v2",
+        "tenant-a",
+        "gateway.networking.k8s.io/v1",
+        json!({
+            "parentRefs": [{ "name": "shared" }],
+            "hostnames": ["store-v2.example.com"],
+            "rules": [{ "backendRefs": [{ "name": "payroll", "port": 8080 }] }]
+        }),
+    ));
+    let translation =
+        translate_k8s_objects(&objects, discovery_off_options()).expect("translation succeeds");
+    assert!(
+        dial_hosts(&translation.config).contains(&SERVICE_DNS),
+        "{:?}",
+        dial_hosts(&translation.config)
+    );
+    let unverified = translation
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains(UNVERIFIED))
+        .count();
+    assert_eq!(unverified, 1, "{:?}", translation.warnings);
+    assert_eq!(resolved_refs(&objects, discovery_off_options()).0, "True");
 }

@@ -2776,9 +2776,11 @@ pub struct EnvConfig {
     pub k8s_pod_discovery_enabled: bool,
     /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. Let a Gateway API
     /// backendRef to a selector-less Service in the route's own namespace
-    /// reach EndpointSlice IPs that are not Pod IPs (an external database or
-    /// VM). Never admits another namespace's Pods, FQDN endpoints, or
-    /// loopback/link-local/unspecified/multicast addresses. Default: false.
+    /// reach EndpointSlice IPs that no observed Pod, Service ClusterIP, Node
+    /// address, or Node Pod CIDR claims (an external database or VM). Never
+    /// admits another namespace's observed Pods, FQDN endpoints,
+    /// loopback/link-local/unspecified/multicast/cloud-metadata addresses, or
+    /// a Service it cannot check because pod discovery is off. Default: false.
     pub k8s_allow_selectorless_external_endpoints: bool,
     /// Namespace where the Ferrum K8s controller and ambient NodeWaypoint
     /// DaemonSet are installed. Defaults to `FERRUM_NAMESPACE`; Helm sets it

@@ -242,12 +242,13 @@ pub(crate) fn checked_backend_namespace(
         ));
     }
 
-    // A selector-less Service publishes whatever addresses its EndpointSlices
-    // name, so a namespace that can write EndpointSlices could point one at
-    // another namespace's Pods (or any address) and reach it without a
+    // A Service publishes whatever addresses its EndpointSlices name, and
+    // anyone who can write EndpointSlices in its namespace can author one (a
+    // selector-backed Service accepts extra slices by label). Pointing one at
+    // another namespace's Pods, or at any address, would reach it without a
     // ReferenceGrant. Admit only endpoints that are Pods of the Service's own
     // namespace (issue #6108).
-    let endpoint_guard = acc.selectorless_endpoint_guard();
+    let endpoint_guard = acc.endpoint_slice_guard();
     let route_namespace = object.metadata.namespace.as_str();
     if backend_kind == BackendKind::Service
         && let Some(name) = backend_name
@@ -255,7 +256,7 @@ pub(crate) fn checked_backend_namespace(
     {
         return Err(invalid_resource(
             object,
-            selectorless_endpoint_backend_message(backend_namespace, name, refusal),
+            endpoint_slice_backend_message(backend_namespace, name, refusal),
         ));
     }
 
@@ -279,46 +280,63 @@ pub(crate) fn service_object_has_selector(object: &K8sObject) -> bool {
         .is_some_and(|selector| !selector.is_empty())
 }
 
-/// Why a backendRef to a selector-less Service is refused (issue #6108).
+/// Why EndpointSlice attribution refuses a backendRef to a Service (issue
+/// #6108).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SelectorlessEndpointRefusal {
-    /// An endpoint names a Pod in another namespace, carries the IP of one,
-    /// or carries an address no Pod can have (an FQDN, or a loopback,
-    /// link-local, unspecified, multicast, or broadcast IP). Always refused.
+pub(crate) enum EndpointSliceRefusal {
+    /// An endpoint names a Pod in another namespace, carries the IP of one, or
+    /// carries an address no Pod of the namespace can have: an FQDN, a
+    /// loopback, link-local, unspecified, multicast, broadcast, or
+    /// cloud-metadata IP, another Service's ClusterIP, a Node address, or an
+    /// IP inside a Node's Pod CIDR that no observed Pod claims. Always refused.
     ForeignEndpoint,
     /// An endpoint IP is not the IP of any Pod observed in the Service's
     /// namespace, and the operator opt-in does not admit it for this route.
     UnattributedEndpoint,
+    /// A selector-less Service whose EndpointSlices cannot be checked: pod
+    /// discovery is disabled or its namespace is outside the Pod watch scope.
+    /// Always refused; the operator opt-in never admits it.
+    Unverifiable,
 }
 
-/// What one selector-less Service's EndpointSlice endpoints contain beyond
-/// Pods of its own namespace.
+/// What one Service's EndpointSlice endpoints contain beyond Pods of its own
+/// namespace.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SelectorlessEndpointFindings {
+pub(crate) struct EndpointSliceFindings {
     pub(crate) foreign: bool,
     pub(crate) unattributed: bool,
+    pub(crate) unverifiable: bool,
+    /// The Service has no `spec.selector`, so Kubernetes manages none of its
+    /// EndpointSlices. Only such a Service's unattributed endpoints are
+    /// eligible for the operator opt-in.
+    pub(crate) selectorless: bool,
 }
 
-/// Per-translation verdicts for backendRefs to selector-less Services.
+impl EndpointSliceFindings {
+    fn refuses_anything(self) -> bool {
+        self.foreign || self.unattributed || self.unverifiable
+    }
+}
+
+/// Per-translation EndpointSlice attribution verdicts for Gateway API
+/// backendRefs to core Services.
 ///
-/// Built once from the collected Pod and EndpointSlice inventory, before any
-/// route is translated, and carried on the translation so the Gateway API
-/// status writer reports the same `ResolvedRefs` verdict translation enforced.
-/// Only Services with a finding are recorded; an absent entry admits.
-///
-/// Without pod discovery no Pod or EndpointSlice is collected, so the guard is
-/// empty and admits everything; translation warns instead (see
-/// [`selectorless_endpoint_unverified_warning`]).
+/// Built once from the collected Pod, Node, Service, and EndpointSlice
+/// inventory, before any route is translated, and carried on the translation
+/// so the Gateway API status writer reports the same `ResolvedRefs` verdict
+/// translation enforced. Only Services with a finding are recorded; an absent
+/// entry admits.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SelectorlessEndpointGuard {
-    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`: admit unattributed
-    /// endpoint IPs when the route and the Service share a namespace.
+pub(crate) struct EndpointSliceGuard {
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`: admit a
+    /// selector-less Service's unattributed endpoint IPs when the route and the
+    /// Service share a namespace.
     allow_external_endpoints: bool,
     /// `namespace → service → findings`.
-    findings: HashMap<String, HashMap<String, SelectorlessEndpointFindings>>,
+    findings: HashMap<String, HashMap<String, EndpointSliceFindings>>,
 }
 
-impl SelectorlessEndpointGuard {
+impl EndpointSliceGuard {
     pub(crate) fn new(allow_external_endpoints: bool) -> Self {
         Self {
             allow_external_endpoints,
@@ -326,19 +344,31 @@ impl SelectorlessEndpointGuard {
         }
     }
 
-    pub(crate) fn record(
-        &mut self,
-        namespace: &str,
-        name: &str,
-        findings: SelectorlessEndpointFindings,
-    ) {
-        if findings == SelectorlessEndpointFindings::default() {
+    /// Merge `findings` into the Service's recorded findings.
+    pub(crate) fn record(&mut self, namespace: &str, name: &str, findings: EndpointSliceFindings) {
+        if !findings.refuses_anything() {
             return;
         }
-        self.findings
+        let recorded = self
+            .findings
             .entry(namespace.to_string())
             .or_default()
-            .insert(name.to_string(), findings);
+            .entry(name.to_string())
+            .or_default();
+        recorded.foreign |= findings.foreign;
+        recorded.unattributed |= findings.unattributed;
+        recorded.unverifiable |= findings.unverifiable;
+        recorded.selectorless |= findings.selectorless;
+    }
+
+    /// Record a selector-less Service whose EndpointSlices cannot be checked.
+    pub(crate) fn record_unverifiable(&mut self, namespace: &str, name: &str) {
+        let findings = EndpointSliceFindings {
+            unverifiable: true,
+            selectorless: true,
+            ..EndpointSliceFindings::default()
+        };
+        self.record(namespace, name, findings);
     }
 
     /// The refusal for a backendRef from `route_namespace` to the Service
@@ -348,58 +378,84 @@ impl SelectorlessEndpointGuard {
         route_namespace: &str,
         service_namespace: &str,
         service_name: &str,
-    ) -> Option<SelectorlessEndpointRefusal> {
+    ) -> Option<EndpointSliceRefusal> {
         let findings = self.findings.get(service_namespace)?.get(service_name)?;
         if findings.foreign {
-            return Some(SelectorlessEndpointRefusal::ForeignEndpoint);
+            return Some(EndpointSliceRefusal::ForeignEndpoint);
+        }
+        // The opt-in promises that other namespaces' Pods stay refused; an
+        // unchecked slice cannot keep that promise, so it never admits one.
+        if findings.unverifiable {
+            return Some(EndpointSliceRefusal::Unverifiable);
         }
         // The opt-in never widens a ReferenceGrant: a granted cross-namespace
         // reference still reaches only the granting namespace's Pods.
-        let external_admitted =
-            self.allow_external_endpoints && route_namespace == service_namespace;
+        let external_admitted = self.allow_external_endpoints
+            && findings.selectorless
+            && route_namespace == service_namespace;
         if findings.unattributed && !external_admitted {
-            return Some(SelectorlessEndpointRefusal::UnattributedEndpoint);
+            return Some(EndpointSliceRefusal::UnattributedEndpoint);
         }
         None
     }
 }
 
-fn selectorless_endpoint_backend_message(
+/// The phrase every EndpointSlice attribution refusal carries; see
+/// [`message_is_endpoint_slice_refusal`].
+const ENDPOINT_SLICE_REFUSAL: &str = "is not permitted by EndpointSlice attribution";
+
+fn endpoint_slice_backend_message(
     namespace: &str,
     name: &str,
-    refusal: SelectorlessEndpointRefusal,
+    refusal: EndpointSliceRefusal,
 ) -> String {
     match refusal {
-        SelectorlessEndpointRefusal::ForeignEndpoint => format!(
-            "backendRef to selector-less Service {namespace:?}/{name:?} is not permitted: an \
+        EndpointSliceRefusal::ForeignEndpoint => format!(
+            "backendRef to Service {namespace:?}/{name:?} {ENDPOINT_SLICE_REFUSAL}: an \
              EndpointSlice endpoint names or carries the IP of a Pod outside namespace \
-             {namespace:?}, or is not a Pod address"
+             {namespace:?}, or an address that is not a Pod of that namespace"
         ),
-        SelectorlessEndpointRefusal::UnattributedEndpoint => format!(
-            "backendRef to selector-less Service {namespace:?}/{name:?} is not permitted: an \
+        EndpointSliceRefusal::UnattributedEndpoint => format!(
+            "backendRef to Service {namespace:?}/{name:?} {ENDPOINT_SLICE_REFUSAL}: an \
              EndpointSlice endpoint IP is not the IP of a Pod observed in namespace \
              {namespace:?}; FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true admits such \
-             endpoints for routes in the same namespace as the Service"
+             endpoints of a selector-less Service for routes in the same namespace as the Service"
+        ),
+        EndpointSliceRefusal::Unverifiable => format!(
+            "backendRef to Service {namespace:?}/{name:?} {ENDPOINT_SLICE_REFUSAL}: the \
+             Service has no selector, and its EndpointSlice endpoints cannot be checked because \
+             the controller observes no Pods in namespace {namespace:?}; enable \
+             FERRUM_K8S_POD_DISCOVERY_ENABLED and watch that namespace"
         ),
     }
 }
 
-/// Stable classification of the selector-less EndpointSlice refusal. Kept
+/// Stable classification of an EndpointSlice attribution refusal. Kept
 /// disjoint from every other backendRef predicate (it never contains
 /// `backendRef Service`, `ReferenceGrant`, or `was not found`) so
 /// `ResolvedRefs` reports `RefNotPermitted`.
-pub(crate) fn message_is_selectorless_endpoint_refusal(message: &str) -> bool {
-    message.contains("backendRef to selector-less Service")
+pub(crate) fn message_is_endpoint_slice_refusal(message: &str) -> bool {
+    message.contains(ENDPOINT_SLICE_REFUSAL)
 }
 
-/// Translation warning for a backendRef to a selector-less Service whose
-/// EndpointSlices this controller cannot attribute, because pod discovery
-/// (the Pod and EndpointSlice inventory) is disabled.
-pub(crate) fn selectorless_endpoint_unverified_warning(namespace: &str, name: &str) -> String {
+/// Translation warning for a backendRef to a selector-backed Service whose
+/// EndpointSlices this controller cannot attribute, because it observes no
+/// Pods in the Service's namespace. Kubernetes manages that Service's slices,
+/// so it is admitted, but a slice someone attached to it by label is unchecked.
+pub(crate) fn endpoint_slice_unverified_warning(
+    namespace: &str,
+    name: &str,
+    pod_discovery_enabled: bool,
+) -> String {
+    let reason = if pod_discovery_enabled {
+        "the namespace is outside the controller's Pod watch scope"
+    } else {
+        "FERRUM_K8S_POD_DISCOVERY_ENABLED=false"
+    };
     format!(
-        "backendRef to selector-less Service {namespace:?}/{name:?} is admitted unverified: \
-         FERRUM_K8S_POD_DISCOVERY_ENABLED=false, so its EndpointSlice endpoints cannot be \
-         checked against Pods in namespace {namespace:?}"
+        "backendRef to Service {namespace:?}/{name:?} is admitted without EndpointSlice \
+         attribution: {reason}, so an EndpointSlice attached to it cannot be checked against \
+         Pods in namespace {namespace:?}"
     )
 }
 
@@ -619,8 +675,8 @@ pub(crate) struct BackendRefStatusInventory<'a> {
     pub service_imports_by_ns_name:
         &'a std::collections::HashMap<(&'a str, &'a str), &'a K8sObject>,
     pub has_any_service: bool,
-    /// The translation's selector-less Service EndpointSlice verdicts.
-    pub selectorless_endpoints: &'a SelectorlessEndpointGuard,
+    /// The translation's EndpointSlice attribution verdicts.
+    pub endpoint_slices: &'a EndpointSliceGuard,
 }
 
 /// Shared `ResolvedRefs` reason for one non-zero-weight `backendRef`.
@@ -628,9 +684,10 @@ pub(crate) struct BackendRefStatusInventory<'a> {
 /// Returns `None` when the ref is resolved. Reasons match Gateway API
 /// `RouteConditionReason` vocabulary (`InvalidKind`, `RefNotPermitted`,
 /// `BackendNotFound`, `UnsupportedProtocol` — the last also for an
-/// `ExternalName` Service, which translation refuses). A selector-less Service
-/// whose EndpointSlices reach outside its namespace is `RefNotPermitted`, from
-/// the same [`SelectorlessEndpointGuard`] translation enforced.
+/// `ExternalName` Service, which translation refuses). A Service whose
+/// EndpointSlices reach outside its namespace, or a selector-less one whose
+/// slices cannot be checked, is `RefNotPermitted`, from the same
+/// [`EndpointSliceGuard`] translation enforced.
 ///
 /// Kind capability uses the same Route-kind predicate as translation, so a
 /// present `ServiceImport` stays `InvalidKind` on UDPRoute. ReferenceGrant is
@@ -704,7 +761,7 @@ where
                 return Some("UnsupportedProtocol");
             }
             if inventory
-                .selectorless_endpoints
+                .endpoint_slices
                 .refusal(&route.metadata.namespace, backend_namespace, backend_name)
                 .is_some()
             {
