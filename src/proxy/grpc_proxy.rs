@@ -2687,6 +2687,12 @@ pub(crate) enum GrpcRequestBodyCollectError {
     /// and counted exactly once for the request; the caller emits the fixed
     /// pre-commitment gRPC terminal.
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// The client ended the upload before its END_STREAM: an HTTP/2 `CANCEL`
+    /// reset, a `NO_ERROR` reset the END_STREAM gate refuses, a dropped
+    /// connection, or any other failed read of the frontend body (issue
+    /// #6022). A client disconnect, never a gateway fault: the caller answers
+    /// `CANCELLED` with client-disconnect accounting, and no backend is dialed.
+    ClientDisconnected,
 }
 
 fn map_authorized_upload_wait_error(
@@ -3002,6 +3008,7 @@ pub const GRPC_STATUS_UNREADABLE_METADATA_KEY: &str = "grpc_status_unreadable";
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
     pub const OK: u32 = 0;
+    pub const CANCELLED: u32 = 1;
     pub const UNKNOWN: u32 = 2;
     pub const INVALID_ARGUMENT: u32 = 3;
     pub const DEADLINE_EXCEEDED: u32 = 4;
@@ -3041,9 +3048,17 @@ pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
         | StatusCode::TOO_MANY_REQUESTS => grpc_status::RESOURCE_EXHAUSTED,
         StatusCode::NOT_IMPLEMENTED => grpc_status::UNIMPLEMENTED,
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => grpc_status::UNAVAILABLE,
+        // The gateway's `499` client-disconnect terminal: the client cancelled,
+        // which gRPC reports as CANCELLED, never a gateway INTERNAL. The
+        // inverse of `grpc_status_to_http_status` (issue #6022).
+        _ if status.as_u16() == CLIENT_CLOSED_REQUEST_STATUS => grpc_status::CANCELLED,
         _ => grpc_status::INTERNAL,
     }
 }
+
+/// The non-standard `499 Client Closed Request` status the gateway records for
+/// a client that disconnected before the response.
+const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
 
 /// Map a gRPC status code to the closest HTTP status — the reverse of
 /// [`http_reject_status_to_grpc_status`]. Used to feed the adaptive-concurrency
@@ -6112,9 +6127,7 @@ pub(crate) async fn collect_grpc_request_body(
                         )),
                     ));
                 }
-                return Err(GrpcRequestBodyCollectError::Proxy(
-                    GrpcProxyError::Internal(format!("Failed to read request body: {}", e)),
-                ));
+                return Err(grpc_request_body_client_disconnected(e.as_ref()));
             }
         }
     } else {
@@ -6126,15 +6139,23 @@ pub(crate) async fn collect_grpc_request_body(
         )
         .await
         .map_err(map_authorized_upload_wait_error)?
-        .map_err(|e| {
-            GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(format!(
-                "Failed to read request body: {}",
-                e
-            )))
-        })?
+        .map_err(|e| grpc_request_body_client_disconnected(e.as_ref()))?
         .to_bytes()
     };
     Ok((parts.method, parts.headers, body_bytes))
+}
+
+/// A failed read of the client's buffered gRPC upload. Every such failure is
+/// the client's: the frontend body yields only the client's own transport
+/// errors and the END_STREAM gate's refusal of a masked reset (issue #6022).
+/// Out of line: only a client that reset or dropped its upload reaches it.
+#[cold]
+#[inline(never)]
+fn grpc_request_body_client_disconnected(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> GrpcRequestBodyCollectError {
+    debug!(error = %error, "Client disconnected while buffering a gRPC request body");
+    GrpcRequestBodyCollectError::ClientDisconnected
 }
 
 /// Build the backend request body for a fully collected gRPC upload, arming the

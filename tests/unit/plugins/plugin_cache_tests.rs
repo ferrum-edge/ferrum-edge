@@ -1382,6 +1382,52 @@ fn a_grpc_only_admission_plugin_the_grpc_web_view_cannot_run_marks_that_view() {
     assert!(!marked(&chain));
 }
 
+/// The buffered H1/H2 response path relabels a native-gRPC response as
+/// gRPC-Web only for the BUILT-IN translator. The view carries that as a
+/// capability computed at cache build from the registered type, never from the
+/// name a plugin reports (issue #6022).
+#[test]
+fn only_the_builtin_grpc_web_translator_marks_its_grpc_web_view() {
+    let config = make_config(
+        vec![
+            make_proxy("translated", "/translated", vec!["grpc-web"]),
+            make_proxy("spoof", "/spoof", vec![]),
+        ],
+        vec![make_plugin_config(
+            "grpc-web",
+            "grpc_web",
+            PluginScope::Proxy,
+            Some("translated"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let runs_builtin = |cache: &PluginCache, proxy: &str| {
+        cache
+            .grpc_web_request_view("ferrum", proxy)
+            .capabilities()
+            .has(PluginCapabilities::RUNS_BUILTIN_GRPC_WEB)
+    };
+    assert!(runs_builtin(&cache, "translated"));
+    assert!(!runs_builtin(&cache, "spoof"));
+
+    let plugin: Arc<dyn Plugin> = Arc::new(NameOnlyPlugin("grpc_web"));
+    ferrum_edge::_test_support::prepend_proxy_plugin_for_test(&cache, "ferrum", "spoof", plugin)
+        .expect("inject the custom plugin");
+    assert!(
+        cache
+            .grpc_web_request_view("ferrum", "spoof")
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "grpc_web"),
+        "the custom plugin reporting `grpc_web` is in the view"
+    );
+    assert!(
+        !runs_builtin(&cache, "spoof"),
+        "a custom plugin reporting `grpc_web` is not the built-in translator"
+    );
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};

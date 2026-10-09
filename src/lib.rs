@@ -14907,6 +14907,16 @@ pub mod _test_support {
         crate::proxy::request_buffer_capacity_reject_headers(is_grpc_request)
     }
 
+    /// The request-buffer capacity refusal the backend-dispatch seams (mesh /
+    /// Unix-socket body preparation, the H1/H2 retry/body-plugin collect, and
+    /// the native-H3 backend collect) return for a request with `headers`.
+    pub fn request_buffer_capacity_backend_response_for_test(
+        headers: &HashMap<String, String>,
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::request_buffer_capacity_backend_response(headers, resolved_ip)
+    }
+
     /// An isolated aggregate buffered-REQUEST budget built from the SAME
     /// [`crate::proxy::response_buffer_budget`] code the process-global one
     /// uses — same clamping, same non-blocking admission, same release-on-drop
@@ -15076,7 +15086,7 @@ pub mod _test_support {
     pub enum GrpcBufferedCollectOutcomeForTest {
         Collected(usize),
         ResourceExhausted,
-        ReadFailed,
+        ClientDisconnected,
         TimedOut,
         DeadlineExceeded,
         AuthorizationExpired,
@@ -15104,9 +15114,6 @@ pub mod _test_support {
             Err(GrpcRequestBodyCollectError::Proxy(GrpcProxyError::ResourceExhausted(_))) => {
                 GrpcBufferedCollectOutcomeForTest::ResourceExhausted
             }
-            Err(GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(_))) => {
-                GrpcBufferedCollectOutcomeForTest::ReadFailed
-            }
             Err(GrpcRequestBodyCollectError::Proxy(_)) => {
                 GrpcBufferedCollectOutcomeForTest::OtherProxyError
             }
@@ -15118,6 +15125,9 @@ pub mod _test_support {
             }
             Err(GrpcRequestBodyCollectError::AuthorizationExpired(_)) => {
                 GrpcBufferedCollectOutcomeForTest::AuthorizationExpired
+            }
+            Err(GrpcRequestBodyCollectError::ClientDisconnected) => {
+                GrpcBufferedCollectOutcomeForTest::ClientDisconnected
             }
         }
     }

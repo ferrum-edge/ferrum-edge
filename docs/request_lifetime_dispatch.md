@@ -69,11 +69,11 @@ frontends skip the check: a valid chunked EOF need not update `is_end_stream()`.
 
 Buffered request intake applies the same check. A body the gateway collects before dispatch (the
 early `before_proxy` prebuffer, which also prepares HBONE and sidecar mesh-mTLS bodies, the H1/H2
-retry and body-plugin collect, and the native gRPC buffered collect) is read through the same
-END_STREAM gate. hyper drops the service future on a client reset only while that future is
-pending, so a collect that read the last DATA and a masked reset in the same poll used to finish
-with the truncated body. It now fails as a client disconnect (`499`, or the gRPC collect's read
-failure), and nothing is dispatched.
+retry and body-plugin collect, the native HTTP/3 backend collect, and the native gRPC buffered
+collect) is read through the same END_STREAM gate. hyper drops the service future on a client
+reset only while that future is pending, so a collect that read the last DATA and a masked reset in
+the same poll used to finish with the truncated body. It now fails as a client disconnect, and
+nothing is dispatched: a `499` on the HTTP paths, and gRPC `CANCELLED` on the native gRPC collect.
 
 When the dispatcher cancels a pump whose client has already reset, the pump looks past the DATA
 still buffered ahead of that reset, so the backend gets the client's `CANCEL` rather than the
@@ -84,10 +84,13 @@ frame past one window, because such a client is still streaming. A client that f
 with smaller frames than that can still be missed: its backend sees `INTERNAL_ERROR`, which is
 still a reset and never a complete body.
 
-The same rule covers the buffered collect on the native HTTP/3 backend path, used when retries or
-body plugins need the whole upload before dispatch. The collect borrows the client body, and when
-it ends the gateway checks the body's receive state. An HTTP/2 upload that ended without the
-client's `END_STREAM` is answered as a `499` client disconnect and never sent to the H3 backend.
+The native gRPC buffered collect reports every failed read of the client's upload (a `CANCEL` or
+masked `NO_ERROR` reset, or a dropped connection) as the client's own cancellation. The gateway
+answers Trailers-Only `grpc-status: 1` (`CANCELLED`), runs the reject-path hooks, and logs the
+request under `rejection_phase` `client_disconnect_buffered_grpc_upload` with the
+`client_disconnect` error class. It releases a circuit-breaker probe and any backend admission
+taken for the body neutrally, and dials no backend. It used to answer `INTERNAL`, and on the
+retry path it handed the read failure to the dispatch pipeline as a gateway error.
 
 The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
 classifier never count this gateway-initiated reset as a backend failure (see

@@ -6656,3 +6656,144 @@ async fn grpc_affinity_releases_translated_web_data_and_trailers() {
 async fn grpc_affinity_releases_pumped_translated_web_data_and_trailers() {
     grpc_affinity_with_queued_final_data(QueuedGrpcUpload::WebPumped).await;
 }
+
+/// Issue #6022 (#6139 review): a client that resets its upload while a
+/// retry-enabled native-gRPC route is buffering it is the client's own
+/// cancellation. The gateway logs `CANCELLED` with the `client_disconnect`
+/// error class, never a gateway `INTERNAL` charged through the dispatch
+/// pipeline, and never dials the backend. Covers the client's `CANCEL` and the
+/// masked `NO_ERROR` reset the END_STREAM gate refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_buffered_upload_client_reset_is_logged_as_a_client_disconnect() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpStream;
+
+    const RPC_PATH: &str = "/echo.Echo/Upload";
+    const PHASE: &str = "client_disconnect_buffered_grpc_upload";
+
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let listener = reservation.into_listener();
+    // Counts only the RPC, so a capability probe is never mistaken for a
+    // dispatched upload.
+    let rpcs = Arc::new(AtomicUsize::new(0));
+    let task_rpcs = Arc::clone(&rpcs);
+    let backend = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let rpcs = Arc::clone(&task_rpcs);
+            tokio::spawn(async move {
+                let Ok(mut connection) = h2::server::handshake(socket).await else {
+                    return;
+                };
+                while let Some(Ok((request, _respond))) = connection.accept().await {
+                    if request.uri().path().ends_with(RPC_PATH) {
+                        rpcs.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+    });
+
+    // A retry policy makes the RPC replayable, so the gateway buffers the
+    // upload before dispatch instead of streaming it.
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_read_timeout_ms": 30_000,
+            "retry": {"max_retries": 1, "retry_on_connect_failure": true},
+        }),
+    );
+    let mut config: Value = serde_yaml::from_str(&yaml).expect("client-reset config");
+    config["plugin_configs"] = json!([{
+        "id": "client-reset-access-log",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {},
+    }]);
+    let harness = GatewayHarness::builder()
+        .file_config(to_file_mode_yaml(&config))
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("gateway");
+    let port = reqwest::Url::parse(harness.proxy_base_url())
+        .expect("frontend URL")
+        .port()
+        .expect("frontend port");
+    let socket = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("h2c socket");
+    let (client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+
+    let reasons = [h2::Reason::CANCEL, h2::Reason::NO_ERROR];
+    for reason in reasons {
+        let mut client = client.clone().ready().await.expect("client ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost:{port}/api{RPC_PATH}"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .expect("request");
+        let (_response, mut upload) = client.send_request(request, false).expect("open upload");
+        // Part of one gRPC message: the prefix declares 64 bytes, 3 follow.
+        upload
+            .send_data(Bytes::from_static(&[0, 0, 0, 0, 64, 1, 2, 3]), false)
+            .expect("partial DATA");
+        // Give the gateway time to start the buffered collect, as a client
+        // that gives up mid-upload does. A reset that lands earlier fails the
+        // same read, so the outcome does not depend on this delay.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        upload.send_reset(reason);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let entries = loop {
+        let logs = harness.captured_combined().unwrap_or_default();
+        let entries: Vec<Value> = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .filter(|entry| entry["proxy_id"] == "scripted")
+            .collect();
+        let refused = entries
+            .iter()
+            .filter(|entry| entry.pointer("/metadata/rejection_phase") == Some(&json!(PHASE)))
+            .count();
+        if refused >= reasons.len() {
+            break entries;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both resets must be logged under rejection_phase {PHASE:?}; logs:\n{logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for entry in &entries {
+        assert_eq!(
+            entry.pointer("/metadata/rejection_phase"),
+            Some(&json!(PHASE)),
+            "every logged transaction is a client-disconnect refusal: {entry}"
+        );
+        assert_eq!(entry["grpc_status"], 1, "CANCELLED: {entry}");
+        assert_eq!(entry["error_class"], "client_disconnect", "{entry}");
+        assert_eq!(entry["client_disconnected"], true, "{entry}");
+        assert_eq!(entry["response_status_code"], 200, "{entry}");
+    }
+    assert_eq!(
+        rpcs.load(Ordering::SeqCst),
+        0,
+        "a reset upload must never be dispatched to the backend"
+    );
+
+    driver.abort();
+    let _ = driver.await;
+    drop(harness);
+    backend.abort();
+    let _ = backend.await;
+}

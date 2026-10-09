@@ -4616,7 +4616,7 @@ async fn prepare_mesh_request_body(
                 client_grpc_deadline_exceeded_response(resolved_ip.clone())
             }
             RequestBodyBufferError::BufferCapacityExceeded => {
-                request_buffer_capacity_backend_response(resolved_ip.clone())
+                request_buffer_capacity_backend_response(headers, resolved_ip.clone())
             }
         })?,
         buffered => buffered,
@@ -24451,6 +24451,7 @@ pub async fn log_rejected_request(
         plugin_execution_ns,
         None,
         true,
+        false,
     )
     .await;
 }
@@ -24476,6 +24477,7 @@ pub async fn log_pre_backend_rejected_request(
         rejection_phase,
         plugin_execution_ns,
         None,
+        false,
         false,
     )
     .await;
@@ -24505,6 +24507,35 @@ pub(crate) async fn log_rejected_request_with_path(
         rejection_phase,
         plugin_execution_ns,
         request_path_override,
+        true,
+        false,
+    )
+    .await;
+}
+
+/// [`log_rejected_request_with_path`] for a rejection the client caused by
+/// resetting or dropping its upload (issue #6022). The summary carries the
+/// `client_disconnect` error class and `client_disconnected`, the accounting an
+/// H1/H2 buffered upload's `499` carries, rather than reading as a gateway
+/// error.
+async fn log_client_disconnect_rejection_with_path(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&str>,
+) {
+    log_rejected_request_with_path_and_backend_state(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        request_path_override,
+        true,
         true,
     )
     .await;
@@ -24537,6 +24568,7 @@ async fn log_rejected_request_with_path_and_backend_state(
     plugin_execution_ns: u64,
     request_path_override: Option<&str>,
     include_backend_target: bool,
+    client_disconnect: bool,
 ) {
     // Gateway diagnostic references (issue #5846): every plugin and gateway
     // rejection passes through here before its response head is written, so
@@ -24624,6 +24656,8 @@ async fn log_rejected_request_with_path_and_backend_state(
         metadata,
         ai_usage_export: ctx.ai_usage_export.clone(),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+        client_disconnected: client_disconnect,
+        error_class: client_disconnect.then_some(retry::ErrorClass::ClientDisconnect),
         ..TransactionSummary::default()
     };
 
@@ -31340,6 +31374,116 @@ fn boxed_finalize_authorization_expired_rejection<'a>(
     ))
 }
 
+/// Fixed `grpc-message` for a client that reset or dropped its buffered gRPC
+/// upload. Compiled in: it echoes nothing from the client's transport error.
+const GRPC_CLIENT_DISCONNECT_MESSAGE: &str = "Client disconnected";
+
+/// Transaction-log `rejection_phase` for a buffered native-gRPC / gRPC-Web
+/// upload the client reset or dropped before dispatch (issue #6022).
+const GRPC_UPLOAD_CLIENT_DISCONNECT_PHASE: &str = "client_disconnect_buffered_grpc_upload";
+
+/// Trailers-only `grpc-status: 1` (`CANCELLED`) for a client that reset or
+/// dropped its buffered upload (issue #6022): the client's own cancellation,
+/// never a gateway `INTERNAL`.
+fn normalized_grpc_client_disconnect() -> NormalizedRejectResponse {
+    normalize_reject_response(
+        StatusCode::OK,
+        Bytes::new(),
+        &HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "grpc-status".to_string(),
+                grpc_proxy::grpc_status::CANCELLED.to_string(),
+            ),
+            (
+                "grpc-message".to_string(),
+                GRPC_CLIENT_DISCONNECT_MESSAGE.to_string(),
+            ),
+        ]),
+        true,
+    )
+}
+
+/// Finalize, log, and record a native-gRPC / gRPC-Web request whose client
+/// reset or dropped its buffered upload before END_STREAM (issue #6022).
+///
+/// No backend was dialed and the client is gone, so the terminal exists for
+/// the reject-path hooks and the transaction log: `CANCELLED` with the
+/// `client_disconnect` error class, the accounting an H1/H2 buffered upload's
+/// `499` carries, never a gateway `INTERNAL`. Mirrors
+/// [`build_finalized_upload_deadline_response`], including the single gRPC-Web
+/// translation pass.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_grpc_upload_client_disconnect(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&str>,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let cancelled = normalized_grpc_client_disconnect();
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        cancelled.http_status,
+        cancelled.body.clone(),
+        cancelled.headers,
+        true,
+        grpc_web_response_content_type.is_none(),
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &reject);
+    let grpc_web_response =
+        build_grpc_web_reject_response(plugins, ctx, grpc_web_response_content_type, &reject).await;
+    let log_status = reject.http_status.as_u16();
+    let response =
+        grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject));
+    log_client_disconnect_rejection_with_path(
+        plugins,
+        ctx,
+        log_status,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+    )
+    .await;
+    record_request(state, log_status);
+    response
+}
+
+/// The buffered-gRPC client-disconnect rejection future, constructed out of
+/// line and returned boxed for the stack-budget reason documented on
+/// [`boxed_finalize_authorization_expired_rejection`]: it awaits the whole
+/// rejection pipeline, on a path only a client that reset its buffered gRPC
+/// upload executes.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_grpc_upload_client_disconnect<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+    grpc_web_response_content_type: Option<&'a str>,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(finalize_grpc_upload_client_disconnect(
+        plugins,
+        ctx,
+        state,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+        grpc_web_response_content_type,
+    ))
+}
+
 /// The native gRPC branch's gateway-generated gRPC-Web error terminal,
 /// constructed out of line and returned boxed for the reason documented on
 /// [`boxed_finalize_reject_response`]: a backend deadline proxy core charged to
@@ -37629,6 +37773,27 @@ async fn handle_proxy_request_inner(
                                 initial_response_header_policy_plugins.as_ref(),
                             ));
                         }
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::ClientDisconnected) => {
+                            // The client reset or dropped its upload (issue
+                            // #6022). No backend was dialed: release the
+                            // HALF_OPEN probe and any body-phase preacquisition
+                            // neutrally, then log the client's CANCELLED rather
+                            // than a gateway INTERNAL. Boxed out of line for the
+                            // same stack-budget reason as the arms above.
+                            cb_probe.release_neutral();
+                            drop(preacquired_backend_admission.take_if_acquired());
+                            return Ok(boxed_finalize_grpc_upload_client_disconnect(
+                                &plugins,
+                                &mut ctx,
+                                &state,
+                                start_time,
+                                GRPC_UPLOAD_CLIENT_DISCONNECT_PHASE,
+                                plugin_execution_ns,
+                                Some(&original_request_path),
+                                grpc_web_response_content_type,
+                            )
+                            .await);
+                        }
                     }
                 }
                 ClientRequestBody::Buffered(buffered) => {
@@ -38268,6 +38433,24 @@ async fn handle_proxy_request_inner(
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(error)) => {
                         (Err(error), Bytes::new())
+                    }
+                    // A client reset mid-upload is the client's CANCELLED, never
+                    // a dispatch error charged through the retry loop (issue
+                    // #6022). Same cleanup as the split-path arm.
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::ClientDisconnected) => {
+                        cb_probe.release_neutral();
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        return Ok(boxed_finalize_grpc_upload_client_disconnect(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            GRPC_UPLOAD_CLIENT_DISCONNECT_PHASE,
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await);
                     }
                 }
             }
@@ -40209,8 +40392,10 @@ async fn handle_proxy_request_inner(
                     // request when the hook-visible response headers are still
                     // native gRPC. The grpc_web body transform relies on this
                     // relabel before it embeds terminal trailers in the body.
+                    // Keyed on the built-in translator's registered type,
+                    // precomputed at cache build, never on a reported name.
                     if let Some(grpc_web_ct) = grpc_web_response_content_type
-                        && plugins.iter().any(|plugin| plugin.name() == "grpc_web")
+                        && capabilities.has(PluginCapabilities::RUNS_BUILTIN_GRPC_WEB)
                         && plugin_response_headers
                             .get("content-type")
                             .is_some_and(|ct| {
@@ -49580,7 +49765,10 @@ async fn proxy_to_backend(
                         Some(permit) => permit,
                         None => {
                             return backend_dispatch_response(
-                                request_buffer_capacity_backend_response(resolved_ip.clone()),
+                                request_buffer_capacity_backend_response(
+                                    headers,
+                                    resolved_ip.clone(),
+                                ),
                                 None,
                                 None,
                             );
@@ -53423,15 +53611,37 @@ fn build_request_buffer_capacity_response(
 
 /// The same refusal on the backend-dispatch seam, for the paths that return a
 /// [`retry::BackendResponse`] rather than a built response.
-fn request_buffer_capacity_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
-    retry::BackendResponse {
-        status_code: response_buffer_budget::REQUEST_BUFFER_OVERLOAD_STATUS,
-        body: ResponseBody::buffered(
+///
+/// A native gRPC request (by its outbound `Content-Type`; a translated
+/// gRPC-Web request is native by dispatch, and its `grpc_web` plugin re-encodes
+/// the terminal) gets the Trailers-Only `RESOURCE_EXHAUSTED` that
+/// [`build_request_buffer_capacity_response`] and the native H3 refusal send,
+/// never a bare `503` its client would read as `UNAVAILABLE` (issue #6022).
+pub(crate) fn request_buffer_capacity_backend_response(
+    headers: &HashMap<String, String>,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let is_grpc = headers
+        .get("content-type")
+        .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
+    let (status_code, body, response_headers) = if is_grpc {
+        let mut grpc_headers = request_buffer_capacity_reject_headers(true);
+        grpc_headers.insert("content-type".to_string(), "application/grpc".to_string());
+        // gRPC errors ride HTTP 200 + grpc-status.
+        (StatusCode::OK.as_u16(), Vec::new(), grpc_headers)
+    } else {
+        (
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_STATUS,
             response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY
                 .as_bytes()
                 .to_vec(),
-        ),
-        headers: HashMap::new(),
+            HashMap::new(),
+        )
+    };
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(body),
+        headers: response_headers,
         // No backend was dialed, so this carries no backend health signal and
         // must never be retried: another upstream would meet the same
         // process-global budget.
@@ -62157,7 +62367,7 @@ async fn proxy_to_backend_http3(
             // An HTTP/2 client's upload EOF must be its own END_STREAM (issue
             // #6022), exactly as on the streamed arm above. Never for HTTP/1.1.
             let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
-            let (_parts, mut client_body) = (*original_req).into_parts();
+            let client_body = (*original_req).into_body();
             // Fail-closed retained ceiling + aggregate admission taken BEFORE
             // the buffer is allocated (issue #4153). `0` on
             // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` stays "unlimited" for
@@ -62190,32 +62400,26 @@ async fn proxy_to_backend_http3(
                 match response_buffer_budget::RequestBufferPermit::reserve(retained_ceiling) {
                     Some(permit) => permit,
                     None => {
-                        return (request_buffer_capacity_backend_response(resolved_ip), None);
+                        return (
+                            request_buffer_capacity_backend_response(headers, resolved_ip),
+                            None,
+                        );
                     }
                 };
-            // Collected through a borrow so the client body's receive state
-            // is still readable once the collect ends.
-            let limited = http_body_util::Limited::new(&mut client_body, retained_ceiling);
-            let collected = collect_request_body_under_authorization(
+            // A masked HTTP/2 client reset is a disconnect, not a complete body
+            // (issue #6022): the gated EOF takes the 499 client-disconnect arm
+            // below, so the H3 backend is never dialed. See
+            // `body::H2EndStreamGated`.
+            let gated = body::H2EndStreamGated::new(client_body, require_end_stream);
+            let limited = http_body_util::Limited::new(gated, retained_ceiling);
+            let body = match collect_request_body_under_authorization(
                 limited.collect(),
                 grpc_deadline_at,
                 proxy.backend_read_timeout_ms,
                 buffered_upload_auth_deadline.as_ref(),
             )
-            .await;
-            // hyper reports an inbound `RST_STREAM(NO_ERROR)` as a clean end of
-            // body, so a collect that ended without the client's END_STREAM
-            // holds a truncated upload. Refuse it as the client disconnect it
-            // is, never dispatch it to the H3 backend as a complete request.
-            let collected = match collected {
-                Ok(Ok(_))
-                    if require_end_stream && !hyper::body::Body::is_end_stream(&client_body) =>
-                {
-                    Ok(Err(crate::proxy::body::h2_upload_reset_error()))
-                }
-                other => other,
-            };
-            let body = match collected {
+            .await
+            {
                 Ok(Ok(collected)) => collected.to_bytes().to_vec(),
                 // `Limited::collect()` yields either a `LengthLimitError` (the
                 // body really exceeded the ceiling -> 413) or the underlying

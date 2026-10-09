@@ -388,3 +388,147 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
     .await;
     gateway.shutdown().await;
 }
+
+/// Trusted-projected fixture: one native-gRPC route on an h2c Unix-socket
+/// target, with a retry policy so the gateway buffers the upload before
+/// dispatch.
+fn grpc_h2c_config(socket_path: &str, placeholder_port: u16) -> String {
+    format!(
+        r#"version: "1"
+proxies:
+  - id: "unix-grpc"
+    listen_path: "/grpc"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {placeholder_port}
+    upstream_id: "unix-grpc-upstream"
+    strip_listen_path: true
+    retry:
+      max_retries: 1
+      retry_on_connect_failure: true
+    updated_at: "2026-10-09T00:00:00Z"
+upstreams:
+  - id: "unix-grpc-upstream"
+    name: "unix-grpc-upstream"
+    algorithm: round_robin
+    updated_at: "2026-10-09T00:00:00Z"
+    targets:
+      - host: "127.0.0.1"
+        port: {placeholder_port}
+        weight: 1
+        tags:
+          mesh.unix_socket: "{socket_path}"
+          mesh.unix_socket_h2c: "true"
+consumers: []
+plugin_configs: []
+"#
+    )
+}
+
+/// Issue #6022: a native gRPC upload the request-buffer budget cannot admit,
+/// refused at a backend-dispatch seam (here the Unix-socket body preparation),
+/// is a Trailers-Only `RESOURCE_EXHAUSTED`, not a bare `503` its client would
+/// read as `UNAVAILABLE`. The upload's retained ceiling
+/// (`max_grpc_recv_size_bytes`, 1 GiB) is larger than the whole request-buffer
+/// budget (256 MiB by default; the in-process gateway never resizes it), so the
+/// refusal is deterministic and comes before any byte is read or the socket is
+/// dialed.
+#[tokio::test]
+#[ignore]
+async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
+    use bytes::Bytes;
+
+    let temp = TempDir::new().expect("temp dir");
+    let root = containment_root(&temp);
+    let socket_path = root.join("grpc.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind grpc socket");
+    let dials = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&dials);
+    let acceptor = tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let (placeholder_port, _placeholder) = reserve_placeholder_port().await;
+
+    let config = grpc_h2c_config(
+        socket_path.to_str().expect("utf-8 socket path"),
+        placeholder_port,
+    );
+    let env = EnvConfig {
+        pool_warmup_enabled: false,
+        log_level: "warn".into(),
+        max_grpc_recv_size_bytes: 1 << 30,
+        ..Default::default()
+    };
+    let mut gateway = TrustedProjectedGateway::spawn_from_yaml(
+        &config,
+        TrustedProjectedGatewayOptions {
+            env,
+            mesh_unix_socket_allowed_roots: vec![
+                root.to_str().expect("utf-8 containment root").to_string(),
+            ],
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("start trusted projected unix gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
+
+    let port = gateway.proxy_http_port;
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("h2c socket");
+    let (client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+    let mut client = client.ready().await.expect("client ready");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{port}/grpc/echo.Echo/Upload"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .expect("request");
+    let (response, mut upload) = client.send_request(request, false).expect("open RPC");
+    let message = Bytes::from_static(&[0, 0, 0, 0, 4, b'p', b'i', b'n', b'g']);
+    upload.send_data(message, true).expect("unary message");
+    let response = tokio::time::timeout(Duration::from_secs(10), response)
+        .await
+        .expect("response timeout")
+        .expect("response");
+    // gRPC errors ride HTTP 200.
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        header("grpc-status").as_deref(),
+        Some("8"),
+        "a buffer-capacity refusal is a Trailers-Only RESOURCE_EXHAUSTED"
+    );
+    assert_eq!(
+        header("grpc-message").as_deref(),
+        Some("Request buffering capacity exceeded")
+    );
+    let mut body = response.into_body();
+    let data = tokio::time::timeout(Duration::from_secs(5), body.data())
+        .await
+        .expect("response body timeout");
+    assert!(data.is_none(), "a Trailers-Only response has no DATA");
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        0,
+        "the refused upload must never dial the unix socket"
+    );
+
+    driver.abort();
+    acceptor.abort();
+    gateway.shutdown().await;
+}
