@@ -5377,6 +5377,7 @@ where
                     };
                     tokio::pin!(peer_closed);
                     let mut reader_done = false;
+                    let mut send_done = false;
                     let resolved = loop {
                         tokio::select! {
                             biased;
@@ -5415,6 +5416,7 @@ where
                                 break None;
                             }
                             result = &mut send_future => {
+                                send_done = true;
                                 drop(pending_slot.take());
                                 if !reader_done {
                                     let backend_succeeded = result.is_ok();
@@ -5505,6 +5507,20 @@ where
                         halt_notify.notify_one();
                         let halt_deadline = Duration::from_millis(100);
                         let _ = tokio::time::timeout(halt_deadline, &mut reader_future).await;
+                    }
+                    // Publishing an abort only wakes the body consumer. Keep
+                    // the exchange alive while hyper consumes that terminal:
+                    // dropping the response future in this same poll can win
+                    // the cancellation race before the body error is polled,
+                    // leaving a partial HTTP/1 request open at the backend.
+                    // This is teardown only: never accept its response, never
+                    // poll a completed send twice, and bound a stalled peer.
+                    if !send_done
+                        && (reader_peer_reset.load(Ordering::Acquire)
+                            || write_timed_out.load(Ordering::Acquire))
+                    {
+                        let abort_grace = Duration::from_millis(100);
+                        let _ = tokio::time::timeout(abort_grace, &mut send_future).await;
                     }
                     resolved
                 };
