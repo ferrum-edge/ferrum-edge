@@ -3253,12 +3253,9 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         // Bypass the handler's initial comparison to exercise the transaction
         // boundary itself, retaining the original representation on both calls.
         let owner = uuid::Uuid::new_v4().to_string();
-        let generation = acquire_namespace_config_admission_lease_after_handler(
-            db.as_ref(),
-            &namespace,
-            &owner,
-        )
-        .await;
+        let generation =
+            acquire_namespace_config_admission_lease_after_handler(db.as_ref(), &namespace, &owner)
+                .await;
         let precondition = DeploymentPrecondition {
             namespace: &namespace,
             expected: SnapshotDigest::of_representation(&original.body["evidence"]).unwrap(),
@@ -3582,12 +3579,9 @@ async fn assert_issued_deployment_evidence_authorizes_the_transaction(
     );
 
     let owner = uuid::Uuid::new_v4().to_string();
-    let generation = acquire_namespace_config_admission_lease_after_handler(
-        db.as_ref(),
-        &namespace,
-        &owner,
-    )
-    .await;
+    let generation =
+        acquire_namespace_config_admission_lease_after_handler(db.as_ref(), &namespace, &owner)
+            .await;
     let precondition = DeploymentPrecondition {
         namespace: &namespace,
         expected,
