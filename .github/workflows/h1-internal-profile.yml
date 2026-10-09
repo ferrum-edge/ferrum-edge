@@ -175,7 +175,7 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
             -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libbpf-dev libelf-dev \
-            zlib1g-dev gcc libc6-dev binutils util-linux linux-tools-generic linux-tools-common python3-yaml
+            zlib1g-dev gcc libc6-dev binutils util-linux linux-perf linux-tools-generic linux-tools-common python3-yaml
       - name: Compile and lint shared observer and optimized DWARF fixture
         run: |
           set -euo pipefail
@@ -243,7 +243,7 @@ jobs:
       - name: Hosted prerequisites and memory headroom
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-tools-generic linux-tools-common
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-perf linux-tools-generic linux-tools-common
           sudo fallocate -l 12G /mnt/h1-profile-swap
           sudo chmod 600 /mnt/h1-profile-swap
           sudo mkswap /mnt/h1-profile-swap

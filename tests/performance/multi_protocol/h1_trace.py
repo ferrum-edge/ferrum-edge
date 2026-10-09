@@ -35,6 +35,7 @@ from hosted import scrub
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 STAGE = Path('/tmp/ferrum-h1-trace')
+PERF_SOURCE = Path('/usr/bin/perf')
 TICKS = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
 DEPENDENCY_PROVENANCE = json.loads((HERE / 'h1_profile_manifest.json').read_text())['external_trace']['dependency_provenance']
@@ -1421,6 +1422,14 @@ def supervise(args):
 
 
 def stage(build):
+    # Ubuntu 26.04's linux-perf package installs the distro ELF directly here.
+    # Use this fixed package path rather than a PATH lookup or a kernel wrapper.
+    perf = PERF_SOURCE.resolve()
+    if not perf.is_file():
+        raise ValueError('installed Ubuntu perf ELF missing')
+    perf_bytes = perf.read_bytes()
+    if perf_bytes[:4] != b'\x7fELF':
+        raise ValueError('perf is not an ELF')
     # A fresh public traversal path for ordinary-UID fixtures, never chmod checkout.
     STAGE.mkdir(mode=0o755)
     for name in ('observer', 'observer.bpf.o', 'h1_trace_fixture'):
@@ -1428,19 +1437,9 @@ def stage(build):
         destination = STAGE / name
         destination.write_bytes(source.read_bytes())
         destination.chmod(0o644 if name.endswith('.o') else 0o755)
-    # Ubuntu's /usr/bin/perf wrapper often expects an unavailable Azure kernel
-    # package. Retain the actual distro ELF from installed linux-tools-generic;
-    # do not download a tool or assume its package version matches the kernel.
-    candidates = sorted({p.resolve() for p in Path('/usr/lib/linux-tools').glob('*/perf') if p.is_file()})
-    if not candidates:
-        raise ValueError('installed Ubuntu perf ELF missing')
-    perf = candidates[-1]
-    with perf.open('rb') as source:
-        if source.read(4) != b'\x7fELF':
-            raise ValueError('perf is not an ELF')
-    (STAGE / 'perf').write_bytes(perf.read_bytes())
+    (STAGE / 'perf').write_bytes(perf_bytes)
     (STAGE / 'perf').chmod(0o755)
-    write(STAGE / 'perf-source.json', dict(installed_path=str(perf), sha256=digest(perf)))
+    write(STAGE / 'perf-source.json', dict(installed_path=str(perf), sha256=hashlib.sha256(perf_bytes).hexdigest()))
     (STAGE / 'buildid-cache').mkdir(mode=0o700)
 
 

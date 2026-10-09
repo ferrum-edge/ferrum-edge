@@ -44,6 +44,43 @@ def producer_records():
                  checkpoints_omitted=0, snapshot_failures=0)]
 
 
+class H1PerfStagingTests(unittest.TestCase):
+    def test_unversioned_package_elf_is_staged_with_provenance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            build = root / 'build'
+            build.mkdir()
+            for name in ('observer', 'observer.bpf.o', 'h1_trace_fixture'):
+                (build / name).write_bytes(b'fixture')
+            installed = root / 'usr/bin/perf'
+            installed.parent.mkdir(parents=True)
+            data = b'\x7fELF' + b'Ubuntu linux-perf fixture'
+            installed.write_bytes(data)
+            staged = root / 'stage'
+            with patch.object(trace, 'PERF_SOURCE', installed), patch.object(trace, 'STAGE', staged):
+                trace.stage(build)
+            self.assertEqual((staged / 'perf').read_bytes(), data)
+            self.assertEqual(stat.S_IMODE((staged / 'perf').stat().st_mode), 0o755)
+            self.assertEqual(json.loads((staged / 'perf-source.json').read_text()),
+                             dict(installed_path=str(installed.resolve()),
+                                  sha256=hashlib.sha256(data).hexdigest()))
+
+    def test_missing_package_or_kernel_wrapper_is_rejected_before_staging(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            installed = root / 'perf'
+            staged = root / 'stage'
+            for content, error in [(None, 'installed Ubuntu perf ELF missing'),
+                                   (b'#!/bin/sh\nexec /kernel-specific/perf "$@"\n', 'perf is not an ELF')]:
+                with self.subTest(content=content):
+                    if content is not None:
+                        installed.write_bytes(content)
+                    with patch.object(trace, 'PERF_SOURCE', installed), patch.object(trace, 'STAGE', staged):
+                        with self.assertRaisesRegex(ValueError, error):
+                            trace.stage(root / 'unused-build')
+                    self.assertFalse(staged.exists())
+
+
 class H1CPUAttributeTests(unittest.TestCase):
     # Verbatim cpu/perf-attributes.txt, hosted run 35422193763, artifact
     # 10577439767, head 61e5dbd46197c3dca06e46585d2ad19a1309569c.

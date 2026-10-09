@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- H1 hosted profiling installs Ubuntu 26.04's `linux-perf` package and stages
+  its `/usr/bin/perf` ELF, retaining its package origin and checksum. The former
+  kernel-specific `linux-tools` path is no longer populated on this image.
+
 - **BREAKING — HTTP/2 WebSocket early data is gated on the wire method
   `CONNECT`** (issue #6107). An RFC 8441 Extended CONNECT WebSocket carrying
   `Early-Data: 1` was checked against `FERRUM_TLS_EARLY_DATA_METHODS` after

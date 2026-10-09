@@ -55,7 +55,7 @@ case "${H1_TRACE_ACTION:?}" in
   readelf-version) exec readelf --version ;;
   perf-version) exec /tmp/ferrum-h1-trace/perf version --build-options ;;
   packages) exec dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' ;;
-  package-origins) exec apt-cache policy linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8 ;;
+  package-origins) exec apt-cache policy linux-perf linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8 ;;
   tracefs) exec mount -t tracefs tracefs /sys/kernel/tracing ;;
   *) exit 2 ;;
 esac
