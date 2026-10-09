@@ -261,8 +261,18 @@ async fn functional_proxy_hop_limit_refuses_a_self_referencing_route() {
         .await
         .expect("origin request below the limit");
     assert_eq!(forwarded.status().as_u16(), 200);
+    // Gateway-originated probes (for example the backend capability probe)
+    // reach the origin directly and carry no hop field; every proxied request
+    // carries exactly one.
+    let proxied: Vec<Vec<String>> = harness
+        .origin
+        .seen()
+        .await
+        .into_iter()
+        .filter(|hops| !hops.is_empty())
+        .collect();
     assert_eq!(
-        harness.origin.seen().await,
+        proxied,
         vec![vec!["1".to_string()], vec!["3".to_string()]],
         "the origin sees exactly one gateway-written count per request"
     );
@@ -297,7 +307,13 @@ async fn functional_proxy_hop_limit_refuses_a_self_referencing_route() {
         "a client-caused 400 carries no gateway error token"
     );
     assert_eq!(
-        harness.origin.seen().await.len(),
+        harness
+            .origin
+            .seen()
+            .await
+            .iter()
+            .filter(|hops| !hops.is_empty())
+            .count(),
         2,
         "refused requests never reach the origin"
     );
