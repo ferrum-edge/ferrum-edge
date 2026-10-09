@@ -162,10 +162,12 @@ build_gateway() {
         CARGO_TARGET_DIR="$source/target" cargo build --locked --profile "$PROFILE" \
             --features bench-h1-profile --bin ferrum-edge
     )
-    mkdir -p "$WORK/$role"
-    cp "$source/target/$PROFILE/ferrum-edge" "$WORK/$role/ferrum-edge"
+    # Staged at the build-output path the Cross policy recognizes, whatever
+    # profile produced it, so the launch below names no repository command.
+    mkdir -p "$WORK/$role/target/release"
+    cp "$source/target/$PROFILE/ferrum-edge" "$WORK/$role/target/release/ferrum-edge"
     git -C "$source" rev-parse HEAD > "$OUTPUT/$role-revision.txt"
-    (cd "$WORK/$role" && sha256sum ferrum-edge) > "$OUTPUT/$role-binary.sha256"
+    (cd "$WORK/$role" && sha256sum target/release/ferrum-edge) > "$OUTPUT/$role-binary.sha256"
 }
 
 ROLES="candidate"
@@ -243,7 +245,7 @@ start_gateway() {
             export FERRUM_ENABLE_HTTP3=true
         fi
         cd "$WORK/$role"
-        exec ./ferrum-edge run
+        exec ./target/release/ferrum-edge run
     ) > "$dir/gateway.log" 2>&1 &
     GATEWAY_PID=$!
     local attempt

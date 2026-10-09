@@ -182,7 +182,7 @@ class RunnerContractTests(unittest.TestCase):
     def test_gateway_is_the_counting_build_started_with_run(self):
         source = RUNNER.read_text()
         self.assertIn("--features bench-h1-profile --bin ferrum-edge", source)
-        self.assertIn("exec ./ferrum-edge run", source)
+        self.assertIn("exec ./target/release/ferrum-edge run", source)
         self.assertIn("^ferrum_h1_profile_allocator_installed 1$", source)
         # Ambient FERRUM_* settings cannot change the measured path.
         self.assertIn('case "$name" in FERRUM_*) unset "$name" ;; esac', source)
