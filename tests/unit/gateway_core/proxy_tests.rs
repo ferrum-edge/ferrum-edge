@@ -2205,7 +2205,7 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         .skip(1)
         .map(|branch| {
             branch
-                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy")
+                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted")
                 .next()
                 .expect("bounded buffered gRPC deadline branch")
         })
@@ -2329,6 +2329,20 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
         2,
         "both the size-limited and unlimited collects report a client disconnect"
     );
+}
+
+#[test]
+fn buffered_grpc_web_relabel_requires_the_registered_translator() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let relabel = source
+        .split("if let Some(grpc_web_ct) = grpc_web_response_content_type")
+        .nth(1)
+        .expect("buffered response relabel")
+        .split("let (response_replaced, representation_rewritten)")
+        .next()
+        .expect("bounded relabel before the body transform");
+    assert!(relabel.contains("capabilities.has(PluginCapabilities::RUNS_BUILTIN_GRPC_WEB)"));
+    assert!(!relabel.contains(".name()"));
 }
 
 #[test]

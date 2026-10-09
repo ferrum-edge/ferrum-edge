@@ -71,7 +71,7 @@ concurrency:
 jobs:
   contracts:
     name: Allocation measurement contracts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -89,7 +89,7 @@ jobs:
     name: Allocations per request
     if: github.event_name == 'workflow_dispatch'
     needs: contracts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Two uncached fat-LTO release builds plus the measurement rounds.
     timeout-minutes: 240
     env:

@@ -47,7 +47,7 @@ concurrency:
 jobs:
   harness-tests:
     name: Benchmark harness tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       # `.cargo/config.toml` points every cargo invocation at sccache and mold.

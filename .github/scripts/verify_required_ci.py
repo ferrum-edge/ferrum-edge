@@ -1708,7 +1708,7 @@ def main() -> int:
             )
         if not re.search(r"(?m)^    if: always\(\)$", body):
             planner_errors.append(f"{workflow_path} jobs.{job} must run with if: always()")
-        if not re.search(r"(?m)^    runs-on: ubuntu-latest$", body):
+        if not re.search(r"(?m)^    runs-on: ubuntu-26.04$", body):
             planner_errors.append(
                 f"{workflow_path} jobs.{job} must use the dedicated required-check runner"
             )

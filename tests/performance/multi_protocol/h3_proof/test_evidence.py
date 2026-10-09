@@ -77,6 +77,18 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["status"], "partial_coverage")
         self.assertEqual(result["positive"], [])
 
+    def test_classic_selection_joins_lookup_and_selected_socket_cookies(self):
+        self.fixture.update(mode="classic-select", sockets=[{"cookie": 7}, {"cookie": 9}],
+                            operations=[{"op": "selection", "selected_cookie": 9}])
+        self.final["rows"] = [self.row(k) for k in [10, 12, 14]]
+        for row in self.final["rows"][:2]:
+            row["peer_cookie"] = 9
+        result = assess(self.ready, self.final, self.fixture, "classic")
+        self.assertEqual(result["positive"], ["classic_execution_selected_socket"])
+        self.final["rows"][0]["cookie"] = 99
+        with self.assertRaises(AssertionError):
+            assess(self.ready, self.final, self.fixture, "classic")
+
 
 if __name__ == "__main__":
     unittest.main()

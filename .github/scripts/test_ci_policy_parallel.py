@@ -141,7 +141,7 @@ def policy_contract_errors(workflow):
         aggregate, aggregate_needs = parsed_job(workflow, "test")
         if set(policy) != {"name", "runs-on", "timeout-minutes", "permissions", "outputs", "steps"} or dependencies:
             errors.append("CI Policy must be an unconditional independent readonly job")
-        if _scalar(policy, "name") != "CI Policy" or _scalar(policy, "runs-on") != "ubuntu-latest":
+        if _scalar(policy, "name") != "CI Policy" or _scalar(policy, "runs-on") != "ubuntu-26.04":
             errors.append("CI Policy identity or runner changed")
         if _scalar(policy, "timeout-minutes") != "10":
             errors.append("CI Policy must retain the full verifier time budget")

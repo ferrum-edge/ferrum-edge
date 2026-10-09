@@ -34,7 +34,7 @@ concurrency:
 jobs:
   refresh:
     name: Resolve and propose current base image digests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       # One inventory for resolution and staging, including the live image layer.
@@ -136,7 +136,7 @@ jobs:
 
   cross-image-drift:
     name: Inspect the admitted Cross image pin
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read

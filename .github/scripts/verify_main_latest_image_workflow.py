@@ -495,8 +495,8 @@ BUILD_PARITY_LINES = (
     "          provenance: false\n",
     "            platform: linux/amd64\n",
     "            platform: linux/arm64\n",
-    "          - os: ubuntu-latest\n",
-    "          - os: ubuntu-24.04-arm\n",
+    "          - os: ubuntu-26.04\n",
+    "          - os: ubuntu-26.04-arm\n",
 )
 FORBIDDEN_ACTIVE_TEXT = (
     ("-ebpf", "eBPF image variants are published only by release.yml"),

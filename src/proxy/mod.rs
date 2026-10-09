@@ -4561,6 +4561,7 @@ async fn prepare_mesh_request_body(
     grpc_deadline_at: Option<tokio::time::Instant>,
     plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
+    request_ctx: Option<&RequestContext>,
     stream_request_body: bool,
     request_body_prepared: bool,
     retain_request_body: bool,
@@ -4616,7 +4617,7 @@ async fn prepare_mesh_request_body(
                 client_grpc_deadline_exceeded_response(resolved_ip.clone())
             }
             RequestBodyBufferError::BufferCapacityExceeded => {
-                request_buffer_capacity_backend_response(headers, resolved_ip.clone())
+                request_buffer_capacity_backend_response(request_ctx, resolved_ip.clone())
             }
         })?,
         buffered => buffered,
@@ -24518,7 +24519,7 @@ pub(crate) async fn log_rejected_request_with_path(
 /// `client_disconnect` error class and `client_disconnected`, the accounting an
 /// H1/H2 buffered upload's `499` carries, rather than reading as a gateway
 /// error.
-async fn log_client_disconnect_rejection_with_path(
+pub(crate) async fn log_client_disconnect_rejection_with_path(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     status_code: u16,
@@ -27483,6 +27484,7 @@ fn finalize_synthesized_reject_headers(
 
 fn grpc_status_reason(status: u32) -> &'static str {
     match status {
+        grpc_proxy::grpc_status::CANCELLED => "Cancelled",
         grpc_proxy::grpc_status::INVALID_ARGUMENT => "Invalid argument",
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED => "Deadline exceeded",
         grpc_proxy::grpc_status::NOT_FOUND => "Not found",
@@ -31106,16 +31108,29 @@ async fn finalize_terminal_request_body_read_rejection(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &normalized);
-    log_rejected_request_with_path(
-        plugins,
-        ctx,
-        normalized.http_status.as_u16(),
-        start_time,
-        "on_final_request_body",
-        plugin_execution_ns,
-        Some(request_path),
-    )
-    .await;
+    if status.as_u16() == 499 {
+        log_client_disconnect_rejection_with_path(
+            plugins,
+            ctx,
+            normalized.http_status.as_u16(),
+            start_time,
+            "client_disconnect_terminal_request_body",
+            plugin_execution_ns,
+            Some(request_path),
+        )
+        .await;
+    } else {
+        log_rejected_request_with_path(
+            plugins,
+            ctx,
+            normalized.http_status.as_u16(),
+            start_time,
+            "on_final_request_body",
+            plugin_execution_ns,
+            Some(request_path),
+        )
+        .await;
+    }
     record_request(state, normalized.http_status.as_u16());
     build_response_from_normalized_reject(normalized)
 }
@@ -31803,6 +31818,29 @@ fn boxed_log_rejected_request_with_path<'a>(
     request_path_override: Option<&'a str>,
 ) -> BoxedRejectionLogFuture<'a> {
     Box::pin(log_rejected_request_with_path(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        request_path_override,
+    ))
+}
+
+/// Keep the cold client-disconnect logger out of the generic request frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_log_client_disconnect_rejection_with_path<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &'a str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&'a str>,
+) -> BoxedRejectionLogFuture<'a> {
+    Box::pin(log_client_disconnect_rejection_with_path(
         plugins,
         ctx,
         status_code,
@@ -35031,6 +35069,16 @@ async fn handle_proxy_request_inner(
                             error = %error_message,
                             "Client disconnected while buffering request body before authenticate"
                         );
+                        boxed_log_client_disconnect_rejection_with_path(
+                            &plugins,
+                            &ctx,
+                            499,
+                            start_time,
+                            "client_disconnect_upload_before_authenticate",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -35236,6 +35284,16 @@ async fn handle_proxy_request_inner(
                             error = %error_message,
                             "Client disconnected while buffering request body before authorize"
                         );
+                        boxed_log_client_disconnect_rejection_with_path(
+                            &plugins,
+                            &ctx,
+                            499,
+                            start_time,
+                            "client_disconnect_upload_before_authorize",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -35488,6 +35546,16 @@ async fn handle_proxy_request_inner(
                             error = %error_message,
                             "Client disconnected while buffering request body before before_proxy"
                         );
+                        boxed_log_client_disconnect_rejection_with_path(
+                            &plugins,
+                            &ctx,
+                            499,
+                            start_time,
+                            "client_disconnect_upload_before_before_proxy",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -36956,6 +37024,16 @@ async fn handle_proxy_request_inner(
                             error = %error_message,
                             "Client disconnected while finalizing request body before dispatch"
                         );
+                        boxed_log_client_disconnect_rejection_with_path(
+                            &plugins,
+                            &ctx,
+                            499,
+                            start_time,
+                            "client_disconnect_upload_before_dispatch",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -37756,19 +37834,12 @@ async fn handle_proxy_request_inner(
                             )
                             .await);
                         }
-                        Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
-                            let (grpc_status, message) = match e {
-                                GrpcProxyError::ResourceExhausted(message) => {
-                                    (grpc_proxy::grpc_status::RESOURCE_EXHAUSTED, message)
-                                }
-                                other => (
-                                    grpc_proxy::grpc_status::INTERNAL,
-                                    format!("Failed to read gRPC request body: {other:?}"),
-                                ),
-                            };
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(
+                            message,
+                        )) => {
                             record_request(&state, StatusCode::OK.as_u16());
                             return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                                grpc_status,
+                                grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                                 &message,
                                 initial_response_header_policy_plugins.as_ref(),
                             ));
@@ -38276,11 +38347,11 @@ async fn handle_proxy_request_inner(
                         if effective_max_grpc_recv_size_bytes > 0
                             && buffered.body.len() > effective_max_grpc_recv_size_bytes
                         {
-                            Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(
-                                GrpcProxyError::ResourceExhausted(format!(
+                            Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(
+                                format!(
                                     "gRPC request payload size exceeds maximum of {} bytes",
                                     effective_max_grpc_recv_size_bytes
-                                )),
+                                ),
                             ))
                         } else {
                             Ok((
@@ -38431,9 +38502,10 @@ async fn handle_proxy_request_inner(
                         )
                         .await);
                     }
-                    Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(error)) => {
-                        (Err(error), Bytes::new())
-                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(message)) => (
+                        Err(GrpcProxyError::ResourceExhausted(message)),
+                        Bytes::new(),
+                    ),
                     // A client reset mid-upload is the client's CANCELLED, never
                     // a dispatch error charged through the retry loop (issue
                     // #6022). Same cleanup as the split-path arm.
@@ -43880,6 +43952,21 @@ async fn handle_proxy_request_inner(
 
     record_request(&state, response_status);
 
+    // Buffered translated gRPC-Web carries terminal metadata in its body
+    // trailer frame. The generic mesh/Unix path may start with a gateway's
+    // native Trailers-Only refusal, so retire its initial-header copy after
+    // the response hooks and terminal accounting have consumed it. Native
+    // gRPC keeps its legitimate empty-body Trailers-Only encoding.
+    if grpc_request_is_web_translated
+        && let ResponseBody::Buffered(data) = &response_body
+        && !data.is_empty()
+        && response_headers
+            .get("content-type")
+            .is_some_and(|ct| crate::plugins::grpc_web::is_grpc_web_content_type(ct))
+    {
+        grpc_proxy::strip_grpc_terminal_metadata_from_initial(&mut response_headers);
+    }
+
     // A streaming deadline can replace an as-yet-unpolled backend body with a
     // differently sized gRPC-Web frame or native trailers. Strip the backend
     // length before response headers are committed. H1/H2 builders below then
@@ -48445,6 +48532,7 @@ async fn proxy_to_backend(
             request_ctx.grpc_deadline_at(),
             plugins,
             ctx.as_deref_mut(),
+            Some(request_ctx),
             stream_request_body,
             request_body_prepared,
             retain_request_body,
@@ -48553,6 +48641,7 @@ async fn proxy_to_backend(
             request_ctx.grpc_deadline_at(),
             plugins,
             ctx.as_deref_mut(),
+            Some(request_ctx),
             stream_request_body,
             request_body_prepared,
             retain_request_body,
@@ -48687,6 +48776,7 @@ async fn proxy_to_backend(
             request_ctx.grpc_deadline_at(),
             plugins,
             ctx.as_deref_mut(),
+            Some(request_ctx),
             stream_request_body,
             request_body_prepared,
             retain_request_body,
@@ -49766,7 +49856,7 @@ async fn proxy_to_backend(
                         None => {
                             return backend_dispatch_response(
                                 request_buffer_capacity_backend_response(
-                                    headers,
+                                    Some(request_ctx),
                                     resolved_ip.clone(),
                                 ),
                                 None,
@@ -53612,19 +53702,35 @@ fn build_request_buffer_capacity_response(
 /// The same refusal on the backend-dispatch seam, for the paths that return a
 /// [`retry::BackendResponse`] rather than a built response.
 ///
-/// A native gRPC request (by its outbound `Content-Type`; a translated
-/// gRPC-Web request is native by dispatch, and its `grpc_web` plugin re-encodes
-/// the terminal) gets the Trailers-Only `RESOURCE_EXHAUSTED` that
-/// [`build_request_buffer_capacity_response`] and the native H3 refusal send,
-/// never a bare `503` its client would read as `UNAVAILABLE` (issue #6022).
+/// Use the frontend's trusted request classification, which survives outbound
+/// header transforms. Pass-through gRPC-Web receives the same framed terminal
+/// as an early refusal; translated gRPC-Web retains the native terminal for
+/// its plugin to encode exactly once (issue #6022).
 pub(crate) fn request_buffer_capacity_backend_response(
-    headers: &HashMap<String, String>,
+    ctx: Option<&RequestContext>,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
-    let is_grpc = headers
-        .get("content-type")
-        .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
-    let (status_code, body, response_headers) = if is_grpc {
+    let passthrough_web = ctx.filter(|ctx| {
+        ctx.request_is_grpc_web() && !crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+    });
+    let is_grpc = ctx.is_some_and(|ctx| {
+        ctx.request_http_flavor() == HttpFlavor::Grpc || ctx.request_is_grpc_web()
+    });
+    let (status_code, body, response_headers) = if let Some(ctx) = passthrough_web {
+        let content_type = crate::plugins::grpc_web::retained_response_content_type(ctx).unwrap_or(
+            if ctx.request_is_grpc_web_text() {
+                "application/grpc-web-text+proto"
+            } else {
+                "application/grpc-web+proto"
+            },
+        );
+        let response = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        );
+        (StatusCode::OK.as_u16(), response.body, response.headers)
+    } else if is_grpc {
         let mut grpc_headers = request_buffer_capacity_reject_headers(true);
         grpc_headers.insert("content-type".to_string(), "application/grpc".to_string());
         // gRPC errors ride HTTP 200 + grpc-status.
@@ -62401,7 +62507,10 @@ async fn proxy_to_backend_http3(
                     Some(permit) => permit,
                     None => {
                         return (
-                            request_buffer_capacity_backend_response(headers, resolved_ip),
+                            request_buffer_capacity_backend_response(
+                                Some(request_ctx),
+                                resolved_ip,
+                            ),
                             None,
                         );
                     }
@@ -67271,6 +67380,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false, // stream_request_body — already buffered
             true,  // request_body_prepared — skip plugin transforms
             false, // retain_request_body — retries disabled; body policy forced buffering
@@ -67335,6 +67445,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             false,
             true,
             true, // retain_request_body — retries configured
@@ -67389,6 +67500,7 @@ mod tests {
             None,
             &[],
             Some(&mut ctx),
+            None,
             false,
             true,
             false,

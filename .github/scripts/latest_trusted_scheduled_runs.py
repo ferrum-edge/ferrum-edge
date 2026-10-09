@@ -112,8 +112,8 @@ def self_test() -> None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workflow", required=True)
-    parser.add_argument("--current-sha", required=True)
+    parser.add_argument("--workflow")
+    parser.add_argument("--current-sha")
     parser.add_argument("--limit", type=int, default=1)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
@@ -121,6 +121,8 @@ def main(argv: list[str]) -> int:
         self_test()
         print("trusted scheduled-run selector self-test passed")
         return 0
+    if not args.workflow or not args.current_sha:
+        parser.error("--workflow and --current-sha are required unless --self-test is used")
     if args.limit < 1 or args.limit > 100:
         parser.error("--limit must be between 1 and 100")
     repository = os.environ.get("GITHUB_REPOSITORY", "")

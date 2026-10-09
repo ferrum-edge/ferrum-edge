@@ -50,7 +50,7 @@ concurrency:
 jobs:
   changes:
     name: Istio status CAS trigger
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -224,7 +224,7 @@ jobs:
     name: Istio status CAS live competing-writer proof
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -266,7 +266,7 @@ jobs:
       - changes
       - istio-status-cas-live
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Fail when Istio status CAS relevance planning fails
         if: needs.changes.result != 'success'

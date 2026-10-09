@@ -398,11 +398,12 @@ SEC("fexit/run_bpf_filter") int BPF_PROG(c_filter, struct sock_reuseport *reuse,
 {
     __u32 zero = 0;
     struct selection *s = bpf_map_lookup_elem(&selection, &zero);
-    struct sock *first = reuse->socks[0];
     struct key k = {};
     if (!s || s->active != 1) return 0;
-    // The lookup socket can be ANY member, so do not compare it to slot zero.
-    k.cookie = identity(first);
+    // Correlate with the typed lookup socket captured at c_enter. It can be
+    // any group member; a flexible-array load cannot provide a verifier-safe
+    // PTR_TO_BTF_ID for bpf_get_socket_cookie on newer kernels.
+    k.cookie = s->anchor;
     if (!k.cookie) return 0;
     k.peer = identity(selected);
     if (selected && !k.peer) return 0;

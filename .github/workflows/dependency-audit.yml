@@ -34,7 +34,7 @@ env:
 jobs:
   advisories:
     name: Advisories & exception expiry
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -141,7 +141,7 @@ jobs:
 
   upstream-patch-status:
     name: Vendored patch upstream status
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -153,8 +153,9 @@ jobs:
 
       - name: Check upstream status of vendored patches
         # Reports each vendored patch's upstream PR state + latest crates.io
-        # release. Fails (red scheduled run) when an upstream PR has merged, so
-        # a retireable vendor copy can't be missed. See docs/dependency-policy.md.
+        # release. Merged patches fail unless a bounded, exact-merge/latest-release
+        # review records why no compatible released fix is available. Release
+        # changes, query failures and expiry fail again. See dependency-policy.md.
         # Wrapper path also self-tests, then parity, then network reporting.
         env:
           GH_TOKEN: ${{ github.token }}

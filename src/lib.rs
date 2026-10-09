@@ -14909,12 +14909,12 @@ pub mod _test_support {
 
     /// The request-buffer capacity refusal the backend-dispatch seams (mesh /
     /// Unix-socket body preparation, the H1/H2 retry/body-plugin collect, and
-    /// the native-H3 backend collect) return for a request with `headers`.
+    /// the native-H3 backend collect) return for a frontend-classified request.
     pub fn request_buffer_capacity_backend_response_for_test(
-        headers: &HashMap<String, String>,
+        ctx: Option<&crate::plugins::RequestContext>,
         resolved_ip: Option<String>,
     ) -> crate::retry::BackendResponse {
-        crate::proxy::request_buffer_capacity_backend_response(headers, resolved_ip)
+        crate::proxy::request_buffer_capacity_backend_response(ctx, resolved_ip)
     }
 
     /// An isolated aggregate buffered-REQUEST budget built from the SAME
@@ -15090,7 +15090,6 @@ pub mod _test_support {
         TimedOut,
         DeadlineExceeded,
         AuthorizationExpired,
-        OtherProxyError,
     }
 
     /// Run the PRODUCTION buffered native-gRPC collect over a real hyper
@@ -15100,7 +15099,7 @@ pub mod _test_support {
         max_grpc_recv_size_bytes: usize,
         request_body_read_timeout_ms: u64,
     ) -> GrpcBufferedCollectOutcomeForTest {
-        use crate::proxy::grpc_proxy::{GrpcProxyError, GrpcRequestBodyCollectError};
+        use crate::proxy::grpc_proxy::GrpcRequestBodyCollectError;
         let collected = crate::proxy::grpc_proxy::collect_grpc_request_body(
             request,
             max_grpc_recv_size_bytes,
@@ -15111,11 +15110,8 @@ pub mod _test_support {
         .await;
         match collected {
             Ok((_, _, body)) => GrpcBufferedCollectOutcomeForTest::Collected(body.len()),
-            Err(GrpcRequestBodyCollectError::Proxy(GrpcProxyError::ResourceExhausted(_))) => {
+            Err(GrpcRequestBodyCollectError::ResourceExhausted(_)) => {
                 GrpcBufferedCollectOutcomeForTest::ResourceExhausted
-            }
-            Err(GrpcRequestBodyCollectError::Proxy(_)) => {
-                GrpcBufferedCollectOutcomeForTest::OtherProxyError
             }
             Err(GrpcRequestBodyCollectError::TimedOut) => {
                 GrpcBufferedCollectOutcomeForTest::TimedOut
