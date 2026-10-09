@@ -735,11 +735,11 @@ come from the target mount namespace while alive, never substituted host libc.
 The gateway's retained ELF must match exactly one symbolized release twin.
 Only this disposable synthetic benchmark process's user stack memory may enter
 perf.data. Matching DSO packages are retained under `builds/<twin>/symfs`, with
-a separate 512 MiB ceiling that includes existing partial files and metadata
-reservations; repeat artifacts reference that package. The admitted H2/gRPC CPU
-extension uses a fixed 1 GiB ceiling because its Ubuntu 26.04 symbolized
-production ELF measured 660.7 MiB. Both limits include prior repeats and partial
-files; retained metadata records the selected ceiling. Acquisition pins the
+a separate fixed 1 GiB ceiling that includes existing partial files and metadata
+reservations; repeat artifacts reference that package. H1 and H2/gRPC share this
+ceiling because the Ubuntu 26.04 symbolized production ELF measured 660.7 MiB,
+exceeding the previous 512 MiB ceiling. Retained metadata records the ceiling;
+prior repeats and failed partial files consume it. Acquisition pins the
 admitted target's root directory, walks every subsequent source component without
 following symlinks, and requires a regular file with the `/proc/<pid>/maps`
 device/inode. One pinned readable descriptor supplies ELF magic, bounded copy,
