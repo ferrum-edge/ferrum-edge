@@ -124,10 +124,10 @@ predicates are `dns_response_allowed`, `node_probe_port4_allowed`, and
 - **Read**: every pod's metadata and bounded Node PodCIDR/InternalIP topology via
   the API server (within ClusterRole RBAC); every cgroup path under
   `/sys/fs/cgroup`; host route state under `/proc/net/`; host network interface
-  state under `/sys/class/net/`; the host PID view (`hostPID: true`). It does
-  not read a pod's own sysfs view or enter pod network namespaces: that view is
-  controlled by the workload, so it is not used to decide which host interface
-  belongs to a pod.
+  state under `/sys/class/net/`. It runs without `hostPID`, reads no
+  per-process `/proc/<pid>` state, and does not read a pod's own sysfs view or
+  enter pod network namespaces: that view is controlled by the workload, so it
+  is not used to decide which host interface belongs to a pod.
 - **Modify**: BPF maps (`FERRUM_POD_IPS*`, `FERRUM_NODE_IPS*`,
   `FERRUM_NODE_PROBE_PORTS*`, `FERRUM_POD_INBOUND_PORTS*`, `FERRUM_UDP_*`,
   `FERRUM_BYPASS_UIDS`, `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE`,
@@ -177,10 +177,10 @@ capability traces to a specific kernel API used by the code.
 
 | Capability | Required for | Kernel API | Code site |
 |---|---|---|---|
-| `CAP_BPF` | Loading BPF programs and creating BPF maps. Available on kernel **≥ 5.8** — split out of `CAP_SYS_ADMIN`. | `bpf(BPF_PROG_LOAD)`, `bpf(BPF_MAP_CREATE)`, `bpf(BPF_*_ELEM)` | `AyaEbpfBackend::load_programs` (aya `EbpfLoader`) in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); map updates in [`src/ebpf/maps.rs`](../src/ebpf/maps.rs) |
+| `CAP_BPF` | Loading BPF programs and creating BPF maps. Available on kernel **≥ 5.8** — split out of `CAP_SYS_ADMIN`. | `bpf(BPF_PROG_LOAD)`, `bpf(BPF_MAP_CREATE)`, `bpf(BPF_BTF_LOAD)`, `bpf(BPF_*_ELEM)` | `AyaEbpfBackend::load_programs` (aya `EbpfLoader`, including BTF load) in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); map updates in [`src/ebpf/maps.rs`](../src/ebpf/maps.rs) |
 | `CAP_NET_ADMIN` | Attaching BPF programs to cgroups (`BPF_PROG_ATTACH` for `BPF_CGROUP_INET_*`/`BPF_CGROUP_SOCK_OPS` types); attaching tc classifiers (incl. the opt-in `ferrum_tc_ingress_redirect` on node capture interfaces); managing host veth qdiscs; the Ferrum-owned `ip rule`/`ip route` policy route for redirect local delivery; binding the single `IP_TRANSPARENT` inbound capture listener (no other listener is transparent); iptables/ip6tables NAT rules on the fallback path. | `bpf(BPF_PROG_ATTACH)` for cgroup hooks; `tc` netlink (`RTM_NEWTFILTER`); `iptables-restore`/`ip6tables` syscalls. | `attach_cgroup`, `attach_tc`, `attach_sock_ops` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); `execute_iptables_commands` in [`src/modes/node_agent.rs`](../src/modes/node_agent.rs) |
-| `CAP_PERFMON` | Reading BPF program / map info from the kernel (BTF, prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)`, `bpf(BPF_BTF_LOAD)` | `aya::Ebpf::load` BTF resolution; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
-| `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8**. The chart drops `SYS_ADMIN` in `local_pod` mode (`nodeAgent.security.dropCapSysAdmin=true`, the default; set it `false` on kernels < 5.8) but still adds it for `nodeAgent.proxyMode=node_waypoint`. Veth resolution no longer enters pod network namespaces, so that `node_waypoint` grant no longer serves veth discovery. | Older-kernel BPF operations. | Same as `CAP_BPF` / `CAP_PERFMON` |
+| `CAP_PERFMON` | Reading BPF program / map info from the kernel (prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. Loading BTF (`BPF_BTF_LOAD`) is gated by `CAP_BPF`, not `CAP_PERFMON`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)` | Program/map info queries; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
+| `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8** only. The chart drops `SYS_ADMIN` in every proxy mode, `node_waypoint` included (`nodeAgent.security.dropCapSysAdmin=true`, the default; set it `false` on kernels < 5.8). `node_waypoint` used to add it so veth discovery could `setns()` into pod network namespaces; veth resolution now reads only host route tables and host sysfs, and the operations `node_waypoint` adds (SOCK_OPS cgroup attach, the tc ingress redirect, sock_ops map pinning) need only `CAP_BPF` + `CAP_NET_ADMIN`, the same as `local_pod`'s cgroup/tc attach and orig-dst map pinning. | Older-kernel BPF operations. | Same as `CAP_BPF` / `CAP_PERFMON` |
 | `CAP_SYS_PTRACE` | NodeWaypoint ambient proxy only. With `hostPID: true`, Linux still applies `ptrace_may_access` checks to `/proc/{pid}/ns/net`; workloads running with different UIDs or dumpability can otherwise return `EACCES` before the proxy can enter the pod netns. This is not used for `PTRACE_ATTACH`. | `stat`/`open` of `/proc/{pid}/ns/net` for enrolled pod PIDs. | `netns_inode_for_cgroup` and `NetnsGuard::enter` in [`src/proxy/netns_capture.rs`](../src/proxy/netns_capture.rs) |
 
 When `nodeAgent.proxyMode=node_waypoint`, the ambient mesh proxy is part of the
@@ -299,8 +299,8 @@ an `ip rule`, and an `ip route` in the host namespace, and still binds
 Treat a compromised proxy in this placement as able to rewrite host netfilter
 state, exactly as in the default placement.
 
-Dropping `hostPID` means the pod's own `/proc` view is unavailable, so interface
-resolution falls through to the host route table for **both** address families
+The host route table is the only interface resolver; no pod `/proc` or sysfs
+view is consulted. Resolution reads it for **both** address families
 (`/proc/net/route` and `/proc/net/ipv6_route`). That parsing is treated as
 hostile input: bounded reads, strict field decoding, and only an unambiguous
 `RTF_UP` host route (`/32` or `/128`), followed by a sysfs check that the device
@@ -344,7 +344,7 @@ corrupt or hostile entry cannot yield a partially-scoped ruleset.
 | `bpf-fs` (hostPath) | `/sys/fs/bpf` (default; override via `FERRUM_NODE_AGENT_BPF_FS_PATH`) | rw | Pinned BPF maps must live on bpffs so the mesh proxy can open `/sys/fs/bpf/ferrum/sock_ops_events`, `/sys/fs/bpf/ferrum/sock_ops_stats`, and `/sys/fs/bpf/ferrum/accept_first_byte_sockets` by path ([`src/ebpf/loader.rs::pin_sock_ops_maps`](../src/ebpf/loader.rs)). |
 | `cgroup` (hostPath) | `/sys/fs/cgroup` (default; override via `FERRUM_NODE_AGENT_CGROUP_ROOT`) | ro | Opening a cgroup directory FD is required to call `BPF_PROG_ATTACH` against it (`attach_cgroup` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs)). The directory is mounted read-only; BPF attach uses the FD via the BPF subsystem, not direct cgroup writes. |
 | ServiceAccount token | `/var/run/secrets/kubernetes.io/serviceaccount/` | ro | Automatically projected by the kubelet. Consumed by `kube::Config::incluster()` ([`build_node_agent_kube_client` in `src/modes/node_agent.rs`](../src/modes/node_agent.rs)) to authenticate the `pods`/`nodes` watcher to the API server. Operators should prefer a **projected** token with a short `expirationSeconds` (the kubelet handles rotation) over the legacy long-lived Secret token. |
-| Host route tables | `/proc/net/route`, `/proc/net/ipv6_route` (host netns via `hostNetwork: true`) | ro | Veth resolution ([`discover_dedicated_veth_for_pod` in `src/ebpf/veth.rs`](../src/ebpf/veth.rs)) accepts only an unambiguous `RTF_UP` `/32` or `/128` host route to the registry-published pod address, then requires the routed device in host `/sys/class/net/` to have a distinct non-zero peer `iflink` and no `bridge/` directory. A pod reached only through a subnet route on a shared CNI device (`cni0`, `cilium_host`) is refused rather than guarded there, because frames forwarded between pods on that device never cross it. A pod's own sysfs view (`/proc/{pid}/root/sys/class/net/`) is never read: the workload controls it. `hostPID: true` is still rendered by the chart but is not used for veth resolution. |
+| Host route tables | `/proc/net/route`, `/proc/net/ipv6_route` (host netns via `hostNetwork: true`) | ro | Veth resolution ([`discover_dedicated_veth_for_pod` in `src/ebpf/veth.rs`](../src/ebpf/veth.rs)) accepts only an unambiguous `RTF_UP` `/32` or `/128` host route to the registry-published pod address, then requires the routed device in host `/sys/class/net/` to have a distinct non-zero peer `iflink` and no `bridge/` directory. A pod reached only through a subnet route on a shared CNI device (`cni0`, `cilium_host`) is refused rather than guarded there, because frames forwarded between pods on that device never cross it. A pod's own sysfs view (`/proc/{pid}/root/sys/class/net/`) is never read: the workload controls it. `/proc/net` follows the reading task's network namespace, not its PID namespace, so this needs `hostNetwork: true` but not `hostPID`. |
 | Pod registry (hostPath) | `nodeAgent.podRegistryDir` (default `/run/ferrum/node-waypoint-pods`) | rw | Only for `node_waypoint` or the Ambient UDP lifecycle. The node-agent publishes the per-pod registry and readiness markers the ambient proxy consumes (see [`docs/node_agent.md`](node_agent.md#pod-registry-for-in-netns-capture-node-waypoint-tcp--ambient-udp)). |
 
 In NodeWaypoint topology, the ambient proxy mounts the same host bpffs and
@@ -380,10 +380,10 @@ If you see a fork or downstream chart that adds any of these mounts to
 the node-agent DaemonSet, treat it as a red flag and confirm the use
 case before merging.
 
-### `hostNetwork: true` and `hostPID: true`
+### `hostNetwork: true` (and no `hostPID`)
 
-Both are required and are the most powerful pieces of host access the
-agent has — they cannot be opted out of without losing function:
+`hostNetwork: true` is required and is the most powerful piece of host access
+the agent has — it cannot be opted out of without losing function:
 
 - **`hostNetwork: true`**: tc programs are attached on the host-side veth
   by interface name from `/sys/class/net/` ([`src/ebpf/veth.rs`](../src/ebpf/veth.rs)),
@@ -391,12 +391,15 @@ agent has — they cannot be opted out of without losing function:
   co-located mesh proxy via the same host filesystem view. Without
   `hostNetwork`, the agent cannot see host veths nor coordinate with the
   in-namespace mesh proxy.
-- **`hostPID: true`**: still rendered by the chart. Veth resolution no longer
-  reads per-pod `/proc` state (see the host route table row above), so this
-  grant has no remaining veth-discovery consumer.
+- **No `hostPID`**: the chart does not render it. The agent reads no
+  per-pod `/proc/<pid>` state and enters no pod namespace: veth resolution
+  uses the host route tables (see the host route table row above), cgroups
+  come from the host cgroup mount, and the node boot id comes from the
+  kernel-global `/proc/sys/kernel/random/boot_id`. The NodeWaypoint ambient
+  proxy, which does enter pod network namespaces, keeps its own `hostPID`.
 
-Both flags expose the host's network and PID namespaces inside the
-container. Combined with `runAsUser: 0` and `CAP_NET_ADMIN`, the
+`hostNetwork` exposes the host's network namespace inside the container.
+Combined with `runAsUser: 0` and `CAP_NET_ADMIN`, the
 agent already has the de-facto ability to manipulate host networking
 within the seccomp boundary. The pod-spec controls below
 (`allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`,
@@ -430,7 +433,6 @@ spec:
     spec:
       serviceAccountName: ferrum-node-agent
       automountServiceAccountToken: true
-      hostPID: true
       hostNetwork: true
       securityContext:
         seccompProfile:
@@ -453,7 +455,7 @@ spec:
                 - BPF              # kernel >= 5.8; covered by SYS_ADMIN on older
                 - NET_ADMIN        # cgroup/tc attach, iptables fallback
                 - PERFMON          # kernel >= 5.8 BPF info/BTF
-                - SYS_ADMIN        # added for node_waypoint; dropped for local_pod
+                # SYS_ADMIN only with dropCapSysAdmin=false (kernel < 5.8)
           volumeMounts:
             - name: bpf-fs
               mountPath: /sys/fs/bpf
@@ -614,6 +616,8 @@ profile ferrum-node-agent /app/ferrum-edge {
   capability bpf,
   capability net_admin,
   capability perfmon,
+  # Needed only with nodeAgent.security.dropCapSysAdmin=false (kernel < 5.8),
+  # or if this profile is reused for the NodeWaypoint ambient proxy.
   capability sys_admin,
   # Needed only if this profile is reused for the NodeWaypoint ambient proxy.
   capability sys_ptrace,
@@ -630,11 +634,14 @@ log without breaking the agent on its expected paths.
 levels and node-agent compatibility:
 
 - **`restricted`** — **incompatible**. Disallows `CAP_NET_ADMIN`,
-  `hostNetwork`, `hostPID`, and `runAsUser: 0`. The node agent needs
-  all four. Do not label the namespace `pod-security.kubernetes.io/enforce: restricted`.
-- **`baseline`** — **partially compatible.** Baseline allows `CAP_NET_ADMIN`
-  and a configurable capability set but **disallows `hostNetwork` and `hostPID`**.
-  The node-agent namespace cannot use baseline either.
+  `hostNetwork`, and `runAsUser: 0`. The node agent needs
+  all three. Do not label the namespace `pod-security.kubernetes.io/enforce: restricted`.
+- **`baseline`** — **incompatible.** Baseline disallows `hostNetwork` and
+  permits only a fixed add-list of capabilities (`AUDIT_WRITE`, `CHOWN`,
+  `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `MKNOD`, `NET_BIND_SERVICE`,
+  `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID`, `SYS_CHROOT`), so it rejects
+  adding `NET_ADMIN`, `BPF`, and `PERFMON`. The node-agent namespace cannot
+  use baseline either.
 - **`privileged`** — compatible. This is what most operators end up with
   for any DaemonSet that touches the kernel.
 
@@ -648,8 +655,9 @@ agent cannot work around.
 
 If your platform enforces PSS via a custom OPA / Kyverno policy, treat
 node-agent like other kernel-adjacent DaemonSets (e.g. CNI plugins,
-Cilium agent, Falco): allow `hostNetwork`, `hostPID`, and the
-capability set above, and audit-log any other deviation.
+Cilium agent, Falco): allow `hostNetwork` and the capability set above,
+and audit-log any other deviation. The node agent does not need `hostPID`;
+only the NodeWaypoint / per-pod-netns ambient proxy does.
 
 ## Network exposure and NetworkPolicy
 

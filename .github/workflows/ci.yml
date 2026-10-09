@@ -4271,6 +4271,17 @@ jobs:
             --set-string nodeAgent.admin.port=19090 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.captureMode=ebpf \
+            --set nodeAgent.proxyMode=node_waypoint \
+            --set-string nodeAgent.admin.port=19090 \
+            --set nodeAgent.security.dropCapSysAdmin=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-node-waypoint-kernel57-sys-admin.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set injector.enabled=true \
             --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
