@@ -1595,6 +1595,12 @@ PYEOF
         fi
     fi
     if [[ " $expected_gateways " == *" envoy "* ]]; then
+        # Retain identity before the first container starts, including on a
+        # fresh hosted runner using --skip-build for its prebuilt Ferrum image.
+        if ! docker image inspect "$ENVOY_IMAGE" >/dev/null 2>&1; then
+            echo "[envoy] pulling pinned comparison image $ENVOY_IMAGE..."
+            docker pull "$ENVOY_IMAGE"
+        fi
         docker image inspect "$ENVOY_IMAGE" --format '{{.Id}} {{json .RepoDigests}}' \
             >> "$root_output/images.txt"
     fi
