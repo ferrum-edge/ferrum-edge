@@ -353,7 +353,11 @@ async fn scoped_instances_still_shadow_globals_of_their_own_standing() {
     let global = impostor("custom_audit");
     let scoped = impostor("custom_audit");
     let merged = shadow_global_plugins_for_test(&[Arc::clone(&global)], &scoped);
-    assert_eq!(merged.len(), 1, "a scoped custom plugin replaces its global");
+    assert_eq!(
+        merged.len(),
+        1,
+        "a scoped custom plugin replaces its global"
+    );
     assert!(holds(&merged, &scoped));
 }
 

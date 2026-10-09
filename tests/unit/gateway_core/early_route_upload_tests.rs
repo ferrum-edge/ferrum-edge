@@ -658,7 +658,9 @@ async fn no_built_in_auth_plugin_undecides_authority_or_unrelated_header_rules()
                 .unwrap_or_else(|| panic!("{name} must declare the headers it writes"));
             for reserved in ["host", ":authority", "x-soap-tier"] {
                 assert!(
-                    !names.iter().any(|known| known.eq_ignore_ascii_case(reserved)),
+                    !names
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(reserved)),
                     "{name} declares {reserved:?}: {names:?}"
                 );
             }
