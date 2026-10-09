@@ -33,7 +33,7 @@ concurrency:
 jobs:
   checks:
     name: Pool profile feature checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -74,7 +74,7 @@ jobs:
     name: Pool calibration and profile (${{ matrix.protocol }}, ${{ matrix.payload }})
     if: github.event_name == 'workflow_dispatch'
     needs: checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 240
     strategy:
       fail-fast: false

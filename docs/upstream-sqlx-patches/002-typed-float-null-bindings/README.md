@@ -33,6 +33,19 @@ value loss, and the correction does not explain the earlier PostgreSQL initial
 import 500, which occurred before the preservation operations. That error's
 underlying cause remains unknown.
 
+## Release hold review
+
+Release hold reviewed 2026-10-09 by Ferrum Edge maintainers; latest stable 0.9.0; expires 2026-11-08.
+
+The latest [published crate source](https://docs.rs/crate/sqlx-core/0.9.0/source/src/any/arguments.rs)
+and [v0.9.0 tag](https://github.com/transact-rs/sqlx/blob/v0.9.0/sqlx-core/src/any/arguments.rs)
+still have the reversed NULL arms. Upstream merge
+`80f44db8073e9a6a61ef6488eb15341554716d35` corrects them, so the compatibility
+replacement test is blocked on a released fix. The weekly audit verifies that
+exact merge and latest release, and fails again on a release change, an unknown
+release/status, or expiry. This review retains the vendor and its PostgreSQL
+regression; it does not certify an unpatched SQLx replacement.
+
 ## Regression coverage
 
 `tests/integration/admin_conditional_write_tests.rs` calls

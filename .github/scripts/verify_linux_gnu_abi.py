@@ -5,7 +5,7 @@ The scanner reads DT_NEEDED, DT_RPATH/DT_RUNPATH, GNU version-need records,
 and e_machine from an ELF; it rejects GLIBC symbol versions above the
 declared floor, unexpected shared libraries, a runtime library search path,
 and an e_machine that does not match the advertised architecture. It is the
-hosted artifact gate for issue #4301: a moving ubuntu-latest glibc floor
+hosted artifact gate for issue #4301: a moving ubuntu-26.04 glibc floor
 must not ship. Parsing stays in-process so trusted automation policy can
 inspect this file; computed process argv fails closed.
 """
@@ -473,7 +473,7 @@ def _aarch64_verifier_errors(
         return [f"{label} is missing the ARM64 GNU ABI job {job}"]
     if _job_needs(workflow, job) != {producer}:
         errors.append(f"{label} {job} must need exactly {producer}")
-    if "runs-on: ubuntu-24.04-arm" not in body:
+    if "runs-on: ubuntu-26.04-arm" not in body:
         errors.append(f"{label} {job} must run on an ARM64 runner")
     for token in (
         f"name: {artifact}",

@@ -20,7 +20,7 @@ permissions:
 jobs:
   validate:
     name: Validate production release request
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 170
     permissions:
       actions: read
@@ -59,7 +59,7 @@ jobs:
   create-tag:
     name: Create version tag and start production builds
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       # A dedicated user/App token is necessary: tags created by GITHUB_TOKEN

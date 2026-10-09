@@ -356,8 +356,13 @@ Fixed outcome/segment-count buckets exclude exact lengths and CPU from live keys
 Sampling omissions, map/ring/read loss and unknown identity are retained.
 
 The 64 MiB arm artifact cap is enforced after collection and each observer stream
-has a 10 MiB cap. Observer RSS is sampled against a 32 MiB reservation, with the
-other half of the proposed 64 MiB budget reserved for bounded kernel maps. This
+has a 10 MiB cap. Observer RSS is sampled against a 48 MiB reservation; another
+32 MiB remains reserved for bounded kernel maps, for a proposed 80 MiB total.
+Ubuntu 26.04 run 37906469066 measured 36.9–37.2 MiB combined observer RSS in all
+four smoke arms and three idle fixtures, exceeding the former 32 MiB RSS bound.
+Active and idle checkpoints enforce the new finite bound and retain the peak
+and reservation breakdown in each sample. The artifact and map/ring limits are
+unchanged. This
 is a conservative allocation design to validate on hosted load, not a measured
 kernel allocator capacity claim. Kernel allocation overhead is not directly
 measured. Concurrent checkpoints are non-atomic; only final snapshots are stable.

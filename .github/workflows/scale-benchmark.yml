@@ -47,7 +47,7 @@ jobs:
   scale-benchmark:
     name: Scale Benchmark (${{ inputs.db_type }})
     if: inputs.benchmark == 'resources'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
 
     steps:
@@ -468,7 +468,7 @@ jobs:
   route-status-profile:
     name: Isolated route status (${{ matrix.revision }})
     if: inputs.benchmark == 'route-status'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     permissions:
       contents: read
@@ -564,7 +564,7 @@ jobs:
   unit-scheduling:
     name: Unit scheduling (${{ matrix.cargo_jobs }} Cargo jobs)
     if: inputs.benchmark == 'unit-compile'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 150
     permissions:
       contents: read

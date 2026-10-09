@@ -44,6 +44,61 @@ def producer_records():
                  checkpoints_omitted=0, snapshot_failures=0)]
 
 
+class H1PerfStagingTests(unittest.TestCase):
+    def test_unversioned_package_elf_is_staged_with_provenance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            build = root / 'build'
+            build.mkdir()
+            for name in ('observer', 'observer.bpf.o', 'h1_trace_fixture'):
+                (build / name).write_bytes(b'fixture')
+            installed = root / 'usr/bin/perf'
+            installed.parent.mkdir(parents=True)
+            data = b'\x7fELF' + b'Ubuntu linux-perf fixture'
+            installed.write_bytes(data)
+            staged = root / 'stage'
+            with patch.object(trace, 'PERF_SOURCE', installed), patch.object(trace, 'STAGE', staged):
+                trace.stage(build)
+            self.assertEqual((staged / 'perf').read_bytes(), data)
+            self.assertEqual(stat.S_IMODE((staged / 'perf').stat().st_mode), 0o755)
+            self.assertEqual(json.loads((staged / 'perf-source.json').read_text()),
+                             dict(installed_path=str(installed.resolve()),
+                                  sha256=hashlib.sha256(data).hexdigest()))
+
+    def test_missing_package_or_kernel_wrapper_is_rejected_before_staging(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            installed = root / 'perf'
+            staged = root / 'stage'
+            for content, error in [(None, 'installed Ubuntu perf ELF missing'),
+                                   (b'#!/bin/sh\nexec /kernel-specific/perf "$@"\n', 'perf is not an ELF')]:
+                with self.subTest(content=content):
+                    if content is not None:
+                        installed.write_bytes(content)
+                    with patch.object(trace, 'PERF_SOURCE', installed), patch.object(trace, 'STAGE', staged):
+                        with self.assertRaisesRegex(ValueError, error):
+                            trace.stage(root / 'unused-build')
+                    self.assertFalse(staged.exists())
+
+
+class H1BuildIDTests(unittest.TestCase):
+    def test_virtual_copy_requires_the_recorded_kernel_mapping(self):
+        path = '/tmp/perf-vdso.so-gg5MgC'
+        record = 'PERF_RECORD_MMAP2 3035/3035: [0x74361f239000(0x2000) @ 0 00:00 0 0]: r-xp [vdso]'
+        self.assertEqual(trace.build_id_gaps({path: '12345678'}, {}, [record]),
+                         ([], {path: '12345678'}))
+        self.assertEqual(trace.build_id_gaps({path: '12345678'}, {}, []), ([path], {}))
+
+    def test_other_missing_or_mismatched_elf_remains_a_hard_gap(self):
+        record = 'PERF_RECORD_MMAP2 7/7: [0x1000(0x2000) @ 0 00:00 0 0]: r-xp [vdso]'
+        for path in ('/fixture', '/tmp/perf-vdso.so-bad', '/tmp/perf-vdso.so-gg5MgC/extra'):
+            with self.subTest(path=path):
+                self.assertEqual(trace.build_id_gaps({path: '12345678'},
+                                                     {path: ['87654321']}, [record]), ([path], {}))
+        self.assertEqual(trace.build_id_gaps({'/fixture': '12345678'},
+                                             {'/fixture': ['12345678']}, [record]), ([], {}))
+
+
 class H1CPUAttributeTests(unittest.TestCase):
     # Verbatim cpu/perf-attributes.txt, hosted run 35422193763, artifact
     # 10577439767, head 61e5dbd46197c3dca06e46585d2ad19a1309569c.
@@ -93,6 +148,16 @@ class H1CPUAttributeTests(unittest.TestCase):
         raw = raw.replace('sample_regs_user: 0xff0fff', 'sample_regs_user: 16715775')
         raw = raw.replace('sample_stack_user: 8192', 'sample_stack_user: 0x2000')
         self.assertTrue(self.verify(raw)['verified'])
+
+    def test_ubuntu_26_perf_enum_annotation_preserves_required_numeric_type(self):
+        # Verbatim hosted run 37897150252, artifact 11601220812, checkout
+        # c1e381cdf6643ec82d6baa18e9e941cc1271d0d9: linux-perf on Ubuntu 26.04.
+        raw = (HERE / 'tests/fixtures/h1-perf-evlist-ubuntu-26.04.txt').read_bytes()
+        self.assertTrue(self.verify(raw)['verified'])
+        self.rejected(raw.replace(b'type: 1 (PERF_TYPE_SOFTWARE)',
+                                  b'type: 0 (PERF_TYPE_SOFTWARE)'), 'type: expected 1')
+        self.rejected(raw.replace(b'type: 1 (PERF_TYPE_SOFTWARE)',
+                                  b'type: 1 (PERF_TYPE_HARDWARE)'), 'invalid numeric attribute type')
 
     def test_missing_attributes_are_not_borrowed_from_dummy(self):
         fragments = {
@@ -211,14 +276,20 @@ class H1CPUAttributeTests(unittest.TestCase):
                   '        3456 fixture_outer (/fixture)\n'
                   '        4567 [unknown] (/fixture)\n\n')
         records = b'PERF_RECORD_SAMPLE\nPERF_RECORD_MMAP2\nPERF_RECORD_COMM\n'
-        for valid in (True, False):
-            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as folder:
+        for valid, virtual in ((True, False), (False, False), (True, True)):
+            with self.subTest(valid=valid, virtual=virtual), tempfile.TemporaryDirectory() as folder:
                 out = Path(folder)
                 raw = self.raw if valid else self.raw.replace(b'freq: 1', b'freq: 0', 1)
+                decoded_stacks = stacks.replace('        4567 [unknown] (/fixture)\n', '') if virtual else stacks
+                recorded_ids = b'12345678 /fixture\n'
+                raw_records = records
+                if virtual:
+                    recorded_ids += b'87654321 /tmp/perf-vdso.so-gg5MgC\n'
+                    raw_records += b'PERF_RECORD_MMAP2 7/7: [0x1000(0x2000) @ 0 00:00 0 0]: r-xp [vdso]\n'
 
                 def metadata(action, destination, **kwargs):
-                    content = {'perf-script': stacks.encode('ascii'), 'perf-attributes': raw,
-                               'perf-buildids': b'12345678 /fixture\n', 'perf-header': b'header\n'}[action]
+                    content = {'perf-script': decoded_stacks.encode('ascii'), 'perf-attributes': raw,
+                               'perf-buildids': recorded_ids, 'perf-header': b'header\n'}[action]
                     destination.write_bytes(content)
                     return dict(returncode=0, forced=False, incomplete=None,
                                 stdout_sha256=hashlib.sha256(content).hexdigest())
@@ -226,12 +297,12 @@ class H1CPUAttributeTests(unittest.TestCase):
                 process = Mock()
                 process.poll.return_value = 0
                 process.wait.return_value = 0
-                dsos = dict(complete=False, dsos=[dict(path='/fixture', eh_frame=False,
+                dsos = dict(complete=virtual, dsos=[dict(path='/fixture', eh_frame=virtual,
                                                       build_id_lines=['Build ID: 12345678'])])
                 with patch.object(trace, 'command', side_effect=metadata), \
                         patch.object(trace, 'launch', return_value=process), \
                         patch.object(trace.os, 'set_blocking'), \
-                        patch.object(trace.os, 'read', side_effect=[records, b'']):
+                        patch.object(trace.os, 'read', side_effect=[raw_records, b'']):
                     result = trace.cpu_decode(out, {7}, dsos)
                 self.assertEqual(result['attributes_verified'], valid)
                 self.assertEqual(result['attribute_validation']['verified'], valid)
@@ -241,11 +312,15 @@ class H1CPUAttributeTests(unittest.TestCase):
                 self.assertFalse(result['unwind_complete'])
                 self.assertFalse(result['samples_complete'])
                 self.assertIn('missing matching ELF/build IDs/CFI', result['issues'])
-                self.assertIn('partial unwinding/unresolved samples', result['issues'])
+                if virtual:
+                    self.assertEqual(result['unretained_virtual_dsos'],
+                                     {'/tmp/perf-vdso.so-gg5MgC': '87654321'})
+                else:
+                    self.assertIn('partial unwinding/unresolved samples', result['issues'])
                 saved = json.loads((out / 'cpu-coverage.json').read_text())
                 self.assertEqual(saved['attribute_validation'], result['attribute_validation'])
                 if valid:
-                    self.assertEqual(len(result['issues']), 2)
+                    self.assertEqual(len(result['issues']), 1 if virtual else 2)
                 else:
                     self.assertIn('actual software sample attributes not verified', result['issues'])
                     self.assertIn('CPU attributes: cpu-clock:uS freq: expected 1, got 0', result['issues'])
@@ -779,6 +854,40 @@ class H1DSOAcquisitionTests(unittest.TestCase):
             self.assertEqual(result['bytes'], len(self.payload))
             self.assertTrue(result['eh_frame'])
             self.assertEqual((self.destination / 'usr/lib/libfixture.so').read_bytes(), self.payload)
+
+    def test_symbolized_production_elf_is_retained_and_reused_with_a_fixed_ceiling(self):
+        # A sparse mapped ELF reproduces the hosted >512 MiB size without a
+        # large in-memory fixture. All copy/hash/inode/reuse checks remain real.
+        size = 600 * 1024**2
+        with self.source.open('r+b') as stream:
+            stream.truncate(size)
+        mapping = self.mapping
+        maps = (f"0-1 r-xp 00000000 {mapping['device_major']:x}:{mapping['device_minor']:x} "
+                f"{mapping['inode']} {mapping['path']}\n")
+        original_open = os.open
+        def open_root(name, *args, **kwargs):
+            return original_open(self.root if name == '/proc/42/root' else name, *args, **kwargs)
+        with patch.object(trace, 'read_metadata', return_value=dict(text=maps, truncated=False)), \
+                patch.object(trace.os, 'open', side_effect=open_root):
+            for repeat in (1, 2):
+                retained = trace.retain_dsos(42, self.destination)
+                self.assertTrue(retained['complete'], retained['errors'])
+                self.assertEqual(retained['package_limit_bytes'], 1024**3)
+                self.assertEqual(retained['dsos'][0]['bytes'], size)
+                self.assertEqual(retained['dsos'][0]['inode'], mapping['inode'])
+                self.assertLess(retained['retained_package_bytes'], 1024**3)
+            with self.source.open('r+b') as stream:
+                stream.truncate(1024**3 + 1)
+            oversized = trace.retain_dsos(42, self.destination)
+            self.assertFalse(oversized['complete'])
+            self.assertIn('retained ELF package cap/size', ' '.join(oversized['errors']))
+            # Failed prior output also consumes the shared ceiling; no fresh
+            # per-capture allowance can bypass an oversized existing package.
+            with (self.destination / 'failed-partial.bin').open('wb') as stream:
+                stream.truncate(430 * 1024**2)
+            existing = trace.retain_dsos(42, self.destination)
+            self.assertFalse(existing['complete'])
+            self.assertIn('existing DSO package cap', ' '.join(existing['errors']))
 
     def test_wrong_inode_regular_replacement_never_copies_unmapped_bytes(self):
         self.source.rename(self.source.with_suffix('.old'))

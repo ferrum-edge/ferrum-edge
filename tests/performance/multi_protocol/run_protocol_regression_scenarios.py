@@ -315,7 +315,7 @@ def main() -> int:
             time.sleep(1)
         with gateway_log.open("w", encoding="utf-8") as handle:
             gateway = subprocess.Popen(
-                ["./target/release/ferrum-edge"],
+                ["./target/release/ferrum-edge", "run"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 cwd=PROJECT_ROOT,
@@ -364,7 +364,7 @@ def main() -> int:
         print("-- soak + resource plateau")
         with gateway_log.open("w", encoding="utf-8") as handle:
             gateway = subprocess.Popen(
-                ["./target/release/ferrum-edge"],
+                ["./target/release/ferrum-edge", "run"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 cwd=PROJECT_ROOT,
@@ -423,7 +423,7 @@ def main() -> int:
         print("-- reload under load")
         with gateway_log.open("w", encoding="utf-8") as handle:
             gateway = subprocess.Popen(
-                ["./target/release/ferrum-edge"],
+                ["./target/release/ferrum-edge", "run"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 cwd=PROJECT_ROOT,

@@ -74,7 +74,7 @@ runs:
         # archive has passed its checksum and the binary is installed.
         echo "FERRUM_SCCACHE_BIN=" >> "$GITHUB_ENV"
 
-        # Hosted callers: Linux x86_64 (ubuntu-latest / ubuntu-24.04),
+        # Hosted callers: Linux x86_64 (ubuntu-26.04 / ubuntu-24.04),
         # macOS x86_64 and aarch64 (macos-latest), Windows x86_64
         # (windows-latest). Linux aarch64 is pinned for GitHub-hosted ARM
         # runners. Unsupported platforms fall through to the wrapper-clearing

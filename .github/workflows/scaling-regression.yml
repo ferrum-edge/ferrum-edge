@@ -35,7 +35,7 @@ env:
 jobs:
   scaling-regression:
     name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 300, not 180: read-your-write live apply (#3960) made `POST /batch` block
     # until the poll loop publishes a covering generation, so every one of the
     # 30k test's ten batches now pays a synchronous convergence cost that used
@@ -222,7 +222,7 @@ jobs:
 
   scaling-gate-signal:
     name: Scaling gate signal
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     needs: [scaling-regression]
     if: always()

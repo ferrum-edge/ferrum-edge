@@ -35,6 +35,7 @@ from hosted import scrub
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 STAGE = Path('/tmp/ferrum-h1-trace')
+PERF_SOURCE = Path('/usr/bin/perf')
 TICKS = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
 DEPENDENCY_PROVENANCE = json.loads((HERE / 'h1_profile_manifest.json').read_text())['external_trace']['dependency_provenance']
@@ -750,6 +751,9 @@ def retain_mapped_elf(root, destination, mapping, budget, deadline):
 
 def retain_dsos(pid, destination):
     """Bounded mapped ELF diagnostics; unsupported mappings never use host libc."""
+    # H1 and H2 use symbolized production binaries, measured at about 661 MiB
+    # on Ubuntu 26.04. Their shared package remains bounded across repeats.
+    package_limit = 1024**3
     if '..' in Path(destination).parts:
         raise ValueError('unsafe DSO destination traversal')
     raw = read_metadata(f'/proc/{pid}/maps')
@@ -772,7 +776,7 @@ def retain_dsos(pid, destination):
             errors.append(str(error))
     if len(mappings) > 128:
         return dict(complete=False, issue='DSO count bound', mappings=raw)
-    budget = dict(remaining=512 * 1024**2, package_remaining=512 * 1024**2)
+    budget = dict(remaining=package_limit, package_remaining=package_limit)
     deadline = time.monotonic() + 30
     # This one proc magic link is the admitted process's root. Subsequent source
     # and ALL destination components are descriptor-relative and no-follow.
@@ -781,7 +785,7 @@ def retain_dsos(pid, destination):
         root = os.open(f'/proc/{pid}/root', os.O_RDONLY | os.O_DIRECTORY)
         with directory_fd(Path(os.path.abspath(destination)), create=True) as target:
             # Include prior repeats and failed partial files in the shared package
-            # reservation. Never create a fresh per-repeat 512 MiB allowance.
+            # reservation. Never create a fresh per-repeat package allowance.
             entries = 0
             for _, directories, files, directory in os.fwalk('.', dir_fd=target, follow_symlinks=False):
                 for name in directories + files:
@@ -811,8 +815,9 @@ def retain_dsos(pid, destination):
         if root is not None:
             os.close(root)
     return dict(complete=not errors, errors=errors, mappings=raw, dsos=records,
-                acquired_elf_bytes=512 * 1024**2 - budget['remaining'],
-                retained_package_bytes=512 * 1024**2 - budget['package_remaining'],
+                package_limit_bytes=package_limit,
+                acquired_elf_bytes=package_limit - budget['remaining'],
+                retained_package_bytes=package_limit - budget['package_remaining'],
                 package_bytes_basis='existing files plus acquired bytes plus conservative decoder output reservations',
                 source='pinned target-root mapped device/inode; symlinks unsupported; never host libc substitution')
 
@@ -1022,7 +1027,9 @@ def read_cpu_attributes(path, status):
         if value is None:
             issues.append('cpu-clock:uS missing attribute ' + key)
             return None
-        suffix = r'(?:[ \t]+\(' + re.escape(annotation) + r'\))?' if annotation else ''
+        annotations = (annotation,) if isinstance(annotation, str) else annotation
+        suffix = (r'(?:[ \t]+\((?:' + '|'.join(re.escape(a) for a in annotations) + r')\))?'
+                  if annotations else '')
         match = re.fullmatch(r'(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})' + suffix, value)
         if match:
             token = match[1]
@@ -1032,7 +1039,7 @@ def read_cpu_attributes(path, status):
         issues.append(f'cpu-clock:uS invalid numeric attribute {key}: {value}')
         return None
 
-    required = {'type': (1, 'software'), 'config': (0, 'PERF_COUNT_SW_CPU_CLOCK'),
+    required = {'type': (1, ('software', 'PERF_TYPE_SOFTWARE')), 'config': (0, 'PERF_COUNT_SW_CPU_CLOCK'),
                 union: (99, None), 'freq': (1, None), 'inherit': (1, None),
                 'exclude_kernel': (1, None), 'use_clockid': (1, None),
                 'clockid': (1, None), 'sample_stack_user': (8192, None)}
@@ -1057,6 +1064,25 @@ def read_cpu_attributes(path, status):
             issues.append(f'cpu-clock:uS {key} missing bits: ' + '|'.join(sorted(missing)))
     result['verified'] = not issues
     return result
+
+
+def build_id_gaps(build_ids, retained_ids, records):
+    """Separate missing target ELFs from perf's unretained kernel vDSO copy.
+
+    Neither category can certify complete CPU samples. The virtual mapping
+    category is the same partial-unwind limitation as [vdso] on older perf.
+    """
+    virtual_mapping = any(record.startswith('PERF_RECORD_MMAP2 ')
+                          and record.endswith(': r-xp [vdso]') for record in records)
+    missing, virtual = [], {}
+    for path, build_id in build_ids.items():
+        if not path.startswith('/') or build_id in retained_ids.get(path, []):
+            continue
+        if virtual_mapping and re.fullmatch(r'/tmp/perf-vdso\.so-[A-Za-z0-9]{6}', path):
+            virtual[path] = build_id
+        else:
+            missing.append(path)
+    return missing, virtual
 
 
 def cpu_decode(out, owners, dsos, *, symfs=None):
@@ -1115,9 +1141,8 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
             build_id_by_path[parts[1].strip()] = parts[0].lower()
     retained_ids = {d['path']: [line.rsplit(' ', 1)[-1].lower() for line in d['build_id_lines']]
                     for d in dsos.get('dsos', [])}
-    for path, build_id in build_id_by_path.items():
-        if path.startswith('/') and build_id not in retained_ids.get(path, []):
-            issues.append('recorded DSO build ID lacks matching retained ELF: ' + path)
+    missing_elves, virtual_dsos = build_id_gaps(build_id_by_path, retained_ids, records)
+    issues.extend('recorded DSO build ID lacks matching retained ELF: ' + path for path in missing_elves)
     if not build_id_by_path or buildids['returncode'] or buildids['incomplete']:
         issues.append('recorded build IDs unavailable')
     if decoded['returncode'] or decoded['incomplete'] or raw_status['returncode'] or raw_error:
@@ -1128,13 +1153,16 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
         issues.append('lost or throttled samples')
     if result['foreign_samples']:
         issues.append('samples outside admitted process generations')
-    if not dsos.get('complete') or any(not d['build_id_lines'] or not d['eh_frame'] for d in dsos.get('dsos', [])):
+    if virtual_dsos or not dsos.get('complete') or any(not d['build_id_lines'] or not d['eh_frame'] for d in dsos.get('dsos', [])):
         issues.append('missing matching ELF/build IDs/CFI')
     if not result['mmap_records'] or not result['task_records']:
         issues.append('missing mapping/task provenance')
     if result['unresolved_samples'] or result['multi_frame_samples'] != result['samples']:
         issues.append('partial unwinding/unresolved samples')
     result.update(issues=issues, samples_complete=not issues, decoder_status=decoded,
+                  inline_expansion=False,
+                  stack_scope='symbolized physical DWARF frames; inline source frames not expanded',
+                  unretained_virtual_dsos=virtual_dsos,
                   header_status=header, buildid_status=buildids, attributes_status=attributes, attributes_verified=attributes_verified,
                   attribute_validation=attribute_validation,
                   raw_decoder_status=raw_status, unwind_complete=False,
@@ -1442,6 +1470,14 @@ def supervise(args):
 
 
 def stage(build):
+    # Ubuntu 26.04's linux-perf package installs the distro ELF directly here.
+    # Use this fixed package path rather than a PATH lookup or a kernel wrapper.
+    perf = PERF_SOURCE.resolve()
+    if not perf.is_file():
+        raise ValueError('installed Ubuntu perf ELF missing')
+    perf_bytes = perf.read_bytes()
+    if perf_bytes[:4] != b'\x7fELF':
+        raise ValueError('perf is not an ELF')
     # A fresh public traversal path for ordinary-UID fixtures, never chmod checkout.
     STAGE.mkdir(mode=0o755)
     for name in ('observer', 'observer.bpf.o', 'h1_trace_fixture'):
@@ -1449,19 +1485,9 @@ def stage(build):
         destination = STAGE / name
         destination.write_bytes(source.read_bytes())
         destination.chmod(0o644 if name.endswith('.o') else 0o755)
-    # Ubuntu's /usr/bin/perf wrapper often expects an unavailable Azure kernel
-    # package. Retain the actual distro ELF from installed linux-tools-generic;
-    # do not download a tool or assume its package version matches the kernel.
-    candidates = sorted({p.resolve() for p in Path('/usr/lib/linux-tools').glob('*/perf') if p.is_file()})
-    if not candidates:
-        raise ValueError('installed Ubuntu perf ELF missing')
-    perf = candidates[-1]
-    with perf.open('rb') as source:
-        if source.read(4) != b'\x7fELF':
-            raise ValueError('perf is not an ELF')
-    (STAGE / 'perf').write_bytes(perf.read_bytes())
+    (STAGE / 'perf').write_bytes(perf_bytes)
     (STAGE / 'perf').chmod(0o755)
-    write(STAGE / 'perf-source.json', dict(installed_path=str(perf), sha256=digest(perf)))
+    write(STAGE / 'perf-source.json', dict(installed_path=str(perf), sha256=hashlib.sha256(perf_bytes).hexdigest()))
     (STAGE / 'buildid-cache').mkdir(mode=0o700)
 
 

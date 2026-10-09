@@ -15,7 +15,7 @@ env:
 jobs:
   validate-release-version:
     name: Validate release version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -42,7 +42,7 @@ jobs:
   validate-release-sha:
     name: Validate release SHA
     needs: validate-release-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 350
     permissions:
       actions: read
@@ -121,7 +121,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
             artifact_name: ferrum-edge
             asset_name: ferrum-edge-linux-x86_64
@@ -238,7 +238,7 @@ jobs:
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       # Every target except x86_64 GNU is compiled natively on its runner.
-      # The x86_64 GNU cell is deliberately excluded: `ubuntu-latest` is a
+      # The x86_64 GNU cell is deliberately excluded: `ubuntu-26.04` is a
       # moving image whose glibc defines the published runtime floor, which is
       # exactly the defect issue #4301 fixes.
       - name: Build release binary
@@ -347,7 +347,7 @@ jobs:
     name: Build (ferrum-edge-linux-aarch64)
     needs: validate-release-sha
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Issue #4674: 2.6x the 45m39s observed compile step, leaving room for the
     # image pull and sysroot preparation. Raise only when a successful run
     # exceeds it.
@@ -434,7 +434,7 @@ jobs:
     # whose text no pull request may change, so its actual uploaded artifact
     # is downloaded, checksum-verified, and scanned here instead.
     needs: build-release-arm64-cross
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 60
     permissions:
       contents: read
@@ -479,7 +479,7 @@ jobs:
     # never pushed. All three manifest jobs run unconditionally on every `v*` tag
     # (no `if:`/path filters), so this keeps the default release path intact.
     needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -673,7 +673,7 @@ jobs:
   docker:
     name: Docker (${{ matrix.platform }})
     needs: [build-release-binaries, build-release-arm64-cross]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -748,7 +748,7 @@ jobs:
   docker-manifest:
     name: Docker Manifest
     needs: docker
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -841,10 +841,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             platform: linux/amd64
             arch_dir: amd64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             platform: linux/arm64
             arch_dir: arm64
     steps:
@@ -931,7 +931,7 @@ jobs:
     # `docker` (per-arch core build), and `docker-ebpf` is added here so the
     # eBPF build still gates its own manifest. The graph stays acyclic.
     needs: [build-release-binaries, docker-manifest, docker-ebpf]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -1019,7 +1019,7 @@ jobs:
     # the preceding job's frozen `steps` block and would break that contract.
     name: Docker eBPF Tools Manifest
     needs: [build-release-binaries, docker-manifest, docker-ebpf, docker-ebpf-manifest]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -1086,7 +1086,7 @@ jobs:
   attest-release-images:
     name: Sign and attest release images
     needs: [docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
       packages: write
@@ -1491,7 +1491,7 @@ jobs:
     # GitHub Release created in a race before attestation finishes is deleted.
     needs: [create-release, attest-release-images]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -1538,7 +1538,7 @@ jobs:
     # a GitHub Release whose ARM64 artifacts were not proven.
     needs: [create-release, verify-linux-gnu-abi-aarch64]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -1577,7 +1577,7 @@ jobs:
   anonymous-pull-smoke:
     name: Anonymous image pull smoke
     needs: docker-manifest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read

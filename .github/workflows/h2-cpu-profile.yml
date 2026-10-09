@@ -5,6 +5,7 @@ on:
     paths:
       - tests/performance/multi_protocol/h2_cpu_profile.py
       - tests/performance/multi_protocol/h1_trace.py
+      - tests/performance/multi_protocol/h1_trace_commands.sh
       - tests/performance/multi_protocol/process_usage.py
       - tests/performance/multi_protocol/src/process_usage.rs
       - tests/performance/multi_protocol/run_gateway_protocol_bench.sh
@@ -39,7 +40,7 @@ concurrency:
 jobs:
   checks:
     name: H2 CPU profile contracts
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -56,7 +57,7 @@ jobs:
     name: Profile ${{ inputs.protocol }} (${{ inputs.payload }} bytes)
     if: github.event_name == 'workflow_dispatch'
     needs: checks
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -69,7 +70,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof \
-            binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-tools-generic linux-tools-common
+            binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-perf linux-tools-generic linux-tools-common
           sudo fallocate -l 12G /mnt/h2-cpu-swap
           sudo chmod 600 /mnt/h2-cpu-swap
           sudo mkswap /mnt/h2-cpu-swap
@@ -120,6 +121,11 @@ jobs:
             python3 tests/performance/multi_protocol/h1_trace.py stage --build h2-cpu-evidence/trace-build
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
             python3 tests/performance/multi_protocol/h1_trace.py preflight --output h2-cpu-evidence/trace-preflight
+      - name: Pull the pinned Envoy comparison image before reusing builds
+        run: |
+          docker pull envoyproxy/envoy:v1.39.1
+          mkdir -p h2-cpu-evidence/builds/envoy
+          docker image inspect envoyproxy/envoy:v1.39.1 > h2-cpu-evidence/builds/envoy/image.json
       - name: Unprofiled controls before and after a separately retained CPU campaign
         env:
           PROFILE_PROTOCOL: ${{ inputs.protocol }}

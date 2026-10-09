@@ -44,6 +44,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- H2/gRPC CPU qualification pulls its pinned Envoy comparison image before
+  reusing the prebuilt Ferrum and harness binaries, and retains the resolved
+  image identity. Fresh hosted runners no longer stop before their controls.
+  The shared H1/H2 mapped-ELF package has a fixed 1 GiB ceiling for the measured
+  660.7 MiB symbolized production binary, exceeding the old 512 MiB ceiling.
+  Mapped inode, byte equality, build ID, deadline and shared-package checks
+  remain enforced; retained metadata records the fixed ceiling.
+  Physical DWARF decoding disables perf's default inline-source expansion after
+  addr2line repeatedly exceeded the 30-second decoder bound on that ELF. Inline
+  source frames remain an explicit diagnostic limitation; sample-count, loss,
+  identity and capture-completeness checks retain their existing requirements.
+
+- The scheduled scaling verifier's positive self-test places run identity checks
+  in its production section, matching the production-only admission rule. Event,
+  repository and workflow-path checks remain required before scaling runs.
+
+- H3 live socket-lifecycle observers recognize Linux 7.0's `sockaddr_unsized`
+  pointer in `inet_bind`, while retaining exact argument, return and pointer
+  checks. Synthetic BTF regressions reject unrelated or changed signatures.
+  Classic selection correlates through the typed lookup socket's captured cookie,
+  avoiding a flexible-array read rejected by the new kernel verifier.
+  H3 campaigns reserve 48 MiB for measured observer RSS after Ubuntu 26.04
+  fixtures used about 37 MiB; the 32 MiB kernel-map reservation and 64 MiB
+  artifact cap remain unchanged. Active and idle samples retain peak usage and
+  reject RSS beyond the new bound.
+
+- The scheduled vendored-patch audit distinguishes an unreviewed upstream merge
+  from a reviewed fix that has not shipped. Release holds bind the exact merge
+  and latest stable version, expire within 30 days, and fail on changed or unknown
+  upstream identities. SQLx's typed-float NULL patch remains vendored until a
+  compatible release passes the existing PostgreSQL regression.
+
+- Ambient host-UDP live qualification passes its four harness inputs explicitly
+  across sudo on Ubuntu 26.04; namespace isolation and required live tests remain
+  enforced. It no longer depends on whole-environment preservation.
+
+- Manual protocol and payload benchmarks keep their standalone harnesses on
+  `release`, while the selected build profile applies to the gateway. Selecting
+  `ci-release` or `max-perf` no longer asks harnesses for undefined profiles.
+  Protocol regression scenarios use the gateway’s required `run` subcommand.
+
+- Scheduled benchmark history selectors can run `--self-test` without live-run
+  arguments; ordinary history queries still require the workflow and commit.
+
+- H1 hosted profiling installs Ubuntu 26.04's `linux-perf` package and stages
+  its `/usr/bin/perf` ELF, retaining its package origin and checksum. The former
+  kernel-specific `linux-tools` path is no longer populated on this image.
+  CPU sample verification accepts its `PERF_TYPE_SOFTWARE` annotation while
+  retaining the numeric event type and all required sampling checks.
+
 - **BREAKING — HTTP/2 WebSocket early data is gated on the wire method
   `CONNECT`** (issue #6107). An RFC 8441 Extended CONNECT WebSocket carrying
   `Early-Data: 1` was checked against `FERRUM_TLS_EARLY_DATA_METHODS` after

@@ -397,8 +397,14 @@ demand:
   `scripts/check_vendored_patch_status.sh`, which delegates to the same checker's
   `--upstream-status` mode and queries each tracked upstream PR. The run goes
   **red when an upstream PR has merged** (a retirement signal — run the
-  compatible-release test before deleting vendor copies) and reports each crate's
-  latest crates.io release plus deliberate-fork reaffirmation gaps.
+  compatible-release test before deleting vendor copies), unless the patch has a
+  reviewed `retirement.merged_release_hold` because a compatible released fix is
+  unavailable. That record must name the patch owner, exact upstream merge SHA,
+  reviewed latest stable version, evidence, reason, and a review window of at most
+  30 days; its compatibility test must remain `blocked`. The README must carry the
+  same review. A changed or unknown release, an unconfirmed merge, or expiry fails
+  the audit again. Other merged patches still fail by default. The audit reports
+  active holds, latest crates.io releases, and deliberate-fork reaffirmation gaps.
 
 The per-PR `dependency-audit` job in `ci.yml` runs the same parity gate. Because
 that job is required to stay behind `mode == 'full'`,

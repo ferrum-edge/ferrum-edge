@@ -254,7 +254,7 @@ def write_pre_collection(
     logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / "vmstat_pre.txt").write_text(output, encoding="utf-8")
     health: dict[str, object] = {
-        "runner_class": os.environ.get("BENCH_RUNNER_CLASS", "ubuntu-24.04"),
+        "runner_class": os.environ.get("BENCH_RUNNER_CLASS", "ubuntu-26.04"),
         "build_profile": os.environ.get("BENCH_BUILD_PROFILE", "release"),
         "commit_sha": os.environ.get("GITHUB_SHA"),
         "avg_steal_percent": steal,

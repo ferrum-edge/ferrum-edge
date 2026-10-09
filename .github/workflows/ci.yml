@@ -38,7 +38,7 @@ env:
 jobs:
   ci-plan:
     name: CI Plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -345,7 +345,7 @@ jobs:
 
           builds = [
               {
-                  "os": "ubuntu-latest",
+                  "os": "ubuntu-26.04",
                   "target": "x86_64-unknown-linux-gnu",
                   "artifact_name": "ferrum-edge",
                   "asset_name": "ferrum-edge-linux-x86_64",
@@ -413,7 +413,7 @@ jobs:
 
   ci-policy:
     name: CI Policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -501,7 +501,7 @@ jobs:
     name: Unit Tests (${{ matrix.shard }})
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -767,7 +767,7 @@ jobs:
     name: ACME Feature Tests
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_acme == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -868,7 +868,7 @@ jobs:
     name: Secret Backends
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_secrets_backends == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -941,7 +941,7 @@ jobs:
     name: Service Integration
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_service_integration == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -993,7 +993,7 @@ jobs:
     name: PKCS#11 SoftHSM Smoke Test
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_pkcs11 == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -1104,7 +1104,7 @@ jobs:
     # conformance consumers. Pin the build host so its glibc stays no newer
     # than the runtime image glibc; all native archive consumers use the same
     # Linux architecture.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -1229,7 +1229,7 @@ jobs:
     name: Integration Tests (${{ matrix.shard }})
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -1647,7 +1647,7 @@ jobs:
     name: Mesh Conformance Tests
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_conformance == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -1697,7 +1697,7 @@ jobs:
     name: Dependency Audit (cargo-deny)
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_dependency_audit == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -1887,7 +1887,7 @@ jobs:
     name: Standalone Cargo Workspaces
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_standalone_cargo == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     permissions:
       contents: read
@@ -1972,7 +1972,7 @@ jobs:
     name: Vendored Patch Regressions
     needs: [ci-plan, build-test-artifacts]
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_vendor_patches == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -2133,7 +2133,7 @@ jobs:
     name: Functional Tests (${{ matrix.shard }})
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -2952,7 +2952,7 @@ jobs:
     name: Plugin Hardening Redis Regression
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -3123,7 +3123,7 @@ jobs:
     name: Helm Chart
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_helm == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       FERRUM_IMAGE: ferrum-edge:helm-chart-ci
@@ -6609,7 +6609,7 @@ jobs:
       - two-cluster-mesh-live
       - build-binaries
       - standalone-cargo
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -6727,7 +6727,7 @@ jobs:
     name: Lint
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -6807,7 +6807,7 @@ jobs:
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     permissions:
       contents: read
@@ -7112,7 +7112,7 @@ jobs:
     name: Build eBPF Programs
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_build == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -7174,7 +7174,7 @@ jobs:
     name: Build eBPF Userspace Loader
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_userspace == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -7214,7 +7214,7 @@ jobs:
     # Live kernel validation is high-value for BPF/loader-sensitive changes,
     # but it adds several minutes to every PR when run unconditionally.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_kernel_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -7336,7 +7336,7 @@ jobs:
     # path gate keeps unrelated PRs fast while preserving coverage for
     # capture/netns/UDP surfaces.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_netns_capture_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -7491,7 +7491,7 @@ jobs:
     # Dedicated cross-cluster/HBONE/identity path gate. The job downloads two
     # real SPIRE control planes and runs the full cross-cluster protocol matrix.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_two_cluster_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -7747,7 +7747,7 @@ jobs:
     name: Build Linux CI image
     needs: [test, build-test-artifacts]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read

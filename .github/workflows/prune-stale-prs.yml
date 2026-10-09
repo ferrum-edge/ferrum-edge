@@ -58,7 +58,7 @@ env:
 jobs:
   prune-merged-branches:
     name: Delete merged PR branches
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -133,7 +133,7 @@ jobs:
 
   prune-stale-closed-prs:
     name: Delete branches from stale closed (unmerged) PRs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -216,7 +216,7 @@ jobs:
 
   prune-orphan-branches:
     name: Delete stale branches that never had a PR
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -338,7 +338,7 @@ jobs:
 
   cleanup-local-refs:
     name: Prune remote-tracking branches
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: [prune-merged-branches, prune-stale-closed-prs, prune-orphan-branches]
     if: github.event.inputs.dry_run != 'true'
     steps:

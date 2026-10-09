@@ -1153,7 +1153,7 @@ stop_gateway() {
 }
 
 # ── Bench runner ────────────────────────────────────────────────────────────
-# Auto-scales concurrency down for large payloads so an ubuntu-latest runner
+# Auto-scales concurrency down for large payloads so an ubuntu-26.04 runner
 # (7 GB RAM) doesn't OOM on 5MB × 100 concurrent in-flight bodies.
 scale_concurrency_for_payload() {
     local size="$1" base="$2"
