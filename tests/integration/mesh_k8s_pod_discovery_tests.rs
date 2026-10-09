@@ -1634,6 +1634,103 @@ fn k8s_pod_discovery_attaches_a_controller_slice_naming_the_services_own_pod() {
     );
 }
 
+#[test]
+fn k8s_pod_discovery_publishes_the_pods_own_spelling_of_an_ipv4_mapped_address() {
+    // A slice may spell the Pod's IPv4 address IPv4-mapped. The workload
+    // carries the address the Pod reports, once (issue #6123).
+    let mut mapped = reviews_slice_with(json!([{
+        "addresses": ["::ffff:10.1.0.10"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+    mapped.metadata.name = "reviews-mapped".to_string();
+
+    let translation = translate_k8s_objects(
+        &[service(), ready_pod(), endpoint_slice(), mapped],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
+}
+
+/// A ready host-network Pod `namespace/name` reporting its Node's IP.
+fn host_network_pod_in(namespace: &str, name: &str, node_ip: &str) -> K8sObject {
+    let mut pod = ready_pod_in(namespace, name, name, node_ip);
+    pod.spec["hostNetwork"] = json!(true);
+    pod
+}
+
+#[test]
+fn k8s_pod_discovery_attaches_a_host_network_pod_named_by_target_ref() {
+    // A host-network DaemonSet Pod reports its Node's IP, as does every other
+    // host-network Pod on that Node, in any namespace. The EndpointSlice
+    // controller's same-namespace `targetRef` attaches it; the other
+    // namespace's host-network Pod must not refuse it.
+    let agent = host_network_pod_in("default", "reviews-v1", "192.168.10.5");
+    let kube_proxy = host_network_pod_in("kube-system", "kube-proxy-a", "192.168.10.5");
+    let slice = reviews_slice_with(json!([{
+        "addresses": ["192.168.10.5"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+
+    let translation = translate_k8s_objects(&[service(), agent, kube_proxy, slice], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(
+        reviews_workload_addresses(&translation),
+        vec!["192.168.10.5"]
+    );
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("mesh workload derivation")),
+        "{:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_ip_lookup_never_resolves_a_node_ip_or_a_shared_ip() {
+    // Without a `targetRef` an endpoint resolves its Pod by IP. A Node IP,
+    // which every host-network Pod on the Node reports, identifies no Pod;
+    // neither does an IP two Pods report.
+    let agent = host_network_pod_in("default", "reviews-v1", "192.168.10.5");
+    let kube_proxy = host_network_pod_in("kube-system", "kube-proxy-a", "192.168.10.5");
+    let node_ip = reviews_slice_with(json!([{
+        "addresses": ["192.168.10.5"],
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), agent, kube_proxy, node_ip], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+
+    let twin = ready_pod_in("default", "reviews-v2", "reviews", "10.1.0.10");
+    let shared_ip = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.10"],
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), twin, shared_ip], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+
+    // The same endpoint resolves once only one Pod reports the IP.
+    let sole_ip = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.10"],
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), sole_ip], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend() {
     use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
