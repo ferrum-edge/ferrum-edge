@@ -2774,6 +2774,22 @@ pub struct EnvConfig {
     /// false for one release; when true, CP also watches core resources and
     /// derives mesh services/workloads from ready pods.
     pub k8s_pod_discovery_enabled: bool,
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. Let a Gateway API
+    /// backendRef to a selector-less Service in the route's own namespace
+    /// reach EndpointSlice IPs that no observed Pod, Service ClusterIP, Node
+    /// address, or Node Pod CIDR claims (an external database or VM). Never
+    /// admits another namespace's observed Pods, FQDN endpoints,
+    /// loopback/link-local/unspecified/multicast/cloud-metadata addresses, or
+    /// a Service it cannot check because pod discovery is off. Default: false.
+    ///
+    /// Active only while the controller watches Nodes: it also needs
+    /// `FERRUM_K8S_CONTROLLER_ENABLED`, `FERRUM_K8S_POD_DISCOVERY_ENABLED`, and
+    /// `FERRUM_K8S_NODE_LOCALITY_ENABLED` (with `nodes` list/watch RBAC), and a
+    /// reconcile that has observed at least one Node. Without the Node watch
+    /// a Node address or an unwatched Pod's IP looks external, so the CP logs a
+    /// startup warning ([`Self::k8s_selectorless_external_endpoints_inactive_reason`])
+    /// or a reconcile warning and keeps refusing unattributed IPs.
+    pub k8s_allow_selectorless_external_endpoints: bool,
     /// Namespace where the Ferrum K8s controller and ambient NodeWaypoint
     /// DaemonSet are installed. Defaults to `FERRUM_NAMESPACE`; Helm sets it
     /// to `.Release.Namespace` so managed workload namespace overrides do not
@@ -2781,7 +2797,9 @@ pub struct EnvConfig {
     pub k8s_controller_namespace: String,
     /// Enable cluster-scoped Node watching to enrich auto-discovered pod
     /// workloads with topology.kubernetes.io/{region,zone}. Requires
-    /// `FERRUM_K8S_POD_DISCOVERY_ENABLED=true` and Node RBAC. Default: false.
+    /// `FERRUM_K8S_POD_DISCOVERY_ENABLED=true` and Node RBAC. The Node watch
+    /// is also what `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS` needs to
+    /// take effect. Default: false.
     pub k8s_node_locality_enabled: bool,
     /// Comma-separated namespaces to watch for CRDs. Empty = all namespaces
     /// (requires ClusterRole). Default: "" (all).
@@ -4285,6 +4303,7 @@ impl Default for EnvConfig {
             node_agent_cni_socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
+            k8s_allow_selectorless_external_endpoints: false,
             k8s_controller_namespace: "ferrum".to_string(),
             k8s_node_locality_enabled: false,
             k8s_watch_namespaces: Vec::new(),
@@ -4933,6 +4952,7 @@ impl EnvConfig {
             node_agent_cni_socket_path: String = "FERRUM_NODE_AGENT_CNI_SOCKET_PATH" => "/var/run/ferrum/node-agent-cni.sock".to_string();
             k8s_controller_namespace: String = "FERRUM_K8S_CONTROLLER_NAMESPACE" => namespace.clone();
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
+            k8s_allow_selectorless_external_endpoints: bool = "FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS" => false;
             k8s_watch_namespaces: Vec<String> = "FERRUM_K8S_WATCH_NAMESPACES" => Vec::new();
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
@@ -5837,6 +5857,7 @@ impl EnvConfig {
             node_agent_cni_socket_path,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
+            k8s_allow_selectorless_external_endpoints,
             k8s_controller_namespace,
             k8s_node_locality_enabled,
             k8s_watch_namespaces,
@@ -6780,6 +6801,35 @@ impl EnvConfig {
 
     pub fn db_tls_enabled(&self) -> bool {
         self.db_tls_mode.is_some_and(DbTlsMode::enables_tls)
+    }
+
+    /// The setting that keeps a requested
+    /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true` from taking
+    /// effect, or `None` when it was not requested or can take effect. The
+    /// opt-in needs the Node watch: without it a Node address, or the IP of a
+    /// Pod outside the Pod watch scope, cannot be told from an external host.
+    pub fn k8s_selectorless_external_endpoints_inactive_reason(&self) -> Option<&'static str> {
+        if !self.k8s_allow_selectorless_external_endpoints {
+            None
+        } else if !self.k8s_controller_enabled {
+            Some("FERRUM_K8S_CONTROLLER_ENABLED=false")
+        } else if !self.k8s_pod_discovery_enabled {
+            Some("FERRUM_K8S_POD_DISCOVERY_ENABLED=false")
+        } else if !self.k8s_node_locality_enabled {
+            Some("FERRUM_K8S_NODE_LOCALITY_ENABLED=false")
+        } else {
+            None
+        }
+    }
+
+    /// Whether `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true` was
+    /// requested and the Node watch it needs is configured. Each reconcile
+    /// additionally requires at least one observed Node.
+    pub fn k8s_selectorless_external_endpoints_active(&self) -> bool {
+        self.k8s_allow_selectorless_external_endpoints
+            && self
+                .k8s_selectorless_external_endpoints_inactive_reason()
+                .is_none()
     }
 
     pub fn mongodb_tls_allows_invalid_certs(&self) -> bool {

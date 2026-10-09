@@ -7247,6 +7247,69 @@ fn test_pool_shard_amount_default_is_zero() {
 }
 
 #[test]
+fn selectorless_external_endpoints_opt_in_needs_the_node_watch() {
+    // Without the Node watch a Node address, or the IP of a Pod outside the
+    // Pod watch scope, cannot be told from an external host (issue #6108).
+    let watching = EnvConfig {
+        k8s_allow_selectorless_external_endpoints: true,
+        k8s_controller_enabled: true,
+        k8s_pod_discovery_enabled: true,
+        k8s_node_locality_enabled: true,
+        ..EnvConfig::default()
+    };
+    assert!(watching.k8s_selectorless_external_endpoints_active());
+    assert_eq!(
+        watching.k8s_selectorless_external_endpoints_inactive_reason(),
+        None
+    );
+
+    let cases = [
+        (
+            EnvConfig {
+                k8s_controller_enabled: false,
+                ..watching.clone()
+            },
+            "FERRUM_K8S_CONTROLLER_ENABLED=false",
+        ),
+        (
+            EnvConfig {
+                k8s_pod_discovery_enabled: false,
+                ..watching.clone()
+            },
+            "FERRUM_K8S_POD_DISCOVERY_ENABLED=false",
+        ),
+        (
+            EnvConfig {
+                k8s_node_locality_enabled: false,
+                ..watching.clone()
+            },
+            "FERRUM_K8S_NODE_LOCALITY_ENABLED=false",
+        ),
+    ];
+    for (config, reason) in cases {
+        assert!(
+            !config.k8s_selectorless_external_endpoints_active(),
+            "{reason}"
+        );
+        assert_eq!(
+            config.k8s_selectorless_external_endpoints_inactive_reason(),
+            Some(reason)
+        );
+    }
+
+    // Not requested: inactive, with nothing to warn about.
+    let not_requested = EnvConfig {
+        k8s_allow_selectorless_external_endpoints: false,
+        ..watching
+    };
+    assert!(!not_requested.k8s_selectorless_external_endpoints_active());
+    assert_eq!(
+        not_requested.k8s_selectorless_external_endpoints_inactive_reason(),
+        None
+    );
+}
+
+#[test]
 fn test_k8s_pod_discovery_default_disabled() {
     let config = EnvConfig::default();
     assert!(

@@ -149,6 +149,7 @@ fn service() -> K8sObject {
             deletion_timestamp: None,
         },
         spec: json!({
+            "selector": {"app": "api"},
             "ports": [{"port": 8080, "targetPort": 8080}]
         }),
         status: Value::Object(serde_json::Map::new()),

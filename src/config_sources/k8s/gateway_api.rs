@@ -8285,6 +8285,7 @@ fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
             message.contains("ReferenceGrant")
                 || super::backend_ref::message_is_unsupported_backend_kind(message)
                 || super::backend_ref::message_is_external_name_backend(message)
+                || super::backend_ref::message_is_endpoint_slice_refusal(message)
         }
         K8sTranslateError::Unsupported(_) => false,
     }
@@ -9107,13 +9108,51 @@ fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8
     Ok(())
 }
 
+/// [`super::backend_ref::checked_backend_namespace`] plus the structured
+/// translation warning for EndpointSlice attribution: a refused Service
+/// backend, or a selector-backed one admitted without its EndpointSlices being
+/// checked because the controller observes no Pods in its namespace.
 fn checked_backend_namespace(
     object: &K8sObject,
     backend_ref: &Value,
-    acc: &K8sAccumulator,
+    acc: &mut K8sAccumulator,
     from_kind: &str,
 ) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
-    super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind)
+    use super::backend_ref::{
+        BackendKind, endpoint_slice_unverified_warning, message_is_endpoint_slice_refusal,
+    };
+
+    let checked =
+        super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind);
+    match &checked {
+        Err(K8sTranslateError::InvalidResource { message, .. })
+            if message_is_endpoint_slice_refusal(message) =>
+        {
+            acc.push_warning_once(format!(
+                "Gateway API {from_kind} {:?}/{:?}: {message}",
+                object.metadata.namespace, object.metadata.name
+            ));
+        }
+        Ok((BackendKind::Service, backend_namespace)) => {
+            let pod_discovery_enabled = acc.options.pod_discovery_enabled;
+            let pods_unobserved =
+                !pod_discovery_enabled || !acc.options.includes_pod_namespace(backend_namespace);
+            if pods_unobserved
+                && let Some(name) = string_field(backend_ref, "name")
+                && acc.service_exists(backend_namespace, name)
+                && !acc.service_is_selectorless(backend_namespace, name)
+            {
+                let warning = endpoint_slice_unverified_warning(
+                    backend_namespace,
+                    name,
+                    pod_discovery_enabled,
+                );
+                acc.push_warning_once(warning);
+            }
+        }
+        _ => {}
+    }
+    checked
 }
 
 fn first_backend_ref<'a>(
@@ -10078,6 +10117,16 @@ mod tests {
             service_name.to_string(),
         );
         slice
+    }
+
+    /// A Running Pod in `default` owning `ip`, so a Service's EndpointSlice
+    /// endpoint is a Pod of its namespace (issue #6108).
+    fn core_pod(name: &str, ip: &str) -> K8sObject {
+        let mut pod = object("Pod", serde_json::json!({}));
+        pod.api_version = "v1".to_string();
+        pod.metadata.name = name.to_string();
+        pod.status = serde_json::json!({"phase": "Running", "podIP": ip});
+        pod
     }
 
     fn namespace(name: &str, labels: &[(&str, &str)]) -> K8sObject {
@@ -11756,8 +11805,9 @@ mod tests {
             }),
         );
 
+        let pod = core_pod("manual-0", "10.1.0.10");
         let result = translate_k8s_objects(
-            &[service, endpoint_slice, route],
+            &[service, endpoint_slice, route, pod],
             options().with_pod_discovery_enabled(true),
         )
         .expect("manual EndpointSlice service should translate");
@@ -11808,8 +11858,9 @@ mod tests {
             }),
         );
 
+        let pod = core_pod("named-target-0", "10.1.0.11");
         let result = translate_k8s_objects(
-            &[service, endpoint_slice, route],
+            &[service, endpoint_slice, route, pod],
             options().with_pod_discovery_enabled(true),
         )
         .expect("named Service targetPort should resolve through EndpointSlice port names");
@@ -11857,8 +11908,10 @@ mod tests {
             }),
         );
 
+        let pod_a = core_pod("headless-0", "10.1.0.11");
+        let pod_b = core_pod("headless-1", "10.1.0.12");
         let result = translate_k8s_objects(
-            &[service, endpoint_slice, route],
+            &[service, endpoint_slice, route, pod_a, pod_b],
             options().with_pod_discovery_enabled(true),
         )
         .expect("headless EndpointSlice service should translate");
@@ -11901,6 +11954,8 @@ mod tests {
                 }),
             ],
         );
+        let pod_a = core_pod("manual-0", "10.1.0.21");
+        let pod_b = core_pod("manual-1", "10.1.0.22");
         let direct = core_service(
             "direct",
             serde_json::json!({
@@ -11923,7 +11978,7 @@ mod tests {
         );
 
         let result = translate_k8s_objects(
-            &[manual, manual_slice, direct, route],
+            &[manual, manual_slice, direct, route, pod_a, pod_b],
             options().with_pod_discovery_enabled(true),
         )
         .expect("mixed endpoint and service backends should translate");
@@ -11977,6 +12032,8 @@ mod tests {
                 }),
             ],
         );
+        let pod_a = core_pod("manual-0", "10.1.0.31");
+        let pod_b = core_pod("manual-1", "10.1.0.32");
         let direct = core_service(
             "direct",
             serde_json::json!({
@@ -11999,7 +12056,7 @@ mod tests {
         );
 
         let result = translate_k8s_objects(
-            &[manual, manual_slice, direct, route],
+            &[manual, manual_slice, direct, route, pod_a, pod_b],
             options().with_pod_discovery_enabled(true),
         )
         .expect("mixed endpoint and service backends should translate");
@@ -16336,6 +16393,7 @@ mod tests {
         let service = core_service(
             "api",
             serde_json::json!({
+                "selector": {"app": "api"},
                 "ports": [{"name": "http", "port": 8080}]
             }),
         );

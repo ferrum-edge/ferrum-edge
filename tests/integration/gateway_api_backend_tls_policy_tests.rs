@@ -92,6 +92,7 @@ fn service(name: &str, port: u16, port_name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [{
                 "name": port_name,
                 "port": port,
@@ -635,6 +636,7 @@ fn multi_port_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "http", "port": 8080, "targetPort": 8080 },
                 { "name": "https", "port": 8443, "targetPort": 8443 }
@@ -1462,6 +1464,7 @@ fn single_udp_port_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" }
             ]
@@ -1475,6 +1478,7 @@ fn mixed_transport_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "http", "port": 8080, "targetPort": 8080, "protocol": "TCP" },
                 { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" }
@@ -1738,6 +1742,7 @@ fn single_sctp_port_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "sigtran", "port": 8443, "targetPort": 8443, "protocol": "SCTP" }
             ]
@@ -1751,6 +1756,7 @@ fn mixed_tcp_sctp_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "http", "port": 8080, "targetPort": 8080, "protocol": "TCP" },
                 { "name": "sigtran", "port": 8443, "targetPort": 8443, "protocol": "SCTP" }
@@ -1769,6 +1775,7 @@ fn unrecognized_protocol_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "weird", "port": 8443, "targetPort": 8443, "protocol": "QUIC" }
             ]
@@ -1782,6 +1789,7 @@ fn tcp_udp_sctp_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "http", "port": 8080, "targetPort": 8080, "protocol": "TCP" },
                 { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" },
@@ -1800,6 +1808,7 @@ fn udp_and_sctp_only_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "quic", "port": 8443, "targetPort": 8443, "protocol": "UDP" },
                 { "name": "sigtran", "port": 8444, "targetPort": 8444, "protocol": "SCTP" }
@@ -1818,6 +1827,7 @@ fn lowercase_tcp_service(name: &str) -> K8sObject {
         "Service",
         name,
         serde_json::json!({
+            "selector": { "app": name },
             "ports": [
                 { "name": "https", "port": 8443, "targetPort": 8443, "protocol": "tcp" }
             ]

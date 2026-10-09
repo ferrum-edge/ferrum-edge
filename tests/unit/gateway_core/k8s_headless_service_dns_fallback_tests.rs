@@ -6,6 +6,8 @@
 //! empty slices, Ferrum falls back to Service DNS. CoreDNS later returns the
 //! pod IP; the container listens on `targetPort` (3000), not `port` (8080).
 //! Selectorless ClusterIP Services keep `port` because kube-proxy DNAT maps it.
+//! Ready endpoints are backed by a Pod in the Service's namespace: the
+//! backendRef guard refuses EndpointSlice endpoints that are not (issue #6108).
 
 use std::collections::HashMap;
 
@@ -89,6 +91,19 @@ fn ready_manual_slice(service_name: &str, address: &str) -> K8sObject {
         "conditions": {"ready": true, "serving": true, "terminating": false}
     }]);
     slice
+}
+
+/// A Running Pod in `default` that owns `ip`. A Service's EndpointSlice is
+/// admitted only when its endpoints are Pods of the Service's namespace
+/// (issue #6108).
+fn pod(name: &str, ip: &str) -> K8sObject {
+    let mut pod = object("Pod", "v1", name, json!({}));
+    pod.status = json!({"phase": "Running", "podIP": ip});
+    pod
+}
+
+fn backend_pod() -> K8sObject {
+    pod("backend-0", "10.1.0.10")
 }
 
 fn headless_service(name: &str, target_port: Value) -> K8sObject {
@@ -178,6 +193,7 @@ fn headless_ready_endpoint_slices_still_expand_to_pod_ip_and_target_port() {
         &[
             headless_service("headless-manual-endpointslices", json!(3000)),
             ready_manual_slice("headless-manual-endpointslices", "10.244.0.21"),
+            pod("headless-manual-endpointslices-0", "10.244.0.21"),
             http_route(
                 "/headless-manual-endpointslices",
                 "headless-manual-endpointslices",
@@ -401,8 +417,9 @@ fn endpoint_slice_ports_override_numeric_targets_without_changing_silent_slice_f
             }
             let mut slice = ready_manual_slice("backend", "10.1.0.10");
             slice.spec["ports"] = ports.clone();
+            let pod = backend_pod();
             let translated = translate_k8s_objects(
-                &[service, slice, http_route("/slice", "backend")],
+                &[service, slice, http_route("/slice", "backend"), pod],
                 options(),
             )
             .expect("translate endpoint port matrix");
@@ -428,8 +445,9 @@ fn unnamed_numeric_target_uses_only_an_unambiguous_unnamed_slice_port() {
             .remove("name");
         let mut slice = ready_manual_slice("backend", "10.1.0.10");
         slice.spec["ports"] = ports;
+        let pod = backend_pod();
         let translated = translate_k8s_objects(
-            &[service, slice, http_route("/slice", "backend")],
+            &[service, slice, http_route("/slice", "backend"), pod],
             options(),
         )
         .expect("translate unnamed endpoint port");
@@ -444,7 +462,12 @@ fn selector_based_cluster_ip_keeps_service_dns_and_port() {
     service.spec["selector"] = json!({"app": "backend"});
     let slice = ready_manual_slice("backend", "10.1.0.10");
     let translated = translate_k8s_objects(
-        &[service, slice, http_route("/slice", "backend")],
+        &[
+            service,
+            slice,
+            http_route("/slice", "backend"),
+            backend_pod(),
+        ],
         options(),
     )
     .expect("translate selector Service");
@@ -466,7 +489,12 @@ fn selector_based_headless_service_and_empty_slice_use_the_matching_slice_port()
             empty_manual_slice("backend")
         };
         let translated = translate_k8s_objects(
-            &[service, slice, http_route("/slice", "backend")],
+            &[
+                service,
+                slice,
+                http_route("/slice", "backend"),
+                backend_pod(),
+            ],
             options(),
         )
         .expect("translate headless selector Service");
@@ -490,8 +518,9 @@ fn unnamed_service_without_target_port_uses_the_unnamed_slice_port() {
     port.remove("targetPort");
     let mut slice = ready_manual_slice("backend", "10.1.0.10");
     slice.spec["ports"] = json!([{"port": 3000}]);
+    let pod = backend_pod();
     let translated = translate_k8s_objects(
-        &[service, slice, http_route("/slice", "backend")],
+        &[service, slice, http_route("/slice", "backend"), pod],
         options(),
     )
     .expect("translate unnamed default Service port");

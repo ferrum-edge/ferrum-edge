@@ -167,7 +167,7 @@ fn gateway_class() -> K8sObject {
 
 fn udp_service(name: &str, port: u16) -> K8sObject {
     let ports = json!([{"name": "udp", "protocol": "UDP", "port": port}]);
-    let spec = json!({"ports": ports});
+    let spec = json!({"selector": {"app": name}, "ports": ports});
     object("Service", "v1", ROUTE_NS, name, spec)
 }
 

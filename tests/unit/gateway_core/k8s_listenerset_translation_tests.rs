@@ -132,6 +132,7 @@ fn service(name: &str) -> K8sObject {
         "Service",
         name,
         json!({
+            "selector": { "app": name },
             "ports": [{ "port": 8080, "protocol": "TCP" }]
         }),
     );

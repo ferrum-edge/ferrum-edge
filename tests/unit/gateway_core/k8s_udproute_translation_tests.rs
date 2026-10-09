@@ -123,6 +123,7 @@ fn udp_lab(spec: Value) -> [K8sObject; 3] {
 
 fn service(namespace: &str, name: &str, port: u16) -> K8sObject {
     let spec = json!({
+        "selector": {"app": name},
         "ports": [{"name": "udp", "protocol": "UDP", "port": port, "targetPort": port}]
     });
     object_in("Service", "v1", namespace, name, spec)
