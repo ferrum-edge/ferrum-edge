@@ -1954,6 +1954,10 @@ pub(crate) fn gateway_api_status_conflict_context(
 /// nothing here can tell where they point. A selector-backed Service in that
 /// position stays admitted (Kubernetes manages its slices) and the Gateway API
 /// translator warns about it instead.
+///
+/// With pod discovery on, the MCS `ServiceImport` slices that HTTPRoute and
+/// GRPCRoute backends expand onto are verified here too (issue #6123); see
+/// [`core::verify_service_import_endpoint_slices`].
 fn build_endpoint_slice_guard(acc: &mut K8sAccumulator, objects: &[K8sObject]) {
     if !objects
         .iter()
@@ -1962,8 +1966,13 @@ fn build_endpoint_slice_guard(acc: &mut K8sAccumulator, objects: &[K8sObject]) {
         return;
     }
     let pod_discovery_enabled = acc.options.pod_discovery_enabled;
+    let cluster_ips = if pod_discovery_enabled {
+        core::observed_cluster_ips(acc)
+    } else {
+        HashSet::new()
+    };
     let mut guard = if pod_discovery_enabled {
-        core::endpoint_slice_guard(acc)
+        core::endpoint_slice_guard(acc, &cluster_ips)
     } else {
         backend_ref::EndpointSliceGuard::new(false)
     };
@@ -1973,6 +1982,9 @@ fn build_endpoint_slice_guard(acc: &mut K8sAccumulator, objects: &[K8sObject]) {
         }
     }
     acc.endpoint_slice_guard = guard;
+    if pod_discovery_enabled {
+        core::verify_service_import_endpoint_slices(acc, &cluster_ips);
+    }
     if pod_discovery_enabled
         && acc.options.allow_selectorless_external_endpoints
         && !core::external_endpoints_opt_in_active(acc)

@@ -27,11 +27,16 @@ pub(super) struct CoreState {
     secrets: HashMap<K8sServiceKey, CoreSecret>,
     configmaps: HashMap<K8sServiceKey, CoreConfigMap>,
     pods: HashMap<PodKey, CorePod>,
-    pod_by_ip: HashMap<String, PodKey>,
+    /// The one non-host-network, non-terminal Pod claiming each IP, or `None`
+    /// when several do. An EndpointSlice endpoint without a `targetRef`
+    /// resolves its Pod here: a host-network Pod reports its Node's IP, which
+    /// never identifies one Pod, and an IP two Pods report identifies neither
+    /// (issue #6123).
+    sole_pod_by_ip: HashMap<IpAddr, Option<PodKey>>,
     /// Namespaces of the non-host-network, non-terminal Pods claiming each IP.
     ///
-    /// Unlike [`Self::pod_by_ip`] (last writer wins), this keeps every claim,
-    /// so an IP two namespaces' Pods report is never attributed to either one.
+    /// This keeps every claim, so an IP two namespaces' Pods report is never
+    /// attributed to either one.
     pod_ip_namespaces: HashMap<IpAddr, BTreeSet<String>>,
     endpoint_slices: Vec<CoreEndpointSlice>,
     node_localities: HashMap<String, String>,
@@ -204,8 +209,36 @@ struct CoreEndpointSlice {
     /// CoreDNS map a slice to a Service by that label alone, so the
     /// EndpointSlice attribution guard must too (issue #6108).
     guarded_service_key: Option<K8sServiceKey>,
+    /// `metadata.name`, for translation warnings.
+    name: String,
+    /// `endpointslice.kubernetes.io/managed-by` names a controller other than
+    /// Kubernetes' own EndpointSlice controllers. KEP-1645 has the MCS
+    /// controller mark every imported slice it manages this way (issue #6123).
+    managed_by_mcs_controller: bool,
+    /// ServiceImport expansion may use this slice; set only by
+    /// [`verify_service_import_endpoint_slices`] (issue #6123).
+    import_admitted: bool,
+    /// Addresses of this slice ServiceImport expansion refuses; set by
+    /// [`verify_service_import_endpoint_slices`].
+    refused_import_addresses: HashSet<String>,
     ports: Vec<CoreEndpointSlicePort>,
     endpoints: Vec<CoreEndpoint>,
+}
+
+/// The `managed-by` label of an EndpointSlice.
+const ENDPOINT_SLICE_MANAGED_BY_LABEL: &str = "endpointslice.kubernetes.io/managed-by";
+
+/// The `managed-by` values of Kubernetes' own EndpointSlice and EndpointSlice
+/// mirroring controllers. Neither manages an MCS-imported slice.
+const KUBERNETES_ENDPOINT_SLICE_MANAGERS: [&str; 2] = [
+    "endpointslice-controller.k8s.io",
+    "endpointslicemirroring-controller.k8s.io",
+];
+
+/// Whether an EndpointSlice `managed-by` value names a controller other than
+/// Kubernetes' own EndpointSlice controllers.
+fn endpoint_slice_manager_is_mcs_controller(manager: &str) -> bool {
+    !manager.is_empty() && !KUBERNETES_ENDPOINT_SLICE_MANAGERS.contains(&manager)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -555,6 +588,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             continue;
         };
         let mut workload_ref_strings = workload_refs_by_service.remove(&key).unwrap_or_default();
+        let mut refused = RefusedWorkloadAddresses::default();
 
         if !acc.explicit_workload_services.contains(&key) {
             let auto_workloads = auto_workloads_for_service(
@@ -564,6 +598,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
                     .get(&key)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
+                &mut refused,
             )?;
             for auto in auto_workloads {
                 service_backed_pod_keys.insert(auto.pod_key);
@@ -588,6 +623,9 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             uid: (!service.uid.is_empty()).then(|| service.uid.clone()),
             allow_path_parameters: service.allow_path_parameters,
         });
+        if let Some(warning) = refused.warning(&key) {
+            acc.push_warning_once(warning);
+        }
     }
 
     add_identity_only_workloads(acc, &service_backed_pod_keys)?;
@@ -700,20 +738,6 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         return;
     };
     let addresses = pod_addresses(object);
-    for address in &addresses {
-        if let Some(previous) = acc.core.pod_by_ip.insert(address.clone(), key.clone())
-            && previous != key
-        {
-            tracing::debug!(
-                ip = %address,
-                previous_namespace = %previous.namespace,
-                previous_pod = %previous.name,
-                replacement_namespace = %key.namespace,
-                replacement_pod = %key.name,
-                "Kubernetes pod IP mapping overwritten by later pod"
-            );
-        }
-    }
     let mut pod = CorePod {
         namespace: object.metadata.namespace.clone(),
         name: object.metadata.name.clone(),
@@ -749,15 +773,24 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
                 .entry(ip)
                 .or_default()
                 .insert(pod.namespace.clone());
+            match acc.core.sole_pod_by_ip.get_mut(&ip) {
+                Some(claimant) => {
+                    if claimant.as_ref().is_some_and(|claimant| *claimant != key) {
+                        tracing::debug!(
+                            ip = %ip,
+                            "Kubernetes pod IP is reported by several pods; it identifies none"
+                        );
+                        *claimant = None;
+                    }
+                }
+                None => {
+                    acc.core.sole_pod_by_ip.insert(ip, Some(key.clone()));
+                }
+            }
         }
     }
     if let Some((node_name, address)) = node_waypoint_pod_candidate(acc, object, &pod) {
         pod.node_waypoint_proxy = true;
-        for address in &pod.addresses {
-            if acc.core.pod_by_ip.get(address) == Some(&key) {
-                acc.core.pod_by_ip.remove(address);
-            }
-        }
         if let Some(node_waypoint) = node_waypoint_pod_endpoint(object, &pod, address) {
             acc.options
                 .node_waypoint_inventory
@@ -799,6 +832,12 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
     };
     let guarded_service_key =
         service_label.and_then(|name| K8sServiceKey::new(object.metadata.namespace.clone(), name));
+    let managed_by_mcs_controller = object
+        .metadata
+        .labels
+        .get(ENDPOINT_SLICE_MANAGED_BY_LABEL)
+        .map(String::as_str)
+        .is_some_and(endpoint_slice_manager_is_mcs_controller);
 
     let ports = object
         .spec
@@ -854,6 +893,10 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
         service_key,
         backend_kind,
         guarded_service_key,
+        name: object.metadata.name.clone(),
+        managed_by_mcs_controller,
+        import_admitted: false,
+        refused_import_addresses: HashSet::new(),
         ports,
         endpoints,
     });
@@ -1136,15 +1179,12 @@ pub(super) fn endpoint_route_backends_for_service(
 /// claims.
 ///
 /// Services in a namespace outside the Pod watch scope are left to the caller,
-/// which records the selector-less ones as unverifiable.
-pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
-    let cluster_ips: HashSet<IpAddr> = acc
-        .core
-        .services
-        .values()
-        .flat_map(|service| service.cluster_ips.iter())
-        .filter_map(|ip| parse_endpoint_ip(ip.as_str()))
-        .collect();
+/// which records the selector-less ones as unverifiable. `cluster_ips` is
+/// [`observed_cluster_ips`].
+pub(super) fn endpoint_slice_guard(
+    acc: &K8sAccumulator,
+    cluster_ips: &HashSet<IpAddr>,
+) -> EndpointSliceGuard {
     // With a restricted Pod watch scope an IP reused by an unwatched Pod
     // would still look like the departed Pod's, so there the remembered
     // claims vouch only for terminating endpoints.
@@ -1170,7 +1210,8 @@ pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
             state: &acc.core,
             recent: &recent,
             remember_every_endpoint,
-            cluster_ips: &cluster_ips,
+            cluster_ips,
+            exempt_cluster_ips: &[],
             service_namespace: namespace,
             service_has_selector: service.has_selector,
         };
@@ -1198,6 +1239,192 @@ pub(super) fn endpoint_slice_guard(acc: &K8sAccumulator) -> EndpointSliceGuard {
         guard.record(&key.namespace, &key.name, findings);
     }
     guard
+}
+
+/// Every observed Service ClusterIP, in any namespace. Computed once per
+/// translation for [`endpoint_slice_guard`] and
+/// [`verify_service_import_endpoint_slices`].
+pub(super) fn observed_cluster_ips(acc: &K8sAccumulator) -> HashSet<IpAddr> {
+    acc.core
+        .services
+        .values()
+        .flat_map(|service| service.cluster_ips.iter())
+        .filter_map(|ip| parse_endpoint_ip(ip.as_str()))
+        .collect()
+}
+
+/// Decide which MCS `ServiceImport` EndpointSlices, and which of their
+/// addresses, Gateway API ServiceImport expansion may dial (issue #6123).
+///
+/// An imported endpoint usually lives in another cluster, so unlike a
+/// Service's it cannot be attributed to an observed Pod. An imported slice is
+/// trusted only as far as the MCS controller that writes it, and the
+/// EndpointSlice write RBAC that keeps everyone else from writing one, are.
+/// What this cluster can check, it does:
+///
+/// * the slice must carry `endpointslice.kubernetes.io/managed-by` naming a
+///   controller other than Kubernetes' own EndpointSlice controllers (KEP-1645
+///   has the MCS controller mark the slices it manages; the label is not
+///   authentication, it only excludes slices Kubernetes' controllers wrote
+///   from a Service's or an Endpoints object's labels), its
+///   `multicluster.kubernetes.io/service-name` label must name an observed
+///   ServiceImport of the slice's own namespace, and that namespace must be
+///   inside the Pod watch scope (otherwise the import's own Pods cannot be
+///   told from anything else, and the backend keeps its ClusterSet DNS name);
+/// * an address is refused when it can never be a backend (the deny list
+///   Service attribution applies), does not parse as an IP, belongs to an
+///   endpoint whose `targetRef` names another namespace, or is this cluster's
+///   own infrastructure without being a Pod of the import's namespace: an
+///   observed Pod of another namespace, a Service ClusterIP, a Node address,
+///   or an IP inside an observed Node's Pod CIDR. The ClusterIP of the
+///   exported Service itself (the same-named Service of the import's
+///   namespace) is this cluster's own endpoint of the ClusterSet Service, as
+///   Submariner Lighthouse writes it, and stays admitted while
+///   [`endpoint_slice_guard`] recorded no finding for that Service: kube-proxy
+///   also sends that ClusterIP to any extra slice labelled with its name.
+///
+/// Any other address is admitted as a remote endpoint. Node addresses and
+/// Pod CIDRs are known only with the Node watch, and other namespaces' Pods
+/// only within the Pod watch scope, so when either is missing one translation
+/// warning says what went unchecked. Expansion skips every slice this has not
+/// admitted, so a translation that never runs it falls back to ClusterSet
+/// DNS. `cluster_ips` is [`observed_cluster_ips`]; the caller has already
+/// refreshed the Pod claim inventory through [`endpoint_slice_guard`].
+pub(super) fn verify_service_import_endpoint_slices(
+    acc: &mut K8sAccumulator,
+    cluster_ips: &HashSet<IpAddr>,
+) {
+    if !acc
+        .core
+        .endpoint_slices
+        .iter()
+        .any(|slice| slice.backend_kind == EndpointSliceBackendKind::ServiceImport)
+    {
+        return;
+    }
+    let remember_every_endpoint = acc.options.watches_every_pod_namespace();
+    let inventory = acc.options.pod_claim_inventory.clone();
+    let recent = inventory.lock();
+    let mut verdicts = Vec::new();
+    let mut warnings = Vec::new();
+    for (index, slice) in acc.core.endpoint_slices.iter().enumerate() {
+        if slice.backend_kind != EndpointSliceBackendKind::ServiceImport {
+            continue;
+        }
+        let namespace = slice.service_key.namespace.as_str();
+        let import = slice.service_key.name.as_str();
+        // A slice naming no observed ServiceImport backs no backendRef.
+        if acc.service_import_port_index(namespace, import).is_none() {
+            continue;
+        }
+        if !slice.managed_by_mcs_controller {
+            warnings.push(format!(
+                "MCS EndpointSlice {namespace:?}/{:?} of ServiceImport {namespace:?}/{import:?} \
+                 is ignored: its `{ENDPOINT_SLICE_MANAGED_BY_LABEL}` label is missing or names \
+                 a Kubernetes EndpointSlice controller rather than the MCS controller",
+                slice.name
+            ));
+            continue;
+        }
+        if !acc.options.includes_pod_namespace(namespace) {
+            warnings.push(format!(
+                "MCS EndpointSlice {namespace:?}/{:?} of ServiceImport {namespace:?}/{import:?} \
+                 is ignored: its namespace is outside the controller's Pod watch scope, so its \
+                 addresses cannot be told from that namespace's own Pods; the backend uses its \
+                 ClusterSet DNS name",
+                slice.name
+            ));
+            continue;
+        }
+        // kube-proxy sends the exported Service's ClusterIP to every slice
+        // labelled with its name, so it is exempt only while the guard found
+        // nothing wrong with that Service's own slices (issue #6121).
+        let exported_clean = acc
+            .endpoint_slice_guard()
+            .admits_every_route(namespace, import);
+        let exported_cluster_ips: Vec<IpAddr> = acc
+            .core
+            .services
+            .get(&slice.service_key)
+            .filter(|_| exported_clean)
+            .map(|service| {
+                service
+                    .cluster_ips
+                    .iter()
+                    .filter_map(|ip| parse_endpoint_ip(ip.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let attribution = EndpointAttribution {
+            state: &acc.core,
+            recent: &recent,
+            remember_every_endpoint,
+            cluster_ips,
+            exempt_cluster_ips: &exported_cluster_ips,
+            service_namespace: namespace,
+            service_has_selector: false,
+        };
+        let mut refused = HashSet::new();
+        for endpoint in &slice.endpoints {
+            for address in &endpoint.addresses {
+                if !address.is_empty()
+                    && attribution.classify(endpoint, address) == EndpointAddress::Foreign
+                {
+                    refused.insert(address.clone());
+                }
+            }
+        }
+        if !refused.is_empty() {
+            warnings.push(format!(
+                "MCS EndpointSlice {namespace:?}/{:?} of ServiceImport {namespace:?}/{import:?}: \
+                 {} endpoint address(es) refused because they can never be a backend, name \
+                 another namespace, or are this cluster's infrastructure rather than a Pod of \
+                 the import's namespace",
+                slice.name,
+                refused.len()
+            ));
+        }
+        verdicts.push((index, refused));
+    }
+    drop(recent);
+    if !verdicts.is_empty() {
+        warnings.extend(service_import_unchecked_warning(acc));
+    }
+    for (index, refused) in verdicts {
+        if let Some(slice) = acc.core.endpoint_slices.get_mut(index) {
+            slice.import_admitted = true;
+            slice.refused_import_addresses = refused;
+        }
+    }
+    for warning in warnings {
+        acc.push_warning_once(warning);
+    }
+}
+
+/// Translation warning for a reconcile that admits MCS ServiceImport
+/// EndpointSlices without the inventory to refuse every local address in
+/// them (issue #6123), or `None` when the controller observes Nodes and
+/// watches Pods in every namespace.
+fn service_import_unchecked_warning(acc: &K8sAccumulator) -> Option<String> {
+    let nodes = (!acc.core.nodes_observed).then_some(
+        "Node addresses or Node Pod CIDRs, because the controller observes no Kubernetes Node \
+         (set FERRUM_K8S_NODE_LOCALITY_ENABLED=true and grant the controller `nodes` list/watch \
+         RBAC, ferrum-mesh chart `controlPlane.rbac.nodeLocality`)",
+    );
+    let pods = (!acc.options.watches_every_pod_namespace()).then_some(
+        "Pods of namespaces outside the Pod watch scope, unless an observed Node's Pod CIDR \
+         covers them (watch every namespace: FERRUM_CP_NAMESPACES=\"*\" with \
+         FERRUM_K8S_WATCH_NAMESPACES unset)",
+    );
+    let unchecked = match (nodes, pods) {
+        (None, None) => return None,
+        (Some(nodes), Some(pods)) => format!("{nodes}, nor against {pods}"),
+        (Some(only), None) | (None, Some(only)) => only.to_string(),
+    };
+    Some(format!(
+        "MCS ServiceImport EndpointSlice addresses are admitted as remote endpoints without \
+         being checked against {unchecked}"
+    ))
 }
 
 /// Whether `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS` is in effect for
@@ -1264,6 +1491,9 @@ struct EndpointAttribution<'a> {
     remember_every_endpoint: bool,
     /// Every observed Service ClusterIP, in any namespace.
     cluster_ips: &'a HashSet<IpAddr>,
+    /// ClusterIPs among `cluster_ips` that are not refused as cluster
+    /// infrastructure: for an MCS ServiceImport, its exported Service's own.
+    exempt_cluster_ips: &'a [IpAddr],
     service_namespace: &'a str,
     service_has_selector: bool,
 }
@@ -1361,12 +1591,12 @@ impl EndpointAttribution<'_> {
     }
 
     /// A Service ClusterIP (kube-proxy forwards it to that Service's
-    /// endpoints), a Node address (the kubelet, every NodePort, and
-    /// host-network Pods), or an IP inside a Node's Pod CIDR (a Pod the
-    /// controller does not watch).
+    /// endpoints) other than an exempt one, a Node address (the kubelet,
+    /// every NodePort, and host-network Pods), or an IP inside a Node's Pod
+    /// CIDR (a Pod the controller does not watch).
     fn is_cluster_infrastructure(&self, ip: IpAddr) -> bool {
         let state = self.state;
-        self.cluster_ips.contains(&ip)
+        (self.cluster_ips.contains(&ip) && !self.exempt_cluster_ips.contains(&ip))
             || state.node_addresses.contains(&ip)
             || state.node_pod_cidrs.contains(ip)
     }
@@ -1568,7 +1798,9 @@ pub(super) fn service_dns_fallback_dial_port(
 ///
 /// Slices are selected by `multicluster.kubernetes.io/service-name`. Unlike
 /// Service expansion, there is no selector/ClusterIP short-circuit — Imports
-/// are ClusterSet-scoped and always endpoint-oriented when slices exist.
+/// are ClusterSet-scoped and always endpoint-oriented when slices exist. Only
+/// slices and addresses [`verify_service_import_endpoint_slices`] admitted are
+/// used (issue #6123).
 pub(super) fn endpoint_route_backends_for_service_import(
     acc: &K8sAccumulator,
     namespace: &str,
@@ -1597,13 +1829,14 @@ pub(super) fn endpoint_route_backends_for_service_import(
     for slice in acc.core.endpoint_slices.iter().filter(|slice| {
         slice.service_key == service_key
             && slice.backend_kind == EndpointSliceBackendKind::ServiceImport
+            && slice.import_admitted
     }) {
         let Some(target_port) = service_import_endpoint_port(import_port_name, slice) else {
             continue;
         };
         for endpoint in slice.endpoints.iter().filter(|endpoint| endpoint.ready) {
             for address in &endpoint.addresses {
-                if address.is_empty() {
+                if address.is_empty() || slice.refused_import_addresses.contains(address) {
                     continue;
                 }
                 if seen.insert((address.clone(), target_port)) {
@@ -1720,13 +1953,25 @@ fn collect_node(acc: &mut K8sAccumulator, object: &K8sObject) {
         .insert(object.metadata.name.clone(), locality);
 }
 
+/// Derive one Service's Pod workloads from its EndpointSlices.
+///
+/// A slice's endpoints are authored with the slice: anyone who can write
+/// EndpointSlices in the Service's namespace can name any Pod in a
+/// `targetRef` and any address beside it. So an address is attached to a
+/// Pod's workload identity only when the Pod is in the Service's own
+/// namespace (the EndpointSlice controller never names another) and its own
+/// status reports that address, which no observed Pod of another namespace
+/// also reports (issue #6123). The workload carries the Pod's own spelling of
+/// each address, de-duplicated by IP. Every other address is dropped and
+/// counted in `refused`; an endpoint left with no address attaches nothing.
 fn auto_workloads_for_service(
     acc: &K8sAccumulator,
     service_key: &K8sServiceKey,
     endpoint_slice_indices: &[usize],
+    refused: &mut RefusedWorkloadAddresses,
 ) -> Result<Vec<CoreAutoWorkload>, K8sTranslateError> {
     let mut endpoints_by_pod = BTreeMap::new();
-    let mut seen_endpoint_addresses: BTreeMap<PodKey, HashSet<String>> = BTreeMap::new();
+    let mut seen_endpoint_addresses: BTreeMap<PodKey, HashSet<IpAddr>> = BTreeMap::new();
     for &slice_index in endpoint_slice_indices {
         let Some(slice) = acc.core.endpoint_slices.get(slice_index) else {
             continue;
@@ -1742,6 +1987,30 @@ fn auto_workloads_for_service(
             let Some(pod_key) = pod_key else {
                 continue;
             };
+            if pod_key.namespace != service_key.namespace {
+                refused.other_namespace += endpoint.addresses.len().max(1);
+                continue;
+            }
+            let Some(pod) = acc.core.pods.get(&pod_key) else {
+                continue;
+            };
+            // An endpoint without addresses (the API requires one) falls back
+            // to the Pod's own, which pass the same checks.
+            let candidates = if endpoint.addresses.is_empty() {
+                &pod.addresses
+            } else {
+                &endpoint.addresses
+            };
+            let mut attached = Vec::with_capacity(candidates.len());
+            for address in candidates {
+                match attachable_workload_address(&acc.core, pod, address) {
+                    Ok(attachable) => attached.push(attachable),
+                    Err(refusal) => refused.record(refusal),
+                }
+            }
+            if attached.is_empty() {
+                continue;
+            }
             let merged = endpoints_by_pod
                 .entry(pod_key.clone())
                 .or_insert_with(|| CoreEndpoint {
@@ -1753,9 +2022,9 @@ fn auto_workloads_for_service(
                     node_name: endpoint.node_name.clone(),
                 });
             let seen_addresses = seen_endpoint_addresses.entry(pod_key).or_default();
-            for address in &endpoint.addresses {
-                if seen_addresses.insert(address.clone()) {
-                    merged.addresses.push(address.clone());
+            for (ip, address) in attached {
+                if seen_addresses.insert(ip) {
+                    merged.addresses.push(address.to_string());
                 }
             }
             if nonempty_node_name(merged.node_name.as_deref()).is_none()
@@ -1782,6 +2051,107 @@ fn auto_workloads_for_service(
         });
     }
     Ok(workloads)
+}
+
+/// Why mesh workload derivation refused to attach an EndpointSlice address to
+/// a Pod's workload identity (issue #6123).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkloadAddressRefusal {
+    /// The Pod's own `status.podIP` / `status.podIPs` does not report it, or
+    /// it is not an IP at all.
+    NotReportedByPod,
+    /// An observed, non-host-network Pod of another namespace reports it too.
+    ClaimedByAnotherNamespace,
+    /// Loopback, link-local, cloud metadata, or another address that is never
+    /// a backend, whatever a Pod status reports.
+    NeverABackend,
+}
+
+/// EndpointSlice addresses one Service's workload derivation refused, by
+/// reason, for its translation warning.
+#[derive(Debug, Default)]
+struct RefusedWorkloadAddresses {
+    /// Named a Pod outside the Service's namespace, by `targetRef` or by an
+    /// IP lookup.
+    other_namespace: usize,
+    not_reported_by_pod: usize,
+    claimed_by_another_namespace: usize,
+    never_a_backend: usize,
+}
+
+impl RefusedWorkloadAddresses {
+    fn record(&mut self, refusal: WorkloadAddressRefusal) {
+        match refusal {
+            WorkloadAddressRefusal::NotReportedByPod => self.not_reported_by_pod += 1,
+            WorkloadAddressRefusal::ClaimedByAnotherNamespace => {
+                self.claimed_by_another_namespace += 1;
+            }
+            WorkloadAddressRefusal::NeverABackend => self.never_a_backend += 1,
+        }
+    }
+
+    /// The translation warning for `service`, or `None` when nothing was
+    /// refused.
+    fn warning(&self, service: &K8sServiceKey) -> Option<String> {
+        let total = self.other_namespace
+            + self.not_reported_by_pod
+            + self.claimed_by_another_namespace
+            + self.never_a_backend;
+        if total == 0 {
+            return None;
+        }
+        Some(format!(
+            "mesh workload derivation attached no workload identity to {total} EndpointSlice \
+             endpoint address(es) of Service {:?}/{:?}: {} name a Pod outside the Service's \
+             namespace, {} are not reported by the named Pod's own status, {} are also reported \
+             by another namespace's Pod, {} can never be a backend",
+            service.namespace,
+            service.name,
+            self.other_namespace,
+            self.not_reported_by_pod,
+            self.claimed_by_another_namespace,
+            self.never_a_backend
+        ))
+    }
+}
+
+/// The IP of `address`, with the Pod's own spelling of it, when `address` may
+/// join `pod`'s workload identity: the Pod's own status reports it, no
+/// observed non-host-network Pod of another namespace does, and it is not an
+/// address that is never a backend. Otherwise why not.
+///
+/// A host-network Pod of another namespace reporting the same Node IP does
+/// not refuse it: every host-network Pod on a Node reports that IP, and the
+/// data plane tells them apart by Pod UID.
+fn attachable_workload_address<'pod>(
+    state: &CoreState,
+    pod: &'pod CorePod,
+    address: &str,
+) -> Result<(IpAddr, &'pod str), WorkloadAddressRefusal> {
+    let Some(ip) = parse_endpoint_ip(address) else {
+        return Err(WorkloadAddressRefusal::NotReportedByPod);
+    };
+    let embedded = embedded_ipv4(ip).map(IpAddr::V4);
+    if ip_is_never_a_backend(ip) || embedded.is_some_and(ip_is_never_a_backend) {
+        return Err(WorkloadAddressRefusal::NeverABackend);
+    }
+    // Publish the Pod's spelling: a slice may write `::ffff:10.1.0.10` for a
+    // Pod reporting `10.1.0.10`.
+    let Some(own) = pod
+        .addresses
+        .iter()
+        .find(|own| parse_endpoint_ip(own) == Some(ip))
+    else {
+        return Err(WorkloadAddressRefusal::NotReportedByPod);
+    };
+    let claimed_elsewhere = state
+        .pod_ip_namespaces
+        .get(&ip)
+        .is_some_and(|claimants| claimants.iter().any(|other| *other != pod.namespace));
+    if claimed_elsewhere {
+        return Err(WorkloadAddressRefusal::ClaimedByAnotherNamespace);
+    }
+    Ok((ip, own.as_str()))
 }
 
 fn add_identity_only_workloads(
@@ -2176,9 +2546,15 @@ fn invalid_resource_for_core_pod(pod: &CorePod, message: impl Into<String>) -> K
     }
 }
 
+/// The Pod an EndpointSlice endpoint without a `targetRef` belongs to: the one
+/// non-host-network, non-terminal Pod reporting one of its addresses. A Node
+/// IP (host-network Pods) or an IP several Pods report identifies no Pod;
+/// attaching a host-network Pod takes an explicit same-namespace `targetRef`,
+/// which the EndpointSlice controller always writes (issue #6123).
 fn pod_key_for_endpoint_addresses(state: &CoreState, addresses: &[String]) -> Option<PodKey> {
     addresses.iter().find_map(|address| {
-        let pod_key = state.pod_by_ip.get(address)?;
+        let ip = parse_endpoint_ip(address)?;
+        let pod_key = state.sole_pod_by_ip.get(&ip)?.as_ref()?;
         state
             .pods
             .get(pod_key)
@@ -2725,7 +3101,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_workload_identity_uses_referenced_pod_namespace() {
+    fn auto_workload_refuses_target_ref_into_another_namespace() {
+        // The EndpointSlice controller never names another namespace's Pod, so
+        // a slice that does cannot lend that Pod's identity to the Service
+        // (issue #6123).
         let mut pod = ready_pod("reviews-v1", "10.1.0.10");
         pod.metadata.namespace = "workloads".to_string();
         let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
@@ -2737,16 +3116,13 @@ mod tests {
         let mesh = translation.config.mesh.expect("mesh config");
         assert_eq!(mesh.services.len(), 1);
         assert_eq!(mesh.services[0].namespace, "default");
-        assert_eq!(mesh.workloads.len(), 1);
-        assert_eq!(mesh.workloads[0].namespace, "workloads");
-        assert_eq!(
-            mesh.workloads[0].selector.namespace.as_deref(),
-            Some("workloads")
-        );
-        assert_eq!(
-            mesh.workloads[0].spiffe_id.as_str(),
-            "spiffe://cluster.local/ns/workloads/sa/reviews"
-        );
+        assert!(mesh.services[0].workloads.is_empty());
+        assert!(mesh.workloads.is_empty());
+        let warned = translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("1 name a Pod outside the Service's namespace"));
+        assert!(warned, "{:?}", translation.warnings);
     }
 
     #[test]
@@ -2756,17 +3132,14 @@ mod tests {
         let mut ipv6_slice = endpoint_slice(vec![("reviews-v1", "fd00::10")]);
         ipv6_slice.metadata.name = "reviews-ipv6".to_string();
         ipv6_slice.spec["addressType"] = json!("IPv6");
+        // A dual-stack Pod reports both families in `status.podIPs`; each
+        // slice address must be one of them (issue #6123).
+        let mut pod = ready_pod("reviews-v1", "10.1.0.10");
+        pod.status["podIPs"] = json!([{"ip": "10.1.0.10"}, {"ip": "fd00::10"}]);
 
-        let translation = translate_k8s_objects(
-            &[
-                service(),
-                ready_pod("reviews-v1", "10.1.0.10"),
-                ipv4_slice,
-                ipv6_slice,
-            ],
-            options(),
-        )
-        .expect("core translation succeeds");
+        let translation =
+            translate_k8s_objects(&[service(), pod, ipv4_slice, ipv6_slice], options())
+                .expect("core translation succeeds");
 
         let mesh = translation.config.mesh.expect("mesh config");
         assert_eq!(mesh.workloads.len(), 1);
