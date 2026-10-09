@@ -1234,6 +1234,94 @@ async fn a_withdrawn_relay_destination_revokes_a_live_inbound_relay_tunnel() {
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
 }
 
+/// [`relay_destination_config`] carrying the markers a materialized Sidecar
+/// publishes for its inbound HTTP routes (issue #6110).
+fn sidecar_http_route_config(
+    destinations: Vec<MeshInboundRelayDestination>,
+    http_app_ports: Vec<u16>,
+    refuses_matched_http_connect: bool,
+    generation_tag: u16,
+) -> GatewayConfig {
+    let mut config = relay_destination_config(destinations, false, generation_tag);
+    let mesh = config.mesh.as_deref_mut().expect("mesh block");
+    mesh.sidecar_inbound_http_app_ports = http_app_ports;
+    mesh.sidecar_inbound_refuses_matched_http_connect = refuses_matched_http_connect;
+    config
+}
+
+/// A live relay to a port that a reload turns into a Sidecar HTTP application
+/// port is revoked: the peer's next CONNECT to it would be refused
+/// `http_application_port`, so the tunnel must not keep relaying bytes past
+/// the HTTP route's plugin chain (issue #6110).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_makes_the_relayed_port_an_http_application_port_revokes_the_tunnel() {
+    let destination = relay_destination(RELAY_APP_HOST, RELAY_APP_PORT);
+    let initial = sidecar_http_route_config(vec![destination.clone()], Vec::new(), true, 9501);
+    let state = build_state(initial);
+    let fence = &state.hbone_admission_fence;
+
+    let tunnel = fence.admit(synthetic_snapshot(
+        inbound_relay_proxy(RELAY_APP_HOST, RELAY_APP_PORT),
+        HboneRelayDestinationGate::InboundRelay,
+        None,
+        fence.sweep_epoch(),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // The destination stays owned; only its port now serves an HTTP route.
+    let reloaded = sidecar_http_route_config(vec![destination], vec![RELAY_APP_PORT], true, 9502);
+    let outcome = state.update_config(reloaded);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::RelayDestination),
+        "the stream relay guard must re-apply the HTTP application port refusal"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
+}
+
+/// A live tunnel admitted through a configured HTTP route on the inbound
+/// listener is revoked once a reload makes that listener a materializing
+/// Sidecar's, where the peer's next bare CONNECT matching the route would be
+/// refused (issue #6110). A tunnel through the same route on a listener of
+/// another direction is not judged by that rule and survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_refuses_matched_http_connects_revokes_a_configured_route_tunnel() {
+    let initial = sidecar_http_route_config(Vec::new(), Vec::new(), false, 9601);
+    let state = build_state(initial);
+    let fence = &state.hbone_admission_fence;
+    let configured = |direction: MeshTrafficDirection| {
+        let mut snapshot = synthetic_snapshot(
+            create_mesh_proxy(RELAY_APP_PORT),
+            HboneRelayDestinationGate::Configured,
+            None,
+            fence.sweep_epoch(),
+        );
+        snapshot.ctx.mesh_direction = Some(direction);
+        fence.admit(snapshot)
+    };
+    let inbound = configured(MeshTrafficDirection::Inbound);
+    let outbound = configured(MeshTrafficDirection::Outbound);
+    assert_eq!(inbound.revoked_reason(), None);
+    assert_eq!(outbound.revoked_reason(), None);
+
+    let reloaded = sidecar_http_route_config(Vec::new(), Vec::new(), true, 9602);
+    let outcome = state.update_config(reloaded);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&inbound).await;
+    assert_eq!(
+        inbound.revoked_reason(),
+        Some(HboneRevocationReason::RelayDestination),
+        "a bare CONNECT matching a Sidecar inbound HTTP route is no longer admitted"
+    );
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(outbound.revoked_reason(), None);
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_loopback_pinned_inbound_relay_is_revoked_when_the_namespace_privilege_is_withdrawn() {
     let destination = relay_destination(RELAY_APP_HOST, RELAY_APP_PORT);

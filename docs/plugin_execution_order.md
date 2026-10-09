@@ -2029,7 +2029,8 @@ use authentication that supports the flavor. The decision is a precomputed
 capability bit (`OMITS_ROUTE_ADMISSION_POLICY`), so the request path does no
 plugin scan, and the HBONE admission fence re-checks it on every reload, so a
 live tunnel admitted on a now-refused view is revoked. The composed gRPC-Web
-view below keeps every HTTP plugin and is never refused.
+view below keeps every HTTP plugin, so it is refused only when it cannot run a
+gRPC-only admission instance (see below).
 
 The same refusal protects a gRPC-intended route in the other direction. Plain
 HTTP is also chosen by the client, by leaving out the gRPC `Content-Type`, so a
@@ -2038,11 +2039,28 @@ route whose OWN chain (proxy or proxy-group scope) carries a
 HTTP — `grpc_method_router` in every configuration, or a custom gRPC-only
 authentication plugin — refuses plain HTTP and WebSocket requests with the same
 `403` and `route_protocol_admission` phase instead of serving them without that
-policy. Native gRPC and gRPC-Web requests on the route are unaffected. A GLOBAL
-gRPC-only instance does not mark any route: it applies to every route, gRPC or
-not, so it says nothing about one route's intent, and plain HTTP stays served.
-`grpc_deadline` is not admission policy and never marks a route. Serve plain
-HTTP endpoints (health checks, REST) from a separate route.
+policy. One request is exempt: a CORS preflight (`OPTIONS` with `Origin` and
+`Access-Control-Request-Method`, and no body). A browser preflights every
+cross-origin gRPC-Web call, the preflight carries no gRPC `Content-Type`, and it
+invokes no gRPC method, so it runs the route's HTTP plugins (`cors` among
+them) as before. The exemption applies to this refusal only. Native gRPC
+requests on the route are unaffected. A GLOBAL gRPC-only instance does not mark
+any route: it applies to every route, gRPC or not, so it says nothing about one
+route's intent, and plain HTTP stays served. The gateway logs a warning at load
+and reload when a global gRPC-only admission plugin exists, because a backend
+that also serves its methods over plain HTTP (Connect, grpc-gateway
+transcoding) is then reachable without it; attach the plugin to the route to
+make that route gRPC-only. `grpc_deadline` is not admission policy and never
+marks a route. Serve plain HTTP endpoints (health checks, REST) from a separate
+route.
+
+A gRPC-Web request declares gRPC intent through its `Content-Type`. Its
+composed view (below) runs every HTTP plugin plus `grpc_method_router` and
+`grpc_deadline`, so it is refused with the same `403` /
+`route_protocol_admission` only when the chain carries another
+`gates_request_admission()` instance that runs on native gRPC but not on HTTP,
+such as a custom gRPC-only authentication plugin. Global instances count here,
+the same way a global HTTP-only instance marks every route's native-gRPC view.
 
 Recognized H3 gRPC-Web requests retain the ordinary `Http` protocol view so HTTP-only validators, deduplication, and other guardrails keep running. At cache rebuild time the gateway composes `grpc_method_router` and `grpc_deadline` into that same priority-ordered view when those native-gRPC policies are configured. No other gRPC-only plugin is added, and each plugin instance appears at most once.
 

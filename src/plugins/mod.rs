@@ -12157,11 +12157,25 @@ pub trait Plugin: Any + Send + Sync {
     /// guardrails).
     ///
     /// The client chooses the request flavor (native gRPC by `Content-Type`,
-    /// WebSocket by upgrade headers), and each flavor runs only the plugins
-    /// whose [`Self::supported_protocols`] include it. When a flavor's view
-    /// omits an instance like this that the route's HTTP view runs, the plugin
-    /// cache marks that view and the proxy refuses the request rather than
-    /// dispatching it without the policy.
+    /// gRPC-Web by its `Content-Type`, WebSocket by upgrade headers, plain HTTP
+    /// by sending none of those), and each flavor runs only the plugins whose
+    /// [`Self::supported_protocols`] include it. The plugin cache marks a view
+    /// that drops an instance like this, and the proxy refuses the request
+    /// rather than dispatching it without the policy. Three directions apply:
+    ///
+    /// - The native-gRPC and WebSocket views are marked when they omit an
+    ///   instance the route's HTTP view runs. Route-scoped and global
+    ///   instances both count.
+    /// - The plain HTTP and WebSocket views of a gRPC-intended route are
+    ///   marked when they omit an instance that runs on native gRPC (issue
+    ///   #6110). Only an instance the route itself is configured with (proxy
+    ///   or proxy-group scope) counts: a global gRPC-only instance says nothing
+    ///   about one route's intent. A CORS preflight is exempt from this one
+    ///   refusal, because it invokes no gRPC method.
+    /// - The composed gRPC-Web view, which keeps every HTTP plugin plus
+    ///   `grpc_method_router` and `grpc_deadline`, is marked when it omits any
+    ///   other instance that runs on native gRPC but not on HTTP. Global
+    ///   instances count, because a gRPC-Web request declares gRPC intent.
     ///
     /// Defaults to [`Self::is_auth_plugin`], so every authentication plugin —
     /// including a custom one that keeps the HTTP-only protocol default —

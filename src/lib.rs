@@ -1568,6 +1568,13 @@ pub mod _test_support {
         )
     }
 
+    /// Whether the composed gRPC-Web view built from `plugins` refuses the
+    /// request because it drops a gRPC-only admission instance (issue #6110).
+    /// The global gRPC-Web view is built from the global chain this way.
+    pub fn grpc_web_view_omits_admission_policy_for_test(plugins: &[Arc<dyn Plugin>]) -> bool {
+        crate::plugin_cache::grpc_web_view_omits_admission_policy_for_test(plugins)
+    }
+
     /// Prepend a plugin onto one proxy's resolved list for external tests.
     ///
     /// Used to inject a gated `on_stream_connect` admission seam into a live

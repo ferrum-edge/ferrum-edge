@@ -3008,6 +3008,54 @@ mod tests {
         );
     }
 
+    /// Issue #6110: a relay synthesized for a stream-family port cannot be moved
+    /// onto a Sidecar HTTP application port by a route override; the
+    /// post-plugin re-check refuses the effective destination.
+    #[test]
+    fn inbound_relay_effective_destination_guard_refuses_an_override_onto_an_http_app_port() {
+        let mut mesh = mesh_with_workload_port(8080);
+        mesh.workloads[0].ports.push(WorkloadPort {
+            port: 6379,
+            protocol: AppProtocol::Tcp,
+            name: None,
+        });
+        mesh.inbound_relay_own_address_ports =
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(&mesh.workloads);
+        mesh.sidecar_inbound_http_app_ports = vec![8080];
+        let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
+        let mut proxy = minimal_proxy();
+        proxy.id = MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string();
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 6379;
+        let decide = |override_target: Option<&UpstreamTarget>| {
+            inbound_hbone_relay_effective_destination_decision(
+                &proxy,
+                override_target,
+                Some(&mesh),
+                Some(own_ip),
+            )
+        };
+
+        // The synthesized stream-family destination relays.
+        assert_eq!(decide(None), Ok(()));
+        assert_eq!(decide(Some(&target("10.1.2.3", 6379))), Ok(()));
+        // An override onto the HTTP application port, by loopback or by the
+        // own pod address, is refused after ownership is proven.
+        assert_eq!(
+            decide(Some(&target("127.0.0.1", 8080))),
+            Err(InboundRelayDenial::HttpApplicationPort)
+        );
+        assert_eq!(
+            decide(Some(&target("10.1.2.3", 8080))),
+            Err(InboundRelayDenial::HttpApplicationPort)
+        );
+        // Ownership still decides first.
+        assert_eq!(
+            decide(Some(&target("203.0.113.10", 8080))),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+    }
+
     /// Issue #3260: the Sidecar ingress CONNECT remap dials a `defaultEndpoint`
     /// that need not be a declared workload port, so it has its OWN post-plugin
     /// guard — strictly the exact declared mapping, and fail-closed without the

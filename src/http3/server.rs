@@ -3955,10 +3955,16 @@ async fn handle_h3_request(
 
     // Same refusal as the H1/H2 dispatcher: a client-selected flavor whose
     // view omits the route's authentication or admission policy is refused
-    // before any plugin runs.
+    // before any plugin runs, except a CORS preflight on the plain HTTP view
+    // of a gRPC-intended route (issue #6110).
     if plugin_cache_view
         .capabilities()
         .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+        && !h3_grpc_intended_refusal_exempts(
+            &req,
+            request_protocol,
+            grpc_web_response_content_type.is_some(),
+        )
     {
         debug!(
             proxy_id = %proxy.id,
@@ -11082,6 +11088,26 @@ async fn handle_h3_request(
     }
 
     Ok(())
+}
+
+/// The H3 counterpart of the H1/H2 dispatcher's one exemption from the
+/// route-admission refusal: a CORS preflight on the plain HTTP view (not
+/// gRPC-Web) of a gRPC-intended route (issue #6110). The request DATA frames
+/// have not been read yet, so the body is judged empty from the declared
+/// framing: no `Content-Length`, or `Content-Length: 0`. Evaluated only once a
+/// view is marked.
+fn h3_grpc_intended_refusal_exempts(
+    req: &http::Request<()>,
+    request_protocol: ProxyProtocol,
+    grpc_web_request: bool,
+) -> bool {
+    let declares_no_body = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .is_none_or(|value| value.as_bytes() == b"0");
+    request_protocol == ProxyProtocol::Http
+        && !grpc_web_request
+        && crate::proxy::is_cors_preflight_request(req.method(), req.headers(), declares_no_body)
 }
 
 pub(crate) fn h3_plugin_protocol_for_request(

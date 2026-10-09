@@ -1256,14 +1256,88 @@ async fn test_grpc_deadline_clamped_to_max() {
     println!("test_grpc_deadline_clamped_to_max PASSED");
 }
 
-/// A route configured with `grpc_method_router` is gRPC-intended, so a plain
-/// HTTP request — which would skip that gRPC-only admission policy — is
-/// refused before any plugin runs (issue #6110). A gRPC-only plugin that is not
-/// admission policy (`grpc_deadline`) still lets plain HTTP through.
+/// Start a plain HTTP/1.1 backend that answers every request `200` with the
+/// body `plain-ok`, so a route's plain HTTP outcome is an exact status.
+async fn start_plain_http_backend() -> (u16, tokio::task::JoinHandle<()>) {
+    let reservation = reserve_port()
+        .await
+        .expect("Failed to reserve plain HTTP backend port");
+    let port = reservation.port;
+    let listener = reservation.into_listener();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async {
+                    let body = Full::new(Bytes::from_static(b"plain-ok"));
+                    Ok::<_, hyper::Error>(Response::new(body))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (port, handle)
+}
+
+/// Send an HTTP/1.1 WebSocket upgrade request and return the response status.
+async fn websocket_upgrade_status(gateway_port: u16, path: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
+        .await
+        .expect("connect to gateway");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{gateway_port}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write upgrade request");
+    let mut head = Vec::new();
+    let mut buf = [0_u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .expect("upgrade response within deadline")
+            .expect("read upgrade response");
+        assert!(read > 0, "gateway closed before answering the upgrade");
+        head.extend_from_slice(&buf[..read]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    head.split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap_or_else(|| panic!("malformed upgrade response: {head}"))
+}
+
+/// A gRPC-Web message frame carrying `payload`.
+fn grpc_web_frame(payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(payload.len() + 5);
+    framed.push(0x00);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// A route configured with `grpc_method_router` is gRPC-intended (issue
+/// #6110). Plain HTTP and WebSocket requests, which would skip that gRPC-only
+/// admission policy, are refused before any plugin runs. Browser gRPC-Web is
+/// unaffected: its CORS preflight reaches the `cors` plugin, and the gRPC-Web
+/// call runs the method policy. A gRPC-only plugin that is not admission
+/// policy (`grpc_deadline`) lets plain HTTP through.
 #[ignore]
 #[tokio::test]
 async fn test_grpc_plugins_on_plain_http_requests() {
-    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
+    const ORIGIN: &str = "https://app.example.com";
+    let (backend_port, hits, echo_handle) = start_grpc_echo_backend_with_hits().await;
+    let (plain_port, plain_handle) = start_plain_http_backend().await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -1280,12 +1354,14 @@ proxies:
     strip_listen_path: true
     auth_mode: single
     plugins:
+      - plugin_config_id: "grpc-web"
+      - plugin_config_id: "cors"
       - plugin_config_id: "grpc-method-router"
   - id: "grpc-deadline-proxy"
     listen_path: "/deadline"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {plain_port}
     strip_listen_path: true
     auth_mode: single
     plugins:
@@ -1294,6 +1370,25 @@ proxies:
 consumers: []
 
 plugin_configs:
+  - id: "grpc-web"
+    plugin_name: "grpc_web"
+    scope: proxy
+    proxy_id: "grpc-intended-proxy"
+    enabled: true
+    config: {{}}
+  - id: "cors"
+    plugin_name: "cors"
+    scope: proxy
+    proxy_id: "grpc-intended-proxy"
+    enabled: true
+    config:
+      allowed_origins:
+        - "{ORIGIN}"
+      allowed_methods:
+        - "POST"
+      allowed_headers:
+        - "content-type"
+        - "x-grpc-web"
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
     scope: proxy
@@ -1301,7 +1396,7 @@ plugin_configs:
     enabled: true
     config:
       allow_methods:
-        - "only.This/Allowed"
+        - "my.EchoService/Echo"
   - id: "grpc-deadline"
     plugin_name: "grpc_deadline"
     scope: proxy
@@ -1320,10 +1415,11 @@ plugin_configs:
     build_gateway().expect("Failed to build gateway");
     let (mut gateway, gateway_port, _admin_port) =
         start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let base = format!("http://127.0.0.1:{gateway_port}");
 
     let client = reqwest::Client::new();
     let refused = client
-        .get(format!("http://127.0.0.1:{}/api/test", gateway_port))
+        .get(format!("{base}/api/test"))
         .send()
         .await
         .expect("HTTP request should complete");
@@ -1338,19 +1434,91 @@ plugin_configs:
         "unexpected refusal body: {body}"
     );
 
+    assert_eq!(
+        websocket_upgrade_status(gateway_port, "/api/ws").await,
+        403,
+        "a WebSocket upgrade must not skip the route's gRPC method policy"
+    );
+
+    // The browser's CORS preflight carries no gRPC Content-Type, so it is plain
+    // HTTP, yet it must reach the cors plugin, which answers it locally.
+    let preflight = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/api/my.EchoService/Echo"),
+        )
+        .header("origin", ORIGIN)
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type,x-grpc-web")
+        .send()
+        .await
+        .expect("CORS preflight should complete");
+    assert_eq!(
+        preflight.status().as_u16(),
+        204,
+        "the CORS preflight must be answered by the cors plugin"
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some(ORIGIN)
+    );
+
+    // The gRPC-Web call itself declares gRPC intent and runs the method policy.
+    let grpc_web = client
+        .post(format!("{base}/api/my.EchoService/Echo"))
+        .header("origin", ORIGIN)
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .body(grpc_web_frame(b"ping"))
+        .send()
+        .await
+        .expect("gRPC-Web request should complete");
+    assert_eq!(grpc_web.status().as_u16(), 200);
+    assert!(
+        grpc_web
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/grpc-web")),
+        "the allowed gRPC-Web call must be translated: {:?}",
+        grpc_web.headers()
+    );
+    let _ = grpc_web.bytes().await.expect("gRPC-Web body");
+    assert_eq!(hits.echo(), 1, "the allowed gRPC-Web call reaches the backend");
+
+    let denied = client
+        .post(format!("{base}/api/my.EchoService/Limited"))
+        .header("content-type", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .body(grpc_web_frame(b"ping"))
+        .send()
+        .await
+        .expect("gRPC-Web request should complete");
+    let _ = denied.bytes().await.expect("gRPC-Web body");
+    assert_eq!(
+        hits.limited(),
+        0,
+        "grpc_method_router must refuse a gRPC-Web call outside its allow list"
+    );
+
     let passed = client
-        .get(format!("http://127.0.0.1:{}/deadline/test", gateway_port))
+        .get(format!("{base}/deadline/test"))
         .send()
         .await
         .expect("HTTP request should complete");
-    assert_ne!(
+    assert_eq!(
         passed.status().as_u16(),
-        403,
+        200,
         "grpc_deadline is not admission policy, so plain HTTP is not refused"
     );
+    assert_eq!(passed.text().await.expect("backend body"), "plain-ok");
 
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
+    plain_handle.abort();
     println!("test_grpc_plugins_on_plain_http_requests PASSED");
 }

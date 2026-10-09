@@ -6160,9 +6160,12 @@ fn materialize_sidecar_inbound_proxies(
     mesh_slice: &MeshSlice,
 ) {
     // Assigned on every apply, before any early return: only the default
-    // service-port path below publishes HTTP application ports (issue #6110).
+    // service-port path below publishes HTTP application ports, and only a
+    // Sidecar that materializes inbound routes refuses a CONNECT matching one
+    // (issue #6110).
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.sidecar_inbound_http_app_ports.clear();
+        mesh.sidecar_inbound_refuses_matched_http_connect = false;
     }
     if runtime.topology != MeshTopology::Sidecar {
         return;
@@ -6171,6 +6174,14 @@ fn materialize_sidecar_inbound_proxies(
         debug!("Sidecar inbound route materialization skipped: no workload SPIFFE identity");
         return;
     };
+    // Both branches below (`ingress[]` listeners and the service-port
+    // defaults) serve HTTP on the inbound listener, so a bare byte-stream
+    // CONNECT that matches one of those routes, or an operator-defined HTTP
+    // proxy there, is refused rather than relayed as opaque bytes (issue
+    // #6110).
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.sidecar_inbound_refuses_matched_http_connect = true;
+    }
 
     let now = chrono::Utc::now();
     // The local workload(s) are this sidecar's own pods. A SPIFFE id alone is not

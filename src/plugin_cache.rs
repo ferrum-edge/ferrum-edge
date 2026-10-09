@@ -4875,11 +4875,13 @@ impl PluginCapabilities {
     /// chain runs: a native-gRPC or WebSocket view that drops an instance the
     /// HTTP view runs, or a plain HTTP or WebSocket view of a gRPC-intended
     /// route that drops a route-scoped instance the native-gRPC view runs
-    /// (issue #6110). The request dispatchers refuse such a request before any
-    /// plugin runs: the flavor is chosen by client headers, so serving it
-    /// would let the client switch the route's authentication or admission
-    /// policy off. Never set on the composed gRPC-Web view, which keeps every
-    /// HTTP plugin plus the native-gRPC policies it can run.
+    /// (issue #6110), or the composed gRPC-Web view when it drops a gRPC-only
+    /// admission instance (route-scoped or global) it cannot run. The request
+    /// dispatchers refuse such a request before any plugin runs: the flavor is
+    /// chosen by client headers, so serving it would let the client switch the
+    /// route's authentication or admission policy off. One exemption, on the
+    /// plain HTTP view only: a CORS preflight, which invokes no gRPC method
+    /// (`proxy::is_cors_preflight_request`).
     pub const OMITS_ROUTE_ADMISSION_POLICY: u32 = 1 << 18;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
@@ -5433,7 +5435,7 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     // Filtering it once preserves that order, retains every ordinary HTTP
     // guardrail, and includes each compatible native-gRPC policy instance at
     // most once even if a future implementation supports both protocols.
-    let plugins = Arc::new(
+    let composed = Arc::new(
         plugins
             .iter()
             .filter(|plugin| {
@@ -5444,8 +5446,73 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
             .cloned()
             .collect::<Vec<_>>(),
     );
-    let phase = build_phase_data(&plugins);
-    ProtocolEntry { plugins, phase }
+    let mut phase = build_phase_data(&composed);
+    if grpc_web_view_omits_grpc_admission_policy(plugins) {
+        phase.capabilities.0 |= PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY;
+    }
+    ProtocolEntry {
+        plugins: composed,
+        phase,
+    }
+}
+
+/// Whether the composed gRPC-Web view of `plugins` drops an admission-gating
+/// instance that runs on native gRPC (issue #6110).
+///
+/// The composed view keeps every HTTP plugin plus only the native-gRPC
+/// policies it can run (`grpc_method_router`, `grpc_deadline`). A gRPC-only
+/// gating instance outside that set, such as a custom gRPC authentication
+/// plugin, would not run, while gateway translation (or a backend that speaks
+/// gRPC-Web itself) still reaches the gRPC service. Unlike plain HTTP, a
+/// gRPC-Web request DECLARES gRPC intent, so a GLOBAL instance counts too, the
+/// same way a global HTTP-only instance marks every route's native-gRPC view.
+fn grpc_web_view_omits_grpc_admission_policy(plugins: &[Arc<dyn Plugin>]) -> bool {
+    plugins.iter().any(|plugin| {
+        let protocols = plugin.supported_protocols();
+        plugin.gates_request_admission()
+            && protocols.contains(&ProxyProtocol::Grpc)
+            && !protocols.contains(&ProxyProtocol::Http)
+            && !H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+    })
+}
+
+/// Test hook: whether the composed gRPC-Web view built from `plugins` is
+/// marked [`PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`] (issue #6110).
+/// The global gRPC-Web view is built from the global chain exactly this way.
+pub(crate) fn grpc_web_view_omits_admission_policy_for_test(plugins: &[Arc<dyn Plugin>]) -> bool {
+    build_grpc_web_protocol_entry(plugins)
+        .phase
+        .capabilities
+        .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
+}
+
+/// Tell the operator, once per global chain built, that a GLOBAL gRPC-only
+/// admission-gating instance (such as `grpc_method_router`) does not make any
+/// route gRPC-only (issue #6110).
+///
+/// A global instance says nothing about one route's intent, so plain HTTP is
+/// not refused on its account (see
+/// [`view_omits_route_grpc_admission_policy`]). A backend that also serves
+/// its methods over plain HTTP (Connect `application/json` or
+/// `application/connect+proto`, grpc-gateway transcoding) is therefore
+/// reachable without the policy. Attaching the plugin to the route closes
+/// that.
+fn log_global_grpc_only_admission_plugins(globals: &[Arc<dyn Plugin>]) {
+    let Some(plugin) = globals.iter().find(|plugin| {
+        let protocols = plugin.supported_protocols();
+        plugin.gates_request_admission()
+            && protocols.contains(&ProxyProtocol::Grpc)
+            && !protocols.contains(&ProxyProtocol::Http)
+    }) else {
+        return;
+    };
+    warn!(
+        plugin = %crate::startup::sanitize_startup_scalar(plugin.name()),
+        "A global gRPC-only admission plugin applies to native gRPC (and gRPC-Web) \
+         requests only; it does not constrain plain HTTP, Connect, or transcoded calls \
+         to the same methods. Attach it to a proxy or proxy group to make that route \
+         gRPC-only"
+    );
 }
 
 /// Build the full protocol snapshot from the plugin map + global fallback.
@@ -5486,6 +5553,7 @@ fn build_protocol_snapshot(
         global.insert(proto, build_protocol_entry(globals, globals, proto));
     }
     log_undeclared_early_route_bound_plugin(None, globals);
+    log_global_grpc_only_admission_plugins(globals);
 
     let grpc_web_global = build_grpc_web_protocol_entry(globals);
 
@@ -7772,6 +7840,7 @@ impl PluginCache {
                 g.insert(proto, entry);
             }
             log_undeclared_early_route_bound_plugin(None, &new_globals);
+            log_global_grpc_only_admission_plugins(&new_globals);
             g
         } else {
             current.protocol_snapshot.global.clone()

@@ -5124,7 +5124,9 @@ pub struct MeshConfig {
     /// would skip that route's plugin chain. Stream-family (TCP/opaque) ports
     /// keep the CONNECT relay. A container port that both an HTTP-family and a
     /// stream-family service port resolve to is in this set, because the HTTP
-    /// route wins that port.
+    /// route wins that port, so a raw-TCP CONNECT for the stream-family service
+    /// (a Ferrum peer's raw-TCP egress included) is refused too. The remedy is
+    /// distinct container ports for the two service ports.
     ///
     /// Populated ONLY by the default Sidecar service-port inbound
     /// materializer and assigned on every apply (empty on every other
@@ -5134,6 +5136,28 @@ pub struct MeshConfig {
     /// [`Self::inbound_relay_destinations`].
     #[serde(skip)]
     pub sidecar_inbound_http_app_ports: Vec<u16>,
+    /// Runtime-only: a bare byte-stream CONNECT on the inbound listener that
+    /// MATCHES an HTTP-family route is refused (issue #6110) instead of being
+    /// relayed to that route's backend as opaque bytes.
+    ///
+    /// [`Self::sidecar_inbound_http_app_ports`] covers the route MISS, where
+    /// the relay is synthesized from the authority. This flag covers the route
+    /// HIT: a CONNECT whose authority names a service host
+    /// (`reviews.default.svc.cluster.local:9080`), a Sidecar `ingress[]` HTTP
+    /// listener host, or an operator-defined HTTP proxy matches that route,
+    /// and relaying it would run the route's plugin chain once, on the CONNECT,
+    /// while every HTTP request written into the tunnel skipped it. The peer
+    /// must send HTTP instead.
+    ///
+    /// Set ONLY by the Sidecar inbound materializer, in both its default
+    /// service-port and its `ingress[]` branch, whenever the Sidecar has a
+    /// workload identity to materialize for; cleared on every apply. Ambient
+    /// and waypoint terminators never set it, so their matched-route CONNECT
+    /// dispatch (which `mesh_route_dispatch` overrides ride) is unchanged.
+    /// `serde(skip)` for the same reason as
+    /// [`Self::inbound_relay_destinations`].
+    #[serde(skip)]
+    pub sidecar_inbound_refuses_matched_http_connect: bool,
     /// The authoritative node-local enrolled-pod registry bounding
     /// [`Self::inbound_relay_destinations`] (issue #4249).
     ///
@@ -6248,6 +6272,7 @@ impl Default for MeshConfig {
             inbound_relay_admits_loopback_namespace: false,
             inbound_relay_own_address_ports: Vec::new(),
             sidecar_inbound_http_app_ports: Vec::new(),
+            sidecar_inbound_refuses_matched_http_connect: false,
             inbound_relay_node_local_registry: Default::default(),
         }
     }
