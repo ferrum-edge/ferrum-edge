@@ -2538,7 +2538,7 @@ def check_fips_producer_channel(
     require(
         "--no-absolute-filenames" not in workflow,
         "FIPS workflow must not use BSD-only tar options unsupported by GNU tar "
-        "on ubuntu-latest",
+        "on ubuntu-26.04",
         failures,
     )
     require(
@@ -6959,7 +6959,7 @@ def self_test() -> int:
     performance_cache_fixture = (
         "jobs:\n"
         "  performance-regression:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - uses: ./.github/actions/setup-rust-ci\n"
         "        env:\n"
@@ -8572,7 +8572,7 @@ def self_test() -> int:
             "    name: NodeWaypoint eBPF live datapath\n"
             "    needs: production-dockerfile-plan\n"
             f"    if: {live_if}\n"
-            "    runs-on: ubuntu-24.04\n"
+            "    runs-on: ubuntu-26.04\n"
             "    timeout-minutes: 120\n"
             "    steps:\n"
             "      - run: kind create cluster --name demo\n"
@@ -8677,7 +8677,7 @@ def self_test() -> int:
         return (
             "  node-waypoint-ebpf-live-gate:\n"
             "    name: NodeWaypoint eBPF Live\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    needs:\n"
             "      - production-dockerfile-plan\n"
             "      - node-waypoint-ebpf-live\n"

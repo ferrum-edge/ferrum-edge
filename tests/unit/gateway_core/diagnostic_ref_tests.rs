@@ -1133,6 +1133,22 @@ fn rejection_detail_carries_only_bounded_labels() {
     assert_eq!(routing.phase, "route_not_found");
     let admission = DiagnosticRejection::gateway_fence("overload", 503);
     assert_eq!(admission.phase, "overload");
+    for phase in [
+        "client_disconnect_upload_before_authenticate",
+        "client_disconnect_upload_before_authorize",
+        "client_disconnect_upload_before_before_proxy",
+        "client_disconnect_upload_before_dispatch",
+        "client_disconnect_terminal_request_body",
+        "client_disconnect_buffered_grpc_upload",
+        "client_disconnect_buffered_h3_upload",
+        "client_disconnect_buffered_h3_bridge_upload",
+        "authorization_expired_buffered_grpc_upload",
+        "invalid_h3_upload",
+    ] {
+        let rejection = DiagnosticRejection::new(phase, None, 499);
+        assert_eq!(rejection.phase, phase);
+        assert_eq!(rejection.source, DiagnosticRejectionSource::Gateway);
+    }
 
     // The phase is a closed set: a well-formed label the gateway does not
     // ship is `other`, exactly like free text.

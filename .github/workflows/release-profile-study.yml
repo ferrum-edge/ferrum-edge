@@ -27,7 +27,7 @@ concurrency:
 jobs:
   validation:
     name: Release study evidence verifier
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -37,7 +37,7 @@ jobs:
 
   tcp-admission:
     name: TCP benchmark admission contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTC_WRAPPER: ""
@@ -66,7 +66,7 @@ jobs:
     name: Paired native Linux release profiles
     if: github.event_name == 'workflow_dispatch'
     needs: [validation, tcp-admission]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6

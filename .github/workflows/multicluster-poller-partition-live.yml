@@ -30,7 +30,7 @@ env:
 jobs:
   changes:
     name: Multicluster poller partition trigger
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -204,7 +204,7 @@ jobs:
     name: Poller partition and last-good retention
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 110
 
     steps:
@@ -270,7 +270,7 @@ jobs:
       - changes
       - multicluster-poller-partition-live
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Summarize multicluster poller partition live result

@@ -1,6 +1,6 @@
 # Scheduled and manually runnable multi-protocol performance regression.
 #
-# Runs the multi_protocol matrix on the documented ubuntu-latest runner class
+# Runs the multi_protocol matrix on the documented ubuntu-26.04 runner class
 # with the stable ci-release build profile, records throughput / error rate /
 # p50/p95/p99 per protocol, then exercises connection churn, long-lived soak
 # with RSS/FD/task plateaus, and reload-under-load. Results are compared to
@@ -70,12 +70,12 @@ env:
   CARGO_HTTP_MULTIPLEXING: "false"
   # Documented stable profile for this regression lane.
   BENCH_BUILD_PROFILE: ci-release
-  BENCH_RUNNER_CLASS: ubuntu-latest
+  BENCH_RUNNER_CLASS: ubuntu-26.04
 
 jobs:
   protocol-perf-regression:
     name: Protocol Performance Regression
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
 
     steps:

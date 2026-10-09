@@ -75,7 +75,7 @@ adding, removing, or materially changing a workflow.
 | `performance-regression.yml` | Performance Regression | Daily schedule on `main`, manual | Out-of-band self-relative overhead benchmark, Criterion microbenchmarks, and the protocol-perf / mesh-baseline static contracts. Not a PR or main-push check; a red run marks the daily `main` tip as regressed. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `h1-tls-post-regression.yml` | H1 TLS POST Historical Baseline | Daily schedule on `main`, manual | Paired same-runner HTTP/1.1 TLS POST/echo throughput of the `main` tip against the historical reference pinned in `tests/performance/multi_protocol/h1_tls_post_reference.json`; gates the paired ratio per payload size, alerts on rolling-ratio drift, downgrades noisy-runner verdicts to provisional. Manual dispatch accepts a reference SHA override for matched-host bisects. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md#historical-baseline-h1-tls-post-check). |
-| `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-24.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
+| `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-26.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
 | `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
 | `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. |
@@ -1259,7 +1259,7 @@ a main-CI rerun cannot finish a version release.
 
 #### 1. CI Plan Static Checks
 
-**Runs**: `ubuntu-latest`
+**Runs**: `ubuntu-26.04`
 
 Checks Rust formatting and integration-shard declarations on full-mode pull
 requests and pushes to `main`:
@@ -1283,7 +1283,7 @@ the base-owned `Trusted Cross Build Policy` remains the admission authority.
 
 #### 2. Test Jobs
 
-**Runs**: `ubuntu-latest`
+**Runs**: `ubuntu-26.04`
 
 Runs the required test matrix in parallel for full-mode pull requests and
 pushes to `main`. The commands below are grouped by job, not run as one
@@ -1504,7 +1504,7 @@ stripped of newlines and backticks before they are written.
 
 #### 3. Lint Job
 
-**Runs**: `ubuntu-latest`
+**Runs**: `ubuntu-26.04`
 
 Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
 `profile.dev.debug=0`) so large integration targets stay within hosted-runner
@@ -1526,7 +1526,7 @@ cargo clippy \
 
 #### 4. eBPF Build Job
 
-**Runs**: `ubuntu-latest`
+**Runs**: `ubuntu-26.04`
 
 The planner schedules this job on PRs only when files under `ebpf/` changed, so
 unrelated PRs consume no runner; pushes to `main` and manual runs force it on.
@@ -1539,7 +1539,7 @@ the shared-types test runs on stable Rust.
 
 #### 4b. eBPF / netns / two-cluster live jobs (`ci.yml`)
 
-**Runs**: `ubuntu-latest` (privileged), only when `CI Plan` marks the matching
+**Runs**: `ubuntu-26.04` (privileged), only when `CI Plan` marks the matching
 gate `true`
 
 Each job has its own fail-closed planner output, and the `Tests` aggregate
@@ -1563,7 +1563,7 @@ trusted-base classifiers; they are not part of these three `ci.yml` jobs.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 The workflow triggers unconditionally on `workflow_dispatch`, `pull_request`,
 `merge_group` (`checks_requested`), and `push` to `main`, with **no
@@ -1628,7 +1628,7 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 #### 5a. Istio Status CAS Live Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 `istio-status-cas-live.yml` is a Kind/apiserver lane for issue #3838. It is
 **not** a required live-suite check and is not wired into the `ci.yml` `Tests`
@@ -1653,7 +1653,7 @@ substitute for this lane.
 
 #### 5b. Ambient Host-Network UDP Live-Kernel Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 `ambient-host-udp-live` triggers on **every** pull request and merge-group run —
 it carries no top-level `paths:` filter, because a required check that can
@@ -1801,7 +1801,7 @@ is observed; no local execution can establish these acceptance criteria.
 
 #### 5c. CNI Install Lifecycle Live Workflow
 
-**Runs**: `ubuntu-24.04`
+**Runs**: `ubuntu-26.04`
 
 `cni-lifecycle-live.yml` is the live install/uninstall recovery proof for issue
 #3609. Logic lives in `tests/k8s/cni_lifecycle_live/run.sh`; the workflow stays
@@ -1828,7 +1828,7 @@ was proven `false`, and otherwise reports the live job's result.
 
 #### 6. Performance Regression Job (`performance-regression.yml`)
 
-**Runs**: `ubuntu-latest`, once a day (`schedule`, 06:17 UTC) against the tip
+**Runs**: `ubuntu-26.04`, once a day (`schedule`, 06:17 UTC) against the tip
 of `main`, and on manual dispatch. It is not part of `ci.yml`, the `Tests`
 aggregate, or any pull-request or main-push validation: the ci-release build,
 the self-relative overhead benchmark, and the Criterion microbenchmarks are
@@ -2789,7 +2789,7 @@ git push origin v0.2.0
 
 ### Validate Release Version Job
 
-**Runs**: `ubuntu-latest`
+**Runs**: `ubuntu-26.04`
 
 Extracts the `[package]` version from `Cargo.toml` and requires
 `GITHUB_REF_NAME` to equal `v${CARGO_VERSION}`. A mismatch produces a clear
@@ -2798,7 +2798,7 @@ or GitHub Release creation. The guard adds no secrets or elevated permissions.
 
 ### Validate Release SHA Job
 
-**Runs**: `ubuntu-latest`
+**Runs**: `ubuntu-26.04`
 
 Validates that the tag name matches the release pattern, that the tag target
 resolves to a commit, and that the commit is an ancestor of `origin/main`. It
@@ -2821,7 +2821,7 @@ publishing anything on an unproven result.
 
 ### Release Build Job
 
-**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (four-target native
+**Runs**: `ubuntu-26.04`, `macos-latest`, `windows-latest` (four-target native
 matrix plus the isolated Linux ARM64 job)
 
 Depends on `Validate release SHA`, then builds optimized release binaries for all target platforms:
@@ -2860,7 +2860,7 @@ downstream job fails closed with it.
 
 **GNU ABI gate** (`verify-linux-gnu-abi-aarch64`, versioned release path):
 - ARM64 only. The x86_64 GNU floor is enforced inside `build-release-binaries` before its artifact exists.
-- Downloads the trusted `release-binaries-aarch64-unknown-linux-gnu` artifact on `ubuntu-24.04-arm`, re-checks its SHA-256 sidecars, and scans the published bytes — it never rebuilds them
+- Downloads the trusted `release-binaries-aarch64-unknown-linux-gnu` artifact on `ubuntu-26.04-arm`, re-checks its SHA-256 sidecars, and scans the published bytes — it never rebuilds them
 - Rejects GLIBC symbols above 2.34, unexpected `DT_NEEDED` entries, a `DT_RPATH`/`DT_RUNPATH`, and an ELF `e_machine` that does not match the advertised `*-x86_64` / `*-aarch64` asset
 - Smokes both binaries and their operator commands (`ferrum-edge version --json` / `validate` / `run` + `health`; `ferrum-cni VERSION` / `install` / `uninstall` / ADD / CHECK / DEL) on digest-pinned AlmaLinux 9.4 (the GLIBC_2.34 floor) and Ubuntu 22.04 via `bash .github/scripts/smoke_linux_gnu_baseline.sh`
 - `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). The ARM64 producer and `create-release.needs` are both frozen by trusted Cross policy, so the ARM64 scan can only join after publication; the gate fails the workflow and deletes the GitHub Release if that job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged: the retraction does not delete published `:vX.Y.Z` image tags.
@@ -3521,8 +3521,8 @@ re-applies the ancestry checks. Re-running CI or the publisher therefore never
 pushes a different digest under an existing, signed `main-<sha>`.
 
 **Build.** Each run builds the root `Dockerfile` `runtime` target with
-`FEATURES=cloud-secrets` on native `linux/amd64` (`ubuntu-latest`) and
-`linux/arm64` (`ubuntu-24.04-arm`) runners, pushes each platform by digest, and
+`FEATURES=cloud-secrets` on native `linux/amd64` (`ubuntu-26.04`) and
+`linux/arm64` (`ubuntu-26.04-arm`) runners, pushes each platform by digest, and
 assembles one multi-arch manifest. BuildKit fetches the source itself from
 `https://github.com/ferrum-edge/ferrum-edge.git#<sha>`, so the credentialed
 build job never checks out the repository, and `github-token: ""` keeps the job
@@ -3792,7 +3792,7 @@ strategy:
   matrix:
     include:
       # Example: add a Linux musl target
-      - os: ubuntu-latest
+      - os: ubuntu-26.04
         target: x86_64-unknown-linux-musl
         artifact_name: ferrum-edge
         asset_name: ferrum-edge-linux-x86_64-musl
@@ -4004,7 +4004,7 @@ trusted-main writer in this workflow. All package and billing settings stay as-i
 Netns Source Capture, Two-Cluster Mesh Live and Ambient host-UDP live-kernel
 use the existing `ci-netns-capture-live` key. All use `setup-rust-ci`, default
 features, the default Cargo profile, native dependencies, workspace and
-compiler flags. Ambient pins Ubuntu 24.04; the other two use `ubuntu-latest`,
+compiler flags. All three pin `ubuntu-26.04`,
 which currently resolves to the same image family. The cache still includes
 its platform/toolchain/environment hash, and Cargo checks build fingerprints.
 All three build the gateway and `functional_tests`; Netns and Ambient also

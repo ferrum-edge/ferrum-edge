@@ -32,8 +32,10 @@ case "${H1_TRACE_ACTION:?}" in
       -p "$H1_TRACE_PID" -o "$H1_TRACE_OUT/perf.data" ;;
   perf-script)
     [[ ${H1_TRACE_OUT:?} == /* && ${H1_TRACE_SYMFS:?} == /* ]]
+    # Keep physical DWARF frames; default inline/source expansion repeatedly
+    # stalls addr2line on the symbolized production ELF past the decoder bound.
     exec /tmp/ferrum-h1-trace/perf script -i "$H1_TRACE_OUT/perf.data" --symfs "$H1_TRACE_SYMFS" \
-      --ns --show-lost-events --show-task-events --show-mmap-events \
+      --no-inline --ns --show-lost-events --show-task-events --show-mmap-events \
       -F comm,pid,tid,time,event,ip,sym,dso ;;
   perf-raw)
     [[ ${H1_TRACE_OUT:?} == /* ]]
@@ -55,7 +57,7 @@ case "${H1_TRACE_ACTION:?}" in
   readelf-version) exec readelf --version ;;
   perf-version) exec /tmp/ferrum-h1-trace/perf version --build-options ;;
   packages) exec dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' ;;
-  package-origins) exec apt-cache policy linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8 ;;
+  package-origins) exec apt-cache policy linux-perf linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8 ;;
   tracefs) exec mount -t tracefs tracefs /sys/kernel/tracing ;;
   *) exit 2 ;;
 esac

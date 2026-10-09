@@ -108,7 +108,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "main-linux-image",
-        "ccfb1554c81c5d5321c4e64872e215b6c410f2bd9f3155b13cf24615af4339f6",
+        "f1eb91cba7a7eb23784dca0f7e5d24db15e35c6af6a3f0bba9e84878a4169717",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -118,7 +118,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "e51d7ba7ea0199481f11e816010051e0546af158857c4129b2002ea95866a17b",
+        "4ba53a655ddbbcd0074728d526604b2caf9f5ba4793237a8bf53eaefbda66aeb",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -1166,7 +1166,7 @@ RELEASE_ATTEST_RELEASE_IMAGES_JOB = (
     r"""  attest-release-images:
     name: Sign and attest release images
     needs: [docker-manifest, docker-ebpf-manifest]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
       packages: write
@@ -1781,7 +1781,7 @@ CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
     name: Main Publish Gate
     needs: [test, build-binaries]
     if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The polling loop stops at its own 60-minute deadline, so the fail-closed
     # timeout below is always the branch that fires. This job-level ceiling is
     # only a backstop against a wedged runner and bounds runner occupancy.
@@ -2023,10 +2023,10 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "      fail-fast: false\n"
                 "      matrix:\n"
                 "        include:\n"
-                "          - os: ubuntu-latest\n"
+                "          - os: ubuntu-26.04\n"
                 "            platform: linux/amd64\n"
                 "            arch_dir: amd64\n"
-                "          - os: ubuntu-24.04-arm\n"
+                "          - os: ubuntu-26.04-arm\n"
                 "            platform: linux/arm64\n"
                 "            arch_dir: arm64\n"
             ),
@@ -2080,7 +2080,7 @@ RELEASE_IMAGE_FAMILY_GENERATIONS = {
             RELEASE_TOOLS_MANIFEST_JOB_NAME: {
                 "name": "    name: Docker eBPF Tools Manifest\n",
                 "needs": RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS,
-                "runs-on": "    runs-on: ubuntu-latest\n",
+                "runs-on": "    runs-on: ubuntu-26.04\n",
                 "permissions": (
                     "    permissions:\n"
                     "      contents: read\n"
@@ -2304,7 +2304,7 @@ def derive_release_family_transition(
 # slug, and suite selector — so every governed workflow runs identical logic.
 LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
     name: @@DISPLAY@@
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -2538,7 +2538,14 @@ AMBIENT_HOST_UDP_LIVE_STEP = r"""      - name: Run ambient host-UDP live gate as
           # creates its own proven disposable outer netns for every ordinary
           # root execution (including ad-hoc), so isolation does not depend on
           # a forgeable environment flag.
-          sudo -E unshare --net -- bash -c '
+          # sudo-rs on Ubuntu 26.04 does not preserve the whole environment.
+          # Pass only the four inputs required by the prebuilt live harness.
+          sudo env \
+            "FERRUM_LIVE_TESTS_REQUIRED=$FERRUM_LIVE_TESTS_REQUIRED" \
+            "FERRUM_HOST_UDP_LIB_TEST_BIN=$FERRUM_HOST_UDP_LIB_TEST_BIN" \
+            "FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN=$FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN" \
+            "FERRUM_HOST_UDP_LIVE_RESULTS=$FERRUM_HOST_UDP_LIVE_RESULTS" \
+            unshare --net -- bash -c '
             set -euo pipefail
             ip link set lo up
             if [[ -w /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
@@ -2553,7 +2560,7 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
     name: Ambient host-network UDP live-kernel
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       CARGO_NET_RETRY: "10"
@@ -2625,7 +2632,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
     name: Ambient host-UDP production image contract
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
 
     steps:
@@ -2760,7 +2767,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
     if: needs.changes.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
     permissions:
       contents: read
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
 
     steps:
@@ -2886,7 +2893,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
 
     steps:
@@ -3024,7 +3031,7 @@ AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB = r"""  ambient-host-udp-image:
     if: always()
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Verify selected production image contract
         env:
@@ -3058,7 +3065,7 @@ AMBIENT_HOST_UDP_GATE_JOB = r"""  gate:
       - ambient-host-udp-live
       - ambient-host-udp-image
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Summarize ambient host-UDP live result
         run: |
@@ -3237,7 +3244,7 @@ NODE_WAYPOINT_LIVE_WORKFLOW = "node-waypoint-ebpf-live.yml"
 
 NODE_WAYPOINT_PLAN_JOB = r"""  production-dockerfile-plan:
     name: Production Dockerfile smoke trigger
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
       node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}
@@ -3394,7 +3401,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
     if: needs.production-dockerfile-plan.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
     permissions:
       contents: read
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - name: Checkout Ferrum Edge
@@ -3507,7 +3514,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - name: Checkout Ferrum Edge
@@ -3624,7 +3631,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
 
 NODE_WAYPOINT_IMAGE_GATE_JOB = r"""  production-dockerfile-smoke:
     name: Production Dockerfile eBPF image smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs:
       - production-dockerfile-plan
       - production-dockerfile-smoke-default
@@ -3679,7 +3686,7 @@ NODE_WAYPOINT_IMAGE_GATE_JOB = r"""  production-dockerfile-smoke:
 
 NODE_WAYPOINT_LIVE_GATE_JOB = r"""  node-waypoint-ebpf-live-gate:
     name: NodeWaypoint eBPF Live
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs:
       - production-dockerfile-plan
       - node-waypoint-ebpf-live
@@ -3887,7 +3894,7 @@ CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     permissions:
       contents: read
@@ -4192,7 +4199,7 @@ CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB = r"""  fuzz-smoke:
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     permissions:
       contents: read
@@ -4497,7 +4504,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     permissions:
       contents: read
@@ -4953,7 +4960,7 @@ concurrency:
 jobs:
   fuzz-sanitized:
     name: Fuzz sanitizer lane
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     permissions:
       contents: read
@@ -7372,18 +7379,18 @@ def build_release_family_fixture(generation: str) -> str:
         # would not exercise the field block the adoption actually rewrites.
         + control["create-release"]["name"]
         + control["create-release"]["needs"]
-        + "    runs-on: ubuntu-latest\n"
+        + "    runs-on: ubuntu-26.04\n"
         + control["create-release"]["steps"]
         + "\n"
         + "  docker:\n"
         + control["docker"]["needs"]
-        + "    runs-on: ubuntu-latest\n"
+        + "    runs-on: ubuntu-26.04\n"
         + control["docker"]["strategy"]
         + control["docker"]["steps"]
         + "\n"
         + "  docker-manifest:\n"
         + control["docker-manifest"]["needs"]
-        + "    runs-on: ubuntu-latest\n"
+        + "    runs-on: ubuntu-26.04\n"
         + control["docker-manifest"]["steps"]
         + "\n"
         + "  docker-ebpf:\n"
@@ -7396,7 +7403,7 @@ def build_release_family_fixture(generation: str) -> str:
         + "\n"
         + "  docker-ebpf-manifest:\n"
         + control["docker-ebpf-manifest"]["needs"]
-        + "    runs-on: ubuntu-latest\n"
+        + "    runs-on: ubuntu-26.04\n"
         + control["docker-ebpf-manifest"]["steps"]
     )
     if generation == RELEASE_THREE_FAMILY_GENERATION:
@@ -13420,7 +13427,7 @@ def node_waypoint_relevance_workflow() -> str:
         bound_jobs += f"    name: {job_name} stub\n"
         bound_jobs += binding["needs"]
         bound_jobs += binding["if"]
-        bound_jobs += "    runs-on: ubuntu-latest\n"
+        bound_jobs += "    runs-on: ubuntu-26.04\n"
         bound_jobs += "    steps:\n"
         bound_jobs += "      - run: echo stub\n"
     return (
@@ -13925,7 +13932,7 @@ CROSS_IMAGE_REFRESH_TRIGGER = (
 )
 CROSS_IMAGE_REFRESH_JOB = r"""  cross-image-drift:
     name: Inspect the admitted Cross image pin
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -18951,7 +18958,7 @@ def pr_workflow_job_surfaces(
 # The x86_64 GNU `ferrum-edge`/`ferrum-cni` assets the GitHub Release, the
 # `.sha256` sidecars, the moving `latest` prerelease, and the default
 # multi-arch container images all consume are produced by exactly one job per
-# workflow. Compiling that cell natively on the moving `ubuntu-latest` image
+# workflow. Compiling that cell natively on the moving `ubuntu-26.04` image
 # is what let the published runtime floor rise to GLIBC_2.39; scanning a
 # SEPARATELY rebuilt binary afterwards proves nothing about the bytes that
 # were published. Both failure modes are refused here, statically, from the
@@ -19833,7 +19840,7 @@ def self_test() -> list[str]:
         failures.append("an unchanged frozen Cross inventory comparison was rejected")
     extra_cross_job = (
         "  untrusted-cross:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         f"      - run: cross build --target {TARGET}\n"
     )
@@ -20296,7 +20303,7 @@ pre_build = []
             failures.append(f"{name} was not rejected")
 
     protected_block = """  protected-arm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         shell: bash
@@ -20316,7 +20323,7 @@ pre_build = []
         "jobs:\n"
         f"{protected_block}"
         "\n  unrelated:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo safe\n"
     )
@@ -20378,8 +20385,8 @@ pre_build = []
             1,
         ),
         "job container": workflow.replace(
-            "    runs-on: ubuntu-latest\n",
-            "    runs-on: ubuntu-latest\n    container: attacker/image\n",
+            "    runs-on: ubuntu-26.04\n",
+            "    runs-on: ubuntu-26.04\n    container: attacker/image\n",
             1,
         ),
         "merge alias": workflow.replace(
@@ -20387,7 +20394,7 @@ pre_build = []
         ),
         "renamed protected job": workflow.replace("protected-arm", "renamed-arm", 1),
         "duplicate protected job": workflow
-        + "  protected-arm:\n    runs-on: ubuntu-latest\n",
+        + "  protected-arm:\n    runs-on: ubuntu-26.04\n",
         "duplicate jobs mapping": workflow + "jobs:\n  attacker: {}\n",
         "flow-style jobs mapping": "name: fixture\njobs: { protected-arm: {} }\n",
         "global loader override": workflow.replace(
@@ -20410,7 +20417,7 @@ pre_build = []
         + "on:\n  push:\n    branches: [attacker]\n",
         "unprotected Cross job": workflow
         + "  unprotected-cross-on-pr:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: cross build --target aarch64-unknown-linux-gnu\n",
         "unprotected absolute Cross executable": workflow.replace(
@@ -20527,9 +20534,9 @@ pre_build = []
 
     merge_base_without_job = (
         "name: stale\nenv:\n  FIXED_INPUT: approved\njobs:\n"
-        "  unrelated:\n    runs-on: ubuntu-latest\n"
+        "  unrelated:\n    runs-on: ubuntu-26.04\n"
     )
-    proposed_without_job = merge_base_without_job.replace("ubuntu-latest", "ubuntu-24.04")
+    proposed_without_job = merge_base_without_job.replace("ubuntu-26.04", "ubuntu-24.04")
     if compare_pr_workflow_job(
         merge_base_without_job,
         proposed_without_job,
@@ -20540,14 +20547,14 @@ pre_build = []
     stale_cross_workflow = (
         "name: stale\nenv:\n  FIXED_INPUT: approved\njobs:\n"
         "  legacy-cross:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: cross build --target aarch64-unknown-linux-gnu\n"
         "  unrelated:\n"
         "    runs-on: ubuntu-22.04\n"
     )
     proposed_stale_cross = stale_cross_workflow.replace(
-        "ubuntu-22.04", "ubuntu-24.04"
+        "ubuntu-22.04", "ubuntu-26.04"
     )
     if compare_pr_workflow_job(
         stale_cross_workflow,
@@ -20697,7 +20704,7 @@ pre_build = []
     flow_cross_job = benign_workflow.replace(
         "\n  unrelated:\n",
         "\n  flow-cross:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps: [{run: cross build --target aarch64-unknown-linux-gnu}]\n"
         "\n  unrelated:\n",
         1,
@@ -20714,7 +20721,7 @@ pre_build = []
     flow_cross_environment = benign_workflow.replace(
         "\n  unrelated:\n",
         "\n  flow-env:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    env: {CROSS_CONFIG: attacker.toml}\n"
         "    steps:\n"
         "      - run: echo staged\n"
@@ -20764,7 +20771,7 @@ pre_build = []
     # spelling does.
     flow_digest_workflow = release_fixture_with_job(
         "  flow-upload:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - {uses: actions/upload-artifact@v7, "
         "with: {name: docker-digest-evil}}\n",
@@ -20783,7 +20790,7 @@ pre_build = []
     # proves the flow pass added coverage rather than replacing it.
     block_digest_workflow = release_fixture_with_job(
         "  block-upload:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - uses: actions/upload-artifact@v7\n"
         "        with:\n"
@@ -20804,7 +20811,7 @@ pre_build = []
     # freezes the ARM64 boundary, not routine CI maintenance.
     benign_added_job = release_fixture_with_job(
         "  extra-tests:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - uses: actions/upload-artifact@" + ("c" * 40) + "\n"
         "        with:\n"
@@ -20820,7 +20827,7 @@ pre_build = []
         failures.append("merge-base comparison rejected an unrelated added job")
     benign_flow_job = release_fixture_with_job(
         "  flow-tests:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps: [{run: echo flow-safe}]\n",
         "the benign flow-spelled step",
     )
@@ -20837,7 +20844,7 @@ pre_build = []
         "on: [pull_request]\n"
         "jobs:\n"
         "  coverage:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo safe\n"
     )
@@ -21485,7 +21492,7 @@ pre_build = []
         "on: [pull_request]\n"
         "jobs:\n"
         "  coverage-merge:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: cross build --target aarch64-unknown-linux-gnu\n"
     )
@@ -21711,27 +21718,27 @@ pre_build = []
         "  pull_request:\n"
         "jobs:\n"
         "  frozen:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo frozen\n"
     )
     job_gen_retired_extra = (
         "  extra:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: cross build --target aarch64-unknown-linux-gnu\n"
         "        # retired-generation\n"
     )
     job_gen_adopted_extra = (
         "  extra:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: cross build --target aarch64-unknown-linux-gnu\n"
         "        # adopted-generation\n"
     )
     job_gen_other_extra = (
         "  extra:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: cross build --target aarch64-unknown-linux-gnu\n"
         "        # other-generation\n"
@@ -21999,7 +22006,7 @@ pre_build = []
         added_cross_workflow
         + "jobs:\n"
         + "  duplicate:\n"
-        + "    runs-on: ubuntu-latest\n"
+        + "    runs-on: ubuntu-26.04\n"
     )
     if not scan_workflow_collection_cross_surfaces(
         {"malformed.yml": malformed_cross_workflow},
@@ -22175,7 +22182,7 @@ pre_build = []
         "name: Referenced automation\n"
         "jobs:\n"
         "  safe:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - uses: ./.github/actions/setup\n"
         "      - run: bash scripts/safe.sh\n"
@@ -22357,7 +22364,7 @@ pre_build = []
         "    shell: python3\n"
         "jobs:\n"
         "  unsafe:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: |\n"
         "          import subprocess\n"
@@ -22444,7 +22451,7 @@ pre_build = []
             "on: [push]\n"
             "jobs:\n"
             "  build:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
             f"      - run: bash {command_path}\n"
         )
@@ -22765,11 +22772,11 @@ pre_build = []
         "  pull_request:\n"
         "jobs:\n"
         "  main-linux-image:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: sh scripts/build_arm64.sh\n"
         "  build-release-arm64-cross:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo release\n"
     )
@@ -22783,7 +22790,7 @@ pre_build = []
         "  pull_request:\n"
         "jobs:\n"
         "  lab:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: bash scripts/lab.sh\n"
     )
@@ -23490,7 +23497,7 @@ pre_build = []
         "on: [push]\n"
         "jobs:\n"
         "  build:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: BODY\n"
     )
@@ -23531,7 +23538,7 @@ pre_build = []
         "on: [push]\n"
         "jobs:\n"
         "  build:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: |\n"
         "          BODY\n"
@@ -23568,7 +23575,7 @@ pre_build = []
         "on: [issue_comment]\n"
         "jobs:\n"
         "  review:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo reviewing\n"
         "        env:\n"
@@ -25368,7 +25375,7 @@ pre_build = []
         "on: [push]\n"
         "jobs:\n"
         "  report:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: |\n"
         "          BODY\n"
@@ -25412,7 +25419,7 @@ pre_build = []
         "on: [push]\n"
         "jobs:\n"
         "  docker-manifest:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: |\n"
         "          docker buildx imagetools create \\\n"
@@ -25476,7 +25483,7 @@ pre_build = []
         "on: [push]\n"
         "jobs:\n"
         "  review:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - name: Review\n"
         f"        uses: anthropics/claude-code-action@{'0' * 40}\n"
@@ -25936,7 +25943,7 @@ pre_build = []
         "on: [push]\n"
         "jobs:\n"
         "  publish:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - uses: USES\n"
         "        with:\n"
@@ -25996,7 +26003,7 @@ pre_build = []
             "on: [push]\n"
             "jobs:\n"
             "  build:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             + extra
             + "    steps:\n"
             + step_body,
@@ -26427,7 +26434,7 @@ pre_build = []
         "name: Folded workflow\n"
         "jobs:\n"
         "  build:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: >\n"
         "          cross\n"
@@ -26627,7 +26634,7 @@ pre_build = []
         "name: Planner fixture\n"
         "jobs:\n"
         "  ci-plan:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: |\n"
         "          planner_dir=.github/scripts\n"
@@ -26722,7 +26729,7 @@ pre_build = []
         "name: Opaque stdin\n"
         "jobs:\n"
         "  build:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         f"      - run: {opaque_stdin_run}\n"
     )
@@ -26896,7 +26903,7 @@ pre_build = []
         "name: Template writer\n"
         "jobs:\n"
         "  render:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: |\n"
         "          cat <<'TEMPLATE' > render.sh\n"
@@ -26940,7 +26947,7 @@ pre_build = []
         "name: Template writer\n"
         "jobs:\n"
         "  render:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: |\n"
         "          cat <<TEMPLATE > render.sh\n"
@@ -27175,7 +27182,7 @@ pre_build = []
         "name: Provenance\n"
         "jobs:\n"
         "  build:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: bash scripts/z-target\n"
         "      - run: bash scripts/a-referrer\n"
@@ -27931,7 +27938,7 @@ pre_build = []
         "on: [push]\n"
         "jobs:\n"
         "  ordinary:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
     )
     if retired_main_publication_gate_errors(
         {GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow},
@@ -27943,7 +27950,7 @@ pre_build = []
         '\"main-publication-required-checks\"',
         '\"main-publication-required-check\\u0073\"',
     ):
-        resurrected = gateway_validation_workflow + f"  {retired_key}:\n    runs-on: ubuntu-latest\n"
+        resurrected = gateway_validation_workflow + f"  {retired_key}:\n    runs-on: ubuntu-26.04\n"
         if not retired_main_publication_gate_errors(
             {GATEWAY_WORKFLOW_FILENAME: resurrected}, "self-test workflow directory",
         ):
@@ -27986,7 +27993,7 @@ pre_build = []
                 f"{protected_name}"
             )
 
-    no_publish = "name: CI\npermissions:\n  contents: read\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    no_publish = "name: CI\npermissions:\n  contents: read\njobs:\n  test:\n    runs-on: ubuntu-26.04\n    steps: []\n"
     if validate_publish_control_contract(no_publish, "CI workflow"):
         failures.append("read-only nonpublishing CI was rejected")
     for job_name in CI_CACHE_OIDC_JOBS:
@@ -28067,7 +28074,7 @@ pre_build = []
             "on: [push]\n"
             "jobs:\n"
             "  build:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
             "      - run: |\n"
             + "".join(f"          {line}\n" for line in program.splitlines()),
@@ -28203,7 +28210,7 @@ pre_build = []
                     "name: Interpreted automation\n"
                     "jobs:\n"
                     "  build:\n"
-                    "    runs-on: ubuntu-latest\n"
+                    "    runs-on: ubuntu-26.04\n"
                     "    steps:\n"
                     "      - uses: ./.github/actions/setup\n"
                     f"      - run: {command}\n"
@@ -28267,7 +28274,7 @@ pre_build = []
                     "name: Shell-executed polyglot\n"
                     "jobs:\n"
                     "  build:\n"
-                    "    runs-on: ubuntu-latest\n"
+                    "    runs-on: ubuntu-26.04\n"
                     "    steps:\n"
                     "      - uses: ./.github/actions/setup\n"
                     f"      - run: {command}\n"
@@ -28533,7 +28540,7 @@ pre_build = []
             "on: [push]\n"
             "jobs:\n"
             f"  {job}:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    steps:\n" + upload
         )
 
@@ -28625,7 +28632,7 @@ pre_build = []
             "on: [push]\n"
             "jobs:\n"
             "  build:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    steps:\n" + steps
         )
 
@@ -28691,7 +28698,7 @@ pre_build = []
             "on: [push]\n"
             "jobs:\n"
             "  build:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             + defaults
             + "    steps:\n"
             "      - run: |\n"
@@ -28823,7 +28830,7 @@ pre_build = []
     ):
         failures.append("an appended privileged attestation step was not rejected")
     attacker_runner = attestation_workflow.replace(
-        "    runs-on: ubuntu-latest\n",
+        "    runs-on: ubuntu-26.04\n",
         "    runs-on: self-hosted\n",
         1,
     )
@@ -29041,7 +29048,7 @@ pre_build = []
                 "  docker-ebpf-tools-manifest:\n"
                 "    name: Docker eBPF Tools Manifest\n"
                 + RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS
-                + "    runs-on: ubuntu-latest\n",
+                + "    runs-on: ubuntu-26.04\n",
                 "  docker-ebpf-tools-manifest:\n"
                 "    name: Docker eBPF Tools Manifest\n"
                 + RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS
@@ -29055,7 +29062,7 @@ pre_build = []
                 + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
                 + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["name"]
                 + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
-                + "    runs-on: ubuntu-latest\n"
+                + "    runs-on: ubuntu-26.04\n"
                 + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME][
                     "permissions"
                 ]
@@ -29445,20 +29452,20 @@ pre_build = []
     smuggled_adoptions = {
         "added Cross build job": adopted_fixture_with_job(
             "  smuggled-cross:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
             f"      - run: cross build --target {TARGET}\n",
             "the smuggled Cross build",
         ),
         "added flow-spelled Cross build job": adopted_fixture_with_job(
             "  smuggled-flow-cross:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             f"    steps: [{{run: cross build --target {TARGET}}}]\n",
             "the smuggled flow-spelled Cross build",
         ),
         "added Cross configuration job": adopted_fixture_with_job(
             "  smuggled-cross-config:\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    env:\n"
             "      CROSS_CONFIG: attacker.toml\n"
             "    steps:\n"
@@ -29498,7 +29505,7 @@ pre_build = []
     injected_tools_upload = (
         "\n"
         "  unrelated:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - uses: actions/upload-artifact@v7\n"
         "        with:\n"
@@ -29657,7 +29664,7 @@ pre_build = []
                 f"    name: {display} live\n"
                 "    needs: changes\n"
                 "    if: needs.changes.outputs.relevant == 'true'\n"
-                "    runs-on: ubuntu-latest\n"
+                "    runs-on: ubuntu-26.04\n"
                 "    steps:\n"
                 "      - run: echo live\n"
             )
@@ -30088,7 +30095,7 @@ pre_build = []
             "jobs:\n"
             "  prose:\n"
             "    name: Prose control\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
             "      - run: |\n"
             "          echo 'name: Ambient Host UDP Live'\n"
@@ -30180,14 +30187,14 @@ pre_build = []
     )
     ambient_mutation(
         "job-level continue-on-error",
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n",
-        "    runs-on: ubuntu-24.04\n"
+        "    runs-on: ubuntu-26.04\n    timeout-minutes: 45\n",
+        "    runs-on: ubuntu-26.04\n"
         "    continue-on-error: true\n"
         "    timeout-minutes: 45\n",
     )
     ambient_mutation(
         "live-job runner replacement",
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n",
+        "    runs-on: ubuntu-26.04\n    timeout-minutes: 45\n",
         "    runs-on: self-hosted\n    timeout-minutes: 45\n",
     )
     ambient_mutation(
@@ -30255,7 +30262,7 @@ pre_build = []
         "jobs:\n"
         "  counterfeit:\n"
         "    name: Ambient Host UDP Live\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo counterfeit\n",
         "must have exactly one parsed direct job owner",
@@ -30268,7 +30275,7 @@ pre_build = []
         "  counterfeit:\n"
         "    name: Harmless name\n"
         "    name: Ambient Host UDP Live\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo counterfeit\n",
         "ambiguous duplicate direct name fields",
@@ -30280,7 +30287,7 @@ pre_build = []
         "jobs:\n"
         "    counterfeit:\n"
         "      name: Ambient Host UDP Live\n"
-        "      runs-on: ubuntu-latest\n"
+        "      runs-on: ubuntu-26.04\n"
         "      steps:\n"
         "        - run: \"true\"\n",
         "canonical two-space job key",
@@ -30289,7 +30296,7 @@ pre_build = []
         "root flow required owner",
         '{"name": "Counterfeit required check", "on": ["pull_request"], '
         '"jobs": {"counterfeit": {"name": "Ambient Host UDP Live", '
-        '"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}}}\n',
+        '"runs-on": "ubuntu-26.04", "steps": [{"run": "true"}]}}}\n',
         "exactly one literal top-level jobs: block",
     )
     ownership_mutation(
@@ -30300,7 +30307,7 @@ pre_build = []
         "  ? counterfeit\n"
         "  :\n"
         "    name: Ambient Host UDP Live\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: \"true\"\n",
         "plain two-space job-id: entry",
@@ -30312,7 +30319,7 @@ pre_build = []
         "jobs:\n"
         "  counterfeit:\n"
         '    "na\\u006de": "Ambient\\u0020Host\\u0020UDP\\u0020Live"\n'
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo counterfeit\n",
         "must have exactly one parsed direct job owner",
@@ -30325,7 +30332,7 @@ pre_build = []
         "  counterfeit:\n"
         "    name: |\n"
         "      Ambient Host UDP Live\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo counterfeit\n",
         "must have exactly one parsed direct job owner",
@@ -30339,7 +30346,7 @@ pre_build = []
         "    env:\n"
         "      REQUIRED_NAME: Ambient Host UDP Live\n"
         "    name: ${{ env.REQUIRED_NAME }}\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo counterfeit\n",
         "must have exactly one parsed direct job owner",
@@ -30353,7 +30360,7 @@ pre_build = []
         "    env:\n"
         "      REQUIRED_NAME: &required-name Ambient Host UDP Live\n"
         "    name: *required-name\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo counterfeit\n",
         "must have exactly one parsed direct job owner",
@@ -30365,7 +30372,7 @@ pre_build = []
         "jobs:\n"
         "  counterfeit:\n"
         "    name: !!str Ambient Host UDP Live\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo counterfeit\n",
         "must have exactly one parsed direct job owner",
@@ -30376,7 +30383,7 @@ pre_build = []
         "on: [pull_request]\n"
         "x-counterfeit: &counterfeit\n"
         "  name: Ambient Host UDP Live\n"
-        "  runs-on: ubuntu-latest\n"
+        "  runs-on: ubuntu-26.04\n"
         "jobs:\n"
         "  counterfeit:\n"
         "    <<: *counterfeit\n"
@@ -30688,7 +30695,7 @@ pre_build = []
             )
     fuzz_absent_workflow = (
         "name: Self-test CI\non:\n  pull_request:\njobs:\n"
-        "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+        "  other:\n    runs-on: ubuntu-26.04\n    steps:\n      - run: echo ok\n"
     )
     if admitted_fuzz_smoke_errors(fuzz_absent_workflow, "CI workflow"):
         failures.append("an absent fuzz-smoke job was rejected")
@@ -30915,7 +30922,7 @@ pre_build = []
     # every case below would pass for the wrong reason.
     aggregate_planner_job = (
         "  ci-plan:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - name: Plan\n"
         "        run: |\n"
@@ -30936,7 +30943,7 @@ pre_build = []
     )
     aggregate_lint_job = (
         "  lint:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo lint\n"
     )
@@ -30947,7 +30954,7 @@ pre_build = []
         "      - ci-plan\n"
         "      - lint\n"
         "      - build-binaries\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - name: Verify required CI aggregate wiring\n"
         "        run: python3 .github/scripts/verify_required_ci.py\n"
@@ -31117,7 +31124,7 @@ pre_build = []
     aggregate_unrelated_job = aggregate_adopted.replace(
         "  lint:\n",
         "  extra-tests:\n"
-        "    runs-on: ubuntu-latest\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: echo extra\n"
         "  lint:\n",

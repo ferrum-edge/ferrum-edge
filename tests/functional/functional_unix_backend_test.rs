@@ -436,6 +436,16 @@ plugin_configs: []
 #[tokio::test]
 #[ignore]
 async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
+    assert_unix_grpc_buffer_capacity_refusal(false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted() {
+    assert_unix_grpc_buffer_capacity_refusal(true).await;
+}
+
+async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
     use bytes::Bytes;
 
     let temp = TempDir::new().expect("temp dir");
@@ -451,10 +461,26 @@ async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
     });
     let (placeholder_port, _placeholder) = reserve_placeholder_port().await;
 
-    let config = grpc_h2c_config(
+    let mut config = grpc_h2c_config(
         socket_path.to_str().expect("utf-8 socket path"),
         placeholder_port,
     );
+    if grpc_web {
+        config = config.replace(
+            "    strip_listen_path: true",
+            "    strip_listen_path: true\n    plugins:\n      - plugin_config_id: \"grpc-web\"",
+        );
+        config = config.replace(
+            "plugin_configs: []",
+            r#"plugin_configs:
+  - id: "grpc-web"
+    plugin_name: "grpc_web"
+    scope: "proxy"
+    proxy_id: "unix-grpc"
+    enabled: true
+    config: {}"#,
+        );
+    }
     let env = EnvConfig {
         pool_warmup_enabled: false,
         log_level: "warn".into(),
@@ -488,7 +514,14 @@ async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("http://127.0.0.1:{port}/grpc/echo.Echo/Upload"))
-        .header("content-type", "application/grpc")
+        .header(
+            "content-type",
+            if grpc_web {
+                "application/grpc-web+proto"
+            } else {
+                "application/grpc"
+            },
+        )
         .header("te", "trailers")
         .body(())
         .expect("request");
@@ -508,20 +541,49 @@ async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
     };
-    assert_eq!(
-        header("grpc-status").as_deref(),
-        Some("8"),
-        "a buffer-capacity refusal is a Trailers-Only RESOURCE_EXHAUSTED"
-    );
-    assert_eq!(
-        header("grpc-message").as_deref(),
-        Some("Request buffering capacity exceeded")
-    );
+    if grpc_web {
+        assert_eq!(
+            header("content-type").as_deref(),
+            Some("application/grpc-web+proto")
+        );
+        assert_eq!(header("grpc-status"), None);
+        assert_eq!(header("grpc-message"), None);
+        assert_eq!(header("grpc-status-details-bin"), None);
+    } else {
+        assert_eq!(header("grpc-status").as_deref(), Some("8"));
+        assert_eq!(
+            header("grpc-message").as_deref(),
+            Some("Request buffering capacity exceeded")
+        );
+    }
     let mut body = response.into_body();
-    let data = tokio::time::timeout(Duration::from_secs(5), body.data())
-        .await
-        .expect("response body timeout");
-    assert!(data.is_none(), "a Trailers-Only response has no DATA");
+    let data = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("response DATA");
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .expect("release capacity");
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes
+    })
+    .await
+    .expect("response body timeout");
+    if grpc_web {
+        assert!(data.len() >= 5, "a complete gRPC-Web frame header");
+        assert_eq!(data[0], 0x80, "one gRPC-Web trailer frame");
+        assert_eq!(
+            u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize,
+            data.len() - 5
+        );
+        let trailers = std::str::from_utf8(&data[5..]).expect("terminal metadata");
+        assert!(trailers.contains("grpc-status: 8\r\n"));
+        assert!(trailers.contains("grpc-message: Request buffering capacity exceeded\r\n"));
+        assert!(body.trailers().await.expect("HTTP trailers").is_none());
+    } else {
+        assert!(data.is_empty(), "a Trailers-Only response has no DATA");
+    }
     assert_eq!(
         dials.load(Ordering::SeqCst),
         0,

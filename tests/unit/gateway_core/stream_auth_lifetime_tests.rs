@@ -3253,7 +3253,7 @@ fn both_buffered_grpc_authorization_exits_release_their_admission_state() {
         .skip(1)
         .map(|branch| {
             branch
-                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy")
+                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted")
                 .next()
                 .expect("bounded buffered gRPC authorization branch")
         })
@@ -7516,7 +7516,7 @@ fn cross_protocol_mesh_force_buffer_uses_the_composed_authorization_bound() {
         .find("H3RequestBodyReadError::DeadlineExceeded")
         .expect("mesh force-buffer DeadlineExceeded arm");
     let mesh_deadline = mesh_collection[mesh_deadline_start..]
-        .split("H3RequestBodyReadError::TimedOut")
+        .split("H3RequestBodyReadError::Read(error)")
         .next()
         .expect("bounded mesh force-buffer DeadlineExceeded arm");
     let mesh_deadline_compact: String = mesh_deadline

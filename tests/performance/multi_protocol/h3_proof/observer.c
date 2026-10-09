@@ -127,7 +127,7 @@ static const struct site attach_sites[] = {
 };
 static const struct site lifetime_sites[] = {
     {"inet_create", 4, {"net", "socket", "4", "4"}, "4"},
-    {"inet_bind", 3, {"socket", "sockaddr", "4"}, "4"},
+    {"inet_bind", 3, {"socket", "bind_address", "4"}, "4"},
 };
 static const struct site destroy_sites[] = {
     {"udp_destroy_sock", 1, {"sock"}, "void"},
@@ -144,10 +144,15 @@ static const struct site classic_sites[] = {
     {"reuseport_select_sock", 4, {"sock", "4", "sk_buff", "4"}, "sock"},
     {"run_bpf_filter", 5, {"sock_reuseport", "2", "bpf_prog", "sk_buff", "4"}, "sock"},
     {"reuseport_attach_prog", 2, {"sock", "bpf_prog"}, "4"},
-    {"inet_bind", 3, {"socket", "sockaddr", "4"}, "4"},
+    {"inet_bind", 3, {"socket", "bind_address", "4"}, "4"},
 };
 static bool matches(const struct btf *btf, __u32 type, const char *spec)
 {
+    // Linux 7.0 uses sockaddr_unsized for this unused inet_bind argument.
+    // The probes consume only the socket and return code. Keep the exact
+    // pointer identities, argument count, length and return checks enforced.
+    if (!strcmp(spec, "bind_address"))
+        return pointer_to(btf, type, "sockaddr") || pointer_to(btf, type, "sockaddr_unsized");
     if (!strcmp(spec, "int_ptr")) {
         const struct btf_type *t = resolve(btf, type);
         return t && btf_is_ptr(t) && integer(btf, t->type, 4);

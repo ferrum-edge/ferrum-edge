@@ -47,7 +47,7 @@ env:
 jobs:
   changes:
     name: Gateway API conformance trigger
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
@@ -133,7 +133,7 @@ jobs:
     if: needs.changes.outputs.relevant == 'true'
     # The host-built binary is packaged into a distroless Debian 13 image.
     # Pin the build host so its glibc stays no newer than the runtime image.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     env:
       KIND_CLUSTER_NAME: ferrum-gwapi
@@ -335,7 +335,7 @@ jobs:
       - changes
       - gateway-api-conformance
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Summarize Gateway API conformance result
         run: |

@@ -201,9 +201,9 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     );
     assert_eq!(
         mesh_collection.matches("cb_probe.release_neutral(").count(),
-        4,
+        5,
         "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch, \
-         including the shared request-buffer capacity refusal (#6009)"
+         including capacity, oversize, deadline, read failure, and timeout"
     );
 
     let oversize = mesh_collection
@@ -233,7 +233,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .find("H3RequestBodyReadError::DeadlineExceeded")
         .expect("missing mesh collection branch: DeadlineExceeded");
     let deadline = mesh_collection[deadline_start..]
-        .split("H3RequestBodyReadError::TimedOut")
+        .split("H3RequestBodyReadError::Read(error)")
         .next()
         .expect("bounded mesh collection DeadlineExceeded branch");
     let deadline_compact: String = deadline.chars().filter(|c| !c.is_whitespace()).collect();
@@ -274,6 +274,24 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         deadline_release < deadline_write,
         "DeadlineExceeded(None) must release the probe before the client-deadline terminal"
     );
+
+    let read_failure = mesh_collection
+        .split("H3RequestBodyReadError::Read(error)")
+        .nth(1)
+        .expect("missing mesh collection branch: Read")
+        .split("H3RequestBodyReadError::TimedOut")
+        .next()
+        .expect("bounded mesh collection Read branch");
+    let read_release = read_failure
+        .find("cb_probe.release_neutral()")
+        .expect("Read must release HALF_OPEN probe");
+    let disconnect_write = read_failure
+        .find("write_bridge_upload_client_disconnect(")
+        .expect("Read must finalize a disconnected upload");
+    let malformed_write = read_failure
+        .find("write_plain_gateway_error(")
+        .expect("Read must reject malformed uploads");
+    assert!(read_release < disconnect_write && read_release < malformed_write);
 
     let timeout = mesh_collection
         .split("H3RequestBodyReadError::TimedOut")
@@ -521,9 +539,28 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .find("halt_cancelled_h3_upload(")
         .expect("disconnected terminal upload must STOP_SENDING");
     let disconnected_finalize = disconnected
-        .find("finalize_h3_terminal_body_read_rejection(")
+        .find("boxed_finalize_h3_upload_read_failure(")
         .expect("disconnected terminal upload rejection finalizer");
     assert!(disconnected_halt < disconnected_finalize);
+    assert_eq!(
+        disconnected
+            .matches("boxed_finalize_h3_upload_read_failure(")
+            .count(),
+        1
+    );
+    let read_finalizer = src
+        .split("fn boxed_finalize_h3_upload_read_failure<'a>(")
+        .nth(1)
+        .expect("failed-read finalizer")
+        .split("/// Optional HTTP/3 listener settings")
+        .next()
+        .expect("bounded failed-read finalizer");
+    assert_eq!(
+        read_finalizer
+            .matches("finalize_h3_terminal_body_rejection_with_headers(")
+            .count(),
+        1
+    );
     assert!(
         !disconnected.contains("send_h3_plugin_reject_flavor_aware("),
         "a disconnected H3 stream must finalize cleanup without attempting a write"

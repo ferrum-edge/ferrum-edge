@@ -730,13 +730,21 @@ and inherited future tasks. It requires an actual perf enable/control receipt
 before client setup. Hardware cycles and kernel stacks are not selected.
 Raw perf.data, build IDs, header attributes, task/MMAP records, decoder exit
 status, loss/throttle records, per-TID samples, depth distribution, unresolved
-samples and folded/decoded call chains are retained. Matching mapped ELF/DSOs
+samples and folded/decoded call chains are retained. Stacks are decoded with
+physical DWARF frames and `--no-inline`; source inline-frame
+expansion is not claimed. Default expansion repeatedly stalled addr2line on the
+660.7 MiB production ELF and exceeded the unchanged 30-second decoder deadline.
+Raw-versus-decoded sample counts, loss, identity and admission gates still apply.
+Matching mapped ELF/DSOs
 come from the target mount namespace while alive, never substituted host libc.
 The gateway's retained ELF must match exactly one symbolized release twin.
 Only this disposable synthetic benchmark process's user stack memory may enter
 perf.data. Matching DSO packages are retained under `builds/<twin>/symfs`, with
-a separate 512 MiB ceiling that includes existing partial files and metadata
-reservations; repeat artifacts reference that package. Acquisition pins the
+a separate fixed 1 GiB ceiling that includes existing partial files and metadata
+reservations; repeat artifacts reference that package. H1 and H2/gRPC share this
+ceiling because the Ubuntu 26.04 symbolized production ELF measured 660.7 MiB,
+exceeding the previous 512 MiB ceiling. Retained metadata records the ceiling;
+prior repeats and failed partial files consume it. Acquisition pins the
 admitted target's root directory, walks every subsequent source component without
 following symlinks, and requires a regular file with the `/proc/<pid>/maps`
 device/inode. One pinned readable descriptor supplies ELF magic, bounded copy,

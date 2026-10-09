@@ -52,7 +52,7 @@ concurrency:
 jobs:
   checks:
     name: H1 profile feature checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -97,7 +97,7 @@ jobs:
 
   cadence:
     name: H1 live cadence (observer ${{ matrix.observer }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -164,7 +164,7 @@ jobs:
 
   trace-fixtures:
     name: H1 syscall and CPU capability fixtures (hosted only)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -175,7 +175,7 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
             -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libbpf-dev libelf-dev \
-            zlib1g-dev gcc libc6-dev binutils util-linux linux-tools-generic linux-tools-common python3-yaml
+            zlib1g-dev gcc libc6-dev binutils util-linux linux-perf linux-tools-generic linux-tools-common python3-yaml
       - name: Compile and lint shared observer and optimized DWARF fixture
         run: |
           set -euo pipefail
@@ -222,7 +222,7 @@ jobs:
     name: Hosted H1 calibration then cutoff observations
     if: github.event_name == 'workflow_dispatch'
     needs: [checks, cadence, trace-fixtures]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -243,7 +243,7 @@ jobs:
       - name: Hosted prerequisites and memory headroom
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-tools-generic linux-tools-common
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-perf linux-tools-generic linux-tools-common
           sudo fallocate -l 12G /mnt/h1-profile-swap
           sudo chmod 600 /mnt/h1-profile-swap
           sudo mkswap /mnt/h1-profile-swap

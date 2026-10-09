@@ -27,7 +27,7 @@ concurrency:
 jobs:
   contracts:
     name: Bounded streaming compiler-store contracts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -46,7 +46,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        github.ref == 'refs/heads/main' &&
        github.repository == 'ferrum-edge/ferrum-edge')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     # Match the isolated production Fuzz lane: it installs no mold linker.
     # An explicit empty RUSTFLAGS overrides root .cargo/config.toml flags.
@@ -108,7 +108,7 @@ jobs:
     name: Validate the handoff and publish an inert compiler-store image
     needs: produce
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -158,7 +158,7 @@ jobs:
   anonymous-reader:
     name: Restore the exact digest anonymously on a fresh runner
     needs: [produce, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -202,7 +202,7 @@ jobs:
     name: Delete only this invocation's handoff and registry version
     needs: [produce, publish, anonymous-reader]
     if: always() && needs.produce.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       actions: write

@@ -149,7 +149,7 @@ def main() -> int:
             "server_url": os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
         },
         "runner": {
-            "class": os.environ.get("BENCH_RUNNER_CLASS", "ubuntu-24.04"),
+            "class": os.environ.get("BENCH_RUNNER_CLASS", "ubuntu-26.04"),
             "name": os.environ.get("RUNNER_NAME"),
             "os": os.environ.get("RUNNER_OS") or platform.system(),
             "arch": os.environ.get("RUNNER_ARCH") or platform.machine(),

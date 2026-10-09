@@ -10,7 +10,7 @@ All gateways run with `--ulimit nofile=1048576:1048576`. The benchmark script is
 
 ## Results
 
-### CI — GitHub Actions (ubuntu-latest)
+### CI — GitHub Actions (ubuntu-26.04)
 
 **Environment**: 4+ cores, 65,536 FD limit (hard cap, unprivileged), `ip_local_port_range=1024-65535`, Docker `--network host`.
 

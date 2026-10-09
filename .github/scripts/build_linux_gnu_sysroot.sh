@@ -3,7 +3,7 @@
 # linked GLIBC symbols cannot track the GitHub-hosted runner image.
 #
 # Cargo output is isolated under /src/target/linux-gnu-sysroot so a restored
-# native ubuntu-latest `target/<triple>/release` tree cannot contaminate the
+# native ubuntu-26.04 `target/<triple>/release` tree cannot contaminate the
 # pinned sysroot link. After a successful container build, only the two
 # regular, non-symlink binaries are copied to the canonical paths consumed
 # by ABI scans and artifact uploads.

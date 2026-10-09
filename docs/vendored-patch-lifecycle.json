@@ -119,8 +119,21 @@
         "trigger": "A compatible SQLx release preserves native REAL/DOUBLE typed-NULL parameter types and passes the hosted PostgreSQL regression. Retain the vendor while patch 001 remains.",
         "co_retirement_group": null,
         "compatible_release_test": {
-          "status": "not_started",
-          "notes": "Upstream fixed the reversed arms in launchbadge/sqlx#4359 (merged 2026-08-19 on main, after v0.9.0). No released SQLx contains it yet; v0.8.6 and v0.9.0 still reverse them."
+          "status": "blocked",
+          "notes": "Reviewed 2026-10-09: latest stable SQLx/sqlx-core 0.9.0 still binds REAL NULL through f64 and DOUBLE NULL through f32. Upstream main fixes the arms in PR #4359, but no released replacement contains that fix. Preserve the hosted PostgreSQL regression and retain the vendor while patch 001 remains."
+        },
+        "merged_release_hold": {
+          "reviewed_on": "2026-10-09",
+          "expires_on": "2026-11-08",
+          "owner": "Ferrum Edge maintainers",
+          "latest_release": "0.9.0",
+          "merge_commit": "80f44db8073e9a6a61ef6488eb15341554716d35",
+          "reason": "The latest stable release lacks the merged typed-float NULL fix; retain the vendor pending a compatible release and hosted PostgreSQL qualification.",
+          "evidence": [
+            "https://docs.rs/crate/sqlx-core/0.9.0/source/src/any/arguments.rs",
+            "https://github.com/transact-rs/sqlx/blob/v0.9.0/sqlx-core/src/any/arguments.rs",
+            "https://github.com/transact-rs/sqlx/pull/4359"
+          ]
         }
       },
       "regression_tests": [
