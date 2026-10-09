@@ -5,6 +5,7 @@ on:
     paths:
       - tests/performance/multi_protocol/h2_cpu_profile.py
       - tests/performance/multi_protocol/h1_trace.py
+      - tests/performance/multi_protocol/h1_trace_commands.sh
       - tests/performance/multi_protocol/process_usage.py
       - tests/performance/multi_protocol/src/process_usage.rs
       - tests/performance/multi_protocol/run_gateway_protocol_bench.sh

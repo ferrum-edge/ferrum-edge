@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   660.7 MiB symbolized production binary, exceeding the old 512 MiB ceiling.
   Mapped inode, byte equality, build ID, deadline and shared-package checks
   remain enforced; retained metadata records the fixed ceiling.
+  Physical DWARF decoding disables perf's default inline-source expansion after
+  addr2line repeatedly exceeded the 30-second decoder bound on that ELF. Inline
+  source frames remain an explicit diagnostic limitation; sample-count, loss,
+  identity and capture-completeness checks retain their existing requirements.
 
 - The scheduled scaling verifier's positive self-test places run identity checks
   in its production section, matching the production-only admission rule. Event,

@@ -1160,6 +1160,8 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
     if result['unresolved_samples'] or result['multi_frame_samples'] != result['samples']:
         issues.append('partial unwinding/unresolved samples')
     result.update(issues=issues, samples_complete=not issues, decoder_status=decoded,
+                  inline_expansion=False,
+                  stack_scope='symbolized physical DWARF frames; inline source frames not expanded',
                   unretained_virtual_dsos=virtual_dsos,
                   header_status=header, buildid_status=buildids, attributes_status=attributes, attributes_verified=attributes_verified,
                   attribute_validation=attribute_validation,
