@@ -174,6 +174,7 @@ mod pool_profile_tests;
 mod pool_sharding_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;
+mod proxy_hop_limit_tests;
 mod proxy_protocol_tests;
 mod proxy_tests;
 mod relay_flush_progress_tests;

@@ -1,7 +1,7 @@
 //! Header, log, and metrics `error_class` vocabularies (issues #4396, #4399,
 //! #4397).
 //!
-//! `X-Gateway-Error` stays on the coarse eight-token set. HTTP metrics and
+//! `X-Gateway-Error` stays on the coarse nine-token set. HTTP metrics and
 //! access logs use granular [`ErrorClass::as_str`] when a class exists.
 
 use std::collections::HashMap;
@@ -204,15 +204,15 @@ fn header_stays_coarse_while_metrics_and_logs_stay_granular() {
 }
 
 #[test]
-fn http_metrics_cardinality_is_error_class_all_plus_five_gateway_tokens() {
-    assert_eq!(HTTP_OBSERVABILITY_ERROR_CLASSES.len(), 8);
-    assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 5);
+fn http_metrics_cardinality_is_error_class_all_plus_six_gateway_tokens() {
+    assert_eq!(HTTP_OBSERVABILITY_ERROR_CLASSES.len(), 9);
+    assert_eq!(HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(), 6);
     assert_eq!(ErrorClass::ALL.len(), 19);
     assert_eq!(
         ErrorClass::ALL.len() + HTTP_METRICS_GATEWAY_ERROR_CLASSES.len(),
         HTTP_METRICS_ERROR_CLASS_BOUND
     );
-    assert_eq!(HTTP_METRICS_ERROR_CLASS_BOUND, 24);
+    assert_eq!(HTTP_METRICS_ERROR_CLASS_BOUND, 25);
 
     let mut header_seen = std::collections::HashSet::new();
     for token in HTTP_OBSERVABILITY_ERROR_CLASSES {

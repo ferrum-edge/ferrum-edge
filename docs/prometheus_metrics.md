@@ -272,15 +272,16 @@ Label sets are bounded by *configuration*, never by traffic or endpoint churn:
 `ferrum_requests_total{error_class}` is optional and closed. When an
 `ErrorClass` exists on a 5xx, the label is that class's `as_str`
 (`dns_lookup_error`, `connection_refused`, `tls_error`, `read_write_timeout`,
-…). When a gateway-authored 503 has no `ErrorClass`, the label is one of
-`circuit_breaker_open` / `overload` / `config_stale` / `concurrency_limit`.
+…). When a gateway-authored 5xx has no `ErrorClass`, the label is one of
+`circuit_breaker_open` / `overload` / `config_stale` / `concurrency_limit` /
+`loop_detected`.
 A backend 5xx with neither a class nor a gateway phase carries
 `backend_error`, matching its `X-Gateway-Error` header so the two can be
-joined. 2xx/3xx/4xx omit the label. Cardinality bound is **24** compiled-in
+joined. 2xx/3xx/4xx omit the label. Cardinality bound is **25** compiled-in
 tokens.
 
-`X-Gateway-Error` stays on the coarser eight-token header vocabulary
-(`connection_failure` / `backend_timeout` / `backend_error` plus the four
+`X-Gateway-Error` stays on the coarser nine-token header vocabulary
+(`connection_failure` / `backend_timeout` / `backend_error` plus the five
 gateway tokens and the header-only `request_timeout`; a route-deadline `504`
 that token covers is labelled `dispatch_policy_rejected` here). Access-log
 `error_class` stays granular `ErrorClass::as_str` on every status. Mapping: [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).

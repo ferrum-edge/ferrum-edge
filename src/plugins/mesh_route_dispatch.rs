@@ -558,6 +558,15 @@ fn compile_transform_field(
     // consumer assertion namespace, matching `request_transformer` admission.
     if field == "request_transform" {
         for (idx, rule) in parsed.iter().enumerate() {
+            // The gateway's `X-Ferrum-Hops` loop-guard count is refused for
+            // every operation, removal included: resetting it would let a
+            // request loop run past `FERRUM_MAX_PROXY_HOPS`.
+            if crate::proxy::hop_limit::is_proxy_hops_header(&rule.key) {
+                return Err(format!(
+                    "`{context}[{idx}].key` is the gateway-owned `x-ferrum-hops` proxy hop \
+                     count and cannot be a `request_transform` target"
+                ));
+            }
             match rule.operation {
                 crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Remove => {}
                 crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Add

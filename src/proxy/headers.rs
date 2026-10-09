@@ -498,6 +498,11 @@ fn is_retained_connection_option(token: &str) -> bool {
 /// assertion and fall back to that proxy's socket address, evading per-IP
 /// deny lists and limits. The backend boundary regenerates or strips these
 /// fields regardless, and the rewritten `Connection` no longer lists them.
+///
+/// `x-ferrum-hops` is the gateway's own loop-guard count
+/// ([`crate::proxy::hop_limit`]): the frontend has already replaced the
+/// client's value with the forwarded count, and a nomination that removed it
+/// would reset the count the next gateway hop reads.
 #[inline]
 fn is_ingress_protected_nominated_field(name: &str, real_ip_header: Option<&str>) -> bool {
     matches!(
@@ -511,6 +516,7 @@ fn is_ingress_protected_nominated_field(name: &str, real_ip_header: Option<&str>
             | "x-forwarded-port"
             | "x-forwarded-proto"
             | "x-real-ip"
+            | crate::proxy::hop_limit::PROXY_HOPS_HEADER
     ) || real_ip_header == Some(name)
 }
 

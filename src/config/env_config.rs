@@ -2859,6 +2859,10 @@ pub struct EnvConfig {
     pub max_single_header_size_bytes: usize,
     /// Maximum number of request headers allowed. 0 = unlimited.
     pub max_header_count: usize,
+    /// Gateway hops (`X-Ferrum-Hops`) an HTTP-family request may already have
+    /// crossed before this gateway refuses it with `508 Loop Detected`
+    /// (issue #6109). `0` disables the limit; the `u8` type bounds it to 255.
+    pub max_proxy_hops: u8,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
     /// Fail-closed per-response ceiling applied when the effective response-body
@@ -4308,6 +4312,7 @@ impl Default for EnvConfig {
             max_header_size_bytes: 32_768,
             max_single_header_size_bytes: 16_384,
             max_header_count: 100,
+            max_proxy_hops: crate::proxy::hop_limit::DEFAULT_MAX_PROXY_HOPS,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
             response_buffer_fallback_max_bytes:
@@ -4972,6 +4977,7 @@ impl EnvConfig {
             max_header_size_bytes: usize = "FERRUM_MAX_HEADER_SIZE_BYTES" => 32_768usize;
             max_single_header_size_bytes: usize = "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES" => 16_384usize;
             max_header_count: usize = "FERRUM_MAX_HEADER_COUNT" => 100usize;
+            max_proxy_hops: u8 = "FERRUM_MAX_PROXY_HOPS" => crate::proxy::hop_limit::DEFAULT_MAX_PROXY_HOPS;
             max_request_body_size_bytes: usize = "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES" => 10_485_760usize;
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
             response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
@@ -5860,6 +5866,7 @@ impl EnvConfig {
             max_header_size_bytes,
             max_single_header_size_bytes,
             max_header_count,
+            max_proxy_hops,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
             response_buffer_fallback_max_bytes,

@@ -693,13 +693,13 @@ When proxying to upstream targets, the gateway adds response headers that help c
 ### `X-Gateway-Error`
 
 Set on 5xx responses to categorize the failure. This is the **stable
-client-facing contract** — a closed set of eight `&'static str` tokens.
+client-facing contract** — a closed set of nine `&'static str` tokens.
 Access-log `error_class` and `ferrum_requests_total{error_class}` use the
 **granular** `ErrorClass::as_str` spelling when a class exists
-(`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus five
+(`dns_lookup_error`, `connection_refused`, `tls_error`, …) plus six
 gateway-authored tokens when there is no `ErrorClass` (`circuit_breaker_open`,
-`overload`, `config_stale`, `concurrency_limit`, and `backend_error` for an
-unclassified backend 5xx). Map
+`overload`, `config_stale`, `concurrency_limit`, `loop_detected`, and
+`backend_error` for an unclassified backend 5xx). Map
 each granular class to its header token in
 [error_classification.md](error_classification.md#http-observability-vocabulary-x-gateway-error).
 The header is omitted on 2xx/3xx/4xx.
@@ -714,6 +714,7 @@ The header is omitted on 2xx/3xx/4xx.
 | `config_stale` | Data-plane stale-config fence; the gateway returned 503 without contacting a backend |
 | `concurrency_limit` | `adaptive_concurrency` admission shed; the gateway returned 503 without contacting a backend |
 | `request_timeout` | A matched route rule's total request deadline expired before any backend held the request (client upload, gateway-local phases, admission, or retry backoff); the gateway returned 504 |
+| `loop_detected` | The request already crossed `FERRUM_MAX_PROXY_HOPS` Ferrum gateway hops (`X-Ferrum-Hops`), so the gateway returned 508 Loop Detected before routing; usually a route whose upstream resolves back to the gateway. See [Proxy hop limit](routing.md#proxy-hop-limit) |
 
 `request_timeout` is distinct from `backend_timeout`: no backend saw the
 request, so on-call should not look for it in backend logs.
@@ -795,7 +796,7 @@ HTTP/1.1 200 OK
 
 ### Use Cases
 
-- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. PromQL on `ferrum_requests_total{error_class}` uses the granular spelling (`dns_lookup_error` vs `connection_refused` vs `read_write_timeout`) plus the five gateway-authored tokens; it does **not** emit `connection_failure` or `backend_timeout`, and it emits `backend_error` only for a backend 5xx the gateway never classified.
+- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`). Alert on `overload`, `config_stale`, and `concurrency_limit` to distinguish gateway-authored sheds from backend 503s. PromQL on `ferrum_requests_total{error_class}` uses the granular spelling (`dns_lookup_error` vs `connection_refused` vs `read_write_timeout`) plus the six gateway-authored tokens; it does **not** emit `connection_failure` or `backend_timeout`, and it emits `backend_error` only for a backend 5xx the gateway never classified.
 - **Client-side retry**: Clients can decide whether to retry based on the error type — connection failures may resolve quickly, while backend errors suggest the service itself is unhealthy.
 - **Dashboards**: Track `X-Gateway-Upstream-Status: degraded` to monitor when upstreams are operating in fallback mode.
 - **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open`, `overload`, `config_stale`, or `concurrency_limit` means the gateway short-circuited the request locally. A `request_timeout` means the route's total deadline ran out before any backend held the request.

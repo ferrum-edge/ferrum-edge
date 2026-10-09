@@ -175,7 +175,7 @@ impl ErrorClass {
     /// Every compiled-in [`ErrorClass`] variant. Stream `error_class` metrics
     /// labels are drawn only from [`Self::as_str`] of this set (or omitted).
     /// HTTP `ferrum_requests_total{error_class}` uses the same strings plus
-    /// the five gateway-authored tokens in
+    /// the six gateway-authored tokens in
     /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
     pub const ALL: &'static [ErrorClass] = &[
         Self::ConnectionTimeout,
@@ -221,8 +221,12 @@ pub const OBS_CONCURRENCY_LIMIT: &str = "concurrency_limit";
 /// backoff). Distinct from `backend_timeout`, which always means a backend
 /// held the request and did not answer in time.
 pub const OBS_REQUEST_TIMEOUT: &str = "request_timeout";
+/// The request had already crossed `FERRUM_MAX_PROXY_HOPS` gateway hops
+/// (`X-Ferrum-Hops`), so the gateway refused it with `508 Loop Detected`
+/// before routing (issue #6109). No backend was contacted.
+pub const OBS_LOOP_DETECTED: &str = "loop_detected";
 
-/// Closed `X-Gateway-Error` vocabulary. Cardinality bound: **8**.
+/// Closed `X-Gateway-Error` vocabulary. Cardinality bound: **9**.
 /// Header spelling is independent of `ferrum_requests_total{error_class}`
 /// and of access-log `error_class` (those use [`ErrorClass::as_str`] plus
 /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]).
@@ -241,10 +245,11 @@ pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
     OBS_CONFIG_STALE,
     OBS_CONCURRENCY_LIMIT,
     OBS_REQUEST_TIMEOUT,
+    OBS_LOOP_DETECTED,
 ];
 
 /// `ferrum_requests_total{error_class}` tokens that have no [`ErrorClass`]
-/// variant. Four are gateway-authored rejects; `backend_error` is the
+/// variant. Five are gateway-authored rejects; `backend_error` is the
 /// fallback for a backend 5xx the gateway never classified, so that series
 /// stays selectable and agrees with its `X-Gateway-Error` header. Combined
 /// with [`ErrorClass::ALL`] they are the closed HTTP metrics label set
@@ -260,16 +265,17 @@ pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
     OBS_OVERLOAD,
     OBS_CONFIG_STALE,
     OBS_CONCURRENCY_LIMIT,
+    OBS_LOOP_DETECTED,
     OBS_BACKEND_ERROR,
 ];
 
 /// Closed `ferrum_requests_total{error_class}` vocabulary.
 ///
-/// Cardinality bound: **24** = [`ErrorClass::ALL`] (19) plus the five
+/// Cardinality bound: **25** = [`ErrorClass::ALL`] (19) plus the six
 /// tokens in [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`].
 /// Values are compiled-in `&'static str` only — never an error message,
 /// never a client- or backend-influenced string. `X-Gateway-Error` stays
-/// on the coarser eight-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
+/// on the coarser nine-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
 /// map each granular class to its header token with
 /// [`x_gateway_error_token_for_class`].
 // The closed label sets and their interners exist so the external `tests/`
@@ -278,7 +284,7 @@ pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
 // `OBS_*` constants and the classifier functions, so the `ferrum-edge`
 // binary target reports these as dead code.
 #[allow(dead_code)]
-pub const HTTP_METRICS_ERROR_CLASS_BOUND: usize = 24;
+pub const HTTP_METRICS_ERROR_CLASS_BOUND: usize = 25;
 
 /// Map a backend-path HTTP status plus the pre-wire flag onto the closed
 /// `X-Gateway-Error` vocabulary. `None` for non-5xx without a connection
@@ -317,7 +323,7 @@ pub fn x_gateway_error_token_for_class(class: ErrorClass) -> &'static str {
     }
 }
 
-/// Intern a gateway-authored rejection-phase name onto the four metrics
+/// Intern a gateway-authored rejection-phase name onto the five metrics
 /// tokens that have no [`ErrorClass`]. Unknown phases return `None` so
 /// attacker-controlled strings cannot become metrics labels.
 #[inline]
@@ -327,12 +333,13 @@ pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
         "adaptive_concurrency" => Some(OBS_CONCURRENCY_LIMIT),
         "overload" => Some(OBS_OVERLOAD),
         "config_stale" => Some(OBS_CONFIG_STALE),
+        crate::proxy::hop_limit::PROXY_HOP_LIMIT_REJECTION_PHASE => Some(OBS_LOOP_DETECTED),
         _ => None,
     }
 }
 
 /// Intern a candidate `X-Gateway-Error` token. Values outside the closed
-/// eight-token header set are rejected rather than forwarded.
+/// nine-token header set are rejected rather than forwarded.
 #[inline]
 // The closed label sets and their interners exist so the external `tests/`
 // crate can prove the vocabulary is bounded and that no out-of-set string
@@ -372,8 +379,8 @@ pub fn intern_http_metrics_error_class(value: &str) -> Option<&'static str> {
 
 /// HTTP `ferrum_requests_total{error_class}` label for one transaction.
 ///
-/// Closed set: [`ErrorClass::ALL`] (`as_str`) plus the five gateway-authored
-/// tokens. Cardinality bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`] (24).
+/// Closed set: [`ErrorClass::ALL`] (`as_str`) plus the six gateway-authored
+/// tokens. Cardinality bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`] (25).
 ///
 /// When an [`ErrorClass`] is present on a 5xx, the label is that class's
 /// `as_str` so `dns_lookup_error` stays distinguishable from

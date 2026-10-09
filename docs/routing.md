@@ -351,6 +351,27 @@ RFC 9110 §7.6.2 requires an intermediary that forwards `OPTIONS` to process the
 - A protected route still returns its normal 401/403 before the hop budget is consulted, a CORS preflight carrying `Max-Forwards: 0` is still answered by the `cors` plugin, and response-phase plugins decorate the 204/400 exactly as they decorate any other gateway-local rejection. Transaction logs record `metadata.rejection_phase = "max_forwards"`.
 - Only `OPTIONS` is processed. Every other method keeps its existing behaviour and forwards the field unchanged; `TRACE` stays rejected with 405 before routing.
 
+### Proxy hop limit
+
+A route whose upstream resolves back to the gateway itself (a control plane that admitted a self-referencing target, or DNS that changed after the route was published) would otherwise turn every request into an unbounded loop. The gateway carries its own hop count on every HTTP-family request in the gateway-owned `X-Ferrum-Hops` request header and refuses a request that already crossed `FERRUM_MAX_PROXY_HOPS` gateway hops (default `10`).
+
+The check runs once per inbound request on the HTTP/1.1, HTTP/2, and native HTTP/3 frontends, so it covers plain HTTP, gRPC, gRPC-Web, the HTTP/3 bridge, and HTTP/1.1, RFC 8441, and RFC 9220 WebSocket upgrades. It runs before routing, authentication, or any plugin, right after the overload and stale-configuration admission fences:
+
+| Received `X-Ferrum-Hops` | Gateway behaviour |
+|---|---|
+| absent | Treated as `0`; forwarded with `X-Ferrum-Hops: 1`. |
+| `N`, N < `FERRUM_MAX_PROXY_HOPS` | Forwarded with `X-Ferrum-Hops: N+1`. |
+| `N`, N ≥ `FERRUM_MAX_PROXY_HOPS` | **508 Loop Detected** with `{"error":"Proxy hop limit exceeded"}` and `X-Gateway-Error: loop_detected` (gRPC and gRPC-Web: Trailers-Only `RESOURCE_EXHAUSTED`). No backend is contacted. |
+| malformed (`abc`, `-1`, `1.0`, empty) or repeated field lines | **400 Bad Request** with `{"error":"Invalid X-Ferrum-Hops header"}` (gRPC: `INVALID_ARGUMENT`). |
+
+- The forwarded value always replaces the client's field lines before anything reads the request, so every backend transport (reqwest, direct HTTP/2, native gRPC, the HTTP/3 client and bridge, WebSocket handshakes, HBONE and mesh-mTLS, retries, `request_mirror`) sends the incremented count. A client can only raise the count, never reset it, so a loop always terminates within `FERRUM_MAX_PROXY_HOPS` hops no matter what the first request carried.
+- A malformed value is refused rather than reset to `0`: Ferrum never writes one, so it can only come from a client or an intermediary that mangles the field, and treating it as `0` would let a loop through such an intermediary run unbounded.
+- The header is gateway-owned. `request_transformer` header rules (add, update, rename, remove), `mesh_route_dispatch` `request_transform` rules, `correlation_id`'s `header_name`, JWT/claim header mappings, and MCP OpenAPI bridge header arguments that name `X-Ferrum-Hops` (any case, `_` or `-`) are refused at plugin admission, and the gateway re-asserts its value on the outbound map after the request-phase plugins run, so no plugin can reset the count. A `Connection: X-Ferrum-Hops` nomination does not remove it either.
+- `FERRUM_MAX_PROXY_HOPS=0` disables the limit: the field is neither checked nor written, and a client value passes through as an ordinary header. The accepted range is `0`–`255`.
+- Each Ferrum hop counts. A service mesh adds two hops per service call (outbound plus inbound sidecar) when the application propagates the header, and gateway tiers (edge gateway in front of an internal gateway) add one each, so raise the limit for deep call chains.
+- The refusal is an admission fence, like the overload and stale-configuration `503`s: no route is matched, so no plugin decorates or logs it. It increments the status counters, mints a [diagnostic reference](error_classification.md#gateway-diagnostic-references) when references are enabled, and emits a rate-limited `warn!` that names no header value.
+- `tcp`, `tcp_tls`, `udp`, and `dtls` stream proxies relay opaque bytes and carry no request headers, so the limit does not apply to them.
+
 ## WebSocket Origin admission
 
 Browsers do not apply the CORS protocol to WebSocket upgrade handshakes. The `cors`

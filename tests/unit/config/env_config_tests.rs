@@ -3891,6 +3891,55 @@ fn test_env_config_max_header_count_custom() {
 }
 
 #[test]
+fn test_env_config_max_proxy_hops_defaults_to_ten() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_PROXY_HOPS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_proxy_hops, 10);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_proxy_hops_accepts_zero_through_255() {
+    for (raw, expected) in [("0", 0u8), ("1", 1), ("32", 32), ("255", 255)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_MAX_PROXY_HOPS", raw),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.max_proxy_hops, expected, "{raw}");
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_max_proxy_hops_refuses_out_of_range_values() {
+    for raw in ["256", "-1", "ten"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_MAX_PROXY_HOPS", raw),
+            ],
+            || {
+                let err = EnvConfig::from_env().expect_err("out-of-range hop limit must fail");
+                assert!(err.contains("FERRUM_MAX_PROXY_HOPS"), "{raw}: {err}");
+            },
+        );
+    }
+}
+
+#[test]
 fn test_env_config_max_url_length_bytes_default() {
     with_env_vars(
         &[

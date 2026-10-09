@@ -1,6 +1,6 @@
 //! Gateway-owned diagnostic references (issue #5767).
 //!
-//! `X-Gateway-Error` is a closed, coarse, eight-token public vocabulary: one
+//! `X-Gateway-Error` is a closed, coarse, nine-token public vocabulary: one
 //! token (`connection_failure`, say) covers DNS, TCP, TLS, pool, and egress
 //! policy failures, and the precise `error_class` behind it reaches only the
 //! operator's logs. This module adds an additive, opt-in bridge between the
@@ -226,6 +226,7 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "config_stale",
     "client_trust_withdrawn",
     "overload",
+    crate::proxy::hop_limit::PROXY_HOP_LIMIT_REJECTION_PHASE,
     "allowed_methods",
     "max_forwards",
     "backend_max_connections",
