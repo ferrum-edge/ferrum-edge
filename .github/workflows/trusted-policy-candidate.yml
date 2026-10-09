@@ -53,3 +53,23 @@ jobs:
       # Read-only hosted evidence, never an admission or publication authority.
       - name: Verify protoc checksum before any extraction
         run: python3 -I .github/scripts/tests/test_cross_build_inputs.py
+
+  native-arm64-smoke:
+    name: Ubuntu 26.04 native Arm64 build smoke
+    # The other native Arm64 runners only execute during publication. Exercise
+    # their new image on the branch with a build and startup, without publishing.
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: ci-native-arm64-smoke
+      - name: Build native Linux binaries
+        run: cargo build --locked --bin ferrum-edge --bin ferrum-cni
+      - name: Start the native gateway
+        run: ./target/debug/ferrum-edge --version
