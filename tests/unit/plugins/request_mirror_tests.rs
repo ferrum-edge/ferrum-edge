@@ -6484,3 +6484,64 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+/// The mirror carries the request's gateway hop count (`received + 1`) as
+/// exactly one `X-Ferrum-Hops` field line, replacing the copied outbound value
+/// (on a mesh inbound route that copy holds the RECEIVED count) and any copied
+/// `_` spelling, so a mirror target that resolves back to the gateway is refused
+/// at the proxy hop limit like a looping route (issue #6128). With the limit
+/// disabled the copied value passes through as an ordinary header.
+#[tokio::test]
+async fn mirror_carries_the_proxy_hop_count_instead_of_the_copied_value() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (outbound_proxy_hops, expected) in [(Some(3), vec!["3"]), (None, vec!["2"])] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let server_url = url::Url::parse(&server.uri()).unwrap();
+        let plugin = RequestMirror::new(
+            &json!({
+                "mirror_host": server_url.host_str().unwrap(),
+                "mirror_port": server_url.port().unwrap(),
+                "percentage": 100,
+                "mirror_request_body": false
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx_with_proxy();
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        let mut headers = HashMap::from([
+            ("x-ferrum-hops".to_string(), "2".to_string()),
+            ("x_ferrum_hops".to_string(), "0".to_string()),
+        ]);
+        plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.collect_mirror_result(),
+        )
+        .await
+        .expect("the mirror request must complete");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+        assert_eq!(
+            received[0].headers.contains_key("x_ferrum_hops"),
+            outbound_proxy_hops.is_none(),
+            "a copied `_` spelling is dropped only while the gateway stamps its own count"
+        );
+    }
+}

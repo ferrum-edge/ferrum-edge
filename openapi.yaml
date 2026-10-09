@@ -28127,7 +28127,9 @@ components:
             type: string
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             not:
-              pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
+              anyOf:
+                - pattern: '^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]$'
+                - pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss]$'
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
@@ -28136,7 +28138,9 @@ components:
             Static HTTP headers sent to OPA on every decision request. Names use
             HTTP token syntax and values are visible ASCII (plus tab). The
             `content-type` header is managed by the plugin and cannot be
-            configured here, case-insensitively.
+            configured here, case-insensitively. Neither can the gateway-owned
+            `X-Ferrum-Hops` proxy hop count (any case, `_` or `-`), which the
+            decision request carries itself.
           example:
             Authorization: "Bearer opa-client-token"
         timeout_ms:
@@ -34916,7 +34920,9 @@ components:
         semantic_embedding_auth_header:
           type: string
           pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+(?![\s\S])'
-          description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key.
+          not:
+            pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss](?![\s\S])'
+          description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key. Must not be the gateway-owned X-Ferrum-Hops proxy hop count (any case, `_` or `-`), which the embedding call carries itself.
         semantic_embedding_auth_scheme:
           type: string
           pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'

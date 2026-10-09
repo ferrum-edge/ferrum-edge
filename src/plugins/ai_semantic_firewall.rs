@@ -1135,7 +1135,12 @@ impl AiSemanticFirewall {
 
         let outcome = self
             .engine
-            .evaluate(Direction::Request, &segments, &ctx.plugin_http_call_ns)
+            .evaluate(
+                Direction::Request,
+                &segments,
+                &ctx.plugin_http_call_ns,
+                crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            )
             .await;
         if self
             .engine
@@ -1249,7 +1254,12 @@ impl AiSemanticFirewall {
 
         let outcome = self
             .engine
-            .evaluate(Direction::Response, &segments, &ctx.plugin_http_call_ns)
+            .evaluate(
+                Direction::Response,
+                &segments,
+                &ctx.plugin_http_call_ns,
+                crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            )
             .await;
         if self
             .engine
@@ -1280,6 +1290,7 @@ impl FirewallEngine {
         direction: Direction,
         segments: &[TextSegment],
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> EvaluationOutcome {
         let mut matches = self.lexical_matches(direction, segments);
         let has_reject_match = matches.iter().any(|m| m.action == Action::Reject);
@@ -1291,7 +1302,13 @@ impl FirewallEngine {
             && let Some(provider) = &self.provider
         {
             match self
-                .semantic_matches(provider, direction, segments, plugin_http_call_ns)
+                .semantic_matches(
+                    provider,
+                    direction,
+                    segments,
+                    plugin_http_call_ns,
+                    proxy_hops,
+                )
                 .await
             {
                 Ok(mut semantic_matches) => {
@@ -1376,6 +1393,7 @@ impl FirewallEngine {
         direction: Direction,
         segments: &[TextSegment],
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<Vec<RuleMatch>, String> {
         // Filter candidate segments BEFORE touching the provider. A request whose
         // extracted segments have no active semantic rule for this direction (e.g.
@@ -1399,7 +1417,7 @@ impl FirewallEngine {
         }
 
         let index = self
-            .rule_embedding_index(provider, plugin_http_call_ns)
+            .rule_embedding_index(provider, plugin_http_call_ns, proxy_hops)
             .await?;
 
         let segment_inputs: Vec<String> = candidate_segments
@@ -1407,7 +1425,7 @@ impl FirewallEngine {
             .map(|segment| segment.text.clone())
             .collect();
         let segment_embeddings = self
-            .embed_texts(provider, &segment_inputs, plugin_http_call_ns)
+            .embed_texts(provider, &segment_inputs, plugin_http_call_ns, proxy_hops)
             .await?;
 
         let mut matches = Vec::new();
@@ -1465,10 +1483,11 @@ impl FirewallEngine {
         &self,
         provider: &ProviderConfig,
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<Arc<RuleEmbeddingIndex>, String> {
         self.rule_embeddings
             .get_or_try_init(|| async {
-                self.build_rule_embedding_index(provider, plugin_http_call_ns)
+                self.build_rule_embedding_index(provider, plugin_http_call_ns, proxy_hops)
                     .await
                     .map(Arc::new)
             })
@@ -1480,6 +1499,7 @@ impl FirewallEngine {
         &self,
         provider: &ProviderConfig,
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<RuleEmbeddingIndex, String> {
         let mut inputs = Vec::new();
         let mut rule_ranges = Vec::new();
@@ -1497,7 +1517,7 @@ impl FirewallEngine {
         }
 
         let embeddings = self
-            .embed_texts(provider, &inputs, plugin_http_call_ns)
+            .embed_texts(provider, &inputs, plugin_http_call_ns, proxy_hops)
             .await?;
         let mut rule_embeddings = HashMap::new();
         let mut allow_topic_embeddings = HashMap::new();
@@ -1520,6 +1540,7 @@ impl FirewallEngine {
         provider: &ProviderConfig,
         texts: &[String],
         plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<Vec<EmbeddingVector>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -1552,6 +1573,10 @@ impl FirewallEngine {
                 .await?;
             request = request.header("Authorization", authorization.as_str());
         }
+        // An embedding endpoint that resolves back to the gateway is refused at
+        // the proxy hop limit like a looping route (issue #6128). The shared
+        // rule index carries the hop count of the request that built it.
+        request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops);
 
         let response = self
             .http_client
@@ -2484,6 +2509,7 @@ impl Plugin for AiSemanticFirewall {
             Arc::clone(&self.engine),
             config,
             Arc::clone(&ctx.plugin_http_call_ns),
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
             hold_stats,
         )))
     }
@@ -5056,6 +5082,8 @@ struct StreamInspector {
     /// Cloned from `ctx.plugin_http_call_ns` so embedding-call time is attributed
     /// to the request even when driven from a detached H1/H2 task.
     plugin_http_call_ns: Arc<AtomicU64>,
+    /// The request's gateway hop count, carried on every embedding call.
+    proxy_hops: Option<u8>,
     /// Non-delta response extraction paths (e.g. `$.choices[*].message.content`,
     /// `$.output_text`), precomputed once. `Some` only when the config enables
     /// such paths, so the common delta-only case pays nothing per window.
@@ -5103,6 +5131,7 @@ impl StreamInspector {
         engine: Arc<FirewallEngine>,
         config: StreamingInspectConfig,
         plugin_http_call_ns: Arc<AtomicU64>,
+        proxy_hops: Option<u8>,
         hold_stats: Arc<StreamHoldStats>,
     ) -> Self {
         // Pre-split the configured response paths: delta paths are covered by the
@@ -5151,6 +5180,7 @@ impl StreamInspector {
             config,
             window,
             plugin_http_call_ns,
+            proxy_hops,
             non_delta_extraction,
             inspections_used: 0,
             terminated: false,
@@ -5438,9 +5468,12 @@ impl StreamInspector {
         // The inner scope ends the evaluation's borrow of `self` before the
         // expiry branch below takes `&mut self`.
         let evaluated = {
-            let evaluation =
-                self.engine
-                    .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns);
+            let evaluation = self.engine.evaluate(
+                Direction::Response,
+                &segments,
+                &self.plugin_http_call_ns,
+                self.proxy_hops,
+            );
             match remaining {
                 Some(remaining) => tokio::time::timeout(remaining, evaluation).await.ok(),
                 None => Some(evaluation.await),
@@ -5499,6 +5532,7 @@ impl StreamInspector {
         self.inspections_used += 1;
         let engine = Arc::clone(&self.engine);
         let plugin_http_call_ns = Arc::clone(&self.plugin_http_call_ns);
+        let proxy_hops = self.proxy_hops;
         let concurrency = self.detect_concurrency.clone();
         let provider_error_logged = Arc::clone(&self.detect_provider_error_logged);
         let max_hold = self.config.max_hold;
@@ -5523,7 +5557,12 @@ impl StreamInspector {
                     None => None,
                 };
                 engine
-                    .evaluate(Direction::Response, &segments, &plugin_http_call_ns)
+                    .evaluate(
+                        Direction::Response,
+                        &segments,
+                        &plugin_http_call_ns,
+                        proxy_hops,
+                    )
                     .await
             };
             // `detect` never cuts (the bytes are already on the wire), so an

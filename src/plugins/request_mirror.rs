@@ -2642,6 +2642,12 @@ impl Plugin for RequestMirror {
         // auditing services that the operator considers off-mesh.
         self.http_client
             .strip_egress_baggage_in_vec(&mut mirror_headers);
+        // The mirror carries the gateway's own hop count, never the copied
+        // outbound field: on a mesh inbound route that copy holds the RECEIVED
+        // count, so a mirror target that resolves back to the gateway would
+        // otherwise loop without bound (issue #6128).
+        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
+        crate::proxy::hop_limit::strip_copied_proxy_hops(&mut mirror_headers, proxy_hops);
 
         // Omit the query from every log/metrics URL. The dispatched URL has
         // already dropped deny-by-default sensitive pairs; logging still
@@ -2867,6 +2873,8 @@ impl Plugin for RequestMirror {
             for (key, value) in &mirror_headers {
                 req_builder = req_builder.header(key.as_str(), value.as_str());
             }
+            req_builder =
+                crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(req_builder, proxy_hops);
 
             if let Some(body) = body_for_request {
                 req_builder = req_builder.body(body);

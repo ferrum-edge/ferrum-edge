@@ -5104,6 +5104,7 @@ impl AiFederation {
         extra_headers: Vec<(String, String)>,
         body: &[u8],
         latency_accumulator: &AtomicU64,
+        proxy_hops: Option<u8>,
     ) -> Result<ProviderResponse, ProviderCallFailure> {
         let parsed_url = validate_dispatch_url(url).map_err(|_| ProviderCallFailure {
             kind: ProviderCallFailureKind::PreWire,
@@ -5165,6 +5166,9 @@ impl AiFederation {
         for (k, v) in &extra_headers {
             req = req.header(k.as_str(), v.as_str());
         }
+        // A provider URL that resolves back to the gateway is refused at the
+        // proxy hop limit like a looping route (issue #6128).
+        req = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(req, proxy_hops);
         req = req.body(Bytes::copy_from_slice(body));
 
         let resp = self
@@ -7950,6 +7954,7 @@ impl Plugin for AiFederation {
                     extra_headers,
                     &body_bytes,
                     ctx.plugin_http_call_ns.as_ref(),
+                    crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
                 )
                 .await
             {

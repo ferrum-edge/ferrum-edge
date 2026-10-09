@@ -4728,3 +4728,62 @@ async fn external_identity_realm_binds_the_oidc_issuer_and_identity_claim() {
         "the identity claim path is part of the realm"
     );
 }
+
+/// The refresh-token grant carries the request's gateway hop count
+/// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so a token
+/// endpoint that resolves back to the gateway is refused at the proxy hop limit
+/// like a looping route (issue #6128). The authorization-code exchange,
+/// UserInfo, and logout revocation share the same token-endpoint helper. With
+/// the limit disabled nothing is stamped.
+#[tokio::test]
+async fn refresh_grant_carries_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(6), vec!["6"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-access-token",
+                "refresh_token": "rotated-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let plugin = OidcRelyingParty::new(
+            &refresh_config(&format!("{}/token", server.uri())),
+            PluginHttpClient::default(),
+        )
+        .expect("valid refresh config");
+        let now = chrono::Utc::now().timestamp();
+        let cookie = oidc_sealed_refresh_session_cookie_for_test(
+            &plugin,
+            json!({
+                "sub": "oidc-subject",
+                "email": "accepted@example.test",
+                "exp": now + 3600
+            }),
+            Some("original-refresh-token".to_string()),
+            true,
+            false,
+        )
+        .expect("session seals");
+        let mut ctx = session_ctx(&cookie);
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+
+        let received = server.received_requests().await.expect("requests");
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}

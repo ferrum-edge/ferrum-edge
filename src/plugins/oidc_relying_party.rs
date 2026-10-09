@@ -1369,8 +1369,9 @@ impl OidcRelyingParty {
                 Some(&state),
             );
         };
+        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
         let token = match self
-            .exchange_code(&discovery, &code, &flow.code_verifier)
+            .exchange_code(&discovery, &code, &flow.code_verifier, proxy_hops)
             .await
         {
             Ok(token) => token,
@@ -1382,7 +1383,7 @@ impl OidcRelyingParty {
         };
         let merged_claims = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
             match self
-                .fetch_userinfo(userinfo_endpoint, &token.access_token)
+                .fetch_userinfo(userinfo_endpoint, &token.access_token, proxy_hops)
                 .await
             {
                 Ok(Some(userinfo)) => {
@@ -1452,6 +1453,7 @@ impl OidcRelyingParty {
         discovery: &DiscoveryDoc,
         code: &str,
         code_verifier: &str,
+        proxy_hops: Option<u8>,
     ) -> Result<TokenResponse, String> {
         let params = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
@@ -1464,7 +1466,7 @@ impl OidcRelyingParty {
             ("code_verifier".to_string(), code_verifier.to_string()),
         ];
         let response = self
-            .post_token_endpoint(&discovery.token_endpoint, params)
+            .post_token_endpoint(&discovery.token_endpoint, params, proxy_hops)
             .await
             .map_err(|_| r#"{"error":"Token exchange failed"}"#.to_string())?;
         if !response.status().is_success() {
@@ -1487,6 +1489,7 @@ impl OidcRelyingParty {
         &self,
         token_endpoint: &str,
         mut params: Vec<(String, String)>,
+        proxy_hops: Option<u8>,
     ) -> Result<reqwest::Response, String> {
         let mut request = self
             .provider
@@ -1531,6 +1534,9 @@ impl OidcRelyingParty {
             }
             OidcClientAuth::None => {}
         }
+        // A token / revocation endpoint that resolves back to the gateway is
+        // refused at the proxy hop limit like a looping route (issue #6128).
+        request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops);
         self.provider
             .http_client
             .execute_redacted(
@@ -1628,17 +1634,20 @@ impl OidcRelyingParty {
         &self,
         endpoint: &str,
         access_token: &str,
+        proxy_hops: Option<u8>,
     ) -> Result<Option<Value>, String> {
+        let request = self
+            .provider
+            .http_client
+            .get()
+            .map_err(|error| format!("userinfo request failed: {error}"))?
+            .get(endpoint)
+            .bearer_auth(access_token);
         let response = self
             .provider
             .http_client
             .execute_redacted(
-                self.provider
-                    .http_client
-                    .get()
-                    .map_err(|error| format!("userinfo request failed: {error}"))?
-                    .get(endpoint)
-                    .bearer_auth(access_token),
+                crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, proxy_hops),
                 "oidc_rp_userinfo",
                 &redacted_endpoint_url_str(endpoint),
             )
@@ -1710,7 +1719,10 @@ impl OidcRelyingParty {
         // carrying the same refresh token share one grant, and a spent token is
         // never re-sealed (`mutated` stays false), so this request can never
         // publish the pre-rotation credential over a rotated cookie.
-        let refresh = self.maybe_refresh_session(&mut payload, now).await;
+        let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
+        let refresh = self
+            .maybe_refresh_session(&mut payload, now, proxy_hops)
+            .await;
 
         // Token-freshness gate: the ID token was validly verified at login, but
         // its claims must not be served as live authorization past their
@@ -1890,6 +1902,7 @@ impl OidcRelyingParty {
         &self,
         payload: &mut SessionPayload,
         now: i64,
+        proxy_hops: Option<u8>,
     ) -> RefreshOutcome {
         if now < payload.refresh_after_unix {
             return RefreshOutcome::UNCHANGED;
@@ -1915,7 +1928,7 @@ impl OidcRelyingParty {
                         retain: false,
                     };
                     let (outcome, published) = match self
-                        .refresh_tokens(&discovery, &refresh_token, payload, now)
+                        .refresh_tokens(&discovery, &refresh_token, payload, now, proxy_hops)
                         .await
                     {
                         Ok(claims_refreshed) => {
@@ -2056,6 +2069,7 @@ impl OidcRelyingParty {
         refresh_token: &str,
         payload: &mut SessionPayload,
         now: i64,
+        proxy_hops: Option<u8>,
     ) -> Result<bool, RefreshFailure> {
         let params = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
@@ -2063,7 +2077,7 @@ impl OidcRelyingParty {
             ("client_id".to_string(), self.provider.client_id.clone()),
         ];
         let response = self
-            .post_token_endpoint(&discovery.token_endpoint, params)
+            .post_token_endpoint(&discovery.token_endpoint, params, proxy_hops)
             .await?;
         if !response.status().is_success() {
             return Err(classify_refresh_failure(response).await);
@@ -2089,7 +2103,7 @@ impl OidcRelyingParty {
             // instead of being reduced to ID-token-only claims.
             let merged = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
                 match self
-                    .fetch_userinfo(userinfo_endpoint, &token.access_token)
+                    .fetch_userinfo(userinfo_endpoint, &token.access_token, proxy_hops)
                     .await
                 {
                     Ok(Some(userinfo)) => merge_claims(id_claims, userinfo, &self.provider)?,
@@ -2693,7 +2707,11 @@ impl super::Plugin for OidcRelyingParty {
                     ];
                     let _ = tokio::time::timeout(
                         Duration::from_secs(5),
-                        self.post_token_endpoint(endpoint, params),
+                        self.post_token_endpoint(
+                            endpoint,
+                            params,
+                            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+                        ),
                     )
                     .await;
                 }
@@ -5827,13 +5845,13 @@ mod tests {
             .expect("explicit discovery document");
         assert!(
             plugin
-                .exchange_code(&discovery, "code", "verifier")
+                .exchange_code(&discovery, "code", "verifier", None)
                 .await
                 .is_err()
         );
         assert!(
             plugin
-                .fetch_userinfo(&format!("{}/userinfo", server.uri()), "access-token")
+                .fetch_userinfo(&format!("{}/userinfo", server.uri()), "access-token", None)
                 .await
                 .is_err()
         );

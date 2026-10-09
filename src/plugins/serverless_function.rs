@@ -1047,6 +1047,12 @@ impl ServerlessFunction {
             .post(&self.function_url)
             .header("content-type", "application/json")
             .timeout(std::time::Duration::from_millis(self.timeout_ms));
+        // A function URL that resolves back to the gateway is refused at the
+        // proxy hop limit like a looping route (issue #6128).
+        req_builder = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(
+            req_builder,
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+        );
 
         // Provider-specific auth
         match &self.provider {

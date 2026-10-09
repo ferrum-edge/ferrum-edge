@@ -9443,3 +9443,56 @@ fn an_environment_session_token_never_completes_a_config_bedrock_key_pair() {
     );
     assert!(!error.contains("ambient-session-fixture"), "got: {error}");
 }
+
+/// The provider call carries the request's gateway hop count (`received + 1`)
+/// as exactly one `X-Ferrum-Hops` field line, so a provider `base_url` that
+/// resolves back to the gateway is refused at the proxy hop limit like a
+/// looping route (issue #6128). With the limit disabled nothing is stamped.
+#[tokio::test]
+async fn provider_call_carries_the_proxy_hop_count() {
+    for (outbound_proxy_hops, expected) in [(Some(3), vec!["3"]), (None, Vec::new())] {
+        let server = MockServer::start().await;
+        mount_openai_success(&server).await;
+        let federation = ai_federation::AiFederation::new(
+            &json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"],
+                    "base_url": server.uri(),
+                    "allow_plaintext": true
+                }]
+            }),
+            create_test_http_client(),
+        )
+        .unwrap();
+        let mut ctx = post_json_ctx(&json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        ctx.outbound_proxy_hops = outbound_proxy_hops;
+        let headers = json_headers();
+        let result = run_federation_final_body(&federation, &mut ctx, &headers).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::RejectBinary {
+                    status_code: 200,
+                    ..
+                }
+            ),
+            "expected the provider response, got {result:?}"
+        );
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let hops: Vec<&str> = received[0]
+            .headers
+            .get_all("x-ferrum-hops")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}

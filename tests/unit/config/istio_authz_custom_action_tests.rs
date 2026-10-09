@@ -474,6 +474,68 @@ extensionProviders:
     }
 }
 
+/// The gateway-owned `X-Ferrum-Hops` field is refused for forwarding AND as a
+/// fixed check header, in either `_` or `-` spelling: the CUSTOM check stamps
+/// the request's hop count itself, so the provider config can never put a
+/// second field line beside it (issue #6128).
+#[test]
+fn the_proxy_hop_count_cannot_be_forwarded_or_fixed_on_a_check() {
+    use ferrum_edge::modes::mesh::config::MeshExtAuthzHeader;
+
+    for header in ["x-ferrum-hops", "x_ferrum_hops", "x_ferrum-internal"] {
+        let forwarded = translate_provider_only(&format!(
+            r#"
+extensionProviders:
+- name: p
+  envoyExtAuthzHttp:
+    service: 127.0.0.1
+    port: 8000
+    includeRequestHeadersInCheck:
+    - "{header}"
+"#
+        ))
+        .expect_err("a gateway-reserved name must not be forwarded to a provider");
+        assert!(
+            forwarded.contains("hop-by-hop, framing, routing, or gateway-reserved"),
+            "'{header}' must be refused for forwarding, got: {forwarded}"
+        );
+        let fixed = translate_provider_only(&format!(
+            r#"
+extensionProviders:
+- name: p
+  envoyExtAuthzHttp:
+    service: 127.0.0.1
+    port: 8000
+    includeAdditionalHeadersInCheck:
+      "{header}": "0"
+"#
+        ))
+        .expect_err("a gateway-reserved name must not be a fixed check header");
+        assert!(
+            fixed.contains("hop-by-hop, framing, routing, or gateway-reserved"),
+            "'{header}' must be refused as a fixed header, got: {fixed}"
+        );
+    }
+
+    for header in ["x-ferrum-hops", "X-Ferrum-Hops", "x_ferrum_hops"] {
+        let mut forwarded = provider("p");
+        forwarded.include_request_headers_in_check = vec![header.to_string()];
+        assert!(
+            forwarded.validate().is_err(),
+            "'{header}' must be refused for forwarding at the native boundary"
+        );
+        let mut fixed = provider("p");
+        fixed.include_additional_headers_in_check = vec![MeshExtAuthzHeader {
+            name: header.to_string(),
+            value: "0".to_string(),
+        }];
+        assert!(
+            fixed.validate().is_err(),
+            "'{header}' must be refused as a fixed header at the native boundary"
+        );
+    }
+}
+
 #[test]
 fn upstream_and_allow_response_mutation_are_refused_at_admission() {
     for field in ["headersToUpstreamOnAllow", "headersToDownstreamOnAllow"] {
