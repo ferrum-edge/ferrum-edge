@@ -388,17 +388,9 @@ impl H3UploadReadError {
     /// Locally detected frame/header violations retain their malformed-input
     /// classification; an operator body-read timeout is a separate outer error.
     pub(crate) fn is_client_disconnect(&self) -> bool {
-        matches!(
-            self,
-            Self::Stream(
-                h3::error::StreamError::RemoteTerminate { .. }
-                    | h3::error::StreamError::RemoteClosing
-                    | h3::error::StreamError::ConnectionError(
-                        h3::error::ConnectionError::Remote(_)
-                            | h3::error::ConnectionError::Timeout
-                    )
-            )
-        )
+        match self {
+            Self::Stream(error) => crate::http3::stream_util::h3_request_read_error_is_client_abort(error),
+        }
     }
 }
 

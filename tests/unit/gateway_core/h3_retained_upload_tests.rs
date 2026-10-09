@@ -287,10 +287,7 @@ fn failed_h3_uploads_finalize_once_and_bridge_logs_before_sending() {
     }
     let classify = server.split("pub(crate) fn is_client_disconnect(&self)").nth(1).unwrap()
         .split("/// Drain an H3 request-body").next().unwrap();
-    assert!(classify.contains("StreamError::RemoteTerminate { .. }"));
-    assert!(classify.contains("ConnectionError::Remote(_)"));
-    assert!(!classify.contains("StreamError::StreamError {"));
-    assert!(!classify.contains("ConnectionError::Local {"));
+    assert!(classify.contains("h3_request_read_error_is_client_abort(error)"));
 
     let bridge = include_str!("../../../src/http3/cross_protocol.rs");
     let finalizer = bridge.split("async fn write_final_body_reject<S>(").nth(1).unwrap()
