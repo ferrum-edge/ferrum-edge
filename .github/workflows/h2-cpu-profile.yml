@@ -120,6 +120,11 @@ jobs:
             python3 tests/performance/multi_protocol/h1_trace.py stage --build h2-cpu-evidence/trace-build
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
             python3 tests/performance/multi_protocol/h1_trace.py preflight --output h2-cpu-evidence/trace-preflight
+      - name: Pull the pinned Envoy comparison image before reusing builds
+        run: |
+          docker pull envoyproxy/envoy:v1.39.1
+          mkdir -p h2-cpu-evidence/builds/envoy
+          docker image inspect envoyproxy/envoy:v1.39.1 > h2-cpu-evidence/builds/envoy/image.json
       - name: Unprofiled controls before and after a separately retained CPU campaign
         env:
           PROFILE_PROTOCOL: ${{ inputs.protocol }}

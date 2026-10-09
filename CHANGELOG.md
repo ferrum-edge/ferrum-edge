@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- H2/gRPC CPU qualification pulls its pinned Envoy comparison image before
+  reusing the prebuilt Ferrum and harness binaries, and retains the resolved
+  image identity. Fresh hosted runners no longer stop before their controls.
+
 - The scheduled scaling verifier's positive self-test places run identity checks
   in its production section, matching the production-only admission rule. Event,
   repository and workflow-path checks remain required before scaling runs.
