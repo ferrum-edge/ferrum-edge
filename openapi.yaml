@@ -313,10 +313,18 @@ paths:
         `dp_config` staleness diagnostic, the CP `cp_dp_trust` reload
         diagnostic, and the bounded `replay_authority` shared single-use
         aggregate — are
-        returned only when the caller presents a valid admin JWT, a matching
-        `FERRUM_METRICS_BEARER_TOKEN`, or originates from
-        `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT bound by
-        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` never adds detail.
+        returned only when the caller presents a valid admin JWT that is not
+        namespace-bounded, a matching `FERRUM_METRICS_BEARER_TOKEN`, or
+        originates from `FERRUM_METRICS_ALLOWED_CIDRS`.
+
+        **Tenant tier** (issue #6095): a namespace-bounded admin JWT — one
+        carrying an `ns` claim, or a viewer-key JWT bound by
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` — never adds detail. Without an
+        allowlisted source IP it receives `HealthTenantResponse`: `status`,
+        `ready`, `mode`, `admin_writes_enabled`, and the `namespace` serving
+        report only when the token's bound admits `namespace.active` (or
+        `active` is `null`). These fields carry exactly the names and shapes of
+        the detailed tier; nothing else is returned.
 
         Returns `503 Service Unavailable` while the gateway is still in
         startup (`status: "starting"`, `ready: false`). Once startup is
@@ -420,13 +428,17 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/HealthResponse"
+                  - $ref: "#/components/schemas/HealthTenantResponse"
         "503":
           description: Gateway not ready (status `starting` during startup, `unavailable` after a supervised serving-listener failure, or `draining` while the process is terminating); `ready=false`
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/HealthResponse"
+                  - $ref: "#/components/schemas/HealthTenantResponse"
         "401":
           description: |
             The admin HTTPS connection this request arrived on authenticated
@@ -452,13 +464,17 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/HealthResponse"
+                  - $ref: "#/components/schemas/HealthTenantResponse"
         "503":
           description: Gateway not ready (status `starting`, `unavailable`, or `draining`, `ready=false`)
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/HealthResponse"
+                  - $ref: "#/components/schemas/HealthTenantResponse"
         "401":
           description: |
             The admin HTTPS connection this request arrived on authenticated
@@ -1932,8 +1948,11 @@ paths:
         `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Otherwise the endpoint
         returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header.
         Unauthenticated scraping is an explicit operator opt-in (token or CIDR).
-        A viewer-key JWT bound by `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is
-        refused with `403`.
+        A namespace-bounded admin JWT (one carrying an `ns` claim, or a
+        viewer-key JWT bound by `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`) is
+        refused with `403` from every source IP: the
+        `FERRUM_METRICS_ALLOWED_CIDRS` allowance covers only scrapes that
+        present no such token.
 
         TLS source watcher telemetry includes certificate expiry gauges,
         certificate rotation counters, source refresh outcomes, source fetch
@@ -16276,7 +16295,9 @@ components:
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
         `service_discovery`, `dp_config`, `cp_dp_trust`, `replay_authority`) are
         present only when the caller is
-        authenticated (admin JWT, metrics bearer token, or allowlisted CIDR).
+        authenticated (an admin JWT that is not namespace-bounded, a metrics
+        bearer token, or an allowlisted CIDR). A namespace-bounded admin JWT
+        receives `HealthTenantResponse` instead.
       required: [status, ready]
       properties:
         status:
@@ -16633,6 +16654,51 @@ components:
         replay_authority:
           $ref: "#/components/schemas/SharedReplayAuthorityHealth"
 
+    HealthTenantResponse:
+      type: object
+      description: |
+        Tenant tier of `/health` and `/status` (issue #6095). Returned to a
+        namespace-bounded admin JWT — one carrying an `ns` claim, or a
+        viewer-key JWT under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` — that has no
+        independent detail authorization (an allowlisted
+        `FERRUM_METRICS_ALLOWED_CIDRS` source IP). It is the unauthenticated
+        `status` + `ready` plus `mode`, `admin_writes_enabled`, and the
+        `namespace` serving report. Each field has exactly the name and shape
+        of the same top-level field on `HealthResponse`; no other detailed
+        field is present. The status code follows the same rules as the other
+        tiers.
+
+        `namespace` is present only when the token's bound (its `ns` claim and,
+        for a viewer-key token, the namespace ceiling) admits
+        `namespace.active`, or when `active` is `null` (`cp`, `node_agent`). It
+        is omitted, never redacted, when this process routes a namespace
+        outside the token's bound, so the tier never names another tenant's
+        namespace.
+      required: [status, ready, mode, admin_writes_enabled]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, starting, unavailable, draining]
+          description: Aggregate gateway health; see `HealthResponse.status`.
+        ready:
+          type: boolean
+          description: Readiness; see `HealthResponse.ready`.
+        mode:
+          type: string
+          description: Gateway operating mode; see `HealthResponse.mode`.
+          examples:
+            - cp
+            - dp
+            - file
+        admin_writes_enabled:
+          type: boolean
+          description: |
+            Config-database mutation signal; see
+            `HealthResponse.admin_writes_enabled`.
+        namespace:
+          $ref: "#/components/schemas/NamespaceServingReport"
+
     NamespaceServingReport:
       type: object
       description: |
@@ -16647,9 +16713,11 @@ components:
         data-plane `404`. Read it once at startup and provision into `active`.
 
         Authenticated detail tier only: the namespace name is operator-supplied
-        deployment topology. Every field is a namespace identifier, a closed-set
-        label, or a boolean — never a resource id, count, or listing of other
-        tenants.
+        deployment topology. A namespace-bounded admin JWT receives it in the
+        tenant tier (`HealthTenantResponse`) only when its bound admits
+        `active`, or `active` is `null`. Every field is a namespace identifier,
+        a closed-set label, or a boolean — never a resource id, count, or
+        listing of other tenants.
       required: [active, serving_scope, data_plane_single_namespace]
       properties:
         active:

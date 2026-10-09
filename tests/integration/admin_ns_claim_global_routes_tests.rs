@@ -9,7 +9,10 @@
 //! - the global allowlist (`GET /plugins`, the probe endpoints, the namespace
 //!   registry, the diagnostic reference lookup) stays reachable, with the
 //!   registry filtered to and authorized by the claim;
-//! - `/health`, `/status`, and `/overload` serve only the minimal tier;
+//! - `/health` and `/status` serve the bounded tenant tier (`status`, `ready`,
+//!   `mode`, `admin_writes_enabled`, and the `namespace` serving block only
+//!   when the claim admits the active namespace), `/overload` only `{level}`;
+//! - `/metrics` refuses the token even from an allowlisted source IP;
 //! - namespace-scoped routes accept only the claimed namespaces.
 //!
 //! A token without an `ns` claim keeps fleet-wide access.
@@ -23,6 +26,8 @@ use ferrum_edge::admin::{
     serve_admin_on_listener,
 };
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::{EnvConfig, OperatingMode};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Method;
@@ -56,6 +61,16 @@ const FLEET_GLOBAL_READS: &[&str] = &[
     "/admin/tls/inventory",
     "/admin/tls/certificates",
     "/no-such-admin-route",
+];
+
+/// Top-level keys of the `/health` tenant tier when it carries the serving
+/// block.
+const TENANT_TIER_KEYS: &[&str] = &[
+    "admin_writes_enabled",
+    "mode",
+    "namespace",
+    "ready",
+    "status",
 ];
 
 /// Fleet-global mutations a namespace-bounded token must not reach.
@@ -165,6 +180,38 @@ fn admin_state(require_namespace_claim: bool) -> AdminState {
         ),
         runtime_config_apply: None,
     }
+}
+
+/// A proxy state whose data plane routes `namespace`, so `/health` reports it
+/// as `namespace.active`.
+fn proxy_state(namespace: &str) -> ferrum_edge::proxy::ProxyState {
+    let mut config = GatewayConfig::default();
+    config.normalize_fields();
+    let env_config = EnvConfig {
+        mode: OperatingMode::Database,
+        namespace: namespace.to_string(),
+        ..Default::default()
+    };
+    let (state, _health_check_handles) = ferrum_edge::proxy::ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("ProxyState::new");
+    state
+}
+
+/// Top-level keys of a JSON object body, sorted.
+fn body_keys(reply: &Reply) -> Vec<String> {
+    let mut keys: Vec<String> = reply
+        .body
+        .as_object()
+        .map(|body| body.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
 }
 
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
@@ -329,18 +376,19 @@ async fn ns_claim_tokens_keep_the_global_allowlist() {
     let live = get(&base, "/live", &scoped, None).await;
     assert_eq!(live.status, 200, "{}", live.text);
 
-    // Probe endpoints answer, but only with the minimal tier.
+    // Probe endpoints answer with the tenant tier. This process has no data
+    // plane, so the serving block names no namespace and is included.
     for path in ["/health", "/status"] {
         let reply = get(&base, path, &scoped, None).await;
         assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
         assert_eq!(
-            reply.body.as_object().map(|body| body.len()),
-            Some(2),
-            "GET {path} must not disclose process detail to an ns-claim token: {}",
+            body_keys(&reply),
+            TENANT_TIER_KEYS,
+            "GET {path} must serve only the tenant tier to an ns-claim token: {}",
             reply.text
         );
-        assert!(reply.body.get("status").is_some(), "{}", reply.text);
-        assert!(reply.body.get("ready").is_some(), "{}", reply.text);
+        assert_eq!(reply.body["namespace"]["active"], Value::Null);
+        assert_eq!(reply.body["namespace"]["serving_scope"], "no-data-plane");
     }
     let overload = get(&base, "/overload", &scoped, None).await;
     assert_eq!(overload.status, 200, "{}", overload.text);
@@ -405,11 +453,176 @@ async fn present_ns_claim_bounds_namespace_scoped_routes_with_the_flag_off() {
 
         // Omitting the header selects the default namespace, also unclaimed.
         let default = get(&base, path, &scoped, None).await;
-        assert_eq!(default.status, 403, "GET {path} (default): {}", default.text);
+        assert_eq!(
+            default.status, 403,
+            "GET {path} (default): {}",
+            default.text
+        );
     }
 
     // Without a claim and with the flag off, the header stays a selector.
     let fleet = fleet_token();
     let other = get(&base, "/proxies", &fleet, Some("prod")).await;
     assert_eq!(other.status, 200, "{}", other.text);
+}
+
+/// The tenant tier reuses the detailed tier's top-level field names and shapes,
+/// and carries the serving block only when the claim admits the namespace this
+/// process routes. A claim-less token keeps the detailed tier and an
+/// unauthenticated probe keeps `status` + `ready`.
+#[tokio::test]
+async fn tenant_health_tier_is_bounded_by_the_claim() {
+    let mut state = admin_state(false);
+    state.mode = "database".to_string();
+    state.proxy_state = Some(proxy_state("staging"));
+    let (base, _sd) = start_admin(state).await;
+
+    let both = admin_token(json!({"ns": ["prod", "staging"]}));
+    let covering = [
+        ("ns=staging", staging_token()),
+        ("ns=[staging,prod]", both),
+    ];
+    let not_covering = [
+        ("ns=prod", admin_token(json!({"ns": "prod"}))),
+        ("ns=[]", admin_token(json!({"ns": []}))),
+    ];
+    for path in ["/health", "/status"] {
+        let detailed = get(&base, path, &fleet_token(), None).await;
+        for detail in ["timestamp", "mode", "admin_writes_enabled", "namespace"] {
+            assert!(
+                detailed.body.get(detail).is_some(),
+                "a claim-less token keeps the detailed tier on {path}: {}",
+                detailed.text
+            );
+        }
+
+        for (label, bearer) in &covering {
+            let tenant = get(&base, path, bearer, None).await;
+            assert_eq!(
+                body_keys(&tenant),
+                TENANT_TIER_KEYS,
+                "{label} {path}: {}",
+                tenant.text
+            );
+            for field in ["mode", "admin_writes_enabled", "namespace"] {
+                assert_eq!(
+                    tenant.body[field], detailed.body[field],
+                    "{label} {path}: `{field}` must match the detailed tier exactly"
+                );
+            }
+            assert_eq!(tenant.body["mode"], "database");
+            assert_eq!(tenant.body["namespace"]["active"], "staging");
+            assert_eq!(
+                tenant.body["namespace"]["serving_scope"],
+                "single-namespace-data-plane"
+            );
+            assert_eq!(
+                tenant.body["namespace"]["data_plane_single_namespace"],
+                true
+            );
+        }
+
+        for (label, bearer) in &not_covering {
+            let tenant = get(&base, path, bearer, None).await;
+            assert_eq!(
+                body_keys(&tenant),
+                ["admin_writes_enabled", "mode", "ready", "status"],
+                "{label} {path}: the serving block must not name an unclaimed namespace: {}",
+                tenant.text
+            );
+            assert!(
+                !tenant.text.contains("staging"),
+                "{label} {path}: {}",
+                tenant.text
+            );
+            assert_eq!(tenant.body["mode"], detailed.body["mode"]);
+            assert_eq!(
+                tenant.body["admin_writes_enabled"],
+                detailed.body["admin_writes_enabled"]
+            );
+        }
+
+        let anonymous = reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        let anonymous: Value = anonymous.json().await.unwrap();
+        let mut keys: Vec<&String> = anonymous.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["ready", "status"],
+            "unauthenticated {path}: {anonymous}"
+        );
+    }
+}
+
+/// An allowlisted metrics source IP does not admit an `ns`-claim token to
+/// `/metrics`: the CIDR allowance covers only scrapes without such a token. On
+/// `/health` the allowlisted IP keeps granting the detail it grants on its own.
+#[tokio::test]
+async fn allowlisted_metrics_cidr_does_not_admit_an_ns_claim_token_to_metrics() {
+    let mut state = admin_state(false);
+    state.metrics_auth = Arc::new(MetricsAuthPolicy {
+        allowed_cidrs: TrustedProxies::parse_strict("127.0.0.1/32,::1", "test")
+            .expect("valid metrics CIDR list"),
+        bearer_token: None,
+    });
+    let (base, _sd) = start_admin(state).await;
+    let scoped = staging_token();
+
+    let refused = get(&base, "/metrics", &scoped, None).await;
+    assert_ns_claim_refusal(&refused, "GET /metrics from an allowlisted CIDR");
+
+    let fleet = get(&base, "/metrics", &fleet_token(), None).await;
+    assert_eq!(fleet.status, 200, "{}", fleet.text);
+    let anonymous = reqwest::Client::new()
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status().as_u16(), 200);
+
+    let health = get(&base, "/health", &scoped, None).await;
+    assert!(
+        health.body.get("timestamp").is_some(),
+        "the allowlisted source IP keeps the detailed /health tier: {}",
+        health.text
+    );
+}
+
+/// Registry writes are name-authorized by a present claim with the flag off:
+/// `PUT` (including a rename into an unclaimed name) and `DELETE` on a name
+/// outside the claim answer `403` before the handler touches storage.
+#[tokio::test]
+async fn present_ns_claim_bounds_namespace_registry_writes_with_the_flag_off() {
+    let mut state = admin_state(false);
+    state.mode = "database".to_string();
+    state.read_only = false;
+    let (base, _sd) = start_admin(state).await;
+    let scoped = staging_token();
+    let client = reqwest::Client::new();
+
+    let writes = [
+        (Method::PUT, "/namespaces/prod", json!({"description": "x"})),
+        (Method::PUT, "/namespaces/staging", json!({"name": "prod"})),
+        (Method::DELETE, "/namespaces/prod", Value::Null),
+    ];
+    for (method, path, body) in writes {
+        let mut req = client
+            .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth(&scoped);
+        if !body.is_null() {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 403, "{method} {path}: {text}");
+        assert!(
+            text.contains("does not authorize namespace 'prod'"),
+            "{method} {path} must be refused by the claim: {text}"
+        );
+    }
 }

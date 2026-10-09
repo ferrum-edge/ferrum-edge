@@ -18577,6 +18577,94 @@ fn health_namespace_serving_report_is_a_fixed_authenticated_detail_block() {
     );
 }
 
+/// The `/health` and `/status` tenant tier (issue #6095) is a closed schema
+/// whose every field reuses the detailed tier's top-level name and shape:
+/// downstream clients read `mode`, `admin_writes_enabled`, and `namespace` by
+/// those names whichever tier answered, so the two must never drift.
+#[test]
+fn health_tenant_tier_reuses_the_detailed_tier_field_shapes() {
+    const TENANT_FIELDS: &[&str] = &[
+        "admin_writes_enabled",
+        "mode",
+        "namespace",
+        "ready",
+        "status",
+    ];
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let tenant = spec
+        .pointer("/components/schemas/HealthTenantResponse")
+        .expect("HealthTenantResponse exists");
+    let health = spec
+        .pointer("/components/schemas/HealthResponse")
+        .expect("HealthResponse exists");
+
+    assert_eq!(tenant["additionalProperties"], json!(false));
+    assert_eq!(
+        tenant["required"],
+        json!(["status", "ready", "mode", "admin_writes_enabled"])
+    );
+    let mut fields: Vec<&str> = tenant["properties"]
+        .as_object()
+        .expect("the tenant tier declares properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, TENANT_FIELDS);
+    for field in ["status", "ready", "mode", "admin_writes_enabled"] {
+        for keyword in ["type", "enum"] {
+            assert_eq!(
+                tenant["properties"][field].get(keyword),
+                health["properties"][field].get(keyword),
+                "tenant `{field}` must keep the detailed tier's `{keyword}`"
+            );
+        }
+    }
+    assert_eq!(
+        tenant["properties"]["namespace"]["$ref"],
+        health["properties"]["namespace"]["$ref"]
+    );
+
+    let tenant_body = json!({
+        "status": "ok",
+        "ready": true,
+        "mode": "database",
+        "admin_writes_enabled": true,
+        "namespace": {
+            "active": "tenant-a",
+            "serving_scope": "single-namespace-data-plane",
+            "data_plane_single_namespace": true
+        }
+    });
+    assert_component_validity(&spec, "HealthTenantResponse", &tenant_body, true);
+    let mut detailed_only = tenant_body.clone();
+    detailed_only["timestamp"] = json!("2026-10-09T00:00:00Z");
+    assert_component_validity(&spec, "HealthTenantResponse", &detailed_only, false);
+
+    // Both probe routes publish both tiers on every body-carrying status.
+    for operation_id in ["getHealth", "getStatus"] {
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        for status in ["200", "503"] {
+            let content = &operation["responses"][status]["content"];
+            let tiers: Vec<&str> = content["application/json"]["schema"]["anyOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{method} {path} {status} must list both tiers"))
+                .iter()
+                .filter_map(|schema| schema["$ref"].as_str())
+                .collect();
+            assert_eq!(
+                tiers,
+                [
+                    "#/components/schemas/HealthResponse",
+                    "#/components/schemas/HealthTenantResponse",
+                ],
+                "{method} {path} {status}"
+            );
+        }
+    }
+}
+
 /// The published `RestoreRequest` must be the complete, closed restore wire
 /// contract (issues #5538 and #5542).
 ///

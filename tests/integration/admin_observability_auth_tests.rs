@@ -3,9 +3,11 @@
 //! Covers the hardened defaults for the observability surfaces:
 //! - `/live` is always unauthenticated and returns only `{"status":"ok"}`.
 //! - `/health` is reachable unauthenticated but exposes only `status`+`ready`;
-//!   the detailed diagnostics (mode, DB, cached-config counts) require auth.
+//!   the detailed diagnostics (timestamp, DB, cached-config counts) require
+//!   auth, and a namespace-bounded JWT gets only the bounded tenant tier.
 //! - `/metrics` returns `401` by default and succeeds with a valid admin JWT,
-//!   a matching metrics bearer token, or an allowlisted client CIDR.
+//!   a matching metrics bearer token, or an allowlisted client CIDR. A
+//!   namespace-bounded JWT is refused with `403` even from an allowlisted CIDR.
 //!
 //! Detailed `/overload` tiering is checked against a live `ProxyState` below.
 
@@ -161,8 +163,10 @@ async fn assert_observability_detail(base: &str, authorization: Option<&str>, ex
             request = request.header("Authorization", value);
         }
         let body: Value = request.send().await.unwrap().json().await.unwrap();
+        // `timestamp` is detailed-tier only: the tenant tier a
+        // namespace-bounded token receives carries `mode` but never it.
         assert_eq!(
-            body.get("mode").is_some(),
+            body.get("timestamp").is_some(),
             expected,
             "unexpected detail tier on {path}: {body}"
         );
@@ -587,6 +591,75 @@ async fn metrics_allows_allowlisted_cidr_unauthenticated() {
         200,
         "allowlisted loopback should scrape without a credential"
     );
+}
+
+/// A namespace-bounded admin JWT is refused on `/metrics` even from an
+/// allowlisted source IP: the CIDR allowance authorizes only scrapes that
+/// present no such token. On `/health` the same caller keeps the detail the
+/// allowlisted IP grants on its own.
+#[tokio::test]
+async fn namespace_bounded_jwt_is_refused_on_metrics_even_from_an_allowlisted_cidr() {
+    let cidr_policy = MetricsAuthPolicy {
+        allowed_cidrs: TrustedProxies::parse_strict("127.0.0.1/32,::1", "test")
+            .expect("valid metrics CIDR list"),
+        bearer_token: None,
+    };
+    let mut state = admin_state(cidr_policy);
+    state.proxy_state = Some(proxy_state());
+    state.jwt_manager = jwt_manager()
+        .with_viewer_secret(VIEWER_SECRET.to_string())
+        .expect("distinct viewer secret")
+        .with_viewer_namespace_ceiling(
+            ViewerNamespaceCeiling::parse("staging").expect("valid namespace ceiling"),
+        );
+    let (base, _sd) = start_admin(state).await;
+    let client = reqwest::Client::new();
+    let metrics_url = format!("{base}/metrics");
+
+    let bounded = [
+        (
+            "ns claim",
+            admin_token_with_additional_claims(json!({"ns": "staging"})),
+        ),
+        (
+            "ns claim array",
+            admin_token_with_additional_claims(json!({"ns": ["staging", "prod"]})),
+        ),
+        (
+            "viewer-key ceiling",
+            token_with_secret("viewer", VIEWER_SECRET),
+        ),
+    ];
+    for (label, token) in &bounded {
+        let resp = client
+            .get(&metrics_url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "{label}: an allowlisted source IP must not admit a bounded JWT"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("# TYPE"),
+            "{label}: the refusal must not carry the scrape body: {body}"
+        );
+        assert_observability_detail(&base, Some(&format!("Bearer {token}")), true).await;
+    }
+
+    // The allowlisted source IP alone, and a claim-less admin JWT, still scrape.
+    let anonymous = client.get(&metrics_url).send().await.unwrap();
+    assert_eq!(anonymous.status().as_u16(), 200);
+    let fleet = client
+        .get(&metrics_url)
+        .bearer_auth(admin_token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fleet.status().as_u16(), 200);
 }
 
 #[tokio::test]

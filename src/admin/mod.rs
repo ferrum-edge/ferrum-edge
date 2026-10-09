@@ -237,9 +237,11 @@ where
 ///
 /// These surfaces are **not** unauthenticated by default. A caller is granted
 /// the detailed/scrape view only when one of the following holds:
-///   1. a valid admin JWT is presented (`Authorization: Bearer <jwt>`), or
+///   1. a valid admin JWT that is not namespace-bounded is presented
+///      (`Authorization: Bearer <jwt>`), or
 ///   2. a dedicated metrics bearer token is configured and matches, or
-///   3. the request originates from an operator-allowlisted CIDR.
+///   3. the request originates from an operator-allowlisted CIDR (on
+///      `/metrics`, only when it presents no namespace-bounded admin JWT).
 ///
 /// When none apply, `/metrics` returns `401` and `/health` / `/overload`
 /// fall back to a minimal, LB-safe projection that reveals no operational
@@ -2413,6 +2415,23 @@ fn active_data_plane_namespace(state: &AdminState) -> Option<&str> {
         .map(|proxy| proxy.env_config.namespace.as_str())
 }
 
+/// The `namespace` block of `/health` and `/status`: `active` is the namespace
+/// the local data plane routes (`null` when this process has none),
+/// `serving_scope` the closed-set [`NamespaceServingScope`] label, and
+/// `data_plane_single_namespace` whether anything outside `active` is unrouted
+/// here. The detailed and tenant tiers share this one builder so the shape
+/// cannot drift between them.
+fn namespace_serving_block(state: &AdminState) -> serde_json::Value {
+    let namespace_scope = namespace_serving_scope(state);
+    let data_plane_single_namespace =
+        namespace_scope == NamespaceServingScope::SingleNamespaceDataPlane;
+    json!({
+        "active": active_data_plane_namespace(state),
+        "serving_scope": namespace_scope.as_str(),
+        "data_plane_single_namespace": data_plane_single_namespace,
+    })
+}
+
 /// Documented spelling of the response header marking an accepted Admin
 /// mutation whose `X-Ferrum-Namespace` names a namespace this process's data
 /// plane does not route (issue #5447).
@@ -2809,14 +2828,18 @@ fn authorize_namespace_bounded_global_route(
 
 /// Whether the caller may see the detailed observability views (`/metrics`
 /// scrape body, full `/health`, full `/overload`). Granted on any of: a valid
-/// primary admin JWT, a matching metrics bearer token, or an allowlisted source
-/// IP. A namespace-bounded admin JWT (a viewer-key token under a namespace
-/// ceiling, or any token carrying an `ns` claim) is not itself detail
-/// authorization, but does not revoke independent bearer-token or source-IP
-/// authorization.
+/// admin JWT that is not namespace-bounded, a matching metrics bearer token, or
+/// an allowlisted source IP. A namespace-bounded admin JWT (a viewer-key token
+/// under a namespace ceiling, or any token carrying an `ns` claim) is not
+/// itself detail authorization. On `/health`, `/status` and `/overload` it does
+/// not revoke source-IP authorization either. `/metrics` is different: it is a
+/// fleet-global route, so a presented namespace-bounded JWT is refused with
+/// `403` before this check runs, and the source-IP allowance covers only
+/// scrapes that present no such token.
 ///
 /// `/metrics` turns a `false` here into `401`; `/health` and `/overload` turn
-/// it into a minimal, LB-safe projection instead.
+/// it into a minimal, LB-safe projection instead (`/health` and `/status` give
+/// a namespace-bounded JWT the tenant tier).
 fn observability_detail_allowed(
     state: &AdminState,
     auth_header: Option<&str>,
@@ -2833,12 +2856,26 @@ fn observability_detail_allowed(
 /// derived using the Admin API signing secret and must not be exposed through
 /// the broader metrics-token/CIDR observability tier.
 fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bool {
+    verified_admin_actor(state, auth_header)
+        .is_some_and(|actor| !actor.is_namespace_bounded())
+}
+
+/// The actor of a valid Admin API JWT in `auth_header`, or `None` when none was
+/// presented or it does not verify.
+fn verified_admin_actor(state: &AdminState, auth_header: Option<&str>) -> Option<AuditActor> {
     state
         .jwt_manager
         .verify_request(auth_header)
         .ok()
         .and_then(|token| AuditActor::from_verified(&token).ok())
-        .is_some_and(|actor| !actor.is_namespace_bounded())
+}
+
+/// Whether a namespace-bounded token's bound admits `namespace`: inside the
+/// viewer-key namespace ceiling when one applies, and inside the `ns` claim
+/// when the token carries one.
+fn namespace_bound_admits(auth: &AuditActor, namespace: &str) -> bool {
+    auth.namespace_ceiling_decision(namespace) != NamespaceCeilingDecision::Outside
+        && (!auth.allowed_namespaces.is_present() || auth.allowed_namespaces.allows(namespace))
 }
 
 /// Throttles the `diagnostic_ref_lookup` audit event for refused (`403`) and
@@ -3384,14 +3421,7 @@ async fn handle_admin_request_inner(
         // allocation, no lock and no I/O — and skipped entirely for an
         // unauthenticated probe flood.
         if detailed {
-            let namespace_scope = namespace_serving_scope(&state);
-            let data_plane_single_namespace =
-                namespace_scope == NamespaceServingScope::SingleNamespaceDataPlane;
-            health_status["namespace"] = json!({
-                "active": active_data_plane_namespace(&state),
-                "serving_scope": namespace_scope.as_str(),
-                "data_plane_single_namespace": data_plane_single_namespace,
-            });
+            health_status["namespace"] = namespace_serving_block(&state);
         }
 
         // Admin audit delivery pipeline (issue #2421). An unavailable or
@@ -3638,9 +3668,36 @@ async fn handle_admin_request_inner(
         // unauthenticated caller — e.g. a load-balancer / orchestrator probe —
         // receives only liveness + readiness, which is enough to drive health
         // checks without leaking operational internals. Authorized callers
-        // (admin JWT / metrics token / allowlisted CIDR) get the full body.
+        // (admin JWT that is not namespace-bounded / metrics token /
+        // allowlisted CIDR) get the full body.
         if detailed {
             return Ok(json_response(response_code, &health_status));
+        }
+        // Tenant tier (issue #6095): a namespace-bounded admin JWT
+        // ([`AuditActor::is_namespace_bounded`]) without independent detail
+        // authorization gets the minimal body plus `mode`,
+        // `admin_writes_enabled`, and the `namespace` serving block, under the
+        // detailed tier's own field names and shapes. The serving block is
+        // added only when it names no namespace outside the token's bound: the
+        // process routes nothing (`active: null`), or the bound admits the
+        // active namespace. Every other detailed field describes the whole
+        // process and stays out. An unauthenticated probe has no token, so
+        // `verified_admin_actor` returns before any signature work.
+        if let Some(actor) = verified_admin_actor(&state, auth_header.as_deref())
+            .filter(AuditActor::is_namespace_bounded)
+        {
+            let mut tenant = json!({
+                "status": health_status["status"],
+                "ready": health_status["ready"],
+                "mode": health_status["mode"],
+                "admin_writes_enabled": health_status["admin_writes_enabled"],
+            });
+            if active_data_plane_namespace(&state)
+                .is_none_or(|namespace| namespace_bound_admits(&actor, namespace))
+            {
+                tenant["namespace"] = namespace_serving_block(&state);
+            }
+            return Ok(json_response(response_code, &tenant));
         }
         let minimal = json!({
             "status": health_status["status"],
@@ -3704,6 +3761,9 @@ async fn handle_admin_request_inner(
     // from `FERRUM_METRICS_ALLOWED_CIDRS`. Unauthenticated scraping is an
     // explicit operator opt-in (token or CIDR), not the default.
     if path == "/metrics" && method == Method::GET {
+        // A presented namespace-bounded JWT is refused here even from an
+        // allowlisted source IP: `/metrics` is fleet-global, and the CIDR
+        // allowance authorizes only scrapes that present no such token.
         if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
             && let Ok(actor) = AuditActor::from_verified(&token_data)
             && let Some(response) =
