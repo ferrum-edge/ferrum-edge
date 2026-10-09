@@ -67,6 +67,23 @@ connection, never the terminal chunk. A native HTTP/3 backend sees its request s
 `H3_REQUEST_CANCELLED`, never a FIN, and the request ends as a `499` client disconnect. HTTP/1.1
 frontends skip the check: a valid chunked EOF need not update `is_end_stream()`.
 
+Buffered request intake applies the same check. A body the gateway collects before dispatch (the
+early `before_proxy` prebuffer, which also prepares HBONE and sidecar mesh-mTLS bodies, the H1/H2
+retry and body-plugin collect, and the native gRPC buffered collect) is read through the same
+END_STREAM gate. hyper drops the service future on a client reset only while that future is
+pending, so a collect that read the last DATA and a masked reset in the same poll used to finish
+with the truncated body. It now fails as a client disconnect (`499`, or the gRPC collect's read
+failure), and nothing is dispatched.
+
+When the dispatcher cancels a pump whose client has already reset, the pump looks past the DATA
+still buffered ahead of that reset, so the backend gets the client's `CANCEL` rather than the
+`INTERNAL_ERROR` of the gateway's own cancellation. Flow control limits that DATA to one frontend
+stream window (`FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE`), so the probe reads up to one
+window, in at most one poll per 4 KiB of window (capped at 8,192) plus 16. It stops at the first
+frame past one window, because such a client is still streaming. A client that filled its window
+with smaller frames than that can still be missed: its backend sees `INTERNAL_ERROR`, which is
+still a reset and never a complete body.
+
 The same rule covers the buffered collect on the native HTTP/3 backend path, used when retries or
 body plugins need the whole upload before dispatch. The collect borrows the client body, and when
 it ends the gateway checks the body's receive state. An HTTP/2 upload that ended without the

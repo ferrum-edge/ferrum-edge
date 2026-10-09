@@ -4157,6 +4157,86 @@ fn test_remaining_h2_upload_dispatchers_require_h2_end_stream() {
 }
 
 #[test]
+fn test_buffered_h2_request_collectors_require_h2_end_stream() {
+    // Issue #6022 (#6042 review N1): a BUFFERED collect of an HTTP/2 client's
+    // `Incoming` must not accept a masked RST_STREAM(NO_ERROR) as a complete
+    // body. hyper only drops the service future on the reset while it is
+    // pending, so a collect that reads the last DATA and the reset in one poll
+    // would otherwise dispatch the truncated body. Behavioural proof for the
+    // early prebuffer and the native-gRPC collect:
+    // `buffered_upload_end_stream_tests`. The H1/H2 retry/body-plugin collect
+    // in `proxy_to_backend` has no test seam, so it is pinned here.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
+    // (source, function signature, frontend version expression, gated body)
+    let collectors = [
+        (
+            source,
+            "pub(crate) async fn buffer_request_body_for_before_proxy(",
+            "parts.version == hyper::Version::HTTP_2",
+            "body::H2EndStreamGated::new(body, require_end_stream)",
+        ),
+        (
+            source,
+            "async fn proxy_to_backend(",
+            "original_req.version() == hyper::Version::HTTP_2",
+            "body::H2EndStreamGated::new((*original_req).into_body(), require_end_stream)",
+        ),
+        (
+            grpc,
+            "pub(crate) async fn collect_grpc_request_body(",
+            "parts.version == hyper::Version::HTTP_2",
+            "super::body::H2EndStreamGated::new(body, require_end_stream)",
+        ),
+    ];
+    for (file, signature, version_check, gated) in collectors {
+        let collector = file
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{signature} not found"))
+            .split("\n}\n")
+            .next()
+            .expect("bounded collector");
+        assert!(
+            collector.contains(&format!("let require_end_stream = {version_check};")),
+            "{signature}: the requirement must come from the frontend request version"
+        );
+        let gate = collector
+            .find(gated)
+            .unwrap_or_else(|| panic!("{signature}: the collected body must be gated"));
+        // Every buffered collect in the function reads the gated body: no
+        // `Limited` or raw `collect` may be built before the gate.
+        for collect in ["Limited::new(", "BodyExt::collect("] {
+            if let Some(first) = collector.find(collect) {
+                assert!(
+                    gate < first,
+                    "{signature}: `{collect}` must read the gated body"
+                );
+            }
+        }
+    }
+
+    let body = include_str!("../../../src/proxy/body.rs");
+    let gate = body
+        .split("impl<B> http_body::Body for H2EndStreamGated<B>")
+        .nth(1)
+        .expect("H2EndStreamGated body impl")
+        .split("\n}\n")
+        .next()
+        .expect("bounded H2EndStreamGated impl");
+    let masked_eof =
+        "Poll::Ready(None) if this.require_end_stream && !this.inner.is_end_stream() => {";
+    assert!(
+        gate.contains(masked_eof),
+        "the gate must check the client's receive state at EOF"
+    );
+    assert!(
+        gate.contains("Poll::Ready(Some(Err(h2_upload_reset_error())))"),
+        "a buffered collect's masked HTTP/2 reset must surface as the reset error"
+    );
+}
+
+#[test]
 fn test_native_h3_streaming_upload_requires_h2_end_stream() {
     // Issue #6022: an HTTP/1.1 or HTTP/2 route whose target is native HTTP/3
     // streams the client's `Incoming` straight into the backend QUIC stream.

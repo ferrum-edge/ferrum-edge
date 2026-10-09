@@ -6087,6 +6087,10 @@ pub(crate) async fn collect_grpc_request_body(
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
     let (parts, body) = req.into_parts();
+    // An HTTP/2 client's masked reset is a failed read, never a complete
+    // request (issue #6022); see `body::H2EndStreamGated`.
+    let require_end_stream = parts.version == hyper::Version::HTTP_2;
+    let body = super::body::H2EndStreamGated::new(body, require_end_stream);
     let body_bytes = if max_grpc_recv_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
         let collected = super::collect_request_body_under_authorization(
