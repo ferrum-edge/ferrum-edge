@@ -322,6 +322,7 @@ spec:
           securityContext:
             runAsUser: 0
             runAsGroup: 0
+            privileged: false
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -365,9 +366,27 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+          {{- /* No capabilities (issue #6122). uid 0 is needed only as the
+                 OWNER of the root-owned host CNI directories: creating,
+                 renaming, and removing entries there needs owner write on
+                 the directory, the only chmods are on staging files this
+                 run just created (so it owns them), it never chowns, and
+                 what it reads (every neighbouring .conf/.conflist/.json it
+                 scans, /app/ferrum-cni, the installed binary) must be
+                 root-owned with owner read, or world-readable. So
+                 CAP_DAC_OVERRIDE, CAP_CHOWN, and CAP_FOWNER are all
+                 unnecessary — the posture the rollback sidecar and the
+                 uninstall hook already run with against the same mounts.
+                 Every write lands on a host mount, so the image root stays
+                 read-only. */}}
           securityContext:
             runAsUser: 0
             runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: host-cni-bin
               mountPath: {{ $cni.hostBinDir }}
