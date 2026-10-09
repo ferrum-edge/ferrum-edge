@@ -67,6 +67,11 @@ connection, never the terminal chunk. A native HTTP/3 backend sees its request s
 `H3_REQUEST_CANCELLED`, never a FIN, and the request ends as a `499` client disconnect. HTTP/1.1
 frontends skip the check: a valid chunked EOF need not update `is_end_stream()`.
 
+The same rule covers the buffered collect on the native HTTP/3 backend path, used when retries or
+body plugins need the whole upload before dispatch. The collect borrows the client body, and when
+it ends the gateway checks the body's receive state. An HTTP/2 upload that ended without the
+client's `END_STREAM` is answered as a `499` client disconnect and never sent to the H3 backend.
+
 The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
 classifier never count this gateway-initiated reset as a backend failure (see
 [error classification](error_classification.md)). The sidecar mesh-mTLS, HBONE, and Unix-socket

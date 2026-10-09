@@ -11791,7 +11791,7 @@ async fn drain_h3_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     upload: H3RetainedUpload,
     charge: &mut Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
-) -> Result<Option<Vec<u8>>, h3::error::StreamError>
+) -> Result<Option<Vec<u8>>, super::server::H3UploadReadError>
 where
     S: RecvStream,
 {

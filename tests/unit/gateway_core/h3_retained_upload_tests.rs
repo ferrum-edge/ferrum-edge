@@ -378,3 +378,40 @@ fn both_h3_bridge_drain_refusals_run_the_reject_hooks_and_the_log() {
         );
     }
 }
+
+#[test]
+fn every_h3_drain_reads_to_the_end_of_the_request_stream() {
+    // Issue #6022: `recv_data` also ends at a trailer section, which ends the
+    // body but not the stream. Every buffered native-H3 and bridge drain goes
+    // through this one function, which must read on to the stream's own end
+    // before it hands the body over, so a reset after the trailers is refused.
+    // On-the-wire proof: `h3_buffered_drain_refuses_a_reset_after_the_trailer_section`.
+    let server = include_str!("../../../src/http3/server.rs");
+    let drain = server
+        .split("pub(crate) async fn drain_h3_request_body<S>(")
+        .nth(1)
+        .expect("shared H3 drain")
+        .split("\n}\n")
+        .next()
+        .expect("bounded shared H3 drain");
+    let body_loop = drain
+        .find("while let Some(chunk) = stream.recv_data().await? {")
+        .expect("body loop");
+    let end_of_stream = drain
+        .find("if stream.recv_data().await?.is_some() {")
+        .expect("end-of-stream read after the body loop");
+    let finish = drain.find("upload.finish()").expect("upload hand-over");
+    assert!(
+        body_loop < end_of_stream && end_of_stream < finish,
+        "the drain must confirm the stream ended before it hands the body over"
+    );
+    assert!(
+        drain[end_of_stream..finish].contains("H3UploadReadError::DataAfterTrailers"),
+        "DATA after the trailer section must be refused"
+    );
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        bridge.contains("super::server::drain_h3_request_body(stream, upload, charge).await"),
+        "the bridge drains must share the native-H3 drain"
+    );
+}
