@@ -1248,28 +1248,38 @@ def supervise(args):
         config = Path(binding['config']).read_bytes()
         result['input_hashes'] = dict(binding=hashlib.sha256(binding_bytes).hexdigest(),
             runtime=hashlib.sha256(runtime_bytes).hexdigest(), config=hashlib.sha256(config).hexdigest())
-        expected = (HERE / 'configs/http1_tls_e2e_perf.yaml').read_text().replace('CA_PATH', '/etc/ferrum/tls/ca.pem').encode()
-        if config != expected or hashlib.sha256(config).hexdigest() != runtime['config_sha256']:
-            raise ValueError('effective config does not match exact H1 TLS fixture')
-        env = runtime['environment']
-        for key, value in {'FERRUM_MODE': 'file', 'FERRUM_PROXY_HTTPS_PORT': '8443',
-                           'FERRUM_ADMIN_HTTP_PORT': '9000', 'FERRUM_ADMIN_BIND_ADDRESS': '127.0.0.1'}.items():
-            if env.get(key) != value:
-                raise ValueError('runtime role configuration mismatch: ' + key)
-        if env.get('FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES') not in ('0', '1'):
-            raise ValueError('unexpected cutoff')
+        h2_protocol = getattr(args, 'h2_protocol', None)
+        if h2_protocol:
+            if args.mode != 'cpu' or not args.enabled:
+                raise ValueError('H2 extension permits only enabled user CPU sampling')
+            from h2_cpu_profile import validate_runtime
+            validate_runtime(binding, runtime, config, h2_protocol)
+        else:
+            expected = (HERE / 'configs/http1_tls_e2e_perf.yaml').read_text().replace('CA_PATH', '/etc/ferrum/tls/ca.pem').encode()
+            if config != expected or hashlib.sha256(config).hexdigest() != runtime['config_sha256']:
+                raise ValueError('effective config does not match exact H1 TLS fixture')
+            env = runtime['environment']
+            for key, value in {'FERRUM_MODE': 'file', 'FERRUM_PROXY_HTTPS_PORT': '8443',
+                               'FERRUM_ADMIN_HTTP_PORT': '9000', 'FERRUM_ADMIN_BIND_ADDRESS': '127.0.0.1'}.items():
+                if env.get(key) != value:
+                    raise ValueError('runtime role configuration mismatch: ' + key)
+            if env.get('FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES') not in ('0', '1'):
+                raise ValueError('unexpected cutoff')
         owner = admit_runtime_target(runtime)
         builds = Path(args.builds).resolve()
         matches = [str(p.relative_to(builds)) for p in builds.glob('*/ferrum-edge') if digest(p) == owner['executable_sha256']]
-        if len(matches) != 1:
+        envoy_cpu = h2_protocol and binding['arm'] == 'envoy'
+        if not envoy_cpu and len(matches) != 1:
             raise ValueError('target ELF does not match exactly one retained release twin')
-        result.update(identity=owner, runtime=runtime, matching_elf=matches[0], binding=binding)
+        result.update(identity=owner, runtime=runtime, matching_elf=None if envoy_cpu else matches[0], binding=binding)
         write(out / 'identity.json', owner)
         admit_runtime_target(runtime, owner)
         result['initial_sockets'] = tcp_inventory(owner['pid'])
         admit_runtime_target(runtime, owner)
         write(out / 'initial-sockets.json', result['initial_sockets'])
-        symbol_package = builds / Path(matches[0]).parent / 'symfs'
+        # Envoy retains its actual mapped ELF and build IDs from the admitted
+        # image, with unresolved/stripped symbols reported by the same decoder.
+        symbol_package = builds / ('envoy' if envoy_cpu else str(Path(matches[0]).parent)) / 'symfs'
         result['symbol_package'] = str(symbol_package)
         dsos = retain_dsos(owner['pid'], symbol_package) if mode == 'cpu' else {}
         write(out / 'build-mappings.json', dsos)
@@ -1453,6 +1463,7 @@ def main():
     s.add_argument('--artifact-root', required=True)
     s.add_argument('--mode', choices=('syscalls', 'cpu'), required=True)
     s.add_argument('--enabled', action='store_true'); s.add_argument('--parent', type=int, required=True)
+    s.add_argument('--h2-protocol', choices=('http2', 'grpcs'))
     s = sub.add_parser('preflight'); s.add_argument('--output', required=True)
     s = sub.add_parser('prepare-artifacts'); s.add_argument('--output', required=True)
     s = sub.add_parser('request-teardown'); s.add_argument('--output', required=True)

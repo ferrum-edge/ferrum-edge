@@ -1,0 +1,154 @@
+name: H2 and gRPC CPU Profile
+
+on:
+  pull_request:
+    paths:
+      - tests/performance/multi_protocol/h2_cpu_profile.py
+      - tests/performance/multi_protocol/h1_trace.py
+      - tests/performance/multi_protocol/process_usage.py
+      - tests/performance/multi_protocol/src/process_usage.rs
+      - tests/performance/multi_protocol/run_gateway_protocol_bench.sh
+      - tests/performance/multi_protocol/tests/test_h2_cpu_profile.py
+      - tests/performance/multi_protocol/tests/test_process_usage.py
+      - .github/workflows/h2-cpu-profile.yml
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: Protocol to profile on one hosted runner
+        type: choice
+        options: [http2, grpcs]
+        default: http2
+      payload:
+        description: Fixed payload size in bytes
+        type: choice
+        options: ['10240', '71680']
+        default: '10240'
+
+permissions:
+  contents: read
+
+env:
+  RUSTC_WRAPPER: ''
+  CARGO_BUILD_RUSTC_WRAPPER: ''
+  RUSTFLAGS: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: H2 CPU profile contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Validate workload admission and scheduler accounting
+        run: |
+          bash -n tests/performance/multi_protocol/run_gateway_protocol_bench.sh
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_process_usage.py'
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_h2_cpu_profile.py'
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_h1_trace.py'
+
+  measurement:
+    name: Profile ${{ inputs.protocol }} (${{ inputs.payload }} bytes)
+    if: github.event_name == 'workflow_dispatch'
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Hosted build and observer prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof \
+            binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-tools-generic linux-tools-common
+          sudo fallocate -l 12G /mnt/h2-cpu-swap
+          sudo chmod 600 /mnt/h2-cpu-swap
+          sudo mkswap /mnt/h2-cpu-swap
+          sudo swapon /mnt/h2-cpu-swap
+      - name: Retain source and runner identity
+        run: |
+          mkdir -p h2-cpu-evidence/builds/ferrum
+          git rev-parse HEAD > h2-cpu-evidence/revision.txt
+          git archive HEAD | sha256sum > h2-cpu-evidence/source-tree.sha256
+          cp Cargo.lock Cargo.toml .cargo/config.toml h2-cpu-evidence/builds/
+          cp tests/performance/multi_protocol/Cargo.lock h2-cpu-evidence/builds/harness-Cargo.lock
+          rustc -Vv > h2-cpu-evidence/builds/rustc.txt
+          uname -a > h2-cpu-evidence/kernel.txt
+          lscpu > h2-cpu-evidence/cpu.txt
+          cat /proc/sys/kernel/random/boot_id > h2-cpu-evidence/boot-id.txt
+      - name: Build the symbolized production-profile binary and common harness
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: '1'
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin ferrum-edge --bin ferrum-cni \
+            2>&1 | tee h2-cpu-evidence/builds/ferrum/build.log
+          mkdir -p bin/amd64
+          cp target/release/ferrum-edge target/release/ferrum-cni bin/amd64/
+          cp target/release/ferrum-edge h2-cpu-evidence/builds/ferrum/ferrum-edge
+          sha256sum bin/amd64/* > h2-cpu-evidence/builds/ferrum/binaries.sha256
+          readelf -n bin/amd64/ferrum-edge > h2-cpu-evidence/builds/ferrum/build-id.txt
+          printf '%s\n' 'profile=release' 'debug=1' 'strip=none' 'lto=fat' 'codegen_units=1' \
+            'opt_level=3' 'panic=abort' 'features=production-default' 'RUSTFLAGS=' \
+            > h2-cpu-evidence/builds/ferrum/flags.txt
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" -t ferrum-h2-cpu:current .
+          docker image inspect ferrum-h2-cpu:current > h2-cpu-evidence/builds/ferrum/image.json
+          cargo build --locked --release --manifest-path tests/performance/multi_protocol/Cargo.toml
+      - name: Stage the shared fixed CPU collector and real capability fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p h2-cpu-evidence/trace-build
+          clang-18 -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wall -Werror \
+            -I/usr/include/x86_64-linux-gnu -c tests/performance/multi_protocol/h3_proof/observer.bpf.c \
+            -o h2-cpu-evidence/trace-build/observer.bpf.o
+          cc -std=gnu11 -O2 -g -Wall -Wextra -Werror tests/performance/multi_protocol/h3_proof/observer.c \
+            -lbpf -lelf -lz -o h2-cpu-evidence/trace-build/observer
+          cc -std=gnu11 -O2 -g -fomit-frame-pointer -fasynchronous-unwind-tables -Wall -Wextra -Werror \
+            tests/performance/multi_protocol/h1_trace_fixture.c -pthread -o h2-cpu-evidence/trace-build/h1_trace_fixture
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH \
+            python3 tests/performance/multi_protocol/h1_trace.py stage --build h2-cpu-evidence/trace-build
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_ARCH,GITHUB_SHA,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,ImageOS,ImageVersion \
+            python3 tests/performance/multi_protocol/h1_trace.py preflight --output h2-cpu-evidence/trace-preflight
+      - name: Unprofiled controls before and after a separately retained CPU campaign
+        env:
+          PROFILE_PROTOCOL: ${{ inputs.protocol }}
+          PROFILE_PAYLOAD: ${{ inputs.payload }}
+          FERRUM_IMAGE: ferrum-h2-cpu:current
+        run: |
+          set -euo pipefail
+          for pass in control-before counters cpu control-after; do
+            mode=off
+            if [ "$pass" = counters ]; then mode=counters; fi
+            if [ "$pass" = cpu ]; then mode=cpu; fi
+            bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
+              "$PROFILE_PROTOCOL" --h2-profile "$mode" --profile-builds h2-cpu-evidence/builds \
+              --gateways 'ferrum envoy' --skip-build --duration 15 --concurrency 200 --pairs 2 \
+              --payload-sizes "$PROFILE_PAYLOAD" --wallclock-budget-seconds 1800 \
+              --output-dir "h2-cpu-evidence/$pass"
+          done
+          python3 tests/performance/multi_protocol/h2_cpu_profile.py report h2-cpu-evidence
+      - name: Hand back bounded root-owned trace artifacts after success or failure
+        if: always()
+        run: |
+          if [ -d h2-cpu-evidence ]; then
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+              python3 tests/performance/multi_protocol/h1_trace.py prepare-artifacts --output h2-cpu-evidence
+          fi
+      - name: Retain raw profiles, coverage limits, counters and controls
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: h2-cpu-${{ inputs.protocol }}-${{ inputs.payload }}-${{ github.sha }}
+          path: h2-cpu-evidence/
+          retention-days: 14

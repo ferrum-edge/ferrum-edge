@@ -17,6 +17,8 @@ def sample_issues(sample):
     issues = []
     if not isinstance(sample, dict):
         return ["invalid sample object"]
+    if "h2_cpu_profile" in sample:
+        issues.append("H2 CPU profiling campaign: diagnostic only")
     if "samples" in sample:
         children = sample["samples"]
         expected = sample.get("expected_pairs")
