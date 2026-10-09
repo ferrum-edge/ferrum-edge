@@ -158,7 +158,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -1203,10 +1203,53 @@ fn is_h2_source_cancel(error: BoxError) -> bool {
     false
 }
 
-/// Most client frames a cancelled pump reads looking for a reset that already
-/// arrived. Only frames already buffered are read, so this bounds how much of
-/// a client still streaming is discarded before the cancellation completes.
-const SOURCE_RESET_PROBE_FRAMES: usize = 16;
+/// The frontend HTTP/2 initial stream window, published once from the accepted
+/// startup configuration (`FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE`)
+/// through `EnvConfig::publish_process_wide_stream_settings`. It sizes the
+/// cancelled pump's reset probe ([`source_already_reset`]). A process-wide
+/// scalar rather than a parameter: the pump is installed from a dozen
+/// dispatchers that do not otherwise carry the frontend listener settings, and
+/// the value only bounds how far a teardown looks ahead. Seeded with the
+/// documented default, so a pump that runs before publication is still bounded.
+static FRONTEND_H2_STREAM_WINDOW_BYTES: AtomicU32 =
+    AtomicU32::new(crate::proxy::FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE);
+
+/// Publish the accepted frontend HTTP/2 initial stream window. Only the
+/// accepted startup-configuration seam calls this.
+pub(crate) fn publish_frontend_h2_stream_window(bytes: u32) {
+    FRONTEND_H2_STREAM_WINDOW_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The DATA frame size the reset probe budgets polls for: a quarter of RFC
+/// 9113's 16 KiB floor for `SETTINGS_MAX_FRAME_SIZE` (the frontend default), so
+/// a client that fills its window with full-size frames, or with frames down
+/// to 4 KiB, is covered.
+const SOURCE_RESET_PROBE_FRAME_BYTES: u32 = 4_096;
+
+/// Most frame polls the probe budgets for, whatever the window: one window of
+/// full-size 16 KiB frames at the largest configurable window (128 MiB).
+const SOURCE_RESET_PROBE_MAX_FRAMES: u32 = 8_192;
+
+/// Polls the reset probe allows beyond its frame budget: the poll that
+/// returns the reset itself, a short final DATA frame, and a few smaller
+/// frames. Zero-length DATA frames are bounded by h2 itself.
+const SOURCE_RESET_PROBE_SLACK_POLLS: usize = 16;
+
+/// The poll budget of a cancelled pump's reset probe for a frontend stream
+/// window of `window` bytes (issue #6038): one poll per 4 KiB of window, at
+/// most [`SOURCE_RESET_PROBE_MAX_FRAMES`], plus
+/// [`SOURCE_RESET_PROBE_SLACK_POLLS`]. 80 polls at the 256 KiB default, where
+/// a fixed 16 used to stop one short of a reset behind a full window of 16 KiB
+/// frames.
+#[inline]
+fn source_reset_probe_polls(window: u32) -> usize {
+    let frames = window
+        .div_ceil(SOURCE_RESET_PROBE_FRAME_BYTES)
+        .min(SOURCE_RESET_PROBE_MAX_FRAMES);
+    usize::try_from(frames)
+        .unwrap_or(usize::MAX)
+        .saturating_add(SOURCE_RESET_PROBE_SLACK_POLLS)
+}
 
 /// Whether the client already reset the HTTP/2 upload that the dispatcher is
 /// cancelling (issue #6038).
@@ -1216,15 +1259,35 @@ const SOURCE_RESET_PROBE_FRAMES: usize = 16;
 /// DATA that is still buffered ahead of the reset is discarded, because the
 /// upload is being torn down either way. A masked reset (EOF without
 /// END_STREAM) counts as a reset, as it does in the relay itself.
-fn source_already_reset<B>(body: &mut B) -> bool
+///
+/// The look-ahead is sized from the frontend stream window. Flow control means
+/// a client can have at most `window` bytes of DATA buffered ahead of its
+/// reset, so the probe reads up to `window` bytes in up to
+/// [`source_reset_probe_polls`] polls. More DATA than one window means the
+/// client is still streaming (each read releases window credit), so the probe
+/// stops there instead of draining a live upload. Only frames already received
+/// are read, so the work is bounded by what the client actually sent. The one
+/// remaining miss is a client that filled its window with frames smaller than
+/// the poll budget assumes (under 4 KiB at windows up to 32 MiB): past the
+/// budget the backend gets hyper's `INTERNAL_ERROR` for the gateway's own
+/// cancellation instead of the client's `CANCEL`. That is still a reset, never
+/// a complete body.
+fn source_already_reset<B>(body: &mut B, window: u32) -> bool
 where
     B: http_body::Body<Data = Bytes> + Unpin,
     B::Error: Into<BoxError>,
 {
     let mut cx = Context::from_waker(std::task::Waker::noop());
-    for _ in 0..SOURCE_RESET_PROBE_FRAMES {
+    let mut window_left = u64::from(window);
+    for _ in 0..source_reset_probe_polls(window) {
         match http_body::Body::poll_frame(Pin::new(&mut *body), &mut cx) {
-            Poll::Ready(Some(Ok(_))) => {}
+            Poll::Ready(Some(Ok(frame))) => {
+                let len = frame.data_ref().map_or(0, |data| data.len() as u64);
+                match window_left.checked_sub(len) {
+                    Some(left) => window_left = left,
+                    None => return false,
+                }
+            }
             Poll::Ready(Some(Err(error))) => return is_h2_source_cancel(error.into()),
             Poll::Ready(None) => return !http_body::Body::is_end_stream(&*body),
             Poll::Pending => return false,
@@ -1396,7 +1459,8 @@ where
     // hyper's INTERNAL_ERROR for the gateway's own cancellation instead of
     // the client's CANCEL.
     if outcome == UploadPumpOutcome::Cancelled && require_end_stream {
-        source_reset = source_already_reset(&mut body);
+        let window = FRONTEND_H2_STREAM_WINDOW_BYTES.load(Ordering::Relaxed);
+        source_reset = source_already_reset(&mut body, window);
     }
     // Publish BEFORE the sender drops: the transport side reads this exactly
     // when `poll_recv` observes the closed channel, and the channel close is
