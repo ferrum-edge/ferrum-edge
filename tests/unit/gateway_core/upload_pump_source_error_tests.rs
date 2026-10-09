@@ -531,7 +531,11 @@ fn reset_probe_stops_after_one_window_of_a_live_upload() {
     let (mut body, state) = buffered_upload(17, 16_384, ProbeEnd::Cancel);
     assert!(!source_already_reset(&mut body, window));
     assert_eq!(state.polls.load(Ordering::Relaxed), 17);
-    assert_eq!(body.frames.len(), 1, "the reset after the overrun is not read");
+    assert_eq!(
+        body.frames.len(),
+        1,
+        "the reset after the overrun is not read"
+    );
 }
 
 #[test]
