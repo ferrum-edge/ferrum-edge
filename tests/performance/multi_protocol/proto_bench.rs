@@ -71,6 +71,9 @@ enum Protocol {
     Saturate(SaturateArgs),
 }
 
+/// The HTTP/2 and gRPC clients' historical fixed stream window: 8 MiB.
+const DEFAULT_H2_STREAM_WINDOW: u32 = 8_388_608;
+
 #[derive(Parser, Clone)]
 struct BenchArgs {
     /// Target URL or address
@@ -111,6 +114,18 @@ struct BenchArgs {
     /// Bounded H1 last-state snapshots and separate driver retirement (diagnostic only).
     #[arg(long, default_value = "false")]
     h1_diagnostic: bool,
+
+    /// Initial HTTP/2 stream window, in bytes, for the HTTP/2 and gRPC
+    /// clients (65535..=2147483647). 65535 measures small-window flow
+    /// control (#6038).
+    #[arg(long, default_value_t = DEFAULT_H2_STREAM_WINDOW)]
+    h2_stream_window: u32,
+
+    /// gRPC only: open a fresh connection (TCP, TLS and HTTP/2 handshakes) for
+    /// every call and close it after the response, instead of sharing a
+    /// channel pool. Latency then includes the connection setup.
+    #[arg(long, default_value = "false")]
+    connection_per_request: bool,
 }
 
 #[derive(Parser, Clone)]
@@ -157,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     let cli = Cli::parse();
+    check_client_options(&cli.command)?;
     match cli.command {
         Protocol::Http1(args) => run_http1(&args).await,
         Protocol::Http2(args) => run_http2(&args).await,
@@ -167,6 +183,31 @@ async fn main() -> anyhow::Result<()> {
         Protocol::Udp(args) => run_udp(&args).await,
         Protocol::Saturate(args) => run_saturate(&args).await,
     }
+}
+
+/// Refuse client options the selected protocol would silently ignore, so a
+/// labelled run cannot measure the default client instead.
+fn check_client_options(command: &Protocol) -> anyhow::Result<()> {
+    let (args, h2_family, grpc) = match command {
+        Protocol::Http2(args) => (args, true, false),
+        Protocol::Grpc(args) => (args, true, true),
+        Protocol::Http1(args)
+        | Protocol::Http3(args)
+        | Protocol::Ws(args)
+        | Protocol::Tcp(args)
+        | Protocol::Udp(args) => (args, false, false),
+        Protocol::Saturate(_) => return Ok(()),
+    };
+    if !(65_535..=2_147_483_647).contains(&args.h2_stream_window) {
+        anyhow::bail!("--h2-stream-window must be within 65535..=2147483647");
+    }
+    if !h2_family && args.h2_stream_window != DEFAULT_H2_STREAM_WINDOW {
+        anyhow::bail!("--h2-stream-window applies only to http2 and grpc");
+    }
+    if !grpc && args.connection_per_request {
+        anyhow::bail!("--connection-per-request applies only to grpc");
+    }
+    Ok(())
 }
 
 // ── Reporting helper ─────────────────────────────────────────────────────────
@@ -640,6 +681,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     // Build an HTTP/2 client builder with optimized flow-control settings.
     // The default 64 KB stream window throttles throughput on modern networks;
     // 8 MiB stream + 32 MiB connection windows match the gateway's tuned defaults.
+    // `--h2-stream-window 65535` lowers only the stream window (#6038).
     //
     // Keep these windows fixed. hyper's `adaptive_window(true)` silently resets
     // both windows to 65,535 and grows them with BDP pings, and in that mode
@@ -650,7 +692,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
         builder
             .timer(TokioTimer::new())
-            .initial_stream_window_size(8_388_608) // 8 MiB
+            .initial_stream_window_size(args.h2_stream_window) // 8 MiB by default
             .initial_connection_window_size(33_554_432) // 32 MiB
             .max_frame_size(1_048_576); // 1 MiB
         builder
@@ -1317,29 +1359,37 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
             args.concurrency as usize / 10 + 1,
         ),
     );
-    let mut channels = Vec::with_capacity(num_conns);
+    // `--h2-stream-window 65535` lowers only the stream window (#6038).
+    let mut endpoint = tonic::transport::Channel::from_shared(args.target.clone())
+        .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
+        .initial_stream_window_size(args.h2_stream_window) // 8 MiB by default (vs 64 KB)
+        .initial_connection_window_size(33_554_432) // 32 MiB
+        .tcp_nodelay(true)
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_while_idle(true);
 
-    for channel_id in 1..=num_conns {
-        let mut endpoint = tonic::transport::Channel::from_shared(args.target.clone())
-            .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
-            .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
-            .initial_connection_window_size(33_554_432) // 32 MiB
-            .tcp_nodelay(true)
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_while_idle(true);
+    if let Some(pem) = &ca_pem {
+        let ca = tonic::transport::Certificate::from_pem(pem);
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(ca)
+            // Benchmark certs are issued for "localhost"; force SNI/name
+            // check to match regardless of the numeric host in the URI.
+            .domain_name("localhost");
+        endpoint = endpoint
+            .tls_config(tls)
+            .map_err(|e| anyhow::anyhow!("gRPC TLS config for {}: {e}", args.target))?;
+    }
 
-        if let Some(pem) = &ca_pem {
-            let ca = tonic::transport::Certificate::from_pem(pem);
-            let tls = tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(ca)
-                // Benchmark certs are issued for "localhost"; force SNI/name
-                // check to match regardless of the numeric host in the URI.
-                .domain_name("localhost");
-            endpoint = endpoint
-                .tls_config(tls)
-                .map_err(|e| anyhow::anyhow!("gRPC TLS config for {}: {e}", args.target))?;
-        }
+    // `--connection-per-request` opens no shared channels: each call dials
+    // its own connection below and closes it after the response.
+    let pooled = if args.connection_per_request {
+        0
+    } else {
+        num_conns
+    };
+    let mut channels = Vec::with_capacity(pooled);
 
+    for channel_id in 1..=pooled {
         let current_connection = Arc::new(GrpcConnectionIdentity::default());
         let channel = endpoint
             .connect_with_connector(GrpcConnector {
@@ -1355,11 +1405,94 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
 
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
-        let (channel, current_connection) = channels[i as usize % num_conns].clone();
         let channel_id = i as usize % num_conns + 1;
         let events = observer.clone();
         let payload = payload.clone();
         let mut metrics = phases.worker();
+        if args.connection_per_request {
+            let endpoint = endpoint.clone();
+            let connections = connections.clone();
+            handles.push(tokio::spawn(async move {
+                while metrics.next_request().await {
+                    let current_connection = Arc::new(GrpcConnectionIdentity::default());
+                    let req = tonic::Request::new(EchoRequest {
+                        payload: payload.clone(),
+                    });
+                    // The latency includes the TCP, TLS and HTTP/2 handshakes.
+                    let start = Instant::now();
+                    let connected = endpoint
+                        .connect_with_connector(GrpcConnector {
+                            connections: connections.clone(),
+                            observer: events.clone(),
+                            channel_id,
+                            current_connection: current_connection.clone(),
+                        })
+                        .await;
+                    let channel = match connected {
+                        Ok(channel) => channel,
+                        Err(error) => {
+                            report_transport_error("gRPC", "connect", &error);
+                            events.record(
+                                0,
+                                Some(i as usize),
+                                Some(channel_id),
+                                "connect_error",
+                                Some(&error),
+                            );
+                            metrics.record_error();
+                            break;
+                        }
+                    };
+                    // Same message caps as the pooled client below.
+                    let mut client = BenchServiceClient::new(ObservedChannel {
+                        inner: channel,
+                        admission: metrics.admission(),
+                    })
+                    .max_decoding_message_size(8 * 1024 * 1024)
+                    .max_encoding_message_size(8 * 1024 * 1024);
+                    let result = client.unary_echo(req).await;
+                    // Dropping the only handle closes this call's connection.
+                    drop(client);
+                    match result {
+                        Ok(resp) => {
+                            let latency = start.elapsed().as_micros() as u64;
+                            let response = resp.into_inner().payload;
+                            if !record_echo_result(
+                                &mut metrics,
+                                "gRPC",
+                                &response,
+                                &payload,
+                                latency,
+                            ) {
+                                events.record(
+                                    0,
+                                    Some(i as usize),
+                                    Some(channel_id),
+                                    "response_validation_failed",
+                                    None,
+                                );
+                                break;
+                            }
+                        }
+                        Err(status) => {
+                            report_transport_error("gRPC", "unary_echo", &status);
+                            events.record(
+                                current_connection.snapshot(),
+                                Some(i as usize),
+                                Some(channel_id),
+                                "unary_echo_error",
+                                Some(&status),
+                            );
+                            metrics.record_error();
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(metrics.finish_worker())
+            }));
+            continue;
+        }
+        let (channel, current_connection) = channels[i as usize % num_conns].clone();
         handles.push(tokio::spawn(async move {
             // tonic defaults to a 4 MiB cap on request + response message
             // size; the bench sweeps payloads up to 5 MiB. Without raising

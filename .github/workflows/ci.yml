@@ -1262,6 +1262,7 @@ jobs:
               integration::admin_observability_auth_tests
               integration::admin_metrics_tls_inventory_snapshot_tests
               integration::admin_namespace_claim_tests
+              integration::admin_ns_claim_global_routes_tests
               integration::admin_namespace_crud_tests
               integration::admin_namespace_live_apply_tests
               integration::file_mode_admin_jwt_tests

@@ -1,0 +1,130 @@
+name: Allocations Per Request
+
+# Hosted measurement for #6022 item 1: allocator calls per proxied request on
+# the default HTTP/1.1 path, the reqwest path, the direct HTTP/2 pool, the gRPC
+# pool and the native HTTP/3 pool. The `measure` job builds `ferrum-edge` with
+# the default-off `bench-h1-profile` feature (a counting forwarding allocator,
+# docs/h1_internal_profile.md) at the dispatched ref and, optionally, at a
+# baseline commit, and measures both on one runner with alternating order.
+# Manual only; pull requests that edit this lane run its cheap contracts. Not a
+# required check and not part of any merge gate. See
+# tests/performance/multi_protocol/README.md ("Allocations per request").
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_sha:
+        description: "Optional full commit SHA measured on the same runner (e.g. the pre-#5993 commit)"
+        required: false
+        default: ""
+        type: string
+      paths:
+        description: "Space-separated paths: h1 h1-reqwest h2 grpc h3"
+        required: false
+        default: "h1 h1-reqwest h2 grpc h3"
+        type: string
+      profile:
+        description: "Cargo profile for every gateway build (release ships; ci-release builds faster)"
+        required: false
+        default: release
+        type: choice
+        options: [release, ci-release]
+      # A choice, not free text: 5 paths x 2 revisions x 5 rounds at 30 s plus
+      # warmup, idle and restarts still leaves the two builds most of the
+      # 240-minute job timeout.
+      duration:
+        description: "Measured seconds per path, revision and round"
+        required: false
+        default: "20"
+        type: choice
+        options: ["5", "10", "20", "30"]
+      rounds:
+        description: "Rounds; the candidate/baseline order alternates per round"
+        required: false
+        default: "3"
+        type: choice
+        options: ["1", "2", "3", "4", "5"]
+  pull_request:
+    paths:
+      - .github/workflows/alloc-per-request.yml
+      - tests/performance/multi_protocol/alloc_per_request.sh
+      - tests/performance/multi_protocol/alloc_per_request.py
+      - tests/performance/multi_protocol/tests/test_alloc_per_request.py
+
+permissions:
+  contents: read
+
+# `.cargo/config.toml` points cargo at sccache and mold; this lane installs
+# neither, exactly like h1-internal-profile.yml.
+env:
+  RUSTC_WRAPPER: ""
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+  RUSTFLAGS: ""
+  CARGO_TERM_COLOR: always
+
+# A newer push to the same pull request cancels the superseded run. Every
+# dispatch gets a unique group so it always runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  contracts:
+    name: Allocation measurement contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Runner syntax and summarizer tests
+        run: |
+          set -euo pipefail
+          bash -n tests/performance/multi_protocol/alloc_per_request.sh
+          python3 -m unittest discover --verbose \
+            --start-directory tests/performance/multi_protocol/tests \
+            --pattern 'test_alloc_per_request.py'
+
+  measure:
+    name: Allocations per request
+    if: github.event_name == 'workflow_dispatch'
+    needs: contracts
+    runs-on: ubuntu-latest
+    # Two uncached fat-LTO release builds plus the measurement rounds.
+    timeout-minutes: 240
+    env:
+      ALLOC_BASELINE_SHA: ${{ inputs.baseline_sha }}
+      ALLOC_PATHS: ${{ inputs.paths }}
+      ALLOC_PROFILE: ${{ inputs.profile }}
+      ALLOC_DURATION: ${{ inputs.duration }}
+      ALLOC_ROUNDS: ${{ inputs.rounds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          # The baseline commit must be present for its worktree.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Hosted prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof
+      - name: Measure allocations per request
+        run: |
+          set -euo pipefail
+          args=(--output alloc-results --paths "$ALLOC_PATHS" --profile "$ALLOC_PROFILE"
+                --duration "$ALLOC_DURATION" --rounds "$ALLOC_ROUNDS")
+          if [ -n "$ALLOC_BASELINE_SHA" ]; then
+            args+=(--baseline "$ALLOC_BASELINE_SHA")
+          fi
+          bash tests/performance/multi_protocol/alloc_per_request.sh "${args[@]}"
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: alloc-per-request-${{ github.sha }}-${{ github.run_attempt }}
+          path: alloc-results/
+          if-no-files-found: warn
+          retention-days: 30

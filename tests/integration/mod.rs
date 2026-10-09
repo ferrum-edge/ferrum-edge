@@ -23,6 +23,7 @@ mod admin_namespace_claim_tests;
 mod admin_namespace_crud_tests;
 mod admin_namespace_live_apply_tests;
 mod admin_node_waypoint_identities_tests;
+mod admin_ns_claim_global_routes_tests;
 mod admin_observability_auth_tests;
 mod admin_plugin_graph_scope_tests;
 mod admin_runtime_metrics_tests;

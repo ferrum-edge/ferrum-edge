@@ -28,6 +28,7 @@
 #   udp-dtls  : ferrum                                         (only Ferrum; direct backend baseline)
 
 name: Gateways Protocol Benchmark
+run-name: "Gateways Protocol Benchmark (h2_window=${{ inputs.h2_window || 'default' }}, grpc_client=${{ inputs.grpc_client_connections || 'pooled' }})"
 
 on:
   workflow_dispatch:
@@ -63,6 +64,39 @@ on:
         default: "1"
         type: choice
         options: ["1", "2", "3"]
+      h2_window:
+        description: "http2/grpcs HTTP/2 stream window (#6038): default keeps 8 MiB; 64k sets 65535 on client, backend, Ferrum frontend and Ferrum pool"
+        required: false
+        default: "default"
+        type: choice
+        options: ["default", "64k"]
+      grpc_client_connections:
+        description: "grpcs client (#6022): pooled channels, or per-rpc (a new connection per call)"
+        required: false
+        default: "pooled"
+        type: choice
+        options: ["pooled", "per-rpc"]
+      baseline_image:
+        description: "Optional same-run ferrum-baseline arm: ferrumedge/ferrum-edge:main-<40-hex sha> (published by main-latest-image.yml)"
+        required: false
+        default: ""
+        type: string
+
+# Least privilege: checkout only reads the repository. Caches and artifacts use
+# the Actions runtime token, which these permissions do not govern.
+permissions:
+  contents: read
+
+# The workload inputs above reach run_gateway_protocol_bench.sh as environment
+# because the `benchmark` job is held byte-for-byte by the trusted Cross build
+# policy (#5896 failed it by editing that job), so its steps cannot pass new
+# arguments. The harness validates every value, refuses to pull any baseline
+# image other than a published `main-<sha>` one, and records all three in each
+# run's manifest.json; the aggregate summary labels the run with them.
+env:
+  BENCH_H2_WINDOW: ${{ inputs.h2_window || 'default' }}
+  BENCH_GRPC_CLIENT_CONNECTIONS: ${{ inputs.grpc_client_connections || 'pooled' }}
+  FERRUM_BASELINE_IMAGE: ${{ inputs.baseline_image }}
 
 jobs:
   benchmark:
@@ -446,6 +480,29 @@ jobs:
           path: results/${{ matrix.protocol }}
           retention-days: 90
 
+  dispatch-inputs:
+    # The frozen `benchmark` step pipes the runner through `tee`, so the runner's
+    # refusal of a malformed baseline_image cannot fail that job; this job fails
+    # the run instead. The patterns must equal BASELINE_PUBLISHED and
+    # BASELINE_MIRRORED in run_gateway_protocol_bench.sh
+    # (tests/test_backend_connections.py checks them).
+    name: Validate dispatch inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check baseline_image
+        run: |
+          published='^(docker\.io/)?ferrumedge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+          mirrored='^ghcr\.io/ferrum-edge/ferrum-edge:main-[0-9a-f]{40}(@sha256:[0-9a-f]{64})?$'
+          if [ -z "$FERRUM_BASELINE_IMAGE" ]; then
+            echo "No baseline image requested."
+          elif [[ $FERRUM_BASELINE_IMAGE =~ $published ]] || [[ $FERRUM_BASELINE_IMAGE =~ $mirrored ]]; then
+            echo "Baseline image: $FERRUM_BASELINE_IMAGE"
+          else
+            echo "::error::baseline_image must be ferrumedge/ferrum-edge:main-<40-hex sha>[@sha256:<64-hex>] or its ghcr.io/ferrum-edge copy; this run is invalid."
+            exit 1
+          fi
+
   aggregate:
     # Maximum safe dispatch inputs (full http1-tls: 6 arms x 5 sizes; adaptive off).
     # Planning envelope: iterations * pairs * 30 * (duration + 15) / 60 + 5 minutes.
@@ -546,6 +603,27 @@ jobs:
           lines = []
           lines.append("# Gateways × Protocols Benchmark — Combined Results\n")
           lines.append(f"**Duration:** {os.environ['DURATION']}s  |  **Concurrency:** {os.environ['CONCURRENCY']}  |  **Iterations:** {iterations}\n")
+
+          lines.append(f"**Workload:** H2 stream window `{os.environ.get('BENCH_H2_WINDOW') or 'default'}`"
+                       f"  |  gRPC client connections `{os.environ.get('BENCH_GRPC_CLIENT_CONNECTIONS') or 'pooled'}`"
+                       f"  |  Baseline image `{os.environ.get('FERRUM_BASELINE_IMAGE') or 'none'}`\n")
+          lines.append("### Workload labels recorded by each run\n")
+          lines.append("| Protocol | Run | H2 stream window | gRPC client connections | Baseline image |")
+          lines.append("|----------|-----|------------------|-------------------------|----------------|")
+          for protocol, run_dir in runs:
+              try:
+                  plan = json.loads((run_dir / "manifest.json").read_text())
+              except (OSError, ValueError):
+                  plan = None
+              if not isinstance(plan, dict):
+                  plan = {}
+              window = plan.get("h2_window", "unrecorded")
+              if isinstance(plan.get("h2_stream_window_bytes"), int):
+                  window = f"{window} ({plan['h2_stream_window_bytes']} B)"
+              lines.append(f"| {protocol} | {run_dir.relative_to(root)} | {window} | "
+                           f"{plan.get('grpc_client_connections', 'unrecorded')} | "
+                           f"{plan.get('baseline_image') or 'none'} |")
+          lines.append("")
 
           lines.append(f"**Paired evidence:** {len(records)} raw samples retained in "
                        "`observed-samples.json`; phase timing, observed workers/connections/streams, "
@@ -676,6 +754,44 @@ jobs:
                           else:
                               row.append("—")
                       lines.append("| " + " | ".join(row) + " |")
+
+          # Backend connections and p99 per pair (#6022 item 6). Only HTTP/2
+          # and gRPC samples carry `backend_connections`.
+          def fmt_ms(us):
+              if not isinstance(us, (int, float)) or isinstance(us, bool) or us <= 0:
+                  return "—"
+              return f"{us / 1000:.2f}ms"
+          for proto in sorted(samples):
+              buckets = samples[proto]
+              connection_rows = []
+              for g in ordered_gateways(g for g, _ in buckets):
+                  for s in sorted({s for _, s in buckets}):
+                      children = [child for row in buckets.get((g, s), [])
+                                  for child in (row.get("samples")
+                                                if isinstance(row.get("samples"), list) else [row])
+                                  if isinstance(child, dict)]
+                      counted = [child["backend_connections"] for child in children
+                                 if isinstance(child.get("backend_connections"), dict)]
+                      if not counted:
+                          continue
+                      valid = [entry for entry in counted if entry.get("available") is True]
+                      accepted = " / ".join(str(entry["accepted"]) if entry.get("available") is True
+                                            else "n/a" for entry in counted)
+                      echoes = sum(entry.get("echo_requests", 0) for entry in valid)
+                      total = sum(entry.get("accepted", 0) for entry in valid)
+                      per_1k = f"{total * 1000 / echoes:.2f}" if echoes else "—"
+                      p99 = " / ".join(fmt_ms(child.get("p99_us")) for child in children)
+                      connection_rows.append(f"| {g} | {fmt_bytes(s)} | {accepted} | {echoes:,} | "
+                                             f"{per_1k} | {p99} |")
+              if connection_rows:
+                  lines.append(f"\n## {proto}: backend connections and p99 per pair\n")
+                  lines.append("Connections the echo backend accepted while each sample ran "
+                               "(handshakes), and that sample's p99.\n")
+                  lines.append("| Gateway | Payload | Backend connections accepted | Echoes "
+                               "| Connections / 1k echoes | p99 |")
+                  lines.append("|---------|---------|------------------------------|--------"
+                               "|-------------------------|-----|")
+                  lines.extend(connection_rows)
 
           # UDP plaintext vs DTLS comparison callout
           if "udp" in data and "udp-dtls" in data:
