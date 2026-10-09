@@ -2845,7 +2845,23 @@ fn observability_detail_allowed(
     auth_header: Option<&str>,
     client_ip: &std::net::IpAddr,
 ) -> bool {
-    admin_jwt_detail_allowed(state, auth_header)
+    observability_detail_allowed_with(
+        state,
+        admin_jwt_detail_allowed(state, auth_header),
+        auth_header,
+        client_ip,
+    )
+}
+
+/// [`observability_detail_allowed`] with the admin-JWT half already decided
+/// ([`admin_jwt_detail_allowed`]), so `/health` verifies the token only once.
+fn observability_detail_allowed_with(
+    state: &AdminState,
+    admin_jwt_detail: bool,
+    auth_header: Option<&str>,
+    client_ip: &std::net::IpAddr,
+) -> bool {
+    admin_jwt_detail
         || state.metrics_auth.token_matches(auth_header)
         || state.metrics_auth.ip_allowed(client_ip)
 }
@@ -3129,8 +3145,17 @@ async fn handle_admin_request_inner(
 
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
-        let admin_jwt_detail = admin_jwt_detail_allowed(&state, auth_header.as_deref());
-        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
+        // The admin JWT is verified once: the detail decision and the tenant
+        // tier below both derive from this actor.
+        let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
+        let admin_jwt_detail =
+            admin_actor.as_ref().is_some_and(|actor| !actor.is_namespace_bounded());
+        let detailed = observability_detail_allowed_with(
+            &state,
+            admin_jwt_detail,
+            auth_header.as_deref(),
+            &client_ip,
+        );
         let mut health_status = json!({
             "status": "ok",
             "timestamp": Utc::now().to_rfc3339(),
@@ -3677,25 +3702,28 @@ async fn handle_admin_request_inner(
         // authorization gets the minimal body plus `mode`,
         // `admin_writes_enabled`, and the `namespace` serving block, under the
         // detailed tier's own field names and shapes. The serving block is
-        // added only when it names no namespace outside the token's bound: the
-        // process routes nothing (`active: null`), or the bound admits the
-        // active namespace. Every other detailed field describes the whole
-        // process and stays out. An unauthenticated probe has no token, so
-        // `verified_admin_actor` returns before any signature work.
-        if let Some(actor) = verified_admin_actor(&state, auth_header.as_deref())
-            .filter(AuditActor::is_namespace_bounded)
-        {
-            let mut tenant = json!({
+        // always present but never names a namespace outside the token's
+        // bound: when the bound does not admit the namespace this data plane
+        // routes, `active` is `null` while `serving_scope` and
+        // `data_plane_single_namespace` keep their mode-derived values, which
+        // reads as "unserved for this token". Every other detailed field
+        // describes the whole process and stays out. An unauthenticated probe
+        // has no token, so `verified_admin_actor` returned before any
+        // signature work.
+        if let Some(actor) = admin_actor.filter(AuditActor::is_namespace_bounded) {
+            let mut block = namespace_serving_block(&state);
+            if active_data_plane_namespace(&state)
+                .is_some_and(|namespace| !namespace_bound_admits(&actor, namespace))
+            {
+                block["active"] = serde_json::Value::Null;
+            }
+            let tenant = json!({
                 "status": health_status["status"],
                 "ready": health_status["ready"],
                 "mode": health_status["mode"],
                 "admin_writes_enabled": health_status["admin_writes_enabled"],
+                "namespace": block,
             });
-            if active_data_plane_namespace(&state)
-                .is_none_or(|namespace| namespace_bound_admits(&actor, namespace))
-            {
-                tenant["namespace"] = namespace_serving_block(&state);
-            }
             return Ok(json_response(response_code, &tenant));
         }
         let minimal = json!({

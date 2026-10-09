@@ -18602,7 +18602,7 @@ fn health_tenant_tier_reuses_the_detailed_tier_field_shapes() {
     assert_eq!(tenant["additionalProperties"], json!(false));
     assert_eq!(
         tenant["required"],
-        json!(["status", "ready", "mode", "admin_writes_enabled"])
+        json!(["status", "ready", "mode", "admin_writes_enabled", "namespace"])
     );
     let mut fields: Vec<&str> = tenant["properties"]
         .as_object()
@@ -18641,6 +18641,14 @@ fn health_tenant_tier_reuses_the_detailed_tier_field_shapes() {
     let mut detailed_only = tenant_body.clone();
     detailed_only["timestamp"] = json!("2026-10-09T00:00:00Z");
     assert_component_validity(&spec, "HealthTenantResponse", &detailed_only, false);
+    // A bound that does not admit the routed namespace withholds only `active`;
+    // the block itself is never omitted.
+    let mut withheld = tenant_body.clone();
+    withheld["namespace"]["active"] = json!(null);
+    assert_component_validity(&spec, "HealthTenantResponse", &withheld, true);
+    let mut without_namespace = tenant_body.clone();
+    without_namespace.as_object_mut().expect("object body").remove("namespace");
+    assert_component_validity(&spec, "HealthTenantResponse", &without_namespace, false);
 
     // Both probe routes publish both tiers on every body-carrying status.
     for operation_id in ["getHealth", "getStatus"] {

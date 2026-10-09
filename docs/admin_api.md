@@ -545,15 +545,27 @@ tier.
 | `status`, `ready` | as in every tier | always |
 | `mode` | string, the operating mode (`database`, `file`, `cp`, `dp`, `mesh`, `node_agent`) | always |
 | `admin_writes_enabled` | boolean, the config-database mutation signal | always |
-| `namespace` | the [serving-scope object](#admin-is-multi-namespace-one-processs-data-plane-serves-one-namespace) (`active`, `serving_scope`, `data_plane_single_namespace`) | only when the token's bound admits `namespace.active`, or `active` is `null` (`cp`, `node_agent`) |
+| `namespace` | the [serving-scope object](#admin-is-multi-namespace-one-processs-data-plane-serves-one-namespace) (`active`, `serving_scope`, `data_plane_single_namespace`) | always; `active` is `null` when the token's bound does not admit the namespace this data plane routes |
 
-The `namespace` object is omitted, not redacted, when this process routes a
-namespace outside the token's `ns` claim (or outside the viewer-key ceiling):
-it never names another tenant's namespace. Use the
-`X-Ferrum-Namespace-Unserved` response header on writes to detect an unserved
-namespace in that case. Every other detailed field (timestamp, database and
-pool state, cached-config counts, polling, mesh, listener, trust, and sink
-detail) describes the whole process and is withheld. The status code is the
+The `namespace` object is always present, but it never names another tenant's
+namespace. When this process's data plane routes a namespace outside the
+token's `ns` claim (or outside the viewer-key ceiling), `active` is redacted to
+`null` while `serving_scope` and `data_plane_single_namespace` keep the values
+the detailed tier derives from the mode:
+
+```json
+{"active": null, "serving_scope": "single-namespace-data-plane", "data_plane_single_namespace": true}
+```
+
+The detailed tier never produces `active: null` together with
+`data_plane_single_namespace: true`, so a client reads this combination as
+"the namespace routed here is not one this token can address" and treats its
+own namespace as unserved. On `cp` and `node_agent`, where `active` is `null`
+anyway, the block is identical to the detailed tier's.
+
+Every other detailed field (timestamp, database and pool state, cached-config
+counts, polling, mesh, listener, trust, and sink detail) describes the whole
+process and is withheld. The status code is the
 same as in the other tiers. Tokens without an `ns` claim (and without a
 viewer-key ceiling) keep the full detailed tier; unauthenticated probes keep
 `status` + `ready`.
@@ -866,9 +878,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9000/status \
 
 The block is authenticated-tier only (the namespace name is operator-supplied
 deployment topology); the unauthenticated probe still carries only `status` and
-`ready`. A namespace-bounded token receives the same block in the
-[tenant tier](#tenant-tier-for-namespace-bounded-tokens) only when its bound
-admits `active` (or `active` is `null`).
+`ready`. A namespace-bounded token always receives the block in the
+[tenant tier](#tenant-tier-for-namespace-bounded-tokens), with `active`
+redacted to `null` when its bound does not admit the namespace routed here.
 
 **2. Detect it per write.** An **accepted** mutation (`2xx` on
 `POST`/`PUT`/`DELETE`) to a namespace-scoped route under a namespace this

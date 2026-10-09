@@ -10,8 +10,9 @@
 //!   registry, the diagnostic reference lookup) stays reachable, with the
 //!   registry filtered to and authorized by the claim;
 //! - `/health` and `/status` serve the bounded tenant tier (`status`, `ready`,
-//!   `mode`, `admin_writes_enabled`, and the `namespace` serving block only
-//!   when the claim admits the active namespace), `/overload` only `{level}`;
+//!   `mode`, `admin_writes_enabled`, and the `namespace` serving block, whose
+//!   `active` is `null` unless the bound admits the routed namespace),
+//!   `/overload` only `{level}`;
 //! - `/metrics` refuses the token even from an allowlisted source IP;
 //! - namespace-scoped routes accept only the claimed namespaces.
 //!
@@ -22,7 +23,7 @@ use crate::scaffolding::port_registry::TestSocket;
 use arc_swap::ArcSwap;
 use ferrum_edge::admin::{
     AdminState, MetricsAuthPolicy,
-    jwt_auth::{JwtConfig, JwtManager},
+    jwt_auth::{JwtConfig, JwtManager, ViewerNamespaceCeiling},
     serve_admin_on_listener,
 };
 use ferrum_edge::config::types::GatewayConfig;
@@ -36,6 +37,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 const JWT_SECRET: &str = "ns-claim-global-route-test-secret-0123456789";
+const VIEWER_SECRET: &str = "ns-claim-global-route-viewer-secret-0123456789";
 const JWT_ISSUER: &str = "ferrum-edge-ns-claim-global-route-test";
 const METRICS_TOKEN: &str = "ns-claim-global-route-metrics-token-0123456789";
 const NS_CLAIM_REFUSAL: &str = "unavailable to admin JWTs with an `ns` claim";
@@ -63,8 +65,8 @@ const FLEET_GLOBAL_READS: &[&str] = &[
     "/no-such-admin-route",
 ];
 
-/// Top-level keys of the `/health` tenant tier when it carries the serving
-/// block.
+/// Top-level keys of the `/health` tenant tier. The serving block is always
+/// present.
 const TENANT_TIER_KEYS: &[&str] = &[
     "admin_writes_enabled",
     "mode",
@@ -93,11 +95,21 @@ fn jwt_manager() -> JwtManager {
 
 /// Mint a primary-key admin JWT with `additional` merged into its claims.
 fn admin_token(additional: Value) -> String {
+    signed_token(JWT_SECRET, "admin", additional)
+}
+
+/// Mint a viewer-key admin JWT with `additional` merged into its claims.
+fn viewer_token(additional: Value) -> String {
+    signed_token(VIEWER_SECRET, "viewer", additional)
+}
+
+/// Mint an admin JWT signed with `secret`, `additional` merged into its claims.
+fn signed_token(secret: &str, role: &str, additional: Value) -> String {
     let now = chrono::Utc::now();
     let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": "ns-claim-global-route-test",
-        "role": "admin",
+        "role": role,
         "iat": now.timestamp(),
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(600)).timestamp(),
@@ -111,7 +123,7 @@ fn admin_token(additional: Value) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()),
     )
     .unwrap()
 }
@@ -201,6 +213,27 @@ fn proxy_state(namespace: &str) -> ferrum_edge::proxy::ProxyState {
     )
     .expect("ProxyState::new");
     state
+}
+
+/// The serving block of a data plane routing `staging`, as the detailed tier
+/// and a tenant whose bound admits `staging` see it.
+fn staging_serving_block() -> Value {
+    json!({
+        "active": "staging",
+        "serving_scope": "single-namespace-data-plane",
+        "data_plane_single_namespace": true,
+    })
+}
+
+/// The serving block a namespace-bounded token receives from a
+/// single-namespace data plane whose namespace is outside its bound: `active`
+/// is withheld, the mode-derived fields are not.
+fn withheld_serving_block() -> Value {
+    json!({
+        "active": null,
+        "serving_scope": "single-namespace-data-plane",
+        "data_plane_single_namespace": true,
+    })
 }
 
 /// Top-level keys of a JSON object body, sorted.
@@ -377,7 +410,7 @@ async fn ns_claim_tokens_keep_the_global_allowlist() {
     assert_eq!(live.status, 200, "{}", live.text);
 
     // Probe endpoints answer with the tenant tier. This process has no data
-    // plane, so the serving block names no namespace and is included.
+    // plane, so the serving block is the detailed tier's `active: null` one.
     for path in ["/health", "/status"] {
         let reply = get(&base, path, &scoped, None).await;
         assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
@@ -466,10 +499,10 @@ async fn present_ns_claim_bounds_namespace_scoped_routes_with_the_flag_off() {
     assert_eq!(other.status, 200, "{}", other.text);
 }
 
-/// The tenant tier reuses the detailed tier's top-level field names and shapes,
-/// and carries the serving block only when the claim admits the namespace this
-/// process routes. A claim-less token keeps the detailed tier and an
-/// unauthenticated probe keeps `status` + `ready`.
+/// The tenant tier reuses the detailed tier's top-level field names and shapes
+/// and always carries the serving block, whose `active` names the namespace
+/// this process routes only when the claim admits it. A claim-less token keeps
+/// the detailed tier and an unauthenticated probe keeps `status` + `ready`.
 #[tokio::test]
 async fn tenant_health_tier_is_bounded_by_the_claim() {
     let mut state = admin_state(false);
@@ -508,23 +541,21 @@ async fn tenant_health_tier_is_bounded_by_the_claim() {
                 );
             }
             assert_eq!(tenant.body["mode"], "database");
-            assert_eq!(tenant.body["namespace"]["active"], "staging");
-            assert_eq!(
-                tenant.body["namespace"]["serving_scope"],
-                "single-namespace-data-plane"
-            );
-            assert_eq!(
-                tenant.body["namespace"]["data_plane_single_namespace"],
-                true
-            );
+            assert_eq!(tenant.body["namespace"], staging_serving_block());
         }
 
         for (label, bearer) in &not_covering {
             let tenant = get(&base, path, bearer, None).await;
             assert_eq!(
                 body_keys(&tenant),
-                ["admin_writes_enabled", "mode", "ready", "status"],
-                "{label} {path}: the serving block must not name an unclaimed namespace: {}",
+                TENANT_TIER_KEYS,
+                "{label} {path}: {}",
+                tenant.text
+            );
+            assert_eq!(
+                tenant.body["namespace"],
+                withheld_serving_block(),
+                "{label} {path}: the serving block must withhold an unclaimed namespace: {}",
                 tenant.text
             );
             assert!(
@@ -552,6 +583,65 @@ async fn tenant_health_tier_is_bounded_by_the_claim() {
             ["ready", "status"],
             "unauthenticated {path}: {anonymous}"
         );
+    }
+}
+
+/// A viewer-key token under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` gets the
+/// tenant tier on a data plane. Its serving block names the routed namespace
+/// only when the ceiling admits it and, when the token also carries an `ns`
+/// claim, the claim does too (`claim ∩ ceiling`); otherwise `active` is
+/// withheld.
+#[tokio::test]
+async fn tenant_health_tier_is_bounded_by_the_viewer_ceiling() {
+    // (ceiling, extra claims, whether the bound admits the routed `staging`)
+    let cases = [
+        ("staging", json!({}), true),
+        ("prod", json!({}), false),
+        ("staging,prod", json!({"ns": "staging"}), true),
+        ("staging,prod", json!({"ns": "prod"}), false),
+        // The claim admits `staging`; the ceiling does not.
+        ("prod", json!({"ns": "staging"}), false),
+    ];
+    for (ceiling, claims, admitted) in cases {
+        let mut state = admin_state(false);
+        state.mode = "dp".to_string();
+        state.proxy_state = Some(proxy_state("staging"));
+        state.jwt_manager = jwt_manager()
+            .with_viewer_secret(VIEWER_SECRET.to_string())
+            .expect("distinct viewer secret")
+            .with_viewer_namespace_ceiling(
+                ViewerNamespaceCeiling::parse(ceiling).expect("valid namespace ceiling"),
+            );
+        let (base, _sd) = start_admin(state).await;
+        let bearer = viewer_token(claims.clone());
+        let label = format!("ceiling={ceiling} claims={claims}");
+        let expected = if admitted {
+            staging_serving_block()
+        } else {
+            withheld_serving_block()
+        };
+        for path in ["/health", "/status"] {
+            let tenant = get(&base, path, &bearer, None).await;
+            assert_eq!(
+                body_keys(&tenant),
+                TENANT_TIER_KEYS,
+                "{label} {path}: {}",
+                tenant.text
+            );
+            assert_eq!(tenant.body["mode"], "dp", "{label} {path}");
+            assert_eq!(
+                tenant.body["namespace"], expected,
+                "{label} {path}: {}",
+                tenant.text
+            );
+            if !admitted {
+                assert!(
+                    !tenant.text.contains("staging"),
+                    "{label} {path}: {}",
+                    tenant.text
+                );
+            }
+        }
     }
 }
 

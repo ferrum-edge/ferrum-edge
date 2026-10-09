@@ -91,8 +91,9 @@ info:
     `/metrics/runtime`, `/cluster`, `/config/apply-status`, backend
     capabilities, every `/mesh/*` endpoint, the waypoint listings, every
     `/admin/tls/*` endpoint, and any endpoint not explicitly allowlisted)
-    returns `403` to it, and `/health`, `/status`, and `/overload` serve it
-    only their minimal tier. `GET /plugins`, `/live`, the namespace registry,
+    returns `403` to it, `/health` and `/status` serve it the tenant tier
+    (`HealthTenantResponse`), and `/overload` serves it only `{level}`.
+    `GET /plugins`, `/live`, the namespace registry,
     and `GET /diagnostics/v1/refs/{ref}` stay reachable. Fleet-global
     endpoints need an admin JWT without an `ns` claim.
 
@@ -322,9 +323,11 @@ paths:
         `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` — never adds detail. Without an
         allowlisted source IP it receives `HealthTenantResponse`: `status`,
         `ready`, `mode`, `admin_writes_enabled`, and the `namespace` serving
-        report only when the token's bound admits `namespace.active` (or
-        `active` is `null`). These fields carry exactly the names and shapes of
-        the detailed tier; nothing else is returned.
+        report, whose `active` is `null` when the token's bound does not admit
+        the namespace this data plane routes (`serving_scope` and
+        `data_plane_single_namespace` keep their mode-derived values). These
+        fields carry exactly the names and shapes of the detailed tier; nothing
+        else is returned.
 
         Returns `503 Service Unavailable` while the gateway is still in
         startup (`status: "starting"`, `ready: false`). Once startup is
@@ -16668,13 +16671,16 @@ components:
         field is present. The status code follows the same rules as the other
         tiers.
 
-        `namespace` is present only when the token's bound (its `ns` claim and,
-        for a viewer-key token, the namespace ceiling) admits
-        `namespace.active`, or when `active` is `null` (`cp`, `node_agent`). It
-        is omitted, never redacted, when this process routes a namespace
-        outside the token's bound, so the tier never names another tenant's
-        namespace.
-      required: [status, ready, mode, admin_writes_enabled]
+        `namespace` is always present. When this process's data plane routes a
+        namespace outside the token's bound (its `ns` claim and, for a
+        viewer-key token, the namespace ceiling), `namespace.active` is `null`
+        while `serving_scope` stays `single-namespace-data-plane` and
+        `data_plane_single_namespace` stays `true`: the tier never names
+        another tenant's namespace, and a client reads that combination as
+        "the namespace routed here is not one this token can address" (treat
+        it as unserved). `serving_scope` and `data_plane_single_namespace`
+        always carry the values the detailed tier derives from `mode`.
+      required: [status, ready, mode, admin_writes_enabled, namespace]
       additionalProperties: false
       properties:
         status:
@@ -16713,9 +16719,10 @@ components:
         data-plane `404`. Read it once at startup and provision into `active`.
 
         Authenticated detail tier only: the namespace name is operator-supplied
-        deployment topology. A namespace-bounded admin JWT receives it in the
-        tenant tier (`HealthTenantResponse`) only when its bound admits
-        `active`, or `active` is `null`. Every field is a namespace identifier,
+        deployment topology. A namespace-bounded admin JWT always receives the
+        block in the tenant tier (`HealthTenantResponse`), with `active`
+        withheld as `null` when its bound does not admit the namespace this
+        data plane routes. Every field is a namespace identifier,
         a closed-set label, or a boolean — never a resource id, count, or
         listing of other tenants.
       required: [active, serving_scope, data_plane_single_namespace]
@@ -16726,7 +16733,12 @@ components:
             The one namespace this process's data plane routes
             (`FERRUM_NAMESPACE`). `null` when this process has no data plane —
             `cp` (which distributes every namespace in `FERRUM_CP_NAMESPACES` to
-            subscribing data planes) and `node_agent`.
+            subscribing data planes) and `node_agent` — or, in the tenant tier
+            (`HealthTenantResponse`) only, when the routed namespace is outside
+            the token's bound; `serving_scope` is then
+            `single-namespace-data-plane` and `data_plane_single_namespace` is
+            `true`, a combination the detailed tier never produces. Treat it as
+            unserved.
           examples:
             - ferrum
           maxLength: 254
