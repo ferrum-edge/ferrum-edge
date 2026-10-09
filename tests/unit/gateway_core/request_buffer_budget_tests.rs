@@ -292,7 +292,10 @@ fn backend_seam_refusal_is_trailers_only_resource_exhausted_for_grpc() {
         grpc.headers.get("grpc-message").map(String::as_str),
         Some("Request buffering capacity exceeded")
     );
-    assert!(grpc.body_bytes().is_empty(), "Trailers-Only carries no body");
+    assert!(
+        grpc.body_bytes().is_empty(),
+        "Trailers-Only carries no body"
+    );
     assert_eq!(grpc.error_class, Some(REQUEST_BUFFER_OVERLOAD_ERROR_CLASS));
     assert!(!grpc.connection_error && !grpc.request_on_wire);
     assert_eq!(grpc.backend_resolved_ip.as_deref(), Some("192.0.2.7"));
