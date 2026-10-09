@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks. Synthetic BTF regressions reject unrelated or changed signatures.
   Classic selection correlates through the typed lookup socket's captured cookie,
   avoiding a flexible-array read rejected by the new kernel verifier.
+  H3 campaigns reserve 48 MiB for measured observer RSS after Ubuntu 26.04
+  fixtures used about 37 MiB; the 32 MiB kernel-map reservation and 64 MiB
+  artifact cap remain unchanged. Active and idle samples retain peak usage and
+  reject RSS beyond the new bound.
 
 - The scheduled vendored-patch audit distinguishes an unreviewed upstream merge
   from a reviewed fix that has not shipped. Release holds bind the exact merge
