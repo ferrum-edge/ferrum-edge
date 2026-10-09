@@ -1091,7 +1091,15 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
 - **MCS `ServiceImport` backendRefs** (`group: multicluster.x-k8s.io`) resolve
   through the shared backend-kind adapter to ClusterSet DNS
   (`{name}.{namespace}.svc.clusterset.local`) or ready EndpointSlice addresses
-  labeled `multicluster.kubernetes.io/service-name`. Cross-namespace imports
+  labeled `multicluster.kubernetes.io/service-name`. An imported slice is used
+  only when its `endpointslice.kubernetes.io/managed-by` names the MCS
+  controller rather than Kubernetes' own EndpointSlice controllers, and its
+  addresses are refused when they can never be a backend (loopback,
+  link-local, cloud metadata, FQDNs) or are this cluster's infrastructure
+  without being a Pod of the import's namespace (another namespace's Pod, a
+  Service ClusterIP, a Node address or Pod CIDR). Remote endpoints cannot be
+  checked against local Pods, so imported slices are trusted as far as the
+  MCS controller and EndpointSlice write RBAC are. Cross-namespace imports
   require a ReferenceGrant whose `to` names that group/kind. Missing imports and
   unknown kinds stay fail-closed with `ResolvedRefs=False`
   (`BackendNotFound` / `InvalidKind`).

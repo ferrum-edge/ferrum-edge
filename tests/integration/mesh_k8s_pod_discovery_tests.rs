@@ -1435,6 +1435,205 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
     );
 }
 
+/// A ready Pod `namespace/name` running as `service_account` whose own status
+/// reports `ip`.
+fn ready_pod_in(namespace: &str, name: &str, service_account: &str, ip: &str) -> K8sObject {
+    let mut pod = ready_pod();
+    pod.metadata.namespace = namespace.to_string();
+    pod.metadata.name = name.to_string();
+    pod.spec["serviceAccountName"] = json!(service_account);
+    pod.status["podIP"] = json!(ip);
+    pod
+}
+
+/// The `default/reviews` EndpointSlice carrying `endpoints`.
+fn reviews_slice_with(endpoints: Value) -> K8sObject {
+    let mut slice = endpoint_slice();
+    slice.spec["endpoints"] = endpoints;
+    slice
+}
+
+/// Every address the translation attaches to a `reviews` workload identity.
+fn reviews_workload_addresses(translation: &K8sTranslation) -> Vec<&str> {
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    mesh.workloads
+        .iter()
+        .filter(|workload| workload.service_name == "reviews")
+        .flat_map(|workload| workload.addresses.iter().map(String::as_str))
+        .collect()
+}
+
+fn reviews_service_workload_count(translation: &K8sTranslation) -> usize {
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    mesh.services
+        .iter()
+        .find(|service| service.namespace == "default" && service.name == "reviews")
+        .expect("reviews service")
+        .workloads
+        .len()
+}
+
+fn assert_warned(translation: &K8sTranslation, fragment: &str) {
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(fragment)),
+        "expected a warning containing {fragment:?}: {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_slice_target_ref_into_another_namespace() {
+    // A slice author in `default` names `payments/ledger-0`. Neither an
+    // address that Pod does not own nor one it does may lend its identity to
+    // the `reviews` Service: the EndpointSlice controller never names another
+    // namespace's Pod (issue #6123).
+    for address in ["10.1.0.99", "10.9.0.5"] {
+        let ledger = ready_pod_in("payments", "ledger-0", "ledger", "10.9.0.5");
+        let forged = reviews_slice_with(json!([{
+            "addresses": [address],
+            "targetRef": {"kind": "Pod", "name": "ledger-0", "namespace": "payments"},
+            "conditions": {"ready": true}
+        }]));
+
+        let translation = translate_k8s_objects(&[service(), ledger, forged], options())
+            .expect("K8s core translation succeeds");
+
+        assert_eq!(reviews_service_workload_count(&translation), 0, "{address}");
+        assert!(
+            reviews_workload_addresses(&translation).is_empty(),
+            "{address}"
+        );
+        let mesh = translation.config.mesh.as_ref().expect("mesh config");
+        assert!(
+            mesh.workloads
+                .iter()
+                .all(|workload| workload.namespace != "payments"),
+            "{address}: {:?}",
+            mesh.workloads
+        );
+        assert_warned(&translation, "1 name a Pod outside the Service's namespace");
+    }
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_slice_ip_lookup_into_another_namespace() {
+    // Without a `targetRef` the endpoint resolves by IP; an IP owned by
+    // another namespace's Pod is refused the same way.
+    let ledger = ready_pod_in("payments", "ledger-0", "ledger", "10.9.0.5");
+    let forged = reviews_slice_with(json!([{
+        "addresses": ["10.9.0.5"],
+        "conditions": {"ready": true}
+    }]));
+
+    let translation = translate_k8s_objects(&[service(), ledger, forged], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(&translation, "1 name a Pod outside the Service's namespace");
+}
+
+#[test]
+fn k8s_pod_discovery_attaches_only_addresses_the_named_pod_reports() {
+    let mixed = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.10", "10.1.0.99"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), mixed], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
+    assert_warned(
+        &translation,
+        "1 are not reported by the named Pod's own status",
+    );
+
+    // An endpoint left with no address the Pod reports attaches nothing.
+    let forged = reviews_slice_with(json!([{
+        "addresses": ["10.1.0.99"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+    let translation = translate_k8s_objects(&[service(), ready_pod(), forged], options())
+        .expect("K8s core translation succeeds");
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(
+        &translation,
+        "1 are not reported by the named Pod's own status",
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_an_address_another_namespace_pod_also_reports() {
+    // Two namespaces' Pods report the same IP (a reused IP, or a forged Pod
+    // status); neither may claim it for its identity.
+    let squatter = ready_pod_in("payments", "ledger-0", "ledger", "10.1.0.10");
+
+    let translation = translate_k8s_objects(
+        &[service(), ready_pod(), endpoint_slice(), squatter],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(
+        &translation,
+        "1 are also reported by another namespace's Pod",
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_refuses_a_never_a_backend_address_even_when_the_pod_reports_it() {
+    let mut pod = ready_pod();
+    pod.status["podIP"] = json!("169.254.169.254");
+    let slice = reviews_slice_with(json!([{
+        "addresses": ["169.254.169.254"],
+        "targetRef": {"kind": "Pod", "name": "reviews-v1", "namespace": "default"},
+        "conditions": {"ready": true}
+    }]));
+
+    let translation = translate_k8s_objects(&[service(), pod, slice], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 0);
+    assert!(reviews_workload_addresses(&translation).is_empty());
+    assert_warned(&translation, "1 can never be a backend");
+}
+
+#[test]
+fn k8s_pod_discovery_attaches_a_controller_slice_naming_the_services_own_pod() {
+    let mut slice = endpoint_slice();
+    slice.metadata.labels.insert(
+        "endpointslice.kubernetes.io/managed-by".to_string(),
+        "endpointslice-controller.k8s.io".to_string(),
+    );
+
+    let translation = translate_k8s_objects(&[service(), ready_pod(), slice], options())
+        .expect("K8s core translation succeeds");
+
+    assert_eq!(reviews_service_workload_count(&translation), 1);
+    assert_eq!(reviews_workload_addresses(&translation), vec!["10.1.0.10"]);
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    assert_eq!(
+        mesh.workloads[0].spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/default/sa/reviews"
+    );
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("mesh workload derivation")),
+        "{:?}",
+        translation.warnings
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend() {
     use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
