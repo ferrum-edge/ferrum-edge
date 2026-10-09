@@ -6159,7 +6159,23 @@ fn materialize_sidecar_inbound_proxies(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    if runtime.topology != MeshTopology::Sidecar {
+    // Assigned on every apply, before any early return: only the default
+    // service-port path below publishes HTTP application ports, and every
+    // Sidecar refuses a bare CONNECT that matches an HTTP route on its inbound
+    // listener (issue #6110).
+    let is_sidecar = runtime.topology == MeshTopology::Sidecar;
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.sidecar_inbound_http_app_ports.clear();
+        // Set for EVERY Sidecar, identity or not: the materialized routes
+        // below (`ingress[]` listeners and the service-port defaults) and any
+        // operator-defined HTTP proxy on the inbound listener all serve HTTP,
+        // and a bare byte-stream CONNECT matching one is refused rather than
+        // relayed as opaque bytes. The rule only ever refuses, so an
+        // identity-less Sidecar, which materializes nothing, loses no
+        // legitimate traffic: a Sidecar peer reaches an HTTP route as HTTP.
+        mesh.sidecar_inbound_refuses_matched_http_connect = is_sidecar;
+    }
+    if !is_sidecar {
         return;
     }
     let Some(local_spiffe) = runtime.workload_spiffe_id.as_deref() else {
@@ -6509,8 +6525,14 @@ fn materialize_sidecar_inbound_proxies(
     }
 
     let tcp_route_count = tcp_routes.len();
+    // The same HTTP-family claim also refuses a bare authenticated CONNECT
+    // naming one of these ports (issue #6110): an HTTP route serves the port,
+    // so the request must arrive as HTTP and run that route's plugin chain.
+    let mut http_app_ports: Vec<u16> = http_inbound_backend_ports.into_iter().collect();
+    http_app_ports.sort_unstable();
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.local_inbound_tcp_routes = tcp_routes;
+        mesh.sidecar_inbound_http_app_ports = http_app_ports;
     }
 
     if materialized > 0 {
@@ -6780,6 +6802,26 @@ fn materialize_sidecar_ingress_listener_proxies(
     // identity can be built.
     let mut tcp_routes = Vec::with_capacity(stream_listeners.len());
     for listener in &stream_listeners {
+        // HTTP-family listeners WIN a shared application port, exactly as on
+        // the service-port default path (issue #6110): a stream listener
+        // forwarding to an HTTP listener's endpoint port relays no plaintext
+        // capture, and an authenticated CONNECT to it is refused
+        // `http_application_port` (`resolve_sidecar_ingress_connect_relay`).
+        if crate::modes::mesh::config::ingress_http_listener_serves_endpoint_port(
+            http_listeners.iter().copied(),
+            listener.endpoint_port,
+        ) {
+            warn!(
+                local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                "Sidecar ingress[] stream listener forwards to the same application port as an \
+                 HTTP listener; the HTTP route wins the port, so this listener relays neither \
+                 captured plaintext nor an authenticated CONNECT. Give it a distinct \
+                 defaultEndpoint port"
+            );
+            continue;
+        }
         let Ok(backend_ip) = listener.endpoint_host.parse::<std::net::IpAddr>() else {
             // endpoint_is_valid already required a loopback IP literal.
             continue;
@@ -7129,6 +7171,25 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
             listener.port,
         );
         let proxy = if listener.is_stream_family() {
+            // The dedicated bind honors the same "HTTP wins a shared port"
+            // rule as the capture table and the CONNECT remap (issue #6110):
+            // relaying it would hand a direct client an opaque byte stream to
+            // the HTTP listener's application socket.
+            if crate::modes::mesh::config::ingress_http_listener_serves_endpoint_port(
+                listeners.iter().copied(),
+                listener.endpoint_port,
+            ) {
+                warn!(
+                    local_spiffe = %sanitize_startup_scalar(local_spiffe.to_string()),
+                    listener_port = %sanitize_startup_scalar(listener.port.to_string()),
+                    endpoint_port = %sanitize_startup_scalar(listener.endpoint_port.to_string()),
+                    "Sidecar ingress[] stream listener with a dedicated bind forwards to the same \
+                     application port as an HTTP listener; the HTTP route wins the port, so no \
+                     dedicated bind listener is materialized for it. Give it a distinct \
+                     defaultEndpoint port"
+                );
+                continue;
+            }
             let Ok(backend_ip) = listener.endpoint_host.parse::<std::net::IpAddr>() else {
                 continue;
             };

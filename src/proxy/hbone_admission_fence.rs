@@ -196,6 +196,7 @@ use super::hbone_proxy::{
 use super::{
     MeshInboundTlsPolicy, SharedMeshInboundTlsPolicy, inbound_hbone_relay_destination_decision,
     mesh_egress_udp_destination_allowed, mesh_inbound_peer_auth_transport_mismatch_for_policy,
+    sidecar_inbound_refuses_matched_http_connect,
 };
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugin_cache::PluginCacheRequestView;
@@ -388,7 +389,9 @@ pub enum HboneRelayDestinationGate {
     /// admitted EgressGateway external UDP endpoint.
     Datagram,
     /// Explicitly configured proxy: no ownership guard applies; presence in the
-    /// published generation is the gate.
+    /// published generation is the gate, plus the Sidecar refusal of a bare
+    /// CONNECT that matched an HTTP route on the inbound listener (issue
+    /// #6110).
     Configured,
 }
 
@@ -2184,7 +2187,13 @@ impl HboneAdmissionFence {
                 .is_ok()
                     || mesh_egress_udp_destination_allowed(app_host, app_port, mesh)
             }
-            HboneRelayDestinationGate::Configured => true,
+            HboneRelayDestinationGate::Configured => {
+                // A configured route has no ownership guard, but a reload can
+                // make it an HTTP route on the Sidecar inbound listener, where
+                // the peer's next bare CONNECT would be refused (issue #6110).
+                let direction = snapshot.ctx.mesh_direction;
+                !sidecar_inbound_refuses_matched_http_connect(proxy, direction, mesh)
+            }
         };
         if !destination_owned {
             return Some(HboneRevocationReason::RelayDestination);

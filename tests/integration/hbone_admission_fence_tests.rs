@@ -93,7 +93,7 @@ use ferrum_edge::modes::mesh::config::{
     PolicyAction, PolicyScope, RequestMatch,
 };
 use ferrum_edge::modes::mesh::{
-    MeshRuntimeConfig, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
 };
 use ferrum_edge::plugins::{HboneReuseContext, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
@@ -166,9 +166,9 @@ fn deny_client() -> MeshPolicy {
 /// rows under reserved `__mesh_*` ids and republishes them through the
 /// crate-private `ProxyState::update_mesh_config`. These tests publish through
 /// the public `update_config`, whose resource-id grammar refuses the reserved
-/// prefix, so the injected rows are retagged as ordinary operator globals. On
-/// the Sidecar topology `mesh_authz` reads only its config JSON, never its row
-/// id, so the retag changes nothing about enforcement.
+/// prefix, so the injected rows are retagged as ordinary operator globals.
+/// Outside the NodeWaypoint topology `mesh_authz` reads only its config JSON,
+/// never its row id, so the retag changes nothing about enforcement.
 fn retag_mesh_managed_plugins(config: &mut GatewayConfig) {
     let retag = |id: &str| {
         id.strip_prefix("__mesh_")
@@ -193,7 +193,28 @@ fn retag_mesh_managed_plugins(config: &mut GatewayConfig) {
     );
 }
 
-/// Sidecar mesh config with one configured HBONE proxy (or none) and the
+/// The mesh runtime every prepared fixture is built for: the Ambient HBONE
+/// terminator.
+///
+/// The live fixtures send a bare CONNECT that MATCHES the configured HTTP
+/// proxy, so the tunnel is admitted through the configured-route
+/// (`HboneRelayDestinationGate::Configured`) dispatch with its own lifecycle
+/// generation and plugin chain, which is what the fence's gates are pinned
+/// against. A Sidecar refuses exactly that CONNECT before the plugin chain
+/// runs (issue #6110: on its inbound listener it would relay HTTP past the
+/// route's chain), and a stream proxy is never an HTTP route match, so the
+/// fence fixtures use the topology whose matched-route CONNECT dispatch is
+/// still served. The Sidecar refusal itself is pinned by
+/// `sidecar_connect_http_port_tests.rs` and by
+/// `a_reload_that_refuses_matched_http_connects_revokes_a_configured_route_tunnel`.
+fn fence_mesh_runtime() -> MeshRuntimeConfig {
+    MeshRuntimeConfig {
+        topology: MeshTopology::Ambient,
+        ..default_mesh_runtime()
+    }
+}
+
+/// Ambient mesh config with one configured HBONE proxy (or none) and the
 /// supplied AuthorizationPolicies, run through the production mesh preparation
 /// so `spiffe_identity` and `mesh_authz` are injected exactly as at runtime.
 fn prepared_config(proxy_backend_port: Option<u16>, policies: Vec<MeshPolicy>) -> GatewayConfig {
@@ -230,14 +251,14 @@ fn prepared_config_from_mesh(
         proxy_id,
         mesh,
         plugin_configs,
-        default_mesh_runtime(),
+        fence_mesh_runtime(),
     )
 }
 
 /// [`prepared_config_from_mesh`] over an explicit [`MeshRuntimeConfig`], for
 /// the cases whose injected plugin set depends on the LISTENER PLAN rather than
 /// on the slice — `mesh_outbound_registry` is scoped to the outbound-direction
-/// capture ports, and `default_mesh_runtime` binds that listener on `:0`, which
+/// capture ports, and `fence_mesh_runtime` binds that listener on `:0`, which
 /// yields no ports at all.
 fn prepared_config_from_mesh_with_runtime(
     proxy_backend_port: Option<u16>,
@@ -1231,6 +1252,94 @@ async fn a_withdrawn_relay_destination_revokes_a_live_inbound_relay_tunnel() {
         Some(HboneRevocationReason::RelayDestination),
         "the synthesized inbound relay's ownership guard is what revoked it"
     );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
+}
+
+/// [`relay_destination_config`] carrying the markers a materialized Sidecar
+/// publishes for its inbound HTTP routes (issue #6110).
+fn sidecar_http_route_config(
+    destinations: Vec<MeshInboundRelayDestination>,
+    http_app_ports: Vec<u16>,
+    refuses_matched_http_connect: bool,
+    generation_tag: u16,
+) -> GatewayConfig {
+    let mut config = relay_destination_config(destinations, false, generation_tag);
+    let mesh = config.mesh.as_deref_mut().expect("mesh block");
+    mesh.sidecar_inbound_http_app_ports = http_app_ports;
+    mesh.sidecar_inbound_refuses_matched_http_connect = refuses_matched_http_connect;
+    config
+}
+
+/// A live relay to a port that a reload turns into a Sidecar HTTP application
+/// port is revoked: the peer's next CONNECT to it would be refused
+/// `http_application_port`, so the tunnel must not keep relaying bytes past
+/// the HTTP route's plugin chain (issue #6110).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_makes_the_relayed_port_an_http_application_port_revokes_the_tunnel() {
+    let destination = relay_destination(RELAY_APP_HOST, RELAY_APP_PORT);
+    let initial = sidecar_http_route_config(vec![destination.clone()], Vec::new(), true, 9501);
+    let state = build_state(initial);
+    let fence = &state.hbone_admission_fence;
+
+    let tunnel = fence.admit(synthetic_snapshot(
+        inbound_relay_proxy(RELAY_APP_HOST, RELAY_APP_PORT),
+        HboneRelayDestinationGate::InboundRelay,
+        None,
+        fence.sweep_epoch(),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    // The destination stays owned; only its port now serves an HTTP route.
+    let reloaded = sidecar_http_route_config(vec![destination], vec![RELAY_APP_PORT], true, 9502);
+    let outcome = state.update_config(reloaded);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::RelayDestination),
+        "the stream relay guard must re-apply the HTTP application port refusal"
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
+}
+
+/// A live tunnel admitted through a configured HTTP route on the inbound
+/// listener is revoked once a reload makes that listener a materializing
+/// Sidecar's, where the peer's next bare CONNECT matching the route would be
+/// refused (issue #6110). A tunnel through the same route on a listener of
+/// another direction is not judged by that rule and survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_refuses_matched_http_connects_revokes_a_configured_route_tunnel() {
+    let initial = sidecar_http_route_config(Vec::new(), Vec::new(), false, 9601);
+    let state = build_state(initial);
+    let fence = &state.hbone_admission_fence;
+    let configured = |direction: MeshTrafficDirection| {
+        let mut snapshot = synthetic_snapshot(
+            create_mesh_proxy(RELAY_APP_PORT),
+            HboneRelayDestinationGate::Configured,
+            None,
+            fence.sweep_epoch(),
+        );
+        snapshot.ctx.mesh_direction = Some(direction);
+        fence.admit(snapshot)
+    };
+    let inbound = configured(MeshTrafficDirection::Inbound);
+    let outbound = configured(MeshTrafficDirection::Outbound);
+    assert_eq!(inbound.revoked_reason(), None);
+    assert_eq!(outbound.revoked_reason(), None);
+
+    let reloaded = sidecar_http_route_config(Vec::new(), Vec::new(), true, 9602);
+    let outcome = state.update_config(reloaded);
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    wait_for_revocation(&inbound).await;
+    assert_eq!(
+        inbound.revoked_reason(),
+        Some(HboneRevocationReason::RelayDestination),
+        "a bare CONNECT matching a Sidecar inbound HTTP route is no longer admitted"
+    );
+    wait_for_settled_sweeps(&state).await;
+    assert_eq!(outbound.revoked_reason(), None);
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 1, 0, 0]);
 }
 
@@ -3645,7 +3754,7 @@ async fn a_chain_that_becomes_reusable_leaves_live_tunnels_untouched() {
 /// so `MeshRuntimeConfig::listener_plan()` yields one nonzero
 /// OUTBOUND-direction entry, which is what `inject_mesh_global_plugins` stamps
 /// onto the injected gate as `outbound_listen_ports`. With
-/// `default_mesh_runtime`'s `127.0.0.1:0` that set is empty and injection
+/// `fence_mesh_runtime`'s `127.0.0.1:0` that set is empty and injection
 /// removes the plugin outright, so a REGISTRY_ONLY fixture built on it would
 /// prove nothing at all.
 const REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT: u16 = 15001;
@@ -3656,7 +3765,7 @@ fn registry_only_runtime() -> MeshRuntimeConfig {
             IpAddr::from([127, 0, 0, 1]),
             REGISTRY_ONLY_OUTBOUND_CAPTURE_PORT,
         )),
-        ..default_mesh_runtime()
+        ..fence_mesh_runtime()
     }
 }
 

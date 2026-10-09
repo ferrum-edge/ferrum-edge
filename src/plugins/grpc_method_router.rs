@@ -634,6 +634,14 @@ impl Plugin for GrpcMethodRouter {
         GRPC_ONLY_PROTOCOLS
     }
 
+    /// Every instance enforces a method allow list, deny list, or rate limit
+    /// (the constructor refuses a config with none), so a route configured
+    /// with one is gRPC-intended: its plain HTTP and WebSocket views, which
+    /// skip this gRPC-only plugin, are refused (issue #6110).
+    fn gates_request_admission(&self) -> bool {
+        true
+    }
+
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.limiter.tracked_keys_count())
     }

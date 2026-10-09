@@ -3121,6 +3121,64 @@ fn every_dispatcher_refuses_a_flavor_view_that_omits_route_admission_policy() {
     }
 }
 
+/// The one exemption from that refusal (issue #6110): a bodiless CORS
+/// preflight on the plain HTTP view of a gRPC-intended route whose `cors`
+/// plugin answers preflights. Each dispatcher evaluates it in the refusal's
+/// own condition, after the capability bit, so it can never relax any other
+/// check and never runs unless a view is marked. An exempted preflight that no
+/// plugin answered is refused right after the `on_request_received` phase, so
+/// it never reaches the backend without the route's gRPC-only policy.
+#[test]
+fn every_dispatcher_exempts_a_cors_preflight_only_inside_the_route_admission_refusal() {
+    const EXEMPTION: &str = "grpc_intended_refusal_exempts(";
+    const UNANSWERED_PREFLIGHT_REFUSAL: &str = "if cors_preflight_exempted {";
+    for (dispatcher, file, signature) in ROUTE_PROTOCOL_ADMISSION_DISPATCHERS {
+        let text = source(file);
+        let body = item_body(&text, signature, "\n}\n");
+        let position = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{dispatcher}: `{file}` must contain `{needle}`"))
+        };
+        let refusal = position("PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)");
+        let exemption = position(EXEMPTION);
+        assert!(
+            refusal < exemption && body[refusal..exemption].len() < 96,
+            "{dispatcher}: `{file}` must evaluate the preflight exemption in the refusal's \
+             own condition, after the capability bit"
+        );
+        assert_eq!(
+            body.matches(EXEMPTION).count(),
+            1,
+            "{dispatcher}: `{file}` must exempt a CORS preflight exactly once"
+        );
+        assert!(
+            text.contains("is_cors_preflight_request("),
+            "{dispatcher}: `{file}` must share the one preflight predicate"
+        );
+        assert!(
+            text.contains("PluginCapabilities::ANSWERS_CORS_PREFLIGHTS)"),
+            "{dispatcher}: `{file}` must exempt a preflight only on a view whose `cors` \
+             plugin answers it"
+        );
+        let first_hook = position("plugin.on_request_received(&mut ctx)");
+        let unanswered = position(UNANSWERED_PREFLIGHT_REFUSAL);
+        // Pre-auth body buffering starts here, so the refusal must come first:
+        // it never reads a body, authenticates, or dispatches.
+        let authentication_inputs = position("let authenticate_body_requirements");
+        assert!(
+            first_hook < unanswered && unanswered < authentication_inputs,
+            "{dispatcher}: `{file}` must refuse an exempted preflight no plugin answered \
+             right after `on_request_received`, before body buffering, authentication or \
+             dispatch"
+        );
+        assert_eq!(
+            body.matches(UNANSWERED_PREFLIGHT_REFUSAL).count(),
+            1,
+            "{dispatcher}: `{file}` must refuse an unanswered preflight exactly once"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket Extended CONNECT: 0-RTT gate and session logs use the wire method
 // ---------------------------------------------------------------------------

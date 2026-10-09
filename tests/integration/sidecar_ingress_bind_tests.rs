@@ -412,6 +412,71 @@ fn http_ingress_routes_carry_the_owner_service_path_parameter_opt_in() {
     }
 }
 
+/// A dedicated-bind stream listener whose `defaultEndpoint` port an HTTP-family
+/// listener also forwards to gets no bind listener (issue #6110): the HTTP
+/// route wins the shared application port on every lane, so a direct client of
+/// the bind cannot reach that socket as an opaque byte stream. A dedicated-bind
+/// stream listener on a distinct endpoint port is unaffected.
+#[test]
+fn dedicated_bind_stream_listener_sharing_an_http_endpoint_is_not_materialized() {
+    let spiffe = "spiffe://cluster.local/ns/default/sa/echo";
+    let (workload, service) = local_echo("default", "echo", spiffe, 8080, AppProtocol::Http);
+    let ingress = |port: u16, protocol: AppProtocol, endpoint_port: u16| MeshSidecarIngress {
+        port,
+        protocol,
+        name: None,
+        bind: (protocol != AppProtocol::Http).then(|| "127.0.0.1".to_string()),
+        default_endpoint: format!("127.0.0.1:{endpoint_port}"),
+    };
+    let mut runtime = default_mesh_runtime();
+    runtime.namespace = "default".to_string();
+    runtime.workload_spiffe_id = Some(spiffe.to_string());
+    runtime.sidecar_enforced = true;
+    runtime.topology = MeshTopology::Sidecar;
+    runtime.inbound_listen_addr = "127.0.0.1:0".parse().expect("addr");
+    runtime.outbound_listen_addr = "127.0.0.1:0".parse().expect("addr");
+    let config = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: vec![workload],
+            services: vec![service],
+            sidecars: vec![MeshSidecar {
+                name: "echo-ingress".to_string(),
+                namespace: "default".to_string(),
+                workload_selector: None,
+                egress_inherits_defaults: true,
+                egress: Vec::new(),
+                outbound_traffic_policy: None,
+                ingress_declared: true,
+                ingress: vec![
+                    ingress(9080, AppProtocol::Http, 8080),
+                    ingress(9081, AppProtocol::Tcp, 8080),
+                    ingress(9082, AppProtocol::Tcp, 6379),
+                ],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepare");
+
+    assert_eq!(
+        dedicated_bind_ids(&prepared),
+        vec!["__mesh-ingress-bind:default-echo-9082"],
+        "only the stream listener on a distinct endpoint port gets a dedicated bind"
+    );
+    let mesh = prepared.mesh.as_deref().expect("mesh");
+    let capture_ports: Vec<u16> = mesh
+        .local_inbound_tcp_routes
+        .iter()
+        .map(|route| route.match_port)
+        .collect();
+    assert_eq!(
+        capture_ports,
+        vec![9082],
+        "the capture table applies the same rule"
+    );
+}
+
 /// Issue #6109: two dedicated binds whose `defaultEndpoint`s name each other
 /// would bounce a request between two gateway listeners. Both are refused at
 /// prepare, for the whole entry, exactly like a bind conflict.

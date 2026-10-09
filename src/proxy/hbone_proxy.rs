@@ -29,7 +29,8 @@ use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
     build_response, build_response_from_normalized_reject,
     finalize_reject_response_with_after_proxy_hooks, inbound_hbone_relay_destination_decision,
-    log_rejected_request, mesh_egress_udp_destination_allowed, record_request, tcp_proxy,
+    inbound_hbone_stream_relay_destination_decision, log_rejected_request,
+    mesh_egress_udp_destination_allowed, record_request, tcp_proxy,
 };
 use crate::config::EnvConfig;
 use crate::config::env_config::OperatingMode;
@@ -836,7 +837,7 @@ pub(super) fn inbound_hbone_relay_effective_destination_decision(
     terminator_local_ip: Option<std::net::IpAddr>,
 ) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
     let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
-    inbound_hbone_relay_destination_decision(app_host, app_port, mesh, terminator_local_ip)
+    inbound_hbone_stream_relay_destination_decision(app_host, app_port, mesh, terminator_local_ip)
 }
 
 /// Drop loopback DNS answers for the ordinary transparent inbound relay when
@@ -1184,7 +1185,7 @@ pub(super) async fn handle_hbone_request(
             "Rejected inbound CONNECT whose effective destination is not one this proxy \
              terminates for (own pod / NodeWaypoint-enrolled / ServiceWaypoint-bound, or — \
              for a Sidecar ingress[] remap — the exact declared listener → defaultEndpoint \
-             mapping)"
+             mapping), or is a Sidecar HTTP application port that must be reached as HTTP"
         );
         // `no_mesh_slice` is a readiness condition (503), not a denial; every
         // other reason is the documented 403 (issue #5763).
@@ -3003,6 +3004,54 @@ mod tests {
         // loopback on a declared port fails closed.
         assert_eq!(
             decide(Some(&target("127.0.0.1", 8080)), None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+    }
+
+    /// Issue #6110: a relay synthesized for a stream-family port cannot be moved
+    /// onto a Sidecar HTTP application port by a route override; the
+    /// post-plugin re-check refuses the effective destination.
+    #[test]
+    fn inbound_relay_effective_destination_guard_refuses_an_override_onto_an_http_app_port() {
+        let mut mesh = mesh_with_workload_port(8080);
+        mesh.workloads[0].ports.push(WorkloadPort {
+            port: 6379,
+            protocol: AppProtocol::Tcp,
+            name: None,
+        });
+        mesh.inbound_relay_own_address_ports =
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(&mesh.workloads);
+        mesh.sidecar_inbound_http_app_ports = vec![8080];
+        let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
+        let mut proxy = minimal_proxy();
+        proxy.id = MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string();
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 6379;
+        let decide = |override_target: Option<&UpstreamTarget>| {
+            inbound_hbone_relay_effective_destination_decision(
+                &proxy,
+                override_target,
+                Some(&mesh),
+                Some(own_ip),
+            )
+        };
+
+        // The synthesized stream-family destination relays.
+        assert_eq!(decide(None), Ok(()));
+        assert_eq!(decide(Some(&target("10.1.2.3", 6379))), Ok(()));
+        // An override onto the HTTP application port, by loopback or by the
+        // own pod address, is refused after ownership is proven.
+        assert_eq!(
+            decide(Some(&target("127.0.0.1", 8080))),
+            Err(InboundRelayDenial::HttpApplicationPort)
+        );
+        assert_eq!(
+            decide(Some(&target("10.1.2.3", 8080))),
+            Err(InboundRelayDenial::HttpApplicationPort)
+        );
+        // Ownership still decides first.
+        assert_eq!(
+            decide(Some(&target("203.0.113.10", 8080))),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
     }

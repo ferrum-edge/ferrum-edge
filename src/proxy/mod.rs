@@ -2657,6 +2657,115 @@ fn inbound_hbone_relay_destination_decision(
     mesh.inbound_relay_destination_decision(host, port, terminator_local_ip)
 }
 
+/// [`inbound_hbone_relay_destination_decision`] for a BYTE-STREAM relay: the
+/// same ownership guard, plus the Sidecar refusal of a port a materialized
+/// HTTP-family inbound route serves (issue #6110, see
+/// [`crate::modes::mesh::config::MeshConfig::inbound_stream_relay_destination_decision`]).
+/// Relay synthesis, the handler's post-plugin re-check, and the admission
+/// fence's sweep all use it, so a reload that turns a port into an HTTP
+/// application port revokes a live byte-stream tunnel to it.
+fn inbound_hbone_stream_relay_destination_decision(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    terminator_local_ip: Option<std::net::IpAddr>,
+) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
+    let Some(mesh) = mesh else {
+        return Err(crate::modes::mesh::config::InboundRelayDenial::NoSlice);
+    };
+    let host = hbone_relay_authority_host_for_mesh(host);
+    mesh.inbound_stream_relay_destination_decision(host, port, terminator_local_ip)
+}
+
+/// Whether a bare byte-stream CONNECT that MATCHED `proxy` must be refused
+/// because that route serves HTTP on the Sidecar inbound listener (issue #6110,
+/// see
+/// [`crate::modes::mesh::config::MeshConfig::sidecar_inbound_refuses_matched_http_connect`]).
+///
+/// The dispatcher refuses such a CONNECT before the route's plugin chain runs,
+/// and the admission fence re-applies this to every live tunnel admitted
+/// through a configured route, so a reload that turns the route into an HTTP
+/// route on the Sidecar inbound listener revokes it. Hot path: two compares
+/// and a flag read, reached only for an HBONE CONNECT.
+pub(crate) fn sidecar_inbound_refuses_matched_http_connect(
+    proxy: &Proxy,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && !proxy.dispatch_kind.is_stream()
+        && mesh.is_some_and(|mesh| mesh.sidecar_inbound_refuses_matched_http_connect)
+}
+
+/// The refusal answered for a bare byte-stream CONNECT that matched an
+/// HTTP-family route on the Sidecar inbound listener (issue #6110): the same
+/// `http_application_port` reason, `403`, and `mesh.relay.*` metadata as a
+/// route-miss relay to an HTTP application port.
+fn matched_http_route_connect_refusal(
+    authority: Option<&http::uri::Authority>,
+) -> InboundConnectRelayRefusal {
+    let reason = crate::modes::mesh::config::InboundRelayDenial::HttpApplicationPort.as_str();
+    let unresolved = || InboundConnectRelayRefusal {
+        reason,
+        destination: None,
+    };
+    let Some(authority) = authority else {
+        return unresolved();
+    };
+    let Some(port) = authority.port_u16() else {
+        return unresolved();
+    };
+    let host = hbone_relay_authority_host_for_mesh(authority.host());
+    InboundConnectRelayRefusal::new(reason, host, port)
+}
+
+/// Whether `method` + `headers` form a bodiless CORS preflight: `OPTIONS`
+/// carrying both `Origin` and `Access-Control-Request-Method`, no
+/// `Transfer-Encoding`, and `Content-Length` absent or `0`.
+///
+/// A browser preflights every cross-origin gRPC-Web call, and the preflight
+/// carries no gRPC `Content-Type`, so it classifies as plain HTTP. The request
+/// dispatchers exempt it from ONE refusal only: a plain HTTP view marked
+/// [`crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY`]
+/// because its route is gRPC-intended (issue #6110), and only when that view
+/// carries [`crate::plugin_cache::PluginCapabilities::ANSWERS_CORS_PREFLIGHTS`].
+/// A preflight invokes no method, so the route's gRPC-only admission policy has
+/// nothing to judge, and refusing it would stop the browser from ever sending
+/// the gRPC-Web call. The route's HTTP plugins (`cors` among them) still run on
+/// it, and a preflight no plugin answered is refused, never forwarded.
+///
+/// The declared framing is necessary but not sufficient: each dispatcher also
+/// proves from its own transport that no body follows (H1/H2
+/// `Body::is_end_stream`, H3 the request stream's end with no DATA frame).
+pub(crate) fn is_cors_preflight_request(method: &http::Method, headers: &http::HeaderMap) -> bool {
+    method == http::Method::OPTIONS
+        && headers.contains_key(http::header::ORIGIN)
+        && headers.contains_key(http::header::ACCESS_CONTROL_REQUEST_METHOD)
+        && !headers.contains_key(http::header::TRANSFER_ENCODING)
+        && headers
+            .get(http::header::CONTENT_LENGTH)
+            .is_none_or(|value| value.as_bytes() == b"0")
+}
+
+/// The H1/H2 dispatcher's one exemption from the route-admission refusal: a
+/// bodiless CORS preflight on the plain HTTP view (not gRPC-Web) of a view that
+/// carries a preflight-answering `cors` instance (`caps`), whose body hyper has
+/// already proven empty (END_STREAM on the H2 HEADERS frame; no H1 framing).
+/// Only the gRPC-intended rule marks that view, so no other refusal is
+/// relaxed. Evaluated only once a view is marked.
+fn grpc_intended_refusal_exempts(
+    req: &Request<Incoming>,
+    request_protocol: ProxyProtocol,
+    grpc_web_request: bool,
+    caps: PluginCapabilities,
+) -> bool {
+    request_protocol == ProxyProtocol::Http
+        && !grpc_web_request
+        && caps.has(PluginCapabilities::ANSWERS_CORS_PREFLIGHTS)
+        && is_cors_preflight_request(req.method(), req.headers())
+        && hyper::body::Body::is_end_stream(req.body())
+}
+
 /// Round-robin cursor over an admitted external UDP destination's precomputed
 /// dial endpoints (issue #3263).
 ///
@@ -2817,17 +2926,25 @@ impl InboundConnectRelayRefusal {
 ///    A declared ingress block that does not resolve to exactly one valid,
 ///    owner-stamped, stream-family mapping for that exact local IP is refused
 ///    (`ingress_endpoint_mapping_mismatch`) instead of falling through to dial
-///    an unlisted or invalid port the operator replaced.
+///    an unlisted or invalid port the operator replaced. A stream listener
+///    whose `defaultEndpoint` port an HTTP-family listener also forwards to is
+///    refused `http_application_port` (issue #6110): the HTTP route wins the
+///    shared application port.
 /// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
 ///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
 ///    original destination the peer asked for — but only when that authority is
 ///    a destination THIS proxy terminates for. Unreachable for a declared
-///    ingress listener port so this can never widen it.
+///    ingress listener port so this can never widen it. On the Sidecar
+///    `:15006` listener a byte-stream CONNECT to a port a materialized
+///    HTTP-family inbound route serves is refused
+///    (`http_application_port`, issue #6110): that port is reached as HTTP so
+///    the route's plugin chain runs.
 ///
 /// Returns an [`InboundConnectRelayRefusal`] when the authority is
 /// missing/portless or is not a destination this terminator owns per
-/// [`inbound_hbone_relay_destination_decision`]. The caller answers it through
-/// [`reject_inbound_connect_relay_synthesis`] (issue #5763): the documented
+/// [`inbound_hbone_relay_destination_decision`] (byte-stream:
+/// [`inbound_hbone_stream_relay_destination_decision`]). The caller answers it through
+/// [`reject_inbound_connect_relay_pre_plugin`] (issue #5763): the documented
 /// `403 hbone_relay_destination_denied`, `503 hbone_relay_not_ready` before the
 /// first mesh slice, or the unauthenticated-peer `403` for a peerless CONNECT.
 ///
@@ -2874,6 +2991,16 @@ fn build_inbound_hbone_relay_proxy(
                 port,
             ));
         }
+        SidecarIngressConnectRelay::HttpApplicationPort => {
+            let denial = InboundRelayDenial::HttpApplicationPort;
+            warn_inbound_connect_to_http_application_port(
+                "ingress_remap",
+                host,
+                port,
+                accepted_local_ip,
+            );
+            return Err(InboundConnectRelayRefusal::new(denial.as_str(), host, port));
+        }
         SidecarIngressConnectRelay::Relay {
             listener_port,
             endpoint_host,
@@ -2888,9 +3015,22 @@ fn build_inbound_hbone_relay_proxy(
         }
     }
 
-    if let Err(denial) =
+    // A byte-stream relay additionally refuses a Sidecar HTTP application port
+    // (issue #6110); the datagram relay keeps the ordinary ownership guard.
+    let decision = if is_udp_connect {
         inbound_hbone_relay_destination_decision(host, port, mesh, accepted_local_ip)
-    {
+    } else {
+        inbound_hbone_stream_relay_destination_decision(host, port, mesh, accepted_local_ip)
+    };
+    if let Err(denial) = decision {
+        if denial == InboundRelayDenial::HttpApplicationPort {
+            warn_inbound_connect_to_http_application_port(
+                "relay_synthesis",
+                host,
+                port,
+                accepted_local_ip,
+            );
+        }
         if is_udp_connect
             && let Some((dial_host, dial_port)) =
                 mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
@@ -2924,14 +3064,61 @@ fn build_inbound_hbone_relay_proxy(
     })
 }
 
-/// Answer a synthesis-time inbound CONNECT relay refusal (issue #5763).
+/// An authenticated peer tunnelled to a port a Sidecar HTTP route serves
+/// (issue #6110): operator-visible (a peer is bypassing an HTTP route, or a
+/// client is misconfigured), but sampled because a peer can drive it at request
+/// rate. Transport facts only. `relay_phase` names the route-miss decision that
+/// refused it (`relay_synthesis` or `ingress_remap`); a CONNECT that matched an
+/// HTTP route warns `matched_route` at its own site.
+fn warn_inbound_connect_to_http_application_port(
+    relay_phase: &'static str,
+    host: &str,
+    port: u16,
+    accepted_local_ip: Option<std::net::IpAddr>,
+) {
+    let denial = crate::modes::mesh::config::InboundRelayDenial::HttpApplicationPort.as_str();
+    crate::warn_sampled!(
+        relay_phase = relay_phase,
+        authority_host = host,
+        authority_port = port,
+        denial = denial,
+        terminator_local_ip = ?accepted_local_ip,
+        "Refused authenticated inbound CONNECT to a Sidecar HTTP application port; \
+         HTTP traffic to this port must be sent as HTTP so its inbound route's plugin \
+         chain runs"
+    );
+}
+
+/// Test hook: run inbound CONNECT relay synthesis for `authority` against
+/// `mesh` and return the refusal's `mesh.relay.denial_reason`, or `None` when
+/// a relay proxy is synthesized (issue #6110).
+pub(crate) fn inbound_connect_relay_synthesis_refusal_for_test(
+    authority: &str,
+    mesh: &crate::modes::mesh::config::MeshConfig,
+    is_udp_connect: bool,
+    accepted_local_ip: Option<std::net::IpAddr>,
+) -> Option<&'static str> {
+    let authority = authority.parse::<http::uri::Authority>().ok();
+    build_inbound_hbone_relay_proxy(
+        authority.as_ref(),
+        Some(mesh),
+        is_udp_connect,
+        accepted_local_ip,
+    )
+    .err()
+    .map(|refusal| refusal.reason)
+}
+
+/// Answer an inbound CONNECT relay refusal decided before any plugin runs:
+/// a relay-synthesis refusal on a route miss (issue #5763), or a bare CONNECT
+/// that MATCHED a Sidecar HTTP route (issue #6110).
 ///
 /// No plugin chain has run yet, so the transaction line goes to the logging
-/// plugins the synthesized relay would have carried (the global chain).
+/// plugins a synthesized relay would have carried (the global chain).
 /// Nothing is dialed. See [`reject_inbound_connect_relay_synthesis_with_plugins`]
 /// for the terminal it answers with.
 #[allow(clippy::too_many_arguments)]
-async fn reject_inbound_connect_relay_synthesis(
+async fn reject_inbound_connect_relay_pre_plugin(
     state: &ProxyState,
     epoch: &RequestEpoch,
     ctx: &mut RequestContext,
@@ -33854,6 +34041,48 @@ async fn handle_proxy_request_inner(
         other => other,
     };
 
+    // A bare byte-stream CONNECT that MATCHES an HTTP-family route on the
+    // Sidecar inbound listener (a service host, a Sidecar `ingress[]` HTTP
+    // listener host, or an operator-defined HTTP proxy) is refused before the
+    // route's plugin chain runs (issue #6110). Relaying it would run that chain
+    // once, on the CONNECT, judged as Layer-4 traffic, while every HTTP request
+    // written into the tunnel skipped it. The route-miss relay refuses an HTTP
+    // application port the same way. Ambient and waypoint terminators never
+    // set the flag, so their matched-route CONNECT dispatch is unchanged.
+    if is_hbone_connect
+        && route_match.as_ref().is_some_and(|rm| {
+            sidecar_inbound_refuses_matched_http_connect(
+                &rm.proxy,
+                ctx.mesh_direction,
+                epoch.config.mesh.as_deref(),
+            )
+        })
+    {
+        let refusal = matched_http_route_connect_refusal(req.uri().authority());
+        // An authenticated peer tunnelled to a port an HTTP route serves:
+        // operator-visible, but sampled because a peer can drive it at request
+        // rate. Transport facts only.
+        crate::warn_sampled!(
+            relay_phase = "matched_route",
+            destination = ?refusal.destination,
+            denial = refusal.reason,
+            "Refused authenticated inbound CONNECT that matched a Sidecar HTTP route; HTTP \
+             traffic to this route must be sent as HTTP so its plugin chain runs"
+        );
+        let response = reject_inbound_connect_relay_pre_plugin(
+            &state,
+            &epoch,
+            &mut ctx,
+            &refusal,
+            false,
+            start_time,
+            request_uses_grpc_content_type,
+            grpc_web_response_content_type,
+        )
+        .await;
+        return Ok(response);
+    }
+
     // Datagram-over-HBONE CONNECTs MUST always traverse the guarded inbound
     // relay-synthesis path, never an LB-backed HTTP/TCP route. The UDP handler
     // dials a local `UdpSocket` straight at the route's backend addr+port, so a
@@ -33973,7 +34202,7 @@ async fn handle_proxy_request_inner(
                     // before the first slice, or the unauthenticated-peer 403
                     // for a peerless CONNECT) and writes a transaction line,
                     // instead of masquerading as a route miss.
-                    let response = reject_inbound_connect_relay_synthesis(
+                    let response = reject_inbound_connect_relay_pre_plugin(
                         &state,
                         &epoch,
                         &mut ctx,
@@ -34204,14 +34433,23 @@ async fn handle_proxy_request_inner(
         plugin_cache_view.initial_response_header_policy_plugins();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
-    // The client selected this flavor (gRPC `Content-Type`, WebSocket upgrade)
-    // and its plugin view omits authentication or admission policy that the
-    // route's HTTP view runs. Refuse before any plugin runs instead of serving
-    // the route without that policy.
-    if plugin_cache_view
-        .capabilities()
+    // The client selected this flavor (gRPC `Content-Type`, WebSocket upgrade,
+    // or plain HTTP on a gRPC-intended route) and its plugin view omits
+    // authentication or admission policy that another view of the route runs.
+    // Refuse before any plugin runs instead of serving the route without that
+    // policy. One exemption: a bodiless CORS preflight on the plain HTTP view
+    // when the route's `cors` plugin answers preflights. Only the gRPC-intended
+    // rule (issue #6110) marks that view, a preflight invokes no gRPC method,
+    // and browser gRPC-Web cannot start without it. `Some(exempt)` once the
+    // view is marked.
+    let caps = plugin_cache_view.capabilities();
+    let omitted_policy_exemption = caps
         .has(PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
-    {
+        .then(|| grpc_intended_refusal_exempts(&req, request_protocol, grpc_web_request, caps));
+    // An exempted preflight is answered by `cors` or refused after the
+    // `on_request_received` phase; it is never forwarded upstream.
+    let cors_preflight_exempted = omitted_policy_exemption == Some(true);
+    if omitted_policy_exemption == Some(false) {
         state.request_count.fetch_add(1, Ordering::Relaxed);
         debug!(
             proxy_id = %proxy.id,
@@ -34495,6 +34733,36 @@ async fn handle_proxy_request_inner(
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // An exempted CORS preflight (issue #6110) exists only so the route's
+    // `cors` plugin can answer it, which it does in the phase above. One that
+    // reaches here (`cors` forwards it, or a trigger skipped `cors`) gets the
+    // view's ordinary refusal rather than reaching the backend without the
+    // route's gRPC-only admission policy.
+    if cors_preflight_exempted {
+        let mut reject = normalize_reject_response(
+            StatusCode::FORBIDDEN,
+            Bytes::from_static(ROUTE_PROTOCOL_NOT_PERMITTED_BODY.as_bytes()),
+            &EMPTY_HEADERS,
+            false,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        boxed_log_rejected_request(
+            &plugins,
+            &ctx,
+            StatusCode::FORBIDDEN.as_u16(),
+            start_time,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(&state, StatusCode::FORBIDDEN.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
     }
 
     // Materialize query params before authentication — key_auth and jwt_auth

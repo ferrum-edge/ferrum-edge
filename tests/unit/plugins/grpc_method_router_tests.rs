@@ -55,6 +55,25 @@ fn test_supported_protocols() {
     assert_eq!(plugin.supported_protocols(), GRPC_ONLY_PROTOCOLS);
 }
 
+/// Every configuration enforces an allow list, deny list, or rate limit, so
+/// the instance is request-admission policy: a route configured with it is
+/// gRPC-intended and refuses the plain HTTP and WebSocket flavors that would
+/// skip it (issue #6110).
+#[test]
+fn every_configuration_gates_request_admission() {
+    for config in [
+        json!({"allow_methods": ["pkg.Svc/Allowed"]}),
+        json!({"deny_methods": ["pkg.Svc/Blocked"]}),
+        json!({"method_rate_limits": {"pkg.Svc/Hot": {"max_requests": 5, "window_seconds": 60}}}),
+    ] {
+        let plugin = create_plugin("grpc_method_router", &config)
+            .unwrap()
+            .unwrap();
+        assert!(plugin.gates_request_admission(), "{config}");
+        assert!(!plugin.is_auth_plugin(), "{config}");
+    }
+}
+
 // ── gRPC path parsing and metadata population ──
 
 #[tokio::test]

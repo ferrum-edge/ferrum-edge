@@ -3988,11 +3988,23 @@ async fn handle_h3_request(
 
     // Same refusal as the H1/H2 dispatcher: a client-selected flavor whose
     // view omits the route's authentication or admission policy is refused
-    // before any plugin runs.
-    if plugin_cache_view
-        .capabilities()
+    // before any plugin runs, except a bodiless CORS preflight on the plain
+    // HTTP view of a gRPC-intended route whose `cors` plugin answers
+    // preflights (issue #6110). `Some(exempt)` once the view is marked.
+    let caps = plugin_cache_view.capabilities();
+    let grpc_web_request = grpc_web_response_content_type.is_some();
+    let omitted_policy_exemption = caps
         .has(crate::plugin_cache::PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY)
-    {
+        .then(|| h3_grpc_intended_refusal_exempts(&req, request_protocol, grpc_web_request, caps));
+    // HTTP/3 may carry DATA with no `Content-Length`, so the declared framing
+    // proves nothing: the request stream must also END with no DATA frame,
+    // within a fixed small wait. An exempted preflight is answered by `cors`
+    // or refused after the `on_request_received` phase; it is never
+    // forwarded upstream.
+    let read_timeout_ms = proxy.backend_read_timeout_ms;
+    let cors_preflight_exempted = omitted_policy_exemption == Some(true)
+        && boxed_h3_request_stream_ends_without_data(&mut stream, read_timeout_ms).await;
+    if omitted_policy_exemption.is_some() && !cors_preflight_exempted {
         debug!(
             proxy_id = %proxy.id,
             protocol = ?request_protocol,
@@ -4329,6 +4341,43 @@ async fn handle_h3_request(
         ctx.materialize_query_params();
     } else {
         ctx.materialize_query_params_raw();
+    }
+
+    // An exempted CORS preflight (issue #6110) exists only so the route's
+    // `cors` plugin can answer it, which it does in the phase above. One that
+    // reaches here (`cors` forwards it, or a trigger skipped `cors`) gets the
+    // view's ordinary refusal rather than reaching the backend without the
+    // route's gRPC-only admission policy. It runs before any pre-auth body
+    // buffering and before authentication. Boxed so this cold arm does not widen
+    // `handle_h3_request`'s frame.
+    if cors_preflight_exempted {
+        Box::pin(async {
+            record_h3_flavor_aware_reject(&state, http_flavor, 403);
+            // Log before send, like every other reject in this phase.
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                StatusCode::FORBIDDEN.as_u16(),
+                start_time,
+                crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_error_flavor_aware_with_policy(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::FORBIDDEN,
+                crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY,
+                crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+                "Request protocol not permitted on this route",
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
+        return Ok(());
     }
 
     // Some auth plugins (for example `hmac_auth`) verify request body integrity
@@ -11125,6 +11174,74 @@ async fn handle_h3_request(
     }
 
     Ok(())
+}
+
+/// The H3 counterpart of the H1/H2 dispatcher's one exemption from the
+/// route-admission refusal: a bodiless CORS preflight on the plain HTTP view
+/// (not gRPC-Web) of a gRPC-intended route whose view carries a
+/// preflight-answering `cors` instance (`caps`) (issue #6110). The request
+/// DATA frames have not been read yet, so this judges only the declared
+/// framing; the dispatcher then requires the stream to end with no DATA frame
+/// ([`boxed_h3_request_stream_ends_without_data`]). Evaluated only once a view
+/// is marked.
+fn h3_grpc_intended_refusal_exempts(
+    req: &http::Request<()>,
+    request_protocol: ProxyProtocol,
+    grpc_web_request: bool,
+    caps: crate::plugin_cache::PluginCapabilities,
+) -> bool {
+    request_protocol == ProxyProtocol::Http
+        && !grpc_web_request
+        && caps.has(crate::plugin_cache::PluginCapabilities::ANSWERS_CORS_PREFLIGHTS)
+        && crate::proxy::is_cors_preflight_request(req.method(), req.headers())
+}
+
+/// Fixed ceiling, in milliseconds, on how long the H3 dispatcher waits for an
+/// exempted CORS preflight's request stream to end (issue #6110).
+///
+/// The wait runs before any plugin (rate limiting, IP restriction, and `cors`
+/// itself all run later), so it must not depend on the route: the route's
+/// `backend_read_timeout_ms` is a backend upload-stall knob (default 30 s, `0`
+/// = unbounded) and can only shorten this bound. A browser sends a preflight's
+/// FIN with its HEADERS frame, so the wait normally ends at once.
+pub(crate) const H3_PREFLIGHT_END_OF_STREAM_WAIT_MS: u64 = 2_000;
+
+/// Whether the H3 request stream ENDS with no DATA frame: the transport proof
+/// that an exempted CORS preflight carries no body (issue #6110). HTTP/3 allows
+/// DATA without `Content-Length`, so the declared framing alone is not enough.
+/// `recv_data` is the stream's next-DATA future: `Ok(None)` is the FIN. A DATA
+/// frame (even an empty one), a stream error, or no FIN within
+/// `min(backend_read_timeout_ms, H3_PREFLIGHT_END_OF_STREAM_WAIT_MS)` (the
+/// fixed cap alone when the route's timeout is `0`) is not proof, and the
+/// preflight is then refused like the rest of the view.
+pub(crate) async fn h3_request_stream_ends_without_data<F, B, E>(
+    recv_data: F,
+    backend_read_timeout_ms: u64,
+) -> bool
+where
+    F: std::future::Future<Output = Result<Option<B>, E>>,
+{
+    let wait_ms = match backend_read_timeout_ms {
+        0 => H3_PREFLIGHT_END_OF_STREAM_WAIT_MS,
+        ms => ms.min(H3_PREFLIGHT_END_OF_STREAM_WAIT_MS),
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_millis(wait_ms), recv_data).await,
+        Ok(Ok(None))
+    )
+}
+
+/// [`h3_request_stream_ends_without_data`] over the live request stream.
+/// Built out of line and boxed so the timer and receive futures do not widen
+/// `handle_h3_request`'s frame.
+#[inline(never)]
+fn boxed_h3_request_stream_ends_without_data(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    backend_read_timeout_ms: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+    Box::pin(async move {
+        h3_request_stream_ends_without_data(stream.recv_data(), backend_read_timeout_ms).await
+    })
 }
 
 pub(crate) fn h3_plugin_protocol_for_request(

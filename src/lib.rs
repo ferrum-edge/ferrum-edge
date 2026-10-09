@@ -223,6 +223,24 @@ pub mod _test_support {
         .await
     }
 
+    /// Run inbound CONNECT relay synthesis exactly as the dispatcher's
+    /// route-miss arm does (issue #6110): the refusal's
+    /// `mesh.relay.denial_reason`, or `None` when a relay proxy is synthesized.
+    /// `authority` is the CONNECT `:authority` (`host:port`).
+    pub fn inbound_connect_relay_synthesis_refusal_for_test(
+        authority: &str,
+        mesh: &crate::modes::mesh::config::MeshConfig,
+        is_udp_connect: bool,
+        accepted_local_ip: Option<std::net::IpAddr>,
+    ) -> Option<&'static str> {
+        crate::proxy::inbound_connect_relay_synthesis_refusal_for_test(
+            authority,
+            mesh,
+            is_udp_connect,
+            accepted_local_ip,
+        )
+    }
+
     pub fn websocket_backend_path_for_test(
         proxy: &crate::config::types::Proxy,
         path: &str,
@@ -1548,6 +1566,13 @@ pub mod _test_support {
             proxy_ids_to_rebuild,
             rebuild_globals,
         )
+    }
+
+    /// Whether the composed gRPC-Web view built from `plugins` refuses the
+    /// request because it drops a gRPC-only admission instance (issue #6110).
+    /// The global gRPC-Web view is built from the global chain this way.
+    pub fn grpc_web_view_omits_admission_policy_for_test(plugins: &[Arc<dyn Plugin>]) -> bool {
+        crate::plugin_cache::grpc_web_view_omits_admission_policy_for_test(plugins)
     }
 
     /// Prepend a plugin onto one proxy's resolved list for external tests.
@@ -16104,6 +16129,27 @@ pub mod _test_support {
                 H3UploadWaitOutcomeForTest::AuthorizationExpired(termination)
             }
         }
+    }
+
+    /// The fixed cap on the H3 CORS preflight end-of-stream wait (issue #6110).
+    pub const H3_PREFLIGHT_END_OF_STREAM_WAIT_MS: u64 =
+        crate::http3::server::H3_PREFLIGHT_END_OF_STREAM_WAIT_MS;
+
+    /// Run the H3 CORS preflight end-of-stream proof (issue #6110) exactly as
+    /// the dispatcher does, over a stand-in for the request stream's next-DATA
+    /// future (`Ok(None)` is the FIN, `Ok(Some(_))` a DATA frame).
+    pub async fn h3_request_stream_ends_without_data_for_test<F>(
+        recv_data: F,
+        backend_read_timeout_ms: u64,
+    ) -> bool
+    where
+        F: std::future::Future<Output = Result<Option<bytes::Bytes>, ()>>,
+    {
+        crate::http3::server::h3_request_stream_ends_without_data(
+            recv_data,
+            backend_read_timeout_ms,
+        )
+        .await
     }
 
     // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────

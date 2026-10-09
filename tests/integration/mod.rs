@@ -154,6 +154,7 @@ mod replay_authority_readiness_tests;
 mod scripted_backend_smoke_tests;
 mod service_discovery_endpointslice_lifecycle_tests;
 mod service_discovery_lifecycle_tests;
+mod sidecar_connect_http_port_tests;
 mod sidecar_ingress_bind_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;

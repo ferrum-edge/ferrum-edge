@@ -3842,6 +3842,27 @@ pub fn is_modeled_ingress_app_protocol(protocol: AppProtocol) -> bool {
     is_http_family_app_protocol(protocol) || is_stream_family_app_protocol(protocol)
 }
 
+/// Whether one of `listeners` is an HTTP-family Sidecar `ingress[]` listener
+/// whose loopback `defaultEndpoint` is on `endpoint_port` (issue #6110).
+///
+/// Every loopback ingress endpoint is in the pod's own network namespace, so a
+/// shared port is one application socket. The HTTP route wins it, exactly as
+/// on the service-port default path: a stream-family listener forwarding to
+/// the same port must not hand a peer an opaque byte stream that skips the
+/// HTTP route's plugin chain. A Unix-stream HTTP backend has no TCP port and
+/// never matches.
+pub fn ingress_http_listener_serves_endpoint_port<'a>(
+    listeners: impl IntoIterator<Item = &'a ResolvedIngressListener>,
+    endpoint_port: u16,
+) -> bool {
+    endpoint_port != 0
+        && listeners.into_iter().any(|listener| {
+            listener.is_http_family()
+                && listener.endpoint_unix_path.is_none()
+                && listener.endpoint_port == endpoint_port
+        })
+}
+
 /// Parse an Istio `defaultEndpoint` into the typed backend it names.
 ///
 /// Supported (per Istio's "Arbitrary IPs are not supported" rule): loopback
@@ -5113,6 +5134,52 @@ pub struct MeshConfig {
     /// [`Self::inbound_relay_destinations`].
     #[serde(skip)]
     pub inbound_relay_own_address_ports: Vec<MeshOwnAddressPortBound>,
+    /// Runtime-only set of the local application (container) ports that a
+    /// materialized Sidecar HTTP-family inbound route serves (issue #6110),
+    /// sorted and deduplicated.
+    ///
+    /// A bare authenticated byte-stream CONNECT on the Sidecar `:15006`
+    /// listener whose authority names one of these ports is refused
+    /// ([`InboundRelayDenial::HttpApplicationPort`]) instead of being relayed
+    /// as opaque bytes: the port is served by an HTTP route, and relaying it
+    /// would skip that route's plugin chain. Stream-family (TCP/opaque) ports
+    /// keep the CONNECT relay. A container port that both an HTTP-family and a
+    /// stream-family service port resolve to is in this set, because the HTTP
+    /// route wins that port, so a raw-TCP CONNECT for the stream-family service
+    /// (a Ferrum peer's raw-TCP egress included) is refused too. The remedy is
+    /// distinct container ports for the two service ports.
+    ///
+    /// Populated ONLY by the default Sidecar service-port inbound
+    /// materializer and assigned on every apply (empty on every other
+    /// topology, and when a Sidecar `ingress[]` block is declared, whose
+    /// CONNECT remap already refuses every HTTP-family listener port).
+    /// `serde(skip)` for the same reason as
+    /// [`Self::inbound_relay_destinations`].
+    #[serde(skip)]
+    pub sidecar_inbound_http_app_ports: Vec<u16>,
+    /// Runtime-only: a bare byte-stream CONNECT on the inbound listener that
+    /// MATCHES an HTTP-family route is refused (issue #6110) instead of being
+    /// relayed to that route's backend as opaque bytes.
+    ///
+    /// [`Self::sidecar_inbound_http_app_ports`] covers the route MISS, where
+    /// the relay is synthesized from the authority. This flag covers the route
+    /// HIT: a CONNECT whose authority names a service host
+    /// (`reviews.default.svc.cluster.local:9080`), a Sidecar `ingress[]` HTTP
+    /// listener host, or an operator-defined HTTP proxy matches that route,
+    /// and relaying it would run the route's plugin chain once, on the CONNECT,
+    /// while every HTTP request written into the tunnel skipped it. The peer
+    /// must send HTTP instead.
+    ///
+    /// Set ONLY by the Sidecar inbound materializer, for EVERY Sidecar
+    /// (with or without a workload identity: the rule only refuses, and a
+    /// Sidecar peer reaches an HTTP route as HTTP); assigned on every apply.
+    /// Ambient and waypoint terminators never set it, so their matched-route
+    /// CONNECT dispatch (which `mesh_route_dispatch` overrides ride) is
+    /// unchanged.
+    /// `serde(skip)` for the same reason as
+    /// [`Self::inbound_relay_destinations`].
+    #[serde(skip)]
+    pub sidecar_inbound_refuses_matched_http_connect: bool,
     /// The authoritative node-local enrolled-pod registry bounding
     /// [`Self::inbound_relay_destinations`] (issue #4249).
     ///
@@ -5240,6 +5307,10 @@ pub enum InboundRelayDenial {
     /// The address IS one this proxy terminates for, but the owning workload
     /// record does not declare the requested port.
     PortNotDeclared,
+    /// A byte-stream CONNECT names a port a materialized Sidecar HTTP-family
+    /// inbound route serves (issue #6110). Relaying it as opaque bytes would
+    /// skip that route's plugin chain, so the peer must send HTTP instead.
+    HttpApplicationPort,
 }
 
 impl InboundRelayDenial {
@@ -5250,6 +5321,7 @@ impl InboundRelayDenial {
             Self::UnresolvableHost => "unresolvable_authority",
             Self::AddressNotTerminated => "address_not_terminated_here",
             Self::PortNotDeclared => "port_not_declared",
+            Self::HttpApplicationPort => "http_application_port",
         }
     }
 }
@@ -5558,6 +5630,12 @@ pub enum SidecarIngressConnectRelay {
     /// CONNECT rather than fall back to dialing the authority, including for a
     /// port absent from an explicit-empty/all-invalid replacement surface.
     Deny,
+    /// The authority resolves to an owned stream-family listener, but its
+    /// loopback `defaultEndpoint` port is also an HTTP-family listener's
+    /// endpoint (issue #6110). The HTTP route wins a shared port, so the caller
+    /// refuses the CONNECT as [`InboundRelayDenial::HttpApplicationPort`]
+    /// instead of relaying opaque bytes past that route's plugin chain.
+    HttpApplicationPort,
     /// Relay to the listener's validated loopback `defaultEndpoint`, while
     /// AuthorizationPolicy evaluation stays keyed to `listener_port`.
     Relay {
@@ -5739,6 +5817,39 @@ impl MeshConfig {
         }
 
         self.inbound_relay_inventory_decision(candidate, address, port)
+    }
+
+    /// [`Self::inbound_relay_destination_decision`] for a BYTE-STREAM relay
+    /// (issue #6110): the same ownership guard, then a refusal for a port a
+    /// materialized Sidecar HTTP-family inbound route serves
+    /// ([`Self::sidecar_inbound_http_app_ports`]).
+    ///
+    /// A bare authenticated CONNECT on the Sidecar `:15006` listener is the
+    /// raw-TCP egress lane. An HTTP application port is reached by plain HTTP
+    /// over the same mTLS listener, where the route's plugin chain runs, so a
+    /// CONNECT that would relay it as opaque bytes is refused instead. The
+    /// ownership guard runs first so a destination this terminator does not
+    /// own keeps its existing denial reason. The set is empty on every
+    /// topology but Sidecar, so Ambient and waypoint HBONE relays are
+    /// unchanged. The datagram relay does not call this: `connect-udp` never
+    /// reaches an HTTP route.
+    ///
+    /// Hot path: one binary search over a short sorted slice, no allocation.
+    pub fn inbound_stream_relay_destination_decision(
+        &self,
+        host: &str,
+        port: u16,
+        terminator_local_ip: Option<std::net::IpAddr>,
+    ) -> Result<(), InboundRelayDenial> {
+        self.inbound_relay_destination_decision(host, port, terminator_local_ip)?;
+        if self
+            .sidecar_inbound_http_app_ports
+            .binary_search(&port)
+            .is_ok()
+        {
+            return Err(InboundRelayDenial::HttpApplicationPort);
+        }
+        Ok(())
     }
 
     /// Screen DNS answers for the ordinary inbound HBONE relay before any
@@ -5978,6 +6089,10 @@ impl MeshConfig {
     ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
     ///    naming it is outside the declared contract and is refused rather than
     ///    relayed to the listener port the operator replaced.
+    /// 6. The listener's `defaultEndpoint` port is also an HTTP-family
+    ///    listener's endpoint ⇒
+    ///    [`SidecarIngressConnectRelay::HttpApplicationPort`] (issue #6110):
+    ///    the HTTP route wins the shared application port.
     pub fn resolve_sidecar_ingress_connect_relay(
         &self,
         host: &str,
@@ -6013,6 +6128,12 @@ impl MeshConfig {
         {
             return SidecarIngressConnectRelay::Deny;
         }
+        if ingress_http_listener_serves_endpoint_port(
+            &self.local_ingress_listeners,
+            listener.endpoint_port,
+        ) {
+            return SidecarIngressConnectRelay::HttpApplicationPort;
+        }
         SidecarIngressConnectRelay::Relay {
             listener_port: listener.port,
             endpoint_host: listener.endpoint_host.clone(),
@@ -6029,7 +6150,9 @@ impl MeshConfig {
     /// selection) can replace the destination between synthesis and dial. Only
     /// the one mapping this listener declares survives; anything else — a
     /// different backend, a widened port, a withdrawn listener — fails closed
-    /// before the dial.
+    /// before the dial. So does a mapping whose endpoint port an HTTP-family
+    /// listener now serves (issue #6110), which also revokes a live tunnel when
+    /// a reload adds that HTTP listener.
     pub fn sidecar_ingress_connect_relay_endpoint_matches(
         &self,
         listener_port: u16,
@@ -6052,6 +6175,7 @@ impl MeshConfig {
             && !listener.owner_service.is_empty()
             && listener.endpoint_port == port
             && canonical_mesh_host(&listener.endpoint_host) == canonical_mesh_host(host)
+            && !ingress_http_listener_serves_endpoint_port(&self.local_ingress_listeners, port)
     }
 }
 
@@ -6188,6 +6312,8 @@ impl Default for MeshConfig {
             inbound_relay_admits_accepted_local_address: false,
             inbound_relay_admits_loopback_namespace: false,
             inbound_relay_own_address_ports: Vec::new(),
+            sidecar_inbound_http_app_ports: Vec::new(),
+            sidecar_inbound_refuses_matched_http_connect: false,
             inbound_relay_node_local_registry: Default::default(),
         }
     }
