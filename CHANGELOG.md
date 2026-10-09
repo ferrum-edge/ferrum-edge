@@ -7,60 +7,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Performance
+## [0.9.16] - 2026-10-09
 
-- **Large config writes apply as deltas instead of full reloads** (issue
-  #6058). The database poller read at most 10,000 `config_changes` rows and
-  treated a full page as a backlog, forcing a reload of the whole namespace.
-  One admin batch of a few thousand proxies with plugins already writes that
-  many rows. It now pages through the change log (10,000 rows per query) and
-  falls back to a full reload only past 100,000 rows, the per-namespace
-  change-log retention. This applies to SQL and MongoDB.
+Release preparation started on **2026-10-09 UTC** from main
+`415990315392dee5a52b8c98d998ceaad961b21e`. This release fixes the published
+QUIC advisories affecting 0.9.15 and tightens admin, plugin, Kubernetes and
+credential boundaries. Read [Upgrading to 0.9.16](docs/upgrade_guide.md#upgrading-to-0916)
+before updating operators, custom plugins, mesh charts or contract consumers.
 
-  On the reload-under-load test at 9,600 live proxies, a 3,000-proxy change
-  went from 2.1 s to 1.2 s to live, and its throughput dip from 6% average /
-  12% worst second to 4% / 5%.
+### Security
 
-  A remaining fallback now logs its reason (for example
-  `change-log batch over the cap`).
+- **QUIC dependencies include the upstream security fixes** (issue #6113,
+  PR #6115): quinn 0.11.12, quinn-proto 0.11.19 and quinn-udp 0.5.16 fix
+  GHSA-qfwj-vfxf-92j2, GHSA-hmxj-32vh-65vr, GHSA-465w-v9q3-7j98,
+  GHSA-53rm-773f-4q8c, GHSA-wppq-2f6r-wfvm and GHSA-6pp4-4cxf-xf88.
+  These cover flow-control panic/memory handling, oversized Retry packets
+  and a truncated-datagram receive loop on non-Linux platforms. The released
+  0.9.15 dependency set is affected; fastbloom also moves to 0.17.
+- **BREAKING — an admin token's `ns` claim always bounds its authority**
+  (issues #6091 / #6095, PR #6093), even when
+  `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`. Namespace headers must be
+  covered by the claim; namespace listings are filtered. Fleet-wide routes
+  and unknown route classes fail closed for bounded tokens. `/health` and
+  `/status` expose the tenant tier, and `/metrics` refuses a bounded JWT
+  even from an allowlisted CIDR. Nexus operators must configure its separate
+  `FERRUM_METRICS_BEARER_TOKEN` before adopting this release.
+- **BREAKING — built-in plugin trust and composition follow registered
+  concrete types** (issue #6022). Custom plugins reporting built-in names
+  cannot replace a global built-in, satisfy managed `mesh_authz` readiness,
+  acquire built-in gRPC-Web privileges or bypass composition checks. Global
+  and scoped built-ins now compose where a custom name collision previously
+  hid them. An invalid stored composition can refuse startup after an
+  upgrade; validate it before restarting.
+- **BREAKING — ambient AWS credentials are restricted to admitted AWS
+  endpoints** (issue #6111, PR #6118). Lambda and Bedrock accept supported
+  regional HTTPS endpoints, including admitted FIPS, dual-stack and VPC
+  endpoint forms, in the commercial, GovCloud and China partitions. A
+  per-config custom endpoint cannot silently receive ambient credentials.
+  The explicit `allow_custom_endpoint_with_ambient_credentials` option
+  grants that authority to the config writer; explicit config credentials
+  retain their existing endpoint behavior.
+- **BREAKING — Gateway API Service backendRefs validate EndpointSlices
+  against observed Pod ownership** (issue #6108, PR #6121). Extra slices
+  attached to selector-backed Services are checked too. Unverifiable,
+  cross-namespace, infrastructure and metadata addresses fail closed;
+  refused routes report `RefNotPermitted`. The narrowly scoped
+  `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS` opt-in requires Pod and
+  Node inventory and applies only to same-namespace selector-less Services.
+- **BREAKING — mesh endpoint discovery verifies Pod targetRefs and MCS
+  provenance** (issue #6123, PR #6130). A same-namespace Pod must report the
+  endpoint IP itself; unreferenced IPs need unique non-host-network ownership.
+  ServiceImport endpoints reject foreign-controller slices and local
+  infrastructure/other-namespace addresses. Remote-controller trust still
+  depends on RBAC and ReferenceGrant; discovery gaps produce explicit
+  warnings rather than a false assurance of isolation.
+- **Invalid backend TLS material cannot fall back to verification-disabled
+  pools** (issue #6105, PR #6119). Refusal markers cover pooled and direct
+  HTTP/2, gRPC, HTTP/3 and WebSocket TLS paths, even with global no-verify
+  enabled. Reload handles invalid destinations separately and drains their
+  old pools. TCP listener retention remains limited to the unchanged-source,
+  unchanged-routing, unchanged-CRL case described in the upgrade guide.
+- **The node agent and CNI installer drop unnecessary host privileges**
+  (issues #6112 / #6122 / #6126). The node agent no longer uses `hostPID`;
+  NodeWaypoint capture drops `SYS_ADMIN` by default. The CNI installer
+  explicitly drops all capabilities, disables privilege escalation, and
+  uses a read-only root filesystem. Staged CNI file modes are set through
+  their open handles before rename. Check host-directory ownership and
+  older-kernel requirements before upgrading.
+- **Replay admission enforces current ownership and capacity** (issue
+  #6106, PR #6116). An expired entry changing principal consumes the new
+  principal's quota. SOAP nonce re-admission respects lowered live limits;
+  expired refreshes cannot bypass the new-entry capacity path or evict a
+  live claim.
 
 ### Changed
 
-- **Vendored h2 moves to 0.4.20** (issue #6062). `vendor/h2-0.4.20-ferrum-patched/`
-  replaces the 0.4.19 fork. Two Ferrum patches retire because upstream now
-  contains them:
-  - the runtime small-DATA-frame budget (`h2-002`, hyperium/h2#965);
-  - the client close-wakeup race (`h2-004`, hyperium/h2#956).
-
-  The DATA-frame write coalescing (`h2-001`) and the assigned-send-capacity
-  accessor (`h2-003`, read by Hyper patch 005) are re-applied unchanged.
-  0.4.20 also brings upstream protocol hardening and HPACK/locking performance
-  work: GOAWAY stream-id validation, `:status` enforcement, duplicate
-  `content-length` rejection, refused-stream and push-promise accounting.
-  Refused streams now count toward
-  `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` (default 256), so a
-  client that overruns `max_concurrent_streams` that many times on one
-  connection receives `GOAWAY(ENHANCE_YOUR_CALM)`.
+- **BREAKING — HTTP-family proxy cycles have a bounded hop budget** (issue
+  #6109, PR #6127). Gateway-owned `X-Ferrum-Hops` increments at each outbound
+  HTTP proxy hop. `FERRUM_MAX_PROXY_HOPS` defaults to `10` (`0` disables the
+  limit; maximum `255`). Malformed or repeated fields return `400`; a reached
+  limit returns `508`, `X-Gateway-Error: loop_detected`, or gRPC
+  `FAILED_PRECONDITION`. Backend `508` responses are never retried.
+  Request-scoped plugin calls and mirrors carry the same hop context
+  (#6128); background exporters and refresh jobs do not.
+- **BREAKING — gRPC-intended routes refuse plain HTTP and Sidecar CONNECT
+  cannot bypass HTTP route policy** (issue #6110, PR #6125). A route-scoped
+  gRPC admission plugin makes plain HTTP/WebSocket views fail closed.
+  gRPC-Web supports the registered built-in method router and deadline
+  policy; unsupported native gRPC admission remains refused. A narrowly
+  bounded, bodiless CORS preflight may be answered locally. Bare Sidecar
+  CONNECT to an HTTP application port is refused, including after reload.
+- **Admin by-id cache misses during a database failure return `503`**
+  (issue #6143, PR #6145), with `CachedReadUnavailable` and
+  `X-Data-Source: cached`. A missing item in a fallback cache does not prove
+  deletion. Authoritative database misses and file-mode misses remain `404`.
+- **Vendored h2 moves to 0.4.20** (issue #6062). Upstream now includes the
+  runtime small-DATA-frame budget and client close-wakeup fixes, so patches
+  `h2-002` and `h2-004` retire. Patches `h2-001` and `h2-003` remain.
+  Refused streams count toward
+  `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` (default `256`), after
+  which the connection receives `GOAWAY(ENHANCE_YOUR_CALM)`.
 
 ### Fixed
 
-- **BREAKING — HTTP/2 WebSocket early data is gated on the wire method
-  `CONNECT`** (issue #6107). An RFC 8441 Extended CONNECT WebSocket carrying
-  `Early-Data: 1` was checked against `FERRUM_TLS_EARLY_DATA_METHODS` after
-  its method was normalized to `GET`, while HTTP/3 checked `CONNECT`. Both now
-  check `CONNECT`, so an allowlist of `GET` alone answers it `425 Too Early`.
-  Route and plugin method policy still see `GET`. The default (unset, no
-  early-data method gate) is unaffected; on HTTP/2 the gate applies to
-  requests that carry `Early-Data: 1`. Listing `CONNECT` also admits mesh
-  HBONE CONNECT in early data, as before.
+- **Uploads require the real transport END_STREAM** (issue #6022, PRs
+  #6138 / #6139 / #6142). Buffered H1/H2, native H3 and bridge paths no
+  longer accept a trailers section followed by a reset as a complete body.
+  An aborted streaming H3 upload aborts the HTTP/1 backend body or resets the
+  HTTP/2 stream, including after trailers, instead of ending it cleanly or
+  leaving a partial request open. A legitimate early backend response can
+  still stop an unfinished upload cleanly. Header/deadline teardown stays
+  bounded; backend timeouts remain logged if the client closes before 504.
+- **Cancelled uploads retain rejection hooks, cleanup and one transaction
+  summary** (issue #6022, PRs #6146 / #6150). Early H1/H2 prebuffers,
+  terminal-body drains and buffered H3/gRPC bridges classify client
+  cancellation as `client_disconnect`, with HTTP `499` or gRPC `CANCELLED`,
+  without charging backend health. Malformed buffered H3 input stays a
+  distinct `400` / `INVALID_ARGUMENT`; read timeouts stay `408` /
+  `DEADLINE_EXCEEDED`. Native H3 mid-body stream resets surface as
+  `502` / `protocol_error`, or gRPC `UNAVAILABLE` with client-disconnect
+  accounting; dashboards must account for the changed 5xx mix.
+- **gRPC request-buffer exhaustion uses the trusted request flavor**
+  (issue #6022). Native gRPC, including Unix-socket and mesh-mTLS paths,
+  receives trailers-only `RESOURCE_EXHAUSTED`; gRPC-Web is converted once
+  by the actual built-in translator. Plain HTTP keeps `503`. The
+  `499` → `CANCELLED` mapping also covers HTTP/3 rejects and operator-defined
+  `499` responses from `request_termination` or `fault_injection` without
+  an explicit gRPC status.
+- **BREAKING — HTTP/2 WebSocket early data uses the wire `CONNECT` method**
+  (issue #6107). With `FERRUM_TLS_EARLY_DATA_METHODS` configured, allowing
+  `GET` alone now refuses Extended CONNECT early data with `425`. Route and
+  plugin policy still see `GET`; the unset default is unchanged. Allowing
+  `CONNECT` also admits HBONE CONNECT early data.
+
+### Performance and tooling
+
+- **Large config writes use paged deltas** (issue #6058). SQL and MongoDB
+  pollers page 10,000 changes at a time and fall back to a full reload only
+  beyond the 100,000-row retention. In the 9,600-proxy reload test, applying
+  3,000 changes improved from 2.1 s to 1.2 s; the average/worst-second
+  throughput dip fell from 6%/12% to 4%/5%. Fallbacks log their reason.
+- **Protocol benchmarks retain reproducible window and allocation inputs**
+  (issues #6022 / #6038 / #6054). A populated output directory is refused,
+  paired matrices retain exact provenance, and hosted lanes measure
+  allocation events and fixed HTTP/2 window sizes. The reset probe is
+  bounded by the configured receive window and a poll cap. These changes
+  make the measurements reproducible; they do not change production
+  HTTP/2 window or pool-affinity defaults.
 
 ### Documentation
 
-- WebSocket session log records on HTTP/2 and HTTP/3 carry the wire method
-  `CONNECT`; `docs/plugins.md` and `docs/http3.md` said `GET` (issue #6107).
-- `FERRUM_PER_IP_IPV6_PREFIX` notes that IPv4 clients behind NAT64/SIIT share
-  one IPv6 prefix budget, and `ferrum.conf` no longer describes a fixed `/64`
-  for the CONNECT-UDP per-client cap (issue #6107).
+- Error-classification guidance documents that a route-total expiry after
+  backend handoff is `backend_timeout`, including during TCP/TLS connection
+  establishment (#6073).
+- Adaptive HTTP/2 windows remain disabled by default. Concurrent large
+  bidirectional streams can deadlock with upstream adaptive mode (#6073);
+  raw-H2 HBONE tuning is separate.
+- HTTP/2 and HTTP/3 WebSocket session logs retain the wire method `CONNECT`.
+  NAT64/SIIT clients can share a `FERRUM_PER_IP_IPV6_PREFIX` quota group
+  (#6107).
+
 
 ## [0.9.15] - 2026-10-08
 
@@ -7720,7 +7826,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.16...HEAD
+[0.9.16]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.16
 [0.9.15]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.12...v0.9.13
