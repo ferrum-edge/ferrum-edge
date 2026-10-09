@@ -2935,7 +2935,7 @@ impl InboundConnectRelayRefusal {
 /// missing/portless or is not a destination this terminator owns per
 /// [`inbound_hbone_relay_destination_decision`] (byte-stream:
 /// [`inbound_hbone_stream_relay_destination_decision`]). The caller answers it through
-/// [`reject_inbound_connect_relay_synthesis`] (issue #5763): the documented
+/// [`reject_inbound_connect_relay_pre_plugin`] (issue #5763): the documented
 /// `403 hbone_relay_destination_denied`, `503 hbone_relay_not_ready` before the
 /// first mesh slice, or the unauthenticated-peer `403` for a peerless CONNECT.
 ///
@@ -2984,7 +2984,12 @@ fn build_inbound_hbone_relay_proxy(
         }
         SidecarIngressConnectRelay::HttpApplicationPort => {
             let denial = InboundRelayDenial::HttpApplicationPort;
-            warn_inbound_connect_to_http_application_port(host, port, accepted_local_ip);
+            warn_inbound_connect_to_http_application_port(
+                "ingress_remap",
+                host,
+                port,
+                accepted_local_ip,
+            );
             return Err(InboundConnectRelayRefusal::new(denial.as_str(), host, port));
         }
         SidecarIngressConnectRelay::Relay {
@@ -3010,7 +3015,12 @@ fn build_inbound_hbone_relay_proxy(
     };
     if let Err(denial) = decision {
         if denial == InboundRelayDenial::HttpApplicationPort {
-            warn_inbound_connect_to_http_application_port(host, port, accepted_local_ip);
+            warn_inbound_connect_to_http_application_port(
+                "relay_synthesis",
+                host,
+                port,
+                accepted_local_ip,
+            );
         }
         if is_udp_connect
             && let Some((dial_host, dial_port)) =
@@ -3048,14 +3058,18 @@ fn build_inbound_hbone_relay_proxy(
 /// An authenticated peer tunnelled to a port a Sidecar HTTP route serves
 /// (issue #6110): operator-visible (a peer is bypassing an HTTP route, or a
 /// client is misconfigured), but sampled because a peer can drive it at request
-/// rate. Transport facts only.
+/// rate. Transport facts only. `relay_phase` names the route-miss decision that
+/// refused it (`relay_synthesis` or `ingress_remap`); a CONNECT that matched an
+/// HTTP route warns `matched_route` at its own site.
 fn warn_inbound_connect_to_http_application_port(
+    relay_phase: &'static str,
     host: &str,
     port: u16,
     accepted_local_ip: Option<std::net::IpAddr>,
 ) {
     let denial = crate::modes::mesh::config::InboundRelayDenial::HttpApplicationPort.as_str();
     crate::warn_sampled!(
+        relay_phase = relay_phase,
         authority_host = host,
         authority_port = port,
         denial = denial,
@@ -3086,14 +3100,16 @@ pub(crate) fn inbound_connect_relay_synthesis_refusal_for_test(
     .map(|refusal| refusal.reason)
 }
 
-/// Answer a synthesis-time inbound CONNECT relay refusal (issue #5763).
+/// Answer an inbound CONNECT relay refusal decided before any plugin runs:
+/// a relay-synthesis refusal on a route miss (issue #5763), or a bare CONNECT
+/// that MATCHED a Sidecar HTTP route (issue #6110).
 ///
 /// No plugin chain has run yet, so the transaction line goes to the logging
-/// plugins the synthesized relay would have carried (the global chain).
+/// plugins a synthesized relay would have carried (the global chain).
 /// Nothing is dialed. See [`reject_inbound_connect_relay_synthesis_with_plugins`]
 /// for the terminal it answers with.
 #[allow(clippy::too_many_arguments)]
-async fn reject_inbound_connect_relay_synthesis(
+async fn reject_inbound_connect_relay_pre_plugin(
     state: &ProxyState,
     epoch: &RequestEpoch,
     ctx: &mut RequestContext,
@@ -33938,12 +33954,13 @@ async fn handle_proxy_request_inner(
         // operator-visible, but sampled because a peer can drive it at request
         // rate. Transport facts only.
         crate::warn_sampled!(
+            relay_phase = "matched_route",
             destination = ?refusal.destination,
             denial = refusal.reason,
             "Refused authenticated inbound CONNECT that matched a Sidecar HTTP route; HTTP \
              traffic to this route must be sent as HTTP so its plugin chain runs"
         );
-        let response = reject_inbound_connect_relay_synthesis(
+        let response = reject_inbound_connect_relay_pre_plugin(
             &state,
             &epoch,
             &mut ctx,
@@ -34076,7 +34093,7 @@ async fn handle_proxy_request_inner(
                     // before the first slice, or the unauthenticated-peer 403
                     // for a peerless CONNECT) and writes a transaction line,
                     // instead of masquerading as a route miss.
-                    let response = reject_inbound_connect_relay_synthesis(
+                    let response = reject_inbound_connect_relay_pre_plugin(
                         &state,
                         &epoch,
                         &mut ctx,
