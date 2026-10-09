@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Manual protocol and payload benchmarks keep their standalone harnesses on
   `release`, while the selected build profile applies to the gateway. Selecting
   `ci-release` or `max-perf` no longer asks harnesses for undefined profiles.
+  Protocol regression scenarios use the gateway’s required `run` subcommand.
 
 - Scheduled benchmark history selectors can run `--self-test` without live-run
   arguments; ordinary history queries still require the workflow and commit.
