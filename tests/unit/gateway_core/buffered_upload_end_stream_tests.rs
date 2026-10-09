@@ -255,7 +255,8 @@ async fn masked_h2_reset_read_in_the_collecting_poll_is_not_collected() {
         match tokio::time::timeout(WAIT, report).await {
             Ok(Ok(verdict)) => assert_eq!(verdict, Verdict::Refused, "{collector:?}"),
             // hyper dropped the service future on the reset: nothing collected.
-            Ok(Err(_)) | Err(_) => {}
+            Ok(Err(_)) => {}
+            Err(_) => panic!("{collector:?}: the reader neither refused nor was dropped in time"),
         }
     }
 }
