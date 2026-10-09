@@ -146,6 +146,13 @@ before updating operators, custom plugins, mesh charts or contract consumers.
 
 ### Performance and tooling
 
+- **Bounded request futures avoid redundant boxes** (#6022, PR #6157).
+  Hosted allocation measurements show about three fewer calls per H1/H2
+  request, two for reqwest and one for gRPC. gRPC requested allocation bytes
+  rise 3.8%; this is not a retained-memory or throughput claim. Native
+  streaming H3 has no measurable allocation change. The larger routing and
+  transport boundaries remain, and all concrete-state ceilings pass. See
+  [the allocation and stack evidence](tests/performance/multi_protocol/hot-box-measurements-2026-10-09.md).
 - **Large config writes use paged deltas** (issue #6058). SQL and MongoDB
   pollers page 10,000 changes at a time and fall back to a full reload only
   beyond the 100,000-row retention. In the 9,600-proxy reload test, applying
@@ -160,8 +167,13 @@ before updating operators, custom plugins, mesh charts or contract consumers.
   HTTP/2 window or pool-affinity defaults.
 - **Hosted HTTP/2 and gRPC CPU profiling** (#6148, PR #6152) records
   all-thread context switches and process user/system CPU, with separate
-  instrumented passes and controls before and after. Profiles remain
-  diagnostic evidence and do not enter the performance scoreboard.
+  instrumented passes and controls before and after. Profiling fixes prepare
+  Envoy before image inspection, retain the full symbolized executable and
+  decode concrete frames within the existing deadline (#6156 / #6158 / #6159).
+  [Four EPYC campaigns](tests/performance/multi_protocol/cpu-profile-measurements-2026-10-09.md)
+  retain usable Ferrum stacks and explicit control-drift/unwind limits; they
+  do not settle the Xeon-specific gap. Profiles remain diagnostic evidence
+  and do not enter the performance scoreboard.
 
 ### Documentation
 
