@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.16] - 2026-10-09
+## [0.9.17] - 2026-10-10
+
+This version carries forward the changes prepared for 0.9.16. That immutable tag
+was created on October 10, but both production ARM64 builds failed and no GitHub
+Release was published. The entries below describe the replacement candidate;
+0.9.17 publication still requires the protected release gates.
 
 This release fixes the published QUIC advisories affecting 0.9.15 and tightens admin, plugin, Kubernetes and
-credential boundaries. Read [Upgrading to 0.9.16](docs/upgrade_guide.md#upgrading-to-0916)
+credential boundaries. Read [Upgrading to 0.9.17](docs/upgrade_guide.md#upgrading-to-0917)
 before updating operators, custom plugins, mesh charts or contract consumers.
 
 ### Security
@@ -227,6 +232,15 @@ before updating operators, custom plugins, mesh charts or contract consumers.
   CPU sample verification accepts its `PERF_TYPE_SOFTWARE` annotation while
   retaining the numeric event type and all required sampling checks.
 
+### Release recovery
+
+- Restore only the protected ARM64 Cross producer to explicit Ubuntu 24.04,
+  the host used by the successful 0.9.15 producer. Preserve the sanitized
+  compiler invocation, fat LTO, codegen units, Cross pins, ABI checks, signing
+  and publication gates. Checksum-pinned host observations run before and
+  after compilation; unavailable telemetry remains explicit. This is a
+  controlled recovery candidate, not proof of the earlier SIGKILL cause.
+
 ### Documentation
 
 - Diagnostic lookup schemas include `loop_detected` in the gateway-error
@@ -243,6 +257,15 @@ before updating operators, custom plugins, mesh charts or contract consumers.
   NAT64/SIIT clients can share a `FERRUM_PER_IP_IPV6_PREFIX` quota group
   (#6107).
 
+
+## [0.9.16] - 2026-10-10 [TAGGED, NOT PUBLISHED]
+
+The immutable tag points to `4c81cb456f9723de42dbd7b0f09c3e3307d527d1`.
+Both attempts of [production run 38048021101](https://github.com/ferrum-edge/ferrum-edge/actions/runs/38048021101)
+failed with ARM64 fat-LTO SIGKILL/Cargo 101. OOM is unproven. Dependent
+publication skipped and both release gates failed closed; no GitHub Release
+was published. The tag remains unchanged. The planned changes are carried
+forward once under 0.9.17 above. See the [recovery record](docs/releases/v0.9.16-arm64-recovery.md).
 
 ## [0.9.15] - 2026-10-08
 
@@ -7902,7 +7925,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.16...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...HEAD
+[0.9.17]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.17
 [0.9.16]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.16
 [0.9.15]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.13...v0.9.14

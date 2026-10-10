@@ -347,7 +347,9 @@ jobs:
     name: Build (ferrum-edge-linux-aarch64)
     needs: validate-release-sha
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-26.04
+    # Recovery candidate: v0.9.15 succeeded on this explicit host image.
+    # The v0.9.16 Ubuntu 26.04 SIGKILL cause remains unproven.
+    runs-on: ubuntu-24.04
     # Issue #4674: 2.6x the 45m39s observed compile step, leaving room for the
     # image pull and sysroot preparation. Raise only when a successful run
     # exceeds it.
@@ -381,6 +383,12 @@ jobs:
             --ci-workflow .github/workflows/ci.yml \
             --release-workflow .github/workflows/release.yml
 
+      - name: Observe ARM64 release host before compilation
+        run: |
+          set -euo pipefail
+          echo '3600a33a21f4384c2855f7a527e7aedbefde616b4c5d8b42532f30d22aa6b810  .github/scripts/collect_release_build_resources.py' | sha256sum --check --strict -
+          python3 -I .github/scripts/collect_release_build_resources.py --phase before
+
       - name: Build release binary with a fixed empty Cross environment
         run: |
           set -euo pipefail
@@ -407,6 +415,13 @@ jobs:
               --features cloud-secrets \
               --release \
               --target aarch64-unknown-linux-gnu
+
+      - name: Observe ARM64 release host after compilation
+        if: always()
+        run: |
+          set -euo pipefail
+          echo '3600a33a21f4384c2855f7a527e7aedbefde616b4c5d8b42532f30d22aa6b810  .github/scripts/collect_release_build_resources.py' | sha256sum --check --strict -
+          python3 -I .github/scripts/collect_release_build_resources.py --phase after
 
       - name: Create release assets
         run: |

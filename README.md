@@ -598,14 +598,16 @@ at `6fb64c5dc2e014204c17609fc717d976f3b4589e`, published on
 `25b37395ff61bfea0f3ffd189d9011c4984fa755`. Earlier contract tags remain
 unchanged.
 
-Edge **v0.9.16** adds the `loop_detected` gateway-error token, the
+The **v0.9.17 candidate** carries the changes from tagged but unpublished
+v0.9.16. Its protected production release and matching Contracts publication
+must succeed before adoption. It adds the `loop_detected` gateway-error token, the
 `X-Ferrum-Hops` request header, and rejection phases for hop admission and
 cancelled uploads. Namespace-bounded admin tokens gain a tenant health tier
 and cannot read fleet-wide routes or `/metrics`. Admin cached-fallback misses
 return `503 CachedReadUnavailable`, and plugin trust follows registered types.
-The matching `contracts-edge-0.9.16` publication must be cut from the verified
+The matching `contracts-edge-0.9.17` publication must be cut from the verified
 Edge release before consumers update their pins. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0916).
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0917).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the

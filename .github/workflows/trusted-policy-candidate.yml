@@ -50,6 +50,9 @@ jobs:
           policy=.github/scripts/verify_cross_build_policy.py
           python3 -I "$policy" --self-test
 
+      - name: Exercise release-host observation failure paths
+        run: python3 -I .github/scripts/tests/test_release_build_resources.py
+
       # Read-only hosted evidence, never an admission or publication authority.
       - name: Verify protoc checksum before any extraction
         run: python3 -I .github/scripts/tests/test_cross_build_inputs.py
@@ -73,3 +76,21 @@ jobs:
         run: cargo build --locked --bin ferrum-edge --bin ferrum-cni
       - name: Start the native gateway
         run: cargo run --locked --bin ferrum-edge -- --version
+
+  release-host-resources:
+    name: Release host resources (${{ matrix.os }})
+    # Observations only: no compilation, credentials, artifacts or publication.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Observe the standard release host
+        run: python3 -I .github/scripts/collect_release_build_resources.py --phase qualification
