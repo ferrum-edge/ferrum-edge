@@ -19,7 +19,7 @@ Example value overlays live under [`examples/`](examples/).
 
 ## Container image tag
 
-The current `appVersion` is **0.9.16**. Until v0.9.16 is published and
+The current `appVersion` is **0.9.17**. Until v0.9.17 is published and
 verified, set `image.tag=0.9.15` to use the published release. The shared
 tag feeds mesh/control-plane, injector sidecar/capture-init and CNI/node-agent
 images; explicit node-agent or injector overrides must match the same release.

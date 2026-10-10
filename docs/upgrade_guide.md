@@ -26,9 +26,14 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Upgrading to 0.9.16
+## Upgrading to 0.9.17
 
-0.9.16 fixes the published QUIC advisories affecting 0.9.15 and includes
+This replacement candidate carries the changes prepared for 0.9.16. The
+0.9.16 tag exists, but its production ARM64 build failed twice and no release
+was published. Keep deployed pins on the published 0.9.15 build until 0.9.17
+and its matching Contracts publication are verified.
+
+0.9.17 fixes the published QUIC advisories affecting 0.9.15 and includes
 security and correctness changes that can refuse previously accepted
 configuration or traffic. CP/DP must run the same build. The ConfigSync
 revision remains `3`; the build-out database rules above still apply.
@@ -39,7 +44,7 @@ EndpointSlices (#6108, #6123), node-agent/CNI privileges (#6112, #6122),
 HTTP proxy cycles (#6109, #6128), gRPC-intended route policy (#6110), and
 HTTP/2 WebSocket early data (#6107). Review dashboards for the upload error
 changes (#6022), and treat cached admin `503` as unavailable rather than
-deleted (#6143). The matching `contracts-edge-0.9.16` release must be
+deleted (#6143). The matching `contracts-edge-0.9.17` release must be
 published before downstream contract pins move.
 
 ### Namespace-bounded admin tokens and Nexus metrics (#6091, #6095)
@@ -65,7 +70,7 @@ another namespace's name. Existing allowlisted-IP detailed health behavior
 is separate from JWT authorization.
 
 `/metrics` refuses a namespace-bounded JWT with `403` even if its source IP
-is on the metrics allowlist. Before Nexus adopts 0.9.16, set its
+is on the metrics allowlist. Before Nexus adopts 0.9.17, set its
 **`FERRUM_METRICS_BEARER_TOKEN`** to the separate Edge metrics bearer token.
 Otherwise the Usage card reports **unavailable (refused)**. Retain the
 namespace-bounded admin token for ordinary Nexus requests. Foundry and
