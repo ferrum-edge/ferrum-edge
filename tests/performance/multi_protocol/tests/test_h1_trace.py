@@ -840,7 +840,8 @@ class H1DSOAcquisitionTests(unittest.TestCase):
         return dict(returncode=0, forced=False, incomplete=None)
 
     def acquire(self, **kwargs):
-        budget = kwargs.pop('budget', dict(remaining=512 * 1024**2, package_remaining=512 * 1024**2))
+        budget = kwargs.pop('budget', dict(remaining=trace.ELF_PACKAGE_BYTES,
+                                          package_remaining=trace.ELF_PACKAGE_BYTES))
         with trace.directory_fd(self.root) as root, trace.directory_fd(self.destination) as target:
             return trace.retain_mapped_elf(root, target, self.mapping, budget,
                                            kwargs.pop('deadline', trace.time.monotonic() + 30))
@@ -854,6 +855,41 @@ class H1DSOAcquisitionTests(unittest.TestCase):
             self.assertEqual(result['bytes'], len(self.payload))
             self.assertTrue(result['eh_frame'])
             self.assertEqual((self.destination / 'usr/lib/libfixture.so').read_bytes(), self.payload)
+
+    def test_production_symbolized_size_reaches_bounded_copy(self):
+        # Hosted H2/gRPC captures produced this 658 MiB ELF. A sparse file
+        # exercises size admission without reading or allocating that payload.
+        with self.source.open('r+b') as stream:
+            stream.truncate(689819544)
+        original_read = os.read
+        def stop_at_copy(fd, size):
+            if size == 65536:
+                raise OSError('admitted the production-sized ELF')
+            return original_read(fd, size)
+        info = self.source.stat()
+        maps = (f'1-2 r-xp 00000000 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} '
+                f'{info.st_ino} {self.source}\n')
+        with patch.object(trace, 'read_metadata', return_value=dict(text=maps)), \
+                patch.object(trace.os, 'read', side_effect=stop_at_copy):
+            result = trace.retain_dsos(os.getpid(), self.destination)
+        self.assertFalse(result['complete'])
+        self.assertTrue(any('admitted the production-sized ELF' in error for error in result['errors']))
+        retained = self.destination / self.source.relative_to('/')
+        self.assertEqual(retained.stat().st_size, 0)
+        self.command.assert_not_called()
+
+    def test_oversize_elf_and_missing_metadata_reservation_remain_refused(self):
+        with self.source.open('r+b') as stream:
+            stream.truncate(trace.ELF_PACKAGE_BYTES + 1)
+        with self.assertRaisesRegex(ValueError, 'cap/size'):
+            self.acquire()
+        self.assertFalse((self.destination / 'usr').exists())
+        self.source.write_bytes(self.payload)
+        with self.assertRaisesRegex(ValueError, 'reservation cap'):
+            self.acquire(budget=dict(remaining=trace.ELF_PACKAGE_BYTES,
+                                     package_remaining=len(self.payload)))
+        self.assertEqual((self.destination / 'usr/lib/libfixture.so').stat().st_size, 0)
+        self.command.assert_not_called()
 
     def test_symbolized_production_elf_is_retained_and_reused_with_a_fixed_ceiling(self):
         # A sparse mapped ELF reproduces the hosted >512 MiB size without a

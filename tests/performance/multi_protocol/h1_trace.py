@@ -26,7 +26,7 @@ import time
 
 from process_usage import capture, parse_stat
 from transport_diagnostics import parse_diag
-from h1_trace_contract import (BOUNDS, LOSSES, SYSCALLS, COUNTERS, validate_record,
+from h1_trace_contract import (BOUNDS, ELF_PACKAGE_BYTES, LOSSES, SYSCALLS, COUNTERS, validate_record,
                                syscall_coverage, fd_lifetimes, decode_cpu, clock_receipt_window)
 # The shared hosted artifact scrubber's sibling import is scoped explicitly.
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'h3_proof'))
@@ -753,7 +753,6 @@ def retain_dsos(pid, destination):
     """Bounded mapped ELF diagnostics; unsupported mappings never use host libc."""
     # H1 and H2 use symbolized production binaries, measured at about 661 MiB
     # on Ubuntu 26.04. Their shared package remains bounded across repeats.
-    package_limit = 1024**3
     if '..' in Path(destination).parts:
         raise ValueError('unsafe DSO destination traversal')
     raw = read_metadata(f'/proc/{pid}/maps')
@@ -776,7 +775,7 @@ def retain_dsos(pid, destination):
             errors.append(str(error))
     if len(mappings) > 128:
         return dict(complete=False, issue='DSO count bound', mappings=raw)
-    budget = dict(remaining=package_limit, package_remaining=package_limit)
+    budget = dict(remaining=ELF_PACKAGE_BYTES, package_remaining=ELF_PACKAGE_BYTES)
     deadline = time.monotonic() + 30
     # This one proc magic link is the admitted process's root. Subsequent source
     # and ALL destination components are descriptor-relative and no-follow.
@@ -815,9 +814,9 @@ def retain_dsos(pid, destination):
         if root is not None:
             os.close(root)
     return dict(complete=not errors, errors=errors, mappings=raw, dsos=records,
-                package_limit_bytes=package_limit,
-                acquired_elf_bytes=package_limit - budget['remaining'],
-                retained_package_bytes=package_limit - budget['package_remaining'],
+                package_limit_bytes=ELF_PACKAGE_BYTES,
+                acquired_elf_bytes=ELF_PACKAGE_BYTES - budget['remaining'],
+                retained_package_bytes=ELF_PACKAGE_BYTES - budget['package_remaining'],
                 package_bytes_basis='existing files plus acquired bytes plus conservative decoder output reservations',
                 source='pinned target-root mapped device/inode; symlinks unsupported; never host libc substitution')
 

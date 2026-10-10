@@ -24,6 +24,10 @@ BOUNDS = dict(observer_rss_and_map_bytes=32 * 1024**2, map_reservation_bytes=8 *
               total_artifact_bytes=128 * 1024**2, aggregate_rows=8192, pending=512,
               vectors=16, witnesses=4096, lifecycle_rows=8192, metadata_snapshots=64,
               fd_rows_per_snapshot=2048, threads=512)
+# Shared across repeat captures, separately from the raw trace-artifact bound.
+# Production-profile binaries with line tables exceed 512 MiB. Keep both
+# acquisition and evidence reads bounded while retaining its actual mapped ELF.
+ELF_PACKAGE_BYTES = 1024 * 1024**2
 
 
 def natural(value):
@@ -581,7 +585,7 @@ def load_trace(path, *, expected=None):
         require(capability['runner']['GITHUB_SHA'] == expected['revision'], 'source revision mismatch')
         matching = claim['matching_elf']
         require(matching in ('off/ferrum-edge', 'on/ferrum-edge'), 'unknown retained release twin')
-        elf, _ = retained_file(expected['builds'], matching, limit=512 * 1024**2)
+        elf, _ = retained_file(expected['builds'], matching, limit=ELF_PACKAGE_BYTES)
         require(elf['sha256'] == owner['executable_sha256'], 'retained gateway ELF mismatch')
         if mode == 'syscalls':
             raw = retained_file(path.parent, 'syscalls.jsonl', keep=True)[1]
@@ -653,7 +657,7 @@ def load_trace(path, *, expected=None):
                         and isinstance(dso.get('build_id_lines'), list)
                         and all(isinstance(line, str) for line in dso['build_id_lines']), 'invalid mapped DSO identity')
                 actual, _ = retained_file(expected['builds'], str(Path(matching).parent / 'symfs') + dso['path'],
-                                          limit=512 * 1024**2)
+                                          limit=ELF_PACKAGE_BYTES)
                 require(actual == {k: dso[k] for k in ('sha256', 'bytes')}, 'DSO artifact mismatch')
                 metadata = dso['metadata_path']
                 require(isinstance(metadata, str) and metadata.startswith('/')
