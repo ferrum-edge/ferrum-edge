@@ -4729,7 +4729,7 @@ const H3_REQUEST_FIN_ENTRY_POINTS: [(&str, &str, &str, &str, &str); 5] = [
     (
         "pooled buffered request",
         "async fn do_request(",
-        "fn boxed_do_request_streaming<'a>(",
+        "fn construct_streaming_request<'a>(",
         H3_BUFFERED_UPLOAD_FIN,
         "upload.completed=true;drop(upload);",
     ),

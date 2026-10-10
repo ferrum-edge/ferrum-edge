@@ -15265,7 +15265,7 @@ async fn handle_connection(
             diagnostic_slot: None,
         };
         async move {
-            let request = boxed_handle_proxy_request_on_frontend_port(
+            let request = construct_frontend_proxy_request(
                 req,
                 state,
                 addr,
@@ -24274,7 +24274,7 @@ async fn handle_tls_connection(
             diagnostic_slot: None,
         };
         async move {
-            let request = boxed_handle_proxy_request_on_frontend_port(
+            let request = construct_frontend_proxy_request(
                 req,
                 state,
                 addr,
@@ -32827,7 +32827,7 @@ pub async fn handle_proxy_request(
     let peer_spiffe_extraction_cache = tls_client_cert_der.as_ref().map(|_| {
         Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
     });
-    boxed_handle_proxy_request_on_frontend_port(
+    construct_frontend_proxy_request(
         req,
         Arc::new(state),
         remote_addr,
@@ -32844,6 +32844,14 @@ pub async fn handle_proxy_request(
     .await
 }
 
+/// Construct a bounded child future in a separate synchronous frame without
+/// allocating. The caller keeps the child inline, in the same task and task
+/// locals; dropping it still releases its existing cancellation guards.
+#[inline(never)]
+fn construct_proxy_future<F: std::future::Future>(construct: impl FnOnce() -> F) -> F {
+    construct()
+}
+
 /// Construct and box a concrete child future in a separate synchronous frame.
 /// The closure captures arguments, but does not await or store the child. In
 /// particular, an async trampoline would still include its awaited child in
@@ -32858,12 +32866,12 @@ where
     Box::pin(construct())
 }
 
-/// Box the concrete frontend future before the affinity task-local scopes.
-/// The factory constructs it out of line, and the routing handler separately
-/// boxes its dispatch children so they do not enlarge its own poll frame.
+/// Construct the bounded frontend future before the affinity task-local scopes.
+/// The larger routing handler remains boxed; its state and the concrete backend
+/// dispatch state have separate regression budgets.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn boxed_handle_proxy_request_on_frontend_port(
+fn construct_frontend_proxy_request(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
     remote_addr: SocketAddr,
@@ -32873,7 +32881,7 @@ fn boxed_handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
-    Box::pin(handle_proxy_request_on_frontend_port(
+    handle_proxy_request_on_frontend_port(
         req,
         state,
         remote_addr,
@@ -32882,7 +32890,7 @@ fn boxed_handle_proxy_request_on_frontend_port(
         tls_client_cert_chain_der,
         mtls_auth_connection_cache,
         connection_metadata,
-    ))
+    )
 }
 
 /// Compiled coroutine sizes for external stack regressions. The type probes
@@ -32910,12 +32918,12 @@ pub mod request_stack_test_support {
         std::mem::size_of::<F>()
     }
 
-    /// Boxed frontend, concrete frontend, concrete routing handler, and
+    /// Frontend boundary, concrete frontend, concrete routing handler, and
     /// concrete backend attempt sizes, including their awaited child state.
     pub fn future_sizes() -> [usize; 4] {
         [
             request_size(|req, state| {
-                boxed_handle_proxy_request_on_frontend_port(
+                construct_frontend_proxy_request(
                     req,
                     state,
                     SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -33328,8 +33336,8 @@ async fn admit_proxy_request_on_frontend_port(
 
 /// Construct the routing future out of line and return only its pointer to
 /// admission and Hyper. The caller retains the request guard and transfers it
-/// to the response body. Backend and native gRPC dispatch futures are boxed
-/// separately: boxing this handler alone does not reduce its poll temporaries.
+/// to the response body. Large dispatch children remain boxed separately;
+/// bounded direct HTTP children stay inline under the backend state budget.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_handle_proxy_request_inner(
@@ -41646,7 +41654,7 @@ async fn handle_proxy_request_inner(
                 &mut route_attempt_deadline,
             ),
             initial_attempt_span.trace(),
-            boxed_proxy_future(|| {
+            construct_proxy_future(|| {
                 proxy_to_backend(
                     &state,
                     &proxy,
@@ -42488,9 +42496,9 @@ async fn handle_proxy_request_inner(
             owned_proxy_headers_ref.unwrap_or(&ctx.headers),
         );
         dispatch_attempt_span.handoff_reported_by_dispatch();
-        // Construct the attempt behind a pointer before the deadline wrapper.
-        // Its transport variants also box their large child futures, bounding
-        // both this handler's state and the backend attempt's poll temporaries.
+        // Construct the bounded attempt out of line before the deadline wrapper.
+        // Larger transport children retain their separate boxing boundaries;
+        // the state-budget tests cover this handler and the concrete attempt.
         let dispatch_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
@@ -42499,7 +42507,7 @@ async fn handle_proxy_request_inner(
                 &mut route_attempt_deadline,
             ),
             dispatch_attempt_span.trace(),
-            boxed_proxy_future(|| {
+            construct_proxy_future(|| {
                 proxy_to_backend(
                     &state,
                     &proxy,
@@ -49211,7 +49219,7 @@ async fn proxy_to_backend(
                     }
                 };
                 let mut passthrough_request_bytes = None;
-                let (backend_resp, request_body_exceeded) = boxed_proxy_future(|| {
+                let (backend_resp, request_body_exceeded) = construct_proxy_future(|| {
                     proxy_to_backend_http2(
                         state,
                         direct_h2_proxy,
@@ -49348,7 +49356,7 @@ async fn proxy_to_backend(
             request_body_prepared,
         )
     {
-        return boxed_proxy_future(|| {
+        return construct_proxy_future(|| {
             proxy_to_backend_direct_h1(
                 state,
                 proxy,

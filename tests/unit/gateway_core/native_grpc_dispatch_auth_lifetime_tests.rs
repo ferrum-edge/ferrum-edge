@@ -2249,7 +2249,7 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
         ),
         (
             "async fn create_connection_to_target(",
-            "fn boxed_do_request<'a>(",
+            "fn construct_request<'a>(",
         ),
     ] {
         let constructor = source_region(client, start, end);
@@ -2319,7 +2319,7 @@ fn the_h3_cold_connect_source_guard_rejects_candidate_scope_and_completion_bypas
         ),
         (
             "async fn create_connection_to_target(",
-            "fn boxed_do_request<'a>(",
+            "fn construct_request<'a>(",
         ),
     ] {
         let constructor = compact_code(source_region(client, start, end));
