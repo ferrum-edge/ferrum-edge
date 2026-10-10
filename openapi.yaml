@@ -40319,6 +40319,7 @@ components:
             - config_stale
             - concurrency_limit
             - request_timeout
+            - loop_detected
             - null
           description: |
             The public `X-Gateway-Error` token of that response, or `null` for
@@ -40368,6 +40369,7 @@ components:
             - concurrency_limit
             - overload
             - config_stale
+            - loop_detected
             - null
           description: Gateway rejection phase, when the gateway refused the request itself.
         route_timeout_phase:

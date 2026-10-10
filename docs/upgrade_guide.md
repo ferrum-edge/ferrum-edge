@@ -26,7 +26,324 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased changes after 0.9.15
+## Upgrading to 0.9.16
+
+0.9.16 fixes the published QUIC advisories affecting 0.9.15 and includes
+security and correctness changes that can refuse previously accepted
+configuration or traffic. CP/DP must run the same build. The ConfigSync
+revision remains `3`; the build-out database rules above still apply.
+
+Before rollout, review namespace-bounded admin clients (#6095), custom plugin
+name collisions (#6022), AWS endpoint overrides (#6111), Gateway API and mesh
+EndpointSlices (#6108, #6123), node-agent/CNI privileges (#6112, #6122),
+HTTP proxy cycles (#6109, #6128), gRPC-intended route policy (#6110), and
+HTTP/2 WebSocket early data (#6107). Review dashboards for the upload error
+changes (#6022), and treat cached admin `503` as unavailable rather than
+deleted (#6143). The matching `contracts-edge-0.9.16` release must be
+published before downstream contract pins move.
+
+### Namespace-bounded admin tokens and Nexus metrics (#6091, #6095)
+
+An admin JWT carrying an `ns` claim is now namespace-bounded even when
+`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`. That flag controls whether
+namespace claims are required; it no longer disables a claim that is present.
+The requested namespace, including the default `ferrum` when the header is
+absent, must be covered by the token. Namespace listings are filtered.
+
+Namespace routes include configuration resources, `/plugins`, `/diagnostics`,
+`/deployment-snapshot` and namespace-scoped probes. Fleet routes such as
+cluster/process operations and global exports refuse bounded tokens, and
+unclassified routes fail closed. Use an appropriate claimless fleet credential
+for global operations. A fleet token does not replace the namespace claim
+required by a namespace route when claim enforcement is enabled.
+
+Bounded JWTs and viewer-ceiling credentials receive a tenant health/status
+shape: `status`, `ready`, `mode`, `admin_writes_enabled` and `namespace`.
+The namespace block is always present. Its `active` is `null` when the served
+namespace is outside the credential's claim or ceiling; it never reveals
+another namespace's name. Existing allowlisted-IP detailed health behavior
+is separate from JWT authorization.
+
+`/metrics` refuses a namespace-bounded JWT with `403` even if its source IP
+is on the metrics allowlist. Before Nexus adopts 0.9.16, set its
+**`FERRUM_METRICS_BEARER_TOKEN`** to the separate Edge metrics bearer token.
+Otherwise the Usage card reports **unavailable (refused)**. Retain the
+namespace-bounded admin token for ordinary Nexus requests. Foundry and
+GitForgeOps must use their coordinated namespace-aware client updates too.
+
+### Custom plugins and stored compositions (#6022)
+
+Trust follows the concrete type registered by the built-in factory, including
+the cache's own wrappers. A custom plugin's reported built-in name no longer
+substitutes for a built-in global policy or acquires its exemptions. Global
+built-ins compose with scoped built-ins even when a custom same-named plugin
+is present. Scoped custom request-size plugins still replace a same-named
+global custom instance; they cannot hide the real built-in limit.
+
+Review chains whose custom plugins report built-in names, especially around
+admission, body limits, compression, caching, gRPC-Web and mesh authorization.
+A managed mesh listener's `mesh_authz` readiness requires the actual built-in
+enforcer. gRPC-Web method-router/deadline admission and response translation
+likewise recognize the registered built-ins only.
+
+**An upgrade is a restart.** In database mode, an invalid stored composition
+can prevent the new process from starting. Reload retention of a last-good
+configuration does not rescue that startup. Validate file-mode configuration
+with `ferrum-edge validate`. In database mode that command checks only the
+backup file; exercise the admin API dry-run or a staging node against a copy
+of the stored configuration before replacing the serving process. Invalid
+admin writes return `400`; a later rejected reload retains the existing
+running configuration.
+
+### Process AWS credentials and endpoint overrides (#6111)
+
+When `serverless_function` (`aws_lambda`) or `ai_federation` (`aws_bedrock`)
+obtains an access-key id or secret from the process environment, it admits
+only a lowercase supported commercial, GovCloud or China region and that
+service's regional HTTPS endpoint on the default port. Supported forms
+include standard, FIPS, dual-stack and interface VPC endpoints. The China
+Bedrock default now derives `bedrock-runtime.<region>.amazonaws.com.cn`.
+See [Ambient AWS credential scope](plugins.md#ambient-aws-credential-scope)
+for the exact endpoint grammar.
+
+Review rows using LocalStack, mock/proxy endpoints, malformed regions, ISO
+partitions or the European Sovereign Cloud with environment credentials.
+Use an admitted AWS endpoint, provide the row's own complete credentials,
+or deliberately set `allow_custom_endpoint_with_ambient_credentials: true`
+(top-level in `serverless_function`, per provider in `ai_federation`). The
+opt-in lets that config writer redirect the gateway's ambient credentials;
+restrict who may write it.
+
+`AWS_SESSION_TOKEN` is paired only with an environment-derived key pair.
+Put `aws_session_token` beside a config-provided key pair when needed.
+An operator-set `AWS_LAMBDA_ENDPOINT_URL` remains trusted when the row does
+not override `aws_endpoint_url`; the region is still screened.
+
+Admin/file validation rejects inadmissible configurations, and stored invalid
+rows can be quarantined. Runtime revalidation happens before signing:
+`serverless_function` fails closed with `500` /
+`ambient_credential_endpoint_refused` regardless of `on_error`; AI federation
+refuses the provider before sending credentials.
+
+### Gateway API Service EndpointSlices (#6108)
+
+For a non-ExternalName Service in the observed Pod scope, every dialable
+endpoint in every slice labelled `kubernetes.io/service-name` must belong
+to an observed Pod in the Service's namespace and not another namespace's
+Pod. This includes additional slices attached to a selector-backed Service
+and slices carrying both ordinary Service and MCS labels. For a
+selector-backed Service, a same-namespace Pod `targetRef` whose own status
+reports the IP also supports host-network DaemonSets.
+
+An endpoint explicitly reporting both `ready: false` and `serving: false`
+is ignored. A departed Pod's IP remains attributed for 60 seconds after the
+first reconcile that no longer observes it, with a newly observed Pod taking
+precedence. With a cluster-wide watch (`FERRUM_CP_NAMESPACES="*"` and
+`FERRUM_K8S_WATCH_NAMESPACES` unset), that remembered claim can vouch for
+any endpoint. With a restricted watch, it can vouch only for an endpoint
+marked `terminating: true` and explicitly `ready: false`; a ready endpoint
+at a departed Pod's IP is refused until an observed Pod claims it.
+
+HTTPRoute/GRPCRoute refuse the affected backend's traffic; TCPRoute,
+TLSRoute and UDPRoute refuse the route. Status reports
+`ResolvedRefs=False` / `RefNotPermitted`, with a translation warning.
+Before upgrading:
+
+- Keep Pod discovery enabled and cover the Services' namespaces. With
+  `FERRUM_K8S_POD_DISCOVERY_ENABLED=false` or a Service outside the Pod watch
+  scope, selector-less backends are unverifiable and refused; selector-backed
+  Services are admitted with an explicit warning that attached slices cannot
+  be checked.
+- For a same-namespace selector-less Service fronting an external database
+  or VM, set `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS=true` only
+  when intended. Also enable `FERRUM_K8S_NODE_LOCALITY_ENABLED=true`, grant
+  cluster-scoped Node list/watch (`controlPlane.rbac.nodeLocality: true` in
+  the chart), and ensure at least one Node is observed. Endpoints claimed by
+  an observed Pod, Service ClusterIP, Node address or Pod CIDR are excluded.
+  A cross-namespace ReferenceGrant does not enable this opt-in.
+- Review selector-backed Services fed by KubeVirt, Multus or other secondary
+  address writers. Addresses absent from Pod status are refused. Move an
+  intended external backend to a selector-less Service and evaluate the
+  preceding opt-in; it never applies to selector-backed Services.
+- Move a backendRef to the Service in the owning Pods' namespace, with a
+  ReferenceGrant when appropriate. EndpointSlice write permission does not
+  grant permission to bypass namespace ownership.
+
+FQDN/unparseable, loopback, link-local, unspecified, multicast, broadcast and
+cloud-metadata addresses are always refused, including `169.254.169.254`,
+`fd00:ec2::254`, `100.100.100.200` and `168.63.129.16`, and their NAT64 or
+IPv4-compatible representations. A Pod reporting such an address does not
+make it a permitted backend.
+
+### Mesh Pod targets and ServiceImport endpoints (#6123)
+
+A Pod `targetRef` must name a Pod in the same namespace whose own status
+reports the endpoint IP, with no other namespace's non-host-network Pod
+claiming it. A missing targetRef can use only uniquely attributable,
+non-host-network Pod IPs. Host-network endpoints need a checked targetRef.
+Normalized IP spellings are equivalent; secondary addresses absent from
+Pod status are dropped with a warning. Model non-Pod workloads with the
+supported WorkloadEntry mechanism instead of a misleading Pod reference.
+
+ServiceImport slices must have the expected controller provenance and an
+observed import within the Pod watch scope. FQDNs, other-namespace Pod
+addresses and local infrastructure are refused. Service ClusterIPs require
+checked attribution to the same exported Service. Enable Node inventory and
+RBAC plus a cluster-wide Pod watch to make the full local-address check
+possible; incomplete inventory produces an unchecked warning.
+
+The managed-by label records provenance; it is not authentication. Keep
+EndpointSlice/ServiceImport writes and ReferenceGrants under trusted RBAC.
+Remote endpoints still rely on that controller trust. When no endpoints
+are admitted, discovery uses its clusterset-DNS fallback; a headless
+Service's port must match the Pod container port.
+
+### Backend TLS refusal and reload (#6105)
+
+Invalid backend TLS material now refuses dispatch across all pooled/direct
+HTTP, gRPC, H3 and WSS paths even when `FERRUM_TLS_NO_VERIFY=true`. Repair
+the referenced CA, certificate or key instead of relying on the no-verify
+setting to bypass an invalid-material marker. Reload refuses only affected
+destinations and drains their old pools.
+
+For TCP TLS, an invalid in-place rotation may retain a running listener only
+when its source references, routing and CRL inputs are unchanged; the reason
+is `backend_tls_rotation_invalid`. Changed CRL inputs require stopping it
+with `backend_tls_invalid`. A failure to load the whole CRL file aborts the
+reload, preserving the previous global configuration.
+
+### Node-agent and CNI privileges (#6112, #6122, #6126)
+
+The node agent no longer needs `hostPID`. NodeWaypoint capture drops
+`SYS_ADMIN` by default; an explicitly set `dropCapSysAdmin: false` preserves
+the older-kernel exception (for example Linux 5.7). Missing/null values mean
+drop. The separate Ambient/NodeWaypoint proxy privilege requirements do not
+change. Current capture needs `PERFMON` and a runtime seccomp profile that
+permits its BPF operations; older runtimes may need the documented Localhost
+seccomp profile.
+
+The CNI installer still runs as uid 0, with `capabilities.drop: [ALL]`,
+`allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true` and
+`privileged: false`. The rollback sidecar explicitly sets `privileged: false`
+too. Make `nodeAgent.cni.hostBinDir`, `hostConfDir` and `hostSocketDir`
+root-owned with owner read/write/search access, and scanned config files
+root-owned/readable (mode `0600` is sufficient) or world-readable. Without
+DAC override capabilities, root is subject to these ordinary permissions.
+
+The upgrade first removes the release's old chained conflist. A subsequent
+permission failure leaves the node unchained and the node-agent in Init
+error until ownership/access is repaired. Copy the security contexts into
+hand-maintained manifests. CNI staging now sets file modes through the open
+file descriptor before rename, preserving the intended protection against
+path substitution.
+
+### Proxy hop budgets and plugin egress (#6109, #6128)
+
+HTTP-family requests propagate gateway-owned `X-Ferrum-Hops`. The default
+maximum is `10`, configurable with `FERRUM_MAX_PROXY_HOPS` (`0` disables,
+range `0`–`255`). Each outbound HTTP proxy hop sends received count plus
+one. Plugins cannot strip or replace it. A malformed or repeated client
+field returns `400` without an `X-Gateway-Error` token (gRPC
+`INVALID_ARGUMENT`); the limit returns `508` / `loop_detected` (gRPC
+`FAILED_PRECONDITION`). Admission occurs before gRPC-Web translation, so
+that frontend can receive an ordinary HTTP error here.
+
+Check intentional chains longer than ten hops and update dashboards for
+`loop_detected`, `proxy_hop_limit` and `proxy_hops_invalid`. Frontend hop
+admission uses status counters and bounded warnings; it does not create a
+normal transaction-summary/request-error row. A preceding gateway relaying
+the refusal can report its usual backend-error outcome. A backend `508`
+is never retried.
+
+Request-scoped plugin HTTP calls and mirrors inherit hop context, including
+calls that could re-enter a gateway. Their configured header maps cannot
+override it. Background exporters and credential refresh jobs have no
+request context and do not carry this header; do not configure them into
+self-loops. Stream protocols carry no HTTP hop header. Mesh delivery to
+a local workload does not add a proxy hop, but listener-cycle endpoints
+are refused rather than used as a loop escape.
+
+### gRPC-intended routes, CORS and Sidecar CONNECT (#6110)
+
+A route-scoped `grpc_method_router` or custom gRPC-only admission plugin
+makes the plain HTTP/WebSocket view refuse with `403` /
+`route_protocol_admission`. A global method router alone does not restrict
+plain HTTP (it emits the existing warning). gRPC-Web can run the registered
+built-in method-router/deadline policy, but refuses other native gRPC
+admission it cannot enforce.
+
+For browser preflight, use a CORS plugin that actually answers locally.
+The exemption requires a bodiless request and transport END_STREAM proof;
+H3 waits no more than two seconds or the shorter backend read timeout.
+An unmatched or forwarding preflight is still refused and never sent to
+the backend. Bare Sidecar CONNECT to a port governed by an HTTP application
+route is refused with `403` / `http_application_port`, including after a
+live reload. When stream and HTTP port declarations overlap, HTTP policy
+wins. Other stream ports, CONNECT-UDP and Ambient/Waypoint behavior retain
+their separate admission rules.
+
+### Upload completion and error accounting (#6022)
+
+Sending trailers no longer proves that a request stream ended. H2/H3
+buffered collection waits for the real END_STREAM/FIN, including when
+transport wrappers mask a `NO_ERROR` reset. A reset after trailers cannot
+deliver a complete backend request. On the streamed H3-to-HTTP bridge,
+HTTP/1 backends see the connection close without its terminal chunk and
+HTTP/2 backends see a reset. This holds with or without a client
+Content-Length. The one clean early end is an intentional halt after a
+valid early backend response.
+
+The native H3 path reports an upload stream reset as `502` with
+`protocol_error`; an idle connection timeout uses `connection_timeout`.
+Native H3 gRPC streaming and the streaming gRPC bridge use `UNAVAILABLE`
+with client-disconnect accounting. These client faults do not charge backend
+health, breakers or H3 capability. Alerts can see more `5xx`/`UNAVAILABLE`
+and fewer of the previous `400`/`INVALID_ARGUMENT` responses. Undecodable
+trailers or illegal frames after trailers are recorded as client disconnects
+on the plain streamed bridge; a buffered H3 drain can instead raise an H3
+connection error and close the whole connection.
+
+Early H1/H2 prebuffers, terminal-body drains and buffered H3/gRPC bridges
+finalize cancelled uploads exactly once, run cleanup/committed hooks, and
+record `client_disconnect` with `499` or gRPC `CANCELLED`. Malformed input
+remains distinct from a real cancellation. New rejection phases identify
+the relevant prebuffer, terminal-body or buffered bridge stage. Consumers
+must accept the updated diagnostic-ref vocabulary.
+
+Native gRPC request-buffer capacity failures use trailers-only
+`RESOURCE_EXHAUSTED` across ordinary, Unix-socket and mesh-mTLS paths.
+The built-in gRPC-Web translator converts once; plain HTTP keeps `503`.
+The `499` → `CANCELLED` conversion also applies to HTTP/3 rejects and
+operator-configured `499` responses from `request_termination` and
+`fault_injection` when no explicit gRPC status is supplied.
+
+A client delaying FIN after trailers can now hold the backend body open
+until FIN or the configured header/route deadline. Keep finite upload and
+response bounds. Backend timeout accounting is retained even if the client
+closes before the gateway can deliver its 504.
+
+### Cached admin misses and other operational changes (#6143, #6106, #6073)
+
+When a database read fails and the fallback cache lacks a by-id resource,
+the admin API returns `503 CachedReadUnavailable` with
+`X-Data-Source: cached`. Retry or show unavailable; never delete local
+state based on this response. A confirmed authoritative `404` still proves
+absence. Cached hits/lists and file-mode `404` behavior are unchanged.
+Nexus's confirmed-absence logic already treats non-404 errors as unavailable.
+
+Expired replay entries consume the current principal's quota on re-admission,
+and SOAP nonce refreshes honor lowered live caps. Size these limits for
+the admitted concurrency; a full store refuses new claims without evicting
+live protection.
+
+Keep `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false` unless the workload requires
+otherwise: concurrent large bidirectional transfers can deadlock upstream
+adaptive mode. HBONE uses a separate raw-H2 window policy. h2 0.4.20 also
+counts refused streams toward the local-reset limit (default `256`), so
+clients repeatedly exceeding concurrency limits can receive
+`GOAWAY(ENHANCE_YOUR_CALM)`. Route-total expiry after backend handoff is
+`backend_timeout`, including during TCP/TLS establishment.
+
 
 ### HTTP/2 WebSocket early data is gated on `CONNECT` (issue [#6107](https://github.com/ferrum-edge/ferrum-edge/issues/6107))
 
@@ -44,8 +361,9 @@ said `GET` was wrong and has been corrected.
 
 ## Upgrading to 0.9.15
 
-0.9.15 (2026-10-08 UTC) is cut from main
-`b4f3b39863c4aeb1e32431cdc0d8b983d9ac1c07`. All previously released breaking
+0.9.15 was published on 2026-10-08 UTC at release merge
+`25b37395ff61bfea0f3ffd189d9011c4984fa755`, whose reviewed second parent is
+`ba667a64c9bf1a3289d49f98e5fb205f5c42d3a3`. All previously released breaking
 identifiers and guidance below remain applicable. CP/DP must run the same
 build; the ConfigSync protocol revision stays `3`. 0.9.15 adds no core schema
 change; a changed baseline in any later release still requires a fresh

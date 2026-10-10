@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-edge"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "ahash",
  "anyhow",

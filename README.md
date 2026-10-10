@@ -591,29 +591,21 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The latest tag is
-[`contracts-edge-0.9.14`](https://github.com/ferrum-edge/ferrum-contracts/tree/ddbdd845733b7046c4393ac951011dafb774db33)
-at `ddbdd845733b7046c4393ac951011dafb774db33`, prepared against Edge
-**v0.9.14**, published at 2026-10-07T08:59:56Z at release merge
-`9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d` (see the
-[v0.9.14 release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.14)).
-The earlier
-[`contracts-edge-0.9.13`](https://github.com/ferrum-edge/ferrum-contracts/tree/9626821eb089c71f5d4d71268c7b8276a8a5ab50)
-tag at `9626821eb089c71f5d4d71268c7b8276a8a5ab50` remains unchanged.
+Edge source. The latest published tag is
+[`contracts-edge-0.9.15`](https://github.com/ferrum-edge/ferrum-contracts/tree/6fb64c5dc2e014204c17609fc717d976f3b4589e)
+at `6fb64c5dc2e014204c17609fc717d976f3b4589e`, published on
+2026-10-08 for Edge **v0.9.15** at release merge
+`25b37395ff61bfea0f3ffd189d9011c4984fa755`. Earlier contract tags remain
+unchanged.
 
-Edge **v0.9.15** changes Edge-owned contract surfaces: `X-Consumer-Username`
-now carries only a mapped Consumer username and external identities move to the
-gateway-owned `X-Authenticated-Identity` header; client `Connection`
-nominations are resolved at ingress and gateway-owned assertion headers match
-`_`/`-` spellings; the plugin trait gains `gates_request_admission()` and the
-gateway rejection phase set gains `route_protocol_admission`; the LDAP
-`consumer_mapping` option is removed, plugin-config environment references must
-name `FERRUM_PLUGIN_SECRET_<NAME>`, and `rate_limiting` gains `ipv6_prefix`;
-and namespace-scoped `operator` writes of `backend_tls_*` references outside
-their namespace are refused with `400`. Consumer pins to
-`contracts-edge-0.9.14` or earlier predate these changes; move them only to a
-ferrum-contracts tag published for Edge 0.9.15. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0915).
+Edge **v0.9.16** adds the `loop_detected` gateway-error token, the
+`X-Ferrum-Hops` request header, and rejection phases for hop admission and
+cancelled uploads. Namespace-bounded admin tokens gain a tenant health tier
+and cannot read fleet-wide routes or `/metrics`. Admin cached-fallback misses
+return `503 CachedReadUnavailable`, and plugin trust follows registered types.
+The matching `contracts-edge-0.9.16` publication must be cut from the verified
+Edge release before consumers update their pins. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0916).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the

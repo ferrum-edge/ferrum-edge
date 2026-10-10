@@ -576,6 +576,8 @@ for window in 64k default; do
 done
 ```
 
+**Measured disposition:** the [2026-10-09 isolated affinity comparison](affinity-measurements-2026-10-09.md) supports keeping affinity enabled; it retains all 36 pairs and the precise source/image identities.
+
 **gRPC connection affinity (#5991, #6022 item 6).** Affinity has no runtime
 toggle; it applies to every gRPC pool with more than one connection per host.
 Pair the dispatched `main` against the published image of #5991's parent
@@ -1233,6 +1235,13 @@ wait remain unavailable; correctness disposition and dispatch belong to root.
 
 ## Allocations per request (#6022 item 1)
 
+The [2026-10-09 five-path measurement](allocation-measurements-2026-10-09.md)
+records all 30 observations and separates the cumulative allocation delta from
+individual box attribution.
+The [isolated bounded-box comparison](hot-box-measurements-2026-10-09.md)
+records the selected removals, their stack/correctness evidence, and the
+requested-byte tradeoff separately.
+
 `alloc_per_request.sh` measures Rust allocator calls per proxied request on
 five dispatch paths. It builds `ferrum-edge` with the default-off
 `bench-h1-profile` feature, whose forwarding global allocator counts every
@@ -1296,3 +1305,6 @@ controls, and same-revision observer calibration. See
 traffic validity are separate; unpublished tails and scrape failures cannot
 become zero-filled success. Controlled locality/burst/churn remain explicit
 hooks, and `experiment.json` remains disabled.
+
+CPU profiling results and their hardware/coverage limits are recorded in
+[the 2026-10-09 diagnostic report](cpu-profile-measurements-2026-10-09.md).
