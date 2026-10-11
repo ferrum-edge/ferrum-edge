@@ -29,7 +29,7 @@ jobs:
 
       - name: Host facts
         run: |
-          set -x
+          set +e -x
           uname -a; cat /proc/cmdline
           free -m; cat /proc/swaps
           cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag || true
@@ -102,6 +102,7 @@ jobs:
       - name: Diagnostics after build
         if: always()
         run: |
+          set +e
           sudo pkill -TERM -f mem_sampler || true
           sleep 5
           cat "$RUNNER_TEMP/diag/sampler.out" || true
