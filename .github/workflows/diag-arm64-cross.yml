@@ -1,0 +1,136 @@
+name: DIAG ARM64 Cross release build (temporary)
+
+# Temporary branch-only diagnostic. Builds the exact release ARM64 Cross
+# command with no secrets, no artifacts consumed elsewhere and no publication.
+on:
+  push:
+    branches:
+      - ci/arm64-2604-diag
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: arm64 cross ${{ matrix.os }} ${{ matrix.variant }} #${{ matrix.n }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-26.04, variant: baseline, n: 1 }
+          - { os: ubuntu-26.04, variant: baseline, n: 2 }
+          - { os: ubuntu-24.04, variant: baseline, n: 1 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Host facts
+        run: |
+          set -x
+          uname -a; cat /proc/cmdline
+          free -m; cat /proc/swaps
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag || true
+          cat /sys/kernel/mm/transparent_hugepage/khugepaged/defrag || true
+          ls /sys/kernel/mm/transparent_hugepage/ || true
+          cat /sys/module/zswap/parameters/enabled || true
+          sysctl vm.overcommit_memory vm.overcommit_ratio vm.swappiness vm.min_free_kbytes vm.watermark_scale_factor vm.max_map_count kernel.pid_max || true
+          cat /sys/kernel/mm/lru_gen/enabled || true
+          systemctl is-active systemd-oomd || true
+          systemctl status systemd-oomd --no-pager || true
+          cat /etc/systemd/oomd.conf 2>/dev/null; ls /etc/systemd/oomd.conf.d 2>/dev/null && cat /etc/systemd/oomd.conf.d/* || true
+          oomctl 2>/dev/null | head -60 || true
+          systemctl show -p ManagedOOMSwap -p ManagedOOMMemoryPressure -p ManagedOOMMemoryPressureLimit -p MemoryMax -p MemoryHigh -p MemorySwapMax -.slice system.slice user.slice docker.service containerd.service || true
+          cat /proc/self/cgroup
+          docker version; docker info
+          cat /etc/docker/daemon.json || true
+          ps -eo pid,rss,vsz,comm,args --sort=-rss | head -40
+          systemctl list-units --type=service --state=running --no-pager
+          df -h; mount | grep -E ' /tmp | /mnt |tmpfs' || true
+          ulimit -a
+
+      - name: Install Rust and the ARM64 target
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install checksum-verified Cross 0.2.5
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        with:
+          tool: cross@0.2.5
+          fallback: none
+
+      - name: Start sampler
+        run: |
+          mkdir -p "$RUNNER_TEMP/diag"
+          sudo dmesg --clear || true
+          sudo nohup python3 .github/diag/mem_sampler.py "$RUNNER_TEMP/diag/mem" 2 > "$RUNNER_TEMP/diag/sampler.out" 2>&1 &
+          sleep 3; pgrep -af mem_sampler
+
+      - name: Build release binary with a fixed empty Cross environment
+        run: |
+          set -euo pipefail
+          test -x /home/runner/.cargo/bin/cross
+          clean_path=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          clean_hostname="$(/bin/hostname)"
+          start=$(date +%s)
+          env -i \
+            HOME=/home/runner \
+            USER=runner \
+            HOSTNAME="$clean_hostname" \
+            PATH="$clean_path" \
+            CARGO_HOME=/home/runner/.cargo \
+            RUSTUP_HOME=/home/runner/.rustup \
+            CARGO_TERM_COLOR=always \
+            TERM=xterm \
+            CI=true \
+            RUSTC_WRAPPER= \
+            RUSTFLAGS= \
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+            CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+            AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+            /home/runner/.cargo/bin/cross build \
+              --features cloud-secrets \
+              --release \
+              --target aarch64-unknown-linux-gnu
+          echo "build_seconds=$(( $(date +%s) - start ))"
+
+      - name: Diagnostics after build
+        if: always()
+        run: |
+          sudo pkill -TERM -f mem_sampler || true
+          sleep 5
+          cat "$RUNNER_TEMP/diag/sampler.out" || true
+          cat "$RUNNER_TEMP/diag/mem.summary.json" || true
+          echo "== samples with lowest MemAvailable"
+          sort -t: -k3 -n "$RUNNER_TEMP/diag/mem.jsonl" >/dev/null 2>&1 || true
+          python3 - "$RUNNER_TEMP/diag/mem.jsonl" <<'EOF'
+          import json, sys
+          rows = [json.loads(l) for l in open(sys.argv[1])]
+          for r in sorted(rows, key=lambda r: r["avail_kb"])[:15]:
+              print(json.dumps(r))
+          print("== last 40 samples")
+          for r in rows[-40:]:
+              print(json.dumps(r))
+          EOF
+          free -m
+          echo "== dmesg"
+          sudo dmesg --ctime | tail -150
+          echo "== oom in kernel journal"
+          sudo journalctl -k --no-pager | grep -i -E "oom|killed process|memory" | tail -60 || true
+          echo "== systemd-oomd journal"
+          sudo journalctl -u systemd-oomd --no-pager | tail -60 || true
+          sudo journalctl --no-pager | grep -i -E "oomd|oom-kill|killed" | tail -60 || true
+          ls -la target/aarch64-unknown-linux-gnu/release/ 2>/dev/null | head || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: diag-${{ matrix.os }}-${{ matrix.variant }}-${{ matrix.n }}
+          path: ${{ runner.temp }}/diag/
+          retention-days: 7
