@@ -476,8 +476,8 @@ def planned_argv(action, **data):
                RUNNER_ARCH='X64', H1_TRACE_ACTION=action)
     env.update({f'H1_TRACE_{k.upper()}': str(v) for k, v in data.items()})
     done = subprocess.run(['bash', '-c', 'exec() { printf "%s\\0" "$@"; exit 0; }; source "$1"',
-                           'h1-trace-plan', str(HERE / 'h1_trace_commands.sh')],
-                          env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+                           'h1-trace-plan', 'tests/performance/multi_protocol/h1_trace_commands.sh'],
+                          cwd=ROOT, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
     if done.returncode or not done.stdout.endswith(b'\0'):
         raise RuntimeError(f'{action} argv not planned (exit {done.returncode})')
     return [arg.decode() for arg in done.stdout[:-1].split(b'\0')]
