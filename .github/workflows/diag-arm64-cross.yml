@@ -12,17 +12,16 @@ permissions:
 
 jobs:
   build:
-    name: arm64 cross ${{ matrix.os }} ${{ matrix.variant }} #${{ matrix.n }}
+    name: arm64 cross ${{ matrix.os }} ${{ matrix.variant }} n${{ matrix.n }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-26.04, variant: baseline, n: 1 }
-          - { os: ubuntu-26.04, variant: baseline, n: 2 }
-          - { os: ubuntu-24.04, variant: baseline, n: 1 }
-          - { os: ubuntu-26.04, variant: thp-always, n: 1 }
+          - { os: ubuntu-26.04, variant: swap12, n: 1 }
+          - { os: ubuntu-26.04, variant: swap12, n: 2 }
+          - { os: ubuntu-26.04, variant: swap12, n: 3 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -57,6 +56,16 @@ jobs:
         run: |
           echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
           cat /sys/kernel/mm/transparent_hugepage/enabled
+
+      - name: Add swap for the fat-LTO gateway link
+        if: matrix.variant == 'swap12'
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
 
       - name: Install Rust and the ARM64 target
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
