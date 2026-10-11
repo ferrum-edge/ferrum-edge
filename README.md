@@ -592,21 +592,21 @@ publishes them in
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
 Edge source. The latest published tag is
-[`contracts-edge-0.9.15`](https://github.com/ferrum-edge/ferrum-contracts/tree/6fb64c5dc2e014204c17609fc717d976f3b4589e)
-at `6fb64c5dc2e014204c17609fc717d976f3b4589e`, published on
-2026-10-08 for Edge **v0.9.15** at release merge
-`25b37395ff61bfea0f3ffd189d9011c4984fa755`. Earlier contract tags remain
-unchanged.
+[`contracts-edge-0.9.17`](https://github.com/ferrum-edge/ferrum-contracts/tree/f7ba1a9b9885900d1e110f76d38e37a02eda13c8)
+at `f7ba1a9b9885900d1e110f76d38e37a02eda13c8`, published on
+2026-10-10 for Edge **v0.9.17** at release commit
+`669c574c1d1e88e84dccb26a8159939e6694644d`. No `contracts-edge-0.9.16` tag
+exists because Edge v0.9.16 was tagged but never published. Earlier contract
+tags remain unchanged.
 
-The **v0.9.17 candidate** carries the changes from tagged but unpublished
-v0.9.16. Its protected production release and matching Contracts publication
-must succeed before adoption. It adds the `loop_detected` gateway-error token, the
+**v0.9.17** carries the changes from tagged but unpublished v0.9.16. It adds
+the `loop_detected` gateway-error token, the
 `X-Ferrum-Hops` request header, and rejection phases for hop admission and
 cancelled uploads. Namespace-bounded admin tokens gain a tenant health tier
 and cannot read fleet-wide routes or `/metrics`. Admin cached-fallback misses
 return `503 CachedReadUnavailable`, and plugin trust follows registered types.
-The matching `contracts-edge-0.9.17` publication must be cut from the verified
-Edge release before consumers update their pins. See the
+Consumers move their pins to `contracts-edge-0.9.17` when they adopt Edge
+v0.9.17. See the
 [upgrade guide](docs/upgrade_guide.md#upgrading-to-0917).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
