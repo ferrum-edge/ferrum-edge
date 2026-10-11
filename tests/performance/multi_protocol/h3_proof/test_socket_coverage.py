@@ -120,7 +120,7 @@ class SocketCoverageTests(unittest.TestCase):
         self.birth()['at_ns'] = self.timeline[0]['capture_end_ns'] + 1
         self.assert_failure('birth_identity_or_boundary_mismatch')
 
-    def test_birth_before_an_earlier_capture_that_missed_the_socket_is_a_gap(self):
+    def test_creation_before_dump_and_binding_after_dump_is_valid(self):
         start = 998 * NS + NS // 2
         earlier = self.fixture.capture(start, start + 1000, 0)
         earlier.update(boot_id='boot-a', netns=2)
@@ -129,14 +129,20 @@ class SocketCoverageTests(unittest.TestCase):
             for owner in sk['owners']:
                 owner.update(ticks=100, cgroup_id=5, netns=2, cgroup='/h3live123.slice/backend')
         self.timeline.insert(0, earlier)
-        # The socket existed for that whole earlier read but was not observed.
+        # Creation may precede this entire dump while the socket is still
+        # unbound. Binding afterwards permits the first positive observation,
+        # which still establishes the initial pre-measurement boundary.
         self.birth()['at_ns'] = start - 1
-        self.assert_failure('missing_capture')
+        result = self.assess()
+        self.assertTrue(result['equal_socket_budget_verified'], result['socket_evidence_issues'])
+        row = next(r for r in result['sockets'] if r['cookie'] == 42)
+        self.assertEqual(row['lifetime_status'], 'witnessed_retirement_with_final_drop')
+        self.assertEqual(row['drops'], {'socket_drops': 27})
         # Born while that earlier dump was running: not seeing it is consistent.
         self.birth()['at_ns'] = start + 500
         self.assertTrue(self.assess()['equal_socket_budget_verified'])
 
-    def test_missing_middle_capture_is_not_excused_by_later_retirement(self):
+    def test_previously_visible_socket_missing_from_middle_capture_is_a_gap(self):
         self.timeline[1]['transport']['sockets'] = self.timeline[1]['transport']['sockets'][1:]
         self.assert_failure('missing_capture')
 
