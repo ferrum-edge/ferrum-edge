@@ -445,9 +445,11 @@ def child_limits(file_limit=BOUNDS["raw_perf_bytes"]):
         os._exit(125)
 
 
+COMMAND_DATA = frozenset({'netns', 'capacity', 'fault', 'denied', 'mode', 'pid', 'out', 'symfs', 'elf'})
+
+
 def launch(action, *, stdout, stderr, stdin=None, file_limit=BOUNDS["raw_perf_bytes"], pass_fds=(), **data):
-    allowed = {'netns', 'capacity', 'fault', 'denied', 'mode', 'pid', 'out', 'symfs', 'elf'}
-    if data.keys() - allowed or not 4096 <= file_limit <= BOUNDS['raw_perf_bytes']:
+    if data.keys() - COMMAND_DATA or not 4096 <= file_limit <= BOUNDS['raw_perf_bytes']:
         raise ValueError('unknown command data/resource bound')
     env = {key: os.environ[key] for key in ('GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT', 'RUNNER_OS', 'RUNNER_ARCH',
            'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'ImageOS', 'ImageVersion') if key in os.environ}
@@ -457,6 +459,34 @@ def launch(action, *, stdout, stderr, stdin=None, file_limit=BOUNDS["raw_perf_by
     return subprocess.Popen(['bash', 'tests/performance/multi_protocol/h1_trace_commands.sh'],
                             cwd=ROOT, env=env, stdin=stdin, stdout=stdout, stderr=stderr,
                             start_new_session=True, pass_fds=pass_fds, preexec_fn=functools.partial(child_limits, file_limit))
+
+
+def planned_argv(action, **data):
+    """Argv the literal inventory execs for action/data, captured instead of run.
+
+    Sources the same script with the same data, but a shell function shadows
+    the ``exec`` builtin (bash resolves functions before special builtins
+    outside POSIX mode), so nothing is executed. Hosted-runner guard values are
+    fixed because this only plans; the real launch still enforces them.
+    """
+    if data.keys() - COMMAND_DATA:
+        raise ValueError('unknown command data')
+    env = dict(PATH='/usr/sbin:/usr/bin:/sbin:/bin', LANG='C.UTF-8', HOME='/nonexistent',
+               GITHUB_ACTIONS='true', RUNNER_ENVIRONMENT='github-hosted', RUNNER_OS='Linux',
+               RUNNER_ARCH='X64', H1_TRACE_ACTION=action)
+    env.update({f'H1_TRACE_{k.upper()}': str(v) for k, v in data.items()})
+    done = subprocess.run(['bash', '-c', 'exec() { printf "%s\\0" "$@"; exit 0; }; source "$1"',
+                           'h1-trace-plan', 'tests/performance/multi_protocol/h1_trace_commands.sh'],
+                          cwd=ROOT, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+    if done.returncode or not done.stdout.endswith(b'\0'):
+        raise RuntimeError(f'{action} argv not planned (exit {done.returncode})')
+    return [arg.decode() for arg in done.stdout[:-1].split(b'\0')]
+
+
+def inline_expansion(argv):
+    """perf script expands inline frames unless the last inline flag disables it."""
+    flags = [arg for arg in argv if arg in ('--inline', '--no-inline')]
+    return not flags or flags[-1] == '--inline'
 
 
 def reap(process, command=None):
@@ -1086,6 +1116,11 @@ def build_id_gaps(build_ids, retained_ids, records):
 
 def cpu_decode(out, owners, dsos, *, symfs=None):
     symfs = out / "symfs" if symfs is None else symfs
+    # Derive inline-frame metadata from the decoder argv the inventory execs.
+    try:
+        decoder_argv, decoder_argv_error = planned_argv('perf-script', out=out, symfs=symfs), None
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+        decoder_argv, decoder_argv_error = None, str(error)
     decoded = command('perf-script', out / 'stacks.txt', limit=16 * 1024**2, timeout=30,
                       out=out, symfs=symfs)
     attributes = command('perf-attributes', out / 'perf-attributes.txt', out=out)
@@ -1158,9 +1193,15 @@ def cpu_decode(out, owners, dsos, *, symfs=None):
         issues.append('missing mapping/task provenance')
     if result['unresolved_samples'] or result['multi_frame_samples'] != result['samples']:
         issues.append('partial unwinding/unresolved samples')
+    if decoder_argv is None:
+        issues.append('decoder argv unverified: ' + decoder_argv_error)
+    expanded = None if decoder_argv is None else inline_expansion(decoder_argv)
     result.update(issues=issues, samples_complete=not issues, decoder_status=decoded,
-                  inline_expansion=False,
-                  stack_scope='symbolized physical DWARF frames; inline source frames not expanded',
+                  decoder_argv=decoder_argv, inline_expansion=expanded,
+                  stack_scope=('symbolized physical DWARF frames; inline source frames not expanded'
+                               if expanded is False else
+                               'symbolized DWARF frames; inline source frame expansion '
+                               + ('requested' if expanded else 'unverified')),
                   unretained_virtual_dsos=virtual_dsos,
                   header_status=header, buildid_status=buildids, attributes_status=attributes, attributes_verified=attributes_verified,
                   attribute_validation=attribute_validation,
