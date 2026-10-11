@@ -15,6 +15,7 @@ class SocketCoverageTests(unittest.TestCase):
     def setUp(self):
         fixture = fixtures.PassiveBoundaryTests()
         fixture.setUp()
+        self.fixture = fixture
         self.phases = fixture.phases
         self.timeline = [fixture.capture(at * NS, at * NS + 1000, i + 1)
                          for i, at in enumerate((999, 1001, 1029, 1031))]
@@ -96,6 +97,44 @@ class SocketCoverageTests(unittest.TestCase):
     def test_missing_initial_boundary_is_not_excused_by_birth(self):
         self.timeline[0]['transport']['sockets'] = self.timeline[0]['transport']['sockets'][1:]
         self.assert_failure('missing_initial_boundary')
+
+    def birth(self):
+        return self.context['observers'][0]['events'][0]
+
+    def test_birth_inside_first_observing_capture_is_ordered_evidence(self):
+        # Hosted runs 37923430213/37994629201 (attempt 1): Envoy upstream sockets
+        # created while the non-atomic passive dump was running were observed by
+        # that same dump. The observation instant lies inside [start, end], so
+        # it cannot precede a birth that is <= end. Nothing is dated from birth.
+        start, end = self.timeline[0]['monotonic_ns'], self.timeline[0]['capture_end_ns']
+        for at in (start + 1, (start + end) // 2, end):
+            with self.subTest(birth_offset_ns=at - start):
+                self.birth()['at_ns'] = at
+                result = self.assess()
+                self.assertTrue(result['equal_socket_budget_verified'], result['socket_evidence_issues'])
+                row = next(r for r in result['sockets'] if r['cookie'] == 42)
+                self.assertEqual(row['lifetime_status'], 'witnessed_retirement_with_final_drop')
+                self.assertEqual(row['drops'], {'socket_drops': 27})
+
+    def test_birth_after_first_observing_capture_ends_is_rejected(self):
+        self.birth()['at_ns'] = self.timeline[0]['capture_end_ns'] + 1
+        self.assert_failure('birth_identity_or_boundary_mismatch')
+
+    def test_birth_before_an_earlier_capture_that_missed_the_socket_is_a_gap(self):
+        start = 998 * NS + NS // 2
+        earlier = self.fixture.capture(start, start + 1000, 0)
+        earlier.update(boot_id='boot-a', netns=2)
+        earlier['transport']['sockets'] = [sk for sk in earlier['transport']['sockets'] if sk['cookie'][0] != 42]
+        for sk in earlier['transport']['sockets']:
+            for owner in sk['owners']:
+                owner.update(ticks=100, cgroup_id=5, netns=2, cgroup='/h3live123.slice/backend')
+        self.timeline.insert(0, earlier)
+        # The socket existed for that whole earlier read but was not observed.
+        self.birth()['at_ns'] = start - 1
+        self.assert_failure('missing_capture')
+        # Born while that earlier dump was running: not seeing it is consistent.
+        self.birth()['at_ns'] = start + 500
+        self.assertTrue(self.assess()['equal_socket_budget_verified'])
 
     def test_missing_middle_capture_is_not_excused_by_later_retirement(self):
         self.timeline[1]['transport']['sockets'] = self.timeline[1]['transport']['sockets'][1:]

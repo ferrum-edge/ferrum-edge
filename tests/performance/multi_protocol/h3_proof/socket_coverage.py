@@ -56,6 +56,26 @@ def lifetime_events(context, cookie):
     return events.get('lifetime', []), events.get('destroy', []), sorted(set(issues))
 
 
+def birth_missed_by_earlier_capture(timeline, first, birth_ns):
+    """Whether a capture that began after this socket's birth failed to see it.
+
+    A passive capture is a non-atomic read spanning [start, end]: the socket
+    is positively observed at some unknown instant inside that interval. So the
+    first observing capture proves only birth <= its END; a birth after its
+    START is the ordinary case of a socket created while the dump was running.
+    The identity, initial-boundary and drop-baseline checks never date the
+    socket from that birth. The real birth-side gap is the opposite one: an
+    earlier capture that STARTED after the birth (so the socket existed for its
+    whole read) and still did not observe it. The first observation is the
+    earliest capture containing the cookie, so only its predecessor can be that
+    capture.
+    """
+    if first == 0:
+        return False
+    previous = capture_interval(timeline[first - 1])
+    return previous is None or previous[0] > birth_ns
+
+
 def socket_coverage(timeline, values, bounds, window, cookie, context=None):
     result = dict(lifetime_covered=False, drops=None, retirement=None, issues=[],
                   lifetime_status='unobserved_disappearance')
@@ -117,8 +137,10 @@ def socket_coverage(timeline, values, bounds, window, cookie, context=None):
             elif (not event_owner_matches(births[0], base)
                   or births[0]['result'] != 0 or births[0]['family'] != base['family']
                   or births[0]['at_ns'] < context['namespace_lifetime']['opened_ns']
-                  or births[0]['at_ns'] > capture_interval(timeline[values[0][0]])[0]):
+                  or births[0]['at_ns'] > capture_interval(timeline[values[0][0]])[1]):
                 issues.append('birth_identity_or_boundary_mismatch')
+            elif birth_missed_by_earlier_capture(timeline, values[0][0], births[0]['at_ns']):
+                issues.append('missing_capture')
             if (not event_owner_matches(end, base) or end['result'] != 0 or end['family'] != base['family']
                     or (ipv4(end['local_ipv4']), end['local_port']) != (base['local_address'], base['local_port'])
                     or (base['peer_port'] and (ipv4(end['peer_ipv4']), end['peer_port'])

@@ -35,6 +35,11 @@ bracket; an admitted retirement instead has `lifetime_covered:true` and
 - A definite initial passive boundary and continuous observations until close.
 - One actual birth and one actual `udp_destroy_sock` retirement, with the same
   cookie, process start tick, owner cgroup, endpoint, boot and held netns lifetime.
+  A passive capture is a non-atomic read over its whole `[start, end]` interval,
+  so the birth must not follow the END of the first capture that observed the
+  socket; a socket created while that dump was running is ordinary ordered
+  evidence. A capture that began after the birth and still missed the socket
+  is `missing_capture`.
 - Supported, finalized birth/destroy streams from this exact invocation, without
   identity/read/map/ring loss, omitted lifecycle records or forced termination.
 - Actual final buffer sizes and a nondecreasing final socket-drop counter. The
