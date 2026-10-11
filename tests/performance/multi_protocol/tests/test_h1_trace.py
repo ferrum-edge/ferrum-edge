@@ -269,6 +269,87 @@ class H1CPUAttributeTests(unittest.TestCase):
         for digest in (None, '0' * 64):
             self.rejected(self.raw, 'hash missing/mismatched', status_changes={'stdout_sha256': digest})
 
+    STACKS = ('fixture 7/8 12.000000000: cpu-clock:uS:\n'
+              '        1234 fixture_leaf (/fixture)\n'
+              '        2345 fixture_middle (/fixture)\n'
+              '        3456 fixture_outer (/fixture)\n'
+              '        4567 [unknown] (/fixture)\n\n')
+
+    @staticmethod
+    def inventory_plan(out):
+        """Real inventory argv, planned before os.read is patched (bash uses it)."""
+        argv = trace.planned_argv('perf-script', out=out, symfs=out / 'symfs')
+        return Mock(return_value=argv)
+
+    def decode_fixture(self, out, *, planned=None):
+        """Decode the valid fixture; ``planned`` replaces the inventory argv plan."""
+        planned = self.inventory_plan(out) if planned is None else planned
+        def metadata(action, destination, **kwargs):
+            content = {'perf-script': self.STACKS.encode('ascii'), 'perf-attributes': self.raw,
+                       'perf-buildids': b'12345678 /fixture\n', 'perf-header': b'header\n'}[action]
+            destination.write_bytes(content)
+            return dict(returncode=0, forced=False, incomplete=None,
+                        stdout_sha256=hashlib.sha256(content).hexdigest())
+
+        process = Mock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        dsos = dict(complete=False, dsos=[dict(path='/fixture', eh_frame=False,
+                                              build_id_lines=['Build ID: 12345678'])])
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(trace, 'planned_argv', planned))
+            stack.enter_context(patch.object(trace, 'command', side_effect=metadata))
+            stack.enter_context(patch.object(trace, 'launch', return_value=process))
+            stack.enter_context(patch.object(trace.os, 'set_blocking'))
+            stack.enter_context(patch.object(trace.os, 'read', side_effect=[b'PERF_RECORD_SAMPLE\n', b'']))
+            result = trace.cpu_decode(out, {7}, dsos)
+        planned.assert_called_once_with('perf-script', out=out, symfs=out / 'symfs')
+        return result
+
+    def test_perf_script_inventory_execs_decoder_without_inline_expansion(self):
+        # Source the real inventory with `exec` captured: the argv is what the
+        # CPU lane runs, so dropping --no-inline must flip the metadata.
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            argv = trace.planned_argv('perf-script', out=out, symfs=out / 'symfs')
+            self.assertEqual(argv[:6], [str(trace.STAGE / 'perf'), 'script', '-i', str(out / 'perf.data'),
+                                        '--symfs', str(out / 'symfs')])
+            self.assertIn('--no-inline', argv)
+            self.assertFalse(trace.inline_expansion(argv))
+            raw = trace.planned_argv('perf-raw', out=out)
+            self.assertNotIn('--no-inline', raw)
+            self.assertTrue(trace.inline_expansion(raw))
+            with self.assertRaisesRegex(RuntimeError, 'not planned'):
+                trace.planned_argv('unknown-action', out=out)
+            with self.assertRaisesRegex(ValueError, 'unknown command data'):
+                trace.planned_argv('perf-script', out=out, symfs=out, decoder='--inline')
+        for argv, expanded in (([], True), (['--no-inline'], False), (['--inline'], True),
+                               (['--no-inline', '--inline'], True), (['--inline', '--no-inline'], False)):
+            with self.subTest(argv=argv):
+                self.assertEqual(trace.inline_expansion(['perf', 'script'] + argv), expanded)
+
+    def test_cpu_decode_inline_metadata_follows_decoder_argv(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            argv = self.inventory_plan(out).return_value
+            expanded = self.decode_fixture(out, planned=Mock(return_value=[
+                arg for arg in argv if arg != '--no-inline']))
+            self.assertTrue(expanded['inline_expansion'])
+            self.assertNotIn('--no-inline', expanded['decoder_argv'])
+            self.assertIn('expansion requested', expanded['stack_scope'])
+            unplanned = self.decode_fixture(out, planned=Mock(
+                side_effect=RuntimeError('perf-script argv not planned (exit 2)')))
+            self.assertIsNone(unplanned['inline_expansion'])
+            self.assertIsNone(unplanned['decoder_argv'])
+            self.assertIn('decoder argv unverified: perf-script argv not planned (exit 2)', unplanned['issues'])
+            self.assertFalse(unplanned['samples_complete'])
+            actual = self.decode_fixture(out)
+            self.assertFalse(actual['inline_expansion'])
+            self.assertIn('--no-inline', actual['decoder_argv'])
+            saved = json.loads((out / 'cpu-coverage.json').read_text())
+            self.assertEqual(saved['decoder_argv'], actual['decoder_argv'])
+            self.assertIs(saved['inline_expansion'], False)
+
     def test_cpu_decode_retains_attribute_reasons_and_unknown_unwinding(self):
         stacks = ('fixture 7/8 12.000000000: cpu-clock:uS:\n'
                   '        1234 fixture_leaf (/fixture)\n'
@@ -299,7 +380,8 @@ class H1CPUAttributeTests(unittest.TestCase):
                 process.wait.return_value = 0
                 dsos = dict(complete=virtual, dsos=[dict(path='/fixture', eh_frame=virtual,
                                                       build_id_lines=['Build ID: 12345678'])])
-                with patch.object(trace, 'command', side_effect=metadata), \
+                with patch.object(trace, 'planned_argv', self.inventory_plan(out)), \
+                        patch.object(trace, 'command', side_effect=metadata), \
                         patch.object(trace, 'launch', return_value=process), \
                         patch.object(trace.os, 'set_blocking'), \
                         patch.object(trace.os, 'read', side_effect=[raw_records, b'']):
@@ -311,6 +393,8 @@ class H1CPUAttributeTests(unittest.TestCase):
                 self.assertTrue(nested_fixture_proof(result['callchains'])['proven'])
                 self.assertFalse(result['unwind_complete'])
                 self.assertFalse(result['inline_expansion'])
+                self.assertIn('--no-inline', result['decoder_argv'])
+                self.assertEqual(result['decoder_argv'][:2], [str(trace.STAGE / 'perf'), 'script'])
                 self.assertFalse(result['samples_complete'])
                 self.assertIn('missing matching ELF/build IDs/CFI', result['issues'])
                 if virtual:
