@@ -560,25 +560,6 @@ fn cached_response_retained_size(body_len: usize, headers: &HashMap<String, Stri
         )
 }
 
-/// How long a local completion keeps answering lookups for its key.
-///
-/// A completion still awaiting its Redis publication verdict answers for at
-/// most its pending window. For ordinary work that window is the owner's
-/// in-flight lease: a publisher that never settles (its future was dropped
-/// mid-publication) leaves the key re-admittable on the same schedule as an
-/// abandoned in-flight marker instead of blocking it for the full completed
-/// TTL. A protected external operation's window is its full retention, so an
-/// unsettled publication can never reopen an operation that already ran.
-fn completed_lookup_window(
-    cached: &CachedResponse,
-    pending_publication_lease: Option<Duration>,
-) -> Duration {
-    match pending_publication_lease {
-        Some(lease) => lease.min(cached.retention),
-        None => cached.retention,
-    }
-}
-
 /// In-flight marker to handle concurrent duplicate requests.
 ///
 /// `InFlight` carries the timestamp it was inserted so stale markers (from
@@ -635,22 +616,22 @@ enum DeduplicationEntry {
         /// for externally executing terminal responses until a distributed
         /// replay is known to be visible.
         retain_barrier_on_eviction: bool,
-        /// `Some(window)` while this completion's fenced Redis publication has
-        /// not yet returned a verdict.
+        /// `true` while this completion's fenced Redis publication has not yet
+        /// returned a verdict.
         ///
         /// Until Redis settles ownership this request may be a stale owner whose
         /// lease already expired, so the bytes must not be replay-visible: a
         /// pending completion answers a matching retry exactly like the
-        /// in-flight marker it replaced. For ordinary work `window` is the
-        /// owner's admission-time in-flight lease, which the pending completion
-        /// never outlives. A protected external operation (serverless
-        /// completion or external-operation tombstone) already executed, so its
-        /// `window` is the completion's own retention: if the publication is
-        /// cancelled and never settles, the entry stays a token-matched
-        /// execution barrier until the original protection deadline. A
-        /// `Published` verdict (or an unreachable Redis, which keeps the local
-        /// replay) clears it; `NotOwner` removes the entry instead.
-        pending_publication_lease: Option<Duration>,
+        /// in-flight marker it replaced. The operation already executed, so the
+        /// pending completion keeps its full completed retention rather than
+        /// the owner's in-flight lease: if the publication is cancelled and
+        /// never settles, the entry stays a non-replayable execution barrier
+        /// until the original protection deadline instead of re-admitting the
+        /// work. Lease-only expiry applies to genuinely unfinished work, which
+        /// never records a completion. A `Published` verdict (or an unreachable
+        /// Redis, which keeps the local replay) clears it; `NotOwner` removes
+        /// the entry instead.
+        pending_publication: bool,
     },
 }
 
@@ -1502,7 +1483,7 @@ impl RequestDeduplication {
         for mut entry in self.local.local_cache.iter_mut() {
             if let DeduplicationEntry::Completed {
                 cached,
-                pending_publication_lease: Some(_),
+                pending_publication: true,
                 ..
             } = entry.value_mut()
             {
@@ -1731,12 +1712,10 @@ impl RequestDeduplication {
                     DeduplicationEntry::Completed {
                         cached,
                         fingerprint: cached_fingerprint,
-                        pending_publication_lease,
+                        pending_publication,
                         ..
                     } => {
-                        if now.duration_since(cached.inserted_at)
-                            < completed_lookup_window(cached, *pending_publication_lease)
-                        {
+                        if now.duration_since(cached.inserted_at) < cached.retention {
                             if cached_fingerprint != fingerprint {
                                 return LocalDeduplicationAction::Conflict(
                                     DeduplicationConflict::FingerprintMismatch,
@@ -1745,7 +1724,7 @@ impl RequestDeduplication {
                             // Not yet authoritative: the Redis fence may still
                             // reject this publisher, so answer as the in-flight
                             // owner it replaced rather than replaying it.
-                            if pending_publication_lease.is_some() {
+                            if *pending_publication {
                                 return LocalDeduplicationAction::Conflict(
                                     DeduplicationConflict::InFlight,
                                 );
@@ -1811,7 +1790,7 @@ impl RequestDeduplication {
             let DeduplicationEntry::Completed {
                 cached,
                 fingerprint: cached_fingerprint,
-                pending_publication_lease,
+                pending_publication,
                 ..
             } = entry.value()
             else {
@@ -1821,7 +1800,7 @@ impl RequestDeduplication {
             // replay-visible: a matching retry that observes the owner's (or a
             // live successor's) Redis in-flight record must keep conflicting
             // until the fence settles who owns the operation.
-            if pending_publication_lease.is_none()
+            if !*pending_publication
                 && cached_fingerprint == fingerprint
                 && now.duration_since(cached.inserted_at) < cached.retention
             {
@@ -1856,17 +1835,15 @@ impl RequestDeduplication {
                     cached,
                     sequence,
                     fingerprint: cached_fingerprint,
-                    pending_publication_lease,
+                    pending_publication,
                     ..
                 } => {
-                    if now.duration_since(cached.inserted_at)
-                        < completed_lookup_window(cached, *pending_publication_lease)
-                    {
+                    if now.duration_since(cached.inserted_at) < cached.retention {
                         if cached_fingerprint != fingerprint {
                             LocalDeduplicationAction::Conflict(
                                 DeduplicationConflict::FingerprintMismatch,
                             )
-                        } else if pending_publication_lease.is_some() {
+                        } else if *pending_publication {
                             LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight)
                         } else {
                             LocalDeduplicationAction::Replay(cached.clone())
@@ -2504,17 +2481,14 @@ impl RequestDeduplication {
             Entry::Vacant(_) => return LocalCompletionAction::Stale,
         };
 
-        let admitted_lease = match entry.get() {
+        match entry.get() {
             DeduplicationEntry::InFlight {
                 fingerprint: current_fingerprint,
                 owner_token: current_owner_token,
-                retention: admitted_lease,
                 ..
-            } if current_fingerprint == fingerprint && current_owner_token == owner_token => {
-                *admitted_lease
-            }
+            } if current_fingerprint == fingerprint && current_owner_token == owner_token => {}
             _ => return LocalCompletionAction::Stale,
-        };
+        }
 
         if entry_size > self.max_entry_size_bytes {
             let inflight_count = if publish_execution_barrier_on_skip {
@@ -2605,15 +2579,6 @@ impl RequestDeduplication {
             response_policy,
         };
         let redis_copy = cached.clone();
-        // An already-performed external operation must keep blocking
-        // re-execution through its full protection deadline even if its
-        // publication is cancelled and never settles; ordinary work only
-        // stands in for the in-flight lease it replaced.
-        let pending_publication_lease = if publish_execution_barrier_on_skip {
-            retention
-        } else {
-            admitted_lease
-        };
         entry.insert(DeduplicationEntry::Completed {
             cached,
             sequence,
@@ -2621,9 +2586,10 @@ impl RequestDeduplication {
             publisher_owner_token: owner_token.to_string(),
             retain_barrier_on_eviction,
             // A Redis owner's completion stays replay-invisible until the
-            // fenced publication settles; process-local ownership is already
+            // fenced publication settles, while still blocking re-execution
+            // through its full retention; process-local ownership is already
             // authoritative.
-            pending_publication_lease: redis_owned.then_some(pending_publication_lease),
+            pending_publication: redis_owned,
         });
         self.add_completed_size_locked(entry_size);
         self.local
@@ -2657,13 +2623,13 @@ impl RequestDeduplication {
             sequence: current_sequence,
             fingerprint: current_fingerprint,
             retain_barrier_on_eviction: current_retain,
-            pending_publication_lease,
+            pending_publication,
             ..
         } = entry.value_mut()
             && *current_sequence == sequence
             && current_fingerprint.as_str() == fingerprint
         {
-            *pending_publication_lease = None;
+            *pending_publication = false;
             if let Some(retain) = retain_barrier_on_eviction {
                 *current_retain = retain;
             }
