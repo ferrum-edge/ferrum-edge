@@ -215,8 +215,11 @@ fn production_dockerfiles_pin_external_bases_by_digest() {
     }
 }
 
+// The runtime repository is synthetic on purpose: a literal distroless pin here
+// would be read as a consumer by the repository-wide distroless consistency gate
+// in `.github/scripts/verify_ci_runtime_cache.py`.
 const PINNED_FIXTURE: &str = "\
-ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG RUNTIME_BASE=registry.example/runtime/cc:nonroot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ARG IPROUTE2_VERSION=6.15.0-1
 # Digest resolved YYYY-MM-DD; the tag is kept for readability, the digest is authoritative.
 FROM debian:13-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS data-dir
@@ -236,7 +239,11 @@ fn trailing_text_after_a_pin_instruction_is_rejected() {
     let cases = [
         (" AS data-dir\n", " AS data-dir # resolved today\n", 4),
         (" AS runtime\n", " AS runtime extra\n", 5),
-        ("aaaa\nARG IPROUTE2", "aaaa # resolved today\nARG IPROUTE2", 1),
+        (
+            "aaaa\nARG IPROUTE2",
+            "aaaa # resolved today\nARG IPROUTE2",
+            1,
+        ),
         ("6.15.0-1\n", "6.15.0-1 # note\n", 2),
     ];
     for (original, replacement, line_no) in cases {
