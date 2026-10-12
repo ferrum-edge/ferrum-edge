@@ -2293,12 +2293,18 @@ async fn composed_admitted_limiters_break_equal_remaining_ties_independent_of_or
     let mut headers = HashMap::new();
     assert_continue(short.after_proxy(&mut ctx, 200, &mut headers).await);
     assert_continue(long.after_proxy(&mut ctx, 200, &mut headers).await);
-    assert_eq!(headers.get("x-ratelimit-limit").map(String::as_str), Some("2"));
+    assert_eq!(
+        headers.get("x-ratelimit-limit").map(String::as_str),
+        Some("2")
+    );
     assert_eq!(
         headers.get("x-ratelimit-remaining").map(String::as_str),
         Some("1")
     );
-    assert_eq!(headers.get("x-ratelimit-window").map(String::as_str), Some("1"));
+    assert_eq!(
+        headers.get("x-ratelimit-window").map(String::as_str),
+        Some("1")
+    );
 
     let short_reversed = composed_window_limiter("short-window-policy", 1);
     let long_reversed = composed_window_limiter("long-window-policy", 60);
