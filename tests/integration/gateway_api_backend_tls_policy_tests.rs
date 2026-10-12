@@ -995,7 +995,10 @@ fn backend_tls_policy_partial_transport_refusal_keeps_route_programmed_and_confl
 
         let parent = route_parent_status(&objects, "method-split");
         let (accepted, accepted_reason, _) = condition_status(&parent, "Accepted");
-        assert_eq!(accepted, "True", "the surviving rule keeps the Route accepted");
+        assert_eq!(
+            accepted, "True",
+            "the surviving rule keeps the Route accepted"
+        );
         assert_eq!(accepted_reason, "Accepted");
         let (programmed, _, _) = condition_status(&parent, "Programmed");
         assert_eq!(programmed, "True", "the surviving rule is still programmed");

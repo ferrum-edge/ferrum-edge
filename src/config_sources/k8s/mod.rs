@@ -1732,7 +1732,9 @@ impl K8sAccumulator {
     /// their own accumulator set for [`Self::finish`] to publish.
     fn resolve_refused_route_attachments(&mut self) -> HashSet<GatewayApiRouteAttachment> {
         if self.gateway_api_refused_route_attachments.is_empty()
-            && self.gateway_api_transport_refused_route_attachments.is_empty()
+            && self
+                .gateway_api_transport_refused_route_attachments
+                .is_empty()
         {
             return HashSet::new();
         }
