@@ -53,6 +53,15 @@ const POLICY_STATE_MASK: u64 = (1_u64 << POLICY_STATE_BITS) - 1;
 const POLICY_ACTIVE: u64 = 0;
 const POLICY_RESETTING: u64 = 1;
 const MAX_POLICY_TRANSITION_EPOCH: u64 = u64::MAX >> POLICY_STATE_BITS;
+/// The closed-window baseline word packs `(window sequence, minimum µs)` so a
+/// rotation publishes its window and the window's age in one atomic store.
+/// 40 bits of microseconds is about 12.7 days; longer samples saturate.
+const BASELINE_LATENCY_BITS: u32 = 40;
+const BASELINE_LATENCY_MASK: u64 = (1_u64 << BASELINE_LATENCY_BITS) - 1;
+const BASELINE_WINDOW_SEQUENCE_MASK: u64 = u64::MAX >> BASELINE_LATENCY_BITS;
+/// Serial-number half range for the wrapping 24-bit window sequence. A
+/// publication is newer only when it is ahead by less than this distance.
+const BASELINE_WINDOW_SEQUENCE_HALF_RANGE: u64 = (BASELINE_WINDOW_SEQUENCE_MASK >> 1) + 1;
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdaptiveConcurrencyResetEpoch {
@@ -230,10 +239,7 @@ struct AdaptiveConcurrencyState {
     /// before the decrease cannot use their later successes to immediately
     /// restore the old limit.
     feedback_epoch: AtomicU64,
-    /// Minimum healthy latency observed in the current baseline window.
-    window_baseline_us: AtomicU64,
-    /// Minimum healthy latency of the most recently closed baseline window.
-    prior_window_baseline_us: AtomicU64,
+    baseline: AdaptiveConcurrencyBaselineWindows,
     latency_ewma_us: AtomicU64,
     samples: AtomicU64,
     rejections: AtomicU64,
@@ -245,8 +251,7 @@ impl AdaptiveConcurrencyState {
             in_flight: CachePadded::new(AtomicU64::new(0)),
             limit: CachePadded::new(AtomicU64::new(initial_limit)),
             feedback_epoch: AtomicU64::new(1),
-            window_baseline_us: AtomicU64::new(0),
-            prior_window_baseline_us: AtomicU64::new(0),
+            baseline: AdaptiveConcurrencyBaselineWindows::new(),
             latency_ewma_us: AtomicU64::new(0),
             samples: AtomicU64::new(0),
             rejections: AtomicU64::new(0),
@@ -937,7 +942,7 @@ impl AdaptiveConcurrencySnapshot {
             key,
             in_flight: state.in_flight.load(Ordering::Relaxed),
             limit: state.limit.load(Ordering::Acquire),
-            baseline_latency_us: effective_baseline_latency_us(state),
+            baseline_latency_us: state.baseline.effective_us(),
             latency_ewma_us: state.latency_ewma_us.load(Ordering::Acquire),
             samples: state.samples.load(Ordering::Acquire),
             rejections: state.rejections.load(Ordering::Relaxed),
@@ -1022,19 +1027,19 @@ impl AdaptiveConcurrencyPermit {
     /// the window that contained the older, faster samples has rolled out.
     fn record_success_latency(&self, backend_elapsed: Duration, allow_increase: bool) {
         let latency_us = (backend_elapsed.as_micros() as u64).max(1);
-        update_min(&self.state.window_baseline_us, latency_us);
+        self.state.baseline.observe(latency_us);
         let ewma = update_ewma(&self.state.latency_ewma_us, latency_us);
         let samples = self.state.samples.fetch_add(1, Ordering::AcqRel) + 1;
         // `is_multiple_of` never panics: a zero window (only reachable by a
         // hand-built config that bypassed validation) simply never rotates.
         if samples.is_multiple_of(self.config.baseline_window_samples) {
-            rotate_baseline_window(&self.state);
+            self.state.baseline.rotate();
         }
         if samples < self.config.min_samples {
             return;
         }
 
-        let baseline = effective_baseline_latency_us(&self.state);
+        let baseline = self.state.baseline.effective_us();
         if baseline == 0 {
             return;
         }
@@ -1177,42 +1182,140 @@ fn scoped_proxy(proxy: &Proxy) -> String {
     scope
 }
 
-fn update_min(atomic: &AtomicU64, candidate: u64) {
-    let mut current = atomic.load(Ordering::Acquire);
-    loop {
-        if current != 0 && current <= candidate {
-            return;
+/// Windowed-minimum latency baseline (issue #5737).
+///
+/// The baseline is the minimum of the current window and the most recently
+/// closed nonempty window, so a sample stops influencing it once two windows
+/// have closed after it. Samples racing a rotation land in either window; both
+/// are genuine recent observations, so that is benign.
+///
+/// Both words pack `(window sequence, minimum µs)`. Closing a window advances
+/// the current word's sequence in the same CAS that takes its minimum, so every
+/// closed window carries its own, unique position in rotation order. Publishing
+/// it as the prior window is a separate step that concurrent feedback can
+/// delay, so a publication that is not newer than the prior window already in
+/// place is a logically late store and is discarded: a delayed rotation can
+/// never restore a window older than ones that have already closed (issue
+/// #6309). The sequence counts rotations, not samples, so it stays ordered when
+/// a compatible reload changes `baseline_window_samples`.
+pub(crate) struct AdaptiveConcurrencyBaselineWindows {
+    /// Current window: its sequence and minimum healthy latency (µs); a zero
+    /// minimum means the window is empty.
+    current: AtomicU64,
+    /// Newest published closed window; `0` means none has been published yet.
+    prior: AtomicU64,
+}
+
+/// A closed window's minimum, taken by `close_window` and not yet published.
+#[derive(Clone, Copy)]
+pub(crate) struct AdaptiveConcurrencyClosedBaselineWindow {
+    sequence: u64,
+    min_us: u64,
+}
+
+impl AdaptiveConcurrencyBaselineWindows {
+    pub(crate) fn new() -> Self {
+        Self {
+            current: AtomicU64::new(0),
+            prior: AtomicU64::new(0),
         }
-        match atomic.compare_exchange(current, candidate, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
+    }
+
+    /// Fold one healthy latency sample into the current window.
+    pub(crate) fn observe(&self, latency_us: u64) {
+        let candidate = latency_us.clamp(1, BASELINE_LATENCY_MASK);
+        let mut current = self.current.load(Ordering::Acquire);
+        loop {
+            let min_us = current & BASELINE_LATENCY_MASK;
+            if min_us != 0 && min_us <= candidate {
+                return;
+            }
+            let next = (current & !BASELINE_LATENCY_MASK) | candidate;
+            match self
+                .current
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Close the current window and start the next one empty. An empty closed
+    /// window has nothing to publish and leaves the prior window in place.
+    pub(crate) fn close_window(&self) -> Option<AdaptiveConcurrencyClosedBaselineWindow> {
+        let mut current = self.current.load(Ordering::Acquire);
+        loop {
+            let sequence = current >> BASELINE_LATENCY_BITS;
+            let next_sequence = sequence.wrapping_add(1) & BASELINE_WINDOW_SEQUENCE_MASK;
+            match self.current.compare_exchange(
+                current,
+                next_sequence << BASELINE_LATENCY_BITS,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let min_us = current & BASELINE_LATENCY_MASK;
+                    return (min_us != 0)
+                        .then_some(AdaptiveConcurrencyClosedBaselineWindow { sequence, min_us });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Publish a closed window as the prior window unless a newer closed
+    /// window has already been published.
+    pub(crate) fn publish_closed_window(&self, closed: AdaptiveConcurrencyClosedBaselineWindow) {
+        let candidate = (closed.sequence << BASELINE_LATENCY_BITS) | closed.min_us;
+        let mut current = self.prior.load(Ordering::Acquire);
+        loop {
+            if current != 0
+                && !baseline_window_sequence_is_newer(
+                    closed.sequence,
+                    current >> BASELINE_LATENCY_BITS,
+                )
+            {
+                return;
+            }
+            match self.prior.compare_exchange(
+                current,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Close the current window and publish it as the prior window.
+    pub(crate) fn rotate(&self) {
+        if let Some(closed) = self.close_window() {
+            self.publish_closed_window(closed);
+        }
+    }
+
+    /// Minimum of the current and prior windows; `0` means no healthy sample
+    /// has been recorded yet.
+    pub(crate) fn effective_us(&self) -> u64 {
+        let prior = self.prior.load(Ordering::Acquire) & BASELINE_LATENCY_MASK;
+        let current = self.current.load(Ordering::Acquire) & BASELINE_LATENCY_MASK;
+        match (prior, current) {
+            (0, current) => current,
+            (prior, 0) => prior,
+            (prior, current) => prior.min(current),
         }
     }
 }
 
-/// Close the current baseline window. Its minimum becomes the previous window
-/// and the next window starts empty, so a sample stops influencing the baseline
-/// once two windows have closed after it. Samples racing the rotation land in
-/// either window; both are genuine recent observations, so that is benign.
-fn rotate_baseline_window(state: &AdaptiveConcurrencyState) {
-    let closed_window_min = state.window_baseline_us.swap(0, Ordering::AcqRel);
-    if closed_window_min != 0 {
-        state
-            .prior_window_baseline_us
-            .store(closed_window_min, Ordering::Release);
-    }
-}
-
-/// Minimum of the current and previous baseline windows; `0` means no healthy
-/// sample has been recorded yet.
-fn effective_baseline_latency_us(state: &AdaptiveConcurrencyState) -> u64 {
-    let prior = state.prior_window_baseline_us.load(Ordering::Acquire);
-    let current = state.window_baseline_us.load(Ordering::Acquire);
-    match (prior, current) {
-        (0, current) => current,
-        (prior, 0) => prior,
-        (prior, current) => prior.min(current),
-    }
+/// Serial-number comparison over the wrapping window sequence. Sequences are
+/// claimed one rotation at a time, so a genuinely delayed publication is only
+/// a few rotations behind, far inside the half range.
+fn baseline_window_sequence_is_newer(candidate: u64, published: u64) -> bool {
+    let distance = candidate.wrapping_sub(published) & BASELINE_WINDOW_SEQUENCE_MASK;
+    distance != 0 && distance < BASELINE_WINDOW_SEQUENCE_HALF_RANGE
 }
 
 fn update_ewma(atomic: &AtomicU64, sample: u64) -> u64 {

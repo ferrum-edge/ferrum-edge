@@ -2753,6 +2753,62 @@ pub mod _test_support {
         }
     }
 
+    /// Drives the latency-baseline windows step by step, so a test can pause a
+    /// rotation between closing its window and publishing it.
+    pub struct AdaptiveConcurrencyBaselineHarness {
+        windows: crate::adaptive_concurrency::AdaptiveConcurrencyBaselineWindows,
+    }
+
+    /// A closed window that has not been published yet (`None` when the closed
+    /// window was empty).
+    pub struct AdaptiveConcurrencyClosedBaselineWindowToken {
+        closed: Option<crate::adaptive_concurrency::AdaptiveConcurrencyClosedBaselineWindow>,
+    }
+
+    impl AdaptiveConcurrencyClosedBaselineWindowToken {
+        pub fn is_empty(&self) -> bool {
+            self.closed.is_none()
+        }
+    }
+
+    impl AdaptiveConcurrencyBaselineHarness {
+        pub fn new() -> Self {
+            Self {
+                windows: crate::adaptive_concurrency::AdaptiveConcurrencyBaselineWindows::new(),
+            }
+        }
+
+        pub fn observe(&self, latency_us: u64) {
+            self.windows.observe(latency_us);
+        }
+
+        pub fn close_window(&self) -> AdaptiveConcurrencyClosedBaselineWindowToken {
+            AdaptiveConcurrencyClosedBaselineWindowToken {
+                closed: self.windows.close_window(),
+            }
+        }
+
+        pub fn publish_closed_window(&self, token: AdaptiveConcurrencyClosedBaselineWindowToken) {
+            if let Some(closed) = token.closed {
+                self.windows.publish_closed_window(closed);
+            }
+        }
+
+        pub fn rotate(&self) {
+            self.windows.rotate();
+        }
+
+        pub fn effective_us(&self) -> u64 {
+            self.windows.effective_us()
+        }
+    }
+
+    impl Default for AdaptiveConcurrencyBaselineHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     pub struct AdaptiveConcurrencyTransitionHarness {
         transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition,
     }
@@ -14599,19 +14655,7 @@ pub mod _test_support {
         pump_outcome: Option<UploadPumpOutcomeForTest>,
         authorization_expired: bool,
     ) -> DirectH2UploadGateForTest {
-        let pump = pump_outcome.map(|outcome| {
-            use crate::proxy::upload_pump::UploadPumpOutcome;
-            match outcome {
-                UploadPumpOutcomeForTest::Completed => UploadPumpOutcome::Completed,
-                UploadPumpOutcomeForTest::SourceError => UploadPumpOutcome::SourceError,
-                UploadPumpOutcomeForTest::Cancelled => UploadPumpOutcome::Cancelled,
-                UploadPumpOutcomeForTest::AuthorizationExpired => {
-                    UploadPumpOutcome::AuthorizationExpired
-                }
-                UploadPumpOutcomeForTest::ConsumerGone => UploadPumpOutcome::ConsumerGone,
-                UploadPumpOutcomeForTest::WriteTimeout => UploadPumpOutcome::WriteTimeout,
-            }
-        });
+        let pump = pump_outcome.map(upload_pump_outcome_from_test);
         match crate::proxy::classify_direct_h2_upload_outcome(outcome, pump, authorization_expired)
         {
             crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
@@ -14626,6 +14670,32 @@ pub mod _test_support {
             }
             crate::proxy::DirectH2UploadGate::FailClosed => DirectH2UploadGateForTest::FailClosed,
         }
+    }
+
+    fn upload_pump_outcome_from_test(
+        outcome: UploadPumpOutcomeForTest,
+    ) -> crate::proxy::upload_pump::UploadPumpOutcome {
+        use crate::proxy::upload_pump::UploadPumpOutcome;
+        match outcome {
+            UploadPumpOutcomeForTest::Completed => UploadPumpOutcome::Completed,
+            UploadPumpOutcomeForTest::SourceError => UploadPumpOutcome::SourceError,
+            UploadPumpOutcomeForTest::Cancelled => UploadPumpOutcome::Cancelled,
+            UploadPumpOutcomeForTest::AuthorizationExpired => {
+                UploadPumpOutcome::AuthorizationExpired
+            }
+            UploadPumpOutcomeForTest::ConsumerGone => UploadPumpOutcome::ConsumerGone,
+            UploadPumpOutcomeForTest::WriteTimeout => UploadPumpOutcome::WriteTimeout,
+        }
+    }
+
+    /// Error class the direct-H2 fail-closed early-response refusal reports for
+    /// the joined pump terminal.
+    pub fn direct_h2_upload_refusal_error_class_for_test(
+        pump_outcome: Option<UploadPumpOutcomeForTest>,
+    ) -> crate::retry::ErrorClass {
+        crate::proxy::upload_pump::early_response_upload_refusal_error_class(
+            pump_outcome.map(upload_pump_outcome_from_test),
+        )
     }
 
     /// Public mirror of the direct-H2 upload cancellation signal.

@@ -4,8 +4,10 @@ use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    AdaptiveConcurrencyDecreaseHarness, AdaptiveConcurrencyTransitionHarness,
+    AdaptiveConcurrencyBaselineHarness, AdaptiveConcurrencyDecreaseHarness,
+    AdaptiveConcurrencyTransitionHarness, UploadPumpOutcomeForTest,
     body_validator_descriptor_preload_required_for_test,
+    direct_h2_upload_refusal_error_class_for_test,
 };
 use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
@@ -2827,4 +2829,268 @@ fn adaptive_concurrency_compatible_reload_keeps_relearning_baseline() {
     assert_rejected(acquire_from_cache(&cache, &reloaded));
     drop(first);
     drop(second);
+}
+
+/// Issue #6309: closing a window and publishing it as the prior window are two
+/// steps, and parallel feedback callbacks can interleave between them. A
+/// rotation delayed past two newer nonempty rotations must not restore its
+/// older, faster minimum as the baseline.
+#[test]
+fn adaptive_concurrency_delayed_rotation_cannot_restore_expired_window() {
+    let windows = AdaptiveConcurrencyBaselineHarness::new();
+
+    // Window 1 holds the 1ms outlier. Callback A closes it, then pauses
+    // before publishing.
+    windows.observe(1_000);
+    windows.observe(10_000);
+    let delayed = windows.close_window();
+    assert!(!delayed.is_empty());
+
+    // Two newer windows close and publish while A is paused.
+    windows.observe(10_000);
+    windows.observe(10_000);
+    windows.rotate();
+    windows.observe(10_000);
+    windows.observe(10_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 10_000);
+
+    // A resumes. Its window is older than the published one, so the store is
+    // discarded rather than re-pinning the expired 1ms baseline.
+    windows.publish_closed_window(delayed);
+    assert_eq!(
+        windows.effective_us(),
+        10_000,
+        "a delayed rotation must not republish an expired window"
+    );
+
+    // Ordinary rotation continues to publish newer windows (repair path).
+    windows.observe(20_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 20_000);
+    windows.observe(5_000);
+    assert_eq!(
+        windows.effective_us(),
+        5_000,
+        "the current window still lowers the baseline"
+    );
+}
+
+/// Publications are ordered by the rotation that closed each window, not by
+/// the order the stores land in; an empty window publishes nothing.
+#[test]
+fn adaptive_concurrency_rotation_publication_is_ordered_not_blocked() {
+    let windows = AdaptiveConcurrencyBaselineHarness::new();
+    windows.observe(3_000);
+    let first = windows.close_window();
+    windows.observe(7_000);
+    let second = windows.close_window();
+
+    // Window 2 publishes before window 1; window 1 is then stale.
+    windows.publish_closed_window(second);
+    windows.publish_closed_window(first);
+    assert_eq!(windows.effective_us(), 7_000);
+
+    // In-order publication is accepted.
+    windows.observe(4_000);
+    let third = windows.close_window();
+    windows.publish_closed_window(third);
+    assert_eq!(windows.effective_us(), 4_000);
+
+    // An empty window leaves the prior window in place.
+    let empty = windows.close_window();
+    assert!(empty.is_empty());
+    windows.publish_closed_window(empty);
+    assert_eq!(windows.effective_us(), 4_000);
+}
+
+/// The window sequence wraps inside the packed word; ordering must survive the
+/// wrap so a long-lived target keeps rotating.
+#[test]
+fn adaptive_concurrency_rotation_order_survives_sequence_wrap() {
+    const SEQUENCE_SPACE: u64 = 1 << 24;
+    let windows = AdaptiveConcurrencyBaselineHarness::new();
+    // Advance to two sequences before the wrap with empty windows, which
+    // publish nothing.
+    for _ in 0..SEQUENCE_SPACE - 2 {
+        assert!(windows.close_window().is_empty());
+    }
+    windows.observe(9_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 9_000);
+    windows.observe(12_000);
+    let delayed = windows.close_window();
+    assert!(!delayed.is_empty());
+
+    // The next window is sequence 0 after the wrap and is newer.
+    windows.observe(11_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 11_000);
+    windows.publish_closed_window(delayed);
+    assert_eq!(
+        windows.effective_us(),
+        11_000,
+        "a pre-wrap window must stay older than a post-wrap window"
+    );
+}
+
+/// The sequence counts rotations, not samples, so a compatible reload that
+/// changes `baseline_window_samples` keeps rotation ordered and relearns.
+#[test]
+fn adaptive_concurrency_baseline_relearns_after_window_size_change() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let small = baseline_window_config(32, 32, 1, 2);
+    let large = baseline_window_config(32, 32, 1, 5);
+
+    // Ten samples at window 2: five rotations, baseline 10ms.
+    for _ in 0..10 {
+        complete_healthy_request(&limiter, &proxy, None, &small, 10);
+    }
+    assert_eq!(
+        target_snapshot(&limiter, &proxy, None).baseline_latency_us,
+        10_000
+    );
+
+    // Window 5 rotates at samples 15 and 20: both closed windows publish.
+    for _ in 11..=15 {
+        complete_healthy_request(&limiter, &proxy, None, &large, 20);
+    }
+    for _ in 16..=20 {
+        complete_healthy_request(&limiter, &proxy, None, &large, 20);
+    }
+    let relearned = target_snapshot(&limiter, &proxy, None);
+    assert_eq!(relearned.samples, 20);
+    assert_eq!(
+        relearned.baseline_latency_us, 20_000,
+        "windows closed after a window-size change must still publish"
+    );
+}
+
+/// The production rotation path still relearns through the limiter API with a
+/// tiny window, so the ordered publication keeps the two-window horizon.
+#[test]
+fn adaptive_concurrency_small_window_relearns_after_two_rotations() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = baseline_window_config(32, 32, 1, 2);
+
+    complete_healthy_request(&limiter, &proxy, None, &config, 1);
+    complete_healthy_request(&limiter, &proxy, None, &config, 10);
+    assert_eq!(
+        target_snapshot(&limiter, &proxy, None).baseline_latency_us,
+        1_000
+    );
+    for _ in 3..=6 {
+        complete_healthy_request(&limiter, &proxy, None, &config, 10);
+    }
+    let relearned = target_snapshot(&limiter, &proxy, None);
+    assert_eq!(relearned.samples, 6);
+    assert_eq!(
+        relearned.baseline_latency_us, 10_000,
+        "the 1ms window must expire after two newer windows close"
+    );
+    assert_eq!(relearned.in_flight, 0);
+}
+
+/// Issue #6314: when a direct-H2 backend answers before the client upload
+/// finishes and the client's own upload stream then fails, the gateway still
+/// refuses the early response (502), but a surviving handler that settles the
+/// permit must not train the backend's limit. Other indeterminate terminals
+/// keep counting as backend protocol failures.
+#[test]
+fn adaptive_concurrency_client_upload_refusal_is_neutral_but_backend_terminals_back_off() {
+    let proxy = proxy();
+
+    let client_class =
+        direct_h2_upload_refusal_error_class_for_test(Some(UploadPumpOutcomeForTest::SourceError));
+    assert_eq!(client_class, ErrorClass::ClientDisconnect);
+
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = limiter_config(4);
+    let permit = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("request should be admitted");
+    assert_eq!(target_snapshot(&limiter, &proxy, None).in_flight, 1);
+    permit.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 502,
+        connection_error: false,
+        error_class: Some(client_class),
+        backend_elapsed: Duration::from_millis(5),
+    });
+    let settled = target_snapshot(&limiter, &proxy, None);
+    assert_eq!(settled.limit, 4, "a client upload failure must not shrink");
+    assert_eq!(settled.samples, 0, "nor feed a latency sample");
+    drop(permit);
+    assert_eq!(target_snapshot(&limiter, &proxy, None).in_flight, 0);
+
+    for pump in [
+        None,
+        Some(UploadPumpOutcomeForTest::Cancelled),
+        Some(UploadPumpOutcomeForTest::ConsumerGone),
+        Some(UploadPumpOutcomeForTest::Completed),
+    ] {
+        let class = direct_h2_upload_refusal_error_class_for_test(pump);
+        assert_eq!(
+            class,
+            ErrorClass::ProtocolError,
+            "pump {pump:?} is not a client source failure"
+        );
+        let limiter = AdaptiveConcurrencyLimiter::new(16);
+        let permit = limiter
+            .try_acquire(&proxy, None, Arc::clone(&config))
+            .expect("request should be admitted");
+        permit.record_backend_outcome(BackendAdmissionOutcome {
+            response_status: 502,
+            connection_error: false,
+            error_class: Some(class),
+            backend_elapsed: Duration::from_millis(5),
+        });
+        assert_eq!(
+            target_snapshot(&limiter, &proxy, None).limit,
+            2,
+            "pump {pump:?} refusal still backs the backend off"
+        );
+        drop(permit);
+        assert_eq!(target_snapshot(&limiter, &proxy, None).in_flight, 0);
+    }
+}
+
+/// Issue #6307: the H3-to-H2 gRPC streaming bridge captures its response timing
+/// when the backend headers are available. Every admission settlement after
+/// that capture must record the captured duration, so a slow successful body
+/// tail, trailers, or downstream backpressure cannot lengthen the healthy
+/// latency sample. The permit is still settled only at the terminal outcome.
+#[test]
+fn h3_grpc_streaming_bridge_settles_admission_with_captured_response_timing() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let handler = cross
+        .split("async fn handle_h3_grpc_streaming_response<S>(")
+        .nth(1)
+        .expect("H3 gRPC streaming response handler")
+        .split("\nasync fn ")
+        .next()
+        .and_then(|body| body.split("\nfn ").next())
+        .expect("bounded H3 gRPC streaming response handler");
+    let capture = "let backend_admission_response_elapsed = backend_admission_start.elapsed();";
+    let (_, after_capture) = handler
+        .split_once(capture)
+        .expect("the handler must capture response timing at header availability");
+    assert!(
+        !after_capture.contains("backend_admission_start.elapsed()"),
+        "admission settlement after header availability must use the captured response timing"
+    );
+    let terminal = after_capture
+        .rsplit("record_cross_protocol_backend_admission_outcome(")
+        .next()
+        .expect("terminal admission settlement");
+    assert!(
+        terminal.contains("outcome_error_class,\n        backend_admission_response_elapsed,"),
+        "the terminal settlement must record the captured response timing: {terminal}"
+    );
+    assert!(
+        after_capture
+            .contains("let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64()"),
+        "the logged TTFB and the latency sample must share one capture"
+    );
 }

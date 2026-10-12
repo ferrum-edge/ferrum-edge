@@ -61694,7 +61694,12 @@ async fn proxy_to_backend_http2(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ProtocolError),
+                        // A client upload failure stays backend-neutral (#6314).
+                        error_class: Some(
+                            crate::proxy::upload_pump::early_response_upload_refusal_error_class(
+                                pump_outcome,
+                            ),
+                        ),
                         request_on_wire: true,
                         buffered_trailers: None,
                     },

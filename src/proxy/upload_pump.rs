@@ -266,6 +266,28 @@ pub(crate) const fn upload_pump_error_message(outcome: UploadPumpOutcome) -> &'s
     }
 }
 
+/// Error class of a fail-closed direct-H2 early-response refusal, by the pump
+/// terminal that left the upload unfinished (issue #6314).
+///
+/// The refusal itself is unconditional: an unfinished upload proves neither
+/// its size nor its authorization bound. Only the attribution varies. A
+/// `SourceError` is the frontend client's own upload failing (reset, cancel,
+/// malformed stream), so it carries the centrally neutral `ClientDisconnect`
+/// class and cannot train circuit-breaker, passive-health, or adaptive
+/// concurrency accounting as a backend fault. Every other indeterminate
+/// terminal (gateway cancellation, a backend that released the upload, no
+/// terminal at all) keeps `ProtocolError`, so a genuine backend reset or
+/// protocol failure still counts against the backend.
+pub(crate) const fn early_response_upload_refusal_error_class(
+    outcome: Option<UploadPumpOutcome>,
+) -> crate::retry::ErrorClass {
+    if matches!(outcome, Some(UploadPumpOutcome::SourceError)) {
+        crate::retry::ErrorClass::ClientDisconnect
+    } else {
+        crate::retry::ErrorClass::ProtocolError
+    }
+}
+
 /// Transport-side error for a non-clean pump terminal.
 ///
 /// Write-timeout uses a typed `io::ErrorKind::TimedOut` so the existing
