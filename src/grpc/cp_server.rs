@@ -5,7 +5,9 @@
 //!   (update_type=0), then incremental `DELTA` updates (update_type=1) as config changes.
 //!   If a DP lags behind the broadcast channel (default capacity 128, configurable
 //!   via `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`), it receives a fresh
-//!   full snapshot instead of the missed deltas.
+//!   full snapshot instead of the missed deltas. Retained broadcasts committed
+//!   strictly before a snapshot the stream already sent are then dropped, so
+//!   the DP's stale-delta fence does not end the stream (issue #6163).
 //! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
 //!
 //! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
@@ -63,7 +65,7 @@ use super::auth::{
 };
 use super::backend_egress_attestation::ReportedEgressPolicy;
 use super::configsync_lifecycle::{
-    CONFIGSYNC_HEARTBEAT_INTERVAL_SECS, check_config_sync_build_identity,
+    CONFIGSYNC_HEARTBEAT_INTERVAL_SECS, SubscriberSnapshotCursor, check_config_sync_build_identity,
     config_sync_build_identity,
 };
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
@@ -2384,8 +2386,19 @@ impl ConfigSync for CpGrpcServer {
         let config_for_recovery = self.config.clone();
         let recovery_namespace = dp_namespace.clone();
         let recovery_scope = self.scope.clone();
+        // A lagged receiver resumes at the oldest retained broadcast, so
+        // updates already folded into a snapshot this stream sent may follow
+        // it. Drop those instead of letting the DP fence end the stream
+        // (issue #6163).
+        let mut snapshot_cursor = SubscriberSnapshotCursor::new(config.loaded_at);
         let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
-            Ok(update) => Some(Ok(update)),
+            Ok(update) => {
+                if update.heartbeat || snapshot_cursor.admits(&update.version) {
+                    Some(Ok(update))
+                } else {
+                    None
+                }
+            }
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                 warn!(
                     "DP config stream lagged behind by {} updates — sending full snapshot to recover",
@@ -2417,6 +2430,7 @@ impl ConfigSync for CpGrpcServer {
                     };
                 match Self::config_json_for_dp(&filtered) {
                     Ok(config_json) => {
+                        snapshot_cursor.record_snapshot(current.loaded_at);
                         Some(Ok(ConfigUpdate {
                             update_type: 0, // FULL_SNAPSHOT
                             config_json,

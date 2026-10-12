@@ -2224,6 +2224,37 @@ pub fn configure_configsync_endpoint(endpoint: Endpoint) -> Endpoint {
         .tcp_keepalive(Some(Duration::from_secs(CONFIGSYNC_TCP_KEEPALIVE_SECS)))
 }
 
+/// Build the tonic client TLS config for one ConfigSync CP endpoint.
+///
+/// A pinned `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` bundle is the ONLY trust anchor
+/// set. Without one, the bundled Mozilla (webpki) roots are selected
+/// explicitly: tonic's `ClientTlsConfig::new()` starts with no anchors, and
+/// the `tls-webpki-roots` Cargo feature only makes the roots available, so a
+/// publicly trusted CP certificate would otherwise have nothing to chain to
+/// (issue #6188). Verification is never disabled.
+pub fn configsync_client_tls_config(tls: &DpGrpcTlsConfig, cp_url: &str) -> ClientTlsConfig {
+    let mut client_tls = ClientTlsConfig::new();
+
+    if let Some(ref ca_pem) = tls.ca_cert_pem {
+        client_tls = client_tls.ca_certificate(Certificate::from_pem(ca_pem));
+    } else {
+        client_tls = client_tls.with_webpki_roots();
+    }
+
+    if let (Some(cert_pem), Some(key_pem)) = (&tls.client_cert_pem, &tls.client_key_pem) {
+        client_tls = client_tls.identity(Identity::from_pem(cert_pem, key_pem));
+    }
+
+    // Extract domain from URL for TLS SNI
+    if let Ok(uri) = cp_url.parse::<http::Uri>()
+        && let Some(host) = uri.host()
+    {
+        client_tls = client_tls.domain_name(host);
+    }
+
+    client_tls
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_subscribe_with_startup_ready_inner(
     cp_url: &str,
@@ -2252,24 +2283,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
 
     // Apply TLS configuration if the URL uses https:// or TLS config is provided
     if let Some(tls) = tls_config {
-        let mut client_tls = ClientTlsConfig::new();
-
-        if let Some(ref ca_pem) = tls.ca_cert_pem {
-            client_tls = client_tls.ca_certificate(Certificate::from_pem(ca_pem));
-        }
-
-        if let (Some(cert_pem), Some(key_pem)) = (&tls.client_cert_pem, &tls.client_key_pem) {
-            client_tls = client_tls.identity(Identity::from_pem(cert_pem, key_pem));
-        }
-
-        // Extract domain from URL for TLS SNI
-        if let Ok(uri) = cp_url.parse::<http::Uri>()
-            && let Some(host) = uri.host()
-        {
-            client_tls = client_tls.domain_name(host);
-        }
-
-        endpoint = endpoint.tls_config(client_tls)?;
+        endpoint = endpoint.tls_config(configsync_client_tls_config(tls, cp_url))?;
     }
 
     let channel = endpoint.connect().await?;

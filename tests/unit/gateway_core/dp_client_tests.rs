@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferrum_edge::grpc::dp_client::{
-    DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt, generate_dp_jwt_with_issuer,
-    subscribe_admission_refusal,
+    DpCpConnectionState, DpGrpcTlsConfig, GrpcJwtSecret, configsync_client_tls_config,
+    generate_dp_jwt, generate_dp_jwt_with_issuer, subscribe_admission_refusal,
 };
 use serial_test::serial;
 
@@ -457,4 +457,44 @@ fn non_status_errors_are_not_admission_refusals() {
 
     let io = anyhow::Error::from(std::io::Error::other("broken pipe"));
     assert!(subscribe_admission_refusal(&io).is_none());
+}
+
+/// Issue #6188: an https:// CP URL without a pinned CA must select the bundled
+/// webpki roots explicitly (tonic's `ClientTlsConfig::new()` has none), while
+/// a pinned CA stays the exclusive trust anchor set.
+#[test]
+fn configsync_client_tls_selects_webpki_roots_only_without_a_pinned_ca() {
+    let no_ca = DpGrpcTlsConfig {
+        ca_cert_pem: None,
+        client_cert_pem: None,
+        client_key_pem: None,
+    };
+    let rendered = format!(
+        "{:?}",
+        configsync_client_tls_config(&no_ca, "https://cp.example.com:50051")
+    );
+    assert!(
+        rendered.contains("with_webpki_roots: true"),
+        "no-CA https CP must trust the bundled webpki roots: {rendered}"
+    );
+    assert!(
+        rendered.contains("cp.example.com"),
+        "SNI domain must be set"
+    );
+
+    let pinned = DpGrpcTlsConfig {
+        ca_cert_pem: Some(
+            b"-----BEGIN CERTIFICATE-----\nMA==\n-----END CERTIFICATE-----\n".to_vec(),
+        ),
+        client_cert_pem: None,
+        client_key_pem: None,
+    };
+    let rendered = format!(
+        "{:?}",
+        configsync_client_tls_config(&pinned, "https://cp.example.com:50051")
+    );
+    assert!(
+        rendered.contains("with_webpki_roots: false"),
+        "a pinned CA must not be widened with public roots: {rendered}"
+    );
 }

@@ -19,11 +19,12 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     CONFIGSYNC_MAX_SILENCE_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome,
     ConfigSyncDivergenceMetrics, DeltaRefuse, DeltaRejectionKind, DeltaRejectionStreamDisposition,
     FullSnapshotStreamDisposition, GatewayTrustEquivalenceState, MultiCpBackoffState,
-    SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriptionApplyState,
-    VersionCompatError, VersionReconcileError, advance_authority_from_committed,
-    advance_multi_cp_backoff, authoritative_snapshot_payload_matches, backoff_max_secs,
-    check_config_sync_build_identity, check_peer_version_compatibility, config_sync_build_identity,
-    connection_error_outcome, cp_endpoints_same_source, delta_rejection_stream_disposition,
+    SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriberSnapshotCursor,
+    SubscriptionApplyState, VersionCompatError, VersionReconcileError,
+    advance_authority_from_committed, advance_multi_cp_backoff,
+    authoritative_snapshot_payload_matches, backoff_max_secs, check_config_sync_build_identity,
+    check_peer_version_compatibility, config_sync_build_identity, connection_error_outcome,
+    cp_endpoints_same_source, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, evaluate_delta_authority,
     evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew, failure_backoff_sequence,
     full_snapshot_stream_disposition, gateway_config_content_matches,
@@ -1651,4 +1652,45 @@ fn admission_refused_still_sleeps_with_one_cp() {
     assert_eq!(state.current_cp_index, 0);
     grow_backoff_after_failure_sleep(&mut state);
     assert!(state.backoff_secs > initial);
+}
+
+/// Issue #6163: after a lag-recovery snapshot at t3, retained broadcasts
+/// committed at t1/t2 are already folded into it and must not be forwarded
+/// (the DP's source-blind fence would end the stream), while a genuinely new
+/// update and an equal-stamp update still flow.
+#[test]
+fn subscriber_snapshot_cursor_drops_only_retained_updates_older_than_its_snapshots() {
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 10).unwrap();
+    let t2 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 20).unwrap();
+    let t3 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+    let t4 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 40).unwrap();
+
+    let mut cursor = SubscriberSnapshotCursor::new(t0);
+    assert!(cursor.admits(&t1.to_rfc3339()));
+    assert!(cursor.admits(&t0.to_rfc3339()), "equal stamp is forwarded");
+
+    cursor.record_snapshot(t3);
+    assert_eq!(cursor.watermark(), t3);
+    assert!(!cursor.admits(&t1.to_rfc3339()));
+    assert!(!cursor.admits(&t2.to_rfc3339()));
+    assert!(cursor.admits(&t3.to_rfc3339()));
+    assert!(cursor.admits(&t4.to_rfc3339()));
+    // Equivalent RFC3339 spelling of an older instant is still dropped.
+    assert!(!cursor.admits("2026-01-01T01:00:20+01:00"));
+
+    // The DP fence would refuse exactly what the cursor drops.
+    let mut authority = None;
+    advance_authority_from_committed(&mut authority, "http://cp-a:50051", t3);
+    assert!(evaluate_delta_authority(authority.as_ref(), t2).is_err());
+    assert!(evaluate_delta_authority(authority.as_ref(), t3).is_ok());
+
+    // An older recovery stamp never lowers the watermark.
+    cursor.record_snapshot(t1);
+    assert_eq!(cursor.watermark(), t3);
+    assert!(!cursor.admits(&t2.to_rfc3339()));
+
+    // Unparseable versions are forwarded so the DP fails closed on them.
+    assert!(cursor.admits("not-a-timestamp"));
+    assert!(cursor.admits(""));
 }

@@ -714,6 +714,57 @@ pub fn evaluate_delta_authority(
     Ok(())
 }
 
+/// CP-side freshness cursor for one ConfigSync Subscribe stream (issue #6163).
+///
+/// A tokio broadcast receiver that reports `Lagged` moves its cursor to the
+/// OLDEST update still retained, not to the tail. The CP answers the lag with
+/// a FULL_SNAPSHOT of the current config, so the retained broadcasts that
+/// follow it can carry committed stamps older than that snapshot. The DP's
+/// source-blind [`evaluate_delta_authority`] fence refuses such a DELTA and
+/// terminates the stream, and an older retained FULL_SNAPSHOT would roll the
+/// DP back. The same race exists for the initial snapshot, because the
+/// receiver is registered before the snapshot is loaded.
+///
+/// The cursor records the committed stamp of every snapshot the stream itself
+/// produced and refuses retained broadcasts strictly older than it. Those
+/// broadcasts were committed before the snapshot was loaded, so the snapshot
+/// already contains them. Equal and newer stamps are forwarded, as are stamps
+/// that do not parse: the DP fails closed on those, and a CP-side filter must
+/// not hide them. The DP fence is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriberSnapshotCursor {
+    watermark: DateTime<Utc>,
+}
+
+impl SubscriberSnapshotCursor {
+    /// Seed the cursor from the stream's initial FULL_SNAPSHOT stamp.
+    pub fn new(initial_snapshot_committed: DateTime<Utc>) -> Self {
+        Self {
+            watermark: initial_snapshot_committed,
+        }
+    }
+
+    /// Record a lag-recovery FULL_SNAPSHOT this stream sent. Monotonic: an
+    /// older recovery stamp never lowers the watermark.
+    pub fn record_snapshot(&mut self, committed: DateTime<Utc>) {
+        self.watermark = monotonic_watermark(Some(self.watermark), committed);
+    }
+
+    /// Current watermark.
+    pub fn watermark(&self) -> DateTime<Utc> {
+        self.watermark
+    }
+
+    /// Whether a broadcast update with `version` (its committed RFC3339
+    /// stamp) should still be forwarded on this stream.
+    pub fn admits(&self, version: &str) -> bool {
+        match DateTime::parse_from_rfc3339(version) {
+            Ok(committed) => committed.with_timezone(&Utc) >= self.watermark,
+            Err(_) => true,
+        }
+    }
+}
+
 /// Why a non-empty DELTA must terminate the stream (issue #2394).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaRejectionKind {
