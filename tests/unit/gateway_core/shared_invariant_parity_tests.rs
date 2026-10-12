@@ -305,6 +305,13 @@ const DIRECT_PROBE_ADMISSION_SITES: &[(&str, &str, usize)] = &[
     ),
 ];
 
+/// What each direct-cache admission arm must contain, whitespace-stripped: the
+/// guard is bound to the generation that SAME admission returned (#6177).
+const DIRECT_ADMISSION_ARM: &str = "Ok((cb,is_half_open_probe,admission_generation))";
+const DIRECT_ADMISSION_GUARD: &str =
+    "HalfOpenProbeGuard::for_admitted_probe(&cb,is_half_open_probe,admission_generation";
+const DIRECT_ADMISSION_REARM: &str = "cb_probe.rearm(&cb,is_half_open_probe,admission_generation";
+
 /// Files that must own a guard rather than re-deriving the release: the
 /// admission sites plus every module they hand the guard to.
 const PROBE_GUARD_HOLDERS: &[&str] = &[
@@ -318,23 +325,28 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
     "src/proxy/udp_proxy.rs",
 ];
 
-/// Every settle path on the shared guard: `(label, signature, terminator)`.
-/// Each must reach the NEUTRAL release or explicitly hand the slot over.
-const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str)] = &[
+/// Every settle path on the shared guard:
+/// `(label, signature, terminator, neutral release it must reach)`. The guard's
+/// own releases are bound to the slot's admission generation (#6177), so a guard
+/// that outlives a reopen cannot free a later cycle's slot.
+const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str, &str)] = &[
     (
         "explicit gateway-side refusal",
         "    pub fn release_neutral(&self) {",
         "\n    }\n",
+        "record_neutral_for_admission(true, self.admission_generation)",
     ),
     (
         "dropped future (client disconnect)",
         "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
+        "record_neutral_for_admission(true, self.admission_generation)",
     ),
     (
         "gRPC streaming recorder handoff",
         "impl Drop for GrpcStreamingProbeRecorder {",
         "\n}\n",
+        "record_neutral(",
     ),
 ];
 
@@ -386,14 +398,21 @@ fn every_circuit_breaker_admission_site_carries_a_probe_guard() {
                 .split_once("Err(_) =>")
                 .expect("cache admission must handle refusal")
                 .0;
+            // Whitespace-insensitive, so rustfmt line breaks cannot hide a dropped
+            // argument.
+            let admitted: String = admitted.split_whitespace().collect();
             assert!(
-                admitted
-                    .contains("HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe)"),
-                "{signature} must own each slot on the breaker returned by cache admission"
+                admitted.contains(DIRECT_ADMISSION_ARM),
+                "{signature} must keep the generation its cache admission returned"
+            );
+            assert!(
+                admitted.contains(DIRECT_ADMISSION_GUARD),
+                "{signature} must own each slot on the breaker returned by cache admission, \
+                 bound to that admission's generation"
             );
             if file == "src/proxy/tcp_proxy.rs" {
                 assert!(
-                    admitted.contains("cb_probe.rearm(&cb, is_half_open_probe)"),
+                    admitted.contains(DIRECT_ADMISSION_REARM),
                     "TCP retries must rearm the guard on the newly admitted breaker"
                 );
             }
@@ -432,10 +451,10 @@ fn no_dispatch_path_carries_a_bare_probe_flag_beside_the_guard() {
 #[test]
 fn every_probe_guard_settle_path_releases_neutrally() {
     let text = source("src/proxy/mod.rs");
-    for &(label, signature, terminator) in PROBE_GUARD_SETTLE_PATHS {
+    for &(label, signature, terminator, release) in PROBE_GUARD_SETTLE_PATHS {
         let body = item_body(&text, signature, terminator);
         assert!(
-            body.contains("record_neutral("),
+            body.contains(release),
             "the {label} settle path must return the probe slot through the NEUTRAL \
              release: a client disconnect is neither a backend success nor a backend \
              failure, and leaving the slot held wedges the breaker"

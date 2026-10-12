@@ -130,7 +130,6 @@ impl CircuitBreaker {
     /// [`record_neutral_for_admission`](Self::record_neutral_for_admission) so a
     /// release that outlives a reopen cannot free a slot in a later cycle.
     #[inline]
-    #[allow(dead_code)]
     pub fn can_execute_with_generation(&self) -> Result<(bool, u64), CircuitOpenError> {
         self.can_execute_inner(None)
             .map(|(is_half_open_probe, generation)| (is_half_open_probe, generation as u64))
@@ -369,7 +368,6 @@ impl CircuitBreaker {
     /// no-op and cannot reduce a later cycle's probe occupancy. Like
     /// [`record_neutral`](Self::record_neutral), it never moves breaker health
     /// and never underflows.
-    #[allow(dead_code)]
     pub fn record_neutral_for_admission(
         &self,
         is_half_open_probe: bool,
@@ -936,35 +934,38 @@ impl CircuitBreakerCache {
     /// `target_key` should be `Some("host:port")` when the proxy uses an upstream,
     /// or `None` for direct backend proxies.
     ///
-    /// Returns `Ok((cb, is_half_open_probe))`. The caller MUST thread
-    /// `is_half_open_probe` into every subsequent `record_success` /
+    /// Returns `Ok((cb, is_half_open_probe, admission_generation))`. The caller
+    /// MUST thread `is_half_open_probe` into every subsequent `record_success` /
     /// `record_failure` call on this breaker so that the half-open in-flight
     /// counter is decremented only for requests that actually hold a probe slot.
+    ///
+    /// `admission_generation` is the open generation the admission was decided
+    /// in, taken from the same atomic operation that admitted the request (see
+    /// [`CircuitBreaker::can_execute_with_generation`]). A probe owner hands it
+    /// to `HalfOpenProbeGuard` so a neutral release that outlives a reopen
+    /// cannot free a later cycle's slot (#6177).
     pub fn can_execute(
         &self,
         namespace: &str,
         proxy_id: &str,
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
-    ) -> Result<(Arc<CircuitBreaker>, bool), CircuitOpenError> {
+    ) -> Result<(Arc<CircuitBreaker>, bool, u64), CircuitOpenError> {
         let cb = self.get_or_create(namespace, proxy_id, target_key, config);
-        let is_half_open_probe = cb.can_execute()?;
-        Ok((cb, is_half_open_probe))
+        let (is_half_open_probe, admission_generation) = cb.can_execute_with_generation()?;
+        Ok((cb, is_half_open_probe, admission_generation))
     }
 
-    /// Like [`can_execute`](Self::can_execute), but also returns the breaker's open
-    /// generation captured BEFORE the admission decision.
+    /// Like [`can_execute`](Self::can_execute); the third element is the open
+    /// generation the request is admitted under.
     ///
-    /// Because the snapshot is taken before `can_execute`, the returned epoch is
-    /// always `<=` the generation the request is actually admitted under: a
-    /// concurrent open racing this admission can only make a later deferred
-    /// streaming outcome look *stale* (neutralized — recovered by the next probe),
-    /// never *too new* (which would let a request heal/reopen a HALF_OPEN cycle it
-    /// never probed). Combined with the bump-before-publish ordering in
-    /// `record_failure`/`reopen_after_probe_failure`, a probe admitted into the
-    /// current OPEN cycle still captures that cycle's generation in the common
-    /// (non-racy) case. Used by the #1649 streaming-deferral admission sites — the
-    /// initial admission and every retry-target rotation — where the backend-health
+    /// The generation is the one the admitting atomic operation observed or
+    /// published, so it is exactly the admission's own cycle: a concurrent open
+    /// racing this admission can only make a later deferred streaming outcome
+    /// look *stale* (neutralized — recovered by the next probe), never *too new*
+    /// (which would let a request heal/reopen a HALF_OPEN cycle it never probed).
+    /// Used by the #1649 streaming-deferral admission sites — the initial
+    /// admission and every retry-target rotation — where the backend-health
     /// outcome is recorded at response-body completion. (#1649 R6 finding 3)
     pub fn can_execute_with_admission_epoch(
         &self,
@@ -973,10 +974,7 @@ impl CircuitBreakerCache {
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
     ) -> Result<(Arc<CircuitBreaker>, bool, u64), CircuitOpenError> {
-        let cb = self.get_or_create(namespace, proxy_id, target_key, config);
-        let admission_open_epoch = cb.open_epoch();
-        let is_half_open_probe = cb.can_execute()?;
-        Ok((cb, is_half_open_probe, admission_open_epoch))
+        self.can_execute(namespace, proxy_id, target_key, config)
     }
 
     /// Snapshot of all circuit breaker states for metrics.

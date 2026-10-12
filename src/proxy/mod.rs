@@ -5698,6 +5698,9 @@ impl Drop for StreamLbSetupFailureGuard {
 ///   client drive a healthy backend to OPEN.
 /// * [`Drop`] does the same for every path that settles nothing at all — above
 ///   all a service future dropped under the gateway by a client disconnect.
+/// * Both neutral releases are bound to the open generation the slot was
+///   admitted in (#6177). A reopen already zeroes the old cycle's slots, so a
+///   guard that outlives it must not free a slot a LATER cycle's probe holds.
 /// * [`Self::rearm`] re-points the guard at the breaker of a rotated retry
 ///   target after the previous target's slot has been settled.
 ///
@@ -5716,6 +5719,10 @@ pub struct HalfOpenProbeGuard {
     /// different `CircuitBreaker` instance than the one that admitted the probe.
     /// `None` whenever no slot was ever held.
     cb: Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
+    /// The open generation the slot was admitted in, as returned by the
+    /// admitting CAS itself — never a pre- or post-admission snapshot. Neutral
+    /// releases are no-ops once the breaker has left this generation (#6177).
+    admission_generation: u64,
     /// Whether this guard still owns an unsettled probe slot.
     armed: AtomicBool,
 }
@@ -5726,11 +5733,13 @@ impl HalfOpenProbeGuard {
     pub fn none() -> Self {
         Self {
             cb: None,
+            admission_generation: 0,
             armed: AtomicBool::new(false),
         }
     }
 
     /// Take ownership of the slot `check_circuit_breaker` just admitted.
+    /// `admission_generation` is the generation that same admission returned.
     ///
     /// The breaker is looked up only for an ACTUAL probe, so the CLOSED-state hot
     /// path costs one `bool` test and no cache touch.
@@ -5739,6 +5748,7 @@ impl HalfOpenProbeGuard {
         proxy: &Proxy,
         target_key: Option<&str>,
         is_half_open_probe: bool,
+        admission_generation: u64,
     ) -> Self {
         if !is_half_open_probe {
             return Self::none();
@@ -5754,6 +5764,7 @@ impl HalfOpenProbeGuard {
         );
         Self {
             cb: Some(cb),
+            admission_generation,
             armed: AtomicBool::new(true),
         }
     }
@@ -5761,13 +5772,16 @@ impl HalfOpenProbeGuard {
     /// Take ownership of the slot an admission on an already-resolved breaker
     /// just returned — the retry paths, which re-admit through
     /// `can_execute*` and get the `Arc` back directly. `is_half_open_probe`
-    /// is that admission's own verdict: `false` yields an empty guard.
+    /// and `admission_generation` are that admission's own verdict and
+    /// generation: `false` yields an empty guard.
     pub fn for_admitted_probe(
         cb: &Arc<crate::circuit_breaker::CircuitBreaker>,
         is_half_open_probe: bool,
+        admission_generation: u64,
     ) -> Self {
         Self {
             cb: is_half_open_probe.then(|| Arc::clone(cb)),
+            admission_generation,
             armed: AtomicBool::new(is_half_open_probe),
         }
     }
@@ -5792,12 +5806,13 @@ impl HalfOpenProbeGuard {
     }
 
     /// Release the slot NEUTRAL: the gateway refused this request before any
-    /// backend outcome existed, so the breaker's health must not move.
+    /// backend outcome existed, so the breaker's health must not move. A no-op
+    /// once a reopen has retired the slot's admission generation.
     pub fn release_neutral(&self) {
         if self.take_slot()
             && let Some(cb) = &self.cb
         {
-            cb.record_neutral(true);
+            cb.record_neutral_for_admission(true, self.admission_generation);
         }
     }
 
@@ -5810,11 +5825,12 @@ impl HalfOpenProbeGuard {
         &mut self,
         cb: &Arc<crate::circuit_breaker::CircuitBreaker>,
         is_half_open_probe: bool,
+        admission_generation: u64,
     ) {
         self.release_neutral();
         // The old value is disarmed by the release above, so the assignment's
         // implicit drop cannot free the slot this guard is about to adopt.
-        *self = Self::for_admitted_probe(cb, is_half_open_probe);
+        *self = Self::for_admitted_probe(cb, is_half_open_probe, admission_generation);
     }
 }
 
@@ -5823,7 +5839,7 @@ impl Drop for HalfOpenProbeGuard {
         if self.armed.swap(false, Ordering::AcqRel)
             && let Some(cb) = &self.cb
         {
-            cb.record_neutral(true);
+            cb.record_neutral_for_admission(true, self.admission_generation);
         }
     }
 }
@@ -16568,12 +16584,12 @@ async fn handle_websocket_request_authenticated(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((cb, is_half_open_probe)) => {
+                            Ok((cb, is_half_open_probe, admission_generation)) => {
                                 // Re-point the probe guard at the rotated target's
                                 // breaker: the prior target's slot was taken by the
                                 // intermediate failure record above, and this retry
                                 // may itself have been admitted as a probe.
-                                cb_probe.rearm(&cb, is_half_open_probe);
+                                cb_probe.rearm(&cb, is_half_open_probe, admission_generation);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
@@ -36940,6 +36956,7 @@ async fn handle_proxy_request_inner(
         &proxy,
         cb_target_key.as_deref(),
         cb_is_half_open_probe,
+        cb_admission_open_epoch,
     );
 
     // For ordinary response-policy reevaluation, finalize the body only after
@@ -38918,7 +38935,7 @@ async fn handle_proxy_request_inner(
                             // finished uploading, so header-flush release (guard
                             // `Drop`) is the correct timing; the eager-record arms
                             // below take the slot instead.
-                            cb_probe.rearm(&cb, is_half_open_probe);
+                            cb_probe.rearm(&cb, is_half_open_probe, admission_open_epoch);
                         }
                         Err(_) => {
                             // Rotated/retried target's breaker rejected: don't
@@ -42250,7 +42267,7 @@ async fn handle_proxy_request_inner(
                     Ok((cb, is_half_open_probe, admission_open_epoch)) => {
                         // Adopt the rotated target's probe slot (the prior
                         // target's was taken by the intermediate record above).
-                        cb_probe.rearm(&cb, is_half_open_probe);
+                        cb_probe.rearm(&cb, is_half_open_probe, admission_open_epoch);
                         // #1649 R6 finding 2: re-capture the admission epoch for the
                         // rotated target so the deferred StreamingH2 body-completion
                         // outcome is stale-checked against THIS target's generation,

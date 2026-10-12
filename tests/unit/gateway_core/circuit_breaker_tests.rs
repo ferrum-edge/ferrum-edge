@@ -417,8 +417,7 @@ fn stale_cycle_neutral_release_cannot_free_a_current_cycle_probe_slot() {
     assert!(c_probe && d_probe, "C and D are HALF_OPEN probes");
     assert_eq!(c_generation, d_generation);
     assert_ne!(
-        c_generation,
-        b_generation,
+        c_generation, b_generation,
         "the reopen must start a new open generation"
     );
     assert_eq!(cb.half_open_in_flight(), 2);
@@ -2057,7 +2056,7 @@ fn test_cache_can_execute_returns_probe_flag() {
     };
 
     // CLOSED: not a probe
-    let (cb, is_probe) = cache.can_execute("ferrum", "p1", None, &config).unwrap();
+    let (cb, is_probe, _) = cache.can_execute("ferrum", "p1", None, &config).unwrap();
     assert!(!is_probe);
 
     // Trip open
@@ -2065,7 +2064,7 @@ fn test_cache_can_execute_returns_probe_flag() {
     assert_eq!(cb.state_name(), "open");
 
     // HALF_OPEN: IS a probe
-    let (_cb2, is_probe2) = cache.can_execute("ferrum", "p1", None, &config).unwrap();
+    let (_cb2, is_probe2, _) = cache.can_execute("ferrum", "p1", None, &config).unwrap();
     assert!(is_probe2);
 }
 
@@ -2390,9 +2389,9 @@ fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
     // #1649 R6 finding 3: the admission epoch must reflect the generation the
     // request is admitted under. A CLOSED admission captures the last open
     // generation; a HALF_OPEN probe captures the generation it is probing. (The
-    // pre-admission snapshot also guarantees the captured value is never NEWER than
-    // the admission generation, so a concurrent open can only neutralize — never
-    // wrongly heal — a deferred outcome; that race is not reproducible
+    // value comes from the admitting atomic operation itself, so it is never NEWER
+    // than the admission generation and a concurrent open can only neutralize —
+    // never wrongly heal — a deferred outcome; that race is not reproducible
     // single-threaded, but the per-state values are asserted here.)
     let config = CircuitBreakerConfig {
         failure_threshold: 1,
@@ -2857,7 +2856,8 @@ fn breaker_with_admitted_probe() -> (Arc<CircuitBreaker>, HalfOpenProbeGuard) {
     let cb = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
     cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
-    let is_half_open_probe = cb.can_execute().expect("timeout 0 admits a probe");
+    let (is_half_open_probe, admission_generation) =
+        cb.can_execute_with_generation().expect("timeout 0 admits a probe");
     assert!(
         is_half_open_probe,
         "the admission must claim the probe slot"
@@ -2867,7 +2867,8 @@ fn breaker_with_admitted_probe() -> (Arc<CircuitBreaker>, HalfOpenProbeGuard) {
         cb.can_execute().is_err(),
         "the single probe slot must be occupied"
     );
-    let guard = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+    let guard =
+        HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe, admission_generation);
     (cb, guard)
 }
 
@@ -2907,12 +2908,16 @@ fn dropping_the_udp_cache_probe_guard_releases_the_admitted_breaker_slot() {
         let cb = cache.get_or_create("default", "udp-proxy", target, &config);
         cb.record_failure(502, true, false);
         assert_eq!(cb.state_name(), "open");
-        let (admitted_cb, is_half_open_probe) = cache
+        let (admitted_cb, is_half_open_probe, admission_generation) = cache
             .can_execute("default", "udp-proxy", target, &config)
             .expect("timeout 0 admits the UDP setup probe");
         assert!(Arc::ptr_eq(&cb, &admitted_cb));
         assert!(is_half_open_probe);
-        let cb_probe = HalfOpenProbeGuard::for_admitted_probe(&admitted_cb, is_half_open_probe);
+        let cb_probe = HalfOpenProbeGuard::for_admitted_probe(
+            &admitted_cb,
+            is_half_open_probe,
+            admission_generation,
+        );
         assert_eq!(cb.half_open_in_flight(), 1);
         assert!(
             cache
@@ -2925,12 +2930,16 @@ fn dropping_the_udp_cache_probe_guard_releases_the_admitted_breaker_slot() {
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");
 
-        let (next_cb, is_half_open_probe) = cache
+        let (next_cb, is_half_open_probe, admission_generation) = cache
             .can_execute("default", "udp-proxy", target, &config)
             .expect("dropping UDP setup must allow the next probe");
         assert!(Arc::ptr_eq(&cb, &next_cb));
         assert!(is_half_open_probe);
-        let next_probe = HalfOpenProbeGuard::for_admitted_probe(&next_cb, is_half_open_probe);
+        let next_probe = HalfOpenProbeGuard::for_admitted_probe(
+            &next_cb,
+            is_half_open_probe,
+            admission_generation,
+        );
         next_cb.record_success(next_probe.take_slot());
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "closed");
@@ -2957,13 +2966,16 @@ fn dropping_the_tcp_cache_probe_future_releases_the_admitted_breaker_slot() {
             };
             let final_cb = cache.get_or_create("default", "tcp-proxy", final_target, &config);
             let mut connection = Box::pin(async {
-                let (admitted_cb, is_half_open_probe) = cache
+                let (admitted_cb, is_half_open_probe, admission_generation) = cache
                     .can_execute("default", "tcp-proxy", target, &config)
                     .expect("timeout 0 admits the TCP setup probe");
                 assert!(Arc::ptr_eq(&cb, &admitted_cb));
                 assert!(is_half_open_probe);
-                let mut cb_probe =
-                    HalfOpenProbeGuard::for_admitted_probe(&admitted_cb, is_half_open_probe);
+                let mut cb_probe = HalfOpenProbeGuard::for_admitted_probe(
+                    &admitted_cb,
+                    is_half_open_probe,
+                    admission_generation,
+                );
                 if retry {
                     admitted_cb.record_failure(502, true, cb_probe.take_slot());
                     assert_eq!(admitted_cb.half_open_in_flight(), 0);
@@ -2971,12 +2983,12 @@ fn dropping_the_tcp_cache_probe_future_releases_the_admitted_breaker_slot() {
                     if !Arc::ptr_eq(&admitted_cb, &final_cb) {
                         final_cb.record_failure(502, true, false);
                     }
-                    let (retry_cb, is_half_open_probe) = cache
+                    let (retry_cb, is_half_open_probe, admission_generation) = cache
                         .can_execute("default", "tcp-proxy", final_target, &config)
                         .expect("the rotated TCP target admits a probe");
                     assert!(Arc::ptr_eq(&final_cb, &retry_cb));
                     assert!(is_half_open_probe);
-                    cb_probe.rearm(&retry_cb, is_half_open_probe);
+                    cb_probe.rearm(&retry_cb, is_half_open_probe, admission_generation);
                 }
                 // Park during setup or relay, then cancel without an outcome.
                 std::future::pending::<()>().await;
@@ -2998,12 +3010,16 @@ fn dropping_the_tcp_cache_probe_future_releases_the_admitted_breaker_slot() {
             if !Arc::ptr_eq(&cb, &final_cb) {
                 assert_eq!(cb.state_name(), "open");
             }
-            let (next_cb, is_half_open_probe) = cache
+            let (next_cb, is_half_open_probe, admission_generation) = cache
                 .can_execute("default", "tcp-proxy", final_target, &config)
                 .expect("dropping TCP setup must allow the next probe");
             assert!(Arc::ptr_eq(&final_cb, &next_cb));
             assert!(is_half_open_probe);
-            let next_probe = HalfOpenProbeGuard::for_admitted_probe(&next_cb, is_half_open_probe);
+            let next_probe = HalfOpenProbeGuard::for_admitted_probe(
+                &next_cb,
+                is_half_open_probe,
+                admission_generation,
+            );
             next_cb.record_success(next_probe.take_slot());
             assert_eq!(final_cb.half_open_in_flight(), 0);
             assert_eq!(final_cb.state_name(), "closed");
@@ -3065,10 +3081,12 @@ fn releasing_neutrally_returns_the_slot_exactly_once() {
 #[test]
 fn a_guard_for_a_closed_state_request_owns_nothing() {
     let cb = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
-    let is_half_open_probe = cb.can_execute().expect("closed admits");
+    let (is_half_open_probe, admission_generation) =
+        cb.can_execute_with_generation().expect("closed admits");
     assert!(!is_half_open_probe);
 
-    let guard = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+    let guard =
+        HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe, admission_generation);
     assert!(!guard.holds_slot());
     assert!(!guard.take_slot());
     guard.release_neutral();
@@ -3091,7 +3109,7 @@ fn rearming_adopts_the_rotated_targets_slot_and_settles_the_previous_one() {
 
     // A retry rotates onto `second` while `first`'s slot is still held. Rearm
     // settles the abandoned slot NEUTRALLY rather than leaking it.
-    guard.rearm(&second, true);
+    guard.rearm(&second, true, second.open_epoch());
     assert_eq!(
         first.half_open_in_flight(),
         0,
@@ -3118,7 +3136,7 @@ fn rearming_onto_a_closed_state_retry_leaves_the_guard_empty() {
     let (first, mut guard) = breaker_with_admitted_probe();
     let healthy = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
 
-    guard.rearm(&healthy, false);
+    guard.rearm(&healthy, false, healthy.open_epoch());
     assert_eq!(first.half_open_in_flight(), 0);
     assert!(!guard.holds_slot());
 
@@ -3129,4 +3147,82 @@ fn rearming_onto_a_closed_state_retry_leaves_the_guard_empty() {
         "a CLOSED-state re-admission owns no probe slot to release"
     );
     assert_eq!(healthy.state_name(), "closed");
+}
+
+#[test]
+fn a_probe_guard_that_outlives_a_reopen_cannot_free_a_current_cycle_slot() {
+    // #6177 through the production guard. Cap 2: old-cycle probes A/B are
+    // admitted through the cache and owned by guards, A fails and reopens, the
+    // timeout admits current-cycle probes C/D, then B's guard settles NEUTRALLY
+    // — by an explicit gateway-side refusal, or by a dropped future. Neither
+    // may reduce C/D's occupancy, so E is refused.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 5,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2,
+        trip_on_connection_errors: true,
+    };
+    for explicit_release in [true, false] {
+        let cache = CircuitBreakerCache::new();
+        let cb = cache.get_or_create("default", "probe-proxy", None, &config);
+        cb.record_failure(500, false, false);
+        assert_eq!(cb.state_name(), "open");
+
+        let admit = || {
+            let (admitted_cb, is_half_open_probe, admission_generation) = cache
+                .can_execute("default", "probe-proxy", None, &config)
+                .expect("a free probe slot admits");
+            assert!(Arc::ptr_eq(&cb, &admitted_cb));
+            assert!(is_half_open_probe);
+            HalfOpenProbeGuard::for_admitted_probe(
+                &admitted_cb,
+                is_half_open_probe,
+                admission_generation,
+            )
+        };
+        let a = admit();
+        let b = admit();
+        assert_eq!(cb.half_open_in_flight(), 2);
+
+        // A fails: its explicit outcome takes A's slot and reopens the breaker,
+        // which clears B's slot together with the old cycle.
+        cb.record_failure(500, false, a.take_slot());
+        assert_eq!(cb.state_name(), "open");
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert!(b.holds_slot());
+
+        let c = admit();
+        let d = admit();
+        assert_eq!(cb.half_open_in_flight(), 2);
+
+        // Old-cycle B settles neutrally.
+        if explicit_release {
+            b.release_neutral();
+            assert!(!b.holds_slot());
+        }
+        drop(b);
+        assert_eq!(
+            cb.half_open_in_flight(),
+            2,
+            "a stale guard's neutral release must not free a current-cycle probe slot"
+        );
+        assert_eq!(cb.state_name(), "half_open");
+        assert!(
+            cache
+                .can_execute("default", "probe-proxy", None, &config)
+                .is_err(),
+            "E must not be admitted while current-cycle probes C and D are active"
+        );
+
+        // Current-cycle guards still release their own slots exactly once.
+        drop(c);
+        assert_eq!(cb.half_open_in_flight(), 1);
+        d.release_neutral();
+        drop(d);
+        drop(a);
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "half_open");
+    }
 }
