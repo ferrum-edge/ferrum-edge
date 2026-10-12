@@ -25,12 +25,20 @@
 //! Every mutation recomputes the whole union, so a publication, retirement,
 //! discovery-URI replacement, or rejected staged generation reconciles only its
 //! own contribution and can never deactivate a co-tenant of the same URI.
+//!
+//! Reconciliation computes and applies that union under one process-wide gate
+//! ([`reconcile_active_requirements`]). Every contributor mutation happens
+//! before its own reconciliation acquires the gate, so whichever
+//! reconciliation applies last read every contribution published before it
+//! started: an older union can never be applied after a newer reconciliation
+//! has already returned. The installed projection is therefore always the
+//! latest completed union, not an eventually convergent one.
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, TryLockError};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -204,6 +212,8 @@ static COMMITTED_REQUIREMENTS: OnceLock<arc_swap::ArcSwap<JwksRequirementMap>> =
 static LATE_ACTIVE_REQUIREMENTS: OnceLock<DashMap<u64, (String, JwksRefreshRequirement)>> =
     OnceLock::new();
 static LATE_ACTIVE_REQUIREMENT_IDS: AtomicU64 = AtomicU64::new(0);
+/// Serializes the snapshot-and-apply of [`reconcile_active_requirements`].
+static RECONCILE_GATE: Mutex<()> = Mutex::new(());
 /// Precomputed active-remote trust aggregate for O(1) `/health` and `/status`.
 static TRUST_HEALTH: OnceLock<arc_swap::ArcSwap<JwksTrustHealthAggregate>> = OnceLock::new();
 /// Generation for the deadline-watcher task; bumping invalidates a stale
@@ -277,9 +287,37 @@ impl LateActiveRequirement {
     /// Publish this consumer's requirement immediately, without waiting for
     /// another configuration reload.
     pub fn register(jwks_uri: &str, requirement: JwksRefreshRequirement) -> Self {
+        Self::register_inner(jwks_uri, requirement, ReconcileInterleaveHooks::default())
+    }
+
+    /// [`Self::register`], running `hook` only when this registration's
+    /// reconciliation finds the reconciliation gate already held, immediately
+    /// before it blocks on it. Lets external tests observe contention.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn register_with_gate_contended_hook_for_test(
+        jwks_uri: &str,
+        requirement: JwksRefreshRequirement,
+        hook: &dyn Fn(),
+    ) -> Self {
+        Self::register_inner(
+            jwks_uri,
+            requirement,
+            ReconcileInterleaveHooks {
+                on_gate_contended: Some(hook),
+                after_snapshot: None,
+            },
+        )
+    }
+
+    fn register_inner(
+        jwks_uri: &str,
+        requirement: JwksRefreshRequirement,
+        hooks: ReconcileInterleaveHooks<'_>,
+    ) -> Self {
         let id = LATE_ACTIVE_REQUIREMENT_IDS.fetch_add(1, Ordering::Relaxed);
         late_active_requirements().insert(id, (jwks_uri.to_string(), requirement));
-        reconcile_active_requirements();
+        reconcile_active_requirements_inner(hooks);
         Self { id }
     }
 
@@ -659,8 +697,43 @@ fn reconfigure_refresh_policy(
 /// Trust-health republication runs only after `retain` returns so it never
 /// iterates the map under the retain shard guard.
 pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefreshRequirement>) {
+    retain_active_requirements_inner(active_requirements, ReconcileInterleaveHooks::default());
+}
+
+/// [`retain_active_requirements`], running `hook` after its reconciliation
+/// computed the active union and before it applies it, while the
+/// reconciliation gate is held. Lets external tests force an interleaving.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn retain_active_requirements_with_after_snapshot_hook_for_test(
+    active_requirements: &HashMap<String, JwksRefreshRequirement>,
+    hook: &dyn Fn(),
+) {
+    retain_active_requirements_inner(
+        active_requirements,
+        ReconcileInterleaveHooks {
+            on_gate_contended: None,
+            after_snapshot: Some(hook),
+        },
+    );
+}
+
+fn retain_active_requirements_inner(
+    active_requirements: &HashMap<String, JwksRefreshRequirement>,
+    hooks: ReconcileInterleaveHooks<'_>,
+) {
     committed_requirements_slot().store(Arc::new(active_requirements.clone()));
-    reconcile_active_requirements();
+    reconcile_active_requirements_inner(hooks);
+}
+
+/// Test-only interleaving points inside [`reconcile_active_requirements`].
+/// Production reconciliation always passes the empty default.
+#[derive(Default)]
+struct ReconcileInterleaveHooks<'a> {
+    /// Runs when the gate is already held, immediately before blocking on it.
+    on_gate_contended: Option<&'a dyn Fn()>,
+    /// Runs under the gate after the union is computed, before it is applied.
+    after_snapshot: Option<&'a dyn Fn()>,
 }
 
 /// Recompute the active set as `committed generation ∪ late contributions` and
@@ -669,7 +742,20 @@ pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefr
 /// Every mutation path funnels through here, so relaxation of a shared store
 /// happens only once *every* stricter committed consumer — published or
 /// asynchronously discovered — is gone.
+///
+/// The union is computed and applied under [`RECONCILE_GATE`]. Without it an
+/// independent caller could copy an older union, stall, and apply it after a
+/// newer reconciliation already returned — marking a live late contribution's
+/// URI inactive or reinstalling an older, relaxed requirement until some later
+/// reconciliation repaired it. Nothing under the gate awaits or reenters
+/// reconciliation, and no path reconciles while holding a `DashMap` shard
+/// guard, so the gate-then-shard lock order cannot invert.
 fn reconcile_active_requirements() {
+    reconcile_active_requirements_inner(ReconcileInterleaveHooks::default());
+}
+
+fn reconcile_active_requirements_inner(hooks: ReconcileInterleaveHooks<'_>) {
+    let _gate = acquire_reconcile_gate(hooks.on_gate_contended);
     let mut effective: JwksRequirementMap = (**committed_requirements_slot().load()).clone();
     if let Some(late) = LATE_ACTIVE_REQUIREMENTS.get() {
         for entry in late.iter() {
@@ -679,6 +765,10 @@ fn reconcile_active_requirements() {
                 .and_modify(|current| *current = current.strictest(*requirement))
                 .or_insert(*requirement);
         }
+    }
+
+    if let Some(hook) = hooks.after_snapshot {
+        hook();
     }
 
     let cache = global_cache();
@@ -694,6 +784,20 @@ fn reconcile_active_requirements() {
         }
     });
     republish_trust_health();
+}
+
+fn acquire_reconcile_gate(on_contended: Option<&dyn Fn()>) -> MutexGuard<'static, ()> {
+    if let Some(on_contended) = on_contended {
+        match RECONCILE_GATE.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => on_contended(),
+        }
+    }
+    match RECONCILE_GATE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Remove JWKS cache entries whose URIs are not in `active_uris`.
@@ -896,6 +1000,15 @@ pub fn cached_store(jwks_uri: &str) -> Option<Arc<JwksKeyStore>> {
     global_cache()
         .get(jwks_uri)
         .map(|entry| Arc::clone(&entry.value().store))
+}
+
+/// Return whether the entry is in the active set, for lifecycle tests.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn cached_active(jwks_uri: &str) -> Option<bool> {
+    global_cache()
+        .get(jwks_uri)
+        .map(|entry| entry.value().active.load(Ordering::Acquire))
 }
 
 /// Return the current strict shared-store policy for diagnostics and tests.

@@ -872,3 +872,135 @@ async fn shared_uri_strictest_arbitration_spans_committed_and_late_consumers() {
     drop(strict_contribution);
     clear_jwks_cache();
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent reconciliation ordering (issue #6310)
+// ---------------------------------------------------------------------------
+
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn older_reconciliation_snapshot_cannot_overwrite_newer_active_requirements() {
+    use ferrum_edge::plugins::utils::jwks_cache::{
+        LateActiveRequirement, cached_active,
+        retain_active_requirements_with_after_snapshot_hook_for_test,
+    };
+    use std::sync::mpsc;
+
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/reconcile-order/shared.json", server.uri());
+    let late_uri = format!("{}/reconcile-order/late.json", server.uri());
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let relaxed = JwksRefreshRequirement::new(Duration::from_secs(600), Duration::from_secs(3_600));
+    let strict = JwksRefreshRequirement::new(Duration::from_secs(60), Duration::from_secs(300));
+
+    let shared_store = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        relaxed.refresh_interval,
+        relaxed.max_stale,
+    );
+    let late_store = get_or_create_jwks_store_with_policy(
+        &late_uri,
+        &client(),
+        relaxed.refresh_interval,
+        relaxed.max_stale,
+    );
+    retain_active_requirements(&HashMap::from([(uri.clone(), relaxed)]));
+    assert_eq!(cached_active(&uri), Some(true));
+    assert_eq!(cached_active(&late_uri), Some(false));
+    assert_eq!(cached_requirement(&uri), Some(relaxed));
+
+    let runtime = tokio::runtime::Handle::current();
+
+    // Caller A: a committed publication that still carries only the relaxed
+    // consumer. It copies the older union and pauses, holding the gate, before
+    // applying it. A dropped release sender (unwinding test) releases it.
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let committed = HashMap::from([(uri.clone(), relaxed)]);
+    let a_runtime = runtime.clone();
+    let caller_a = std::thread::spawn(move || {
+        let _entered = a_runtime.enter();
+        let pause = || {
+            let _ = paused_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        };
+        retain_active_requirements_with_after_snapshot_hook_for_test(&committed, &pause);
+    });
+    paused_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("caller A must reach its apply point");
+
+    // Callers B: independent discovery owners publish a stricter requirement
+    // on the same URI and a URI absent from A's union. Each reports when its
+    // reconciliation finds the gate held, immediately before blocking on it.
+    let (contended_tx, contended_rx) = mpsc::channel::<&'static str>();
+    let (done_tx, done_rx) = mpsc::channel::<&'static str>();
+    let spawn_caller_b = |name: &'static str, jwks_uri: String, requirement| {
+        let b_runtime = runtime.clone();
+        let contended_tx = contended_tx.clone();
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            let _entered = b_runtime.enter();
+            let report_contention = || {
+                let _ = contended_tx.send(name);
+            };
+            let contribution = LateActiveRequirement::register_with_gate_contended_hook_for_test(
+                &jwks_uri,
+                requirement,
+                &report_contention,
+            );
+            let _ = done_tx.send(name);
+            contribution
+        })
+    };
+    let caller_b_strict = spawn_caller_b("strict", uri.clone(), strict);
+    let caller_b_late = spawn_caller_b("late", late_uri.clone(), relaxed);
+
+    // Both newer reconciliations positively contend on the gate A holds with
+    // its older union still unapplied, so neither can have completed.
+    let mut contended = HashSet::new();
+    for _ in 0..2 {
+        contended.insert(
+            contended_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("caller B must contend on the reconciliation gate"),
+        );
+    }
+    assert_eq!(contended, HashSet::from(["strict", "late"]));
+    assert_eq!(
+        done_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "a newer reconciliation must not complete while an older union is pending application"
+    );
+
+    release_tx.send(()).expect("release caller A");
+    caller_a.join().expect("caller A");
+    let strict_contribution = caller_b_strict.join().expect("caller B strict");
+    let late_contribution = caller_b_late.join().expect("caller B late");
+
+    assert_eq!(
+        cached_requirement(&uri),
+        Some(strict),
+        "an older union must not reinstall a relaxed requirement over a live stricter owner"
+    );
+    assert_eq!(cached_active(&uri), Some(true));
+    assert_eq!(
+        cached_active(&late_uri),
+        Some(true),
+        "an older union must not deactivate a URI a live contribution still owns"
+    );
+
+    // Later reconciliation still withdraws exactly the retired contributions.
+    drop(strict_contribution);
+    assert_eq!(cached_requirement(&uri), Some(relaxed));
+    assert_eq!(cached_active(&uri), Some(true));
+    drop(late_contribution);
+    assert_eq!(cached_active(&late_uri), Some(false));
+
+    drop(shared_store);
+    drop(late_store);
+    clear_jwks_cache();
+}
