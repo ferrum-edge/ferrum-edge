@@ -5806,7 +5806,11 @@ async fn grpc_map_entry_extra_field_is_outside_decoded_message_coverage() {
 
     // Field 99, length-delimited, inside the map entry: decoding drops it.
     let entry_extra = ext_pb_str_field(99, "ops@example.com");
-    let body = grpc_frame(&scoped_reply_with_map_entry_extra("team", "edge", &entry_extra));
+    let body = grpc_frame(&scoped_reply_with_map_entry_extra(
+        "team",
+        "edge",
+        &entry_extra,
+    ));
     let mut ctx = grpc_ctx("/scope.Svc/Run");
     assert!(
         matches!(
@@ -5819,7 +5823,11 @@ async fn grpc_map_entry_extra_field_is_outside_decoded_message_coverage() {
     );
 
     // Control: the decoded map value itself is scanned.
-    let body = grpc_frame(&scoped_reply_with_map_entry_extra("team", "ops@example.com", &[]));
+    let body = grpc_frame(&scoped_reply_with_map_entry_extra(
+        "team",
+        "ops@example.com",
+        &[],
+    ));
     let mut ctx = grpc_ctx("/scope.Svc/Run");
     assert!(
         matches!(
