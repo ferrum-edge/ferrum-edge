@@ -80,14 +80,17 @@ Verifies basic request routing through the gateway:
 2. Starts a local echo HTTP server on a reserved port
 3. Starts the gateway binary with `FERRUM_MODE=file`
 4. Sends a test request through the proxy at `/echo/test-path`
-5. Verifies the request is routed correctly and returns 200 OK
+5. Verifies the request completes and returns a success (2xx) status
 
 **What it tests:**
 - Gateway startup in file mode
 - Configuration loading from file
 - HTTP request routing to backend
-- Path stripping behavior
 - Basic proxy functionality
+
+The proof is limited to `resp.status().is_success()` (any 2xx); it does not
+assert an exact `200`, the stripped path as seen by the backend, or backend
+identity.
 
 #### Test: `test_file_mode_config_reload_on_sighup`
 
@@ -95,14 +98,21 @@ Verifies configuration reload on SIGHUP signal:
 
 1. Creates a temporary config with one proxy
 2. Starts echo server and gateway
-3. Verifies initial proxy is accessible
+3. Verifies the gateway serves the initial route
 4. Updates the config file to add a second proxy
 5. Sends SIGHUP signal to the gateway process (Unix only)
-6. Verifies the new proxy is accessible after reload
+6. Verifies the new route is served after reload
 
 **What it tests:**
 - SIGHUP signal handling
 - Live configuration reloading
+
+Both assertions use `reqwest::Client::send(...).is_ok()`, which confirms only
+that the request completed and received an HTTP response — not a specific
+status. Under an unrelated failure the pre-reload route could answer a 404 (or
+any status) for the new path and still satisfy the assertion, so the test
+demonstrates reload-driven routing rather than proving an exact 200 or the
+post-reload response body.
 
 #### Test: `test_file_mode_empty_config`
 
@@ -125,12 +135,17 @@ Verifies routing to multiple backend services:
 2. Starts two echo servers on different ports
 3. Starts the gateway
 4. Sends requests to both backend paths
-5. Verifies both requests are routed correctly
+5. Verifies both requests complete
 
 **What it tests:**
 - Multiple proxy configurations
 - Routing to different backends
 - Path isolation between proxies
+
+As with the reload test, each assertion is `reqwest::Client::send(...).is_ok()`
+(any response, including a 404, satisfies it); the test does not assert exact
+status codes, the stripped path as seen by each backend, or which backend served
+a given request.
 
 #### Test: `test_file_mode_consumer_identity_headers_forwarded`
 

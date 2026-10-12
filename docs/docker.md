@@ -19,11 +19,21 @@ keylessly signed with Cosign and attested with SLSA provenance and SPDX SBOMs.
 
 | Tag | Moves? | Published by | Use for |
 | --- | --- | --- | --- |
-| `vX.Y.Z`, `X.Y.Z` | No | `release.yml` on a version tag | Production (or pin the digest) |
+| `vX.Y.Z`, `X.Y.Z` | No* | `release.yml` on a version tag | Production (or pin the digest) |
 | `X.Y` | Within the release series | `release.yml` on a version tag | Tracking patch releases of one series |
-| `vX.Y.Z-ebpf`, `vX.Y.Z-ebpf-tools` (and `X.Y.Z` / `X.Y` forms) | As above | `release.yml` on a version tag | Mesh node-agent / NodeWaypoint / Ambient UDP capture |
+| `vX.Y.Z-ebpf`, `vX.Y.Z-ebpf-tools` (and `X.Y.Z` / `X.Y` forms) | As above* | `release.yml` on a version tag | Mesh node-agent / NodeWaypoint / Ambient UDP capture |
 | `latest` | Forward only, to the newest `main` commit whose CI passed and whose image was built and signed; may skip intermediate commits | `main-latest-image.yml` | Evaluation and development only |
 | `main-<40-character-sha>` | No: built once for each `main` commit that the publisher builds (not every commit); re-runs reuse the signed image | `main-latest-image.yml` | Reproducing a specific `main` build |
+
+\* Version-tag immutability is the **intended release policy**, not a mechanism
+`release.yml` itself enforces on an authorized rerun: the manifest jobs assign
+the version / `-ebpf` / `-ebpf-tools` tags to the freshly built digests after
+their builds, with no prior-version-digest comparison or already-signed-version
+reuse guard, and the build stages still consume floating nightly/package inputs.
+The "No" reflects the release contract that a version tag is published once for
+a semver release and is never re-pointed at a different image; a rerun can only
+keep it stable by rebuilding the identical digest (or being refused reassignment
+by registry policy). Pin the digest when the exact image matters.
 
 `latest` is a moving development channel, not a release: it moves forward to
 the newest `main` commit whose push CI succeeded and whose image was then built,
@@ -493,7 +503,16 @@ FERRUM_DB_URL=postgres://user:pass@rds-endpoint.amazonaws.com/ferrum
 
 ### 3. Logging and Monitoring
 
-**Structured JSON Logs** (logs are always JSON on stdout):
+**Structured JSON logs** are emitted on both streams, split by severity:
+`WARN` and `ERROR` go to **stderr**, while `INFO`, `DEBUG`, and `TRACE` go to
+**stdout**. Docker's log collection combines both streams, so ingest either or
+both. The image defaults `FERRUM_LOG_LEVEL` to `warn`, so under the default
+ordinary `INFO` diagnostics are filtered out and visible output appears only on
+stderr. Bootstrap startup errors also write JSON to stderr. Transaction
+access-log and plugin output is a separate sink: it always goes to stdout as
+JSON, is gated by plugin enablement rather than `FERRUM_LOG_LEVEL`, and is not
+part of the severity split above.
+
 ```bash
 # Raise verbosity from the image default (warn)
 docker run -e FERRUM_LOG_LEVEL=info ferrum-edge:latest
