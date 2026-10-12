@@ -983,18 +983,24 @@ its H3 path follows the same RFC 6455 masking rules as H1 and H2:
 By default, the gateway strips the `permessage-deflate` offer and parses
 WebSocket frames. With `websocket_permessage_deflate: passthrough`, it forwards
 the offer only when no enabled plugin requires frame parsing; if compression is
-negotiated, the session uses a raw byte relay and the gateway does not inspect
-frames. The peers still have to follow RFC 6455 masking rules. The process-wide
+negotiated, the session uses a raw byte relay that bypasses frame parsing,
+masking validation, and `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`. The peers
+remain responsible for RFC 6455 masking rules. The process-wide
 `FERRUM_WEBSOCKET_TUNNEL_MODE` flag does not select this H3 behavior.
 
 
 ### Tunnel mode
 
 `FERRUM_WEBSOCKET_TUNNEL_MODE` (raw bidirectional TCP copy) does NOT
-apply to H3 sessions. The H3 frontend has no raw TCP underneath QUIC to
-splice; bytes always pass through the pump tasks. Operators who set
-tunnel mode for H1/H2 throughput automatically get frame-parsing
-semantics on H3 — frame-level plugins continue to work regardless.
+select tunnel mode for H3 sessions. The H3 frontend has no raw TCP underneath
+QUIC to splice, so bytes pass through the pump tasks; H3 normally parses frames
+and frame-level plugins continue to work. The negotiated-compression exception
+is `websocket_permessage_deflate: passthrough`: the offer is forwarded only
+when no enabled plugin requires frame parsing, and a negotiated extension
+switches the session to a raw byte relay that bypasses frame parsing, masking
+validation, and `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`. The peers remain
+responsible for RFC 6455 masking rules. The process-wide tunnel flag is ignored
+for this H3 behavior.
 
 ### Circuit breaker, load balancer, graceful drain
 
