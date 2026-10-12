@@ -59,9 +59,6 @@ const MAX_POLICY_TRANSITION_EPOCH: u64 = u64::MAX >> POLICY_STATE_BITS;
 const BASELINE_LATENCY_BITS: u32 = 40;
 const BASELINE_LATENCY_MASK: u64 = (1_u64 << BASELINE_LATENCY_BITS) - 1;
 const BASELINE_WINDOW_SEQUENCE_MASK: u64 = u64::MAX >> BASELINE_LATENCY_BITS;
-/// Serial-number half range for the wrapping 24-bit window sequence. A
-/// publication is newer only when it is ahead by less than this distance.
-const BASELINE_WINDOW_SEQUENCE_HALF_RANGE: u64 = (BASELINE_WINDOW_SEQUENCE_MASK >> 1) + 1;
 /// How far the open window's sequence may lead the published prior window
 /// while that prior is still in force: by one when it is the latest closed
 /// window, by two when a newer window has closed but is still being
@@ -1224,6 +1221,16 @@ fn scoped_proxy(proxy: &Proxy) -> String {
 /// like a missing one, whatever order the pending publications land in. The
 /// sequence counts rotations, not samples, so it stays ordered when a
 /// compatible reload changes `baseline_window_samples`.
+///
+/// Publication order is likewise decided by age relative to the open window,
+/// never by comparing two wrapping sequences directly: a candidate outside the
+/// horizon is dropped, a candidate inside it replaces an expired prior, and
+/// two in-horizon windows compare by age. A callback can therefore stall for
+/// any number of rotations without its late store being mistaken for a newer
+/// one or blocking the publications that follow it. The 24-bit sequence still
+/// aliases at whole multiples of its range: a store delayed by a multiple of
+/// 2^24 rotations, to within the horizon, looks recent, stands for at most
+/// `BASELINE_PRIOR_WINDOW_HORIZON` rotations, and then expires like any other.
 pub(crate) struct AdaptiveConcurrencyBaselineWindows {
     /// Current window: its sequence and minimum healthy latency (µs); a zero
     /// minimum means the window is empty.
@@ -1291,28 +1298,31 @@ impl AdaptiveConcurrencyBaselineWindows {
         }
     }
 
-    /// Publish a closed window as the prior window unless a newer closed
-    /// window has already been published.
+    /// Publish a closed window as the prior window if it is still within the
+    /// horizon and newer than any prior window still in force.
     pub(crate) fn publish_closed_window(&self, closed: AdaptiveConcurrencyClosedBaselineWindow) {
         let candidate = (closed.sequence << BASELINE_LATENCY_BITS) | closed.min_us;
-        let mut current = self.prior.load(Ordering::Acquire);
+        let mut prior = self.prior.load(Ordering::Acquire);
         loop {
-            if current != 0
-                && !baseline_window_sequence_is_newer(
-                    closed.sequence,
-                    current >> BASELINE_LATENCY_BITS,
-                )
-            {
+            // Read the open window after the prior, as `effective_us` does, and
+            // again on every retry. A CAS that succeeds proves the prior was
+            // unchanged since that read, so it replaces exactly the prior the
+            // decision aged against the open window. If the open window
+            // advances before the CAS lands, the stored candidate only ages
+            // further, and both `effective_us` and the next publication treat
+            // it as expired once it leaves the horizon.
+            let current = self.current.load(Ordering::Acquire);
+            if !baseline_closed_window_replaces_prior(closed.sequence, prior, current) {
                 return;
             }
             match self.prior.compare_exchange(
-                current,
+                prior,
                 candidate,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => return,
-                Err(observed) => current = observed,
+                Err(observed) => prior = observed,
             }
         }
     }
@@ -1353,18 +1363,41 @@ fn baseline_prior_window_in_force(prior: u64, current: u64) -> bool {
     if prior == 0 {
         return false;
     }
-    let open_sequence = current >> BASELINE_LATENCY_BITS;
-    let prior_sequence = prior >> BASELINE_LATENCY_BITS;
-    let age = open_sequence.wrapping_sub(prior_sequence) & BASELINE_WINDOW_SEQUENCE_MASK;
-    (1..=BASELINE_PRIOR_WINDOW_HORIZON).contains(&age)
+    let age = baseline_window_age(prior >> BASELINE_LATENCY_BITS, current);
+    baseline_window_age_in_horizon(age)
 }
 
-/// Serial-number comparison over the wrapping window sequence. Sequences are
-/// claimed one rotation at a time, so a genuinely delayed publication is only
-/// a few rotations behind, far inside the half range.
-fn baseline_window_sequence_is_newer(candidate: u64, published: u64) -> bool {
-    let distance = candidate.wrapping_sub(published) & BASELINE_WINDOW_SEQUENCE_MASK;
-    distance != 0 && distance < BASELINE_WINDOW_SEQUENCE_HALF_RANGE
+/// Whether a closed window may replace the stored prior window. A candidate
+/// that has already left the horizon never publishes, however long its
+/// callback stalled, so it can neither restore an expired minimum nor shadow
+/// later publications. A candidate inside the horizon replaces a missing or
+/// expired prior outright and otherwise must be strictly younger. Both ages lie
+/// in `1..=BASELINE_PRIOR_WINDOW_HORIZON`, so the comparison never depends on
+/// how far apart the two wrapping sequences are (issue #6309).
+fn baseline_closed_window_replaces_prior(
+    candidate_sequence: u64,
+    prior: u64,
+    current: u64,
+) -> bool {
+    let candidate_age = baseline_window_age(candidate_sequence, current);
+    if !baseline_window_age_in_horizon(candidate_age) {
+        return false;
+    }
+    if !baseline_prior_window_in_force(prior, current) {
+        return true;
+    }
+    candidate_age < baseline_window_age(prior >> BASELINE_LATENCY_BITS, current)
+}
+
+/// Rotations the open window's sequence leads a closed window's sequence by,
+/// modulo the 24-bit sequence space.
+fn baseline_window_age(closed_sequence: u64, current: u64) -> u64 {
+    let open_sequence = current >> BASELINE_LATENCY_BITS;
+    open_sequence.wrapping_sub(closed_sequence) & BASELINE_WINDOW_SEQUENCE_MASK
+}
+
+fn baseline_window_age_in_horizon(age: u64) -> bool {
+    (1..=BASELINE_PRIOR_WINDOW_HORIZON).contains(&age)
 }
 
 fn update_ewma(atomic: &AtomicU64, sample: u64) -> u64 {

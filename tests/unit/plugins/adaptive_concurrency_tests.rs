@@ -2909,8 +2909,8 @@ fn adaptive_concurrency_expired_window_is_ignored_while_newer_publications_are_p
         "window 0 expired once windows 2 and 3 closed after it"
     );
 
-    // A resumes first. Its sequence is newer than the published window 0, so
-    // the store lands, but window 1 is itself already two closures old.
+    // A resumes first. Its sequence is newer than the published window 0, but
+    // window 1 is itself already two closures old, so it does not publish.
     windows.publish_closed_window(a);
     assert_eq!(
         windows.effective_us(),
@@ -2988,6 +2988,84 @@ fn adaptive_concurrency_rotation_order_survives_sequence_wrap() {
         11_000,
         "a pre-wrap window must stay older than a post-wrap window"
     );
+}
+
+/// PR #6328 review: a callback that stalls for half the 24-bit sequence space
+/// must not alias as newer than the windows published meanwhile. Publication
+/// is aged against the open window, so the stale store is dropped and the
+/// windows that follow keep publishing.
+#[test]
+fn adaptive_concurrency_half_range_delayed_publication_is_rejected() {
+    const HALF_SEQUENCE_SPACE: u64 = 1 << 23;
+    let windows = AdaptiveConcurrencyBaselineHarness::new();
+
+    // Callback A closes window 0, which holds the 1ms outlier, and stalls.
+    windows.observe(1_000);
+    let delayed = windows.close_window();
+    assert!(!delayed.is_empty());
+
+    // Half the sequence space of empty windows closes while A is stalled,
+    // then two nonempty windows publish: the prior is window 2^23 + 1.
+    for _ in 1..HALF_SEQUENCE_SPACE {
+        assert!(windows.close_window().is_empty());
+    }
+    windows.observe(10_000);
+    windows.rotate();
+    windows.observe(10_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 10_000);
+
+    // A resumes. Serial comparison against the prior would read it as less
+    // than half the range ahead; its age against the open window is 2^23 + 2.
+    windows.publish_closed_window(delayed);
+    assert_eq!(
+        windows.effective_us(),
+        10_000,
+        "a half-range delayed publication must not replace the prior window"
+    );
+
+    // Later publications and recovery proceed.
+    windows.observe(20_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 20_000);
+    windows.observe(30_000);
+    windows.rotate();
+    assert_eq!(
+        windows.effective_us(),
+        30_000,
+        "rotation keeps advancing the baseline after the stale store"
+    );
+}
+
+/// A prior window that expired more than half the sequence space ago must not
+/// block a recent publication; serial comparison would read the recent window
+/// as older than the expired one and leave the baseline empty.
+#[test]
+fn adaptive_concurrency_recent_publication_replaces_half_range_expired_prior() {
+    const HALF_SEQUENCE_SPACE: u64 = 1 << 23;
+    let windows = AdaptiveConcurrencyBaselineHarness::new();
+
+    // Window 0 publishes, then expires as more than half the sequence space
+    // of empty windows closes after it.
+    windows.observe(5_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 5_000);
+    for _ in 0..=HALF_SEQUENCE_SPACE {
+        assert!(windows.close_window().is_empty());
+    }
+    assert_eq!(windows.effective_us(), 0);
+
+    // The next nonempty window is recent and replaces the expired prior.
+    windows.observe(10_000);
+    windows.rotate();
+    assert_eq!(
+        windows.effective_us(),
+        10_000,
+        "a recent window must replace a prior that expired half the range ago"
+    );
+    windows.observe(15_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 15_000);
 }
 
 /// The sequence counts rotations, not samples, so a compatible reload that
