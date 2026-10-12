@@ -318,11 +318,16 @@ of at most 64 MiB; provision updates by atomic replacement, with permissions
 appropriate for unredacted credentials.
 
 Before admission, resources are filtered to the gateway's `FERRUM_NAMESPACE`.
-Consumer admission follows the database full-load policy; malformed consumer
-fields or ambiguous resource IDs/credentials reject the candidate. Only a fully
-admitted candidate can become the startup generation. A healthy database start
-also checks the configured backup and warns if it is unusable, while continuing
-to serve the authoritative database configuration.
+Duplicate resource IDs reject the candidate before quarantine. As in the
+database full-load policy, colliding consumer identities and invalid
+`hmac_auth` credentials are deterministically quarantined (removed with a
+warning) rather than rejected, so admission validates the *surviving*
+candidate: malformed consumer fields or duplicate credentials among the
+survivors still reject, and a removed credential cannot authenticate through
+the removed mechanism. Only a fully admitted surviving candidate can become the
+startup generation. A healthy database start also checks the configured backup
+and warns if it is unusable, while continuing to serve the authoritative
+database configuration.
 
 Bootstrap **does not restore API specs or gateway trust**. Those administrative
 sections are ignored even when present. Namespace trust remains **unknown** and

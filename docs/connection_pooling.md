@@ -274,7 +274,7 @@ The admin `/status` and `/health` endpoints include database connection pool sta
 | `idle` | Connections available for checkout |
 | `active` | Connections currently in use |
 | `max_connections` | Configured maximum (`FERRUM_DB_POOL_MAX_CONNECTIONS`) |
-| `min_connections` | Configured minimum idle (`FERRUM_DB_POOL_MIN_CONNECTIONS`) |
+| `min_connections` | Configured minimum total pool size (`FERRUM_DB_POOL_MIN_CONNECTIONS`) — the pool keeps total connections (idle + checked out) at or above this count, not a guaranteed number of idle connections. A checked-out connection does not mean the pool is below its minimum |
 | `read_replica` | Present only when the configured SQL admin-read replica pool is currently active |
 
 **MongoDB**: Pool stats are not available (the MongoDB driver manages pooling internally). The `pool` field is omitted from the response.

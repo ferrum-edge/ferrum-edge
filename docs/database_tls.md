@@ -41,13 +41,13 @@ For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`
 | Ferrum value | PostgreSQL query parameter | MySQL query parameter | MongoDB driver behavior | Encryption | CA validation | Hostname validation | Under-the-hood behavior |
 |--------------|----------------------------|-----------------------|-------------------------|------------|---------------|---------------------|-------------------------|
 | `disable` | `sslmode=disable` | `ssl-mode=DISABLED` | TLS disabled | No | No | No | Opens only plaintext connections for network databases. For SQLite, this value is accepted as a no-op for templated configs. |
-| `allow` | `sslmode=allow` | N/A | N/A | Maybe | No | No | PostgreSQL-only. Tries plaintext first, then retries TLS if plaintext fails. Not a production-safe setting. |
+| `allow` | `sslmode=allow` | N/A | N/A | No | No | No | PostgreSQL-only. The pinned SQLx driver implements this mode as plaintext only and never retries TLS, even when the server refuses plaintext. Not a production-safe setting. |
 | `prefer` | `sslmode=prefer` | `ssl-mode=PREFERRED` | N/A | Maybe | No | No | Tries TLS first, but may fall back to plaintext when the server does not support TLS. |
 | `require` | `sslmode=require` | `ssl-mode=REQUIRED` | TLS enabled with invalid certificates allowed | Yes | No | No | Requires encryption but does not verify the server certificate or hostname. Use only for testing or separately authenticated private networks. |
 | `verify-ca` | `sslmode=verify-ca` | `ssl-mode=VERIFY_CA` | N/A | Yes | Yes | No | Requires TLS and verifies that the certificate chain ends at the configured CA only, but does not verify the requested hostname. `FERRUM_DB_TLS_CA_CERT_PATH` (or `FERRUM_DB_TLS_CA_CERT_SOURCE`) is mandatory for this mode. |
 | `verify-full` | `sslmode=verify-full` | `ssl-mode=VERIFY_IDENTITY` | TLS enabled with certificate validation | Yes | Yes | Yes | Requires TLS, validates the CA chain, and verifies the requested hostname. A configured CA is the only trust anchor; with no configured CA the platform's bundled public roots are used. This is the recommended production mode. |
 
-For PostgreSQL, client certificate parameters can be present with `allow` or `prefer`, but those modes may still use plaintext. Client-certificate authentication effectively requires `require`, `verify-ca`, or `verify-full`; use `verify-full` for production.
+For PostgreSQL, client certificate parameters can be present with `allow` or `prefer`, but `allow` opens plaintext only in the pinned driver and `prefer` may fall back to plaintext, so certificate parameters may be inert in both. Client-certificate authentication effectively requires `require`, `verify-ca`, or `verify-full`; use `verify-full` for production.
 
 A configured CA is **exclusive**. When `FERRUM_DB_TLS_CA_CERT_PATH` (or its
 `FERRUM_DB_TLS_CA_CERT_SOURCE` override) is set, that CA *replaces* the
@@ -212,7 +212,7 @@ export FERRUM_DB_TLS_CLIENT_KEY_PATH=/etc/ferrum/certs/client.key
 
 Requires PostgreSQL to be configured with `ssl_ca_file` pointing to a CA that signed the client certificate, and `pg_hba.conf` entries using `hostssl ... cert` authentication.
 
-Use `FERRUM_DB_TLS_MODE=require` or stricter for PostgreSQL client-certificate authentication. `allow` and `prefer` can fall back to plaintext, making client certificate parameters inert.
+Use `FERRUM_DB_TLS_MODE=require` or stricter for PostgreSQL client-certificate authentication. `allow` is plaintext only in the pinned driver, and `prefer` can fall back to plaintext, making client certificate parameters inert in both.
 
 ### Docker Example
 
@@ -473,7 +473,7 @@ export FERRUM_DB_URL="sqlite:///data/ferrum.db?mode=rwc"
 | Mode          | PostgreSQL | MySQL | MongoDB | Encrypted | Server Cert Verified | Hostname Verified | Use Case |
 |---------------|------------|-------|---------|-----------|----------------------|-------------------|----------|
 | `disable`     | Yes        | Yes   | Yes     | No        | No                   | No                | Development / SQLite no-op in shared templates |
-| `allow`       | Yes        | No    | No      | Maybe     | No                   | No                | PostgreSQL-only plaintext-first fallback |
+| `allow`       | Yes        | No    | No      | No        | No                   | No                | PostgreSQL-only; the pinned driver opens plaintext only and never retries TLS |
 | `prefer`      | Yes        | Yes   | No      | Maybe     | No                   | No                | Opportunistic TLS, not production-safe |
 | `require`     | Yes        | Yes   | Yes     | Yes       | No                   | No                | Testing or separately authenticated private networks |
 | `verify-ca`   | Yes        | Yes   | No      | Yes       | Yes                  | No                | SQL databases with trusted CA but dynamic hostnames |
@@ -672,14 +672,28 @@ cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --n
 | `test_mongodb_tls_require_connection`  | MongoDB    | require         | Encrypted connection + CRUD + proxy routing     |
 | `test_mongodb_mtls_connection`         | MongoDB    | verify-full+mTLS| Client cert auth + CRUD + proxy routing         |
 
-Each test performs a complete CRUD cycle:
-1. Creates an upstream, proxy, consumer, and plugin config via the Admin API
-2. Reads each resource back and verifies correctness
-3. Waits for database polling to load the proxy into the routing table
-4. Sends an HTTP request through the proxy to verify end-to-end routing
-5. Updates and verifies a proxy modification
-6. Lists all resources
-7. Deletes all resources
+Per-helper coverage:
+
+- The SQL helper (`run_crud_and_proxy_tests` in
+  `tests/functional/functional_db_tls_test.rs`), used by the PostgreSQL, MySQL,
+  and SQLite TLS tests, creates an upstream, proxy, consumer, and plugin config
+  via the Admin API, reads back the proxy, consumer, and plugin config, waits
+  for database polling to load the proxy into the routing table, sends an HTTP
+  request through the proxy to verify end-to-end routing, updates and verifies
+  the proxy, lists proxies, consumers, upstreams, and plugin configs, and
+  deletes all created resources. The upstream is created but never read back
+  individually, and cleanup DELETE responses are not asserted.
+- The MongoDB helper (`run_crud_and_proxy_tests` in
+  `tests/functional/functional_mongodb_test.rs`), used by the MongoDB
+  TLS/mTLS tests, creates a proxy, consumer, and plugin config via the Admin
+  API, reads back the proxy and consumer (the plugin config is not read back),
+  waits for database polling, sends an HTTP request through the proxy, updates
+  the proxy, deletes all three resources and asserts each DELETE succeeds, and
+  verifies the deleted proxy returns `404`. It creates no upstream and performs
+  no list operation.
+- `test_health_endpoint_shows_db_status` starts the gateway against a TLS
+  PostgreSQL database and checks `GET /health` only; it does not run the CRUD
+  cycle. The table above already separates this health scenario.
 
 ### Cleanup
 
