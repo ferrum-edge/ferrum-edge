@@ -426,10 +426,22 @@ fn plugin_clients_without_enforced_crls_keep_resumption() {
 /// Callers of the shared CRL-enforcing verifier builder that build no cached
 /// rustls `ClientConfig` governed by an enforced CRL set, and why.
 const RESUMPTION_EXEMPT_VERIFIER_CALLERS: &[(&str, &str)] = &[
-    ("src/tls/mod.rs", "defines the shared verifier and resumption helpers"),
-    ("src/dtls/mod.rs", "dimpl DTLS client: session resumption is not implemented"),
-    ("src/plugins/udp_logging.rs", "dimpl DTLS client: session resumption is not implemented"),
-    ("src/modes/mesh/config_consumer/native_tls.rs", "DP-to-CP gRPC passes no CRLs"),
+    (
+        "src/tls/mod.rs",
+        "defines the shared verifier and resumption helpers",
+    ),
+    (
+        "src/dtls/mod.rs",
+        "dimpl DTLS client: session resumption is not implemented",
+    ),
+    (
+        "src/plugins/udp_logging.rs",
+        "dimpl DTLS client: session resumption is not implemented",
+    ),
+    (
+        "src/modes/mesh/config_consumer/native_tls.rs",
+        "DP-to-CP gRPC passes no CRLs",
+    ),
 ];
 
 const SHARED_VERIFIER_CALL: &str = "build_server_verifier_with_crls(";
