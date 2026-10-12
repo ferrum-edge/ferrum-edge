@@ -35,13 +35,20 @@ fn read(rel: &str) -> String {
     })
 }
 
-/// The verbatim `name() {` ... `}` definition of a top-level shell function.
+/// The verbatim definition of a top-level shell function: either a one-line
+/// `name() { ...; }` whose braces balance on that line, or a multi-line
+/// `name() {` ... `}` block closed at column 0.
 fn shell_function(source: &str, name: &str) -> String {
     let header = format!("{name}() {{");
-    let mut lines = source.lines().skip_while(|line| *line != header);
+    let mut lines = source
+        .lines()
+        .skip_while(|line| *line != header && !is_one_line_definition(line, &header));
     let first = lines
         .next()
         .unwrap_or_else(|| panic!("top-level shell function {name} not found"));
+    if first != header {
+        return format!("{first}\n");
+    }
     let mut body = vec![first];
     for line in lines {
         body.push(line);
@@ -50,6 +57,13 @@ fn shell_function(source: &str, name: &str) -> String {
         }
     }
     panic!("top-level shell function {name} has no closing brace at column 0");
+}
+
+fn is_one_line_definition(line: &str, header: &str) -> bool {
+    line.len() > header.len()
+        && line.starts_with(header)
+        && line.trim_end().ends_with('}')
+        && line.matches('{').count() == line.matches('}').count()
 }
 
 fn shell_functions(source: &str, names: &[&str]) -> String {
@@ -102,6 +116,40 @@ fn path_with(bin: &Path) -> String {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     )
+}
+
+#[test]
+fn shell_function_extracts_one_line_and_multi_line_definitions() {
+    let source = r#"log() { printf '%s\n' "$*"; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 127; }; }
+
+wait_for() {
+  if [[ -n "$1" ]]; then
+    need "$1"
+  fi
+}
+after() { :; }
+"#;
+    assert_eq!(
+        shell_function(source, "need"),
+        r#"need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 127; }; }
+"#
+    );
+    assert_eq!(
+        shell_function(source, "wait_for"),
+        r#"wait_for() {
+  if [[ -n "$1" ]]; then
+    need "$1"
+  fi
+}
+"#
+    );
+    assert_eq!(
+        shell_functions(source, &["log", "after"]),
+        r#"log() { printf '%s\n' "$*"; }
+after() { :; }
+"#
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -800,7 +848,13 @@ fn node_waypoint_dtls_denial_requires_probe_execution_and_a_read_backend_log() {
     let bin = TempDir::new().expect("stub bin dir");
     write_executable(
         &bin.path().join("timeout"),
-        "#!/bin/sh\n# Stub timeout: drop the duration, run the command.\nshift\nexec \"$@\"\n",
+        "#!/bin/sh\n# Stub timeout: drop the duration, run the command, or fail to\n\
+         # launch it with $STUB_TIMEOUT_RC.\n\
+         if [ -n \"${STUB_TIMEOUT_RC:-}\" ]; then\n\
+         echo \"timeout: failed to run command '$2': Permission denied\" >&2\n\
+         exit \"$STUB_TIMEOUT_RC\"\n\
+         fi\n\
+         shift\nexec \"$@\"\n",
     );
     write_executable(
         &bin.path().join("openssl"),
@@ -829,12 +883,21 @@ EXEC_FAIL=0 LOGS_FAIL=1
 verdict_for
 LOGS_FAIL=0
 verdict_for
+STUB_OPENSSL_RC=143
+verdict_for
 STUB_OPENSSL_RC=1
+verdict_for
+STUB_OPENSSL_OUTPUT='40F7E1B2:error:0A000410:SSL routines:dtls1_read_bytes:sslv3 alert handshake failure:ssl/record/rec_layer_d1.c:613:SSL alert number 40'
+verdict_for
+STUB_OPENSSL_OUTPUT='Error configuring OpenSSL modules: 40F7E1B2:error:12800067:DSO support routines::could not load the shared library'
 verdict_for
 STUB_OPENSSL_OUTPUT='BIO_lookup_ex:system lib: Name does not resolve'
 verdict_for
 STUB_OPENSSL_RC=127 STUB_OPENSSL_OUTPUT=''
 verdict_for
+export STUB_TIMEOUT_RC=125
+verdict_for
+unset STUB_TIMEOUT_RC
 STUB_OPENSSL_RC=0 STUB_OPENSSL_OUTPUT='dtls-ok:dtls-b'
 verdict_for
 STUB_OPENSSL_RC=124 STUB_OPENSSL_OUTPUT=''
@@ -853,15 +916,21 @@ verdict_for
         [
             "2|probe-did-not-run",
             "2|probe-did-not-run",
-            "2|probe-ran-no-echo rc=124 backend-log-unavailable",
-            "0|probe-ran-no-echo rc=124 backend_hits=0",
-            "0|probe-ran-no-echo rc=1 backend_hits=0",
+            "2|probe-timed-out rc=124 backend-log-unavailable",
+            "0|probe-timed-out rc=124 backend_hits=0",
+            "0|probe-timed-out rc=143 backend_hits=0",
+            "2|probe-inconclusive rc=1",
+            "0|probe-peer-alert rc=1 backend_hits=0",
+            "2|probe-inconclusive rc=1",
             "2|probe-setup-failed rc=1",
             "2|probe-tool-unavailable rc=127",
+            "2|probe-tool-unavailable rc=125",
             "1|echo-returned backend_hits=0",
             "1|backend_hits=1",
         ],
-        "an unavailable probe or log read must never satisfy a DTLS denial row"
+        "only a timeout or a received DTLS alert, with the backend log read, \
+         satisfies a DTLS denial row; wrapper, setup, and unrecognized client \
+         failures are inconclusive"
     );
 }
 

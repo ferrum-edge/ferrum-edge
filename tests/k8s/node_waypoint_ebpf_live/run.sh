@@ -5233,10 +5233,19 @@ dtls_denial_probe_from() {
     -- "$wait_secs" "$target:$port" "$DTLS_PROBE_RC_MARKER" 2>&1 || true
 }
 
-# Did the denial probe demonstrably run? Prints the probe evidence and returns
-# 0 when the in-pod status marker is present and the client neither lacked its
-# tools nor failed before it could send (name resolution, local connect,
-# ICMP-refused port). Returns 2 otherwise.
+# Did the denial probe demonstrably reach a refusal? Prints the probe evidence
+# and returns 0 ONLY for recognized denial evidence:
+# - `probe-peer-alert`: the peer rejected the session with a DTLS alert. OpenSSL
+#   prints `SSL alert number N` only for an alert it RECEIVED, never for one it
+#   raised locally.
+# - `probe-timed-out`: the bounded wait expired with nothing back, the
+#   non-delivery signature of a dropped datagram or session. 124 is coreutils
+#   `timeout`; 143/137 are the TERM/KILL status of the client the image's
+#   busybox `timeout` signals in place.
+# Everything else returns 2 (inconclusive): a missing marker, a wrapper that
+# could not launch its child (125/126/127), a client that failed before it
+# could send (name resolution, local connect, ICMP-refused port), and any other
+# status with no recognized diagnostic, such as an OpenSSL initialization error.
 classify_dtls_denial_probe() {
   local report="$1" rc
   rc="$(printf '%s\n' "$report" | sed -n "s/^${DTLS_PROBE_RC_MARKER}//p" | tail -n1)"
@@ -5245,7 +5254,7 @@ classify_dtls_denial_probe() {
     return 2
   fi
   case "$rc" in
-    126|127)
+    125|126|127)
       printf 'probe-tool-unavailable rc=%s' "$rc"
       return 2
       ;;
@@ -5254,7 +5263,18 @@ classify_dtls_denial_probe() {
     printf 'probe-setup-failed rc=%s' "$rc"
     return 2
   fi
-  printf 'probe-ran-no-echo rc=%s' "$rc"
+  if [[ "$rc" != "0" ]] && grep -qE 'SSL alert number [0-9]+' <<<"$report"; then
+    printf 'probe-peer-alert rc=%s' "$rc"
+    return 0
+  fi
+  case "$rc" in
+    124|137|143)
+      printf 'probe-timed-out rc=%s' "$rc"
+      return 0
+      ;;
+  esac
+  printf 'probe-inconclusive rc=%s' "$rc"
+  return 2
 }
 
 # Verdict for one DTLS denial row: the probe report, the echo that must NOT
