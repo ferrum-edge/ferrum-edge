@@ -732,7 +732,12 @@ Raw perf.data, build IDs, header attributes, task/MMAP records, decoder exit
 status, loss/throttle records, per-TID samples, depth distribution, unresolved
 samples and folded/decoded call chains are retained. Stacks are decoded with
 physical DWARF frames and `--no-inline`; source inline-frame
-expansion is not claimed; metadata records `inline_expansion: false`.
+expansion is not claimed. `cpu-coverage.json` records the `decoder_argv` that
+`h1_trace_commands.sh` execs for `perf script` (planned by sourcing the same
+inventory with `exec` captured) and derives `inline_expansion` from it: `false`
+only when the last inline flag is `--no-inline`, `true` otherwise (perf's
+default expands), and `null` with a `decoder argv unverified` issue when the
+argv cannot be planned.
 Default expansion repeatedly stalled addr2line on the
 660.7 MiB production ELF and exceeded the unchanged 30-second decoder deadline.
 Raw-versus-decoded sample counts, loss, identity and admission gates still apply.

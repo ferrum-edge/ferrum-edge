@@ -117,8 +117,12 @@ def socket_coverage(timeline, values, bounds, window, cookie, context=None):
             elif (not event_owner_matches(births[0], base)
                   or births[0]['result'] != 0 or births[0]['family'] != base['family']
                   or births[0]['at_ns'] < context['namespace_lifetime']['opened_ns']
-                  or births[0]['at_ns'] > capture_interval(timeline[values[0][0]])[0]):
+                  or births[0]['at_ns'] > capture_interval(timeline[values[0][0]])[1]):
                 issues.append('birth_identity_or_boundary_mismatch')
+            # inet_create witnesses creation, before bind/connect/autobind
+            # makes UDP visible to INET_DIAG. An earlier absent dump cannot
+            # establish a gap from birth alone. Positive initial-boundary
+            # evidence and continuity between observations remain required.
             if (not event_owner_matches(end, base) or end['result'] != 0 or end['family'] != base['family']
                     or (ipv4(end['local_ipv4']), end['local_port']) != (base['local_address'], base['local_port'])
                     or (base['peer_port'] and (ipv4(end['peer_ipv4']), end['peer_port'])

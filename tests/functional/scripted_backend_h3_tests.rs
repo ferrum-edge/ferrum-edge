@@ -3526,6 +3526,37 @@ async fn h2c_frontend_h3_backend_streaming_trailers_obey_response_header_policy(
     );
 }
 
+/// `backend_read_timeout_ms` for the delayed-FIN trailer tests (14c and 15).
+///
+/// The one knob bounds every backend read on these routes: the initial
+/// response-header wait on a freshly pooled QUIC connection, the DATA phase and
+/// the trailer phase. Only the trailer-phase expiry is under test; the earlier
+/// reads must simply finish inside it. At 25 ms the cold first-request header
+/// wait in an unoptimized gateway on a shared hosted runner already sat at the
+/// edge (`latency_backend_ttfb_ms` 27.08 in the 504 of H1 Profile run
+/// 37994566757, attempt 1), so the margin, not the absolute value, is what
+/// these tests depend on.
+const DELAYED_FIN_READ_TIMEOUT_MS: u64 = 500;
+
+/// How long the scripted backend withholds FIN after its trailer HEADERS.
+///
+/// The script FINs only after this stall, which starts after the request has
+/// reached the backend. A complete response observed by the client in less
+/// than this duration was therefore delivered by the trailer-phase timeout
+/// collapse, never by a FIN that had not been sent yet:
+/// [`assert_trailers_beat_delayed_fin`] makes that proof explicit so neither
+/// test can pass vacuously through the ordinary FIN route.
+const DELAYED_FIN_STALL: Duration = Duration::from_secs(5);
+
+fn assert_trailers_beat_delayed_fin(elapsed: Duration, logs: &str) {
+    assert!(
+        elapsed < DELAYED_FIN_STALL,
+        "the response must complete through the {DELAYED_FIN_READ_TIMEOUT_MS} ms trailer-phase \
+         timeout collapse, before the backend's delayed FIN ({DELAYED_FIN_STALL:?}); \
+         elapsed={elapsed:?}\n--- logs ---\n{logs}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 14c — the SAME response-header policy binds the trailer section on the
 // delayed-FIN / trailer-timeout-collapse route, not just on the ordinary FIN
@@ -3575,24 +3606,32 @@ async fn h2c_frontend_h3_backend_delayed_fin_trailers_obey_response_header_polic
                 ("x-gateway-error", "backend_error".to_string()),
                 ("x-gateway-upstream-status", "degraded".to_string()),
             ]),
-            // Hold the stream open well past the 25 ms backend read timeout so
-            // the trailer-phase deadline is the ONLY thing that can deliver the
+            // Hold the stream open well past the backend read timeout so the
+            // trailer-phase deadline is the ONLY thing that can deliver the
             // buffered trailer map downstream.
-            H3Step::StallFor(Duration::from_millis(300)),
+            H3Step::StallFor(DELAYED_FIN_STALL),
         ],
         &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
-        &|port| file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(port, 25),
+        &|port| {
+            file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(
+                port,
+                DELAYED_FIN_READ_TIMEOUT_MS,
+            )
+        },
     )
     .await;
 
+    let started = Instant::now();
     let resp = raw_h2c_request(&harness.proxy_url("/api/delayed-fin-policy"), "GET", &[])
         .await
         .unwrap_or_else(|e| {
             let logs = harness.captured_combined().unwrap_or_default();
             panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
         });
+    let elapsed = started.elapsed();
 
     let logs = harness.captured_combined().unwrap_or_default();
+    assert_trailers_beat_delayed_fin(elapsed, &logs);
     assert_eq!(
         resp.status, 200,
         "expected the response to STREAM; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
@@ -3676,17 +3715,18 @@ async fn h2c_frontend_h3_backend_forwards_trailers_when_fin_is_delayed_past_time
                 ("x-backend-checksum", "sha256-delayed-fin".to_string()),
                 ("transfer-encoding", "chunked".to_string()),
             ]),
-            // Keep the stream open past the 25 ms backend read timeout. Pre-fix,
-            // h3 had the trailer HEADERS buffered internally but withheld them
+            // Keep the stream open past the backend read timeout. Pre-fix, h3
+            // had the trailer HEADERS buffered internally but withheld them
             // until FIN, so the gateway's timeout collapse emitted clean EOS and
             // dropped the trailers.
-            H3Step::StallFor(Duration::from_millis(200)),
+            H3Step::StallFor(DELAYED_FIN_STALL),
         ],
         &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
-        25,
+        DELAYED_FIN_READ_TIMEOUT_MS,
     )
     .await;
 
+    let started = Instant::now();
     let resp = raw_h2c_request(
         &harness.proxy_url("/api/delayed-fin-trailers"),
         "GET",
@@ -3697,8 +3737,10 @@ async fn h2c_frontend_h3_backend_forwards_trailers_when_fin_is_delayed_past_time
         let logs = harness.captured_combined().unwrap_or_default();
         panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
     });
+    let elapsed = started.elapsed();
 
     let logs = harness.captured_combined().unwrap_or_default();
+    assert_trailers_beat_delayed_fin(elapsed, &logs);
     assert_eq!(
         resp.status, 206,
         "expected delayed-FIN trailered response to stay successful; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
