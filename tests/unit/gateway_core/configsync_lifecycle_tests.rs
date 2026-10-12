@@ -19,11 +19,12 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     CONFIGSYNC_MAX_SILENCE_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome,
     ConfigSyncDivergenceMetrics, DeltaRefuse, DeltaRejectionKind, DeltaRejectionStreamDisposition,
     FullSnapshotStreamDisposition, GatewayTrustEquivalenceState, MultiCpBackoffState,
-    SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriptionApplyState,
-    VersionCompatError, VersionReconcileError, advance_authority_from_committed,
-    advance_multi_cp_backoff, authoritative_snapshot_payload_matches, backoff_max_secs,
-    check_config_sync_build_identity, check_peer_version_compatibility, config_sync_build_identity,
-    connection_error_outcome, cp_endpoints_same_source, delta_rejection_stream_disposition,
+    SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriberSnapshotCursor,
+    SubscriptionApplyState, VersionCompatError, VersionReconcileError,
+    advance_authority_from_committed, advance_multi_cp_backoff,
+    authoritative_snapshot_payload_matches, backoff_max_secs, check_config_sync_build_identity,
+    check_peer_version_compatibility, config_sync_build_identity, connection_error_outcome,
+    cp_endpoints_same_source, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, evaluate_delta_authority,
     evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew, failure_backoff_sequence,
     full_snapshot_stream_disposition, gateway_config_content_matches,
@@ -1651,4 +1652,51 @@ fn admission_refused_still_sleeps_with_one_cp() {
     assert_eq!(state.current_cp_index, 0);
     grow_backoff_after_failure_sleep(&mut state);
     assert!(state.backoff_secs > initial);
+}
+
+/// Issue #6163: the cursor drops only broadcast positions that were queued
+/// before a snapshot this stream sent was loaded. Coverage comes from channel
+/// position, so timestamps play no part: a publication sent after the queued
+/// count was taken is always forwarded.
+#[test]
+fn subscriber_snapshot_cursor_drops_only_positions_queued_before_its_snapshots() {
+    // One publication was queued between subscribe and the initial load.
+    let mut cursor = SubscriberSnapshotCursor::new(1);
+    assert_eq!(cursor.covered_until(), 1);
+    assert!(
+        !cursor.admit_next(),
+        "position 0 is in the initial snapshot"
+    );
+    assert!(cursor.admit_next(), "position 1 was sent after the load");
+    assert_eq!(cursor.next_position(), 2);
+
+    // The receiver lags: positions 2..6 are overwritten and it resumes at
+    // the oldest retained position 6, with 6 and 7 still queued when the
+    // recovery snapshot is loaded.
+    cursor.record_lag(4);
+    assert_eq!(cursor.next_position(), 6);
+    cursor.record_snapshot(2);
+    assert_eq!(cursor.covered_until(), 8);
+    assert!(
+        !cursor.admit_next(),
+        "retained position 6 is in the snapshot"
+    );
+    assert!(
+        !cursor.admit_next(),
+        "retained position 7 is in the snapshot"
+    );
+    assert!(
+        cursor.admit_next(),
+        "position 8 was published after the snapshot load and must be forwarded"
+    );
+
+    // Coverage is monotonic: an empty queue never lowers it.
+    let mut cursor = SubscriberSnapshotCursor::new(3);
+    cursor.record_snapshot(0);
+    assert_eq!(cursor.covered_until(), 3);
+
+    // A fresh subscription with nothing queued forwards everything.
+    let mut cursor = SubscriberSnapshotCursor::new(0);
+    assert!(cursor.admit_next());
+    assert!(cursor.admit_next());
 }

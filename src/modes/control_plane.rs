@@ -2409,6 +2409,9 @@ pub async fn run(
         .scope(cp_scope.clone())
         .require_ns_claim(env_config.cp_require_namespace_claim)
         .real_ip_header(env_config.real_ip_header.clone())
+        // Subscribe streams capture snapshot coverage under the same gate
+        // both config writers publish through (issue #6163).
+        .publication_gate(publication_gate.clone())
         .build();
     let broadcasts = grpc_server.broadcasts();
     let (mesh_grpc_server, mesh_update_tx) =
