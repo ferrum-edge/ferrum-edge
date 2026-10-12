@@ -4572,6 +4572,65 @@ async fn mirror_metrics_track_dispatch_completion_and_timeout() {
     assert_eq!(m2.cancellations, 0, "{m2:?}");
 }
 
+/// #6353: a dispatched mirror task that the executor drops before its first
+/// poll still records exactly one terminal outcome. `tokio::spawn` never polls
+/// synchronously and runtime shutdown drops queued tasks, so the cancellation
+/// guard must already be owned by the future when it is handed over.
+#[test]
+fn mirror_task_dropped_before_first_poll_counts_one_cancellation() {
+    // A current-thread runtime that is entered but never driven: the spawned
+    // mirror task is queued on it and can never be polled before shutdown.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let entered = runtime.enter();
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": "127.0.0.1",
+            "mirror_port": 9,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    // The dispatch hook has no await point, so a plain executor completes it
+    // without driving the tokio runtime that owns the spawned task.
+    let result = futures::executor::block_on(plugin.finalized_egress(&mut ctx, &mut headers));
+    plugin_utils::assert_continue(result);
+    let queued = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(queued.dispatched, 1, "one task dispatched: {queued:?}");
+    assert_eq!(
+        queued.cancellations, 0,
+        "the queued task has not been dropped yet: {queued:?}"
+    );
+
+    drop(ctx);
+    drop(entered);
+    // Shutdown drops the queued, never-polled task future.
+    drop(runtime);
+
+    let m = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(m.dispatched, 1, "{m:?}");
+    assert_eq!(
+        m.cancellations, 1,
+        "an unpolled dropped task must count one cancellation: {m:?}"
+    );
+    assert_eq!(
+        m.completed
+            + m.request_timeouts
+            + m.request_failures
+            + m.drain_timeouts
+            + m.drain_failures
+            + m.drain_truncations
+            + m.cancellations,
+        m.dispatched,
+        "terminal outcomes must sum to dispatched: {m:?}"
+    );
+}
+
 /// #3057: the concurrency-drop admission path increments the drop counter while
 /// leaving the primary request unaffected.
 #[tokio::test]

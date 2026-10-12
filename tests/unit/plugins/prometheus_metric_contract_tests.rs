@@ -875,9 +875,10 @@ fn representative_exposition() -> String {
         false,
         Some(&passive),
     );
+    let data_load_balancer = ferrum_edge::load_balancer::LoadBalancerCache::new(&data_config);
     ferrum_edge::data_path_metrics::render_upstream_health(
         &mut data_path,
-        &data_config,
+        &data_load_balancer.load(),
         &health,
         data_ns_label,
     );
@@ -1233,11 +1234,12 @@ fn bundled_grafana_dashboard_metric_refs_are_inventoried() {
 #[test]
 fn bundled_classification_matches_chart_references() {
     let contract = load_contract();
-    let mut referenced = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
-    referenced.extend(ferrum_metric_names_in_text(
+    let mut alert_refs = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
+    alert_refs.extend(ferrum_metric_names_in_text(
         BUNDLED_GATEWAY_PROMETHEUS_RULE_TEMPLATE,
         &contract,
     ));
+    let mut dashboard_refs = BTreeSet::new();
     for dash in [
         include_str!("../../../charts/ferrum-mesh/dashboards/certificate-posture.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/egress-scope.json"),
@@ -1246,23 +1248,26 @@ fn bundled_classification_matches_chart_references() {
         include_str!("../../../charts/ferrum-mesh/dashboards/policy-deny.json"),
         include_str!("../../../charts/ferrum-gateway/dashboards/gateway-overview.json"),
     ] {
-        referenced.extend(ferrum_metric_names_in_text(dash, &contract));
+        dashboard_refs.extend(ferrum_metric_names_in_text(dash, &contract));
     }
+    // The classification is exact, not just "referenced or not": a family a
+    // bundled alert consumes must not be inventoried as dashboard-only
+    // (issue #6352), and vice versa.
     for fam in contract.values() {
-        let is_ref = referenced.contains(&fam.name);
-        match fam.bundled.as_str() {
-            "documented_only" => assert!(
-                !is_ref,
-                "{} is documented_only but appears in bundled charts/alerts",
-                fam.name
-            ),
-            "alert" | "dashboard" | "alert_and_dashboard" => assert!(
-                is_ref,
-                "{} is classified as {} but is not referenced by bundled charts/alerts",
-                fam.name, fam.bundled
-            ),
-            other => panic!("unexpected bundled value {other}"),
-        }
+        let expected = match (
+            alert_refs.contains(&fam.name),
+            dashboard_refs.contains(&fam.name),
+        ) {
+            (true, true) => "alert_and_dashboard",
+            (true, false) => "alert",
+            (false, true) => "dashboard",
+            (false, false) => "documented_only",
+        };
+        assert_eq!(
+            fam.bundled, expected,
+            "{} is classified as {} but bundled chart references make it {}",
+            fam.name, fam.bundled, expected
+        );
     }
 }
 

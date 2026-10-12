@@ -1020,7 +1020,7 @@ pub fn render_prometheus(
     );
 
     output.push_str(
-        "# HELP ferrum_gateway_listeners_active Dynamic Gateway API listener ports currently bound and accepting.\n",
+        "# HELP ferrum_gateway_listeners_active Dynamic Gateway API listener ports with an open accept gate at the last accepted reconcile; not re-sampled between reconciles, so a listener task that ends in between is reflected at the next reconcile.\n",
     );
     output.push_str("# TYPE ferrum_gateway_listeners_active gauge\n");
     render_process_gauge(
@@ -1078,7 +1078,7 @@ pub fn render_prometheus(
     );
 
     output.push_str(
-        "# HELP ferrum_gateway_listener_recoveries_total Dynamic Gateway API listener failures cleared by a later reconcile since process start, by protocol half and bounded reason.\n",
+        "# HELP ferrum_gateway_listener_recoveries_total Dynamic Gateway API listener failure identities cleared since process start, by protocol half and bounded reason: tracked failures absent at a later accepted reconcile (including a reason change or listener withdrawal, not only a restored socket), plus transient failures settled within the same reconcile pass.\n",
     );
     output.push_str("# TYPE ferrum_gateway_listener_recoveries_total counter\n");
     render_cumulative(

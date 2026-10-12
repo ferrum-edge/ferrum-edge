@@ -39,6 +39,15 @@ def parse_metrics(text):
     return counters
 
 
+def _is_finite_number(value):
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def counter_relations(counters):
     issues = []
     for direction in ("ingress", "reply", "other"):
@@ -110,8 +119,7 @@ def profile_bracket(usage, phases):
         return result
     start = phases.get("measurement_start_unix_secs")
     duration = phases.get("measurement_secs")
-    if (type(start) not in (float, int) or type(duration) not in (float, int)
-            or not math.isfinite(start) or not math.isfinite(duration) or duration <= 0):
+    if (not _is_finite_number(start) or not _is_finite_number(duration) or duration <= 0):
         result["issues"].append("missing measurement boundaries")
         return result
     timeline = usage.get("timeline", [])
@@ -119,8 +127,8 @@ def profile_bracket(usage, phases):
         result["issues"].append("missing or malformed capture timeline")
         return result
     for row in timeline:
-        if (not isinstance(row, dict) or type(row.get("unix_secs")) not in (float, int)
-                or not math.isfinite(row["unix_secs"]) or not isinstance(row.get("processes"), list)
+        if (not isinstance(row, dict) or not _is_finite_number(row.get("unix_secs"))
+                or not isinstance(row.get("processes"), list)
                 or any(not isinstance(p, dict) or not {"pid", "start_ticks", "role"} <= p.keys()
                        or type(p["pid"]) is not int or type(p["start_ticks"]) is not int
                        or p["pid"] <= 0 or p["start_ticks"] < 0 or not isinstance(p["role"], str)
@@ -130,13 +138,10 @@ def profile_bracket(usage, phases):
         if "udp_profile" not in row:
             continue
         profile = row["udp_profile"]
-        if (not isinstance(profile, dict) or type(profile.get("unix_secs")) not in (float, int)
-                or not math.isfinite(profile["unix_secs"])
-                or type(profile.get("capture_secs")) not in (float, int)
-                or not math.isfinite(profile["capture_secs"])
+        if (not isinstance(profile, dict) or not _is_finite_number(profile.get("unix_secs"))
+                or not _is_finite_number(profile.get("capture_secs"))
                 or profile["capture_secs"] < 0
-                or type(profile.get("sampler_cpu_secs")) not in (float, int)
-                or not math.isfinite(profile["sampler_cpu_secs"])
+                or not _is_finite_number(profile.get("sampler_cpu_secs"))
                 or profile["sampler_cpu_secs"] < 0):
             result["issues"].append("malformed profile capture")
             return result
@@ -185,12 +190,12 @@ def profile_bracket(usage, phases):
             result["issues"].append("metrics PID is not bound to observed gateway process")
     for field in ("sample_id", "monotonic_secs", "unix_secs"):
         values = [p.get(field) for p in profiles]
-        if (any(type(value) not in (int, float) or not math.isfinite(value) for value in values)
+        if (any(not _is_finite_number(value) for value in values)
                 or any(b <= a for a, b in zip(values, values[1:]))):
             result["issues"].append("missing or non-increasing capture " + field)
     if any(type(p.get("sample_id")) is not int or p["sample_id"] < 0 for p in profiles):
         result["issues"].append("invalid sample ID")
-    clocks_valid = all(type(p.get(field)) in (int, float) and math.isfinite(p[field])
+    clocks_valid = all(_is_finite_number(p.get(field))
                        for p in profiles for field in ("unix_secs", "monotonic_secs"))
     if clocks_valid and any(abs((b["unix_secs"] - a["unix_secs"]) -
                                 (b["monotonic_secs"] - a["monotonic_secs"])) > 0.05

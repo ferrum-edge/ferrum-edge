@@ -28,7 +28,10 @@
 //! A budget expiry is *not* a lost write. The reconciler leaves the status-plan
 //! cursor unchanged on any patch error, so the same bounded window is replanned
 //! and retried on the next reconcile; objects that already succeeded drop out of
-//! the plan, so the tail of a slow batch moves up rather than starving.
+//! the plan, so the tail of a slow batch moves up rather than starving. A window
+//! that fails `STATUS_WINDOW_MAX_FAILED_BATCHES` times in a row is advanced past
+//! (#6370) so a persistently failing object cannot starve candidates outside it;
+//! its own write is retried when the rotation wraps back.
 
 use std::future::Future;
 use std::sync::atomic::Ordering;
@@ -97,7 +100,8 @@ pub struct StatusOperation<'a> {
 /// Modeled as an API `Status` failure with HTTP 504 and reason `Timeout` so it
 /// flows through the existing error handling unchanged: it is not a 409, so no
 /// conflict-retry path treats it as a lost CAS race, and the reconciler's
-/// "leave the cursor unchanged and retry this window" branch already covers it.
+/// bounded "leave the cursor unchanged and retry this window" branch already
+/// covers it.
 pub fn status_timeout_error(
     operation: StatusOperation<'_>,
     budget: Option<Duration>,

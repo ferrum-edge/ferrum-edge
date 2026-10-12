@@ -28,7 +28,10 @@ use crate::k8s_controller::status::{
     gateway_api_data_plane_service_ready, plan_gateway_api_status_updates_budgeted,
 };
 use crate::k8s_controller::status_budget::STATUS_BATCH_BACKSTOP;
-use crate::k8s_controller::status_plan::{DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget};
+use crate::k8s_controller::status_plan::{
+    DEFAULT_STATUS_PLAN_WORK_BUDGET, STATUS_WINDOW_MAX_FAILED_BATCHES, StatusPlanBudget,
+    StatusWindowBatch, StatusWindowCursorDecision, status_window_cursor_after_batch,
+};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
 use crate::modes::mesh::config::MeshConfig;
 use crate::modes::mesh::revision::{MeshConfigRevision, MeshRevisionOrder};
@@ -1402,11 +1405,16 @@ async fn patch_gateway_api_statuses(
     // Advance the cursor when planning succeeds with an empty write set (fairness
     // must progress) or after a successful patch batch. Patch errors and batch
     // timeouts leave the prior cursor so the same bounded window retries on the
-    // next serialized reconcile (#2397).
+    // next serialized reconcile (#2397), but only up to
+    // STATUS_WINDOW_MAX_FAILED_BATCHES consecutive failures: a persistently
+    // failing object must not starve healthy candidates outside the window
+    // (#6370).
     if updates.is_empty() {
-        metrics.gateway_api_status_plan_cursor.store(
-            outcome.next_cursor as u64,
-            std::sync::atomic::Ordering::Relaxed,
+        record_gateway_api_status_batch(
+            metrics,
+            cursor,
+            outcome.next_cursor,
+            StatusWindowBatch::Succeeded,
         );
         return;
     }
@@ -1425,31 +1433,99 @@ async fn patch_gateway_api_statuses(
     match await_status_patch_batch(writer.patch_updates(updates), STATUS_PATCH_BATCH_TIMEOUT).await
     {
         Ok(Ok(())) => {
-            metrics.gateway_api_status_plan_cursor.store(
-                outcome.next_cursor as u64,
-                std::sync::atomic::Ordering::Relaxed,
+            record_gateway_api_status_batch(
+                metrics,
+                cursor,
+                outcome.next_cursor,
+                StatusWindowBatch::Succeeded,
             );
         }
         Ok(Err(error)) => {
-            warn!(
-                error = %error,
-                updates = updates_len,
+            let decision = record_gateway_api_status_batch(
+                metrics,
                 cursor,
-                "Failed to patch Gateway API status; leaving status-plan cursor unchanged to retry this window"
+                outcome.next_cursor,
+                StatusWindowBatch::Failed,
             );
+            if decision.advanced_past_failures {
+                warn!(
+                    error = %error,
+                    updates = updates_len,
+                    cursor,
+                    next_cursor = decision.cursor,
+                    max_failed_batches = STATUS_WINDOW_MAX_FAILED_BATCHES,
+                    "Failed to patch Gateway API status; window kept failing, advancing status-plan cursor so other candidates progress (failed objects retry when the rotation wraps)"
+                );
+            } else {
+                warn!(
+                    error = %error,
+                    updates = updates_len,
+                    cursor,
+                    failed_batches = decision.failed_batches,
+                    max_failed_batches = STATUS_WINDOW_MAX_FAILED_BATCHES,
+                    "Failed to patch Gateway API status; leaving status-plan cursor unchanged to retry this window"
+                );
+            }
         }
         Err(_) => {
             metrics
                 .status_batch_timeouts
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            warn!(
-                updates = updates_len,
-                timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
+            let decision = record_gateway_api_status_batch(
+                metrics,
                 cursor,
-                "Gateway API status patch batch exceeded its defensive backstop; leaving status-plan cursor unchanged so this window retries on a later reconcile"
+                outcome.next_cursor,
+                StatusWindowBatch::Failed,
             );
+            if decision.advanced_past_failures {
+                warn!(
+                    updates = updates_len,
+                    timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
+                    cursor,
+                    next_cursor = decision.cursor,
+                    max_failed_batches = STATUS_WINDOW_MAX_FAILED_BATCHES,
+                    "Gateway API status patch batch exceeded its defensive backstop; window kept failing, advancing status-plan cursor so other candidates progress (failed objects retry when the rotation wraps)"
+                );
+            } else {
+                warn!(
+                    updates = updates_len,
+                    timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
+                    cursor,
+                    failed_batches = decision.failed_batches,
+                    max_failed_batches = STATUS_WINDOW_MAX_FAILED_BATCHES,
+                    "Gateway API status patch batch exceeded its defensive backstop; leaving status-plan cursor unchanged so this window retries on a later reconcile"
+                );
+            }
         }
     }
+}
+
+/// Persist the Gateway API status-plan cursor and failure streak after one
+/// planning/patch round (#2397, #6370).
+///
+/// The only writer of both atomics; called from the serialized reconcile loop.
+fn record_gateway_api_status_batch(
+    metrics: &ControllerMetrics,
+    cursor: usize,
+    next_cursor: usize,
+    batch: StatusWindowBatch,
+) -> StatusWindowCursorDecision {
+    let decision = status_window_cursor_after_batch(
+        cursor,
+        next_cursor,
+        metrics
+            .gateway_api_status_window_failed_batches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        batch,
+    );
+    metrics.gateway_api_status_window_failed_batches.store(
+        decision.failed_batches,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    metrics
+        .gateway_api_status_plan_cursor
+        .store(decision.cursor as u64, std::sync::atomic::Ordering::Relaxed);
+    decision
 }
 
 fn gateway_api_status_context(

@@ -1252,8 +1252,9 @@ impl RequestMirrorAdmissions {
 /// `{completed, request_timeouts, request_failures, drain_timeouts,
 /// drain_failures, drain_truncations, cancellations}`, so those seven sum to
 /// `dispatched`. A task that is dropped before recording a terminal outcome —
-/// runtime shutdown, panic, or the executor cancelling the future — is counted
-/// as a cancellation by [`MirrorTaskGuard`].
+/// runtime shutdown, panic, or the executor cancelling the future, including
+/// before its first poll — is counted as a cancellation by [`MirrorTaskGuard`],
+/// which is armed before the future is handed to the executor.
 #[derive(Debug, Default)]
 struct MirrorMetrics {
     /// Detached tasks spawned (admitted past both concurrency and byte budgets).
@@ -1262,7 +1263,8 @@ struct MirrorMetrics {
     completed: AtomicU64,
     /// Request-phase deadline expiries (connect/header/body request timeout).
     request_timeouts: AtomicU64,
-    /// Other transport failures before a response (DNS, refused, reset, TLS…).
+    /// Other failures before a response: local client/request construction
+    /// and transport errors (DNS, refused, reset, TLS…).
     request_failures: AtomicU64,
     /// Response-body drain-phase deadline expiries.
     drain_timeouts: AtomicU64,
@@ -2793,6 +2795,15 @@ impl Plugin for RequestMirror {
         let body_for_request = body_bytes;
         let metrics = Arc::clone(&self.metrics);
         metrics.bump_dispatched();
+        // Count a cancellation if this task is dropped (runtime shutdown,
+        // panic, or future cancellation) before recording a terminal outcome.
+        // Armed BEFORE the future reaches the executor and moved into it:
+        // `tokio::spawn` never polls synchronously, and a task dropped before
+        // its first poll (runtime shutdown with the task still queued) drops
+        // its captured values without running the body, so a guard built
+        // inside the body would never exist to count it. Settled below once a
+        // terminal metric is recorded.
+        let task_guard = MirrorTaskGuard::new(metrics);
 
         // Fire-and-forget: spawn an async task to send the mirror request.
         // The main request proceeds immediately — mirror latency has zero
@@ -2804,10 +2815,7 @@ impl Plugin for RequestMirror {
             // when this future ends.
             let _permit = permit;
             let _retained_body_lease = body_lease;
-            // Count a cancellation if this task is dropped (runtime shutdown,
-            // panic, or future cancellation) before recording a terminal
-            // outcome. Settled below once a terminal metric is recorded.
-            let mut task_guard = MirrorTaskGuard::new(metrics);
+            let mut task_guard = task_guard;
             let start = std::time::Instant::now();
             // ONE absolute deadline for the whole detached mirror. The shared
             // `PluginHttpClient` replays GET/HEAD/OPTIONS on transport failure
