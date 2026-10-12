@@ -838,6 +838,7 @@ fn node_waypoint_functions() -> String {
     let source = read(NODE_WAYPOINT_RUN_SH);
     let mut prelude = shell_line(&source, "LAST_HTTP_DENIAL_EVIDENCE=");
     prelude.push_str(&shell_line(&source, "DTLS_PROBE_RC_MARKER="));
+    prelude.push_str(&shell_line(&source, "DTLS_PROBE_DEADLINE_MARKER="));
     let functions = shell_functions(
         &source,
         &[
@@ -1086,21 +1087,20 @@ show dtls-b
 fn node_waypoint_dtls_denial_requires_probe_execution_and_a_read_backend_log() {
     let bin = TempDir::new().expect("stub bin dir");
     write_executable(
-        &bin.path().join("timeout"),
-        "#!/bin/sh\n# Stub timeout: drop the duration, run the command, or fail to\n\
-         # launch it with $STUB_TIMEOUT_RC.\n\
-         if [ -n \"${STUB_TIMEOUT_RC:-}\" ]; then\n\
-         echo \"timeout: failed to run command '$2': Permission denied\" >&2\n\
-         exit \"$STUB_TIMEOUT_RC\"\n\
-         fi\n\
-         shift\nexec \"$@\"\n",
-    );
-    write_executable(
         &bin.path().join("openssl"),
-        "#!/bin/sh\n# Stub openssl s_client for the DTLS denial regression.\n\
+        "#!/bin/sh\n# Stub openssl s_client for the DTLS denial regression. Modes:\n\
+         # hang (outlive the deadline), ignore-term (outlive TERM too),\n\
+         # self-term/self-kill (die of an unrelated signal before the\n\
+         # deadline), exit (print $STUB_OPENSSL_OUTPUT, exit $STUB_OPENSSL_RC).\n\
          cat >/dev/null\n\
+         case \"${STUB_OPENSSL_MODE:-exit}\" in\n\
+         hang) exec sleep 30 ;;\n\
+         ignore-term) trap '' TERM; exec sleep 30 ;;\n\
+         self-term) kill -TERM $$ ;;\n\
+         self-kill) kill -KILL $$ ;;\n\
+         esac\n\
          if [ -n \"${STUB_OPENSSL_OUTPUT:-}\" ]; then printf '%s\\n' \"$STUB_OPENSSL_OUTPUT\"; fi\n\
-         exit \"${STUB_OPENSSL_RC:-124}\"\n",
+         exit \"${STUB_OPENSSL_RC:-1}\"\n",
     );
     let functions = node_waypoint_functions();
     let state = TempDir::new().expect("state dir");
@@ -1108,12 +1108,12 @@ fn node_waypoint_dtls_denial_requires_probe_execution_and_a_read_backend_log() {
         r#"{NODE_WAYPOINT_STUBS}{functions}
 verdict_for() {{
   local report hits log_status=0 evidence verdict=0
-  report="$(dtls_denial_probe_from ferrum-ebpf-live dtls-src-b 10.0.0.1 15354 dtls-b 8)"
+  report="$(dtls_denial_probe_from ferrum-ebpf-live dtls-src-b 10.0.0.1 15354 dtls-b 1)"
   hits="$(backend_log_payload_count ferrum-ebpf-live dtls-echo dtls-b)" || log_status=$?
   evidence="$(dtls_denial_verdict "$report" "dtls-ok:dtls-b" "$log_status" "$hits")" || verdict=$?
   printf '%s|%s\n' "$verdict" "$evidence"
 }}
-export STUB_OPENSSL_RC=124 STUB_OPENSSL_OUTPUT=''
+export STUB_OPENSSL_MODE=hang STUB_OPENSSL_RC=1 STUB_OPENSSL_OUTPUT=''
 EXEC_FAIL=1 LOGS_FAIL=1
 verdict_for
 EXEC_FAIL=1 LOGS_FAIL=0
@@ -1122,7 +1122,15 @@ EXEC_FAIL=0 LOGS_FAIL=1
 verdict_for
 LOGS_FAIL=0
 verdict_for
-STUB_OPENSSL_RC=143
+STUB_OPENSSL_MODE=ignore-term
+verdict_for
+STUB_OPENSSL_MODE=self-term
+verdict_for
+STUB_OPENSSL_MODE=self-kill
+verdict_for
+STUB_OPENSSL_MODE=exit STUB_OPENSSL_RC=143
+verdict_for
+STUB_OPENSSL_RC=124
 verdict_for
 STUB_OPENSSL_RC=1
 verdict_for
@@ -1134,12 +1142,9 @@ STUB_OPENSSL_OUTPUT='BIO_lookup_ex:system lib: Name does not resolve'
 verdict_for
 STUB_OPENSSL_RC=127 STUB_OPENSSL_OUTPUT=''
 verdict_for
-export STUB_TIMEOUT_RC=125
-verdict_for
-unset STUB_TIMEOUT_RC
 STUB_OPENSSL_RC=0 STUB_OPENSSL_OUTPUT='dtls-ok:dtls-b'
 verdict_for
-STUB_OPENSSL_RC=124 STUB_OPENSSL_OUTPUT=''
+STUB_OPENSSL_RC=1 STUB_OPENSSL_OUTPUT=''
 BACKEND_LOGS='recv:dtls-b\n'
 verdict_for
 "#
@@ -1155,21 +1160,24 @@ verdict_for
         [
             "2|probe-did-not-run",
             "2|probe-did-not-run",
-            "2|probe-timed-out rc=124 backend-log-unavailable",
-            "0|probe-timed-out rc=124 backend_hits=0",
+            "2|probe-timed-out rc=143 backend-log-unavailable",
             "0|probe-timed-out rc=143 backend_hits=0",
+            "0|probe-timed-out rc=137 backend_hits=0",
+            "2|probe-killed-without-deadline rc=143",
+            "2|probe-killed-without-deadline rc=137",
+            "2|probe-killed-without-deadline rc=143",
+            "2|probe-inconclusive rc=124",
             "2|probe-inconclusive rc=1",
             "0|probe-peer-alert rc=1 backend_hits=0",
             "2|probe-inconclusive rc=1",
             "2|probe-setup-failed rc=1",
             "2|probe-tool-unavailable rc=127",
-            "2|probe-tool-unavailable rc=125",
             "1|echo-returned backend_hits=0",
             "1|backend_hits=1",
         ],
-        "only a timeout or a received DTLS alert, with the backend log read, \
-         satisfies a DTLS denial row; wrapper, setup, and unrecognized client \
-         failures are inconclusive"
+        "only an expiry of the probe's own deadline or a received DTLS alert, \
+         with the backend log read, satisfies a DTLS denial row; an unrelated \
+         TERM/KILL, setup, and unrecognized client failures are inconclusive"
     );
 }
 

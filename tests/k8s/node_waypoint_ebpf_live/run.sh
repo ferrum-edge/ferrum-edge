@@ -5256,18 +5256,45 @@ backend_log_payload_count() {
 }
 
 DTLS_PROBE_RC_MARKER="FERRUM_DTLS_PROBE_RC:"
+DTLS_PROBE_DEADLINE_MARKER="FERRUM_DTLS_PROBE_DEADLINE_FIRED"
 
 # DTLS denial probe that keeps its provenance. Same handshake and datagram as
-# dtls_probe_from, but openssl's stderr is kept and the status of `timeout
-# openssl` is appended INSIDE the pod as `FERRUM_DTLS_PROBE_RC:<rc>`, so a
-# kubectl/exec/image failure (no marker) stays distinguishable from a probe that
-# ran and got nothing back. A timeout is a legitimate denial outcome, so the
-# status is evidence that the probe ran, not a pass/fail verdict by itself.
+# dtls_probe_from, but openssl's stderr is kept and the client's exit status is
+# appended INSIDE the pod as `FERRUM_DTLS_PROBE_RC:<rc>`, so a kubectl/exec/image
+# failure (no marker) stays distinguishable from a probe that ran and got
+# nothing back.
+#
+# The wait is bounded by an in-pod supervisor, not `timeout`: the image's
+# BusyBox `timeout` signals the client in place, so its status (143/137) is the
+# same one an unrelated TERM/KILL (an OOM kill, say) produces. The supervisor
+# prints `FERRUM_DTLS_PROBE_DEADLINE_FIRED` only when its OWN deadline expires,
+# immediately before it sends TERM (then KILL after 2s), so the expiry is
+# evidenced independently of the client's exit status. If its sleep fails it
+# kills the client without the marker, leaving the probe inconclusive.
 dtls_denial_probe_from() {
   local ns="$1" app="$2" target="$3" port="$4" payload="$5" wait_secs="${6:-8}"
-  printf '%s\n' "$payload" | kubectl -n "$ns" exec -i "deploy/$app" -c dtls -- \
-    sh -c 'timeout "$1" openssl s_client -dtls1_2 -connect "$2" -quiet 2>&1; printf "\n%s%s\n" "$3" "$?"' \
-    -- "$wait_secs" "$target:$port" "$DTLS_PROBE_RC_MARKER" 2>&1 || true
+  printf '%s\n' "$payload" | kubectl -n "$ns" exec -i "deploy/$app" -c dtls -- sh -c '
+      exec 3<&0
+      openssl s_client -dtls1_2 -connect "$2" -quiet <&3 3<&- 2>&1 &
+      client=$!
+      exec 3<&-
+      (
+        if ! sleep "$1" >/dev/null 2>&1; then
+          kill -KILL "$client" 2>/dev/null
+          exit 0
+        fi
+        printf "\n%s\n" "$4"
+        kill -TERM "$client" 2>/dev/null
+        sleep 2 >/dev/null 2>&1
+        kill -KILL "$client" 2>/dev/null
+      ) &
+      guard=$!
+      wait "$client"
+      rc=$?
+      kill "$guard" 2>/dev/null
+      wait "$guard" 2>/dev/null
+      printf "\n%s%s\n" "$3" "$rc"
+    ' -- "$wait_secs" "$target:$port" "$DTLS_PROBE_RC_MARKER" "$DTLS_PROBE_DEADLINE_MARKER" 2>&1 || true
 }
 
 # Did the denial probe demonstrably reach a refusal? Prints the probe evidence
@@ -5275,13 +5302,13 @@ dtls_denial_probe_from() {
 # - `probe-peer-alert`: the peer rejected the session with a DTLS alert. OpenSSL
 #   prints `SSL alert number N` only for an alert it RECEIVED, never for one it
 #   raised locally.
-# - `probe-timed-out`: the bounded wait expired with nothing back, the
-#   non-delivery signature of a dropped datagram or session. 124 is coreutils
-#   `timeout`; 143/137 are the TERM/KILL status of the client the image's
-#   busybox `timeout` signals in place.
-# Everything else returns 2 (inconclusive): a missing marker, a wrapper that
-# could not launch its child (125/126/127), a client that failed before it
-# could send (name resolution, local connect, ICMP-refused port), and any other
+# - `probe-timed-out`: the supervisor's deadline fired (its marker is present)
+#   and the client then died of the TERM/KILL it sent (143/137), the
+#   non-delivery signature of a dropped datagram or session.
+# Everything else returns 2 (inconclusive): a missing marker, a client that
+# could not launch (126/127), a client that failed before it could send (name
+# resolution, local connect, ICMP-refused port), a TERM/KILL status with no
+# deadline marker (an unrelated signal, such as an OOM kill), and any other
 # status with no recognized diagnostic, such as an OpenSSL initialization error.
 classify_dtls_denial_probe() {
   local report="$1" rc
@@ -5305,9 +5332,13 @@ classify_dtls_denial_probe() {
     return 0
   fi
   case "$rc" in
-    124|137|143)
-      printf 'probe-timed-out rc=%s' "$rc"
-      return 0
+    137|143)
+      if grep -qxF "$DTLS_PROBE_DEADLINE_MARKER" <<<"$report"; then
+        printf 'probe-timed-out rc=%s' "$rc"
+        return 0
+      fi
+      printf 'probe-killed-without-deadline rc=%s' "$rc"
+      return 2
       ;;
   esac
   printf 'probe-inconclusive rc=%s' "$rc"
