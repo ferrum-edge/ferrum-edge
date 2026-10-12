@@ -755,7 +755,8 @@ async fn transform_response_body(
   `'static`, which `Arc<dyn Plugin>` already required.
 - Declaring `Never` but returning `Some` from `normalize_response_body*` /
   `transform_response_body*` remains a contract violation: the replacement is
-  refused rather than installed.
+  refused rather than installed, even when a producing peer in the same chain
+  opened a retained-response window the replacement would fit in.
 
 Exporters that must observe the response after all rejecting validators should
 also return `true` from `requires_response_committed_hook()` and emit from

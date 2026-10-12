@@ -7956,9 +7956,8 @@ pub async fn normalize_response_body_for_inspection(
         // the previous replacement has by now been installed and the body it
         // replaced has dropped its charge — refilling any earlier would hold
         // both at once.
-        if let Some(reason) =
-            admit_response_body_producer(plugin.response_body_production(), window.as_mut())
-        {
+        let production = plugin.response_body_production();
+        if let Some(reason) = admit_response_body_producer(production, window.as_mut()) {
             tracing::warn!(
                 plugin = plugin.name(),
                 reason,
@@ -8023,11 +8022,29 @@ pub async fn normalize_response_body_for_inspection(
             // so a gRPC-Web refusal is body-framed and no header describing the
             // discarded representation survives.
             //
-            // A `None` window here means a plugin declared as a non-producer
-            // returned bytes anyway. The blocks that would pay for them were
-            // never reserved, so the fail-closed answer is the same refusal
-            // rather than installing an uncharged allocation.
+            // A plugin declared as a non-producer that returned bytes anyway is
+            // refused per plugin, not per chain: a producing peer may have
+            // opened a window this plugin never reserved for, and installing
+            // its bytes there would honour a contract it declared it does not
+            // have. A pure-Never chain, which opens no window at all, is refused
+            // here the same way.
             let body_len = body.len();
+            if !production.may_replace_response_body() {
+                tracing::warn!(
+                    plugin = plugin.name(),
+                    replacement_bytes = body_len,
+                    "Response normalization refused: a plugin declared as a non-producer \
+                     returned a replacement body"
+                );
+                crate::proxy::replace_buffered_response_with_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                );
+                return true;
+            }
             let Some(charged) = window.as_mut().and_then(|window| window.charge(body)) else {
                 tracing::warn!(
                     plugin = plugin.name(),

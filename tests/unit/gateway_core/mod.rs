@@ -189,6 +189,7 @@ mod request_representation_tests;
 mod request_trailer_boundary_tests;
 mod reqwest_response_trailer_tests;
 mod response_body_mode_tests;
+mod response_body_never_producer_tests;
 mod response_buffer_budget_tests;
 mod response_coalescing_allocation_tests;
 mod response_coalescing_lazy_tests;
