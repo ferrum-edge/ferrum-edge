@@ -7274,7 +7274,7 @@ async fn serve_scripted_dedup_redis(
                     let commands = queued.take().unwrap_or_default();
                     let held = state
                         .holds_remaining
-                        .fetch_update(
+                        .try_update(
                             std::sync::atomic::Ordering::SeqCst,
                             std::sync::atomic::Ordering::SeqCst,
                             |remaining| remaining.checked_sub(1),
