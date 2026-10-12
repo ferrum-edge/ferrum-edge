@@ -812,7 +812,8 @@ impl ProviderCircuit {
                 self.half_open_in_flight.store(false, Ordering::Release);
                 return CircuitAdmission::Open;
             }
-            self.half_open_probe_state.store(observed, Ordering::Release);
+            self.half_open_probe_state
+                .store(observed, Ordering::Release);
             super::prometheus_metrics::global_registry().record_ai_federation_half_open_probe();
             CircuitAdmission::HalfOpenProbe
         } else {
@@ -956,7 +957,9 @@ impl ProviderCircuit {
     fn open(&self, provider_name: &str, reason: &'static str) {
         // The closure always returns `Some`, so this update cannot fail.
         let reopen = |current| Some(self.reopened_state(current));
-        let _ = self.state.try_update(Ordering::AcqRel, Ordering::Acquire, reopen);
+        let _ = self
+            .state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, reopen);
         self.publish_open(provider_name, reason);
     }
 
@@ -9325,7 +9328,9 @@ pub mod test_helpers {
             };
             Some(state.pack())
         };
-        let _ = circuit.state.try_update(Ordering::AcqRel, Ordering::Acquire, backdate);
+        let _ = circuit
+            .state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, backdate);
     }
 
     fn circuit_admission_label(admission: CircuitAdmission) -> &'static str {
