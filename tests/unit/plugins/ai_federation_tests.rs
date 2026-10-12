@@ -6369,7 +6369,7 @@ fn provider_circuit_cooldown_uses_the_process_monotonic_clock() {
         .split("fn add_external_io_elapsed(")
         .next()
         .expect("bounded provider circuit implementation");
-    assert!(circuit.contains("open_until_monotonic_ms"));
+    assert!(circuit.contains("open_until: circuit_monotonic_millis()"));
     assert!(circuit.contains("crate::socket_opts::monotonic_now_ms()"));
     assert!(circuit.contains("saturating_add(1)"));
     assert!(!circuit.contains("SystemTime"));
@@ -6495,6 +6495,45 @@ fn delayed_closed_failure_cannot_free_a_live_half_open_probe() {
 #[test]
 fn delayed_closed_success_leaves_a_live_half_open_probe_held() {
     assert!(test_helpers::delayed_closed_success_keeps_live_probe_for_test());
+}
+
+#[test]
+fn stale_half_open_outcome_cannot_commit_over_a_concurrent_reopen() {
+    // A reopen that lands between the probe validating its cycle and
+    // committing its outcome must win: the stale commit fails, the newer
+    // cooldown survives unchanged, and the circuit stays open.
+    for (outcome, success_threshold) in [("success", 1), ("success", 2), ("failure", 1)] {
+        assert_eq!(
+            test_helpers::half_open_outcome_commit_race_for_test(outcome, success_threshold, true),
+            Some((false, true, "open")),
+            "stale probe outcome {outcome:?} with success_threshold {success_threshold}"
+        );
+    }
+}
+
+#[test]
+fn uncontended_half_open_outcome_commits_through_the_same_path() {
+    // Control: without the interleaved reopen, the same split commit applies.
+    let cases = [
+        ("success", 1, "closed"),
+        ("success", 2, "half_open_probe"),
+        ("failure", 1, "open"),
+    ];
+    for (outcome, success_threshold, next) in cases {
+        assert_eq!(
+            test_helpers::half_open_outcome_commit_race_for_test(outcome, success_threshold, false),
+            Some((true, false, next)),
+            "probe outcome {outcome:?} with success_threshold {success_threshold}"
+        );
+    }
+}
+
+#[test]
+fn stale_half_open_success_does_not_count_toward_the_superseding_cycle() {
+    assert_eq!(
+        test_helpers::stale_probe_success_skips_new_cycle_for_test(),
+        Some(vec!["half_open_probe", "half_open_probe", "closed"])
+    );
 }
 
 #[tokio::test]
