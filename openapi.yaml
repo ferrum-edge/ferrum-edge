@@ -10849,10 +10849,12 @@ components:
           maxLength: 4096
           description: >-
             Path to mTLS client certificate (PEM). Max 4096 characters.
-            Where the admin `ns` claim is enforced, an `operator` may set only
+            When admin namespace-claim enforcement is on, or the token carries
+            an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
             namespace; any other reference it introduces is refused with `400`
-            before the material is loaded.
+            before the material is loaded. A value already stored in this field
+            is exempt, and `admin`-role tokens are not restricted.
         backend_tls_client_key_path:
           type: [string, "null"]
           maxLength: 4096
@@ -10861,10 +10863,12 @@ components:
             optional pkcs11 build feature. Module overrides require admission by
             FERRUM_PKCS11_MODULE_ALLOWED_PATHS on each node. Without that policy,
             omit module options to use FERRUM_PKCS11_MODULE_PATH. Max 4096 characters.
-            Where the admin `ns` claim is enforced, an `operator` may set only
+            When admin namespace-claim enforcement is on, or the token carries
+            an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
             namespace; any other reference it introduces is refused with `400`
-            before the material is loaded.
+            before the material is loaded. A value already stored in this field
+            is exempt, and `admin`-role tokens are not restricted.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
@@ -10881,10 +10885,12 @@ components:
             `FERRUM_TLS_NO_VERIFY`. `system://` requires
             `backend_tls_verify_server_cert: true` and must be spelled exactly,
             with no path or query options.
-            Where the admin `ns` claim is enforced, an `operator` may set only
+            When admin namespace-claim enforcement is on, or the token carries
+            an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
             namespace; any other reference it introduces is refused with `400`
-            before the material is loaded.
+            before the material is loaded. A value already stored in this field
+            is exempt, and `admin`-role tokens are not restricted.
         dns_override:
           type: [string, "null"]
 
@@ -14736,10 +14742,12 @@ components:
             config takes precedence over the proxy's own backend TLS fields.
             Only meaningful for TLS-enabled backend schemes (`https`, `tcps`,
             `dtls`).
-            Where the admin `ns` claim is enforced, an `operator` may set only
+            When admin namespace-claim enforcement is on, or the token carries
+            an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
             namespace; any other reference it introduces is refused with `400`
-            before the material is loaded.
+            before the material is loaded. A value already stored in this field
+            is exempt, and `admin`-role tokens are not restricted.
         backend_tls_client_key_path:
           type: [string, "null"]
           description: >-
@@ -14748,10 +14756,12 @@ components:
             With the optional pkcs11 build feature, also accepts a pkcs11 signer
             URI. Module overrides require FERRUM_PKCS11_MODULE_ALLOWED_PATHS on
             each node; without it, omit module options to use FERRUM_PKCS11_MODULE_PATH.
-            Where the admin `ns` claim is enforced, an `operator` may set only
+            When admin namespace-claim enforcement is on, or the token carries
+            an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
             namespace; any other reference it introduces is refused with `400`
-            before the material is loaded.
+            before the material is loaded. A value already stored in this field
+            is exempt, and `admin`-role tokens are not restricted.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
@@ -14773,10 +14783,12 @@ components:
             `BackendTLSPolicy` `wellKnownCACertificates: System`, requires
             `backend_tls_verify_server_cert: true`, and must be spelled
             exactly, with no path or query options.
-            Where the admin `ns` claim is enforced, an `operator` may set only
+            When admin namespace-claim enforcement is on, or the token carries
+            an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
             namespace; any other reference it introduces is refused with `400`
-            before the material is loaded.
+            before the material is loaded. A value already stored in this field
+            is exempt, and `admin`-role tokens are not restricted.
         backend_tls_sni:
           type: [string, "null"]
           minLength: 1
@@ -15142,6 +15154,17 @@ components:
         `verify_server_cert: false` (the same contradiction Proxy and Upstream
         admission reject); that pairing is a runtime check because the schema
         cannot condition on a value prefix and a sibling boolean at once.
+
+        Admin writes of a `mesh_route_dispatch` plugin config apply the
+        Proxy/Upstream backend TLS reference admission to `client_cert_path`,
+        `client_key_path`, and `server_ca_cert_path` in every
+        `rules[].destination.backend_tls`: when admin namespace-claim
+        enforcement is on, or the token carries an `ns` claim even with
+        enforcement off, an `operator` may set only inline PEM, `system://`,
+        or a `k8s://` Secret in the addressed namespace, and any other
+        reference it introduces is refused with `400` before the material is
+        loaded. A value already stored at the same rule index and field is
+        exempt, and `admin`-role tokens are not restricted.
       allOf:
         - if:
             required: [client_cert_path]
