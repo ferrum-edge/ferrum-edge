@@ -62,7 +62,7 @@ Round-robin counters, weighted round-robin schedules, and consistent-hash rings 
 Upstream target hostnames are automatically resolved through the gateway's [central DNS cache](dns_resolver.md). This means:
 
 - **Startup warmup**: All upstream target hostnames are pre-resolved alongside proxy backend hostnames before the gateway accepts traffic — no cold-cache DNS lookups on the first request. After DNS warmup, [connection pool warmup](connection_pooling.md#connection-pool-warmup) pre-establishes backend connections to each upstream target for HTTP-family pools.
-- **Hot-path efficiency**: DNS resolution never happens in the request hot path. All HTTP clients use a custom `DnsCacheResolver` that transparently routes lookups through the in-memory cache.
+- **Hot-path efficiency**: DNS lookups almost never block the request path, because startup warmup, proactive background refresh, and stale-while-revalidate serve the vast majority of resolutions from the in-memory cache. All HTTP clients use a custom `DnsCacheResolver` that transparently routes lookups through the cache. The exception is a cold, evicted, or fully expired hostname — one past both the caller's effective TTL and its stale window: that caller performs a synchronous foreground lookup and awaits it rather than being served from cache. See [Stale-While-Revalidate](dns_resolver.md#stale-while-revalidate).
 - **Background refresh**: DNS entries for upstream targets are proactively refreshed at a configurable TTL threshold (default 90%, tunable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`), just like proxy backend hostnames.
 
 ## Quick Start
@@ -162,7 +162,7 @@ Upstreams can define named `subsets` for Istio DestinationRule-style routing. A 
 
 Subset matching is exact label matching: a target belongs to a subset when its `tags` contain every key/value pair from the subset's `labels`. Subsets can optionally override the parent upstream's load-balancing algorithm with `traffic_policy.load_balancer_algorithm`, and subset-scoped consistent hashing can set `traffic_policy.hash_on` using the same `ip`, `header:<name>`, or `cookie:<name>` syntax as upstream-level `hash_on`. Weighted round-robin state and consistent-hash rings are isolated per subset, so subset traffic does not perturb parent or sibling subset selection.
 
-If all targets in a defined subset are unhealthy, Ferrum falls back to the parent upstream and marks the selection degraded. Unknown subset names never silently fall through to the full upstream.
+If the selected subset has no healthy targets, selection fails **within** the subset: the load balancer stays in the configured subset and returns no target, and the parent upstream is not consulted or substituted. Unknown subset names never silently fall through to the full upstream. A passive ejection does not necessarily eliminate a member — an effective ejection cap can keep a passively-marked member eligible inside the subset.
 
 ```yaml
 proxies:
@@ -575,7 +575,7 @@ upstreams:
 
 **Connection pooling:** Active health check probes share a single HTTP client configured with the gateway's global connection pool settings (keep-alive, idle timeout, HTTP/2, TCP keep-alive). This means health check connections behave like regular proxy traffic and benefit from connection reuse. The verdict and least-latency sample come from the response headers. The probe then drains up to 64 KiB of response body in the background for at most 1 second (further capped by the remaining probe timeout) so the connection can return to the idle pool. A larger, stalled, or failing body is abandoned without changing the verdict or delaying the next probe.
 
-**TLS:** Health probes accept self-signed certificates by default since backends in internal environments often use self-signed certs.
+**TLS:** Health probes **verify** the backend certificate by default; skipping TLS verification is an explicit opt-out (`backend_tls_verify_server_cert: false` or the global `FERRUM_TLS_NO_VERIFY`), never the default. HTTPS probes build a real trust store from the upstream's CA (`backend_tls_server_ca_cert_path`), falling back to the global `FERRUM_TLS_CA_BUNDLE_PATH`, then the system/webpki roots, and verify the chain and server identity. A self-signed or private certificate is therefore accepted only when the configured trust store trusts it (for example, by adding the backend's CA to the probe's CA bundle), or when the operator explicitly disables verification — not merely because the certificate is self-signed. Deployments with internal or private CAs should add them to the probe trust store rather than relying on no-verify.
 
 ### Passive Health Checks
 
@@ -670,19 +670,25 @@ health_checks:
     unhealthy_window_seconds: 30
 ```
 
-Both checks write to the same shared `unhealthy_targets` set. Either check can mark a target as unhealthy, and either check can restore it:
+Active and passive checks keep **independent state**, and target selection excludes a target when it is unhealthy in **either** layer:
 
-- Active checks can restore a passively-marked-unhealthy target when their probes succeed.
-- A successful proxied response can restore an actively-marked-unhealthy target.
-- The passive recovery timer (`healthy_after_seconds`) can restore a target regardless of which check marked it.
+- **Active** state is shared per upstream (`upstream_id::host:port`): when a probe marks a target unhealthy, every proxy using that upstream sees it as unavailable.
+- **Passive** state is isolated per proxy (`proxy_id` → its own `host:port` map): a failure observed through one proxy's requests affects only that proxy's selection.
 
-> **Best practice:** When using passive-only health checks, always keep `healthy_after_seconds` enabled (the default is 30s). When using combined active + passive checks, active probes provide the primary recovery mechanism and the timer acts as an additional safety net.
+Each layer is marked and recovered independently — a probe result never clears a proxy's passive ejection, and a successful proxied response never clears the active mark:
+
+- **Active layer**: probes mark a target unhealthy after `unhealthy_threshold` consecutive failures, and recover it after `healthy_threshold` consecutive probe successes. Both act only on the active (upstream-wide) state.
+- **Passive layer (marking)**: passive failures mark the calling proxy's target unhealthy.
+- **Passive layer (on-success recovery)**: a successful proxied response to the target removes only the calling proxy's passive mark.
+- **Passive layer (timer)**: the passive recovery timer (`healthy_after_seconds`) scans only passive ejections; it does not touch active marks.
+
+> **Best practice:** When using passive-only health checks, always keep `healthy_after_seconds` enabled (the default is 30s). With combined checks, active probes recover the *active* layer — they do not replace a disabled passive timer, and they do not clear a proxy's passive ejection. If `healthy_after_seconds` is `0`, a passively-ejected target stays excluded while at least one other eligible target remains healthy (it receives no traffic, so on-success recovery never fires). The passive ejection caps (`max_ejection_percent` re-admits the earliest excess ejections first) and the all-unhealthy fallback (a successful fallback request restores the target) are the only additional recovery paths.
 
 ### Fallback When All Unhealthy
 
 If all targets in an upstream are marked unhealthy, the load balancer **falls back to routing to all targets** rather than returning errors. This ensures the gateway continues to serve traffic even in degraded conditions — some targets may still be partially functional. If the fallback request succeeds, the target is immediately restored to the healthy rotation via passive health check recovery.
 
-For subset routing, if the selected subset has no healthy targets, the load balancer falls back to the parent upstream and marks the selection degraded. This mirrors DestinationRule fail-open behavior while preserving validation for unknown subset names.
+For subset routing, if the selected subset has no healthy targets, selection fails **within** the subset: the load balancer returns no target and the request is not dispatched through the parent upstream. The all-unhealthy degraded fallback applies only to the whole upstream path, not to a per-subset outage. Unknown subset names are still rejected at config/admin validation — they never silently fall through to the full upstream.
 
 When operating in fallback mode, the gateway sets the `X-Gateway-Upstream-Status: degraded` response header so clients and monitoring systems can detect degraded routing. See [Client Observability Headers](#client-observability-headers) for details.
 
