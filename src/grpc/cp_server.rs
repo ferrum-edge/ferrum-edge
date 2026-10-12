@@ -5,9 +5,10 @@
 //!   (update_type=0), then incremental `DELTA` updates (update_type=1) as config changes.
 //!   If a DP lags behind the broadcast channel (default capacity 128, configurable
 //!   via `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`), it receives a fresh
-//!   full snapshot instead of the missed deltas. Retained broadcasts committed
-//!   strictly before a snapshot the stream already sent are then dropped, so
-//!   the DP's stale-delta fence does not end the stream (issue #6163).
+//!   full snapshot instead of the missed deltas. Retained broadcasts that were
+//!   queued before that snapshot was loaded (by channel position, never by
+//!   timestamp) are then dropped, so the DP's stale-delta fence does not end
+//!   the stream (issue #6163).
 //! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
 //!
 //! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
@@ -51,7 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, interval_at};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
+use tokio_stream::wrappers::IntervalStream;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -463,6 +464,17 @@ impl DpNodeRegistry {
     pub fn is_empty(&self) -> bool {
         self.streams.is_empty()
     }
+}
+
+/// Per-stream state for a ConfigSync Subscribe broadcast receiver: the raw
+/// receiver (so lag recovery can read its queued count) plus what a
+/// lag-recovery snapshot needs (issue #6163).
+struct ConfigSyncBroadcastState {
+    rx: broadcast::Receiver<ConfigUpdate>,
+    snapshot_cursor: SubscriberSnapshotCursor,
+    config: Arc<ArcSwap<GatewayConfig>>,
+    namespace: String,
+    scope: CpScope,
 }
 
 /// A stream wrapper that removes its own registry entry when the gRPC stream
@@ -1810,6 +1822,53 @@ impl CpGrpcServer {
         }
     }
 
+    /// Build the namespace-filtered FULL_SNAPSHOT a lagged ConfigSync
+    /// Subscribe stream sends to recover, without re-leaking other
+    /// namespaces' config.
+    #[allow(clippy::result_large_err)]
+    fn configsync_lag_recovery_snapshot(
+        config: &ArcSwap<GatewayConfig>,
+        namespace: &str,
+        scope: &CpScope,
+    ) -> Result<ConfigUpdate, Status> {
+        let current = config.load_full();
+        let publication =
+            Self::filter_config_and_trust_for_scope(current.as_ref(), namespace, scope);
+        let (filtered, trust_bundles_json) = match publication {
+            Ok(publication) => publication,
+            Err(failure_class) => {
+                error!(
+                    namespace = %crate::startup::sanitize_startup_scalar(namespace.to_string()),
+                    failure_class,
+                    "Terminating ConfigSync recovery because gateway trust is unusable"
+                );
+                return Err(Status::internal("Failed to prepare ConfigSync recovery snapshot"));
+            }
+        };
+        match Self::config_json_for_dp(&filtered) {
+            Ok(config_json) => Ok(ConfigUpdate {
+                update_type: 0, // FULL_SNAPSHOT
+                config_json,
+                version: current.loaded_at.to_rfc3339(),
+                timestamp: chrono::Utc::now().timestamp(),
+                ferrum_version: FERRUM_VERSION.to_string(),
+                trust_bundles_json,
+                heartbeat: false,
+                config_sync_build: config_sync_build_identity().to_string(),
+            }),
+            Err(e) => {
+                error!(
+                    "{}",
+                    crate::startup::sanitize_startup_cause(
+                        format!("Failed to serialize recovery snapshot: {}", e),
+                        &[]
+                    )
+                );
+                Err(Status::internal("Failed to serialize ConfigSync recovery snapshot"))
+            }
+        }
+    }
+
     /// Test support: broadcast an unpartitioned full config snapshot on one
     /// raw sender. Returns whether a bounded message was sent to at least one
     /// subscriber.
@@ -2304,6 +2363,10 @@ impl ConfigSync for CpGrpcServer {
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
         let rx = namespace_tx.subscribe();
+        // Publications already queued before the load were committed to the
+        // config `ArcSwap` before they were sent, so the snapshot contains
+        // them (issue #6163).
+        let snapshot_cursor = SubscriberSnapshotCursor::new(rx.len() as u64);
 
         // Send initial full config — filtered to the DP's namespace so the
         // initial snapshot matches the per-namespace broadcast stream.
@@ -2383,79 +2446,48 @@ impl ConfigSync for CpGrpcServer {
             },
         );
 
-        let config_for_recovery = self.config.clone();
-        let recovery_namespace = dp_namespace.clone();
-        let recovery_scope = self.scope.clone();
         // A lagged receiver resumes at the oldest retained broadcast, so
         // updates already folded into a snapshot this stream sent may follow
-        // it. Drop those instead of letting the DP fence end the stream
+        // it. Drop only publications proven covered by broadcast position,
+        // never by timestamp, instead of letting the DP fence end the stream
         // (issue #6163).
-        let mut snapshot_cursor = SubscriberSnapshotCursor::new(config.loaded_at);
-        let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
-            Ok(update) => {
-                if update.heartbeat || snapshot_cursor.admits(&update.version) {
-                    Some(Ok(update))
-                } else {
-                    None
-                }
-            }
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                warn!(
-                    "DP config stream lagged behind by {} updates — sending full snapshot to recover",
-                    n
-                );
-                // Send a namespace-filtered full snapshot so the DP recovers
-                // from missed deltas without re-leaking other namespaces'
-                // config.
-                let current = config_for_recovery.load_full();
-                let (filtered, trust_bundles_json) =
-                    match Self::filter_config_and_trust_for_scope(
-                        current.as_ref(),
-                        &recovery_namespace,
-                        &recovery_scope,
-                    ) {
-                        Ok(publication) => publication,
-                        Err(failure_class) => {
-                            error!(
-                                namespace = %crate::startup::sanitize_startup_scalar(
-                                    recovery_namespace.to_string()
-                                ),
-                                failure_class,
-                                "Terminating ConfigSync recovery because gateway trust is unusable"
-                            );
-                            return Some(Err(Status::internal(
-                                "Failed to prepare ConfigSync recovery snapshot",
-                            )));
+        let broadcast_state = ConfigSyncBroadcastState {
+            rx,
+            snapshot_cursor,
+            config: self.config.clone(),
+            namespace: dp_namespace.clone(),
+            scope: self.scope.clone(),
+        };
+        let stream = stream::unfold(broadcast_state, |mut state| async move {
+            loop {
+                match state.rx.recv().await {
+                    Ok(update) => {
+                        // Count the position even for heartbeats.
+                        if state.snapshot_cursor.admit_next() || update.heartbeat {
+                            return Some((Ok(update), state));
                         }
-                    };
-                match Self::config_json_for_dp(&filtered) {
-                    Ok(config_json) => {
-                        snapshot_cursor.record_snapshot(current.loaded_at);
-                        Some(Ok(ConfigUpdate {
-                            update_type: 0, // FULL_SNAPSHOT
-                            config_json,
-                            version: current.loaded_at.to_rfc3339(),
-                            timestamp: chrono::Utc::now().timestamp(),
-                            ferrum_version: FERRUM_VERSION.to_string(),
-                            trust_bundles_json,
-                            heartbeat: false,
-                            config_sync_build: config_sync_build_identity().to_string(),
-                        }))
                     }
-                    Err(e) => {
-                        error!(
-                            "{}",
-                            crate::startup::sanitize_startup_cause(
-                                format!(
-                                    "Failed to serialize recovery snapshot: {}", e
-                                ),
-                                &[]
-                            )
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        state.snapshot_cursor.record_lag(n);
+                        warn!(
+                            "DP config stream lagged behind by {} updates — sending full snapshot to recover",
+                            n
                         );
-                        Some(Err(Status::internal(
-                            "Failed to serialize ConfigSync recovery snapshot",
-                        )))
+                        // Taken before the load: every publication queued now
+                        // was committed before it was sent, so the recovery
+                        // snapshot contains it.
+                        let queued = state.rx.len() as u64;
+                        let recovery = Self::configsync_lag_recovery_snapshot(
+                            &state.config,
+                            &state.namespace,
+                            &state.scope,
+                        );
+                        if recovery.is_ok() {
+                            state.snapshot_cursor.record_snapshot(queued);
+                        }
+                        return Some((recovery, state));
                     }
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
         });

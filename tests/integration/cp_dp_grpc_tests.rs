@@ -4506,6 +4506,68 @@ async fn lag_recovery_snapshot_is_not_followed_by_older_retained_deltas() {
     client_handle.abort();
 }
 
+/// Issue #6163 review: snapshot coverage must follow publication order, not
+/// wall-clock stamps. A CP whose clock stepped backwards publishes a NEW
+/// snapshot stamped earlier than the one this stream already sent. That
+/// publication was never part of the earlier snapshot, so the CP must
+/// deliver it, and the DP accepts it as a same-source snapshot.
+#[tokio::test]
+async fn snapshot_published_after_a_clock_step_back_is_still_delivered() {
+    let base = Utc::now();
+    let mut initial_config = create_test_config(1);
+    initial_config.loaded_at = base;
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(initial_config, 16).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "clock-step-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    assert!(
+        wait_for_proxy_id(&proxy_state, "proxy-0", Duration::from_secs(5)).await,
+        "DP should receive the initial snapshot"
+    );
+    assert_eq!(proxy_state.config.load().loaded_at, base);
+
+    // The CP clock stepped back 10s before this reload committed changed
+    // config, so its stamp is older than the stream's initial snapshot.
+    let mut stepped = create_test_config(1);
+    stepped
+        .proxies
+        .push(create_test_proxy("after-clock-step", "/after-clock-step"));
+    stepped.loaded_at = base - chrono::Duration::seconds(10);
+    config_arc.store(Arc::new(stepped.clone()));
+    assert!(
+        CpGrpcServer::broadcast_update(&update_tx, &stepped),
+        "the stepped-back snapshot must be queued to the live subscription"
+    );
+
+    assert!(
+        wait_for_proxy_id(&proxy_state, "after-clock-step", Duration::from_secs(5)).await,
+        "a snapshot published after the stream's snapshot must be delivered \
+         even when its stamp is older; stream ended: {}",
+        client_handle.is_finished()
+    );
+    assert_eq!(proxy_state.config.load().proxies.len(), 2);
+    assert!(
+        !client_handle.is_finished(),
+        "the same-source stepped-back snapshot must not end the stream"
+    );
+
+    client_handle.abort();
+}
+
 // ─── Cross-namespace rejection tests ─────────────────────────────────────────
 //
 // These tests cover the multi-tenant security gap where a DP started with

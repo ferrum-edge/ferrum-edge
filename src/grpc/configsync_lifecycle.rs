@@ -714,54 +714,75 @@ pub fn evaluate_delta_authority(
     Ok(())
 }
 
-/// CP-side freshness cursor for one ConfigSync Subscribe stream (issue #6163).
+/// CP-side coverage cursor for one ConfigSync Subscribe stream (issue #6163).
 ///
 /// A tokio broadcast receiver that reports `Lagged` moves its cursor to the
 /// OLDEST update still retained, not to the tail. The CP answers the lag with
-/// a FULL_SNAPSHOT of the current config, so the retained broadcasts that
-/// follow it can carry committed stamps older than that snapshot. The DP's
-/// source-blind [`evaluate_delta_authority`] fence refuses such a DELTA and
-/// terminates the stream, and an older retained FULL_SNAPSHOT would roll the
-/// DP back. The same race exists for the initial snapshot, because the
+/// a FULL_SNAPSHOT of the current config, so retained broadcasts that the
+/// snapshot already contains can follow it. The DP's source-blind
+/// [`evaluate_delta_authority`] fence refuses such a DELTA and terminates the
+/// stream. The same race exists for the initial snapshot, because the
 /// receiver is registered before the snapshot is loaded.
 ///
-/// The cursor records the committed stamp of every snapshot the stream itself
-/// produced and refuses retained broadcasts strictly older than it. Those
-/// broadcasts were committed before the snapshot was loaded, so the snapshot
-/// already contains them. Equal and newer stamps are forwarded, as are stamps
-/// that do not parse: the DP fails closed on those, and a CP-side filter must
-/// not hide them. The DP fence is unchanged.
+/// Coverage is proven by publication ORDER, never by committed timestamps: a
+/// CP wall clock can step backwards, so a newer publication may carry an
+/// older stamp. The cursor counts broadcast-channel positions relative to the
+/// stream's subscription. Before loading a snapshot, the stream records how
+/// many publications are already queued; those positions were sent before
+/// the load. Every CP publisher commits its config to the shared `ArcSwap`
+/// before broadcasting it, under one publication gate, so a publication sent
+/// before the load is contained in the loaded snapshot. Only those positions
+/// are dropped. A publication sent after the queued count was taken is always
+/// forwarded, even when its content may already be in the snapshot; the DP
+/// fence remains the safety net. The DP fence is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriberSnapshotCursor {
-    watermark: DateTime<Utc>,
+    next_position: u64,
+    covered_until: u64,
 }
 
 impl SubscriberSnapshotCursor {
-    /// Seed the cursor from the stream's initial FULL_SNAPSHOT stamp.
-    pub fn new(initial_snapshot_committed: DateTime<Utc>) -> Self {
+    /// Seed the cursor for a receiver subscribed at position 0. `queued` is
+    /// the receiver's queued count taken BEFORE the initial snapshot was
+    /// loaded.
+    pub fn new(queued: u64) -> Self {
         Self {
-            watermark: initial_snapshot_committed,
+            next_position: 0,
+            covered_until: queued,
         }
     }
 
-    /// Record a lag-recovery FULL_SNAPSHOT this stream sent. Monotonic: an
-    /// older recovery stamp never lowers the watermark.
-    pub fn record_snapshot(&mut self, committed: DateTime<Utc>) {
-        self.watermark = monotonic_watermark(Some(self.watermark), committed);
+    /// Consume the next delivered broadcast position. Returns whether the
+    /// update is NOT covered by a snapshot this stream sent and must be
+    /// forwarded.
+    pub fn admit_next(&mut self) -> bool {
+        let position = self.next_position;
+        self.next_position = self.next_position.saturating_add(1);
+        position >= self.covered_until
     }
 
-    /// Current watermark.
-    pub fn watermark(&self) -> DateTime<Utc> {
-        self.watermark
+    /// Account for `skipped` positions a `Lagged` receiver jumped over.
+    pub fn record_lag(&mut self, skipped: u64) {
+        self.next_position = self.next_position.saturating_add(skipped);
     }
 
-    /// Whether a broadcast update with `version` (its committed RFC3339
-    /// stamp) should still be forwarded on this stream.
-    pub fn admits(&self, version: &str) -> bool {
-        match DateTime::parse_from_rfc3339(version) {
-            Ok(committed) => committed.with_timezone(&Utc) >= self.watermark,
-            Err(_) => true,
-        }
+    /// Record a lag-recovery FULL_SNAPSHOT. `queued` is the receiver's
+    /// queued count taken BEFORE that snapshot was loaded. Monotonic: never
+    /// lowers coverage.
+    pub fn record_snapshot(&mut self, queued: u64) {
+        self.covered_until = self
+            .covered_until
+            .max(self.next_position.saturating_add(queued));
+    }
+
+    /// Position of the next update the receiver will deliver.
+    pub fn next_position(&self) -> u64 {
+        self.next_position
+    }
+
+    /// First position not covered by a snapshot this stream sent.
+    pub fn covered_until(&self) -> u64 {
+        self.covered_until
     }
 }
 
