@@ -1225,9 +1225,9 @@ pub(super) async fn handle_hbone_request(
     );
 
     // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
-    // responses are excluded from the deferred-dispatch path, #1649), so the
-    // admission open-epoch is unused here.
-    let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
+    // responses are excluded from the deferred-dispatch path, #1649); the
+    // admission generation only binds the probe guard's neutral release (#6177).
+    let (cb_target_key, cb_is_half_open_probe, cb_admission_generation) =
         match backend_dispatch::check_circuit_breaker(proxy, state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -1269,6 +1269,7 @@ pub(super) async fn handle_hbone_request(
         proxy,
         cb_target_key.as_deref(),
         cb_is_half_open_probe,
+        cb_admission_generation,
     );
 
     let hbone_on_upgrade = match client_request_body {

@@ -900,7 +900,11 @@ HTTP/1.1, HTTP/2, WebSocket, gRPC, HTTP/3, the HBONE relay, UDP/DTLS session
 setup, and TCP passthrough and terminating connections own their probe slots
 through the shared `HalfOpenProbeGuard`. Dropping TCP or UDP/DTLS setup during
 DNS resolution or backend connect/handshake, or returning early before a backend
-outcome, releases the slot neutrally. TCP keeps the guard through relay completion
+outcome, releases the slot neutrally. A neutral release is bound to the
+open-circuit cycle that admitted the probe: if the breaker has since reopened and
+started a new HALF_OPEN cycle, the reopen already discarded the old slot, so the
+late release is a no-op and cannot free a slot a newer probe holds.
+TCP keeps the guard through relay completion
 and rearms it on each retry admission; dropping the connection future also releases
 an unsettled slot. UDP/DTLS still records success when backend setup completes,
 and TCP still records its successful connection outcome at relay completion; the

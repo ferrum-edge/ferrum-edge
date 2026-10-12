@@ -7621,8 +7621,12 @@ async fn handle_dtls_client_inner(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((cb, is_half_open_probe)) => {
-                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+            Ok((cb, is_half_open_probe, admission_generation)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(
+                    &cb,
+                    is_half_open_probe,
+                    admission_generation,
+                );
             }
             Err(_) => {
                 warn!(
@@ -8547,8 +8551,12 @@ async fn create_session(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((cb, is_half_open_probe)) => {
-                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+            Ok((cb, is_half_open_probe, admission_generation)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(
+                    &cb,
+                    is_half_open_probe,
+                    admission_generation,
+                );
             }
             Err(_) => {
                 warn!(

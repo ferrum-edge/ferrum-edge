@@ -6720,7 +6720,7 @@ async fn handle_h3_request(
                 upstream_target.as_deref(),
             )
         };
-    let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
+    let (cb_target_key, cb_is_half_open_probe, cb_admission_generation) =
         match circuit_breaker_admission {
             Ok(result) => result,
             Err(()) => {
@@ -6826,6 +6826,7 @@ async fn handle_h3_request(
         &proxy,
         cb_target_key.as_deref(),
         cb_is_half_open_probe,
+        cb_admission_generation,
     );
 
     // Preserve fail-fast breaker behavior for ordinary request-body plugins:

@@ -14746,7 +14746,7 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (_, is_half_open_probe) = state
+        let (_, is_half_open_probe, admission_generation) = state
             .circuit_breaker_cache
             .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
             .expect("half-open probe should be admitted");
@@ -14760,8 +14760,14 @@ mod tests {
             "single probe slot should be occupied before neutral release"
         );
 
-        crate::proxy::HalfOpenProbeGuard::new(&state, &proxy, target_key, is_half_open_probe)
-            .release_neutral();
+        crate::proxy::HalfOpenProbeGuard::new(
+            &state,
+            &proxy,
+            target_key,
+            is_half_open_probe,
+            admission_generation,
+        )
+        .release_neutral();
 
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");

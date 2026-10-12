@@ -1272,11 +1272,11 @@ pub(crate) async fn handle_h3_websocket(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((cb, is_half_open_probe)) => {
+                            Ok((cb, is_half_open_probe, admission_generation)) => {
                                 // Re-point the probe guard at the rotated target's
                                 // breaker: the prior target's slot was taken by the
                                 // intermediate failure record above.
-                                cb_probe.rearm(&cb, is_half_open_probe);
+                                cb_probe.rearm(&cb, is_half_open_probe, admission_generation);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
