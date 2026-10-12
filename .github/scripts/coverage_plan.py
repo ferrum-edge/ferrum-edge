@@ -279,6 +279,7 @@ SHARD_DEFINITIONS: dict[str, dict[str, str]] = {
                 "integration::connection_pool_tests",
                 "integration::http2_pool_tests",
                 "integration::http3_integration_tests",
+                "integration::h3_backend_retirement_tests",
                 "integration::grpc_proxy_tests",
                 "integration::scripted_backend_smoke_tests",
                 "integration::backend_timeout_enforcement_tests",
