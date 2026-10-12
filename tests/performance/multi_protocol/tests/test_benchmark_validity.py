@@ -95,6 +95,12 @@ class BenchmarkValidityTests(unittest.TestCase):
                 self.assertTrue(sample_issues(sample))
         self.assertEqual(throughput_value(dict(rps=float("nan"))), 0)
 
+    def test_oversized_integer_throughput_is_invalid_without_aborting(self):
+        self.assertEqual(sample_issues(clean()), [])
+        sample = dict(clean(), rps=10 ** 400)
+        self.assertIn("non-positive/invalid throughput", sample_issues(sample))
+        self.assertEqual(throughput_value(sample), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,8 +81,16 @@ class UDPInternalProfileTests(unittest.TestCase):
             self.assertFalse(result["complete"])
             self.assertTrue(result["issues"])
         for invalid in (None, [], dict(measurement_start_unix_secs=float("nan"), measurement_secs=1),
-                        dict(measurement_start_unix_secs=10, measurement_secs=-1)):
+                        dict(measurement_start_unix_secs=10, measurement_secs=-1),
+                        dict(measurement_start_unix_secs=10 ** 400, measurement_secs=1)):
             self.assertFalse(profile.profile_bracket(capture(), invalid)["complete"])
+
+        oversized_clock = capture()
+        oversized_clock["timeline"][1]["unix_secs"] = 10 ** 400
+        result = profile.profile_bracket(oversized_clock,
+                                         dict(measurement_start_unix_secs=10, measurement_secs=1))
+        self.assertFalse(result["complete"])
+        self.assertIn("malformed process capture", result["issues"])
 
     def test_selection_preserves_declared_policy_and_h2_manifest(self):
         args = ["profile", "udp", "4", "15", "200", "ferrum kong", "1024", "", ""]
@@ -109,6 +117,60 @@ class UDPInternalProfileTests(unittest.TestCase):
             self.assertFalse(result["profiles_complete"])
             self.assertFalse(result["fully_measured_comparison_eligible"])
             self.assertTrue(all(row["traffic_issues"] for row in result["observations"]))
+
+
+    def test_oversized_numeric_fields_retain_full_report_and_profile_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gateways = ["direct", "ferrum", "kong"]
+            (root / "manifest.json").write_text(json.dumps(dict(
+                pairs=4, gateways=gateways, payload_sizes=[1024], host_id="host")))
+            for pair in range(1, 5):
+                folder = root / "pairs" / f"pair_{pair:03d}"
+                folder.mkdir(parents=True)
+                for gateway in gateways:
+                    gauges = {name: dict(min=200, max=200, mean=200)
+                              for name in ("active_workers", "active_connections",
+                                           "active_streams", "queued_requests")}
+                    sample = dict(sample_schema=2, gateway=gateway, pair=pair, host_id="host",
+                        effective_concurrency=200, warmup_requests=200, duration_secs=15,
+                        total_errors=0, total_requests=150, payload_size=1024, total_bytes=153600, rps=10,
+                        phases=dict(measurement_start_unix_secs=10, measurement_secs=15,
+                                    measurement_elapsed_secs=15),
+                        observed=dict(samples=10, workers_retired_before_deadline=0,
+                                      workers_at_barrier=200, **gauges),
+                        process_usage=dict(processes=[{}], measurement=[
+                            dict(role=role, complete_bracket=True, cpu_seconds=1)
+                            for role in ("gateway", "backend", "client")]))
+                    if pair == 1 and gateway == "direct":
+                        sample["rps"] = 10 ** 400
+                    (folder / f"{gateway}_udp_1024.json").write_text(json.dumps(sample))
+                    if gateway == "ferrum":
+                        usage = capture()
+                        for row, timestamp in zip(usage["timeline"], (9.9, 25.5, 26.1)):
+                            row["unix_secs"] = timestamp
+                            row["udp_profile"]["unix_secs"] = timestamp
+                            row["udp_profile"]["monotonic_secs"] = timestamp
+                        if pair == 1:
+                            usage["timeline"][1]["unix_secs"] = 10 ** 400
+                        diagnostics = folder / "diagnostics"
+                        diagnostics.mkdir()
+                        (diagnostics / "ferrum_1024_process_usage.json").write_text(
+                            json.dumps(usage))
+
+            result = profile.report(root, "profile")
+            self.assertEqual(len(result["observations"]), 12)
+            self.assertFalse(result["traffic_complete"])
+            self.assertFalse(result["profiles_complete"])
+            self.assertIn("non-positive/invalid throughput",
+                          result["observations"][0]["traffic_issues"])
+            ferrum = next(row for row in result["observations"]
+                          if row["pair"] == 1 and row["gateway"] == "ferrum")
+            self.assertIn("malformed process capture", ferrum["profile"]["issues"])
+            saved = json.loads((root / "udp_profile_report.json").read_text())
+            self.assertEqual(len(saved["observations"]), 12)
+            self.assertFalse(saved["traffic_complete"])
+            self.assertFalse(saved["profiles_complete"])
 
 
     def test_valid_traffic_does_not_imply_complete_profile(self):
