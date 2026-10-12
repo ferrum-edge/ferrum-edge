@@ -15,11 +15,21 @@ pub(crate) use crate::util::backoff::{BACKOFF_MAX_SECS, jittered_backoff_with_en
 /// closed before unbounded allocation.
 pub const MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// Build the tonic client TLS config for a mesh control-plane endpoint.
+///
+/// A pinned CA bundle is the ONLY trust anchor set. Without one, the bundled
+/// Mozilla (webpki) roots are selected explicitly: tonic's
+/// `ClientTlsConfig::new()` starts with no anchors, and the `tls-webpki-roots`
+/// Cargo feature only makes the roots available, so a publicly trusted CP
+/// certificate would otherwise have nothing to chain to. Verification is never
+/// disabled.
 pub fn tonic_tls_config(tls: &DpGrpcTlsConfig) -> tonic::transport::ClientTlsConfig {
     let mut client_tls = tonic::transport::ClientTlsConfig::new();
 
     if let Some(ref ca_pem) = tls.ca_cert_pem {
         client_tls = client_tls.ca_certificate(Certificate::from_pem(ca_pem));
+    } else {
+        client_tls = client_tls.with_webpki_roots();
     }
 
     if let (Some(cert_pem), Some(key_pem)) = (&tls.client_cert_pem, &tls.client_key_pem) {
