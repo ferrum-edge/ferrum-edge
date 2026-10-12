@@ -1557,7 +1557,7 @@ fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<St
 /// frontend mTLS / rustls logging-sink surfaces. An empty `crls` slice yields a
 /// plain WebPki verifier (no behavioural change vs. the previous root-store
 /// verifier).
-fn build_ldap_tls_config(
+pub(crate) fn build_ldap_tls_config(
     no_verify: bool,
     ca_bundle_path: Option<&str>,
     crls: &[CertificateRevocationListDer<'static>],
@@ -1606,7 +1606,11 @@ fn build_ldap_tls_config(
         });
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
             .map_err(|_| "ldap_auth: failed to build TLS verifier".to_string())?;
-        builder.with_webpki_verifier(verifier).with_no_client_auth()
+        let mut config = builder.with_webpki_verifier(verifier).with_no_client_auth();
+        // The config is reused across LDAP reconnects; resumption would skip
+        // the CRL expiration check on a resumed handshake.
+        crate::tls::apply_crl_enforced_client_resumption(&mut config, crls);
+        config
     };
 
     Ok(Arc::new(config))

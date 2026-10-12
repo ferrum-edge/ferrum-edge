@@ -157,6 +157,34 @@ pub mod _test_support {
         )
     }
 
+    /// The cached rustls config a CRL-enforcing plugin/notification client
+    /// builds from the gateway TLS inputs (`tcp_logging`, `ws_logging`,
+    /// `ldap_auth`, and SMTP `email`, which always verifies).
+    pub fn crl_enforcing_outbound_client_config_for_test(
+        surface: &str,
+        no_verify: bool,
+        ca: Option<&str>,
+        crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    ) -> Result<rustls::ClientConfig, String> {
+        use crate::notifications::channels::email;
+        use crate::plugins::{ldap_auth, tcp_logging, ws_logging};
+
+        let config = match surface {
+            "tcp_logging" => {
+                let connector = tcp_logging::build_tls_connector(no_verify, ca, crls)?;
+                Arc::clone(connector.config())
+            }
+            "ws_logging" => Arc::new(ws_logging::build_tls_client_config(no_verify, ca, crls)?),
+            "ldap_auth" => ldap_auth::build_ldap_tls_config(no_verify, ca, crls)?,
+            "email" if !no_verify => {
+                let config = email::build_client_config(ca.map(str::to_string), crls.to_vec());
+                config.map_err(|error| format!("{error:?}"))?
+            }
+            other => return Err(format!("unsupported CRL-enforcing surface {other:?}")),
+        };
+        Ok((*config).clone())
+    }
+
     /// The origin-form request target the direct HTTP/1.1 pool sends for an
     /// absolute backend URL (issue #5588), for parity checks against the `url`
     /// serialization reqwest used.

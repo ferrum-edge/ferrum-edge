@@ -401,7 +401,7 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
 /// blocks a tokio worker thread re-reading the filesystem on reconnect
 /// (finding #74). The result is an `Arc<ClientConfig>`-backed connector that is
 /// cheap to clone per reconnect.
-fn build_tls_connector(
+pub(crate) fn build_tls_connector(
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<&str>,
     tls_crls: &[CertificateRevocationListDer<'static>],
@@ -446,9 +446,13 @@ fn build_tls_connector(
         // `build_server_verifier_with_crls`) decides the posture.
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, tls_crls)
             .map_err(|_| "TCP logging: failed to build TLS verifier".to_string())?;
-        rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .with_webpki_verifier(verifier)
-            .with_no_client_auth()
+            .with_no_client_auth();
+        // The connector is reused across reconnects; resumption would skip the
+        // CRL expiration check on a resumed handshake.
+        crate::tls::apply_crl_enforced_client_resumption(&mut config, tls_crls);
+        config
     };
 
     Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))

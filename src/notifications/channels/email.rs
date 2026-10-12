@@ -840,7 +840,7 @@ impl EmailChannel {
 /// docs. `FERRUM_TLS_CA_BUNDLE_PATH` replaces the webpki roots when set, and
 /// `FERRUM_TLS_CRL_FILE_PATH` revocation applies via the shared verifier
 /// builder, matching the proxy backend / DTLS / frontend mTLS surfaces.
-fn build_client_config(
+pub(crate) fn build_client_config(
     ca_bundle_path: Option<String>,
     crls: Vec<CertificateRevocationListDer<'static>>,
 ) -> Result<Arc<rustls::ClientConfig>, SmtpFailure> {
@@ -869,12 +869,15 @@ fn build_client_config(
         .map_err(|_| SmtpFailure::TlsSetup)?;
     // Pin the build-selected provider explicitly so the channel does not depend
     // on a globally installed default (unit tests build channels without startup).
-    let config =
+    let mut config =
         rustls::ClientConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|_| SmtpFailure::TlsSetup)?
             .with_webpki_verifier(verifier)
             .with_no_client_auth();
+    // The config is cached across sends; resumption would skip the CRL
+    // expiration check on a resumed handshake.
+    crate::tls::apply_crl_enforced_client_resumption(&mut config, &crls);
     Ok(Arc::new(config))
 }
 

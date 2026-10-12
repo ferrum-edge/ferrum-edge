@@ -399,13 +399,16 @@ outbound:
   `nextUpdate`, new backend connections that would be policed by it fail. In-flight
   requests on already-established connections are unaffected; the refusal applies
   to new handshakes. Refresh the CRL ahead of its own `nextUpdate`.
-- **CRL-enforcing backend clients do full handshakes on reconnect.** TLS 1.2
+- **CRL-enforcing outbound clients do full handshakes on reconnect.** TLS 1.2
   session IDs/tickets and TLS 1.3 PSK resumption bypass certificate
-  reverification, so resumption is disabled for backend data-path and verified
-  HTTPS/gRPC probe configs with a nonempty CRL set. This also adds full-handshake
-  latency and cryptographic work for uncovered issuers sharing those configs;
-  their chains remain accepted. Connection reuse and established in-flight
-  traffic are unaffected. Empty-CRL and skip-verify configs keep resumption.
+  reverification, so resumption is disabled for every cached rustls client
+  config with a nonempty CRL set: backend data paths, verified HTTPS/gRPC
+  probes, the `tcp_logging` and `ws_logging` sinks, `ldap_auth`, SMTP
+  notifications, and mesh SPIFFE outbound configs. This also adds
+  full-handshake latency and cryptographic work for uncovered issuers sharing
+  those configs; their chains remain accepted. Connection reuse and established
+  in-flight traffic are unaffected. Empty-CRL and skip-verify configs keep
+  resumption. DTLS clients (`udp_logging`, backend DTLS) never resume sessions.
 - **A candidate CRL outside its validity window is refused whole.** Startup
   fails; a live reload keeps the previously accepted CRL slot, backend pools, and
   health checks exactly as they were, and logs a redacted warning.

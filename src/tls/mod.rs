@@ -2210,11 +2210,26 @@ pub fn apply_client_session_resumption(
     enforced_crls: &[CertificateRevocationListDer<'static>],
 ) {
     if !enforced_crls.is_empty() {
-        config.resumption = rustls::client::Resumption::disabled();
+        apply_crl_enforced_client_resumption(config, enforced_crls);
         return;
     }
     let cache_size = tls_policy.map(|p| p.session_cache_size).unwrap_or(4096);
     config.resumption = rustls::client::Resumption::in_memory_sessions(cache_size);
+}
+
+/// Disable outbound resumption when the verifier enforces a nonempty CRL set.
+///
+/// The one resumption policy every cached CRL-enforcing `ClientConfig` shares
+/// (backend builder, health probes, rustls logging sinks, LDAP, SMTP). With no
+/// enforced CRLs, the config's existing resumption setting is left untouched.
+/// Pass an empty slice when verification is disabled.
+pub fn apply_crl_enforced_client_resumption(
+    config: &mut rustls::ClientConfig,
+    enforced_crls: &[CertificateRevocationListDer<'static>],
+) {
+    if !enforced_crls.is_empty() {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
 }
 
 /// Validate that the backend TLS policy can be converted into a QUIC-capable
