@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 
 use crate::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
-    adaptive_concurrency_scope,
+    AdaptiveConcurrencySnapshot, adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
 use crate::plugins::early_route_total::{
@@ -6930,6 +6930,18 @@ impl PluginCache {
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
         self.inner.load_full()
+    }
+
+    /// Every target tracked by the live adaptive-concurrency policies.
+    /// Inspection only, for in-process fixtures that settle real requests.
+    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
+    pub(crate) fn adaptive_concurrency_snapshots(&self) -> Vec<AdaptiveConcurrencySnapshot> {
+        self.inner
+            .load()
+            .adaptive_concurrency_instances
+            .values()
+            .flat_map(|instance| instance.limiter.snapshots())
+            .collect()
     }
 
     /// Prepend `plugin` onto one proxy's resolved list and rebuild that proxy's

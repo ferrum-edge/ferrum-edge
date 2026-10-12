@@ -61664,6 +61664,9 @@ async fn proxy_to_backend_http2(
         // collapses the pump's write-watermark expiry into a transport error, so
         // the typed terminal is what distinguishes a backend write stall (504
         // `ReadWriteTimeout`) from an indeterminate size decision (502).
+        // Every earlier exit that takes the pump returns, so this still says
+        // whether the adapter read a pump bridge or the client body itself.
+        let upload_pumped = upload_pump.is_some();
         let pump_outcome = if let Some(pump) = upload_pump.take() {
             pump.cancel_and_join().await
         } else {
@@ -61729,7 +61732,14 @@ async fn proxy_to_backend_http2(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ProtocolError),
+                        // A client upload failure stays backend-neutral (#6314).
+                        error_class: Some(
+                            crate::proxy::upload_pump::early_response_upload_refusal_error_class(
+                                outcome,
+                                upload_pumped,
+                                pump_outcome,
+                            ),
+                        ),
                         request_on_wire: true,
                         buffered_trailers: None,
                     },
