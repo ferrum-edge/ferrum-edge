@@ -74,7 +74,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Env var:** `FERRUM_STATUS_COUNTS_MAX_ENTRIES`.
 
-**Cleanup mechanism:** Rare status codes create entries on first occurrence up to the configured cap. Once the cap is reached, new status codes that are not already tracked are silently dropped from the counter map (they are still proxied normally). The pre-populated common codes are never evicted.
+**Cleanup mechanism:** Rare status codes create entries on first occurrence, and a previously-unseen code is admitted only while the map length is below the configured cap — otherwise it is silently dropped from the counter map (the request is still proxied normally). Admission is **best-effort, not a strict hard cap**: each admission does an independent length check for its own key without a shared capacity reservation, so under concurrent first occurrences of several distinct status codes the map can end up holding more than the configured maximum (the pre-populated common codes already count toward the length). There is no status-counter eviction or pruning: once admitted, every entry (including any over-cap overshoot) persists for the lifetime of the counter map, so the excess is not reclaimed until restart.
 
 ### Per-IP Request Counters
 
