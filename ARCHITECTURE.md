@@ -321,7 +321,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 - Custom CA bundle support for server certificate verification
 - No-Verify mode for testing environments (`FERRUM_TLS_NO_VERIFY`)
 - Per-proxy connection configuration overrides
-- Transparent DNS cache integration via `DnsCacheResolver` — no DNS in the hot path
+- Transparent DNS cache integration via `DnsCacheResolver` — cached and stale-while-revalidate hits avoid DNS on the request path; a cache miss is resolved in the foreground (awaited) before dispatch
 - Connection statistics and monitoring
 
 ### **5. Plugin System (`src/plugins/`)**
