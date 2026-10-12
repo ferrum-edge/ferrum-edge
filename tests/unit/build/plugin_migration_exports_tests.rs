@@ -6,7 +6,12 @@ mod plugin_migration_exports {
     include!("../../../build/plugin_migration_exports.rs");
 }
 
-use plugin_migration_exports::source_defines_plugin_migrations as detects;
+use plugin_migration_exports::plugin_migrations_exported;
+
+fn detects(source: &str) -> bool {
+    plugin_migrations_exported(source)
+        .unwrap_or_else(|msg| panic!("unexpected scan error for {source:?}: {msg}"))
+}
 
 #[test]
 fn detects_standard_spelling() {
@@ -79,15 +84,86 @@ fn ignores_mentions_in_comments_and_literals() {
 }
 
 #[test]
-fn ignores_nested_functions_not_reachable_from_collector() {
+fn detects_root_reexport_from_inline_module() {
+    for source in [
+        "mod inner { pub fn plugin_migrations() -> Vec<M> { vec![] } }\n\
+         pub use self::inner::plugin_migrations;",
+        "pub use self::inner::plugin_migrations;\n\
+         mod inner { pub fn plugin_migrations() -> Vec<M> { vec![] } }",
+        "pub use crate::custom_plugins::shared::plugin_migrations;",
+        "pub use inner::r#plugin_migrations;\n\
+         mod inner { pub fn plugin_migrations() -> Vec<M> { vec![] } }",
+        "pub(crate) use self::inner /* why */ :: plugin_migrations ;\n\
+         mod inner { pub fn plugin_migrations() -> Vec<M> { vec![] } }",
+    ] {
+        assert!(detects(source), "should detect: {source:?}");
+    }
+}
+
+#[test]
+fn detects_grouped_and_renamed_root_reexports() {
+    for source in [
+        "mod inner { pub fn helper() {} pub fn plugin_migrations() -> Vec<M> { vec![] } }\n\
+         pub use self::inner::{helper, plugin_migrations};",
+        "mod inner { pub fn declare() -> Vec<M> { vec![] } }\n\
+         pub use self::inner::declare as plugin_migrations;",
+        "mod inner { pub fn declare() -> Vec<M> { vec![] } }\n\
+         pub use self::{inner::{declare as plugin_migrations}, other::Thing};",
+        "pub use crate::{a::b, c::{d, plugin_migrations}};",
+    ] {
+        assert!(detects(source), "should detect: {source:?}");
+    }
+}
+
+#[test]
+fn ignores_use_trees_that_do_not_bind_the_name() {
+    for source in [
+        "use self::plugin_migrations::Thing;",
+        "use self::inner::plugin_migrations as declare;",
+        "use self::inner::{plugin_migrations as declare, helper};",
+        "use std::collections::HashMap;",
+        "mod inner { pub use super::other::plugin_migrations; }",
+        "pub fn f<'a>(x: &'a str) -> impl Sized + use<'a> { x }\n\
+         pub fn plugin_migrations_v2() {}",
+    ] {
+        assert!(!detects(source), "should not detect: {source:?}");
+    }
+}
+
+#[test]
+fn precise_capture_bound_does_not_hide_later_root_export() {
+    let source = "pub fn f<'a>(x: &'a str) -> impl Sized + use<'a> { x }\n\
+                  pub fn plugin_migrations() -> Vec<M> { vec![] }";
+    assert!(detects(source));
+}
+
+#[test]
+fn nested_definition_without_root_export_is_a_hard_error() {
     for source in [
         "impl Plugin { pub fn plugin_migrations() -> Vec<M> { vec![] } }",
         "mod inner { pub fn plugin_migrations() -> Vec<M> { vec![] } }",
         "pub fn outer() { fn plugin_migrations() {} }",
         "#[cfg(test)] mod tests { fn plugin_migrations() {} }",
+        "mod inner { pub fn plugin_migrations() -> Vec<M> { vec![] } }\n\
+         pub use self::inner::plugin_migrations as declare;",
+        "mod inner { pub fn plugin_migrations() -> Vec<M> { vec![] } }\n\
+         pub use self::inner::*;",
     ] {
-        assert!(!detects(source), "should not detect: {source:?}");
+        let Err(err) = plugin_migrations_exported(source) else {
+            panic!("nested definition must fail the build: {source:?}");
+        };
+        assert!(
+            err.contains("pub use <path>::plugin_migrations;"),
+            "error should explain the root re-export fix: {err}"
+        );
     }
+}
+
+#[test]
+fn root_definition_alongside_nested_definition_is_detected() {
+    let source = "impl Plugin { fn plugin_migrations(&self) {} }\n\
+                  pub fn plugin_migrations() -> Vec<M> { vec![] }";
+    assert!(detects(source));
 }
 
 #[test]

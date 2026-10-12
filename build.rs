@@ -202,14 +202,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     fs::write(Path::new(&out_dir).join("custom_plugin_mods.rs"), &mods)?;
 
-    // Detect which plugins define a module-level `fn plugin_migrations`.
-    // The token scan tolerates comments/whitespace and the raw-identifier
-    // spelling; an unreadable plugin source fails the build instead of
-    // silently omitting its migrations.
+    // Detect which plugins expose `plugin_migrations` at their module root,
+    // by definition or by `use` re-export. The token scan tolerates
+    // comments/whitespace and the raw-identifier spelling; an unreadable
+    // plugin source, or a nested definition with no root export, fails the
+    // build instead of silently omitting its migrations.
     let mut plugins_with_migrations: Vec<String> = Vec::new();
     for (name, plugin_path) in &plugin_sources {
         let source = fs::read_to_string(plugin_path)?;
-        if plugin_migration_exports::source_defines_plugin_migrations(&source) {
+        let path = plugin_path.display();
+        let exported = plugin_migration_exports::plugin_migrations_exported(&source)
+            .map_err(|msg| format!("custom plugin `{name}` ({path}): {msg}"))?;
+        if exported {
             plugins_with_migrations.push(name.clone());
         }
     }

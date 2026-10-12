@@ -1,7 +1,19 @@
 /// Name of the function a custom plugin exports to declare its migrations.
 pub const PLUGIN_MIGRATIONS_FN: &str = "plugin_migrations";
 
-/// Returns `true` when `source` declares a module-level `fn plugin_migrations`.
+/// Decides whether a custom plugin source exposes `plugin_migrations` at its
+/// module root, where the generated collector calls
+/// `<plugin>::plugin_migrations()`.
+///
+/// Returns `Ok(true)` when the plugin root defines `fn plugin_migrations` or
+/// binds that name with a `use` declaration, such as
+/// `pub use self::inner::plugin_migrations;`, a grouped
+/// `pub use self::inner::{helper, plugin_migrations};`, or a rename
+/// `pub use self::inner::declare as plugin_migrations;`. Returns `Ok(false)`
+/// when the name is neither defined nor bound. Returns `Err` when
+/// `fn plugin_migrations` is defined only inside braces (inline module, `impl`
+/// block, function body) with no root binding: the collector could not reach
+/// it, and silently omitting it would drop the plugin's migrations.
 ///
 /// This is a small Rust-aware token scan, not a substring search, so valid
 /// spellings the compiler accepts are recognized:
@@ -9,19 +21,104 @@ pub const PLUGIN_MIGRATIONS_FN: &str = "plugin_migrations";
 /// - any whitespace or comments between `fn`, the name, and `(`
 ///   (non-doc comments are whitespace to the compiler);
 /// - the raw-identifier spelling `r#plugin_migrations`;
-/// - any qualifiers before `fn` (`pub`, `pub(crate)`, `const`, `extern "C"`).
+/// - any qualifiers before `fn` or `use` (`pub`, `pub(crate)`, `const`,
+///   `extern "C"`).
 ///
-/// Comments, string/char literals, and items nested inside braces (`impl`
-/// blocks, inline modules, function bodies) are ignored, because only a
-/// module-level function is reachable as `<plugin>::plugin_migrations()` from
-/// the generated collector. Functions produced by macro expansion cannot be
-/// seen by a source scan and are not detected.
-pub fn source_defines_plugin_migrations(source: &str) -> bool {
+/// Mentions in comments and string/char literals are ignored. Glob imports
+/// (`pub use self::inner::*;`) and functions produced by macro expansion
+/// cannot be resolved by a source scan and are not detected.
+pub fn plugin_migrations_exported(source: &str) -> Result<bool, String> {
+    let tokens = tokenize(source);
+    let mut nested_definition = false;
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if token.is_keyword("fn") && tokens.get(i + 1).is_some_and(Token::is_migrations_name) {
+            if token.depth == 0 {
+                return Ok(true);
+            }
+            nested_definition = true;
+        } else if token.depth == 0
+            && token.is_keyword("use")
+            && !tokens.get(i + 1).is_some_and(|next| next.is_punct('<'))
+        {
+            // `use<'a>` (a precise-capturing bound) was excluded above; this
+            // is a use declaration, which ends at the next root-level `;`.
+            let end = tokens[i..]
+                .iter()
+                .position(|t| t.depth == 0 && t.is_punct(';'))
+                .map_or(tokens.len(), |offset| i + offset);
+            if use_tree_binds_migrations(&tokens[i + 1..end]) {
+                return Ok(true);
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+
+    if nested_definition {
+        return Err(format!(
+            "`fn {PLUGIN_MIGRATIONS_FN}` is defined inside a nested item (inline module, \
+             `impl` block, or function body) and is not re-exported at the plugin root; \
+             the generated migration collector calls `<plugin>::{PLUGIN_MIGRATIONS_FN}()`, \
+             so move the function to the plugin root, add \
+             `pub use <path>::{PLUGIN_MIGRATIONS_FN};` at the plugin root, or rename the \
+             nested function"
+        ));
+    }
+    Ok(false)
+}
+
+/// Returns `true` when a use tree (the tokens between `use` and `;`) binds
+/// the name `plugin_migrations`: either as a final path segment
+/// (`a::plugin_migrations`, `a::{b, plugin_migrations}`) or as a rename
+/// target (`a::declare as plugin_migrations`). A segment followed by `::` is
+/// a module path, and one followed by `as` is renamed away.
+fn use_tree_binds_migrations(tree: &[Token]) -> bool {
+    tree.iter().enumerate().any(|(i, token)| {
+        token.is_migrations_name()
+            && !tree
+                .get(i + 1)
+                .is_some_and(|next| next.is_punct(':') || next.is_keyword("as"))
+    })
+}
+
+enum TokenKind {
+    /// Identifier or keyword; `raw` marks the `r#ident` spelling.
+    Ident { name: String, raw: bool },
+    Punct(char),
+    Literal,
+}
+
+struct Token {
+    kind: TokenKind,
+    /// Brace depth outside this token (`{` and `}` carry the outer depth).
+    depth: usize,
+}
+
+impl Token {
+    fn is_keyword(&self, keyword: &str) -> bool {
+        matches!(&self.kind, TokenKind::Ident { name, raw: false } if name == keyword)
+    }
+
+    fn is_migrations_name(&self) -> bool {
+        matches!(&self.kind, TokenKind::Ident { name, .. } if name == PLUGIN_MIGRATIONS_FN)
+    }
+
+    fn is_punct(&self, ch: char) -> bool {
+        matches!(self.kind, TokenKind::Punct(c) if c == ch)
+    }
+}
+
+/// Split `source` into identifiers, punctuation, and opaque literals, skipping
+/// whitespace and comments and tracking brace depth.
+fn tokenize(source: &str) -> Vec<Token> {
     let chars: Vec<char> = source.chars().collect();
+    let mut tokens = Vec::new();
     let mut i = 0;
     let mut depth: usize = 0;
-    // The previous significant token was a module-level `fn` keyword.
-    let mut after_top_level_fn = false;
 
     while i < chars.len() {
         let c = chars[i];
@@ -43,47 +140,60 @@ pub fn source_defines_plugin_migrations(source: &str) -> bool {
         }
         if c == '"' {
             i = skip_quoted(&chars, i + 1, '"');
-            after_top_level_fn = false;
+            tokens.push(Token {
+                kind: TokenKind::Literal,
+                depth,
+            });
             continue;
         }
         if c == '\'' {
             i = skip_char_or_lifetime(&chars, i);
-            after_top_level_fn = false;
+            tokens.push(Token {
+                kind: TokenKind::Literal,
+                depth,
+            });
             continue;
         }
         if is_ident_start(c) {
             if let Some(end) = prefixed_literal_end(&chars, i) {
                 i = end;
-                after_top_level_fn = false;
+                tokens.push(Token {
+                    kind: TokenKind::Literal,
+                    depth,
+                });
                 continue;
             }
-            let raw_ident = c == 'r'
+            let raw = c == 'r'
                 && next == Some('#')
                 && chars.get(i + 2).is_some_and(|&n| is_ident_start(n));
-            let start = if raw_ident { i + 2 } else { i };
+            let start = if raw { i + 2 } else { i };
             let mut end = start;
             while end < chars.len() && is_ident_continue(chars[end]) {
                 end += 1;
             }
-            let ident: String = chars[start..end].iter().collect();
-            if after_top_level_fn && ident == PLUGIN_MIGRATIONS_FN {
-                return true;
-            }
-            after_top_level_fn = depth == 0 && !raw_ident && ident == "fn";
+            let name: String = chars[start..end].iter().collect();
+            tokens.push(Token {
+                kind: TokenKind::Ident { name, raw },
+                depth,
+            });
             i = end;
             continue;
         }
 
-        match c {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            _ => {}
+        if c == '}' {
+            depth = depth.saturating_sub(1);
         }
-        after_top_level_fn = false;
+        tokens.push(Token {
+            kind: TokenKind::Punct(c),
+            depth,
+        });
+        if c == '{' {
+            depth += 1;
+        }
         i += 1;
     }
 
-    false
+    tokens
 }
 
 fn is_ident_start(c: char) -> bool {
