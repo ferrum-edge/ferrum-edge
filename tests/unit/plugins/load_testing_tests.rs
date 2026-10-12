@@ -1004,6 +1004,94 @@ async fn test_fanout_control_request_terminates_before_backend() {
     wait_until_idle(&plugin).await;
 }
 
+/// A retained replay body larger than the whole process-wide retained-body
+/// budget is refused by the real admission branch no matter what other tests
+/// hold concurrently, and the refusal reserves nothing that could disturb them.
+fn over_process_body_budget() -> Bytes {
+    Bytes::from(vec![0u8; 64 * 1024 * 1024 + 1])
+}
+
+#[tokio::test]
+async fn test_fanout_resource_budget_refusal_is_not_acknowledged_as_admission() {
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(over_process_body_budget());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert("x-loadtesting-fanout".to_string(), "1".to_string());
+
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers: reject_headers,
+        } => {
+            assert_eq!(status_code, 503, "budget refusal is not the 204 ack");
+            assert!(body.is_empty(), "refusal body must stay empty: {body:?}");
+            assert!(reject_headers.is_empty());
+        }
+        other => panic!("expected fan-out resource refusal, got {other:?}"),
+    }
+    assert!(!headers.contains_key("x-loadtesting-key"));
+    assert!(!headers.contains_key("x-loadtesting-fanout"));
+    assert!(!plugin.is_running(), "a refused trigger must start no cohort");
+    let result = plugin
+        .last_run_result()
+        .expect("a refused trigger records a terminal result");
+    assert_eq!(result.outcome, RunOutcome::Failed);
+    assert_eq!(result.attempted_requests, 0);
+}
+
+#[tokio::test]
+async fn test_application_resource_budget_refusal_stays_fire_and_forget() {
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(over_process_body_budget());
+    let mut headers = HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
+
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "the initiating application request must keep flowing"
+    );
+    assert!(!headers.contains_key("x-loadtesting-key"));
+    assert!(!plugin.is_running(), "a refused trigger must start no cohort");
+    let result = plugin
+        .last_run_result()
+        .expect("a refused trigger records a terminal result");
+    assert_eq!(result.outcome, RunOutcome::Failed);
+    assert_eq!(result.attempted_requests, 0);
+}
+
 #[tokio::test]
 async fn test_ingress_fanout_marker_cannot_be_removed_to_reenable_fanout() {
     let plugin = LoadTesting::new(
