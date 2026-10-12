@@ -6478,6 +6478,25 @@ fn completed_half_open_probe_cannot_release_an_active_successor() {
     );
 }
 
+#[test]
+fn delayed_closed_failure_cannot_free_a_live_half_open_probe() {
+    // Issue #6311: B (admitted Closed) fails after C took the half-open probe.
+    // Neither B's reopen nor the expiry of B's cooldown may admit a second
+    // probe while C is unresolved; C's stale outcome only returns its slot.
+    for outcome in ["success", "failure", "release"] {
+        assert_eq!(
+            test_helpers::delayed_closed_failure_preserves_live_probe_for_test(outcome),
+            Some(vec!["open", "open", "half_open_probe", "closed"]),
+            "stale probe outcome {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn delayed_closed_success_leaves_a_live_half_open_probe_held() {
+    assert!(test_helpers::delayed_closed_success_keeps_live_probe_for_test());
+}
+
 #[tokio::test]
 async fn all_open_provider_circuits_fail_fast_and_reload_replaces_state() {
     let primary = MockServer::start().await;

@@ -674,7 +674,19 @@ struct ProviderCircuit {
     consecutive_failures: AtomicU32,
     open_until_monotonic_ms: AtomicU64,
     metrics_open: AtomicBool,
+    /// Advanced by every `open()`, after the new cooldown is published. A
+    /// half-open probe records the epoch it was admitted under so its outcome
+    /// can only score the open cycle it actually probed (issue #6311).
+    open_epoch: AtomicU64,
+    /// Owned by the single admitted half-open probe: set only by `admit()`'s
+    /// false-to-true compare-and-exchange and cleared only by that probe's own
+    /// outcome or release. `open()` never clears it, so a delayed failure from
+    /// an older `Closed` admission cannot hand a second probe the slot while
+    /// the first is still live.
     half_open_in_flight: AtomicBool,
+    /// `open_epoch` observed when the current probe was admitted. Written and
+    /// read only by the probe that owns `half_open_in_flight`.
+    half_open_probe_epoch: AtomicU64,
     half_open_successes: AtomicU32,
 }
 
@@ -732,12 +744,18 @@ impl ProviderCircuit {
             consecutive_failures: AtomicU32::new(0),
             open_until_monotonic_ms: AtomicU64::new(0),
             metrics_open: AtomicBool::new(false),
+            open_epoch: AtomicU64::new(0),
             half_open_in_flight: AtomicBool::new(false),
+            half_open_probe_epoch: AtomicU64::new(0),
             half_open_successes: AtomicU32::new(0),
         }
     }
 
     fn admit(&self) -> CircuitAdmission {
+        // Load the epoch BEFORE the cooldown: `open()` publishes the cooldown
+        // before advancing the epoch, so a probe that read an expired cooldown
+        // from an earlier cycle can never record the newer epoch.
+        let epoch = self.open_epoch.load(Ordering::Acquire);
         let open_until = self.open_until_monotonic_ms.load(Ordering::Acquire);
         if open_until == 0 {
             return CircuitAdmission::Closed;
@@ -750,6 +768,7 @@ impl ProviderCircuit {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            self.half_open_probe_epoch.store(epoch, Ordering::Release);
             super::prometheus_metrics::global_registry().record_ai_federation_half_open_probe();
             CircuitAdmission::HalfOpenProbe
         } else {
@@ -767,6 +786,12 @@ impl ProviderCircuit {
     fn record_success(&self, provider_name: &str, admission: CircuitAdmission) {
         self.consecutive_failures.store(0, Ordering::Release);
         if admission != CircuitAdmission::HalfOpenProbe {
+            return;
+        }
+        if !self.half_open_probe_is_current() {
+            // The circuit reopened after this probe was admitted; its success
+            // cannot heal a cycle it never probed. Return the slot only.
+            self.half_open_in_flight.store(false, Ordering::Release);
             return;
         }
 
@@ -793,7 +818,12 @@ impl ProviderCircuit {
 
     fn record_failure(&self, provider_name: &str, admission: CircuitAdmission) {
         if admission == CircuitAdmission::HalfOpenProbe {
-            self.open(provider_name, "half_open_probe_failed");
+            // A stale probe's failure must not extend the newer cycle's
+            // cooldown either; it only returns the slot it owns.
+            if self.half_open_probe_is_current() {
+                self.open(provider_name, "half_open_probe_failed");
+            }
+            self.half_open_in_flight.store(false, Ordering::Release);
             return;
         }
 
@@ -804,6 +834,11 @@ impl ProviderCircuit {
         if failures >= self.config.failure_threshold {
             self.open(provider_name, "failure_threshold_reached");
         }
+    }
+
+    fn half_open_probe_is_current(&self) -> bool {
+        self.half_open_probe_epoch.load(Ordering::Acquire)
+            == self.open_epoch.load(Ordering::Acquire)
     }
 
     fn release_probe(&self, admission: CircuitAdmission) {
@@ -818,9 +853,11 @@ impl ProviderCircuit {
             circuit_monotonic_millis().saturating_add(cooldown_ms),
             Ordering::Release,
         );
+        self.open_epoch.fetch_add(1, Ordering::AcqRel);
         self.consecutive_failures.store(0, Ordering::Release);
         self.half_open_successes.store(0, Ordering::Release);
-        self.half_open_in_flight.store(false, Ordering::Release);
+        // Deliberately leave `half_open_in_flight` alone: a live probe keeps
+        // its slot until its own outcome or release returns it.
         if !self.metrics_open.swap(true, Ordering::AcqRel) {
             super::prometheus_metrics::global_registry().record_ai_federation_circuit_opened();
         }
@@ -8982,6 +9019,105 @@ pub mod test_helpers {
         first_guard.resolve();
         drop(first_guard);
         circuit.admit() == CircuitAdmission::Open
+    }
+
+    /// Reproduce issue #6311: a delayed failure from an older `Closed`
+    /// admission reopens the circuit while a half-open probe is still live.
+    ///
+    /// `probe_outcome` resolves the live (now stale) probe with `"success"`,
+    /// `"failure"`, or `"release"` (cancellation / neutral). Returns the admit
+    /// labels observed: right after the reopen, after the second cooldown
+    /// expires with the probe still live, after the stale probe resolves, and
+    /// after a fresh probe succeeds. `None` if the setup admissions differ
+    /// from the issue's schedule or `probe_outcome` is unknown.
+    pub fn delayed_closed_failure_preserves_live_probe_for_test(
+        probe_outcome: &str,
+    ) -> Option<Vec<&'static str>> {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 1,
+        });
+        let expire_cooldown = |circuit: &ProviderCircuit| {
+            circuit
+                .open_until_monotonic_ms
+                .store(circuit_monotonic_millis(), Ordering::Release);
+        };
+
+        // A and B are admitted while Closed; A's failure opens the circuit.
+        let a = circuit.admit();
+        let b = circuit.admit();
+        if a != CircuitAdmission::Closed || b != CircuitAdmission::Closed {
+            return None;
+        }
+        circuit.record_failure("test", a);
+
+        // C probes after the first cooldown and stays unresolved.
+        expire_cooldown(&circuit);
+        let c = circuit.admit();
+        if c != CircuitAdmission::HalfOpenProbe {
+            return None;
+        }
+        let mut c_guard = HalfOpenProbeGuard::new(&circuit);
+
+        // B's delayed failure reopens the circuit under its Closed admission.
+        circuit.record_failure("test", b);
+        let mut states = vec![circuit_admission_label(circuit.admit())];
+
+        // After B's cooldown, D must not obtain a second probe while C lives.
+        expire_cooldown(&circuit);
+        states.push(circuit_admission_label(circuit.admit()));
+
+        match probe_outcome {
+            "success" => {
+                circuit.record_success("test", c);
+                c_guard.resolve();
+            }
+            "failure" => {
+                circuit.record_failure("test", c);
+                c_guard.resolve();
+            }
+            "release" => c_guard.release(),
+            _ => return None,
+        }
+        drop(c_guard);
+
+        // The stale probe neither healed nor re-armed the newer cycle, so the
+        // still-expired cooldown now grants exactly one fresh probe.
+        let d = circuit.admit();
+        states.push(circuit_admission_label(d));
+        if d == CircuitAdmission::HalfOpenProbe {
+            circuit.record_success("test", d);
+        }
+        states.push(circuit_admission_label(circuit.admit()));
+        Some(states)
+    }
+
+    /// Control for issue #6311: a delayed SUCCESS from an older `Closed`
+    /// admission must leave a live half-open probe's slot held.
+    pub fn delayed_closed_success_keeps_live_probe_for_test() -> bool {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 1,
+        });
+        let b = circuit.admit();
+        if b != CircuitAdmission::Closed {
+            return false;
+        }
+        circuit.open("test", "forced_open_for_test");
+        circuit
+            .open_until_monotonic_ms
+            .store(circuit_monotonic_millis(), Ordering::Release);
+        let c = circuit.admit();
+        if c != CircuitAdmission::HalfOpenProbe {
+            return false;
+        }
+        let _c_guard = HalfOpenProbeGuard::new(&circuit);
+        circuit.record_success("test", b);
+        circuit.release_probe(b);
+        circuit.admit() == CircuitAdmission::Open
+            && circuit.half_open_in_flight.load(Ordering::Acquire)
     }
 
     fn circuit_admission_label(admission: CircuitAdmission) -> &'static str {
