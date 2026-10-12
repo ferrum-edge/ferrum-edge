@@ -303,7 +303,7 @@ Top-level gateway info and throughput counters.
 | `requests_per_second` | integer | Average requests per second over the last metrics window |
 | `status_codes_per_second` | object | Average per-second rate of each HTTP status code over the last metrics window |
 | `metrics_window_seconds` | integer | Window size in seconds used for per-second rate calculations (configurable via `FERRUM_STATUS_METRICS_WINDOW_SECONDS`, default 30) |
-| `config_last_updated_at` | string (RFC 3339) | Timestamp of the last successful config load/reload. `null` in `cp` and `node_agent` modes (no proxy state) |
+| `config_last_updated_at` | string (RFC 3339) | The active config snapshot's `loaded_at` value, serialized as RFC 3339. It is not necessarily the completion time of a successful load: file config can supply a valid timestamp (or default it during deserialization), while SQL/Mongo full loaders sample before their queries. `null` in `cp` and `node_agent` modes (no proxy state) |
 | `config_source_status` | string | Lock-free snapshot of the DB config source: `"online"` when a DB-backed mode reports `db_available=true` (configured and dynamically reachable), `"offline"` when a configured DB is unavailable (`db_available=false`), and `"n/a"` when the mode has no DB-backed config source (`file`, `dp`, `mesh`, `node_agent`). Control-plane (`cp`) reports `online`/`offline` even though `proxy_state` is absent. Never derived from a per-request database probe. |
 | `proxy_count` | integer | Number of proxy routes in the active config |
 | `consumer_count` | integer | Number of consumers in the active config |
@@ -459,7 +459,7 @@ Present only in `database` and `cp` modes, once the database poll loop has regis
 | `last_resource_category` | string | Resource category of the most recent rejection |
 | `last_poll_completed_at` | string (RFC 3339) | *(optional)* Last normally completed poll, including handled errors. Absent until the first poll finishes |
 | `degraded` | object or null | Set while a rejected delta keeps the gateway on its last known-good config; `null` otherwise |
-| `change_stream` | object | *(optional)* MongoDB config-change watcher state; present only when a watcher is running |
+| `change_stream` | object | *(optional)* MongoDB config-change watcher status; present after the watcher has started, including after it stops. `enabled` means started-ever, not currently running. Use `connected` and `degraded_reason` for current watch status; `degraded_reason: "stopped"` means the task has ended. Periodic polling remains authoritative. |
 
 ## Dashboard Tips
 

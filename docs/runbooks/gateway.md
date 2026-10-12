@@ -46,8 +46,10 @@ server errors.
    `sum by (proxy_id, status_code) (rate(ferrum_requests_total{status_code=~"5.."}[5m]))`.
    One proxy means a single route or upstream; all proxies means a gateway-wide
    cause.
-2. `GET /overload` — a non-zero `level` or an active shedding action means the
-   5xx are 503s Ferrum is generating deliberately. Go to
+2. `GET /overload` — JSON `level` is `normal`, `pressure`, or `critical`; the
+   Prometheus `ferrum_overload_level` gauge uses 0, 1, or 2. Pressure can shed
+   keepalives without rejecting requests; check the active actions before
+   attributing 5xx responses to overload. Go to
    [FerrumGatewayOverloadSheddingActive](#ferrumgatewayoverloadsheddingactive).
 3. `GET /health` (credentialed) — `config_rejected: true` means the gateway is
    serving an older configuration than the source of truth.
@@ -69,8 +71,9 @@ temporarily disable the plugin instance through the admin API in `database`/`cp`
 mode.
 
 **Escalation.** Page the owning service team when the 5xx are upstream-origin.
-Page the gateway on-call when `ferrum_requests_total` shows 5xx with no
-corresponding upstream errors and no overload signal.
+Page the gateway on-call when 5xx have no corresponding upstream errors and
+there is no matching gateway signal. An overload signal alone does not explain
+every observed 5xx.
 
 ## FerrumGatewayHighP99Latency
 
@@ -86,9 +89,11 @@ corresponding upstream errors and no overload signal.
 2. `GET /overload` (credentialed) — `pressure.event_loop_latency_us` and the
    per-resource `current`/`max` pairs under `pressure` show whether the runtime
    itself is saturated (metric: `ferrum_overload_event_loop_latency_seconds`).
-3. `ferrum_connection_pool_entries` versus
-   `ferrum_connection_pool_max_idle_per_host` — pool churn adds a connect
-   handshake to requests that should have reused a connection.
+3. Compare `ferrum_connection_pool_entries` and
+   `ferrum_connection_pool_max_idle_per_host` as different dimensions: the HTTP
+   entries count cached reqwest clients, while the latter is the idle-connection
+   ceiling per backend host. These values do not show socket churn or handshakes;
+   confirm churn with connection or handshake evidence before changing the pool.
 4. `GET /backend-capabilities` — an unexpected protocol downgrade (HTTP/2 to
    HTTP/1.1) removes multiplexing and raises tail latency.
 
@@ -98,8 +103,9 @@ overload; a synchronous plugin (external authorization, remote rate limiting)
 on the hot path.
 
 **Remediation.** Scale or fix the upstream when backend duration dominates.
-When gateway overhead dominates, raise `FERRUM_POOL_MAX_IDLE_PER_HOST` (a
-global setting), verify DNS caching, and check for CPU throttling on the pod. If a
+When gateway overhead dominates, confirm connection reuse or handshake churn
+before raising `FERRUM_POOL_MAX_IDLE_PER_HOST` (a global setting); also verify
+DNS caching and check for CPU throttling on the pod. If a
 remote-dependency plugin dominates, lower its timeout so it fails fast rather
 than holding requests.
 
@@ -118,8 +124,9 @@ itself.
    active `actions`, `draining`, `red_drop_probability_pct`, and every resource
    under `pressure` with its `current` and `max`.
 2. `ferrum_overload_resource_current / ferrum_overload_resource_limit` per
-   `resource` identifies which budget is exhausted (connections, requests,
-   memory, file descriptors, ports).
+   `resource` identifies the sampled file-descriptor, connection, or request
+   budget. Port exhaustion has its own event counter; these pairs do not report
+   memory or port limits.
 3. `ferrum_overload_active_connections` and `ferrum_overload_active_requests` —
    compare against configured caps.
 4. `ferrum_overload_draining == 1` means this is a graceful shutdown, not an
@@ -150,8 +157,10 @@ health probes have ejected most of that upstream's targets.
 
 **First checks.**
 
-1. `GET /health` (credentialed) — the health-check block reports per-upstream
-   probe state.
+1. `GET /admin/metrics` (admin JWT) — `health_check.unhealthy_target_count`
+   and `health_check.unhealthy_targets` report currently unhealthy targets,
+   including whether an entry is active or passive. They are not a history of
+   individual probe results.
 2. `ferrum_upstream_targets` — if the denominator dropped rather than the
    numerator rising, targets were removed from configuration or service
    discovery, not ejected.
@@ -190,8 +199,12 @@ minutes. Requests to that upstream are being rejected without being sent.
 3. `ferrum_backend_duration_ms` — breakers also open on timeouts, not only on
    error responses.
 4. `ferrum_circuit_breaker_cache_entries` versus
-   `ferrum_circuit_breaker_cache_max_entries` — a saturated cache means breaker
-   state is being evicted and re-learned.
+   `ferrum_circuit_breaker_cache_max_entries` — at capacity, existing breaker
+   states remain resident; new distinct keys receive transient uncached
+   breakers. Check `ferrum_circuit_breaker_cache_admission_refused_total` for
+   refused cache admission. A rising value means circuit-breaker state does not
+   accumulate for those keys; consider raising
+   `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES`.
 
 **Likely causes.** Sustained upstream errors or timeouts; a breaker threshold
 tuned too tightly for a naturally bursty upstream; an upstream deploy causing a
@@ -270,11 +283,12 @@ OCSP response is below `metrics.alerts.revocationExpiringSeconds` (default 7
 days) for 15 minutes. The gauge counts down to the material's `nextUpdate`;
 a negative value means it has already expired.
 
-**Why it pages.** Ferrum refuses expired revocation material at reload **and
-at startup**. A gateway that is still serving keeps its last good material,
-but any pod that restarts after `nextUpdate` will not come back until fresh
-material is published. This alert is the advance notice before that
-restart-blocking outage.
+**Why it pages.** CRL admission rejects material at or after `nextUpdate`.
+OCSP admission allows up to 300 seconds of clock skew past `nextUpdate`, but
+the hourly staple re-check retires an accepted staple at the exact deadline. A
+gateway can therefore continue with a retired stapleless listener until fresh
+material is attached; a must-staple certificate then cannot complete a valid
+handshake. This alert gives advance notice before that loss of usable material.
 
 **First checks.**
 
@@ -291,14 +305,15 @@ restart-blocking outage.
    recurs without a reload.
 
 **Remediation.** Publish a freshly issued CRL (or a new stapled OCSP
-response) through the configured source; Ferrum reloads revocation material
-from watched sources without a restart. Note that a stapled OCSP response that
-reaches its `nextUpdate` is **dropped** by the hourly re-check — the listener
-then serves no staple, which is the safer state but leaves a must-staple
-certificate unusable until a fresh response is published. Do **not** restart the gateway as a
-remedy — if the material has already expired, the restart is exactly the
-outage this alert warns about. Verify the gauge moves after the source is
-updated; if it does not, the watcher is not seeing the new material.
+response) through the configured source. Their validity boundaries differ:
+CRL admission rejects at or after `nextUpdate`; OCSP admission allows up to
+300 seconds of clock skew past `nextUpdate`, while the hourly staple re-check
+retires an accepted staple at `nextUpdate`. After retirement the listener serves
+no staple, which leaves a must-staple certificate unusable until a fresh
+response is published. Do **not** restart the gateway as a remedy: startup
+revalidates the configured material, and a restart does not publish a fresh
+response. Verify the gauge moves after the source is updated; if it does not,
+the watcher is not seeing the new material.
 
 **Escalation.** Page the PKI/CRL-issuing owner immediately when the remaining
 lifetime is under 24 hours, or when the issuer has stopped publishing.
@@ -335,7 +350,10 @@ rejected for the duration.
    advancing, the poll task is alive and this is a genuine backend problem, not
    a wedged poller. If it has stopped, work
    [FerrumGatewayDatabasePollStale](#ferrumgatewaydatabasepollstale) as well.
-5. Pod logs — every failure path logs a `warn!`/`error!` with the backend error.
+5. Pod logs — many backend failure paths include a sanitized cause, but some
+   control-plane reload/failover failures emit a generic warning. Use the
+   configuration-source availability and poll-failure reason metrics alongside
+   those logs; do not expect every warning to include a backend error.
 
 **Likely causes.** Database down, failed over, or out of connections; network
 policy or security-group change; credential rotation invalidating the
@@ -371,8 +389,10 @@ gauge advances on every *normally completed* poll tick — success, empty result
 validation rejection, **and handled error** — so a database that is completely
 unreachable still advances it every poll interval. Use
 [FerrumGatewayDatabaseUnavailable](#ferrumgatewaydatabaseunavailable) for
-outages. This alert firing means the supervised poll task itself panicked, was
-aborted or cancelled, or is wedged inside a tick.
+outages. If the process remains up, this alert means the supervised poll task
+was aborted or cancelled, completed unexpectedly, or is wedged inside a tick.
+In shipping profiles, a task panic aborts the process, so process-supervisor
+recovery and the absent/stale series are the relevant signals instead.
 
 **First checks.**
 
@@ -380,8 +400,10 @@ aborted or cancelled, or is wedged inside a tick.
    the same timestamp in RFC3339 form. In `cp` mode an unexpected poll-task
    exit also flips sticky `serving_degraded`, so `/health` returns 503 with
    `status: "unavailable"` and `ready: false`.
-2. Pod logs — look for a panic backtrace or an abort from the poll task at
-   roughly `last_poll_completed_at`.
+2. Pod logs — in unwind builds, look for a panic backtrace near
+   `last_poll_completed_at`. In shipping profiles, inspect process termination
+   and supervisor-restart logs because a panic ends the process before the poll
+   supervisor can classify the task exit.
 3. If the series is **absent**, check that the gateway is actually in
    `database` or `cp` mode and that a globally scoped `prometheus_metrics`
    plugin is enabled — the family is conditional on the delta-poll registry
@@ -397,9 +419,15 @@ respawn-and-die.
 unexpected exit while last-known-good configuration continues to serve; check
 whether the timestamp resumes advancing. In `cp` mode the process marks itself
 degraded and should be restarted (it is no longer distributing fresh
-configuration to data planes). Capture the panic backtrace before restarting —
-a wedged tick with no panic is a bug worth filing with the backend type and the
-last log lines.
+configuration to data planes). In shipping profiles, a task panic aborts the
+process before the poll supervisor can classify or respawn it; rely on the
+process supervisor to recover the process and capture its logs there. In unwind
+builds (such as dev/test/pr-build), a panic can reach the in-process supervisor
+and follows the mode's unexpected-exit policy. Database-mode respawn and CP
+sticky degradation also apply to task cancellation or unexpected completion; a
+wedged tick with no panic is a bug worth filing with the backend type and last
+log lines. The separate database unavailable alert remains the signal for a
+backend outage.
 
 **Escalation.** Page the gateway on-call. This is a Ferrum-side fault, not a
 database fault.
