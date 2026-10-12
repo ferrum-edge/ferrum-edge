@@ -409,9 +409,17 @@ fn postgres_dollar_inside_identifier_does_not_expose_keywords() {
     let sql = "CREATE FUNCTION f() RETURNS void AS $body$ BEGIN PERFORM 'CREATE INDEX CONCURRENTLY'; END $body$ LANGUAGE plpgsql;\nCREATE INDEX CONCURRENTLY idx$plugin ON plugin_data (id);";
     let statements = split_plugin_migration_statements(sql, "postgres").unwrap();
     assert_eq!(statements.len(), 2);
-    assert!(!statements_require_non_transactional_postgres("postgres", &statements[..1]));
-    assert!(statements_require_non_transactional_postgres("postgres", &statements[1..]));
-    assert!(!postgres_requires_top_level("DO $$ BEGIN EXECUTE 'VACUUM plugin_data'; END $$;"));
+    assert!(!statements_require_non_transactional_postgres(
+        "postgres",
+        &statements[..1]
+    ));
+    assert!(statements_require_non_transactional_postgres(
+        "postgres",
+        &statements[1..]
+    ));
+    assert!(!postgres_requires_top_level(
+        "DO $$ BEGIN EXECUTE 'VACUUM plugin_data'; END $$;"
+    ));
 }
 
 #[test]
