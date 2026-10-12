@@ -161,6 +161,10 @@ fn status_planning_avoids_per_object_retranslate_and_post_cap() {
     );
 }
 
+fn strip_whitespace(src: &str) -> String {
+    src.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 #[test]
 fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
     // Structural regression for the serialized reconcile / cursor retry
@@ -178,15 +182,18 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .and_then(|rest| rest.split("\nfn gateway_api_status_context(").next())
         .expect("record_gateway_api_status_batch body");
 
+    // Compare with all whitespace stripped so rustfmt's method-chain layout
+    // cannot break these structural assertions.
+    let helper_compact = strip_whitespace(helper);
     assert!(
-        helper.contains("status_window_cursor_after_batch(")
-            && helper.contains("gateway_api_status_plan_cursor.store")
-            && helper.contains("gateway_api_status_window_failed_batches.store"),
+        helper_compact.contains("status_window_cursor_after_batch(")
+            && helper_compact.contains("gateway_api_status_plan_cursor.store(")
+            && helper_compact.contains("gateway_api_status_window_failed_batches.store("),
         "the helper must persist the bounded-retry decision"
     );
     assert_eq!(
-        RECONCILER_SRC
-            .matches("gateway_api_status_plan_cursor.store")
+        strip_whitespace(RECONCILER_SRC)
+            .matches("gateway_api_status_plan_cursor.store(")
             .count(),
         1,
         "record_gateway_api_status_batch must be the only status-plan cursor writer"

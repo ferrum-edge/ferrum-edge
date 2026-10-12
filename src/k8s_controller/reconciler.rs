@@ -1522,10 +1522,9 @@ fn record_gateway_api_status_batch(
         decision.failed_batches,
         std::sync::atomic::Ordering::Relaxed,
     );
-    metrics.gateway_api_status_plan_cursor.store(
-        decision.cursor as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    metrics
+        .gateway_api_status_plan_cursor
+        .store(decision.cursor as u64, std::sync::atomic::Ordering::Relaxed);
     decision
 }
 
