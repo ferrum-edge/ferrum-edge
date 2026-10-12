@@ -25,6 +25,14 @@
 //! Every mutation recomputes the whole union, so a publication, retirement,
 //! discovery-URI replacement, or rejected staged generation reconciles only its
 //! own contribution and can never deactivate a co-tenant of the same URI.
+//!
+//! Reconciliation computes and applies that union under one process-wide gate
+//! ([`reconcile_active_requirements`]). Every contributor mutation happens
+//! before its own reconciliation acquires the gate, so whichever
+//! reconciliation applies last read every contribution published before it
+//! started: an older union can never be applied after a newer reconciliation
+//! has already returned. The installed projection is therefore always the
+//! latest completed union, not an eventually convergent one.
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
@@ -204,6 +212,13 @@ static COMMITTED_REQUIREMENTS: OnceLock<arc_swap::ArcSwap<JwksRequirementMap>> =
 static LATE_ACTIVE_REQUIREMENTS: OnceLock<DashMap<u64, (String, JwksRefreshRequirement)>> =
     OnceLock::new();
 static LATE_ACTIVE_REQUIREMENT_IDS: AtomicU64 = AtomicU64::new(0);
+/// Serializes the snapshot-and-apply of [`reconcile_active_requirements`].
+static RECONCILE_GATE: Mutex<()> = Mutex::new(());
+/// Callback type for [`set_reconcile_snapshot_hook_for_test`].
+pub type ReconcileSnapshotHook = Arc<dyn Fn() + Send + Sync>;
+/// Test-only hook run after a reconciliation computed its union and before it
+/// applies it. Lets external tests force a concurrent interleaving.
+static RECONCILE_SNAPSHOT_HOOK: Mutex<Option<ReconcileSnapshotHook>> = Mutex::new(None);
 /// Precomputed active-remote trust aggregate for O(1) `/health` and `/status`.
 static TRUST_HEALTH: OnceLock<arc_swap::ArcSwap<JwksTrustHealthAggregate>> = OnceLock::new();
 /// Generation for the deadline-watcher task; bumping invalidates a stale
@@ -669,7 +684,19 @@ pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefr
 /// Every mutation path funnels through here, so relaxation of a shared store
 /// happens only once *every* stricter committed consumer — published or
 /// asynchronously discovered — is gone.
+///
+/// The union is computed and applied under [`RECONCILE_GATE`]. Without it an
+/// independent caller could copy an older union, stall, and apply it after a
+/// newer reconciliation already returned — marking a live late contribution's
+/// URI inactive or reinstalling an older, relaxed requirement until some later
+/// reconciliation repaired it. Nothing under the gate awaits or reenters
+/// reconciliation, and no path reconciles while holding a `DashMap` shard
+/// guard, so the gate-then-shard lock order cannot invert.
 fn reconcile_active_requirements() {
+    let _gate = match RECONCILE_GATE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let mut effective: JwksRequirementMap = (**committed_requirements_slot().load()).clone();
     if let Some(late) = LATE_ACTIVE_REQUIREMENTS.get() {
         for entry in late.iter() {
@@ -680,6 +707,8 @@ fn reconcile_active_requirements() {
                 .or_insert(*requirement);
         }
     }
+
+    run_reconcile_snapshot_hook();
 
     let cache = global_cache();
     cache.retain(|uri, entry| {
@@ -694,6 +723,28 @@ fn reconcile_active_requirements() {
         }
     });
     republish_trust_health();
+}
+
+fn run_reconcile_snapshot_hook() {
+    let hook = match RECONCILE_SNAPSHOT_HOOK.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Install (or clear with `None`) a hook that runs inside every reconciliation
+/// between computing the active union and applying it.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn set_reconcile_snapshot_hook_for_test(hook: Option<ReconcileSnapshotHook>) {
+    let mut slot = match RECONCILE_SNAPSHOT_HOOK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = hook;
 }
 
 /// Remove JWKS cache entries whose URIs are not in `active_uris`.
@@ -896,6 +947,15 @@ pub fn cached_store(jwks_uri: &str) -> Option<Arc<JwksKeyStore>> {
     global_cache()
         .get(jwks_uri)
         .map(|entry| Arc::clone(&entry.value().store))
+}
+
+/// Return whether the entry is in the active set, for lifecycle tests.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn cached_active(jwks_uri: &str) -> Option<bool> {
+    global_cache()
+        .get(jwks_uri)
+        .map(|entry| entry.value().active.load(Ordering::Acquire))
 }
 
 /// Return the current strict shared-store policy for diagnostics and tests.
