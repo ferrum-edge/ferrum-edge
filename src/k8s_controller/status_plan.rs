@@ -11,9 +11,78 @@
 //! counts, can be expensive — so every candidate enters the window within at
 //! most `ceil(eligible_candidates / limit)` successful planning/patch rounds
 //! for a stable candidate set.
+//!
+//! A failed patch batch retries the same window, but only a bounded number of
+//! times ([`STATUS_WINDOW_MAX_FAILED_BATCHES`], #6370). A window that keeps a
+//! persistently failing object (403/422, request-budget 504) would otherwise
+//! pin the cursor forever and starve every healthy candidate outside it. After
+//! the bound the cursor advances anyway; the failed object stays unsynchronized
+//! (nothing is marked written) and is retried when the rotation wraps back.
 
 /// Default per-reconcile status planning / write budget (Gateway API).
 pub const DEFAULT_STATUS_PLAN_WORK_BUDGET: usize = 256;
+
+/// Consecutive failed patch batches for one window before the cursor advances
+/// past it anyway (#6370).
+pub const STATUS_WINDOW_MAX_FAILED_BATCHES: u64 = 3;
+
+/// Result of one status patch batch for the selected window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusWindowBatch {
+    /// Every write in the batch succeeded (or the plan was empty).
+    Succeeded,
+    /// At least one write failed, or the batch exceeded its backstop.
+    Failed,
+}
+
+/// Cursor bookkeeping to persist after a status patch batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusWindowCursorDecision {
+    /// Cursor the next reconcile plans from.
+    pub cursor: usize,
+    /// Consecutive failed batches recorded against `cursor`.
+    pub failed_batches: u64,
+    /// The window failed [`STATUS_WINDOW_MAX_FAILED_BATCHES`] times in a row
+    /// and the cursor advanced past it without a successful batch.
+    pub advanced_past_failures: bool,
+}
+
+/// Decide the next status-plan cursor after a patch batch.
+///
+/// Success advances to `next_cursor` and clears the failure streak. Failure
+/// keeps `cursor` so the same window retries, until the streak reaches
+/// [`STATUS_WINDOW_MAX_FAILED_BATCHES`]; then the cursor advances to
+/// `next_cursor` so candidates outside the window can make progress.
+pub fn status_window_cursor_after_batch(
+    cursor: usize,
+    next_cursor: usize,
+    prior_failed_batches: u64,
+    batch: StatusWindowBatch,
+) -> StatusWindowCursorDecision {
+    match batch {
+        StatusWindowBatch::Succeeded => StatusWindowCursorDecision {
+            cursor: next_cursor,
+            failed_batches: 0,
+            advanced_past_failures: false,
+        },
+        StatusWindowBatch::Failed => {
+            let failed_batches = prior_failed_batches.saturating_add(1);
+            if failed_batches >= STATUS_WINDOW_MAX_FAILED_BATCHES {
+                StatusWindowCursorDecision {
+                    cursor: next_cursor,
+                    failed_batches: 0,
+                    advanced_past_failures: true,
+                }
+            } else {
+                StatusWindowCursorDecision {
+                    cursor,
+                    failed_batches,
+                    advanced_past_failures: false,
+                }
+            }
+        }
+    }
+}
 
 /// Fair, deterministic work budget for one status-planning pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
