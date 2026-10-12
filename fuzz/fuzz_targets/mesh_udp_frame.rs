@@ -8,6 +8,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let _ = ferrum_edge::fuzz_support::fuzz_drain_mesh_udp_frames(data);
     if data.len() <= ferrum_edge::proxy::mesh_udp_frame::MAX_FRAME_PAYLOAD {
-        let _ = ferrum_edge::fuzz_support::mesh_udp_frame_round_trip(data);
+        ferrum_edge::fuzz_support::mesh_udp_frame_round_trip(data)
+            .expect("bounded mesh UDP payload must round-trip");
     }
 });

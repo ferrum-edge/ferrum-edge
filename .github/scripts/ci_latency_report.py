@@ -273,11 +273,6 @@ def summarize_jobs(
     for run_id, job_records in sorted(jobs_by_run.items(), key=lambda item: item[0]):
         run = run_by_id.get(run_id, {})
         run_cancelled = run.get("conclusion") == "cancelled"
-        creations = [
-            stamp
-            for stamp in (parse_timestamp(job.get("created_at")) for job in job_records)
-            if stamp is not None
-        ]
         completions = [
             stamp
             for stamp in (
@@ -285,8 +280,14 @@ def summarize_jobs(
             )
             if stamp is not None
         ]
-        if creations and completions:
-            span = (max(completions) - min(creations)).total_seconds()
+        # The reported span is labelled "Run creation to last job
+        # completion", so it starts at the parent run's `created_at`, not at
+        # the first job's creation: any pre-first-job delay belongs to the
+        # interval. A missing run timestamp or a negative span is withheld
+        # rather than rewritten, matching `elapsed_seconds`.
+        run_created = parse_timestamp(run.get("created_at"))
+        if run_created is not None and completions:
+            span = (max(completions) - run_created).total_seconds()
             if span >= 0:
                 chain_seconds.append(span)
         if job_records:
@@ -340,6 +341,7 @@ def summarize_jobs(
 
 def summarize_required_sets(
     runs: list[dict[str, Any]],
+    jobs_by_run: dict[int, list[dict[str, Any]]],
     required: list[dict[str, str]],
 ) -> dict[str, Any]:
     """Whole-required-set completion per exact head SHA and event.
@@ -348,6 +350,16 @@ def summarize_required_sets(
     can never overwrite a merge-group or pull-request observation of the same
     commit. Incomplete heads stay in the denominator; percentiles cover only
     the complete ones and therefore carry survivorship bias.
+
+    Each named context is resolved from its own job record — the job whose
+    display name is the context, inside a run of the context's workflow for
+    that exact head/event/attempt — never from the workflow run's overall
+    conclusion or ``updated_at``. An unrelated job later in the same
+    workflow (for example a push-main image tail after ``Tests``) therefore
+    neither fails a completed context nor delays its reported completion.
+    A head whose required runs were collected without their job records is
+    counted under ``heads_missing_job_data``: that is incomplete collection
+    coverage, not evidence the context itself was incomplete.
     """
 
     by_head: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -359,46 +371,64 @@ def summarize_required_sets(
     # A push has no associated pull request, so a `pr_head` context cannot run
     # for it. Reporting those heads as incomplete would count a structural
     # absence as latency.
-    push_required = [
-        entry["workflow_path"] for entry in required if entry["evidence"] != "pr_head"
-    ]
-    all_required = [entry["workflow_path"] for entry in required]
+    push_required = [entry for entry in required if entry["evidence"] != "pr_head"]
     results: dict[str, dict[str, Any]] = {}
     for event in sorted({event for _, event in by_head}):
-        expected = push_required if event == "push" else all_required
+        expected = push_required if event == "push" else required
         complete = 0
         heads = 0
+        heads_missing_job_data = 0
         completion_seconds: list[float] = []
         for (_, head_event), head_runs in by_head.items():
             if head_event != event:
                 continue
             heads += 1
             successful: dict[str, datetime] = {}
+            missing_job_data = False
             earliest: datetime | None = None
             for run in head_runs:
-                path = run.get("path")
                 created = parse_timestamp(run.get("created_at"))
                 if created is not None and (earliest is None or created < earliest):
                     earliest = created
-                if run.get("conclusion") != "success" or not isinstance(path, str):
-                    continue
-                finished = parse_timestamp(run.get("updated_at"))
-                if finished is None:
-                    continue
-                previous = successful.get(path)
-                if previous is None or finished < previous:
-                    successful[path] = finished
-            if earliest is None or not all(path in successful for path in expected):
+            for entry in expected:
+                context = entry["context"]
+                for run in head_runs:
+                    if run.get("path") != entry["workflow_path"]:
+                        continue
+                    run_id = run.get("id")
+                    job_records = (
+                        jobs_by_run.get(run_id) if isinstance(run_id, int) else None
+                    )
+                    if job_records is None:
+                        missing_job_data = True
+                        continue
+                    for job in job_records:
+                        if job.get("name") != context:
+                            continue
+                        if job.get("conclusion") != "success":
+                            continue
+                        finished = parse_timestamp(job.get("completed_at"))
+                        if finished is None:
+                            continue
+                        previous = successful.get(context)
+                        if previous is None or finished < previous:
+                            successful[context] = finished
+            if missing_job_data:
+                heads_missing_job_data += 1
+            if earliest is None or not all(
+                entry["context"] in successful for entry in expected
+            ):
                 continue
             complete += 1
             span = (
-                max(successful[path] for path in expected) - earliest
+                max(successful[entry["context"]] for entry in expected) - earliest
             ).total_seconds()
             if span >= 0:
                 completion_seconds.append(span)
         results[event] = {
             "heads": heads,
             "complete_sets": complete,
+            "heads_missing_job_data": heads_missing_job_data,
             "expected_contexts": len(expected),
             "p50_minutes": minutes(percentile(completion_seconds, 0.50)),
             "p95_minutes": minutes(percentile(completion_seconds, 0.95)),
@@ -446,7 +476,7 @@ def summarize(
         "attempts": dict(sorted(attempts.items())),
         "reattempted_heads": len(reattempted_heads),
         "jobs": summarize_jobs(runs, jobs_by_run),
-        "required_set_completion": summarize_required_sets(runs, required),
+        "required_set_completion": summarize_required_sets(runs, jobs_by_run, required),
     }
 
 
@@ -559,11 +589,22 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "pull-request-head context, which structurally cannot run for a push."
     )
     lines.append("")
-    lines.append("| Event | Heads | Complete sets | Contexts | p50 (min) | p95 (min) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+    lines.append(
+        "Each context's verdict and completion come from its own named job "
+        "record, not from its workflow run's conclusion or `updated_at`, so "
+        "an unrelated later job in the same workflow neither fails a "
+        "completed context nor delays it. `Heads missing job data` counts "
+        "heads whose required runs were collected without their job "
+        "records: for those heads the collection is incomplete and no "
+        "context verdict is claimed."
+    )
+    lines.append("")
+    lines.append("| Event | Heads | Complete sets | Heads missing job data | Contexts | p50 (min) | p95 (min) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for event, entry in summary["required_set_completion"].items():
         lines.append(
             f"| {event} | {entry['heads']} | {entry['complete_sets']} "
+            f"| {entry['heads_missing_job_data']} "
             f"| {entry['expected_contexts']} | {entry['p50_minutes']} "
             f"| {entry['p95_minutes']} |"
         )
@@ -688,16 +729,27 @@ def self_test() -> int:
         1: [
             {
                 "name": "plan",
+                "conclusion": "success",
                 "created_at": "2026-09-08T00:00:00Z",
                 "started_at": "2026-09-08T00:01:00Z",
                 "completed_at": "2026-09-08T00:03:00Z",
             },
             {
-                "name": "test",
+                "name": "Tests",
+                "conclusion": "success",
                 "created_at": "2026-09-08T00:04:00Z",
                 "started_at": "2026-09-08T00:05:00Z",
-                "completed_at": "2026-09-08T00:55:00Z",
+                "completed_at": "2026-09-08T01:00:00Z",
             },
+        ],
+        2: [
+            {
+                "name": "Trusted Cross Build Policy",
+                "conclusion": "success",
+                "created_at": "2026-09-08T00:05:00Z",
+                "started_at": "2026-09-08T00:06:00Z",
+                "completed_at": "2026-09-08T00:20:00Z",
+            }
         ],
         3: [
             {
@@ -705,6 +757,15 @@ def self_test() -> int:
                 "created_at": "2026-09-08T02:00:00Z",
                 "started_at": "2026-09-08T02:01:00Z",
                 "completed_at": "2026-09-08T02:21:00Z",
+            }
+        ],
+        4: [
+            {
+                "name": "Tests",
+                "conclusion": "success",
+                "created_at": "2026-09-08T03:00:00Z",
+                "started_at": "2026-09-08T03:01:00Z",
+                "completed_at": "2026-09-08T03:40:00Z",
             }
         ],
     }
@@ -721,12 +782,13 @@ def self_test() -> int:
     assert summary["runs_by_event"]["push"] == {"cancelled": 1, "success": 1}
 
     jobs = summary["jobs"]
-    assert jobs["job_attempts"] == 3
-    # 2 + 50 + 20 minutes of execution, of which the 20 sits in a cancelled run.
-    assert jobs["execution_minutes_total"] == 72.0
+    assert jobs["job_attempts"] == 5
+    # 2 + 55 + 14 + 20 + 39 minutes of execution, of which the 20 sits in a
+    # cancelled run.
+    assert jobs["execution_minutes_total"] == 130.0
     assert jobs["execution_minutes_in_cancelled_runs"] == 20.0
     assert jobs["queue_p50_minutes"] == 1.0
-    assert jobs["slowest_jobs"][0]["job"] == "test"
+    assert jobs["slowest_jobs"][0]["job"] == "Tests"
 
     assert summary["required_workflows_expected"] == 2
     assert summary["required_workflows_observed"] == [
@@ -747,6 +809,82 @@ def self_test() -> int:
     assert completion["push"]["complete_sets"] == 1
     assert completion["push"]["expected_contexts"] == 1
     assert completion["push"]["p50_minutes"] == 40.0
+    assert completion["push"]["heads_missing_job_data"] == 0
+    assert completion["pull_request"]["heads_missing_job_data"] == 0
+
+    # The run-creation span includes any delay before the first job exists:
+    # a run created at 00:00 whose only job is created at 00:10 and completes
+    # at 00:20 spans 20 minutes, not 10.
+    span_jobs = summarize_jobs(
+        [
+            {
+                "id": 9,
+                "conclusion": "success",
+                "created_at": "2026-09-08T00:00:00Z",
+            }
+        ],
+        {
+            9: [
+                {
+                    "name": "only",
+                    "created_at": "2026-09-08T00:10:00Z",
+                    "started_at": "2026-09-08T00:11:00Z",
+                    "completed_at": "2026-09-08T00:20:00Z",
+                }
+            ]
+        },
+    )
+    assert span_jobs["run_span_p50_minutes"] == 20.0
+
+    # A required context keeps its own job verdict and completion even when
+    # an unrelated later job in the same workflow fails (or finishes late),
+    # and a head whose job records were never fetched is reported as
+    # incomplete collection coverage rather than as an incomplete context.
+    tail_runs = [
+        {
+            "id": 10,
+            "event": "push",
+            "conclusion": "failure",
+            "run_attempt": 1,
+            "head_sha": "ddd",
+            "path": ".github/workflows/ci.yml",
+            "created_at": "2026-09-08T04:00:00Z",
+            "updated_at": "2026-09-08T05:30:00Z",
+        },
+        {
+            "id": 11,
+            "event": "push",
+            "conclusion": "success",
+            "run_attempt": 1,
+            "head_sha": "eee",
+            "path": ".github/workflows/ci.yml",
+            "created_at": "2026-09-08T06:00:00Z",
+            "updated_at": "2026-09-08T06:30:00Z",
+        },
+    ]
+    tail_jobs = {
+        10: [
+            {
+                "name": "Tests",
+                "conclusion": "success",
+                "created_at": "2026-09-08T04:01:00Z",
+                "started_at": "2026-09-08T04:02:00Z",
+                "completed_at": "2026-09-08T04:30:00Z",
+            },
+            {
+                "name": "Build Linux CI image",
+                "conclusion": "failure",
+                "created_at": "2026-09-08T04:31:00Z",
+                "started_at": "2026-09-08T04:32:00Z",
+                "completed_at": "2026-09-08T05:30:00Z",
+            },
+        ]
+    }
+    tail_completion = summarize_required_sets(tail_runs, tail_jobs, required)["push"]
+    assert tail_completion["heads"] == 2
+    assert tail_completion["complete_sets"] == 1
+    assert tail_completion["p50_minutes"] == 30.0
+    assert tail_completion["heads_missing_job_data"] == 1
 
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
