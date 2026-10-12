@@ -219,8 +219,16 @@ Custom CA and client-certificate bundles are admitted atomically. Every
 declared `CERTIFICATE` record must parse, every custom CA record must be usable
 as a trust root, and a selected custom bundle must contain at least one
 certificate. A failure rejects the complete startup/reload candidate; Ferrum
-never installs only the surviving subset, and existing live pools/health
-clients keep their last-known-good generation. Shared PEM admission limits each
+never installs only the surviving subset. That last-good retention is scoped
+to this atomic candidate admission — and to a CRL candidate that fails
+admission, which likewise refuses the reload before any pool is drained. It
+is not a blanket guarantee for backend live reload of in-place source
+changes: there, a destination whose client cert/key material no longer
+builds is skipped while the reload proceeds for the rest, backend caches and
+pools are cleared, and that destination's **new** connections fail until the
+material is fixed (existing in-flight connections are unaffected; see the
+per-destination contract under "Operational Contract for Backend TLS
+Sources" below). Shared PEM admission limits each
 certificate/key source to 4 MiB and each certificate bundle to 4096 records so
 provider- or file-controlled input cannot drive unbounded parsing work.
 
@@ -403,11 +411,15 @@ outbound:
   fails; a live reload keeps the previously accepted CRL slot, backend pools, and
   health checks exactly as they were, and logs a redacted warning.
 - **CRL refresh is therefore a restart-blocking dependency.** "Startup fails"
-  above is literal and applies in every serving mode: a process that restarts
+  above is literal in every serving mode whose startup loads the CRL: a process that restarts
   after the CRL's `nextUpdate` does not come back, so a forgotten refresh job
   becomes a fleet-wide outage rather than one degraded pod. This is deliberate
   — booting with an expired CRL would serve without revocation enforcement for
-  that issuer, which is fail-open. Keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true`
+  that issuer, which is fail-open. The one scoped exception is `node_agent`
+  with no active or explicitly requested admin HTTPS surface (admin disabled
+  or HTTP-only): that mode loads no TLS policy or CRL at startup, so an
+  unrelated CRL path cannot block it. Every surface that does load the CRL
+  keeps the refusal above. Keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true`
   (the default) so a refreshed CRL is adopted without a restart, and refresh
   the CRL before `nextUpdate`. Frontend surfaces need
   `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, which is **off** by default;

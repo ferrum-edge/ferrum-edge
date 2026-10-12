@@ -305,8 +305,9 @@ their upstream licenses (MIT, Apache-2.0, and similar permissive terms for the
 current patches) must fall within the allowlist or carry an explicit exception.
 
 Every `[licenses.exceptions]` entry must document an **owner**, a **rationale**,
-and an `[expires:YYYY-MM-DD]` token, and this is **enforced**:
-`scripts/check_advisory_expiry.sh` walks the `exceptions` array in
+and an `[expires:YYYY-MM-DD]` token. The owner and rationale are a review
+requirement; the automated checker enforces only the expiry token and its
+date: `scripts/check_advisory_expiry.sh` walks the `exceptions` array in
 `deny.toml` and fails on a missing token or a passed date, on the per-PR
 `dependency-audit` job in `.github/workflows/ci.yml` **and** on the weekly
 `.github/workflows/dependency-audit.yml`, so a license exception cannot become
