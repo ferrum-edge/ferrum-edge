@@ -3984,7 +3984,7 @@ A query is *ambiguous* when Ferrum cannot prove the backend will read it the sam
 Under the default `query_ambiguity_policy: reject`, such a request is denied before OPA is called. Under `delegate`, OPA receives:
 
 - `input.query_pairs` — every occurrence in wire order as `{"name": …, "value": …, "bare": …}`. `bare` distinguishes `?flag` from `?flag=`; both decode to an empty `value`. A non-UTF-8 component is replacement-decoded and classified in `input.query_ambiguity`; a policy that needs exact bytes must reject that class.
-- `input.query_ambiguity` — the classification tokens above, in the order encountered. Empty for an unambiguous query.
+- `input.query_ambiguity` — the classification tokens above, deduplicated (at most one entry per class) in deterministic classification order: `literal_plus`, `malformed_percent_encoding`, `non_utf8_name`, and `non_utf8_value` are recorded in the order first encountered while scanning the pairs, and `duplicate_name` is detected afterwards in a separate pass over the decoded names and appended last. So `a=1&a=2&b=x+y` produces `["literal_plus", "duplicate_name"]` even though the second `a` precedes the `+`, and `reject` mode reports that first recorded token. Empty for an unambiguous query.
 - `input.query` — **omitted** when `input.query_ambiguity` is non-empty, so no rule can read from the flat map a value the backend does not execute.
 
 `%20` and `%2B` are unambiguous and decode to a space and a `+` respectively; only a *literal* `+` byte is ambiguous. Use `delegate` only when the backend's duplicate-parameter and `+` conventions are known and encoded in Rego.
@@ -6684,7 +6684,18 @@ as a buffered JSON body is governed normally. See the guide's
 handling of each.
 
 **Mode semantics.** `mode: enforce` is the only mode that rejects or cuts; it
-fails closed on anything it cannot policy-check. `mode: dry_run` never rejects
+fails closed on governed, uninspectable cases where the configured posture
+requires it, within the configured inspection surfaces and supported
+extraction scope. That is not unconditional: a JSON-labelled plaintext
+response that fails to parse is forwarded (see the guide's
+[limitations](plugins/ai_tool_governor.md#limitations-mvp)),
+[`approval.fail_on_error`](plugins/ai_tool_governor.md#approval)`=warn`/`allow`
+deliberately fails open on an approval endpoint error (the default `reject`
+fails closed), and
+`unknown_shape_action=allow` is the documented opt-out for a marker-bearing
+payload from which no call was extracted — a backstop that applies only when
+no supported call was extracted, not a guarantee that every unreadable sibling
+in a mixed body is detected. `mode: dry_run` never rejects
 and never calls the approval webhook — it evaluates policy, records what
 enforce *would* have done, and forwards — so it is the safe rollout/observe
 posture. Global dry-run **preserves the would-be policy label** rather than
@@ -6700,19 +6711,30 @@ plugin cannot read is an **extraction failure, not an allow**:
 `unknown_shape_action` (default `deny`) makes enforce fail closed on it, while
 the documented `allow` opt-out forwards it. Both settings record the fixed
 `ai_tool_governor.uninspectable_reason=unrecognized_tool_call_shape`
-observation without claiming a decision, so the case is never silent in either
-mode.
+observation, so the case is never silent in either mode. The observation
+writer itself never invents a policy decision; on the forwarding paths
+(`allow`, or `dry_run`) it does not set `decision` (a stronger decision from
+another surface can still stand), while the default enforce rejection path
+records `ai_tool_governor.decision=deny` as the rejection outcome alongside
+the fixed reason — when metadata emission is enabled.
 
 **Bounded observation metadata.** The cumulative comma-delimited fields
 (`tool_names`, `policy_ids`, `approval_id`, `arguments_hashes`,
-`redacted_tools`) aggregate across every governed surface of a request and
-every completed batch of a response stream, so each is capped at 64 distinct
-values and 8192 bytes, with individual values retained to 256 bytes. A stream
-that keeps emitting distinct tool names cannot grow that state without limit —
-unlimited streaming is a documented response-byte setting, so no wire-byte
-ceiling bounds it. Dropped distinct values are counted in
-`ai_tool_governor.observations_omitted`; enforcement, the sticky highest
-`decision`, and the maximum `risk` are unaffected. See the guide's
+`redacted_tools`) aggregate by winning decision rank across the governed
+surfaces of a request and the completed batches of a response stream: a
+lower-rank batch is ignored, an equal-rank batch merges into the retained
+ledger, and a stronger batch replaces the weaker decision's ledger basis.
+Each field is capped at 64 distinct values and 8192 bytes (the byte cap
+includes comma and marker bytes), with individual values retained to at most
+256 bytes plus a trailing `…` marker when shortened (259 bytes in total). A
+stream that keeps emitting distinct tool names cannot grow that state without
+limit — unlimited streaming is a documented response-byte setting, so no
+wire-byte ceiling bounds it. Distinct truncated values dropped by an entry or
+byte cap during a merge are counted in
+`ai_tool_governor.observations_omitted` (it is not a count of rank-displaced
+observations); enforcement, the sticky highest `decision`, and `risk` — the
+maximum within the winning decision rank, so a stronger decision can replace
+a previous rank's higher risk — are unaffected. See the guide's
 [observability metadata](plugins/ai_tool_governor.md#observability-metadata).
 
 ### `ai_transcript_audit`
@@ -9128,7 +9150,7 @@ Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applica
 | `cluster_domains` | Array of strings | `[]` | **Injection-only.** Deduplicated cluster-domain aliases for the same host matching. |
 | `node_waypoint_route_upstreams` | Array of objects | `[]` | **Injection-only.** Mesh-generated route upstream metadata used to precompute destination policy scopes for node-waypoint dispatch. |
 
-The six injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
+The five injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
 
 **Direct policy example.** A namespace-scoped policy that denies `/admin` outright and otherwise allows only one service account:
 
@@ -9159,13 +9181,13 @@ config:
             - spiffe_id_pattern: "spiffe://cluster.local/ns/default/sa/checkout"
 ```
 
-**Strict configuration admission.** The policy grammar is closed at every level — the policy, each rule, and each `from` / `to` / `when` / `source_negation` matcher reject unknown members — and `action` is **required** on every rule. Every misspelling in this grammar removes a restriction rather than adding one: `not_paths` typed `not_path` would deserialize as an unconstrained rule, and `action` typed `actoin` would fall back to the `Allow` default and turn a DENY into a grant. Both fail admission with a field-specific diagnostic.
+**Strict configuration admission.** The policy grammar is closed at the named-struct levels — the policy, each rule, its workload selector, and each `from` / `to` / `when` / `source_negation` matcher reject unknown members — and `action` is **required** on every rule. The enum-variant objects are the exception: `scope` (`PolicyScope`), target-ref attachments (`PolicyTargetAttachment`), and the `custom` action (`PolicyAction::Custom`) deserialize without `deny_unknown_fields`, so an extra sibling member inside one of those variant objects is ignored rather than rejected; a misspelling there is not caught at admission. Misspellings at the closed levels remove a restriction rather than adding one: `not_paths` typed `not_path` would deserialize as an unconstrained rule, and `action` typed `actoin` would fall back to the `Allow` default and turn a DENY into a grant. Both fail admission with a field-specific diagnostic.
 
-**Trusted identity is required.** `mesh_authz` authorizes the identity another plugin established; it does not authenticate. Without the `spiffe_identity` plugin (or an authenticated HBONE peer), `source_principal` is absent, so every `from` matcher fails, every ALLOW rule misses, and a policy set containing any ALLOW rule denies everything. Deploy it behind mesh mTLS, not on a plaintext listener.
+**Trusted identity is required for identity-constrained rules.** `mesh_authz` authorizes the identity another plugin established; it does not authenticate. Without the `spiffe_identity` plugin (or an authenticated HBONE peer), `source_principal` is absent, so every rule carrying a nonempty positive `from` source-principal constraint misses, and a policy set whose ALLOW rules all carry such constraints denies everything. An ALLOW rule with no source-principal (or request-principal / source-negation) constraint is unconstrained and still matches an anonymous request — intentional Istio-style semantics — unless an independent DENY or CUSTOM refusal applies. Deploy it behind mesh mTLS, not on a plaintext listener.
 
 **Layer-4 sessions.** A raw TCP/TLS/UDP/DTLS session carries no HTTP request, so HTTP-only fields (`to.operation` methods/paths/hosts/headers, `request_principals`, `when: request.*`) are unsourceable there. Following Istio, a `DENY` or `CUSTOM` rule ignores an unsourceable field and still matches on its remaining constraints, while an `ALLOW` or `AUDIT` rule can never match on it. Scope such rules with `to.ports` when the workload also serves non-HTTP ports. On an HTTP-family request a header the client simply did not send is **absent**, not unsourceable, and fails a positive `to.headers` predicate for every action — see [Rule Matching](mesh.md#rule-matching).
 
-**CUSTOM delegation.** `action: {custom: {provider: <name>}}` delegates the decision to a `meshConfig.extensionProviders` entry carried on the mesh slice. A provider that does not bind, and a generation with no executor at all (which includes every direct `mesh_policies` config), refuse with a fixed `403` that no provider's `failOpen` can admit. See [AuthorizationPolicy `action: CUSTOM`](mesh.md#authorizationpolicy-action-custom-issue-3235) in the mesh guide for the outcome vocabulary, the failure table, and the process-wide in-flight budget.
+**CUSTOM delegation.** `action: {custom: {provider: <name>}}` delegates the decision to a `meshConfig.extensionProviders` entry carried on the mesh slice. A direct flat `mesh_policies` configuration carries no provider source, so its CUSTOM rules have no bound provider and always refuse with a fixed `403` — whether an (empty-provider) executor exists depends on the construction path: the normal plugin factory builds one, which denies the unbound provider as `provider_unbound`, while the no-HTTP-client seam has no executor and takes the other fixed-403 branch. A provider that does not bind likewise refuses with a fixed `403` that no provider's `failOpen` can admit. See [AuthorizationPolicy `action: CUSTOM`](mesh.md#authorizationpolicy-action-custom-issue-3235) in the mesh guide for the outcome vocabulary, the failure table, and the process-wide in-flight budget.
 
 See [Authorization](mesh.md#authorization), [MeshPolicy](mesh.md#meshpolicy), [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors), and [plugin execution order](plugin_execution_order.md#why-this-order-matters).
 

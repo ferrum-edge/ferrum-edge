@@ -451,7 +451,14 @@ helm install ferrum ./charts/ferrum-mesh -n ferrum --create-namespace \
 ```
 
 Production-style installs should use existing Secrets for both JWT material and
-the database URL:
+the database URL. Before running the install below, also provision the
+`ferrum-mesh-production-trust-bundle` Secret in namespace `ferrum` with the
+`cp-dp-trust-bundle.json` key, using the setup documented in the comments of
+[`production-existing-secrets-values.yaml`](../charts/ferrum-mesh/examples/production-existing-secrets-values.yaml)
+— those values mount it through a non-optional Secret volume, and the block
+below does not create it. CP/DP gRPC TLS must likewise be configured before
+the `helm install` step (see the paragraph after the block); treat these
+commands as a scaffold to customize, not a complete production setup:
 
 ```bash
 kubectl apply --server-side=true \
