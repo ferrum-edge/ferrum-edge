@@ -2809,6 +2809,15 @@ pub mod _test_support {
         }
     }
 
+    /// Every target the live adaptive-concurrency policies track, read through
+    /// the proxy state's plugin cache, so an in-process test can check what a
+    /// real request settled.
+    pub fn adaptive_concurrency_snapshots_for_test(
+        state: &crate::proxy::ProxyState,
+    ) -> Vec<crate::adaptive_concurrency::AdaptiveConcurrencySnapshot> {
+        state.plugin_cache.adaptive_concurrency_snapshots()
+    }
+
     pub struct AdaptiveConcurrencyTransitionHarness {
         transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition,
     }

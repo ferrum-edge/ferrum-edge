@@ -2876,6 +2876,61 @@ fn adaptive_concurrency_delayed_rotation_cannot_restore_expired_window() {
     );
 }
 
+/// Issue #6309 review: publication order alone does not bound the horizon.
+/// Newer windows can have closed while their own publications are still
+/// pending, so an older window that publishes first must not become the
+/// baseline once two windows have closed after it.
+#[test]
+fn adaptive_concurrency_expired_window_is_ignored_while_newer_publications_are_pending() {
+    let windows = AdaptiveConcurrencyBaselineHarness::new();
+    // Warmup window 0 publishes a 10ms baseline.
+    windows.observe(10_000);
+    windows.observe(10_000);
+    windows.rotate();
+    assert_eq!(windows.effective_us(), 10_000);
+
+    // A closes window 1, which holds the 1ms outlier, and pauses before
+    // publishing.
+    windows.observe(1_000);
+    windows.observe(10_000);
+    let a = windows.close_window();
+    // B and C close windows 2 and 3 and pause before publishing too.
+    windows.observe(10_000);
+    windows.observe(10_000);
+    let b = windows.close_window();
+    windows.observe(10_000);
+    windows.observe(10_000);
+    let c = windows.close_window();
+    assert!(!a.is_empty() && !b.is_empty() && !c.is_empty());
+    assert_eq!(
+        windows.effective_us(),
+        0,
+        "window 0 expired once windows 2 and 3 closed after it"
+    );
+
+    // A resumes first. Its sequence is newer than the published window 0, so
+    // the store lands, but window 1 is itself already two closures old.
+    windows.publish_closed_window(a);
+    assert_eq!(
+        windows.effective_us(),
+        0,
+        "an expired 1ms window must not become an effective baseline"
+    );
+    windows.observe(12_000);
+    assert_eq!(
+        windows.effective_us(),
+        12_000,
+        "only the open window trains feedback while newer publications are pending"
+    );
+
+    // B and C land: window 2 trails the latest closed window by one and is in
+    // force, and window 3 replaces it.
+    windows.publish_closed_window(b);
+    assert_eq!(windows.effective_us(), 10_000);
+    windows.publish_closed_window(c);
+    assert_eq!(windows.effective_us(), 10_000);
+}
+
 /// Publications are ordered by the rotation that closed each window, not by
 /// the order the stores land in; an empty window publishes nothing.
 #[test]

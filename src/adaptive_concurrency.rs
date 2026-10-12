@@ -62,6 +62,11 @@ const BASELINE_WINDOW_SEQUENCE_MASK: u64 = u64::MAX >> BASELINE_LATENCY_BITS;
 /// Serial-number half range for the wrapping 24-bit window sequence. A
 /// publication is newer only when it is ahead by less than this distance.
 const BASELINE_WINDOW_SEQUENCE_HALF_RANGE: u64 = (BASELINE_WINDOW_SEQUENCE_MASK >> 1) + 1;
+/// How far the open window's sequence may lead the published prior window
+/// while that prior is still in force: by one when it is the latest closed
+/// window, by two when a newer window has closed but is still being
+/// published. Any further and two windows have closed after it.
+const BASELINE_PRIOR_WINDOW_HORIZON: u64 = 2;
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdaptiveConcurrencyResetEpoch {
@@ -880,6 +885,21 @@ impl AdaptiveConcurrencyLimiter {
             .map(|entry| AdaptiveConcurrencySnapshot::from_state(key, entry.value()))
     }
 
+    /// Every target tracked in the active tracking space. Inspection only, for
+    /// in-process fixtures that settle real requests through the proxy.
+    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
+    pub(crate) fn snapshots(&self) -> Vec<AdaptiveConcurrencySnapshot> {
+        let tracking_space = self.tracking_space.load();
+        tracking_space
+            .inner
+            .iter()
+            .map(|entry| {
+                let key = entry.key().clone();
+                AdaptiveConcurrencySnapshot::from_state(key, entry.value())
+            })
+            .collect()
+    }
+
     /// Resolve the scope component of the key for `proxy` under `key_by`.
     /// `backend` scoping returns one shared constant. `proxy` scoping caches a
     /// reused `Arc<str>` per namespace-qualified `namespace|id` runtime key —
@@ -1195,9 +1215,15 @@ fn scoped_proxy(proxy: &Proxy) -> String {
 /// it as the prior window is a separate step that concurrent feedback can
 /// delay, so a publication that is not newer than the prior window already in
 /// place is a logically late store and is discarded: a delayed rotation can
-/// never restore a window older than ones that have already closed (issue
-/// #6309). The sequence counts rotations, not samples, so it stays ordered when
-/// a compatible reload changes `baseline_window_samples`.
+/// never restore a window older than ones that have already been published
+/// (issue #6309). Newer windows can also have closed while their publications
+/// are still pending, so the open window's sequence — advanced at close, before
+/// any publication — is the monotonic latest-closed position, and a prior
+/// window counts toward the baseline only within
+/// `BASELINE_PRIOR_WINDOW_HORIZON` of it. An expired prior is ignored exactly
+/// like a missing one, whatever order the pending publications land in. The
+/// sequence counts rotations, not samples, so it stays ordered when a
+/// compatible reload changes `baseline_window_samples`.
 pub(crate) struct AdaptiveConcurrencyBaselineWindows {
     /// Current window: its sequence and minimum healthy latency (µs); a zero
     /// minimum means the window is empty.
@@ -1242,7 +1268,8 @@ impl AdaptiveConcurrencyBaselineWindows {
     }
 
     /// Close the current window and start the next one empty. An empty closed
-    /// window has nothing to publish and leaves the prior window in place.
+    /// window has nothing to publish and leaves the prior window in place,
+    /// though its closure still counts toward the prior window's horizon.
     pub(crate) fn close_window(&self) -> Option<AdaptiveConcurrencyClosedBaselineWindow> {
         let mut current = self.current.load(Ordering::Acquire);
         loop {
@@ -1297,17 +1324,39 @@ impl AdaptiveConcurrencyBaselineWindows {
         }
     }
 
-    /// Minimum of the current and prior windows; `0` means no healthy sample
-    /// has been recorded yet.
+    /// Minimum of the current window and a prior window still within the
+    /// two-window horizon; `0` means no healthy sample is in force.
     pub(crate) fn effective_us(&self) -> u64 {
-        let prior = self.prior.load(Ordering::Acquire) & BASELINE_LATENCY_MASK;
-        let current = self.current.load(Ordering::Acquire) & BASELINE_LATENCY_MASK;
-        match (prior, current) {
-            (0, current) => current,
-            (prior, 0) => prior,
-            (prior, current) => prior.min(current),
+        // Load the prior first. Its publisher closed that window (advancing the
+        // open sequence) before publishing it, so the open word read afterwards
+        // is never older than the prior it is compared with.
+        let prior = self.prior.load(Ordering::Acquire);
+        let current = self.current.load(Ordering::Acquire);
+        let prior_us = if baseline_prior_window_in_force(prior, current) {
+            prior & BASELINE_LATENCY_MASK
+        } else {
+            0
+        };
+        let current_us = current & BASELINE_LATENCY_MASK;
+        match (prior_us, current_us) {
+            (0, current_us) => current_us,
+            (prior_us, 0) => prior_us,
+            (prior_us, current_us) => prior_us.min(current_us),
         }
     }
+}
+
+/// Whether a published prior window is still within the two-window horizon of
+/// the open window. A prior older than that has had two windows close after
+/// it, even if their publications have not landed yet.
+fn baseline_prior_window_in_force(prior: u64, current: u64) -> bool {
+    if prior == 0 {
+        return false;
+    }
+    let open_sequence = current >> BASELINE_LATENCY_BITS;
+    let prior_sequence = prior >> BASELINE_LATENCY_BITS;
+    let age = open_sequence.wrapping_sub(prior_sequence) & BASELINE_WINDOW_SEQUENCE_MASK;
+    (1..=BASELINE_PRIOR_WINDOW_HORIZON).contains(&age)
 }
 
 /// Serial-number comparison over the wrapping window sequence. Sequences are
