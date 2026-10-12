@@ -11,7 +11,8 @@ use ferrum_edge::k8s_controller::status::{
     plan_gateway_api_status_updates_budgeted,
 };
 use ferrum_edge::k8s_controller::status_plan::{
-    DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget, select_fair_work_window,
+    DEFAULT_STATUS_PLAN_WORK_BUDGET, STATUS_WINDOW_MAX_FAILED_BATCHES, StatusPlanBudget,
+    StatusWindowBatch, select_fair_work_window, status_window_cursor_after_batch,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -160,15 +161,43 @@ fn status_planning_avoids_per_object_retranslate_and_post_cap() {
     );
 }
 
+fn strip_whitespace(src: &str) -> String {
+    src.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 #[test]
 fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
     // Structural regression for the serialized reconcile / cursor retry
-    // invariant (#2397): advance on empty plans and successful patches only.
+    // invariant (#2397, #6370): every cursor write goes through the one
+    // bounded-retry helper; empty plans and successful patches advance, patch
+    // errors and batch timeouts record a failed batch.
     let body = RECONCILER_SRC
         .split("async fn patch_gateway_api_statuses(")
         .nth(1)
-        .and_then(|rest| rest.split("\nfn gateway_api_status_context(").next())
+        .and_then(|rest| rest.split("\nfn record_gateway_api_status_batch(").next())
         .expect("patch_gateway_api_statuses body");
+    let helper = RECONCILER_SRC
+        .split("\nfn record_gateway_api_status_batch(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn gateway_api_status_context(").next())
+        .expect("record_gateway_api_status_batch body");
+
+    // Compare with all whitespace stripped so rustfmt's method-chain layout
+    // cannot break these structural assertions.
+    let helper_compact = strip_whitespace(helper);
+    assert!(
+        helper_compact.contains("status_window_cursor_after_batch(")
+            && helper_compact.contains("gateway_api_status_plan_cursor.store(")
+            && helper_compact.contains("gateway_api_status_window_failed_batches.store("),
+        "the helper must persist the bounded-retry decision"
+    );
+    assert_eq!(
+        strip_whitespace(RECONCILER_SRC)
+            .matches("gateway_api_status_plan_cursor.store(")
+            .count(),
+        1,
+        "record_gateway_api_status_batch must be the only status-plan cursor writer"
+    );
 
     let empty_return = body
         .split("if updates.is_empty()")
@@ -176,8 +205,9 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .and_then(|rest| rest.split("if outcome.eligible_candidates").next())
         .expect("empty-updates branch");
     assert!(
-        empty_return.contains("gateway_api_status_plan_cursor.store")
-            && empty_return.contains("outcome.next_cursor"),
+        empty_return.contains("record_gateway_api_status_batch(")
+            && empty_return.contains("outcome.next_cursor")
+            && empty_return.contains("StatusWindowBatch::Succeeded"),
         "empty update plans must still advance the cursor so fairness progresses"
     );
 
@@ -187,8 +217,9 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .and_then(|rest| rest.split("Ok(Err(error)) =>").next())
         .expect("successful patch arm");
     assert!(
-        success_arm.contains("gateway_api_status_plan_cursor.store")
-            && success_arm.contains("outcome.next_cursor"),
+        success_arm.contains("record_gateway_api_status_batch(")
+            && success_arm.contains("outcome.next_cursor")
+            && success_arm.contains("StatusWindowBatch::Succeeded"),
         "successful patch batches must advance to outcome.next_cursor"
     );
 
@@ -198,8 +229,9 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .and_then(|rest| rest.split("Err(_) =>").next())
         .expect("patch error arm");
     assert!(
-        !error_arm.contains("gateway_api_status_plan_cursor.store"),
-        "patch errors must leave the cursor unchanged so the same window retries"
+        error_arm.contains("StatusWindowBatch::Failed")
+            && !error_arm.contains("StatusWindowBatch::Succeeded"),
+        "patch errors must record a failed batch, never a success"
     );
     assert!(
         error_arm.contains("leaving status-plan cursor unchanged"),
@@ -212,8 +244,9 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .and_then(|rest| rest.split("\n    }").next())
         .expect("patch timeout arm");
     assert!(
-        !timeout_arm.contains("gateway_api_status_plan_cursor.store"),
-        "batch timeouts must leave the cursor unchanged so the same window retries"
+        timeout_arm.contains("StatusWindowBatch::Failed")
+            && !timeout_arm.contains("StatusWindowBatch::Succeeded"),
+        "batch timeouts must record a failed batch, never a success"
     );
     assert!(
         timeout_arm.contains("leaving status-plan cursor unchanged"),
@@ -225,12 +258,145 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .split("await_status_patch_batch")
         .next()
         .expect("pre-patch region");
-    let stores_before_patch = before_patch
-        .matches("gateway_api_status_plan_cursor.store")
-        .count();
     assert_eq!(
-        stores_before_patch, 1,
-        "only the empty-plan branch may store the cursor before patch_updates"
+        before_patch
+            .matches("record_gateway_api_status_batch(")
+            .count(),
+        1,
+        "only the empty-plan branch may record the cursor before patch_updates"
+    );
+}
+
+#[test]
+fn failed_status_window_retries_then_advances_after_bounded_failures() {
+    const { assert!(STATUS_WINDOW_MAX_FAILED_BATCHES >= 2) };
+    let (cursor, next_cursor) = (512, 768);
+    let mut failed = 0;
+    for attempt in 1..STATUS_WINDOW_MAX_FAILED_BATCHES {
+        let decision = status_window_cursor_after_batch(
+            cursor,
+            next_cursor,
+            failed,
+            StatusWindowBatch::Failed,
+        );
+        assert_eq!(
+            decision.cursor, cursor,
+            "attempt {attempt} must retry the window"
+        );
+        assert_eq!(decision.failed_batches, attempt);
+        assert!(!decision.advanced_past_failures);
+        failed = decision.failed_batches;
+    }
+    let advanced =
+        status_window_cursor_after_batch(cursor, next_cursor, failed, StatusWindowBatch::Failed);
+    assert_eq!(advanced.cursor, next_cursor);
+    assert_eq!(advanced.failed_batches, 0);
+    assert!(advanced.advanced_past_failures);
+
+    // A success at any point clears the streak and advances normally.
+    let success =
+        status_window_cursor_after_batch(cursor, next_cursor, 1, StatusWindowBatch::Succeeded);
+    assert_eq!(success.cursor, next_cursor);
+    assert_eq!(success.failed_batches, 0);
+    assert!(!success.advanced_past_failures);
+}
+
+#[test]
+fn persistently_failing_window_does_not_starve_outside_candidate_at_default_cap() {
+    // Issue #6370 shape: 257 stable candidates, the default 256 window, and a
+    // window member whose write fails on every attempt. The 257th candidate
+    // must still enter the window within a bounded number of reconciles.
+    let eligible = DEFAULT_STATUS_PLAN_WORK_BUDGET + 1;
+    let outsider = eligible - 1;
+    let failing = 0;
+    let mut cursor = 0;
+    let mut failed = 0;
+    let mut reached = None;
+    for tick in 0..(STATUS_WINDOW_MAX_FAILED_BATCHES as usize * 4) {
+        let window = select_fair_work_window(
+            eligible,
+            StatusPlanBudget::new(DEFAULT_STATUS_PLAN_WORK_BUDGET, cursor),
+        );
+        let covers = |index: usize| (index + eligible - window.start) % eligible < window.take;
+        if covers(outsider) {
+            reached = Some(tick);
+            break;
+        }
+        assert!(
+            covers(failing),
+            "the persistently failing object must pin the first window"
+        );
+        let decision = status_window_cursor_after_batch(
+            cursor,
+            window.next_cursor,
+            failed,
+            StatusWindowBatch::Failed,
+        );
+        cursor = decision.cursor;
+        failed = decision.failed_batches;
+    }
+    assert_eq!(
+        reached,
+        Some(STATUS_WINDOW_MAX_FAILED_BATCHES as usize),
+        "the outside candidate must be planned right after the bounded retries"
+    );
+}
+
+#[test]
+fn persistently_failing_status_object_does_not_starve_healthy_candidates() {
+    // Planner-driven regression for #6370: route-0000 sits in the first window
+    // and its status write fails on every attempt (for example 403/422 or a
+    // request-budget 504). Healthy routes outside that window must still be
+    // planned for status within a bounded number of reconciles.
+    let objects = base_objects_with_routes(8);
+    let conflicts = gateway_api_route_conflicts(&objects, &options());
+    let limit = 3;
+    let failing = "route-0000";
+    let mut cursor = 0;
+    let mut failed = 0;
+    let mut planned_routes = std::collections::BTreeSet::new();
+    let mut first_window: Option<Vec<String>> = None;
+    for tick in 0..30 {
+        let outcome = plan_gateway_api_status_updates_budgeted(
+            &objects,
+            options(),
+            &conflicts,
+            Default::default(),
+            None,
+            StatusPlanBudget::new(limit, cursor),
+        );
+        assert_eq!(outcome.eligible_candidates, 10);
+        let names: Vec<String> = outcome.updates.iter().map(|u| u.name.clone()).collect();
+        if (tick as u64) < STATUS_WINDOW_MAX_FAILED_BATCHES {
+            // Bounded retries replan exactly the same failing window.
+            match &first_window {
+                Some(first) => assert_eq!(&names, first, "tick {tick} must retry the window"),
+                None => first_window = Some(names.clone()),
+            }
+            assert!(names.iter().any(|name| name == failing));
+        }
+        for name in &names {
+            if name.starts_with("route-") {
+                planned_routes.insert(name.clone());
+            }
+        }
+        let batch = if names.iter().any(|name| name == failing) {
+            StatusWindowBatch::Failed
+        } else {
+            StatusWindowBatch::Succeeded
+        };
+        let step = status_window_cursor_after_batch(cursor, outcome.next_cursor, failed, batch);
+        cursor = step.cursor;
+        failed = step.failed_batches;
+        if planned_routes.len() == 8 {
+            break;
+        }
+    }
+    let expected: std::collections::BTreeSet<String> =
+        (0..8).map(|index| format!("route-{index:04}")).collect();
+    assert_eq!(
+        planned_routes, expected,
+        "every healthy route must be planned despite a persistently failing window"
     );
 }
 

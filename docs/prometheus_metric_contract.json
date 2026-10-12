@@ -1262,7 +1262,7 @@
   {
     "name": "ferrum_connection_pool_entries",
     "type": "gauge",
-    "help": "Resident entries per gateway backend pool: cached reqwest clients for http, live multiplexed connections for the others.",
+    "help": "Resident entries per gateway backend pool, counted at scrape without a health filter: cached reqwest clients for http, resident multiplexed-connection entries for the others. Health and idle cleanup can lag the scrape.",
     "labels": [
       "pool",
       "namespace"
@@ -2051,7 +2051,7 @@
   {
     "name": "ferrum_gateway_listener_recoveries_total",
     "type": "counter",
-    "help": "Dynamic Gateway API listener failures cleared by a later reconcile since process start, by protocol half and bounded reason.",
+    "help": "Dynamic Gateway API listener failure identities cleared since process start, by protocol half and bounded reason: tracked failures absent at a later accepted reconcile (including a reason change or listener withdrawal, not only a restored socket), plus transient failures settled within the same reconcile pass.",
     "labels": [
       "protocol",
       "reason",
@@ -2065,7 +2065,7 @@
   {
     "name": "ferrum_gateway_listeners_active",
     "type": "gauge",
-    "help": "Dynamic Gateway API listener ports currently bound and accepting.",
+    "help": "Dynamic Gateway API listener ports with an open accept gate at the last accepted reconcile; not re-sampled between reconciles, so a listener task that ends in between is reflected at the next reconcile.",
     "labels": [
       "namespace"
     ],
@@ -2922,7 +2922,7 @@
   {
     "name": "ferrum_mesh_config_stream_attempts_total",
     "type": "counter",
-    "help": "Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure.",
+    "help": "Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a pre-establishment attempt failure, such as a dial failure or an RPC-open refusal (xds and stock_xds count every RPC-open refusal here, RESOURCE_EXHAUSTED included), while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is emitted only by the native consumer, for a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure.",
     "labels": [
       "protocol",
       "outcome",
@@ -3645,7 +3645,7 @@
   {
     "name": "ferrum_mesh_udp_placement_migration_adoption_proof",
     "type": "gauge",
-    "help": "Node-specific proof that authorized a recordless Ambient UDP placement adoption (one bounded proof is 1).",
+    "help": "Node-specific proof of the last Ambient UDP placement adoption recorded by this process without a same-incarnation durable ownership record (no record, or a record from an earlier boot of this node UID); one bounded proof is 1, and none is 1 until this process records an adoption.",
     "labels": [
       "proof",
       "gateway_namespace"
@@ -3658,7 +3658,7 @@
   {
     "name": "ferrum_mesh_udp_placement_migration_adoptions_total",
     "type": "counter",
-    "help": "Recordless Ambient UDP placement adoptions by bounded node-specific proof.",
+    "help": "Ambient UDP placement adoptions recorded by this process without a same-incarnation durable ownership record (no record, or a record from an earlier boot of this node UID), by bounded node-specific proof; process-local, not durable adoption history.",
     "labels": [
       "proof",
       "gateway_namespace"
@@ -3759,7 +3759,7 @@
   {
     "name": "ferrum_mesh_workload_api_rpcs_rejected_total",
     "type": "counter",
-    "help": "SPIFFE Workload API RPCs shed by RPC admission \u2014 the service-wide concurrency ceiling or the per-peer-UID quota \u2014 before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.",
+    "help": "SPIFFE Workload API RPCs refused by RPC admission before any producer work was spawned: shed by the service-wide concurrency ceiling or the per-peer-UID quota (RESOURCE_EXHAUSTED), or refused for missing kernel-attested peer credentials (PERMISSION_DENIED, defence in depth behind the connection gate). The HTTP/2 stream is already open, so this is not a protocol-level stream refusal.",
     "labels": [
       "gateway_namespace"
     ],
@@ -3835,7 +3835,7 @@
   {
     "name": "ferrum_node_agent_ingress_interface_expected_interfaces",
     "type": "gauge",
-    "help": "Number of interfaces required by the proved node/CNI route topology (names are never labels).",
+    "help": "Ingress interfaces established for the node/CNI route topology (names are never labels): the complete required set only when topology validation succeeds; while topology is unavailable, the partial count reached before validation stopped, not readiness or complete route coverage.",
     "labels": [
       "namespace"
     ],
@@ -4487,7 +4487,7 @@
     ],
     "subsystem": "prometheus_metrics",
     "export_surface": "/metrics",
-    "bundled": "dashboard",
+    "bundled": "alert_and_dashboard",
     "emission": "always"
   },
   {
@@ -4505,7 +4505,7 @@
   {
     "name": "ferrum_request_mirror_cancellations_total",
     "type": "counter",
-    "help": "request_mirror tasks dropped before a terminal outcome (shutdown/panic/cancellation).",
+    "help": "request_mirror dispatched tasks dropped before a terminal outcome, including tasks dropped before their first poll (shutdown/panic/cancellation).",
     "labels": [
       "namespace"
     ],
@@ -4517,7 +4517,7 @@
   {
     "name": "ferrum_request_mirror_completed_total",
     "type": "counter",
-    "help": "request_mirror tasks that fully drained a response within byte and time bounds.",
+    "help": "request_mirror tasks that obtained a response of any HTTP status (including a locally synthesized 502) and fully drained it within byte and time bounds.",
     "labels": [
       "namespace"
     ],
@@ -4589,7 +4589,7 @@
   {
     "name": "ferrum_request_mirror_request_failures_total",
     "type": "counter",
-    "help": "request_mirror pre-response transport failures (DNS, refused, reset, TLS, \u2026).",
+    "help": "request_mirror non-timeout failures before a response was obtained: local client or request construction failures and transport errors (DNS, refused, reset, TLS).",
     "labels": [
       "namespace"
     ],
@@ -4624,7 +4624,7 @@
     ],
     "subsystem": "prometheus_metrics",
     "export_surface": "/metrics",
-    "bundled": "dashboard",
+    "bundled": "alert_and_dashboard",
     "emission": "always"
   },
   {
@@ -4726,7 +4726,7 @@
   {
     "name": "ferrum_service_discovery_stale_expiries_total",
     "type": "counter",
-    "help": "Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound.",
+    "help": "Service-discovery stale episodes whose expiry was claimed: the staleness anchor (last published snapshot, or task start before any) reached the effective bound (configured window floored at three poll intervals), then the episode was claimed after lifecycle checks (retain policy) or a successful withdrawal publication (withdrawing policies).",
     "labels": [
       "namespace"
     ],
@@ -4762,7 +4762,7 @@
   {
     "name": "ferrum_service_discovery_task_panics_total",
     "type": "counter",
-    "help": "Service-discovery pollers that exited unexpectedly instead of stopping cleanly.",
+    "help": "Service-discovery poller or supervisor unwind panics: a poller JoinError observed by its supervisor, or a non-cancelled supervisor JoinError during teardown. Reachable only in panic=unwind builds.",
     "labels": [
       "namespace"
     ],
@@ -4774,7 +4774,7 @@
   {
     "name": "ferrum_service_discovery_task_restarts_total",
     "type": "counter",
-    "help": "Service-discovery pollers restarted by their supervisor after an unexpected exit.",
+    "help": "Service-discovery poller restarts scheduled by their supervisor after an unexpected exit; counted before the cancellable restart backoff, so a reconcile or shutdown during backoff can prevent the respawn.",
     "labels": [
       "namespace"
     ],
@@ -4798,7 +4798,7 @@
   {
     "name": "ferrum_service_discovery_tasks_crash_looping",
     "type": "gauge",
-    "help": "Service-discovery tasks that exited unexpectedly repeatedly without an intervening published snapshot.",
+    "help": "Service-discovery tasks whose retained health state is crash-looping after repeated unexpected exits without an intervening published snapshot; the state persists through respawn until a snapshot is published.",
     "labels": [
       "namespace"
     ],
@@ -4846,7 +4846,7 @@
   {
     "name": "ferrum_service_discovery_tasks_replaced_total",
     "type": "counter",
-    "help": "Service-discovery tasks replaced across a config reconcile because their effective specification changed.",
+    "help": "Service-discovery tasks replaced across a config reconcile because their effective specification changed or their previous task had already finished; counted even when the replacement provider fails to start.",
     "labels": [
       "namespace"
     ],
@@ -4858,7 +4858,7 @@
   {
     "name": "ferrum_service_discovery_tasks_restarting",
     "type": "gauge",
-    "help": "Service-discovery tasks waiting out a restart backoff after an unexpected poller exit.",
+    "help": "Service-discovery tasks whose retained health state is restarting after an unexpected poller exit; the state persists through backoff and respawn until a snapshot is published.",
     "labels": [
       "namespace"
     ],
@@ -4870,7 +4870,7 @@
   {
     "name": "ferrum_service_discovery_tasks_running",
     "type": "gauge",
-    "help": "Service-discovery tasks whose poller is running.",
+    "help": "Service-discovery tasks whose retained health state is starting or running; a recorded lifecycle state, not a live poller-handle census.",
     "labels": [
       "namespace"
     ],
@@ -4882,7 +4882,7 @@
   {
     "name": "ferrum_service_discovery_tasks_stale",
     "type": "gauge",
-    "help": "Service-discovery tasks whose last admitted snapshot is older than the configured staleness bound.",
+    "help": "Service-discovery tasks whose staleness anchor (last published snapshot, or task start before any) has reached the effective staleness bound (configured window floored at three poll intervals).",
     "labels": [
       "namespace"
     ],
@@ -4906,7 +4906,7 @@
   {
     "name": "ferrum_service_discovery_tasks_stopped_total",
     "type": "counter",
-    "help": "Service-discovery tasks stopped because their upstream no longer configures service discovery.",
+    "help": "Service-discovery stop decisions for tasks whose upstream no longer configures service discovery; counted when the stop is signalled, before the detached join completes.",
     "labels": [
       "namespace"
     ],
@@ -5171,7 +5171,7 @@
   {
     "name": "ferrum_udp_amplification_policy_invalid_total",
     "type": "counter",
-    "help": "UDPResponseAmplificationPolicy objects rejected before listener programming.",
+    "help": "UDPResponseAmplificationPolicy admission refusals: one per invalid, unauthorized, or unresolved policy object in each translation pass (repeats across passes); otherwise-valid policies that lose a conflict are not counted.",
     "labels": [
       "namespace"
     ],
@@ -5219,7 +5219,7 @@
   {
     "name": "ferrum_upstream_targets",
     "type": "gauge",
-    "help": "Targets configured on an upstream, including service-discovery resolved endpoints.",
+    "help": "Targets the load balancer currently serves for an upstream: configured static targets merged with service-discovery resolved endpoints.",
     "labels": [
       "upstream_id",
       "upstream_namespace",
@@ -5247,7 +5247,7 @@
   {
     "name": "ferrum_websocket_bytes_total",
     "type": "counter",
-    "help": "WebSocket payload bytes relayed by direction.",
+    "help": "WebSocket bytes relayed by direction: frame payload bytes in framed mode, raw copied bytes under FERRUM_WEBSOCKET_TUNNEL_MODE; a tunnel-mode session stopped by gateway policy reports only its pre-relay residual bytes.",
     "labels": [
       "proxy_id",
       "direction",
@@ -5261,7 +5261,7 @@
   {
     "name": "ferrum_websocket_frames_total",
     "type": "counter",
-    "help": "WebSocket frames relayed by direction.",
+    "help": "WebSocket frames relayed by direction in framed mode; FERRUM_WEBSOCKET_TUNNEL_MODE sessions do not parse frames and add 0, so zero frames does not mean an empty session.",
     "labels": [
       "proxy_id",
       "direction",
@@ -5336,7 +5336,7 @@
   {
     "name": "ferrum_xds_first_slice_nacks_total",
     "type": "counter",
-    "help": "NACKs of a required mesh-slice type while the data plane is still waiting for its first slice.",
+    "help": "xDS NACKs counted while the consumer's accumulator is incomplete, by protocol-specific predicate: xds counts a required mesh-slice type while a required type is absent (recorded before the NACK is enqueued); stock_xds counts any supported type while CDS or a subscribed EDS is missing (recorded after the NACK is enqueued). Not runtime first-slice state: a control-plane reset can re-arm it after a slice exists, and version skew among present types is not counted.",
     "labels": [
       "namespace",
       "type_url",
