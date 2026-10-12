@@ -382,6 +382,123 @@ fn test_half_open_client_disconnect_neutral_releases_probe_slot() {
 }
 
 #[test]
+fn stale_cycle_neutral_release_cannot_free_a_current_cycle_probe_slot() {
+    // #6177: a probe's neutral release must stay bound to the open cycle that
+    // admitted it. Cap 2: old-cycle probes A/B are admitted, A fails and
+    // reopens, the timeout admits current-cycle probes C/D, then old B drops
+    // neutrally. B's release must not reduce C/D's occupancy, so E is refused.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 5,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    let (a_probe, a_generation) = cb.can_execute_with_generation().expect("A admitted");
+    let (b_probe, b_generation) = cb.can_execute_with_generation().expect("B admitted");
+    assert!(a_probe && b_probe, "A and B are HALF_OPEN probes");
+    assert_eq!(a_generation, b_generation, "A and B share one open cycle");
+    assert_eq!(cb.half_open_in_flight(), 2);
+
+    // A fails: the breaker reopens, clearing the old cycle's slots.
+    cb.record_failure(500, false, true);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.half_open_in_flight(), 0);
+
+    // timeout_seconds = 0: the next requests start a new HALF_OPEN cycle.
+    let (c_probe, c_generation) = cb.can_execute_with_generation().expect("C admitted");
+    let (d_probe, d_generation) = cb.can_execute_with_generation().expect("D admitted");
+    assert!(c_probe && d_probe, "C and D are HALF_OPEN probes");
+    assert_eq!(c_generation, d_generation);
+    assert_ne!(
+        c_generation,
+        b_generation,
+        "the reopen must start a new open generation"
+    );
+    assert_eq!(cb.half_open_in_flight(), 2);
+
+    // Old-cycle B drops neutrally.
+    cb.record_neutral_for_admission(true, b_generation);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        2,
+        "an old-cycle neutral release must not reduce current-cycle occupancy"
+    );
+    assert_eq!(cb.state_name(), "half_open");
+    assert!(
+        cb.can_execute().is_err(),
+        "E must not be admitted while current-cycle probes C and D are active"
+    );
+
+    // A current-cycle release still frees its own slot exactly once.
+    cb.record_neutral_for_admission(true, c_generation);
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert!(
+        cb.can_execute().expect("freed slot re-admits"),
+        "the slot C released admits the next probe"
+    );
+    assert_eq!(cb.half_open_in_flight(), 2);
+
+    // D and the re-admitted probe release; a further same-generation release
+    // at zero is a no-op (underflow protection).
+    cb.record_neutral_for_admission(true, d_generation);
+    cb.record_neutral_for_admission(true, d_generation);
+    cb.record_neutral_for_admission(true, d_generation);
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(cb.state_name(), "half_open");
+
+    // Non-probe callers never touch the count.
+    let (e_probe, e_generation) = cb.can_execute_with_generation().expect("E admitted");
+    assert!(e_probe);
+    cb.record_neutral_for_admission(false, e_generation);
+    assert_eq!(cb.half_open_in_flight(), 1);
+}
+
+#[test]
+fn stale_cycle_neutral_release_after_recovery_and_reopen_is_a_no_op() {
+    // #6177: a probe straggler that outlives a full recovery (HALF_OPEN ->
+    // CLOSED) and a later reopen still belongs to its original cycle.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false, false);
+    let (_, straggler_generation) = cb.can_execute_with_generation().expect("straggler");
+    assert!(cb.can_execute().expect("closer admitted"));
+    cb.record_success(true);
+    assert_eq!(cb.state_name(), "closed");
+
+    let (closed_probe, _) = cb.can_execute_with_generation().expect("closed admission");
+    assert!(!closed_probe, "CLOSED admission holds no probe slot");
+
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let (probe, current_generation) = cb.can_execute_with_generation().expect("probe");
+    assert!(probe);
+    assert_ne!(current_generation, straggler_generation);
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    cb.record_neutral_for_admission(true, straggler_generation);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "a straggler from a recovered cycle must not free the current probe slot"
+    );
+}
+
+#[test]
 fn record_success_without_probe_admission_still_advances_half_open() {
     // F04 (PR #1408): the gRPC retry loop now gates a rotated retry through
     // can_execute before dispatching (mirroring the HTTP path). This matters

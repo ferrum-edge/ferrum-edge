@@ -507,6 +507,12 @@ fn record_probe_neutral(cb: &CircuitBreaker) {
     cb.record_neutral(true);
 }
 
+fn record_probe_neutral_for_admission(cb: &CircuitBreaker) {
+    // `breaker_holding_one_probe` admits with no concurrent transition, so the
+    // current generation is the probe's admission generation.
+    cb.record_neutral_for_admission(true, cb.open_epoch());
+}
+
 /// One probe outcome: its label and the breaker call that reports it.
 type ProbeOutcome = (&'static str, fn(&CircuitBreaker));
 
@@ -526,6 +532,10 @@ const PROBE_OUTCOMES: &[ProbeOutcome] = &[
         record_probe_connection_failure,
     ),
     ("record_neutral", record_probe_neutral),
+    (
+        "record_neutral_for_admission",
+        record_probe_neutral_for_admission,
+    ),
 ];
 
 #[test]

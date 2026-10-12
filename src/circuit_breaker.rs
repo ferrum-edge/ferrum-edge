@@ -118,6 +118,22 @@ impl CircuitBreaker {
     #[inline]
     pub fn can_execute(&self) -> Result<bool, CircuitOpenError> {
         self.can_execute_inner(None)
+            .map(|(is_half_open_probe, _)| is_half_open_probe)
+    }
+
+    /// Like [`can_execute`](Self::can_execute), but also returns the open
+    /// generation the admission was decided in (#6177).
+    ///
+    /// For a HALF_OPEN probe this is the generation carried by the SAME CAS that
+    /// claimed the slot, so it is exact — never a pre- or post-admission
+    /// snapshot. A probe owner passes it to
+    /// [`record_neutral_for_admission`](Self::record_neutral_for_admission) so a
+    /// release that outlives a reopen cannot free a slot in a later cycle.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn can_execute_with_generation(&self) -> Result<(bool, u64), CircuitOpenError> {
+        self.can_execute_inner(None)
+            .map(|(is_half_open_probe, generation)| (is_half_open_probe, generation as u64))
     }
 
     /// Deterministic-clock variant used by external unit tests.
@@ -125,10 +141,17 @@ impl CircuitBreaker {
     #[allow(dead_code)]
     pub fn can_execute_at_for_test(&self, monotonic_now_ms: u64) -> Result<bool, CircuitOpenError> {
         self.can_execute_inner(Some(monotonic_now_ms))
+            .map(|(is_half_open_probe, _)| is_half_open_probe)
     }
 
+    /// Admission decision plus the open generation it was decided in. The
+    /// generation of a probe admission is the one published by the admitting
+    /// CAS; for a CLOSED admission it is informational only.
     #[inline]
-    fn can_execute_inner(&self, monotonic_now_ms: Option<u64>) -> Result<bool, CircuitOpenError> {
+    fn can_execute_inner(
+        &self,
+        monotonic_now_ms: Option<u64>,
+    ) -> Result<(bool, u32), CircuitOpenError> {
         // Acquire pairs with the Release in record_failure() when transitioning
         // CLOSED → OPEN, ensuring visibility of last_failure_tick_ms and
         // failure_count. Using Relaxed here would risk stale reads on ARM/weak-
@@ -137,7 +160,7 @@ impl CircuitBreaker {
         // circuit breaker checks are not the bottleneck at scale.
         let packed = self.packed.load(Ordering::Acquire);
         match packed_state(packed) {
-            STATE_CLOSED => Ok(false),
+            STATE_CLOSED => Ok((false, packed_generation(packed))),
             STATE_OPEN => {
                 // OPEN recovery is elapsed-time state, so it uses the single
                 // process-local monotonic origin. The clock is read only in
@@ -168,14 +191,14 @@ impl CircuitBreaker {
                         Ok(_) => {
                             self.success_count.store(0, Ordering::Relaxed);
                             info!("Circuit breaker transitioning from Open to Half-Open");
-                            Ok(true)
+                            Ok((true, generation))
                         }
                         Err(actual) => match packed_state(actual) {
                             // Another thread already opened the half-open cycle;
                             // claim a slot through the same bounded CAS.
                             STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
                             // Recovered to closed in the meantime.
-                            STATE_CLOSED => Ok(false),
+                            STATE_CLOSED => Ok((false, packed_generation(actual))),
                             // Still open (lost the race to a concurrent reopen) —
                             // reject.
                             _ => Err(CircuitOpenError),
@@ -186,7 +209,7 @@ impl CircuitBreaker {
                 }
             }
             STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
-            _ => Ok(false),
+            _ => Ok((false, packed_generation(packed))),
         }
     }
 
@@ -206,7 +229,10 @@ impl CircuitBreaker {
     /// The limit is floored at 1 (a breaker configured with
     /// `half_open_max_requests == 0` must still admit a single probe to be able
     /// to recover) and capped at the 30-bit count field.
-    fn try_acquire_half_open_slot(&self) -> Result<bool, CircuitOpenError> {
+    ///
+    /// Returns the generation of the state the CAS succeeded against, which is
+    /// the exact open cycle the slot belongs to.
+    fn try_acquire_half_open_slot(&self) -> Result<(bool, u32), CircuitOpenError> {
         let max = self.config.half_open_max_requests.clamp(1, COUNT_MASK);
         loop {
             let packed = self.packed.load(Ordering::Acquire);
@@ -218,13 +244,14 @@ impl CircuitBreaker {
                     }
                     // Preserve the generation (steady-state HALF_OPEN admission is
                     // the same open cycle); `packed` already carries it.
+                    let generation = packed_generation(packed);
                     match self.packed.compare_exchange_weak(
                         packed,
-                        pack_full(packed_generation(packed), STATE_HALF_OPEN, count + 1),
+                        pack_full(generation, STATE_HALF_OPEN, count + 1),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
-                        Ok(_) => return Ok(true),
+                        Ok(_) => return Ok((true, generation)),
                         // State or count moved under us — re-evaluate against the
                         // fresh value (which may now be OPEN/CLOSED).
                         Err(_) => continue,
@@ -233,8 +260,8 @@ impl CircuitBreaker {
                 // Reopened after the caller observed HALF_OPEN — do not admit.
                 STATE_OPEN => return Err(CircuitOpenError),
                 // Recovered to closed — normal closed-state admission.
-                STATE_CLOSED => return Ok(false),
-                _ => return Ok(false),
+                STATE_CLOSED => return Ok((false, packed_generation(packed))),
+                _ => return Ok((false, packed_generation(packed))),
             }
         }
     }
@@ -320,11 +347,40 @@ impl CircuitBreaker {
     ///
     /// Used for client-caused aborts where no backend result exists, while
     /// still releasing any reserved half-open probe slot.
+    ///
+    /// This release is generation-blind: if the breaker reopened and a later
+    /// HALF_OPEN cycle admitted new probes since this probe's admission, it
+    /// frees one of THOSE slots. A caller that captured the admission
+    /// generation should use
+    /// [`record_neutral_for_admission`](Self::record_neutral_for_admission).
     pub fn record_neutral(&self, is_half_open_probe: bool) {
         if !is_half_open_probe {
             return;
         }
         self.release_half_open_slot();
+    }
+
+    /// Record a neutral outcome for a probe admitted in `admission_generation`
+    /// (from [`can_execute_with_generation`](Self::can_execute_with_generation)).
+    ///
+    /// Releases the slot only while the breaker is still in that open cycle
+    /// (#6177). Once a reopen has advanced the generation, the reopen already
+    /// zeroed this probe's slot together with its cycle, so the release is a
+    /// no-op and cannot reduce a later cycle's probe occupancy. Like
+    /// [`record_neutral`](Self::record_neutral), it never moves breaker health
+    /// and never underflows.
+    #[allow(dead_code)]
+    pub fn record_neutral_for_admission(
+        &self,
+        is_half_open_probe: bool,
+        admission_generation: u64,
+    ) {
+        if !is_half_open_probe {
+            return;
+        }
+        // Generations are produced from the packed u32 field, so truncation is
+        // lossless for any value `can_execute_with_generation` returned.
+        self.release_half_open_slot_in_generation(admission_generation as u32);
     }
 
     /// Record a failed response.
@@ -566,6 +622,25 @@ impl CircuitBreaker {
                         packed_state(packed),
                         count - 1,
                     ))
+                }
+            });
+    }
+
+    /// Release one half-open probe slot only if the breaker is still in
+    /// `generation`, in the same CAS that checks it. A generation mismatch means
+    /// a reopen already cleared this probe's slot with its cycle, so the
+    /// current cycle's count is left alone. Same-generation states carry the
+    /// probe's slot (HALF_OPEN) or a zeroed count (CLOSED after recovery), and
+    /// the count-0 no-op keeps the release from underflowing.
+    fn release_half_open_slot_in_generation(&self, generation: u32) {
+        let _ = self
+            .packed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
+                let count = packed_count(packed);
+                if count == 0 || packed_generation(packed) != generation {
+                    None
+                } else {
+                    Some(pack_full(generation, packed_state(packed), count - 1))
                 }
             });
     }
