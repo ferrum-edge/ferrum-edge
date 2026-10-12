@@ -2711,6 +2711,11 @@ fn route_status(
     // fail-closed, so status must never report those claims programmed. Sorted
     // for a stable condition message across reconciles.
     let refused_attachments = refused_route_attachments_for_route(result, object);
+    // Claims refused because they share one listener's route slot with an
+    // earlier claim that dials its backend over a different transport. A
+    // separate cause, so it gets its own message.
+    let transport_refused_attachments =
+        transport_refused_route_attachments_for_route(result, object);
     let (accepted, resolved_refs, programmed, accepted_reason, resolved_refs_reason, message) =
         match result {
             Ok(_) => {
@@ -2829,13 +2834,21 @@ fn route_status(
             .copied()
             .filter(|attachment| attachment.parent_ref == parent_ref_key)
             .collect();
+        let transport_refused_claims: Vec<&GatewayApiRouteAttachment> =
+            transport_refused_attachments
+                .iter()
+                .copied()
+                .filter(|attachment| attachment.parent_ref == parent_ref_key)
+                .collect();
+        let any_claim_refused = !refused_claims.is_empty() || !transport_refused_claims.is_empty();
         let parent_materialized = materialized_parent_refs.contains(&parent_ref_key);
         // A refused claim on one listener is a conflict for this parentRef, but
         // it only withdraws the parentRef when nothing under it still serves —
-        // a sibling listener that kept its claim keeps the parent programmed.
-        let all_parent_claims_refused = !refused_claims.is_empty() && !parent_materialized;
+        // a sibling listener or rule that kept its claim keeps the parent
+        // programmed.
+        let all_parent_claims_refused = any_claim_refused && !parent_materialized;
         let cross_kind_conflict = !parent_conflicts.is_empty();
-        let has_conflict = cross_kind_conflict || !refused_claims.is_empty();
+        let has_conflict = cross_kind_conflict || any_claim_refused;
         let all_parent_matches_conflicted = cross_kind_conflict
             && !parent_route_keys.is_empty()
             && parent_route_keys
@@ -2859,6 +2872,11 @@ fn route_status(
                 refused_claims
                     .first()
                     .map(|attachment| route_slot_ambiguity_message(attachment))
+            })
+            .or_else(|| {
+                transport_refused_claims
+                    .first()
+                    .map(|attachment| route_transport_refusal_message(attachment))
             });
         let not_allowed_by_listener = accepted
             && !parent_programming_conflicted
@@ -3059,6 +3077,42 @@ fn refused_route_attachments_for_route<'a>(
         .collect();
     attachments.sort();
     attachments
+}
+
+/// This route's claims refused for mixed backend transport on one route slot,
+/// in a deterministic order.
+fn transport_refused_route_attachments_for_route<'a>(
+    result: Result<&'a K8sTranslation, &K8sTranslateError>,
+    route: &K8sObject,
+) -> Vec<&'a GatewayApiRouteAttachment> {
+    let Ok(translation) = result else {
+        return Vec::new();
+    };
+    let route_key = K8sResourceKey::from_object(route);
+    let mut attachments: Vec<&GatewayApiRouteAttachment> = translation
+        .transport_refused_route_attachments
+        .iter()
+        .filter(|attachment| attachment.route == route_key)
+        .collect();
+    attachments.sort();
+    attachments
+}
+
+/// Operator-facing reason one route claim was refused because an earlier
+/// claim on the same listener, hosts, and path dials its backend over a
+/// different transport. Only the later claim is withdrawn; the earlier one
+/// keeps serving, so requests only the refused rule would match get no route.
+fn route_transport_refusal_message(attachment: &GatewayApiRouteAttachment) -> String {
+    let scope = match attachment.listener.as_ref() {
+        Some(listener) => format!(" on Gateway listener {listener}"),
+        None => String::new(),
+    };
+    format!(
+        "Ferrum refused a rule of this route{scope}: an earlier rule claims the same hosts, \
+         path, and listener but dials its backend over a different transport \
+         (BackendTLSPolicy coverage differs), and one route slot dials only one transport, so \
+         the earlier rule keeps serving and requests only this rule would match get no route"
+    )
 }
 
 /// Operator-facing reason one route claim was refused for same-slot listener
