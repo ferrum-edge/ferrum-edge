@@ -354,6 +354,11 @@ fn cni_fixture_routes_recovery_checks_through_the_observation_helpers() {
 /// tools do. `REPLACE_BEFORE_DELETE` swaps that cluster's node for another
 /// invocation's same-name replacement immediately before the first
 /// destructive call, after every ownership check the fixture could make.
+/// A created node carries the token mounted from its kind config's `hostPath`
+/// in `$STATE/token-<id>`, which `docker exec <id> cat` reads.
+/// `REPLACE_AFTER_CREATE` swaps that cluster's node for another invocation's
+/// same-name replacement, carrying a different token, the instant its
+/// `kind create` succeeds and before the fixture's first identity inspection.
 const POLLER_STUBS: &str = r#"set -euo pipefail
 log_call() { printf '%s\n' "$*" >>"$STATE/calls"; }
 replace_before_delete() {
@@ -374,7 +379,12 @@ python3() {
   fi
 }
 curl() { log_call "curl $*"; printf '{}'; }
-openssl() { log_call "openssl $*"; }
+openssl() {
+  log_call "openssl $*"
+  if [[ "$1" == rand ]]; then
+    printf 'run-token-ours\n'
+  fi
+}
 kubectl() { log_call "kubectl $*"; }
 kind() {
   log_call "kind $*"
@@ -390,8 +400,15 @@ kind() {
       fi
       printf '%s\n' "$4" >>"$STATE/clusters"
       printf 'node-%s-ours' "$4" >"$STATE/id-$4-control-plane"
+      local host_path
+      host_path="$(sed -n 's/^ *- hostPath: //p' "$6")"
+      cat "$host_path/token" >"$STATE/token-node-$4-ours"
       printf 'context kind-%s\n' "$4" >>"$KUBECONFIG"
       printf '%s' "$KUBECONFIG" >"$STATE/kubeconfig-path"
+      if [[ "${REPLACE_AFTER_CREATE:-}" == "$4" ]]; then
+        printf 'node-%s-theirs' "$4" >"$STATE/id-$4-control-plane"
+        printf 'run-token-theirs\n' >"$STATE/token-node-$4-theirs"
+      fi
       ;;
     "delete cluster")
       replace_before_delete
@@ -410,6 +427,10 @@ docker() {
       else
         printf '172.18.0.9'
       fi
+      ;;
+    exec)
+      [[ "$3 $4" == "cat /ferrum-run-provenance/token" ]] || return 1
+      cat "$STATE/token-$2" 2>/dev/null
       ;;
     create)
       touch "$STATE/container-$3"
@@ -482,6 +503,8 @@ fn run_poller(
         shell_line(&source, "OWNED_TOXIPROXY_ID="),
         shell_line(&source, "RUN_KUBECONFIG_DIR="),
         shell_line(&source, "export KUBECONFIG="),
+        shell_line(&source, "RUN_PROVENANCE_DIR="),
+        shell_line(&source, "RUN_PROVENANCE_MOUNT="),
     ]
     .concat();
     let functions = shell_functions(
@@ -492,6 +515,7 @@ fn run_poller(
             "release_owned_cluster",
             "cleanup",
             "preflight",
+            "write_provenance_kind_config",
             "record_created_cluster",
             "create_clusters_and_fault_layer",
         ],
@@ -735,6 +759,41 @@ fn poller_cleanup_preserves_a_replacement_made_after_the_ownership_check() {
             "docker rm -f -v node-custom-b-ours",
             "docker rm -f toxi-ours",
         ]
+    );
+}
+
+#[test]
+fn poller_refuses_a_node_replaced_before_its_identity_is_recorded() {
+    // The replacement lands after `kind create` succeeds and before the
+    // fixture's first inspection of the node, so the only id the fixture can
+    // ever observe for this name is the replacement's.
+    let run = run_poller(
+        "preflight\ncreate_clusters_and_fault_layer\nexit 0",
+        &[],
+        false,
+        &[ACK, ("REPLACE_AFTER_CREATE", "custom-a")],
+    );
+    assert_ne!(run.status, 0, "an unproven node must fail the run");
+    assert!(
+        run.stderr.contains("does not carry this run's provenance token"),
+        "stderr: {}",
+        run.stderr
+    );
+    let provenance_read = "docker exec node-custom-a-theirs cat /ferrum-run-provenance/token";
+    assert!(
+        run.calls.iter().any(|call| call == provenance_read),
+        "the provenance is read through the captured id; calls: {:?}",
+        run.calls
+    );
+    assert!(
+        run.destructive_calls().is_empty(),
+        "the replacement is neither adopted nor deleted, got {:?}",
+        run.destructive_calls()
+    );
+    assert_eq!(
+        run.node_after("custom-a"),
+        Some("node-custom-a-theirs"),
+        "the same-name replacement survives"
     );
 }
 
