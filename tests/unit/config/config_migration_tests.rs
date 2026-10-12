@@ -233,3 +233,72 @@ fn test_migrate_in_memory_rejects_unreachable_version_without_mutation() {
     );
     assert_eq!(value, original);
 }
+
+#[test]
+fn test_plan_migration_steps_current_version_is_noop() {
+    let steps =
+        ConfigMigrator::plan_migration_steps(CURRENT_CONFIG_VERSION, CURRENT_CONFIG_VERSION)
+            .unwrap();
+    assert_eq!(steps, 0);
+}
+
+#[test]
+fn test_plan_migration_steps_rejects_unreachable_version() {
+    let err = ConfigMigrator::plan_migration_steps("0", CURRENT_CONFIG_VERSION).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("No config migration path from version (<redacted scalar>)")
+    );
+}
+
+#[test]
+fn test_plan_file_current_version_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    let content = "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n";
+    std::fs::write(&config_path, content).unwrap();
+
+    let plan = ConfigMigrator::plan_file(config_path.to_str().unwrap()).unwrap();
+
+    assert_eq!(plan.from_version, CURRENT_CONFIG_VERSION);
+    assert_eq!(plan.to_version, CURRENT_CONFIG_VERSION);
+    assert_eq!(plan.migrations_applied, 0);
+    assert!(plan.backup_path.is_none());
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), content);
+}
+
+#[test]
+fn test_plan_file_rejects_unreachable_version_like_real_migration() {
+    for (name, content) in [
+        (
+            "config.yaml",
+            "version: \"0\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+        ),
+        (
+            "config.json",
+            r#"{"version":"0","proxies":[],"consumers":[],"plugin_configs":[]}"#,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(name);
+        std::fs::write(&config_path, content).unwrap();
+        let path = config_path.to_str().unwrap();
+
+        let dry_err = ConfigMigrator::plan_file(path).unwrap_err();
+        let real_err = ConfigMigrator::migrate_file(path).unwrap_err();
+
+        assert_eq!(dry_err.to_string(), real_err.to_string());
+        assert!(
+            dry_err
+                .to_string()
+                .contains("No config migration path from version (<redacted scalar>)")
+        );
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), content);
+        let backup_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".backup."))
+            .count();
+        assert_eq!(backup_count, 0);
+    }
+}

@@ -10,6 +10,10 @@ mod protoc_preflight {
     include!("build/protoc_preflight.rs");
 }
 
+mod plugin_migration_exports {
+    include!("build/plugin_migration_exports.rs");
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=PROTOC");
     println!("cargo:rerun-if-changed=proto/ferrum.proto");
@@ -198,13 +202,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     fs::write(Path::new(&out_dir).join("custom_plugin_mods.rs"), &mods)?;
 
-    // Detect which plugins define a `plugin_migrations()` function.
-    // We do a simple text search for the function signature in each source file.
+    // Detect which plugins expose `plugin_migrations` at their module root,
+    // by definition or by `use` re-export. The token scan tolerates
+    // comments/whitespace and the raw-identifier spelling; an unreadable
+    // plugin source, or a nested definition with no root export, fails the
+    // build instead of silently omitting its migrations.
     let mut plugins_with_migrations: Vec<String> = Vec::new();
     for (name, plugin_path) in &plugin_sources {
-        if let Ok(source) = fs::read_to_string(plugin_path)
-            && source.contains("fn plugin_migrations()")
-        {
+        let source = fs::read_to_string(plugin_path)?;
+        let path = plugin_path.display();
+        let exported = plugin_migration_exports::plugin_migrations_exported(&source)
+            .map_err(|msg| format!("custom plugin `{name}` ({path}): {msg}"))?;
+        if exported {
             plugins_with_migrations.push(name.clone());
         }
     }
