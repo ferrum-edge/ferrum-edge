@@ -1663,7 +1663,10 @@ fn subscriber_snapshot_cursor_drops_only_positions_queued_before_its_snapshots()
     // One publication was queued between subscribe and the initial load.
     let mut cursor = SubscriberSnapshotCursor::new(1);
     assert_eq!(cursor.covered_until(), 1);
-    assert!(!cursor.admit_next(), "position 0 is in the initial snapshot");
+    assert!(
+        !cursor.admit_next(),
+        "position 0 is in the initial snapshot"
+    );
     assert!(cursor.admit_next(), "position 1 was sent after the load");
     assert_eq!(cursor.next_position(), 2);
 
@@ -1674,8 +1677,14 @@ fn subscriber_snapshot_cursor_drops_only_positions_queued_before_its_snapshots()
     assert_eq!(cursor.next_position(), 6);
     cursor.record_snapshot(2);
     assert_eq!(cursor.covered_until(), 8);
-    assert!(!cursor.admit_next(), "retained position 6 is in the snapshot");
-    assert!(!cursor.admit_next(), "retained position 7 is in the snapshot");
+    assert!(
+        !cursor.admit_next(),
+        "retained position 6 is in the snapshot"
+    );
+    assert!(
+        !cursor.admit_next(),
+        "retained position 7 is in the snapshot"
+    );
     assert!(
         cursor.admit_next(),
         "position 8 was published after the snapshot load and must be forwarded"

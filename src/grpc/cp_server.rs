@@ -1877,7 +1877,9 @@ impl CpGrpcServer {
                     failure_class,
                     "Terminating ConfigSync recovery because gateway trust is unusable"
                 );
-                return Err(Status::internal("Failed to prepare ConfigSync recovery snapshot"));
+                return Err(Status::internal(
+                    "Failed to prepare ConfigSync recovery snapshot",
+                ));
             }
         };
         match Self::config_json_for_dp(&filtered) {
@@ -1899,7 +1901,9 @@ impl CpGrpcServer {
                         &[]
                     )
                 );
-                Err(Status::internal("Failed to serialize ConfigSync recovery snapshot"))
+                Err(Status::internal(
+                    "Failed to serialize ConfigSync recovery snapshot",
+                ))
             }
         }
     }

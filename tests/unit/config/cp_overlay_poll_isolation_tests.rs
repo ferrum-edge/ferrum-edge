@@ -831,7 +831,10 @@ fn subscribe_snapshot_coverage_cannot_straddle_a_concurrent_publication() {
         "publications committed after the snapshot load must be forwarded"
     );
     let committed = proxy_ids(&harness.config_arc.load_full());
-    assert_eq!(dp_state, committed, "the DP must end on the committed config");
+    assert_eq!(
+        dp_state, committed,
+        "the DP must end on the committed config"
+    );
 }
 
 #[test]
