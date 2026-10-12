@@ -269,7 +269,7 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
 
 #[test]
 fn failed_status_window_retries_then_advances_after_bounded_failures() {
-    assert!(STATUS_WINDOW_MAX_FAILED_BATCHES >= 2);
+    const { assert!(STATUS_WINDOW_MAX_FAILED_BATCHES >= 2) };
     let (cursor, next_cursor) = (512, 768);
     let mut failed = 0;
     for attempt in 1..STATUS_WINDOW_MAX_FAILED_BATCHES {
