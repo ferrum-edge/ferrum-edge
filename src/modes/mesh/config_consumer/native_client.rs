@@ -85,6 +85,33 @@ enum NativeStreamEvent {
 /// unbounded retry loop.
 const STATUS_REPORT_RETRIES: u8 = 3;
 
+/// Whether a failed `ReportMeshSliceStatus` RPC may be retried.
+///
+/// The ONE predicate for both the initial failure and every later retry
+/// (issue #6298): only transport/overload outcomes are transient. An explicit
+/// control-plane refusal (`FailedPrecondition`, `InvalidArgument`, auth
+/// failures, ...) means the report is no longer admissible, so it is dropped
+/// instead of occupying the pending slot until the next frame.
+pub fn status_report_failure_is_transient(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Unknown
+    )
+}
+
+/// The pending-retry slot after a report's FIRST attempt failed with `err`:
+/// the full retry budget for a transient failure, nothing for a refusal.
+/// Either way the result replaces any older pending report.
+fn initial_status_report_retry(
+    report: MeshSliceStatusReport,
+    err: &tonic::Status,
+) -> Option<(MeshSliceStatusReport, u8)> {
+    status_report_failure_is_transient(err.code()).then_some((report, STATUS_REPORT_RETRIES))
+}
+
 /// Phase B shell for Ferrum-native MeshSubscribe consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeMeshClientConfig {
@@ -529,8 +556,9 @@ async fn connect_mesh_subscribe(
     // Retain only the LAST failed report (a newer report supersedes an older
     // one) and retry it on the next frame — including the 60s heartbeat, which
     // bounds convergence without adding a timer. Retries are attempt-bounded,
-    // and a report the CP explicitly refused is dropped immediately: it is no
-    // longer admissible, so retrying it can only add load.
+    // and a report the CP explicitly refused is dropped immediately — on its
+    // first failure as well as on any retry (issue #6298): it is no longer
+    // admissible, so retrying it can only add load.
     let mut pending_status_report: Option<(MeshSliceStatusReport, u8)> = None;
 
     // ── issue #4812: report the RUNTIME verdict, not only the install ACK ──
@@ -631,7 +659,7 @@ async fn connect_mesh_subscribe(
                             code = ?err.code(),
                             "Failed to report mesh slice runtime verdict to control plane"
                         );
-                        pending_status_report = Some((retry_report, STATUS_REPORT_RETRIES));
+                        pending_status_report = initial_status_report_retry(retry_report, &err);
                     } else {
                         pending_status_report = None;
                     }
@@ -658,13 +686,7 @@ async fn connect_mesh_subscribe(
             .await
             .unwrap_or_else(|_| Err(status_report_deadline_exceeded()));
             if let Err(err) = sent {
-                let transient = matches!(
-                    err.code(),
-                    tonic::Code::Unavailable
-                        | tonic::Code::DeadlineExceeded
-                        | tonic::Code::ResourceExhausted
-                        | tonic::Code::Unknown
-                );
+                let transient = status_report_failure_is_transient(err.code());
                 let attempts_left = attempts_left.saturating_sub(1);
                 if transient && attempts_left > 0 {
                     pending_status_report = Some((retry_report, attempts_left));
@@ -738,7 +760,7 @@ async fn connect_mesh_subscribe(
                         code = ?err.code(),
                         "Failed to report mesh slice ACK to control plane"
                     );
-                    pending_status_report = Some((retry_report, STATUS_REPORT_RETRIES));
+                    pending_status_report = initial_status_report_retry(retry_report, &err);
                 } else {
                     pending_status_report = None;
                 }
@@ -776,7 +798,7 @@ async fn connect_mesh_subscribe(
                             code = ?err.code(),
                             "Failed to report mesh slice NACK to control plane"
                         );
-                        pending_status_report = Some((retry_report, STATUS_REPORT_RETRIES));
+                        pending_status_report = initial_status_report_retry(retry_report, &err);
                     } else {
                         pending_status_report = None;
                     }

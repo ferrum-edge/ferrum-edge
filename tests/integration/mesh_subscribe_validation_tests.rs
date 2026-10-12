@@ -1134,3 +1134,242 @@ async fn start_heartbeat_only_cp() -> CpHandle {
         task,
     }
 }
+
+// ── issue #6298: status-report retry classification ────────────────────────
+
+/// The last frame of every status-report script: its ACK is answered `OK` and
+/// is the final report the client can send, so observing it means every
+/// earlier frame (and any retry piggybacked on it) has been processed.
+const SENTINEL_VERSION: &str = "v-sentinel";
+
+/// One subscription's frames, and whether the stream is then held open (true)
+/// or ended with `UNAVAILABLE` (false).
+type ScriptedStream = (Vec<MeshConfigUpdate>, bool);
+
+/// A control plane that serves the Nth subscription from a per-subscribe
+/// script (the last entry repeats) and answers the Nth
+/// `ReportMeshSliceStatus` with the Nth scripted code (`OK` past the end),
+/// recording the version of every report it receives.
+#[derive(Clone)]
+struct ReportScriptedMeshCp {
+    streams: Arc<Vec<ScriptedStream>>,
+    subscribe_count: Arc<AtomicUsize>,
+    report_codes: Arc<Vec<tonic::Code>>,
+    reports: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[tonic::async_trait]
+impl MeshConfigSync for ReportScriptedMeshCp {
+    type MeshSubscribeStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<MeshConfigUpdate, Status>> + Send>>;
+
+    async fn mesh_subscribe(
+        &self,
+        _request: Request<MeshSubscribeRequest>,
+    ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
+        let index = self.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        let (frames, hold_open) = self
+            .streams
+            .get(index.min(self.streams.len().saturating_sub(1)))
+            .cloned()
+            .expect("at least one scripted stream");
+        let items: Vec<Result<MeshConfigUpdate, Status>> = frames.into_iter().map(Ok).collect();
+        let scripted = tokio_stream::iter(items);
+        let stream: Self::MeshSubscribeStream = if hold_open {
+            Box::pin(scripted.chain(tokio_stream::pending()))
+        } else {
+            let ended = tokio_stream::once(Err(Status::unavailable("scripted stream end")));
+            Box::pin(scripted.chain(ended))
+        };
+        Ok(Response::new(stream))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        request: Request<ferrum_edge::grpc::proto::MeshSliceStatusReport>,
+    ) -> Result<Response<ferrum_edge::grpc::proto::MeshSliceStatusResponse>, Status> {
+        let index = {
+            let mut reports = self.reports.lock().expect("reports lock");
+            reports.push(request.into_inner().version);
+            reports.len() - 1
+        };
+        match self.report_codes.get(index).copied() {
+            Some(code) if code != tonic::Code::Ok => {
+                Err(Status::new(code, "scripted status-report refusal"))
+            }
+            _ => Ok(Response::new(ferrum_edge::grpc::proto::MeshSliceStatusResponse {})),
+        }
+    }
+}
+
+fn pinned_update(version: &str) -> MeshConfigUpdate {
+    update_for(&MeshSlice {
+        version: version.to_string(),
+        workload_spiffe_id: Some(SPIFFE.to_string()),
+        ..bound_slice()
+    })
+}
+
+/// Run the native client against a [`ReportScriptedMeshCp`] until the
+/// sentinel ACK arrives, then return the versions of every status report the
+/// control plane received, in order.
+async fn status_reports_for(streams: Vec<ScriptedStream>, codes: Vec<tonic::Code>) -> Vec<String> {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind report-scripted stub CP");
+    let addr = listener.local_addr().expect("report-scripted stub CP addr");
+    let subscribe_count = Arc::new(AtomicUsize::new(0));
+    let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cp = ReportScriptedMeshCp {
+        streams: Arc::new(streams),
+        subscribe_count: subscribe_count.clone(),
+        report_codes: Arc::new(codes),
+        reports: reports.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let incoming = TcpListenerStream::new(listener);
+    let task = tokio::spawn(async move {
+        Server::builder()
+            .add_service(MeshConfigSyncServer::new(cp))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let cp = CpHandle {
+        url: format!("http://{addr}"),
+        subscribe_count,
+        shutdown_tx: Some(shutdown_tx),
+        task,
+    };
+
+    let state = MeshRuntimeState::new();
+    let client = spawn_client(vec![cp.url.clone()], state);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let observed = loop {
+        let observed = reports.lock().expect("reports lock").clone();
+        if observed.iter().any(|version| version == SENTINEL_VERSION) {
+            break observed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the sentinel ACK; reports={observed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    stop_client(client).await;
+    cp.shutdown().await;
+    observed
+}
+
+/// An explicit refusal of the FIRST report attempt is dropped immediately: a
+/// later heartbeat must not send it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initially_refused_status_report_is_never_retried() {
+    for code in [
+        tonic::Code::FailedPrecondition,
+        tonic::Code::InvalidArgument,
+    ] {
+        let script = vec![
+            pinned_update("v1"),
+            heartbeat(),
+            heartbeat(),
+            pinned_update(SENTINEL_VERSION),
+        ];
+        let reports = status_reports_for(vec![(script, true)], vec![code]).await;
+        assert_eq!(
+            reports,
+            vec!["v1".to_string(), SENTINEL_VERSION.to_string()],
+            "an initial {code:?} refusal must not be retried on a later frame"
+        );
+    }
+}
+
+/// A transient first failure keeps the bounded budget: exactly three further
+/// attempts, one per later frame, then the report is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transiently_failed_status_report_is_retried_at_most_three_times() {
+    let script = vec![
+        pinned_update("v1"),
+        heartbeat(),
+        heartbeat(),
+        heartbeat(),
+        heartbeat(),
+        pinned_update(SENTINEL_VERSION),
+    ];
+    let codes = vec![tonic::Code::Unavailable; 4];
+    let reports = status_reports_for(vec![(script, true)], codes).await;
+    assert_eq!(
+        reports,
+        vec!["v1", "v1", "v1", "v1", SENTINEL_VERSION],
+        "one initial attempt plus exactly three retries"
+    );
+
+    // A retry the CP then explicitly refuses is dropped at that point.
+    let script = vec![
+        pinned_update("v1"),
+        heartbeat(),
+        heartbeat(),
+        pinned_update(SENTINEL_VERSION),
+    ];
+    let reports = status_reports_for(
+        vec![(script, true)],
+        vec![
+            tonic::Code::Unavailable,
+            tonic::Code::FailedPrecondition,
+        ],
+    )
+    .await;
+    assert_eq!(reports, vec!["v1", "v1", SENTINEL_VERSION]);
+}
+
+/// A newer report supersedes the pending one — whether the newer report's
+/// first attempt fails transiently (it takes the slot) or is refused (the slot
+/// is cleared, and neither report is retried).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_status_report_supersedes_the_pending_retry() {
+    let script = || {
+        vec![
+            pinned_update("v1"),
+            pinned_update("v2"),
+            heartbeat(),
+            pinned_update(SENTINEL_VERSION),
+        ]
+    };
+
+    let codes = vec![tonic::Code::Unavailable; 3];
+    let reports = status_reports_for(vec![(script(), true)], codes).await;
+    assert_eq!(
+        reports,
+        vec!["v1", "v1", "v2", "v2", SENTINEL_VERSION],
+        "the transiently failed v2 ACK replaces the pending v1 retry"
+    );
+
+    let reports = status_reports_for(
+        vec![(script(), true)],
+        vec![
+            tonic::Code::Unavailable,
+            tonic::Code::Unavailable,
+            tonic::Code::FailedPrecondition,
+        ],
+    )
+    .await;
+    assert_eq!(
+        reports,
+        vec!["v1", "v1", "v2", SENTINEL_VERSION],
+        "a refused v2 ACK clears the slot instead of being retried"
+    );
+}
+
+/// The pending retry is stream-local: when the stream terminates, the next
+/// stream never resends the previous stream's failed report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_status_report_does_not_outlive_its_stream() {
+    let first = (vec![pinned_update("v1")], false);
+    let resumed = vec![heartbeat(), pinned_update(SENTINEL_VERSION)];
+    let codes = vec![tonic::Code::Unavailable];
+    let reports = status_reports_for(vec![first, (resumed, true)], codes).await;
+    assert_eq!(reports, vec!["v1", SENTINEL_VERSION]);
+}
