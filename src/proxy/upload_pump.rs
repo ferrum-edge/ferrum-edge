@@ -266,22 +266,40 @@ pub(crate) const fn upload_pump_error_message(outcome: UploadPumpOutcome) -> &'s
     }
 }
 
-/// Error class of a fail-closed direct-H2 early-response refusal, by the pump
-/// terminal that left the upload unfinished (issue #6314).
+/// Error class of a fail-closed direct-H2 early-response refusal, by the
+/// upload terminal that left the upload unfinished (issue #6314).
 ///
 /// The refusal itself is unconditional: an unfinished upload proves neither
 /// its size nor its authorization bound. Only the attribution varies. A
-/// `SourceError` is the frontend client's own upload failing (reset, cancel,
-/// malformed stream), so it carries the centrally neutral `ClientDisconnect`
-/// class and cannot train circuit-breaker, passive-health, or adaptive
-/// concurrency accounting as a backend fault. Every other indeterminate
-/// terminal (gateway cancellation, a backend that released the upload, no
+/// frontend client's own upload failing (reset, cancel, malformed stream)
+/// carries the centrally neutral `ClientDisconnect` class and cannot train
+/// circuit-breaker, passive-health, or adaptive concurrency accounting as a
+/// backend fault. Which terminal proves that depends on who read the client
+/// body:
+///
+/// * With a gateway-owned pump, only its `SourceError` terminal does. The
+///   adapter then reads the pump's bridge, so its `Errored` outcome may be any
+///   pump terminal surfaced as a transport error.
+/// * Without a pump (an unauthenticated upload with
+///   `backend_write_timeout_ms = 0`), the adapter reads the original client
+///   body directly, so its `Errored` outcome is the client's own stream
+///   failing.
+///
+/// Every other indeterminate terminal (gateway cancellation or authorization
+/// expiry, a backend that released the upload, an abandoned upload, no
 /// terminal at all) keeps `ProtocolError`, so a genuine backend reset or
 /// protocol failure still counts against the backend.
 pub(crate) const fn early_response_upload_refusal_error_class(
-    outcome: Option<UploadPumpOutcome>,
+    body_outcome: Option<crate::proxy::body::RequestBodyOutcome>,
+    upload_pumped: bool,
+    pump_outcome: Option<UploadPumpOutcome>,
 ) -> crate::retry::ErrorClass {
-    if matches!(outcome, Some(UploadPumpOutcome::SourceError)) {
+    let client_source_failed = if upload_pumped {
+        matches!(pump_outcome, Some(UploadPumpOutcome::SourceError))
+    } else {
+        matches!(body_outcome, Some(crate::proxy::body::RequestBodyOutcome::Errored))
+    };
+    if client_source_failed {
         crate::retry::ErrorClass::ClientDisconnect
     } else {
         crate::retry::ErrorClass::ProtocolError

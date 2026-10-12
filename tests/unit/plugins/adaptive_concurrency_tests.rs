@@ -21,6 +21,7 @@ use ferrum_edge::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, BackendAdmissionOutcome,
     BackendAdmissionPermit, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
 };
+use ferrum_edge::proxy::body::RequestBodyOutcome;
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
 
@@ -3048,66 +3049,86 @@ fn adaptive_concurrency_small_window_relearns_after_two_rotations() {
     assert_eq!(relearned.in_flight, 0);
 }
 
-/// Issue #6314: when a direct-H2 backend answers before the client upload
-/// finishes and the client's own upload stream then fails, the gateway still
-/// refuses the early response (502), but a surviving handler that settles the
-/// permit must not train the backend's limit. Other indeterminate terminals
-/// keep counting as backend protocol failures.
-#[test]
-fn adaptive_concurrency_client_upload_refusal_is_neutral_but_backend_terminals_back_off() {
-    let proxy = proxy();
-
-    let client_class =
-        direct_h2_upload_refusal_error_class_for_test(Some(UploadPumpOutcomeForTest::SourceError));
-    assert_eq!(client_class, ErrorClass::ClientDisconnect);
-
+/// Settle one admitted request with a fail-closed 502 of `class` and return the
+/// target's state once its permit is released.
+fn settle_upload_refusal(
+    proxy: &Proxy,
+    config: &Arc<AdaptiveConcurrencyConfig>,
+    class: ErrorClass,
+) -> AdaptiveConcurrencySnapshot {
     let limiter = AdaptiveConcurrencyLimiter::new(16);
-    let config = limiter_config(4);
     let permit = limiter
-        .try_acquire(&proxy, None, Arc::clone(&config))
+        .try_acquire(proxy, None, Arc::clone(config))
         .expect("request should be admitted");
-    assert_eq!(target_snapshot(&limiter, &proxy, None).in_flight, 1);
+    assert_eq!(target_snapshot(&limiter, proxy, None).in_flight, 1);
     permit.record_backend_outcome(BackendAdmissionOutcome {
         response_status: 502,
         connection_error: false,
-        error_class: Some(client_class),
+        error_class: Some(class),
         backend_elapsed: Duration::from_millis(5),
     });
-    let settled = target_snapshot(&limiter, &proxy, None);
-    assert_eq!(settled.limit, 4, "a client upload failure must not shrink");
-    assert_eq!(settled.samples, 0, "nor feed a latency sample");
+    let settled = target_snapshot(&limiter, proxy, None);
     drop(permit);
-    assert_eq!(target_snapshot(&limiter, &proxy, None).in_flight, 0);
+    assert_eq!(target_snapshot(&limiter, proxy, None).in_flight, 0);
+    settled
+}
 
-    for pump in [
-        None,
-        Some(UploadPumpOutcomeForTest::Cancelled),
-        Some(UploadPumpOutcomeForTest::ConsumerGone),
-        Some(UploadPumpOutcomeForTest::Completed),
-    ] {
-        let class = direct_h2_upload_refusal_error_class_for_test(pump);
+/// Issue #6314: when a direct-H2 backend answers before the client upload
+/// finishes and the client's own upload stream then fails, the gateway still
+/// refuses the early response (502), but a surviving handler that settles the
+/// permit must not train the backend's limit. That holds whether or not a
+/// gateway-owned pump fed the adapter: an unauthenticated upload with
+/// `backend_write_timeout_ms = 0` has none, and its adapter's `Errored` outcome
+/// is the client body's own. Other indeterminate terminals keep counting as
+/// backend protocol failures.
+#[test]
+fn adaptive_concurrency_client_upload_refusal_is_neutral_but_backend_terminals_back_off() {
+    use UploadPumpOutcomeForTest as Pump;
+
+    let proxy = proxy();
+    let config = limiter_config(4);
+
+    let client_failures = [
+        (Some(RequestBodyOutcome::Errored), true, Some(Pump::SourceError)),
+        (None, true, Some(Pump::SourceError)),
+        (Some(RequestBodyOutcome::Errored), false, None),
+    ];
+    for (body, pumped, pump) in client_failures {
+        let class = direct_h2_upload_refusal_error_class_for_test(body, pumped, pump);
+        assert_eq!(
+            class,
+            ErrorClass::ClientDisconnect,
+            "body {body:?}, pumped {pumped}, pump {pump:?} is a client source failure"
+        );
+        let settled = settle_upload_refusal(&proxy, &config, class);
+        assert_eq!(settled.limit, 4, "a client upload failure must not shrink");
+        assert_eq!(settled.samples, 0, "nor feed a latency sample");
+    }
+
+    // A pumped adapter's `Errored` may be any pump terminal surfaced through
+    // the bridge, and an abandoned or unreported upload proves nothing about
+    // the client, so these still back the backend off.
+    let backend_terminals = [
+        (Some(RequestBodyOutcome::Errored), true, None),
+        (Some(RequestBodyOutcome::Errored), true, Some(Pump::Cancelled)),
+        (Some(RequestBodyOutcome::Errored), true, Some(Pump::ConsumerGone)),
+        (Some(RequestBodyOutcome::Abandoned), true, Some(Pump::Completed)),
+        (None, true, None),
+        (Some(RequestBodyOutcome::Abandoned), false, None),
+        (None, false, None),
+    ];
+    for (body, pumped, pump) in backend_terminals {
+        let class = direct_h2_upload_refusal_error_class_for_test(body, pumped, pump);
         assert_eq!(
             class,
             ErrorClass::ProtocolError,
-            "pump {pump:?} is not a client source failure"
+            "body {body:?}, pumped {pumped}, pump {pump:?} is not a client source failure"
         );
-        let limiter = AdaptiveConcurrencyLimiter::new(16);
-        let permit = limiter
-            .try_acquire(&proxy, None, Arc::clone(&config))
-            .expect("request should be admitted");
-        permit.record_backend_outcome(BackendAdmissionOutcome {
-            response_status: 502,
-            connection_error: false,
-            error_class: Some(class),
-            backend_elapsed: Duration::from_millis(5),
-        });
+        let settled = settle_upload_refusal(&proxy, &config, class);
         assert_eq!(
-            target_snapshot(&limiter, &proxy, None).limit,
-            2,
-            "pump {pump:?} refusal still backs the backend off"
+            settled.limit, 2,
+            "body {body:?}, pumped {pumped}, pump {pump:?} refusal still backs the backend off"
         );
-        drop(permit);
-        assert_eq!(target_snapshot(&limiter, &proxy, None).in_flight, 0);
     }
 }
 

@@ -14698,11 +14698,16 @@ pub mod _test_support {
     }
 
     /// Error class the direct-H2 fail-closed early-response refusal reports for
+    /// the adapter's outcome, whether a gateway-owned pump fed that adapter, and
     /// the joined pump terminal.
     pub fn direct_h2_upload_refusal_error_class_for_test(
+        body_outcome: Option<crate::proxy::body::RequestBodyOutcome>,
+        upload_pumped: bool,
         pump_outcome: Option<UploadPumpOutcomeForTest>,
     ) -> crate::retry::ErrorClass {
         crate::proxy::upload_pump::early_response_upload_refusal_error_class(
+            body_outcome,
+            upload_pumped,
             pump_outcome.map(upload_pump_outcome_from_test),
         )
     }
