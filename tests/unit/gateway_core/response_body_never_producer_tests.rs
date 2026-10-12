@@ -235,7 +235,10 @@ async fn normalize_still_installs_a_bounded_peer_beside_an_honest_never_plugin()
         ],
     ] {
         let (normalized, outcome) = run_normalize(plugins).await;
-        assert!(normalized, "the bounded producer's replacement is installed");
+        assert!(
+            normalized,
+            "the bounded producer's replacement is installed"
+        );
         assert_eq!(outcome.status, 200);
         assert_eq!(outcome.body.as_ref(), BOUNDED_REPLACEMENT);
         assert!(!outcome.capacity_terminal);
