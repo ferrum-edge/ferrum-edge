@@ -1186,7 +1186,7 @@ cd tests/performance/multi_protocol
 ./run_connection_saturation_bench.sh --stop-at-first-break
 ```
 
-In CI, this runs as the on-demand `Connection Saturation Benchmark` workflow (`.github/workflows/connection-saturation-benchmark.yml`) — that path applies the host-level sysctl/ulimit tuning required for the headline numbers.
+In CI, this runs as the on-demand `Connection Saturation Benchmark` workflow (`.github/workflows/connection-saturation-benchmark.yml`). That workflow does not raise host ulimits: it validates the runner's inherited host/client FD ceiling against the requested connection levels (failing fast when the soft limit is below the highest N + 1024), tunes kernel sysctls, and relies on the runner script's per-container Docker `nofile` limits. Headline numbers therefore require a runner whose inherited FD capacity already fits the requested levels; larger requests belong on a suitably configured self-hosted runner.
 
 ### What "breaking point" means here
 
@@ -1213,9 +1213,9 @@ The JSON output breaks connect failures into `refused / timeout / reset / tls_er
 
 ### Methodology + caveats
 
-- **Default-config gateways**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing). `worker_connections`, `max_concurrent_conns`, etc. are left at their out-of-the-box defaults. This measures what an operator gets from `docker run`. A separate "tuned" run could be wired up later.
+- **Mostly default-config gateways, with explicit Ferrum overrides**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing), and headline capacity knobs such as Kong's `worker_connections` are deliberately left at their out-of-the-box defaults. The Ferrum launch is the exception: `run_connection_saturation_bench.sh` explicitly sets `FERRUM_MAX_CONNECTIONS=0` (disabling the connection limit; the parser default is `100_000`), `FERRUM_POOL_MAX_IDLE_PER_HOST=1024` (default `64`), and `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=120` (default `300`); it also restates the defaults `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true` and `FERRUM_POOL_WARMUP_ENABLED=true`. Ferrum's numbers therefore measure that configured saturation setup, not bare `docker run` defaults. A separate fully "tuned" run for every gateway could be wired up later.
 - **Universal protocol = HTTP/1.1+TLS**. All five gateways speak this end-to-end with matched configs, so it's the apples-to-apples comparison. Other protocols would force per-gateway exclusions (KrakenD CE has no gRPC; Kong has no H2 upstream; etc. — see `run_gateway_protocol_bench.sh` for the full matrix).
-- **All gateways run in Docker with `--ulimit nofile=1048576:1048576`** so no gateway gets a per-container FD-cap advantage. The host-side ulimit/sysctl tuning is applied by the CI workflow before launching anything.
+- **All gateways run in Docker with `--ulimit nofile=1048576:1048576`** so no gateway gets a per-container FD-cap advantage. Separately, the CI workflow validates the inherited host/client FD ceiling against the requested connection levels and tunes kernel sysctls before launching anything; it does not modify host ulimits, so the operator (or runner image) must already provide enough host FD capacity.
 - **macOS hosts hit ~12K FD ceiling and aren't suitable for headline numbers**. The benchmark runs locally for development and at small N (≤4K), but the comparison numbers should always come from the Linux CI workflow.
 - **Heartbeat is intentionally low-rate** (default 1 req/sec/conn). The point is to test connection capacity, not RPS — a high heartbeat rate would conflate the two and give a different (RPS-bound) breaking point.
 - **Connect attempts are spread over `--ramp-seconds`** so the *client* doesn't SYN-flood itself. With N=50K and ramp=30s that's ~1666 connects/sec, well within typical client capacity given proper ulimit.
