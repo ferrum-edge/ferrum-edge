@@ -7495,3 +7495,116 @@ async fn settled_redis_publication_makes_the_local_completion_replayable() {
         "a settled local completion replays once its publication was accepted",
     );
 }
+
+// ── A cancelled publication must not reopen a completed external operation ──
+
+/// Redis-owned plugin whose completed TTL far outlives its in-flight lease.
+fn cancelled_publication_dedup_plugin(port: u16) -> RequestDeduplication {
+    make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": format!("redis://127.0.0.1:{port}/0"),
+        "redis_connect_timeout_seconds": 5,
+        "redis_pool_size": 1,
+        "redis_health_check_interval_seconds": 3600,
+        "ttl_seconds": 300,
+        "inflight_ttl_seconds": 10
+    }))
+}
+
+/// Complete a Redis-owned operation, then cancel its publication while the
+/// fenced `EXEC` is held: the publisher's future is dropped before the
+/// compare-and-set runs, so no verdict ever settles the local completion.
+async fn complete_and_cancel_publication(
+    plugin: &RequestDeduplication,
+    exec_arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    external_operation: bool,
+) {
+    let (mut owner, mut owner_headers) = pending_publication_request();
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+    if external_operation {
+        owner.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+    let mut publish = Box::pin(complete_response(plugin, &mut owner));
+    tokio::select! {
+        () = &mut publish => panic!("the fenced publication must still be awaiting EXEC"),
+        () = wait_for_held_exec(exec_arrivals) => {}
+    }
+    drop(publish);
+}
+
+/// Let the owner's Redis lease expire and the local in-flight lease's ten
+/// seconds pass without the cancelled publication ever settling.
+fn lapse_redis_and_local_leases(server: &ScriptedDedupRedis, plugin: &RequestDeduplication) {
+    use ferrum_edge::_test_support::request_deduplication_backdate_pending_publication_for_test;
+
+    // The fenced write never executed: Redis still holds the owner's lease.
+    assert_eq!(server.single_record()["state"], "inflight");
+    // The scripted keyspace has no TTLs, so expire the lease by removing it.
+    server.clear();
+    request_deduplication_backdate_pending_publication_for_test(
+        plugin,
+        std::time::Duration::from_secs(11),
+    );
+}
+
+/// Issue #6312 follow-up: hiding a pending completion's replay must not shorten
+/// the protection of an external operation that already executed. With
+/// `ttl_seconds=300` and `inflight_ttl_seconds=10`, cancelling the publication
+/// before its fenced Redis write and letting both leases lapse must still leave
+/// a token-matched execution barrier: a matching retry that re-acquires Redis
+/// ownership is refused as in progress instead of executing again.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn cancelled_publication_keeps_a_completed_external_operation_blocked() {
+    let _policy = pinned_policy_guard();
+    let (server, mut exec_arrivals) = spawn_scripted_dedup_redis(1).await;
+    let plugin = cancelled_publication_dedup_plugin(server.port);
+
+    complete_and_cancel_publication(&plugin, &mut exec_arrivals, true).await;
+    lapse_redis_and_local_leases(&server, &plugin);
+
+    for attempt in ["first", "second"] {
+        let (mut retry, mut retry_headers) = pending_publication_request();
+        let context = format!("{attempt} matching retry inside the 300s protection window");
+        assert_in_progress_conflict(
+            plugin.before_proxy(&mut retry, &mut retry_headers).await,
+            &context,
+        );
+        assert!(
+            request_identity(&plugin, &retry).is_none(),
+            "{context}: the retry must not take ownership of the completed operation"
+        );
+    }
+    assert!(
+        assert_completed_size_exact(&plugin) > 0,
+        "the unsettled external-operation completion must stay retained"
+    );
+}
+
+/// Control: ordinary abandoned work keeps the shorter lease-bounded expiry. The
+/// same cancelled publication without an external operation re-admits a
+/// matching retry once the in-flight lease has lapsed.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn cancelled_publication_of_ordinary_work_expires_with_the_inflight_lease() {
+    let _policy = pinned_policy_guard();
+    let (server, mut exec_arrivals) = spawn_scripted_dedup_redis(1).await;
+    let plugin = cancelled_publication_dedup_plugin(server.port);
+
+    complete_and_cancel_publication(&plugin, &mut exec_arrivals, false).await;
+    lapse_redis_and_local_leases(&server, &plugin);
+
+    let (mut retry, mut retry_headers) = pending_publication_request();
+    let result = plugin.before_proxy(&mut retry, &mut retry_headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "ordinary abandoned work must re-admit after its lease; got {result:?}"
+    );
+    assert!(request_identity(&plugin, &retry).is_some());
+}
