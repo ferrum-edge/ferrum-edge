@@ -2,7 +2,9 @@
 
 use ferrum_edge::config::migrations::{
     CustomPluginMigration, MigrationRunner, split_plugin_migration_statements,
+    statements_require_non_transactional_postgres,
 };
+use std::time::{Duration, Instant};
 
 fn assert_split(db_type: &str, sql: &str, expected: &[&str]) {
     let got = split_plugin_migration_statements(sql, db_type).expect("split should succeed");
@@ -186,28 +188,96 @@ fn case_expression_end_does_not_break_splitting() {
     );
 }
 
+fn assert_transaction_control_rejected(db_type: &str, sql: &str) {
+    let err = split_plugin_migration_statements(sql, db_type)
+        .expect_err("transaction-control SQL must be rejected before execution");
+    assert!(
+        err.to_string().contains("transaction-control"),
+        "db_type={db_type} sql={sql:?} got {err}"
+    );
+}
+
 #[test]
 fn transaction_begin_does_not_swallow_following_statements() {
-    // Runner-owned transactions mean authors rarely need this, but `BEGIN;`
-    // must not be treated as a compound block opener.
-    assert_split(
-        "sqlite",
-        "BEGIN; CREATE TABLE t (id TEXT); COMMIT;",
-        &["BEGIN", "CREATE TABLE t (id TEXT)", "COMMIT"],
-    );
-    assert_split(
+    // `BEGIN;` is not a compound block opener (that would report an unclosed
+    // BEGIN … END); it is runner-owned transaction control and is rejected.
+    assert_transaction_control_rejected("sqlite", "BEGIN; CREATE TABLE t (id TEXT); COMMIT;");
+    assert_transaction_control_rejected(
         "postgres",
         "BEGIN /* transaction comment */; CREATE TABLE t (id TEXT); COMMIT;",
+    );
+    assert_transaction_control_rejected(
+        "postgres",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1; COMMIT;",
+    );
+}
+
+#[test]
+fn transaction_control_statements_are_rejected_for_every_dialect() {
+    for db_type in ["sqlite", "postgres", "mysql"] {
+        assert_transaction_control_rejected(
+            db_type,
+            "CREATE TABLE plugin_transaction_escape (id INTEGER);\nCOMMIT;\nINSERT INTO missing_plugin_table VALUES (1);",
+        );
+        assert_transaction_control_rejected(db_type, "BEGIN; CREATE TABLE t (id INT);");
+        assert_transaction_control_rejected(db_type, "CREATE TABLE t (id INT); ROLLBACK;");
+        assert_transaction_control_rejected(db_type, "CREATE TABLE t (id INT); /* note */ commit;");
+        assert_transaction_control_rejected(db_type, "SELECT 1; -- note\nROLLBACK WORK;");
+    }
+    assert_transaction_control_rejected("sqlite", "BEGIN IMMEDIATE; SELECT 1;");
+    assert_transaction_control_rejected("sqlite", "SELECT 1; END TRANSACTION;");
+    assert_transaction_control_rejected("sqlite", "SELECT 1; COMMIT TRANSACTION;");
+    assert_transaction_control_rejected("postgres", "START TRANSACTION; SELECT 1;");
+    assert_transaction_control_rejected("postgres", "SELECT 1; END;");
+    assert_transaction_control_rejected("postgres", "SELECT 1; ABORT;");
+    assert_transaction_control_rejected("postgres", "SELECT 1; ROLLBACK AND CHAIN;");
+    assert_transaction_control_rejected("postgres", "SELECT 1; PREPARE TRANSACTION 'plugin';");
+    assert_transaction_control_rejected("mysql", "START TRANSACTION; SELECT 1;");
+    assert_transaction_control_rejected("mysql", "BEGIN WORK; SELECT 1;");
+    assert_transaction_control_rejected("mysql", "XA START 'plugin';");
+}
+
+#[test]
+fn savepoints_and_non_keyword_transaction_words_are_allowed() {
+    assert_split(
+        "sqlite",
+        "SAVEPOINT s1; INSERT INTO t VALUES ('COMMIT'); ROLLBACK TO s1; RELEASE s1;",
         &[
-            "BEGIN /* transaction comment */",
-            "CREATE TABLE t (id TEXT)",
-            "COMMIT",
+            "SAVEPOINT s1",
+            "INSERT INTO t VALUES ('COMMIT')",
+            "ROLLBACK TO s1",
+            "RELEASE s1",
         ],
     );
     assert_split(
         "postgres",
-        "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1; COMMIT;",
-        &["BEGIN ISOLATION LEVEL SERIALIZABLE", "SELECT 1", "COMMIT"],
+        "SAVEPOINT s1; ROLLBACK TO SAVEPOINT s1; ROLLBACK TRANSACTION TO s1; RELEASE SAVEPOINT s1;",
+        &[
+            "SAVEPOINT s1",
+            "ROLLBACK TO SAVEPOINT s1",
+            "ROLLBACK TRANSACTION TO s1",
+            "RELEASE SAVEPOINT s1",
+        ],
+    );
+    assert_split(
+        "mysql",
+        "SAVEPOINT s1; ROLLBACK WORK TO SAVEPOINT s1;",
+        &["SAVEPOINT s1", "ROLLBACK WORK TO SAVEPOINT s1"],
+    );
+    assert_split(
+        "postgres",
+        "SELECT 1 /* COMMIT */; -- BEGIN\nSELECT \"commit\" FROM t;",
+        &[
+            "SELECT 1 /* COMMIT */",
+            "-- BEGIN\nSELECT \"commit\" FROM t",
+        ],
+    );
+    // Transaction control inside a stored routine body runs when the routine
+    // is called, not while the migration executes.
+    assert_split(
+        "mysql",
+        "DELIMITER //\nCREATE PROCEDURE p() BEGIN COMMIT; END //\nDELIMITER ;",
+        &["CREATE PROCEDURE p() BEGIN COMMIT; END"],
     );
 }
 
@@ -264,17 +334,90 @@ fn concurrently_inside_dollar_quote_stays_in_function_body_statement() {
     assert_eq!(statements.len(), 2);
     assert!(statements[0].contains("CREATE INDEX CONCURRENTLY"));
     assert!(
-        strip_leading_upper(statements[1]).starts_with("CREATE INDEX CONCURRENTLY"),
+        !statements_require_non_transactional_postgres("postgres", &statements[..1]),
+        "dollar-quoted body text must not select top-level execution"
+    );
+    assert!(
+        statements_require_non_transactional_postgres("postgres", &statements[1..]),
         "{}",
         statements[1]
     );
 }
 
-fn strip_leading_upper(sql: &str) -> String {
-    sql.split_whitespace()
-        .map(str::to_ascii_uppercase)
-        .collect::<Vec<_>>()
-        .join(" ")
+fn postgres_requires_top_level(sql: &str) -> bool {
+    let statements = split_plugin_migration_statements(sql, "postgres").expect("split");
+    statements_require_non_transactional_postgres("postgres", &statements)
+}
+
+#[test]
+fn postgres_inline_comments_between_keywords_still_select_top_level_execution() {
+    for sql in [
+        "CREATE /* online */ INDEX CONCURRENTLY idx_plugin ON plugin_data (id);",
+        "CREATE\n/* a /* nested */ b */ UNIQUE -- trailing\nINDEX CONCURRENTLY idx_plugin ON plugin_data (id);",
+        "DROP /* x */ INDEX CONCURRENTLY idx_plugin;",
+        "REINDEX (VERBOSE) /* x */ TABLE CONCURRENTLY plugin_data;",
+        "ALTER /* x */ SYSTEM SET work_mem = '64MB';",
+        "SELECT 1; /* lead */ VACUUM plugin_data;",
+    ] {
+        assert!(postgres_requires_top_level(sql), "{sql}");
+    }
+}
+
+#[test]
+fn postgres_keywords_inside_comments_or_quotes_keep_transactional_execution() {
+    for sql in [
+        "CREATE INDEX idx_plugin ON plugin_data (id) /* CONCURRENTLY */;\nINSERT INTO missing_plugin_table VALUES (1);",
+        "CREATE INDEX idx_plugin ON plugin_data (id) -- CONCURRENTLY\n;",
+        "CREATE INDEX \"CONCURRENTLY\" ON plugin_data (id);",
+        "CREATE INDEX idx_plugin ON plugin_data (id) WHERE note <> ' CONCURRENTLY';",
+        "/* VACUUM */ CREATE TABLE plugin_data (id INT);",
+        "CREATE /* DATABASE */ TABLE plugin_data (id INT);",
+        "CREATE INDEX idx_plugin_concurrently ON plugin_data (id);",
+    ] {
+        assert!(!postgres_requires_top_level(sql), "{sql}");
+    }
+    // Only PostgreSQL ever selects the top-level path.
+    let sqlite_statements = ["CREATE INDEX CONCURRENTLY idx ON t (id)"];
+    assert!(!statements_require_non_transactional_postgres("sqlite", &sqlite_statements));
+}
+
+#[test]
+fn mysql_leading_whitespace_padding_is_scanned_linearly() {
+    // Before #6375 every padding byte rescanned the bytes before and after it
+    // (quadratic). The bound is orders of magnitude above linear cost.
+    let padding = " ".repeat(200_000);
+    let sql = format!("{padding}SELECT 1;");
+    let started = Instant::now();
+    let statements = split_plugin_migration_statements(&sql, "mysql").unwrap();
+    assert_eq!(statements, ["SELECT 1"]);
+    let directive_sql = format!(
+        "{padding}-- lead\n{padding}DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END //\nDELIMITER ;\n{padding}SELECT 2;"
+    );
+    let statements = split_plugin_migration_statements(&directive_sql, "mysql").unwrap();
+    assert_no_delimiter_directives(&statements);
+    assert_eq!(
+        statements,
+        ["CREATE PROCEDURE p() BEGIN SELECT 1; END", "SELECT 2"]
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "padding scan took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn mysql_delimiter_word_after_statement_text_is_not_a_directive() {
+    assert_split(
+        "mysql",
+        "SELECT 1\nDELIMITER //\n;",
+        &["SELECT 1\nDELIMITER //"],
+    );
+    assert_split(
+        "mysql",
+        "SELECT 'x'\nDELIMITER //\n;",
+        &["SELECT 'x'\nDELIMITER //"],
+    );
 }
 
 #[test]

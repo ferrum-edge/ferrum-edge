@@ -49,6 +49,8 @@ impl std::error::Error for SqlStatementSplitError {}
 /// Empty segments (whitespace / comment-only after a delimiter) are omitted.
 /// The entire input is scanned before returning; malformed or unsupported
 /// constructs return [`Err`] so callers never partially apply a migration.
+/// Transaction-control statements (`BEGIN`, `COMMIT`, `ROLLBACK`, …) are
+/// rejected because the migration runner owns every transaction boundary.
 pub fn split_plugin_migration_statements<'a>(
     sql: &'a str,
     db_type: &str,
@@ -58,6 +60,7 @@ pub fn split_plugin_migration_statements<'a>(
     if dialect == SplitDialect::Mysql {
         validate_mysql_compound_statements(&statements)?;
     }
+    reject_transaction_control_statements(&statements, dialect)?;
     Ok(statements)
 }
 
@@ -111,14 +114,21 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
     // SQL `CASE … END` expressions (and MySQL `CASE … END CASE`) must not pop
     // an enclosing BEGIN depth.
     let mut case_depth: usize = 0;
+    // True while `[stmt_start, i)` holds only ASCII whitespace and complete
+    // comments. Tracked incrementally so leading padding is scanned once
+    // rather than rescanned at every byte.
+    let mut at_statement_start = true;
 
     while i < bytes.len() {
         // Client DELIMITER directives are only meaningful at statement starts.
         // They are mysql-client meta-commands: never push them as executable SQL.
+        // Only probe at the first non-whitespace byte so the directive parser
+        // never rescans the remaining padding.
         if dialect.allows_delimiter_directives()
             && compound_depth == 0
             && case_depth == 0
-            && is_at_statement_start(sql, stmt_start, i)
+            && at_statement_start
+            && !bytes[i].is_ascii_whitespace()
             && let Some(new_delim) = try_parse_delimiter_directive(sql, &mut i)?
         {
             // [stmt_start, previous i) was only whitespace/comments; discarding it
@@ -130,18 +140,22 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
             };
             skip_whitespace_and_newlines(bytes, &mut i);
             stmt_start = i;
+            at_statement_start = true;
             continue;
         }
 
         match bytes[i] {
             b'\'' => {
                 i = scan_single_quoted(sql, i, dialect)?;
+                at_statement_start = false;
             }
             b'"' => {
                 i = scan_double_quoted(sql, i, dialect)?;
+                at_statement_start = false;
             }
             b'`' if dialect.allows_backticks() => {
                 i = scan_backtick_quoted(sql, i, dialect)?;
+                at_statement_start = false;
             }
             b'-' if starts_dash_line_comment(bytes, i, dialect) => {
                 i = scan_line_comment(bytes, i + 2);
@@ -158,8 +172,10 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
                 } else {
                     i += 1;
                 }
+                at_statement_start = false;
             }
             b if b.is_ascii_alphabetic() || b == b'_' => {
+                at_statement_start = false;
                 let word_start = i;
                 i += 1;
                 while i < bytes.len() && is_ident_byte(bytes[i]) {
@@ -202,7 +218,11 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
                     i += delim_len;
                     skip_whitespace_and_newlines(bytes, &mut i);
                     stmt_start = i;
+                    at_statement_start = true;
                 } else {
+                    if !bytes[i].is_ascii_whitespace() {
+                        at_statement_start = false;
+                    }
                     i += 1;
                 }
             }
@@ -320,56 +340,6 @@ impl CowDelim {
                 .is_some_and(|candidate| candidate == d.as_bytes()),
         }
     }
-}
-
-/// True when `[stmt_start, i)` is only whitespace and/or SQL comments, so a
-/// MySQL `DELIMITER` directive at `i` is still at a statement boundary.
-fn is_at_statement_start(sql: &str, stmt_start: usize, i: usize) -> bool {
-    let bytes = sql.as_bytes();
-    let mut j = stmt_start;
-    while j < i {
-        if bytes[j].is_ascii_whitespace() {
-            j += 1;
-            continue;
-        }
-        if j + 1 < i && starts_dash_line_comment(bytes, j, SplitDialect::Mysql) {
-            // Line comments extend through newline; require the scanned span
-            // to stay within `[stmt_start, i)`.
-            let after = scan_line_comment(bytes, j + 2);
-            if after > i {
-                return false;
-            }
-            j = after;
-            continue;
-        }
-        // MySQL `#` line comments (DELIMITER handling is MySQL-only).
-        if bytes[j] == b'#' {
-            let after = scan_line_comment(bytes, j + 1);
-            if after > i {
-                return false;
-            }
-            j = after;
-            continue;
-        }
-        if j + 1 < i && bytes[j] == b'/' && bytes[j + 1] == b'*' {
-            let mut k = j + 2;
-            let mut closed = false;
-            while k + 1 < bytes.len() {
-                if bytes[k] == b'*' && bytes[k + 1] == b'/' {
-                    j = k + 2;
-                    closed = true;
-                    break;
-                }
-                k += 1;
-            }
-            if !closed || j > i {
-                return false;
-            }
-            continue;
-        }
-        return false;
-    }
-    true
 }
 
 fn try_parse_delimiter_directive(
@@ -789,12 +759,6 @@ fn strip_leading_sql_comments_for_dialect(mut sql: &str, dialect: SplitDialect) 
     }
 }
 
-/// Leading PostgreSQL `--` / nested `/* */` comment stripper shared with
-/// non-transactional statement classification.
-pub(super) fn strip_leading_sql_comments(sql: &str) -> &str {
-    strip_leading_sql_comments_for_dialect(sql, SplitDialect::Postgres)
-}
-
 fn validate_mysql_compound_statements(statements: &[&str]) -> Result<(), SqlStatementSplitError> {
     for statement in statements {
         if mysql_stored_program_looks_incomplete(statement) {
@@ -979,27 +943,156 @@ fn ends_with_mysql_end(sql: &str) -> bool {
     prev.eq_ignore_ascii_case("END")
 }
 
-/// Whether any statement requires PostgreSQL top-level (non-transactional) execution.
-pub(super) fn statements_require_non_transactional_postgres(
-    db_type: &str,
+/// Bare SQL words in `statement`, in order, excluding comments, quoted
+/// strings/identifiers, and PostgreSQL dollar-quoted bodies.
+///
+/// Statement classification must use these tokens rather than raw text: the
+/// server treats comments as whitespace and never interprets quoted content
+/// as keywords, so neither may change how a statement is executed.
+fn sql_keyword_tokens(statement: &str, dialect: SplitDialect) -> Vec<&str> {
+    let bytes = statement.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let next = match bytes[i] {
+            b'\'' => scan_single_quoted(statement, i, dialect),
+            b'"' => scan_double_quoted(statement, i, dialect),
+            b'`' if dialect.allows_backticks() => scan_backtick_quoted(statement, i, dialect),
+            b'-' if starts_dash_line_comment(bytes, i, dialect) => {
+                Ok(scan_line_comment(bytes, i + 2))
+            }
+            b'#' if dialect.allows_hash_line_comments() => Ok(scan_line_comment(bytes, i + 1)),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => scan_block_comment(statement, i, dialect),
+            b'$' if dialect.allows_dollar_quotes() => {
+                let dollar_end = try_scan_dollar_quoted(statement, i);
+                dollar_end.map(|end| end.unwrap_or(i + 1))
+            }
+            b if is_keyword_token_byte(b) => {
+                let mut end = i + 1;
+                while end < bytes.len() && is_keyword_token_byte(bytes[end]) {
+                    end += 1;
+                }
+                tokens.push(&statement[i..end]);
+                Ok(end)
+            }
+            _ => Ok(i + 1),
+        };
+        match next {
+            Ok(next) => i = next,
+            // Statements reaching classification already passed the full-body
+            // split, so an unterminated construct cannot occur; stop scanning.
+            Err(_) => break,
+        }
+    }
+    tokens
+}
+
+/// Non-ASCII bytes continue a word so a keyword embedded in a Unicode
+/// identifier is never split out as its own token.
+fn is_keyword_token_byte(b: u8) -> bool {
+    is_ident_byte(b) || !b.is_ascii()
+}
+
+fn token_is(tokens: &[&str], index: usize, keyword: &str) -> bool {
+    tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case(keyword))
+}
+
+/// The migration runner owns every transaction boundary: the SQLite migration
+/// lock is itself a `BEGIN IMMEDIATE` transaction, and PostgreSQL bodies share
+/// one runner transaction with their tracking row. A plugin statement that
+/// begins, commits, or rolls back a transaction would end that boundary
+/// before tracking is recorded (and on SQLite release the cross-process
+/// lock), so the full body is rejected before statement one executes.
+fn reject_transaction_control_statements(
     statements: &[&str],
-) -> bool {
+    dialect: SplitDialect,
+) -> Result<(), SqlStatementSplitError> {
+    for statement in statements {
+        if let Some(command) = transaction_control_command(statement, dialect) {
+            return Err(SqlStatementSplitError::new(
+                format!(
+                    "custom-plugin migration SQL must not contain transaction-control \
+                     statements ({command}); the migration runner owns transaction boundaries"
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn transaction_control_command(statement: &str, dialect: SplitDialect) -> Option<&'static str> {
+    let tokens = sql_keyword_tokens(statement, dialect);
+    let first = tokens.first()?;
+    if first.eq_ignore_ascii_case("BEGIN") {
+        return Some("BEGIN");
+    }
+    if first.eq_ignore_ascii_case("COMMIT") {
+        return Some("COMMIT");
+    }
+    // SQLite `END [TRANSACTION]` and PostgreSQL `END` are COMMIT aliases.
+    if first.eq_ignore_ascii_case("END") {
+        return Some("END");
+    }
+    // PostgreSQL `ABORT` is a ROLLBACK alias.
+    if first.eq_ignore_ascii_case("ABORT") {
+        return Some("ABORT");
+    }
+    if first.eq_ignore_ascii_case("ROLLBACK") {
+        // `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name` keeps the
+        // enclosing transaction open.
+        let to_index = if token_is(&tokens, 1, "WORK") || token_is(&tokens, 1, "TRANSACTION") {
+            2
+        } else {
+            1
+        };
+        if token_is(&tokens, to_index, "TO") {
+            return None;
+        }
+        return Some("ROLLBACK");
+    }
+    if first.eq_ignore_ascii_case("START") && token_is(&tokens, 1, "TRANSACTION") {
+        return Some("START TRANSACTION");
+    }
+    if dialect == SplitDialect::Postgres
+        && first.eq_ignore_ascii_case("PREPARE")
+        && token_is(&tokens, 1, "TRANSACTION")
+    {
+        return Some("PREPARE TRANSACTION");
+    }
+    if dialect == SplitDialect::Mysql && first.eq_ignore_ascii_case("XA") {
+        return Some("XA");
+    }
+    None
+}
+
+/// Whether any statement requires PostgreSQL top-level (non-transactional) execution.
+///
+/// Classification reads SQL keyword tokens only, so keywords inside comments
+/// or quoted text never select (or suppress) top-level execution.
+pub fn statements_require_non_transactional_postgres(db_type: &str, statements: &[&str]) -> bool {
     if db_type != "postgres" {
         return false;
     }
-    statements.iter().any(|statement| {
-        let normalized = strip_leading_sql_comments(statement)
-            .split_whitespace()
-            .map(str::to_ascii_uppercase)
-            .collect::<Vec<_>>()
-            .join(" ");
-        normalized.starts_with("VACUUM")
-            || normalized.starts_with("CREATE DATABASE")
-            || normalized.starts_with("DROP DATABASE")
-            || normalized.starts_with("ALTER SYSTEM")
-            || normalized.starts_with("REINDEX") && normalized.contains(" CONCURRENTLY")
-            || normalized.starts_with("CREATE INDEX") && normalized.contains(" CONCURRENTLY")
-            || normalized.starts_with("CREATE UNIQUE INDEX") && normalized.contains(" CONCURRENTLY")
-            || normalized.starts_with("DROP INDEX") && normalized.contains(" CONCURRENTLY")
-    })
+    statements
+        .iter()
+        .any(|statement| postgres_statement_requires_top_level(statement))
+}
+
+fn postgres_statement_requires_top_level(statement: &str) -> bool {
+    let tokens = sql_keyword_tokens(statement, SplitDialect::Postgres);
+    let at = |index: usize, keyword: &str| token_is(&tokens, index, keyword);
+    let concurrently = tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("CONCURRENTLY"));
+    at(0, "VACUUM")
+        || (at(0, "CREATE") && at(1, "DATABASE"))
+        || (at(0, "DROP") && at(1, "DATABASE"))
+        || (at(0, "ALTER") && at(1, "SYSTEM"))
+        || (at(0, "REINDEX") && concurrently)
+        || (at(0, "CREATE") && at(1, "INDEX") && concurrently)
+        || (at(0, "CREATE") && at(1, "UNIQUE") && at(2, "INDEX") && concurrently)
+        || (at(0, "DROP") && at(1, "INDEX") && concurrently)
 }
