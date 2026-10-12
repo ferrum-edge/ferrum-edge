@@ -285,10 +285,13 @@ a negative value means it has already expired.
 
 **Why it pages.** CRL admission rejects material at or after `nextUpdate`.
 OCSP admission allows up to 300 seconds of clock skew past `nextUpdate`, but
-the hourly staple re-check retires an accepted staple at the exact deadline. A
-gateway can therefore continue with a retired stapleless listener until fresh
-material is attached; a must-staple certificate then cannot complete a valid
-handshake. This alert gives advance notice before that loss of usable material.
+the first hourly staple re-check that observes `now >= nextUpdate` retires an
+accepted staple without that skew allowance. Because the check runs hourly,
+retirement can happen after the wall-clock deadline. A gateway can therefore
+continue with an expired staple until that check, then serve a stapleless
+listener until fresh material is attached; a must-staple certificate cannot
+complete a valid handshake in that state. This alert gives advance notice
+before that loss of usable material.
 
 **First checks.**
 
@@ -307,13 +310,19 @@ handshake. This alert gives advance notice before that loss of usable material.
 **Remediation.** Publish a freshly issued CRL (or a new stapled OCSP
 response) through the configured source. Their validity boundaries differ:
 CRL admission rejects at or after `nextUpdate`; OCSP admission allows up to
-300 seconds of clock skew past `nextUpdate`, while the hourly staple re-check
-retires an accepted staple at `nextUpdate`. After retirement the listener serves
-no staple, which leaves a must-staple certificate unusable until a fresh
-response is published. Do **not** restart the gateway as a remedy: startup
-revalidates the configured material, and a restart does not publish a fresh
-response. Verify the gauge moves after the source is updated; if it does not,
-the watcher is not seeing the new material.
+300 seconds of clock skew past `nextUpdate`, while the first hourly staple
+re-check that observes `now >= nextUpdate` retires an accepted staple without
+that skew allowance. After retirement the listener serves no staple, which
+leaves a must-staple certificate unusable until fresh valid material is
+accepted. When `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is enabled and the
+OCSP source is refreshable, publish the fresh response and confirm that a
+coherent rebuild is accepted before relying on live adoption. With the default
+static or inline configuration, or when live adoption is unavailable, install
+fresh valid material and then restart or roll out the gateway. Restarting
+against stale material does not repair the problem because startup revalidates
+the configured material and a restart does not publish a fresh response.
+Verify the gauge moves after the source is updated; if it does not, the watcher
+is not seeing the new material.
 
 **Escalation.** Page the PKI/CRL-issuing owner immediately when the remaining
 lifetime is under 24 hours, or when the issuer has stopped publishing.
