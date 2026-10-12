@@ -1049,7 +1049,10 @@ async fn test_fanout_resource_budget_refusal_is_not_acknowledged_as_admission() 
     }
     assert!(!headers.contains_key("x-loadtesting-key"));
     assert!(!headers.contains_key("x-loadtesting-fanout"));
-    assert!(!plugin.is_running(), "a refused trigger must start no cohort");
+    assert!(
+        !plugin.is_running(),
+        "a refused trigger must start no cohort"
+    );
     let result = plugin
         .last_run_result()
         .expect("a refused trigger records a terminal result");
@@ -1084,7 +1087,10 @@ async fn test_application_resource_budget_refusal_stays_fire_and_forget() {
         "the initiating application request must keep flowing"
     );
     assert!(!headers.contains_key("x-loadtesting-key"));
-    assert!(!plugin.is_running(), "a refused trigger must start no cohort");
+    assert!(
+        !plugin.is_running(),
+        "a refused trigger must start no cohort"
+    );
     let result = plugin
         .last_run_result()
         .expect("a refused trigger records a terminal result");
