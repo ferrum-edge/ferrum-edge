@@ -775,7 +775,8 @@ fn poller_refuses_a_node_replaced_before_its_identity_is_recorded() {
     );
     assert_ne!(run.status, 0, "an unproven node must fail the run");
     assert!(
-        run.stderr.contains("does not carry this run's provenance token"),
+        run.stderr
+            .contains("does not carry this run's provenance token"),
         "stderr: {}",
         run.stderr
     );
@@ -1351,11 +1352,13 @@ fn spire_start_failure_after_agent_launch_stops_both_children() {
 fn spire_start_failure_before_any_launch_leaves_nothing_to_stop() {
     let fixture = SpireFixture::new();
     let output = fixture.run(&["start", &fixture.root(), "stub-a.test"], &[]);
-    assert!(
-        !output.status.success(),
-        "a missing port is a usage error"
-    );
-    for name in ["stub-server.pid", "stub-agent.pid", "server.pid", "agent.pid"] {
+    assert!(!output.status.success(), "a missing port is a usage error");
+    for name in [
+        "stub-server.pid",
+        "stub-agent.pid",
+        "server.pid",
+        "agent.pid",
+    ] {
         assert!(!fixture.has(name), "{name}: nothing may be launched");
     }
 }
