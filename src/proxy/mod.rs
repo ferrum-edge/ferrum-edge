@@ -30172,10 +30172,10 @@ async fn transform_buffered_response_body_with_deadline_inner(
             // fresh full window are never both charged. An out-of-tree plugin that
             // declares no bounded construction contract is refused instead of being
             // invoked, because invoking it is what would let it allocate unbounded.
-            if let Some(reason) = crate::plugins::admit_response_body_producer(
-                plugin.response_body_production(),
-                window.as_mut(),
-            ) {
+            let production = plugin.response_body_production();
+            if let Some(reason) =
+                crate::plugins::admit_response_body_producer(production, window.as_mut())
+            {
                 warn_sampled!(
                     plugin = plugin.name(),
                     reason,
@@ -30265,10 +30265,28 @@ async fn transform_buffered_response_body_with_deadline_inner(
                 // window is refused for the same reason a backend body that size
                 // would be: it is above this response's retained ceiling.
                 //
-                // A `None` window here means a plugin declared as a non-producer
-                // returned bytes anyway: nothing was reserved for them, so they are
-                // refused rather than installed uncharged.
+                // A plugin declared as a non-producer that returned bytes anyway
+                // is refused per plugin, before any charge: a producing peer may
+                // have opened the window, but nothing was reserved on this
+                // plugin's account. A pure-Never chain, which opens no window at
+                // all, is refused here the same way.
                 let transformed_len = transformed.len();
+                if !production.may_replace_response_body() {
+                    warn_sampled!(
+                        plugin = plugin.name(),
+                        replacement_bytes = transformed_len,
+                        "Response body transform refused: a plugin declared as a \
+                         non-producer returned a replacement body"
+                    );
+                    replace_buffered_response_with_capacity_refusal(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    );
+                    return (true, true);
+                }
                 let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
                     warn_sampled!(
                         plugin = plugin.name(),

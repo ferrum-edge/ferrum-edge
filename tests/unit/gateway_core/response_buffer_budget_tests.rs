@@ -922,9 +922,10 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal(")
             .count(),
-        5,
+        6,
         "one definition, the transform window-open/admission/publication \
-         refusals, and final gRPC-Web reframe; the normalize call site lives in \
+         refusals, the per-plugin Never-production contract refusal (#6289), and \
+         final gRPC-Web reframe; the normalize call site lives in \
          src/plugins/mod.rs"
     );
     assert_eq!(
