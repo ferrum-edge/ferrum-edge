@@ -13,6 +13,16 @@ def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _is_finite_number(value):
+    """Check JSON numbers without letting oversized integers abort a report."""
+    if not _is_number(value):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def sample_issues(sample):
     issues = []
     if not isinstance(sample, dict):
@@ -41,9 +51,9 @@ def sample_issues(sample):
         else:
             duration = phases.get("measurement_secs")
             elapsed = phases.get("measurement_elapsed_secs")
-            if (not _is_number(duration) or not math.isfinite(duration) or duration <= 0
+            if (not _is_finite_number(duration) or duration <= 0
                     or duration != sample.get("duration_secs") or phases.get("timed_out")
-                    or not _is_number(elapsed) or not math.isfinite(elapsed)
+                    or not _is_finite_number(elapsed)
                     or not duration <= elapsed <= duration + max(0.1, duration * 0.05)):
                 issues.append("invalid/incomplete measurement phase")
             count = observed.get("samples")
@@ -53,8 +63,8 @@ def sample_issues(sample):
             for name in ("active_workers", "active_connections", "active_streams", "queued_requests"):
                 gauge = observed.get(name)
                 if (not isinstance(gauge, dict)
-                        or any(not _is_number(gauge.get(field))
-                               or not math.isfinite(gauge[field]) for field in ("min", "max", "mean"))
+                        or any(not _is_finite_number(gauge.get(field))
+                               for field in ("min", "max", "mean"))
                         or not 0 <= gauge["min"] <= gauge["mean"] <= gauge["max"]):
                     issues.append(f"missing/invalid observed {name}")
             if (observed.get("workers_at_barrier") != sample.get("effective_concurrency")
@@ -80,7 +90,7 @@ def sample_issues(sample):
                 if not records or any(
                         p.get("complete_bracket") is not True
                         or not _is_number(p.get("cpu_seconds"))
-                        or not math.isfinite(p["cpu_seconds"]) or p["cpu_seconds"] < 0
+                        or not _is_finite_number(p["cpu_seconds"]) or p["cpu_seconds"] < 0
                         for p in records):
                     issues.append(f"incomplete {role} measurement bracket")
     if sample.get("error"):
@@ -117,7 +127,7 @@ def sample_issues(sample):
         if not isinstance(size, int) or size <= 0 or sample.get("total_bytes") != requests * size:
             issues.append("echo byte accounting mismatch")
     rps = sample.get("rps")
-    if not _is_number(rps) or not math.isfinite(rps) or rps <= 0:
+    if not _is_finite_number(rps) or rps <= 0:
         issues.append("non-positive/invalid throughput")
     return issues
 
@@ -134,7 +144,7 @@ def bucket_issues(samples, expected_iterations):
 def throughput_value(sample):
     """Keep malformed/non-finite measurements out of display arithmetic too."""
     value = sample.get("rps")
-    return float(value) if _is_number(value) and math.isfinite(value) and value > 0 else 0.0
+    return float(value) if _is_finite_number(value) and value > 0 else 0.0
 
 
 def expected_rows(run_directory):
