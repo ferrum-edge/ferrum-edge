@@ -876,11 +876,12 @@ pub struct MetricsRegistry {
     admin_read_only_rejected_mutations: AtomicU64,
     /// `request_mirror` detached tasks admitted past concurrency + byte budgets.
     request_mirror_dispatched: AtomicU64,
-    /// `request_mirror` tasks that fully drained a response within bounds.
+    /// `request_mirror` tasks that fully drained a response (any status) within bounds.
     request_mirror_completed: AtomicU64,
     /// `request_mirror` request-phase deadline expiries.
     request_mirror_request_timeouts: AtomicU64,
-    /// `request_mirror` pre-response transport failures.
+    /// `request_mirror` non-timeout failures before a response, including local
+    /// client/request construction failures.
     request_mirror_request_failures: AtomicU64,
     /// `request_mirror` response-body drain deadline expiries.
     request_mirror_drain_timeouts: AtomicU64,
@@ -926,7 +927,8 @@ pub struct MetricsRegistry {
     service_discovery_tasks_kept: AtomicU64,
     /// Discovery tasks started for newly configured upstreams.
     service_discovery_tasks_started: AtomicU64,
-    /// Discovery tasks replaced because their effective specification changed.
+    /// Discovery tasks replaced because their effective specification changed
+    /// or their previous task had already finished.
     service_discovery_tasks_replaced: AtomicU64,
     /// Discovery tasks stopped because their upstream was removed.
     service_discovery_tasks_stopped: AtomicU64,
@@ -3992,7 +3994,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_request_mirror_completed_total",
-                "request_mirror tasks that fully drained a response within byte and time bounds.",
+                "request_mirror tasks that obtained a response of any HTTP status (including a locally synthesized 502) and fully drained it within byte and time bounds.",
                 self.request_mirror_completed.load(Ordering::Relaxed),
             ),
             (
@@ -4002,7 +4004,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_request_mirror_request_failures_total",
-                "request_mirror pre-response transport failures (DNS, refused, reset, TLS, …).",
+                "request_mirror non-timeout failures before a response was obtained: local client or request construction failures and transport errors (DNS, refused, reset, TLS).",
                 self.request_mirror_request_failures.load(Ordering::Relaxed),
             ),
             (
@@ -4023,7 +4025,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_request_mirror_cancellations_total",
-                "request_mirror tasks dropped before a terminal outcome (shutdown/panic/cancellation).",
+                "request_mirror dispatched tasks dropped before a terminal outcome, including tasks dropped before their first poll (shutdown/panic/cancellation).",
                 self.request_mirror_cancellations.load(Ordering::Relaxed),
             ),
             (
@@ -4089,7 +4091,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_service_discovery_stale_expiries_total",
-                "Service-discovery tasks whose last admitted snapshot crossed the configured staleness bound.",
+                "Service-discovery stale episodes whose expiry was claimed: the staleness anchor (last published snapshot, or task start before any) reached the effective bound (configured window floored at three poll intervals), then the episode was claimed after lifecycle checks (retain policy) or a successful withdrawal publication (withdrawing policies).",
                 self.service_discovery_stale_expiries
                     .load(Ordering::Relaxed),
             ),
@@ -4107,12 +4109,12 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_service_discovery_task_panics_total",
-                "Service-discovery pollers that exited unexpectedly instead of stopping cleanly.",
+                "Service-discovery poller or supervisor unwind panics: a poller JoinError observed by its supervisor, or a non-cancelled supervisor JoinError during teardown. Reachable only in panic=unwind builds.",
                 self.service_discovery_task_panics.load(Ordering::Relaxed),
             ),
             (
                 "ferrum_service_discovery_task_restarts_total",
-                "Service-discovery pollers restarted by their supervisor after an unexpected exit.",
+                "Service-discovery poller restarts scheduled by their supervisor after an unexpected exit; counted before the cancellable restart backoff, so a reconcile or shutdown during backoff can prevent the respawn.",
                 self.service_discovery_task_restarts.load(Ordering::Relaxed),
             ),
             (
@@ -4122,7 +4124,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_service_discovery_tasks_replaced_total",
-                "Service-discovery tasks replaced across a config reconcile because their effective specification changed.",
+                "Service-discovery tasks replaced across a config reconcile because their effective specification changed or their previous task had already finished; counted even when the replacement provider fails to start.",
                 self.service_discovery_tasks_replaced
                     .load(Ordering::Relaxed),
             ),
@@ -4133,7 +4135,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_service_discovery_tasks_stopped_total",
-                "Service-discovery tasks stopped because their upstream no longer configures service discovery.",
+                "Service-discovery stop decisions for tasks whose upstream no longer configures service discovery; counted when the stop is signalled, before the detached join completes.",
                 self.service_discovery_tasks_stopped.load(Ordering::Relaxed),
             ),
         ] {
@@ -4155,22 +4157,22 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_service_discovery_tasks_running",
-                "Service-discovery tasks whose poller is running.",
+                "Service-discovery tasks whose retained health state is starting or running; a recorded lifecycle state, not a live poller-handle census.",
                 discovery_health.running as i64,
             ),
             (
                 "ferrum_service_discovery_tasks_restarting",
-                "Service-discovery tasks waiting out a restart backoff after an unexpected poller exit.",
+                "Service-discovery tasks whose retained health state is restarting after an unexpected poller exit; the state persists through backoff and respawn until a snapshot is published.",
                 discovery_health.restarting as i64,
             ),
             (
                 "ferrum_service_discovery_tasks_crash_looping",
-                "Service-discovery tasks that exited unexpectedly repeatedly without an intervening published snapshot.",
+                "Service-discovery tasks whose retained health state is crash-looping after repeated unexpected exits without an intervening published snapshot; the state persists through respawn until a snapshot is published.",
                 discovery_health.crash_looping as i64,
             ),
             (
                 "ferrum_service_discovery_tasks_stale",
-                "Service-discovery tasks whose last admitted snapshot is older than the configured staleness bound.",
+                "Service-discovery tasks whose staleness anchor (last published snapshot, or task start before any) has reached the effective staleness bound (configured window floored at three poll intervals).",
                 discovery_health.stale as i64,
             ),
             (
@@ -4465,7 +4467,7 @@ impl MetricsRegistry {
             ),
             (
                 "ferrum_udp_amplification_policy_invalid_total",
-                "UDPResponseAmplificationPolicy objects rejected before listener programming.",
+                "UDPResponseAmplificationPolicy admission refusals: one per invalid, unauthorized, or unresolved policy object in each translation pass (repeats across passes); otherwise-valid policies that lose a conflict are not counted.",
                 amp.policy_invalid,
             ),
             (
@@ -4550,7 +4552,7 @@ impl MetricsRegistry {
 
         if !self.ws_bytes_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_websocket_bytes_total WebSocket payload bytes relayed by direction.\n",
+                "# HELP ferrum_websocket_bytes_total WebSocket bytes relayed by direction: frame payload bytes in framed mode, raw copied bytes under FERRUM_WEBSOCKET_TUNNEL_MODE; a tunnel-mode session stopped by gateway policy reports only its pre-relay residual bytes.\n",
             );
             output.push_str("# TYPE ferrum_websocket_bytes_total counter\n");
             for entry in self.ws_bytes_counter.iter() {
@@ -4566,7 +4568,7 @@ impl MetricsRegistry {
 
         if !self.ws_frames_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_websocket_frames_total WebSocket frames relayed by direction.\n",
+                "# HELP ferrum_websocket_frames_total WebSocket frames relayed by direction in framed mode; FERRUM_WEBSOCKET_TUNNEL_MODE sessions do not parse frames and add 0, so zero frames does not mean an empty session.\n",
             );
             output.push_str("# TYPE ferrum_websocket_frames_total counter\n");
             for entry in self.ws_frames_counter.iter() {
@@ -5572,7 +5574,7 @@ impl MetricsRegistry {
                 &ns_label,
             );
             output.push_str(
-                "# HELP ferrum_node_agent_ingress_interface_expected_interfaces Number of interfaces required by the proved node/CNI route topology (names are never labels).\n",
+                "# HELP ferrum_node_agent_ingress_interface_expected_interfaces Ingress interfaces established for the node/CNI route topology (names are never labels): the complete required set only when topology validation succeeds; while topology is unavailable, the partial count reached before validation stopped, not readiness or complete route coverage.\n",
             );
             output
                 .push_str("# TYPE ferrum_node_agent_ingress_interface_expected_interfaces gauge\n");
