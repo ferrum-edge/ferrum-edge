@@ -3357,6 +3357,24 @@ fn upsert_http_route_resources(
             acc.record_gateway_api_refused_route_attachments(attachments);
             continue;
         }
+        if let Some(sibling) = transport_incompatible_merge_target(acc, &proxy, route_kind) {
+            // The merged proxy keeps ONE backend scheme, and a dispatch
+            // destination cannot carry its own. Merging would dial a
+            // BackendTLSPolicy-covered upstream over plaintext (or an
+            // uncovered backend over TLS), so refuse this claim instead.
+            acc.warnings.push(format!(
+                "Gateway API route proxy {:?}/{:?} is refused: it shares the host+path claim of \
+                 {:?}/{:?} on the same listener but dials its backend over a different \
+                 transport (BackendTLSPolicy coverage differs), which one route-table slot \
+                 cannot represent",
+                proxy.namespace, proxy.id, sibling.0, sibling.1
+            ));
+            if let Some(key) = proxy_key {
+                acc.gateway_api_route_proxy_listeners.remove(&key);
+            }
+            acc.record_gateway_api_refused_route_attachments(attachments);
+            continue;
+        }
         if let Some(merged_into) = merge_http_route_proxy(acc, &proxy, &route_plugins, route_kind) {
             // The claim materializes through the proxy it collapsed into, so
             // credit that proxy: withdrawing the survivor must take the merged
@@ -3531,6 +3549,39 @@ fn can_merge_http_route_proxy(
         && namespaced_resource_key(&existing.namespace, &existing.id)
             .and_then(|key| acc.gateway_api_route_proxy_kinds.get(&key))
             .is_some_and(|kind| kind == route_kind)
+}
+
+/// The same-kind, same-listener sibling this candidate would merge into when
+/// the two dial their backends over different transports.
+///
+/// A merged proxy keeps the surviving proxy's `backend_scheme`, and
+/// `mesh_route_dispatch` destinations carry only upstream / host / port, so a
+/// BackendTLSPolicy-covered (`https`) rule cannot share a proxy with an
+/// uncovered (`http`) one. A candidate that never dials a backend (redirect,
+/// fault, or zero-weight blackhole rules) is transport-agnostic and may still
+/// merge. Returned as `(namespace, id)` for the refusal diagnostic.
+fn transport_incompatible_merge_target(
+    acc: &K8sAccumulator,
+    proxy: &Proxy,
+    route_kind: &str,
+) -> Option<(String, String)> {
+    if !route_proxy_dials_backend(proxy) {
+        return None;
+    }
+    // Same selection `merge_http_route_proxy` makes, so the transport check
+    // judges exactly the proxy the merge would extend.
+    acc.config
+        .proxies
+        .iter()
+        .find(|existing| can_merge_http_route_proxy(acc, existing, proxy, route_kind))
+        .filter(|existing| existing.backend_scheme != proxy.backend_scheme)
+        .map(|existing| (existing.namespace.clone(), existing.id.clone()))
+}
+
+/// Whether a route proxy forwards to a real backend rather than the
+/// zero-weight blackhole placeholder.
+fn route_proxy_dials_backend(proxy: &Proxy) -> bool {
+    proxy.upstream_id.is_some() || proxy.backend_host != ZERO_WEIGHT_BACKEND_HOST
 }
 
 /// Whether two materialized proxies occupy one physical route-table slot —
