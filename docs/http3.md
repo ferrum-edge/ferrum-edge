@@ -1,6 +1,6 @@
 # HTTP/3 (QUIC) Frontend & Backend
 
-Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxies it to backends of any supported protocol family — HTTP/1.1, HTTP/2, HTTP/3, or gRPC. The listener is fully decoupled from the backend scheme: an HTTP/3 client can hit an `https://` backend that speaks HTTP/1.1, or a `grpc://` backend, or an H3-preferred backend, and the gateway bridges all three transparently.
+Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxies it to backends of any supported protocol family — HTTP/1.1, HTTP/2, HTTP/3, or gRPC. The listener is fully decoupled from the backend scheme: an HTTP/3 client can hit an `https://` backend that speaks HTTP/1.1, a gRPC request sent to an `http://` or `https://` backend, or an H3-preferred backend, and the gateway bridges all three transparently. gRPC is a request flavor, not a backend URL scheme.
 
 ## Table of Contents
 
@@ -186,7 +186,7 @@ When the matched proxy has `backend_scheme: https`, the concrete backend target 
 
 - Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body_under_authorization()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. The admitted authorization plan bounds acquisition, HEADERS, upload, and response headers; cancellation resets an unfinished backend upload with `H3_REQUEST_CANCELLED`. No buffering. See [dispatch authorization lifetime](request_lifetime_dispatch.md).
 - Response body: written straight to the client stream with the shared H3 coalescing window (see [Coalescing and frame cadence](#coalescing-and-frame-cadence)).
-- Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
+- Request DATA chunks are passed to h3 as `Bytes`. On responses, chunks large enough to bypass coalescing are passed through, while smaller chunks are copied into the coalescing accumulator before being sent; this path is not universally zero-copy.
 
 The same native QUIC fast path also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`, and it is **fully bidirectional**. The response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded after response-direction hop-by-hop stripping and response-header-policy reconciliation of its application metadata (the reserved status fields always survive — see [Native gRPC terminal metadata](#native-grpc-terminal-metadata)). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, client-streaming, and bidirectional RPCs are all supported. Retry / body-buffering gRPC still falls through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
 
@@ -293,7 +293,7 @@ Retry-enabled requests normally keep native-H3 responses buffered so status-base
 
 A backend that was H3-capable at refresh time may later lose its QUIC listener — rollback, UDP block, infrastructure change. Without live invalidation, every request keeps taking the native H3 path and 502s until the next periodic refresh (default 24 h).
 
-Every H3 backend failure path — H1/H2 frontend→H3 backend (`proxy_to_backend`, `proxy_to_backend_http3_retry`) and H3 frontend→H3 backend (`http3/server.rs` streaming-body / streaming-response / buffered) — classifies the error via `is_h3_transport_error_class` (ConnectionRefused / Timeout / Reset / Closed / TlsError / ProtocolError / DnsLookupError / PortExhaustion / ConnectionPoolError). The classifier looks at `error_class` only, NOT `connection_error`: `classify_h3_error` flags GOAWAY / stream reset as `connection_error=false`, but they are still H3 transport failures that warrant a downgrade. Backend response read deadlines classify as `ReadWriteTimeout` for retry/LB/accounting, but are intentionally excluded from H3 capability downgrade because a stalled response does not prove the target has lost QUIC/H3 support. The pool carries a typed `H3PoolError::is_read_timeout()` signal for these (set when `backend_read_timeout_ms` expires around `recv_response()` or the buffered `recv_data` drain), and every gateway H3 dispatch site maps it to **504** `{"error":"Backend timeout"}` with `connection_error=false` — the same client-visible outcome as the direct-H2 / HBONE / sidecar-mTLS read-timeout arms — instead of the generic 502. On a transport-class failure the registry entry is Arc-swapped so `plain_http.h3 = Unsupported` via `BackendCapabilityRegistry::mark_h3_unsupported`, with an operator-visible `last_probe_error`. Subsequent requests see `Unsupported`, skip the native H3 pool, and route via the cross-protocol bridge. The next periodic refresh re-probes; if the backend recovered, `Supported` is restored.
+Every H3 backend failure path — H1/H2 frontend→H3 backend (`proxy_to_backend`, `proxy_to_backend_http3_retry`) and H3 frontend→H3 backend (`http3/server.rs` streaming-body / streaming-response / buffered) — classifies the error via `is_h3_transport_error_class` (ConnectionRefused / Timeout / Reset / Closed / TlsError / ProtocolError / DnsLookupError / PortExhaustion). The classifier looks at `error_class` only, NOT `connection_error`: `classify_h3_error` flags GOAWAY / stream reset as `connection_error=false`, but they are still H3 transport failures that warrant a downgrade. Backend response read deadlines classify as `ReadWriteTimeout` for retry/LB/accounting, but are intentionally excluded from H3 capability downgrade because a stalled response does not prove the target has lost QUIC/H3 support. The pool carries a typed `H3PoolError::is_read_timeout()` signal for these (set when `backend_read_timeout_ms` expires around `recv_response()` or the buffered `recv_data` drain), and every gateway H3 dispatch site maps it to **504** `{"error":"Backend timeout"}` with `connection_error=false` — the same client-visible outcome as the direct-H2 / HBONE / sidecar-mTLS read-timeout arms — instead of the generic 502. On a transport-class failure the registry entry is Arc-swapped so `plain_http.h3 = Unsupported` via `BackendCapabilityRegistry::mark_h3_unsupported`, with an operator-visible `last_probe_error`. Subsequent requests see `Unsupported`, skip the native H3 pool, and route via the cross-protocol bridge. The next periodic refresh re-probes; if the backend recovered, `Supported` is restored.
 
 **Refresh must not undo a proven classification.** The periodic refresh builds a fresh record per target, so a probe that fails for reachability reasons alone would otherwise wipe a working `Supported` entry for a whole refresh interval (default 24 h). `probe_h3` / `probe_h2_tls` therefore merge against the previous record via `merge_protocol_probe_classification`: a transient class (`DnsLookupError`, `ConnectionTimeout`, `ConnectionRefused`, `PortExhaustion`) or a TLS-config build failure carries the prior verdict forward, mirroring the HBONE probe's preserve-on-non-capability-failure contract, while ALPN/protocol evidence still downgrades. A **first** probe has no verdict to protect, so it still classifies definitively — a QUIC connect timeout is indistinguishable from "no QUIC listener", and preserving `Unknown` there would leave every non-QUIC HTTPS backend permanently unclassified. A probe failure against a target previously classified `Supported` always stamps `last_probe_error`, so both a real downgrade and a preserved-but-stale record are visible in `GET /backend-capabilities`; expected "no QUIC here" outcomes stay silent so healthy backends do not report a phantom error every cycle. The plaintext h2c capability probe follows the same operator-noise rule at the tracing layer: an expected HTTP/1.1 h2c miss is debug-only (see [Backend Capability Registry](admin_api.md#backend-capability-registry)), while request-time gRPC failures, probe dial timeouts, port exhaustion, and unexpected candidate connection/handshake failures stay at WARN/ERROR.
 
@@ -303,7 +303,7 @@ Every H3 backend failure path — H1/H2 frontend→H3 backend (`proxy_to_backend
 
 Rejection is fail-closed and terminal for that cycle: the newer live record survives, the probe result is dropped rather than retried (the transport failure is strictly more recent evidence), and the next refresh re-classifies from the new baseline. Because the token is the whole record, an H3-only probe cannot clobber a concurrent HBONE or H2/TLS downgrade it never observed. Operator-facing accounting follows the commit, not the proposal: the `h2_tls` / `h3` / `h2c` / `hbone` tallies and the "supported protocol changed to unavailable" warning are computed from the record that was actually published, and discarded probes are reported separately in the refresh summary line rather than folded into the classification counts.
 
-**Typed classifier**: `classify_h3_error` in `src/proxy/mod.rs` is a thin wrapper over `http3::client::classify_http3_error` — both walk `std::error::Error::source()` for typed `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` first, falling back to anchored substring matches on `h3::Error` Display strings only when the typed chain doesn't expose a recognizable cause. The proxy wrapper returns just `(error_kind_label, ErrorClass)`; the `connection_error: bool` is derived separately via `H3PoolError::request_on_wire()` (the pool's typed body-on-wire signal — see [Stale capability recovery](#stale-capability-recovery) above) and `retry::request_reached_wire(class)` for paths that don't go through the pool. The buffered consumer in `proxy_to_backend_http3` calls `drain_h3_response_body`, which returns `Result<Vec<u8>, h3::error::StreamError>` so the typed `StreamError` reaches the classifier directly — and graceful recoveries (`H3_NO_ERROR` / `GOAWAY` after a complete body) are caught at the `recv_data` boundary inside the drain helper itself and never produce an error in the first place.
+**Typed classifier**: `classify_h3_error` in `src/proxy/mod.rs` is a thin wrapper over `http3::client::classify_http3_error` — both walk `std::error::Error::source()` for typed `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` first, then use substring checks on the lowercased error display text when the typed chain doesn't expose a recognizable cause. The text checks are broad `contains` tests, not anchored token matches. `ConnectionPoolError` is not in the positive capability-downgrade class list. The proxy wrapper returns just `(error_kind_label, ErrorClass)`; the `connection_error: bool` is derived separately via `H3PoolError::request_on_wire()` (the pool's typed body-on-wire signal — see [Stale capability recovery](#stale-capability-recovery) above) and `retry::request_reached_wire(class)` for paths that don't go through the pool. The buffered consumer in `proxy_to_backend_http3` calls `drain_h3_response_body`, which returns `Result<Vec<u8>, h3::error::StreamError>` so the typed `StreamError` reaches the classifier directly — and graceful recoveries (`H3_NO_ERROR` / `GOAWAY` after a complete body) are caught at the `recv_data` boundary inside the drain helper itself and never produce an error in the first place.
 
 ### Graceful close handling at recv_response
 
@@ -964,7 +964,8 @@ frontend: client-to-server frames MUST be masked, server-to-client
 frames MUST NOT be, and a server MUST close the connection on an
 unmasked client frame. RFC 9220 §5 is IANA Considerations.
 
-The gateway's H3 path is therefore identical to H1 and H2:
+When the gateway parses frames (the default `strip` mode or `terminate` mode),
+its H3 path follows the same RFC 6455 masking rules as H1 and H2:
 
 - **Emits unmasked frames to the client** — `tokio_tungstenite`'s
   `Role::Server` doesn't mask outgoing frames, which is what RFC 6455
@@ -978,6 +979,13 @@ The gateway's H3 path is therefore identical to H1 and H2:
   on every frontend, so an unmasked client frame is a tungstenite
   protocol error and the client is closed with code `1002` by the same
   shared close mapping H1/H2 use.
+
+By default, the gateway strips the `permessage-deflate` offer and parses
+WebSocket frames. With `websocket_permessage_deflate: passthrough`, it forwards
+the offer only when no enabled plugin requires frame parsing; if compression is
+negotiated, the session uses a raw byte relay and the gateway does not inspect
+frames. The peers still have to follow RFC 6455 masking rules. The process-wide
+`FERRUM_WEBSOCKET_TUNNEL_MODE` flag does not select this H3 behavior.
 
 
 ### Tunnel mode
@@ -1360,10 +1368,12 @@ payload ceiling, a live tunnel can concurrently hold the decoder's transient
 buffer (bounded at `2 × (P + 8 + 16)` — the ceiling above, not one capsule),
 the `P + 1`-byte target receive buffer, and the client-bound framing scratch
 plus a framed capsule still owned by a `send_data` future that QUIC send flow
-control has blocked (about `2 × (P + 9)`). The conservative per-session bound is
-therefore about `5 × P` — roughly 320 KiB at the 65527-byte default, or roughly
-80 MiB across the 256-session default. Lower
-`FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` to scale every term down.
+control has blocked (about `2 × (P + 9)`, with a fixed 4096-byte initial
+capacity for the framing scratch). The roughly `5 × P` estimate is therefore a
+large-payload approximation: it is about 320 KiB at the 65527-byte default,
+or roughly 80 MiB across the 256-session default. Lowering
+`FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` reduces payload-dependent terms,
+but not the framing scratch's initial capacity.
 
 Each tunnel uses one *connected* UDP socket (RFC 9298 §3.1), so the kernel
 enforces the 5-tuple and off-path packets never enter the session. The socket is
@@ -1617,7 +1627,7 @@ The H3 listener enforces its own per-header and total-header size limits:
 
 | Env var | Purpose |
 |---|---|
-| `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | Max bytes per individual header value |
+| `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | Max combined name and value bytes for an individual header |
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | Max bytes across all headers combined |
 
 These are enforced separately from hyper's built-in validation because the H3 listener parses headers via the `h3` crate, not via hyper. The `Host` value used for routing is extracted from an already-validated header, so separate host-length validation is unnecessary.
@@ -1671,11 +1681,13 @@ raw decoded field vector, before any per-field validation and before Ferrum's ow
 process under `panic = "abort"`.
 
 QPACK bounds only the accumulated field-section size, never the field count, and
-accounts `name + value + 32` bytes per field, so the admitted field count is
-exactly `field_section_size / 32`. Both H3 field-section policies — the
+accounts `name + value + 32` bytes per field, so a field section of size `S`
+admits at most `floor(S / 32)` decoded fields. Both H3 field-section policies — the
 frontend request policy and the backend response policy — are therefore capped at
 `(24_576 − 576) × 32 = 768,000` bytes, which admits at most 24,000
-decoded fields. The 576-field margin covers pseudo-header expansion.
+decoded fields. This leaves 576 entries of conservative slack below the
+24,576-entry HeaderMap construction ceiling; pseudo-fields are stored separately
+from ordinary headers and do not account for that margin.
 
 The cap applies to the **frontend** policy as well as the backend one: with a
 sufficiently large `FERRUM_MAX_HEADER_SIZE_BYTES`, an unauthenticated H3 client
@@ -1716,11 +1728,13 @@ than a connection abort. Only a declaration far beyond the policy — the attack
 shape — reaches the connection-level refusal. The listener's own post-decode
 total-header check remains in place as defence in depth. On the backend client,
 the same 2x declared-frame ceiling bounds encoded response HEADERS and the
-peer's unidirectional control and push frames without adding a decoded response
-header policy that H1/H2 backends do not share.
+peer's unidirectional control and push frames. Pooled H3 backend clients also
+enforce the finite decoded response field-section ceiling described above; an
+oversized QPACK-decoded response is rejected during decoding.
 
-**Configuration admission.** Both derived values travel the wire as QUIC
-varints. `EnvConfig::validate` refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` whose
+**Configuration admission.** The derived buffered-frame ceiling is a local
+receive policy; the derived field-section size is advertised in SETTINGS as a
+QUIC varint. `EnvConfig::validate` refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` whose
 derived ceiling would not fit in one, rather than silently clamping the policy
 into a bound the operator never configured (which would also make the H3
 frontend disagree with H1 and H2 about the same setting). For the same reason it
@@ -1771,7 +1785,7 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` | `256` | Maximum concurrent CONNECT-UDP tunnels for this process; `503` over the limit. `0` disables the limit. A value above the tokio semaphore permit ceiling is a startup validation error, never a silent clamp or a silent "unlimited". |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` | `32` | Maximum concurrent CONNECT-UDP tunnels per resolved client (IPv4 per address, IPv6 grouped by `/64`); `503` over the limit. The slot is held for the tunnel's lifetime and released on every close path. `0` disables the per-client cap. |
 | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | `120` | Seconds a tunnel may carry no datagram in either direction (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below. This value is also the floor for the frontend QUIC connection idle timeout while the profile is enabled, so the advertised tunnel lifetime is the one that actually holds. |
-| `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales every per-session buffer — see [Bounds and lifecycle](#bounds-and-lifecycle). |
+| `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales payload-dependent per-session buffers; the client-bound framing scratch has an independent initial capacity of 4096 bytes — see [Bounds and lifecycle](#bounds-and-lifecycle). |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |
 
 ## Authorization lifetime at backend handoff

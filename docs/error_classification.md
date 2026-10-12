@@ -73,8 +73,8 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 | HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS. Port exhaustion and every other pre-wire io verdict live INSIDE the `is_connect()` branch. **Four-way boundary:** (1) connect-phase RST/refused with no rustls → `ConnectionRefused`; (2) typed rustls during the independently known connect phase → `TlsError`; (3) hyper `is_canceled()` with no rustls → `ConnectionPoolError` (issue #4406 live reqwest path; issue #3578); (4) post-connect RST / refusal / `EADDRNOTAVAIL` / rustls error → `ConnectionReset` (issue #4536). Missing `close_notify` is matched *before* rustls so it stays `ConnectionClosed` (#4051). Post-connect `UnexpectedEof` / incomplete message → `ConnectionClosed`. Bounded substring fallback inside the `is_connect()` branch |
 | HTTP/2 (direct pool acquisition) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants. `BackendUnavailableSource::Tls` is a construction-site handshake-phase signal and classifies as `TlsError` (except TimedOut → `ConnectionTimeout` and port exhaustion). Other io walks peek rustls via `io::Error::get_ref()` before the connect-phase RST collapse. |
 | HTTP/2 (pooled request send) | [`classify_pooled_h2_send_request_error`](../src/proxy/http2_pool.rs) | `&hyper::Error` | Hyper typed predicates → post-wire io source-chain walk → conservative `ProtocolError` fallback |
-| HTTP/3 (native pool) | [`classify_http3_error`](../src/http3/client.rs) | `&dyn Error` | Typed walk for `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` → anchored substring fallback for `h3::Error` Display |
-| gRPC | [`classify_grpc_proxy_error`](../src/retry.rs) | `&GrpcProxyError` (typed enum with kinds) | Pattern match on `BackendUnavailable.kind: GrpcBackendUnavailableKind` → typed `is_port_exhaustion` source walk → no message substring matching |
+| HTTP/3 (native pool) | [`classify_http3_error`](../src/http3/client.rs) | `&dyn Error` | Typed walk for `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` → broad substring checks on lowercased error display text when no recognizable typed cause is exposed |
+| gRPC | [`classify_grpc_proxy_error`](../src/retry.rs) | `&GrpcProxyError` (typed enum with kinds) | Checks debug text for egress-policy denial before matching `BackendUnavailable.kind: GrpcBackendUnavailableKind`; then uses a typed `is_port_exhaustion` source walk with a message fallback when the source chain has no port-exhaustion errno |
 | WebSocket / generic boxed | [`classify_boxed_error`](../src/retry.rs) | `&dyn Error` | Typed walk: `StreamSetupError` (TCP/UDP setup) → `tokio_tungstenite::tungstenite::Error` (RFC 6455 ConnectionClosed/AlreadyClosed/Protocol) → `io::Error` → `hyper::Error` → bounded Display/Debug fallback |
 | TCP relay (stream) | [`classify_stream_error`](../src/proxy/tcp_proxy.rs) | `&anyhow::Error` | Thin wrapper over `classify_boxed_error` — same typed walk |
 | Streaming response body | [`classify_body_error`](../src/retry.rs) | `&dyn Error` | Typed walk for io/h2/hyper, returns `(ErrorClass, client_disconnected: bool)` |
@@ -497,13 +497,15 @@ such a rejection can be under-marked, but it never gets a false reference. A
 response is gateway-authored only when its rejection site recorded it in the
 request's diagnostic slot before the head was written, and
 only on a head whose status is the one that rejection recorded (a rejection a
-later phase replaced marks nothing). A backend's own `4xx`/`5xx` never carries a
-reference: not when it is relayed to the client, and not when a plugin replays
-or relays it as its short-circuit (a `response_caching` or `ai_semantic_cache`
-hit, a `request_deduplication` idempotent replay, a `serverless_function`
-terminate reply, an `ai_federation` provider response or provider-failure
-envelope). Neither does a plugin short-circuit that answers `2xx`/`3xx`. The
-lookup of such a reference has a `null` `gateway_error`.
+later phase replaced marks nothing). An ordinary relayed backend `5xx` receives
+the compiled `backend_error` token and may carry a diagnostic reference when
+diagnostics are enabled. Backend `4xx` responses do not receive a reference.
+Neither do marked origin-served plugin replays or short-circuits (a
+`response_caching` or `ai_semantic_cache` hit, a `request_deduplication`
+idempotent replay, a `serverless_function` terminate reply, an `ai_federation`
+provider response or provider-failure envelope), or a plugin short-circuit
+that answers `2xx`/`3xx`. The lookup of such an excluded response has a
+`null` `gateway_error`.
 
 **Ownership.** The header is gateway-owned whatever the setting. A backend or
 serverless-function copy, in the headers or the trailers, is stripped at every
