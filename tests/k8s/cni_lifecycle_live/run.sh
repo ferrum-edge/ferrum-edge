@@ -217,17 +217,66 @@ run_job() {
   [ "$phase" = "Succeeded" ]
 }
 
+# Poll a pod's phase until it leaves Pending or the budget runs out, and print
+# the last phase a status read actually returned. A failed or empty read is not
+# an observation: when no read in the whole budget returned a phase, this fails
+# with a bounded diagnostic rather than printing an empty phase a caller could
+# mistake for "not Pending". A pod observed to stay Pending prints `Pending`
+# and succeeds, so callers keep it distinct from an unavailable status.
+# $3 is the poll interval in seconds.
 wait_for_pod_not_pending() {
-  local pod="$1" budget="${2:-90}"
-  local deadline=$((SECONDS + budget)) phase=""
+  local pod="$1" budget="${2:-90}" interval="${3:-5}"
+  local deadline=$((SECONDS + budget)) phase="" observed="" read_error="" err_file
+  err_file="$(mktemp)"
   while [ "$SECONDS" -lt "$deadline" ]; do
-    phase="$(kubectl get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-    if [ "$phase" != "Pending" ] && [ -n "$phase" ]; then
-      break
+    if phase="$(kubectl get pod "$pod" -o jsonpath='{.status.phase}' 2>"$err_file")"; then
+      if [ -n "$phase" ]; then
+        observed="$phase"
+        if [ "$phase" != "Pending" ]; then
+          break
+        fi
+      else
+        read_error="empty status.phase"
+      fi
+    else
+      read_error="$(tr '\n' ' ' <"$err_file" | cut -c1-512)"
     fi
-    sleep 5
+    sleep "$interval"
   done
+  rm -f "$err_file"
+  if [ -z "$observed" ]; then
+    echo "::error title=Pod phase never observed::${pod}: no status read returned a phase within ${budget}s (last read: ${read_error:-none})" >&2
+    return 1
+  fi
+  printf '%s' "$observed"
+}
+
+# Phases that prove a recovery probe pod got past sandbox creation. The probe
+# is a `restartPolicy: Never` pod running `uninstall-status`, which exits 1 when
+# no cleanup marker exists, so its ordinary terminal phase is Failed; Running
+# and Succeeded are the same evidence observed earlier or with a marker present.
+# A pod whose chained CNI ADD fails never leaves Pending (the stuck-pod check
+# relies on that), and Unknown or an unreadable status proves nothing.
+is_recovered_pod_phase() {
+  case "$1" in
+    Running|Succeeded|Failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prove a freshly applied probe pod was created normally: its phase must be
+# observed within the budget AND be a recovered phase. Prints the observed
+# phase (possibly empty) either way.
+observe_recovered_pod() {
+  local pod="$1" budget="$2" interval="${3:-5}" phase
+  if ! phase="$(wait_for_pod_not_pending "$pod" "$budget" "$interval")"; then
+    return 1
+  fi
   printf '%s' "$phase"
+  if ! is_recovered_pod_phase "$phase"; then
+    echo "::error title=Pod creation not proven::${pod} reached phase '${phase}', not Running, Succeeded or Failed" >&2
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -266,7 +315,11 @@ spec:
       imagePullPolicy: Never
       command: ["${CNI_BIN_PATH}", "uninstall-status"]
 YAML
-phase="$(wait_for_pod_not_pending stuck-pod 90)"
+if ! phase="$(wait_for_pod_not_pending stuck-pod 90)"; then
+  kubectl describe pod stuck-pod | tee "$RESULTS_DIR/stuck-pod-describe.txt" | tail -n 30 || true
+  echo "::error title=Stuck pod phase never observed::fail-closed ADD cannot be proven without an observed Pending phase"
+  exit 1
+fi
 kubectl describe pod stuck-pod | tee "$RESULTS_DIR/stuck-pod-describe.txt" | tail -n 30
 if [ "$phase" != "Pending" ]; then
   echo "::error title=Pod creation did not fail closed::stuck-pod reached phase '$phase' without a node-agent"
@@ -327,9 +380,9 @@ YAML
   sleep 5
 done
 phase="$(kubectl get pod stuck-pod -o jsonpath='{.status.phase}')"
-if [ "$phase" = "Pending" ]; then
-  kubectl describe pod stuck-pod | tee "$RESULTS_DIR/stuck-pod-after-rollback.txt" | tail -n 30
-  echo "::error title=Pod creation did not recover after rollback::stuck-pod is still Pending"
+if ! is_recovered_pod_phase "$phase"; then
+  kubectl describe pod stuck-pod | tee "$RESULTS_DIR/stuck-pod-after-rollback.txt" | tail -n 30 || true
+  echo "::error title=Pod creation did not recover after rollback::stuck-pod phase is '${phase}', not Running, Succeeded or Failed"
   exit 1
 fi
 echo "Confirmed live: rollback restored pod creation on the node (stuck-pod reached '$phase')."
@@ -372,10 +425,9 @@ spec:
       imagePullPolicy: Never
       command: ["${CNI_BIN_PATH}", "uninstall-status"]
 YAML
-phase="$(wait_for_pod_not_pending recovered-pod 120)"
-if [ "$phase" = "Pending" ]; then
-  kubectl describe pod recovered-pod | tee "$RESULTS_DIR/recovered-pod-describe.txt" | tail -n 30
-  echo "::error title=Pod creation still broken after uninstall::recovered-pod is Pending"
+if ! phase="$(observe_recovered_pod recovered-pod 120)"; then
+  kubectl describe pod recovered-pod | tee "$RESULTS_DIR/recovered-pod-describe.txt" | tail -n 30 || true
+  echo "::error title=Pod creation still broken after uninstall::recovered-pod phase '${phase:-unobserved}' does not prove normal pod creation"
   exit 1
 fi
 echo "Confirmed live: after uninstall the node creates pods normally (recovered-pod reached '$phase')."

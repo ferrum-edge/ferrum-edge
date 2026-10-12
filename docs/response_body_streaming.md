@@ -212,7 +212,7 @@ Built-in plugins with per-request refinement:
 |--------|---------------------|
 | `compression` | The client's `Accept-Encoding` selects no supported nonzero coding — identity, unsupported-only, or all-`q=0` requests (nothing to compress) — or the request is `HEAD` / request `no-transform`. It also skips (streams identity) when `before_proxy` negotiated a supported coding but could not reserve bounded response-buffer admission, or when `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is unlimited (`0`) or above the fixed 32 MiB compression safety ceiling. The buffered population never exceeds the dedicated response-buffer semaphore, while codec CPU admission remains independent, and every compression-induced full-body collection has an absolute per-response bound. |
 | `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
-| `ai_rate_limiter` | Never for active HTTP responses (HTTP-only plugin; native gRPC is not in the protocol view); response usage reconciliation needs the body. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
+| `ai_rate_limiter` | Its config-time capability remains enabled, but this instance skips response buffering when the request has no AI/deferred-compressed/reservation accounting candidate, or when response headers show a non-2xx status or a missing, non-JSON, or framed-gRPC representation. A candidate successful JSON response stays buffered for usage reconciliation. Other plugins or `response_body_mode: buffer` may still require buffering. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
 | `ai_response_guard` | Never from request-side intent. An active guard buffers conservatively until pristine backend headers are known. A genuine backend event stream is then decided before header commit: enforcing/redacting/structural policies reject with 502 because they cannot inspect an unbounded stream completely, while a warn-only guard records the uninspectable stream and permits it. Native gRPC is the one request-side exception: a gRPC request whose method is not enrolled in the plugin's `grpc` block is released to stream, because an un-enrolled method has no decodable contract to enforce. |
 | `body_validator` response rules | Never from request-side intent. A genuine backend event stream is rejected with 502 before header commit while response validation is active. After headers, media types outside configured JSON/XML `response_content_types` (including malformed/ambiguous values that cannot match), and gRPC without applicable protobuf response validation, are released to stream; a missing type, matching JSON/XML, and applicable gRPC stay buffered. |
 | `openapi_validator` response rules | Never from request-side intent. A genuine backend event stream follows the configured response-mismatch posture: `block` rejects before commit; `log_only` records the mismatch and permits the stream. |
@@ -398,7 +398,7 @@ Three properties are load-bearing:
 
 | Point | Behavior |
 |-------|----------|
-| Before the credential is accepted | Ordinary authentication rejection — a fixed `401`. An expired JWT/JWKS/OIDC/introspection credential fails at validation; an `mtls_auth` leaf outside its validity interval fails the per-request temporal check, including on a reused H1 keep-alive connection and on new H2/H3 streams over an existing transport connection |
+| Before the credential is accepted | Authentication rejection or challenge, with the status chosen by the provider. For example, expired OIDC claims enter its configured browser or API challenge path (the browser path may redirect); ordinary token and mTLS validation failures use their provider's rejection behavior. An `mtls_auth` leaf outside its validity interval fails the per-request temporal check, including on a reused H1 keep-alive connection and on new H2/H3 streams over an existing transport connection |
 | After acceptance, before the downstream response head is committed | A fixed terminal chosen once, at the single point where every H1/H2 dispatch path converges: plain HTTP, SSE, and chunked responses get a fixed `401` with the compiled-in `{"error":"Unauthorized"}` body; native gRPC gets HTTP 200 with trailers-only `grpc-status: 16` (`UNAUTHENTICATED`); gRPC-Web gets the equivalent bounded terminal through the shared translation. This is the terminal a **request-upload** expiry produces, because the upload seam fires while the backend is still withholding response headers |
 | After the response head is committed, before any response DATA | Native gRPC receives `grpc-status: 16` (`UNAUTHENTICATED`) trailers; gRPC-Web receives the equivalent bounded trailer frame in DATA. Ordinary HTTP and SSE have **no** terminal status metadata, so the body ends with a transport error instead — a `grpc-status` trailer is never synthesized for a client that did not speak gRPC, and the body never ends cleanly, which would be indistinguishable from a complete response |
 | After response DATA is committed | The body ends with a transport error, which resets the HTTP/2 or HTTP/3 stream and terminates an HTTP/1.1 or SSE body deterministically. A complete gRPC message boundary cannot be proven at that point, so a terminal status is **never fabricated** |
@@ -415,10 +415,11 @@ through the same deferred machinery every other terminal path uses.
 The response-body adapter only acts when the transport **polls** it, and hyper
 does not always poll a response body:
 
-- **HTTP/2.** `PipeToSendStream` reserves stream send capacity and awaits
-  `SendStream::poll_capacity` *before* it polls the body. A client that
+- **HTTP/2.** `PipeToSendStream` polls the body for a frame first, then reserves
+  stream send capacity for DATA. If capacity is unavailable, it retains that
+  ready chunk while awaiting `SendStream::poll_capacity`; a client that
   advertises `SETTINGS_INITIAL_WINDOW_SIZE: 0` — or that simply stops issuing
-  `WINDOW_UPDATE` — parks that pipe for as long as it likes.
+  `WINDOW_UPDATE` — can therefore leave a chunk waiting indefinitely.
 - **HTTP/1.1.** the dispatcher flushes a connection that can no longer buffer
   before it polls the body, so a client that stops reading parks the write.
 
@@ -806,13 +807,15 @@ Deliberate scope notes:
 
 Every H1/H2 backend transport hands the client request body to a hyper client
 and lets that client's own connection task drive it. For HTTP/2 the task is
-`PipeToSendStream`, which **reserves and awaits stream send capacity before it
-polls the body**. Two consequences follow, and together they defeat any bound
-that lives only inside a body adapter:
+`PipeToSendStream`, which polls for a body frame before reserving capacity for
+DATA, then retains a ready chunk while it waits for stream send capacity. Two
+consequences follow, and together they defeat any bound that lives only inside
+a body adapter:
 
-* A pipe parked in `poll_capacity` polls nothing, so a cancellation channel or
-  a `Sleep` armed *inside* the body cannot be observed until flow-control
-  credit, a reset, or a connection close arrives.
+* After polling a ready DATA frame, a pipe parked in `poll_capacity` does not
+  poll the body again, so a cancellation channel or a `Sleep` armed *inside*
+  the body cannot be observed until flow-control credit, a reset, or a
+  connection close arrives.
 * Once the response head resolves, hyper's own cancellation sender is gone, so
   the detached pipe can keep owning the inbound body — and the request
   accounting rooted in it — indefinitely.
@@ -1061,7 +1064,13 @@ gRPC supports **full bidirectional streaming** of both request and response bodi
 
 **Response body streaming**: HTTP/2 DATA frames are forwarded as they arrive from the backend, wrapped in the `Coalescing<Incoming>` adapter for efficient batching. HTTP/2 trailers (`grpc-status`, `grpc-message`) are forwarded automatically via hyper's `Incoming` body framing. The terminal trailer block first crosses the response-header policy boundary: `grpc-status` / `grpc-message` / `grpc-status-details-bin` always survive, while trailer-borne application metadata is reconciled against the policy the response headers already applied — see [docs/http3.md → Native gRPC terminal metadata](http3.md#native-grpc-terminal-metadata).
 
-When native-gRPC-capable plugins require response body access or retries are configured, gRPC falls back to **buffered** mode for both request and response — the full body and trailers are collected before constructing the response. `ai_token_metrics` is HTTP-only: enabling it alone does not alter native gRPC streaming or inspect protobuf frames.
+When retries are configured, gRPC buffers the request body so it can replay
+attempts; retry configuration alone does not require buffering the response, and
+a response eligible for streaming remains live. Native-gRPC-capable plugins that
+require response body access, or explicit `response_body_mode = Buffer`, require
+the response body and trailers to be collected before constructing the response.
+`ai_token_metrics` is HTTP-only: enabling it alone does not alter native gRPC
+streaming or inspect protobuf frames.
 
 ### WebSocket
 

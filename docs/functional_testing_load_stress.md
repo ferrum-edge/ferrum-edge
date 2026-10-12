@@ -17,7 +17,7 @@ The test provisions **10,000 proxies**, **10,000 consumers**, **30,000 plugins**
 | **Config churn** | Admin API create/update/delete operations during active traffic |
 | **No-plugin baseline** | Pure proxy overhead measurement without any plugin execution |
 | **wrk comparison** | Native C load generator to isolate client overhead from gateway performance |
-| **Latency analysis** | P50, P95, P99, P99.9, Max latency; RPS; success rate per phase |
+| **Latency analysis** | P50, P95, P99, P99.9, Max latency; RPS; success rate per phase (see [Measurement Boundary](#measurement-boundary)) |
 
 ### Auth Distribution
 
@@ -105,7 +105,7 @@ brew install wrk
 sudo apt-get install wrk
 ```
 
-If wrk is not installed, Phase 4 is automatically skipped with instructions to install it.
+If wrk is not installed, Phase 4 is automatically skipped with instructions to install it. Once wrk is found, every Phase 4 run must produce a result (see [Failure Threshold](#failure-threshold)). The scheduled `scaling-regression.yml` workflow installs wrk, so Phase 4 always runs there.
 
 ## Running the Test
 
@@ -143,21 +143,33 @@ Four 30-second load test phases at increasing concurrency, using all auth types 
 | 200 | High load |
 | 400 | Stress / saturation point |
 
-Each phase reports RPS, success rate, and full latency distribution (P50/P95/P99/P99.9/Max).
+Each phase reports attempt RPS, 2xx-status success rate, and a response-head latency distribution (P50/P95/P99/P99.9/Max). See [Measurement Boundary](#measurement-boundary).
 
 ### Phase 2: No-Plugin Baseline
 
-Same concurrency ramp (50 -> 100 -> 200 -> 400) against the 1,000 open proxies with **no plugins attached**. This isolates pure proxy overhead (route matching, connection pooling, body streaming, header construction) from plugin execution cost (auth crypto, ACL checks, rate limiting).
+Same concurrency ramp (50 -> 100 -> 200 -> 400) against the 1,000 open proxies with **no plugins attached**. Comparing it with Phase 1 separates plugin execution cost (auth crypto, ACL checks, rate limiting) from the rest of the request path up to the response head (route matching, connection pooling, request forwarding, header construction). The reqwest client never reads the response body, so neither phase measures response-body streaming or end-of-body latency, and the comparison is not an isolated gateway-overhead figure: the in-process client shares the host and CPU with the gateway and backend.
+
+### Measurement Boundary
+
+The reqwest phases (1, 2, and the traffic in 3) measure the following:
+
+- **Latency** runs from request start until reqwest's `send()` completes, that is, until the response head arrives. The response body is dropped without being read.
+- **Success** means a 2xx response status. A body error after a 2xx head cannot turn a recorded success into a failure.
+- **RPS** is attempts (successes and failures) divided by wall-clock time. Latency samples include failed attempts.
+
+The console labels these as `Attempt RPS`, `Response-head latency`, and `2xx-status success rate`. wrk rows (Phase 4) show wrk's own `Requests/sec` and latency figures; their failures are wrk's non-2xx/3xx responses plus socket errors.
 
 ### Phase 3: Admin Mutations Under Load
 
-Runs for 30 seconds at concurrency=100 while a separate task performs admin API mutations every 200ms:
+Runs for 30 seconds at concurrency=100 while a separate task runs admin API mutation cycles, pausing 200ms between cycles:
 
-- **Create** a temporary proxy + plugin
-- **Update** an existing proxy (rotate through all 10k)
-- **Delete** the temporary proxy + plugin
+- **Create** a temporary proxy (`POST /proxies`, expects `201`) and a plugin on it (`POST /plugins/config`, expects `201`)
+- **Update** an existing proxy, rotating through all 10k (`PUT /proxies/{id}`, expects `200`)
+- **Delete** the temporary plugin (`DELETE /plugins/config/{id}`, expects `204`) and proxy (`DELETE /proxies/{id}`, expects `204`)
 
-The test compares P99 latency and RPS against the Phase 1 ramp result at the same concurrency level to quantify the impact of config reloads on request latency.
+The writes use the default `?apply=sync` mode, so each documented success status means a covering config generation was already live on the gateway when it answered. Every write is classified against its expected status as accepted, rejected (any other HTTP status, including other 2xx codes), or transport-failed (no response, including the 30-second client timeout). Only accepted writes count as successful, and only their latencies feed the per-operation averages. The phase prints attempted/accepted/rejected/transport-failed counts per operation, the number of cycles in which all five writes were accepted, and up to 10 failure diagnostics (status plus a response-body excerpt, or the transport error).
+
+The test compares P99 latency and attempt RPS against the Phase 1 ramp result at the same concurrency level to estimate the impact of config reloads on response-head latency.
 
 ### Phase 4: wrk Comparison (if wrk is installed)
 
@@ -167,27 +179,21 @@ For each concurrency level (50, 100, 200, 400), wrk runs:
 - **key_auth proxies** — with a Lua script that cycles through 100 API keys and paths
 - **open proxies** — plain GET against a no-plugin proxy
 
-wrk uses `--latency` for percentile distribution and is launched via `spawn_blocking` to avoid blocking the tokio runtime that hosts the hyper backend.
+wrk uses `--latency` for percentile distribution and is launched via `spawn_blocking` to avoid blocking the tokio runtime that hosts the hyper backend. A run counts as a result only when wrk's output has a positive `N requests in` total. A wrk invocation error, a failed blocking task, or output with no positive request total is reported as a missing result and fails the test. A nonzero wrk exit status with a positive parsed total is still accepted.
 
-## Backend Pool Modes
+## Backend Pool Settings
 
-The test runs **twice** — once with the gateway's backend connection pool set to HTTP/1.1, and once with HTTP/2 enabled. This reveals how the backend pool protocol affects throughput:
+The test runs **twice**: once with `FERRUM_POOL_ENABLE_HTTP2=false` and once with `FERRUM_POOL_ENABLE_HTTP2=true`. The console labels each run by that setting.
 
-### Run 1: Backend Pool HTTP/1.1
-
-With `FERRUM_POOL_ENABLE_HTTP2=false`, each request uses a dedicated HTTP/1.1 connection from the pool. Connection reuse depends on keep-alive and the `max_idle_per_host` pool size.
-
-### Run 2: Backend Pool HTTP/2
-
-With `FERRUM_POOL_ENABLE_HTTP2=true`, the gateway can multiplex many concurrent requests over a single HTTP/2 connection to the backend. This dramatically reduces connection overhead and eliminates ephemeral port exhaustion at high concurrency.
+Both runs use the same embedded backend, which speaks **plaintext HTTP/1.1 only** (`hyper::server::conn::http1::Builder` with keep-alive, and every route uses `backend_scheme: http`). `FERRUM_POOL_ENABLE_HTTP2` only permits HTTP/2 when the backend supports it, and this backend never does. Neither run is therefore an observed HTTP/1.1-versus-HTTP/2 backend comparison, and differences between the runs must not be attributed to HTTP/2 framing or multiplexing. A real protocol comparison would need an HTTP/2-capable backend, an explicit client path, a forced-HTTP/1.1 control, and an assertion of the negotiated protocol at the backend.
 
 ## Interpreting Results
 
 ### Summary Tables
 
-The test prints a summary table for each backend pool mode. Example from a PostgreSQL run on Apple Silicon macOS:
+The test prints a summary table for each backend pool setting. The tables below are historical examples from a PostgreSQL run on Apple Silicon macOS. They predate the current labels: their headings name the protocol setting, not an observed backend protocol (see [Backend Pool Settings](#backend-pool-settings)), and their reqwest rows use the [measurement boundary](#measurement-boundary) above (attempt RPS, response-head latency).
 
-#### HTTP/1.1 Backend Pool
+#### `FERRUM_POOL_ENABLE_HTTP2=false` (historical output)
 
 ```
 ======================================================================
@@ -210,7 +216,7 @@ wrk key_auth c=200             200    37291      6.5      4.6      —      40.4
 wrk no-plugin c=200            200    61612      3.5      3.0      —      12.2    134.1  100.0%
 ```
 
-#### HTTP/2 Backend Pool
+#### `FERRUM_POOL_ENABLE_HTTP2=true` (historical output)
 
 ```
 ======================================================================
@@ -235,11 +241,13 @@ wrk no-plugin c=200            200    53449      4.8      3.3      —      33.8
 
 *(Apple Silicon macOS, release build, PostgreSQL. Actual results depend on hardware and system load.)*
 
-### HTTP/1.1 vs HTTP/2 Backend Pool Comparison
+### `FERRUM_POOL_ENABLE_HTTP2` false vs true (historical)
+
+The columns below compare the two settings. The backend was HTTP/1.1-only in both runs, so these are not HTTP/1.1-versus-HTTP/2 measurements.
 
 With-plugins ramp (reqwest client):
 
-| Concurrency | HTTP/1.1 RPS | HTTP/2 RPS | HTTP/1.1 P99 | HTTP/2 P99 |
+| Concurrency | `false` RPS | `true` RPS | `false` P99 | `true` P99 |
 |-------------|-------------|------------|-------------|------------|
 | 50 | 28,656 | 24,575 | 4.0ms | 5.8ms |
 | 100 | 28,261 | 27,900 | 7.4ms | 7.5ms |
@@ -248,20 +256,13 @@ With-plugins ramp (reqwest client):
 
 wrk (native C client):
 
-| Concurrency | HTTP/1.1 RPS | HTTP/2 RPS | HTTP/1.1 P99 | HTTP/2 P99 |
+| Concurrency | `false` RPS | `true` RPS | `false` P99 | `true` P99 |
 |-------------|-------------|------------|-------------|------------|
 | 50 | 63,442 | 49,427 | 2.9ms | 11.1ms |
 | 200 | 37,291 | 56,348 | 40.4ms | 21.4ms |
 | 400 | 57,004 | 42,883 | 22.0ms | 53.2ms |
 
-**Key findings:**
-
-- **At low concurrency (c=50), HTTP/1.1 wins.** Connection setup cost on localhost is negligible, so HTTP/2 framing overhead (HPACK, flow control, frame multiplexing) adds latency without benefit. HTTP/1.1 with keep-alive is simpler and faster.
-- **At high concurrency (c=200+), HTTP/2 wins with reqwest.** Multiplexing avoids connection exhaustion — the reqwest client needs fewer sockets, reducing contention on file descriptors and ephemeral ports.
-- **wrk is less affected.** wrk manages its own optimized connection pool, so the HTTP/1.1 vs HTTP/2 difference is smaller and depends more on system load during the test run.
-- **No-plugin baseline was slower with HTTP/2** across all concurrency levels, suggesting HTTP/2 framing overhead dominates when there's no plugin CPU work to amortize it against.
-
-**Recommendation:** Use `FERRUM_POOL_ENABLE_HTTP2=false` for localhost or low-latency backends. Enable HTTP/2 for backends across network boundaries where connection setup cost is significant.
+**Interpretation:** Run-to-run differences in these tables cannot be attributed to HTTP/2 framing, HPACK, flow control, or multiplexing, because no backend leg spoke HTTP/2. This fixture does not identify their cause; run-to-run system load also varies. This fixture is not a basis for choosing a backend transport policy. Use an HTTP/2-capable backend with the controls described in [Backend Pool Settings](#backend-pool-settings) for that.
 
 ### wrk vs reqwest Client Comparison
 
@@ -281,7 +282,7 @@ The wrk numbers represent the gateway's true throughput ceiling. The reqwest num
 
 ### Plugin Overhead Analysis
 
-The test quantifies the cost of auth + ACL + rate limiting (HTTP/1.1 run, wrk client):
+The test quantifies the cost of auth + ACL + rate limiting (`FERRUM_POOL_ENABLE_HTTP2=false` run, wrk client):
 
 ```
   wrk c=200:  no-plugin 61,612 RPS  vs  key_auth 37,291 RPS  (-39.5%)
@@ -292,14 +293,17 @@ Plugin overhead varies with concurrency. At c=200 the auth plugin (key lookup + 
 
 ### Admin Mutation Impact
 
-The test reports the percentage change in P99 latency and RPS when admin mutations are active:
+The test prints the mutation accounting, then the percentage change in response-head P99 latency and attempt RPS when admin mutations are active. Illustrative shape:
 
 ```
-P99 latency impact from admin mutations: +1.4%  (15.4ms -> 15.6ms)
-RPS impact from admin mutations: -0.9%  (10081 -> 9988)
+  Admin mutations: attempted=500 accepted=500 rejected=0 transport_failed=0 | cycles: attempted=100 fully_accepted=100
+    create_proxy (expect 201): attempted=100 accepted=100 rejected=0 transport_failed=0, accepted avg=40.0ms max=90.0ms
+    ...
+  P99 latency impact from admin mutations: +1.4%  (15.4ms -> 15.6ms)
+  RPS impact from admin mutations: -0.9%  (10081 -> 9988)
 ```
 
-A small impact (<10% P99 increase) indicates the gateway handles config reloads gracefully without significant latency spikes. This is due to the lock-free `ArcSwap`-based config reload — requests in-flight see either the old or new config atomically, never a partial update.
+The impact figures describe a reload workload only when the accounting shows accepted writes; the final gate enforces this (see [Failure Threshold](#failure-threshold)). A small impact (<10% P99 increase) indicates config reloads did not produce significant response-head latency spikes. Config publication uses `ArcSwap`, so in-flight requests see either the old or new config atomically, never a partial update.
 
 ### Latency Warnings
 
@@ -310,7 +314,13 @@ The test flags:
 
 ### Failure Threshold
 
-The test asserts that success rate stays above **50%** across all phases. If it drops below that, the test fails — indicating the gateway is unable to handle the load.
+Each backend pool run ends with one gate that lists every failure it found:
+
+- Every phase that ran (Phase 1, Phase 2, the Phase 3 traffic, and each Phase 4 wrk result) must report a positive request count and a success rate **above 50%**. A phase with zero requests fails.
+- When wrk is available, each of the eight attempted wrk runs must have produced a result. A missing result fails the test; it is not dropped from the comparison.
+- The admin mutation phase must have at least one cycle in which all five writes were accepted, and accepted writes must be more than 50% of attempted writes.
+
+A reqwest load worker that panics also fails its phase. Before measurement starts, provisioning, the live-apply cursor, and convergence have their own strict gates.
 
 ## Gateway Configuration
 
@@ -364,7 +374,7 @@ The test configures the gateway with tuned connection pool and flow-control sett
 
 ## Understanding reqwest vs wrk Performance Gap
 
-The reqwest-based phases report much lower throughput than the wrk phases. In one earlier run (different from the example tables above), the HTTP/1.1 backend pool gap was ~6-8x (10k vs 75k RPS) and the HTTP/2 gap ~2x (31k vs 69k RPS). This is a client-side bottleneck, **not** a gateway limitation:
+The reqwest-based phases report much lower throughput than the wrk phases. In one earlier run (different from the example tables above), the gap was ~6-8x (10k vs 75k RPS) with `FERRUM_POOL_ENABLE_HTTP2=false` and ~2x (31k vs 69k RPS) with `true`. This is a client-side bottleneck, **not** a gateway limitation:
 
 | Factor | reqwest (in-process) | wrk (native C) |
 |--------|---------------------|-----------------|
@@ -467,10 +477,10 @@ cargo build --release --bin ferrum-edge
 
 Debug builds are 2-4x slower and will show artificially high latency numbers.
 
-### reqwest RPS plateaus around 10k (HTTP/1.1 run)
+### reqwest RPS plateaus around 10k (`FERRUM_POOL_ENABLE_HTTP2=false` run)
 
-This is expected in the HTTP/1.1 backend pool run — each in-flight request needs its own TCP connection, and the reqwest client competes for file descriptors and ephemeral ports. The HTTP/2 run typically shows 3x better throughput (~30k RPS) because requests multiplex over fewer connections. The wrk comparison phase shows the gateway's true throughput ceiling (~70-80k RPS). See "Understanding reqwest vs wrk Performance Gap" above.
+The in-process reqwest client competes with the gateway and backend for CPU, file descriptors, and ephemeral ports. Historical runs showed higher reqwest throughput with `FERRUM_POOL_ENABLE_HTTP2=true`, but the backend is HTTP/1.1-only, so that difference is not evidence of backend HTTP/2 multiplexing (see [Backend Pool Settings](#backend-pool-settings)). The wrk comparison phase shows how much of the gap comes from the client. See "Understanding reqwest vs wrk Performance Gap" above.
 
 ### Test takes too long
 
-The test runs two full passes (HTTP/1.1 + HTTP/2), each with 4 ramp phases + 4 no-plugin phases + admin mutations + wrk phases. Total runtime is ~15-18 minutes. To run only a specific backend pool mode, modify the `enable_http2` parameter in `test_load_stress_10k_proxies()`.
+The test runs two full passes (`FERRUM_POOL_ENABLE_HTTP2=false`, then `true`), each with 4 ramp phases + 4 no-plugin phases + admin mutations + wrk phases. Total runtime is ~15-18 minutes. To run only one setting, modify the `enable_http2` parameter in `test_load_stress_10k_proxies()`.

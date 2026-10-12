@@ -714,6 +714,78 @@ pub fn evaluate_delta_authority(
     Ok(())
 }
 
+/// CP-side coverage cursor for one ConfigSync Subscribe stream (issue #6163).
+///
+/// A tokio broadcast receiver that reports `Lagged` moves its cursor to the
+/// OLDEST update still retained, not to the tail. The CP answers the lag with
+/// a FULL_SNAPSHOT of the current config, so retained broadcasts that the
+/// snapshot already contains can follow it. The DP's source-blind
+/// [`evaluate_delta_authority`] fence refuses such a DELTA and terminates the
+/// stream. The same race exists for the initial snapshot, because the
+/// receiver is registered before the snapshot is loaded.
+///
+/// Coverage is proven by publication ORDER, never by committed timestamps: a
+/// CP wall clock can step backwards, so a newer publication may carry an
+/// older stamp. The cursor counts broadcast-channel positions relative to the
+/// stream's subscription. The stream reads how many publications are queued
+/// and loads the snapshot together, inside the CP publication gate that every
+/// publisher holds across committing its config to the shared `ArcSwap` and
+/// broadcasting it. No publication is half-done while the gate is held, so
+/// the queued positions are exactly the publications the snapshot contains,
+/// and every later position was committed after the load. Only the queued
+/// positions are dropped; every later one is forwarded. The DP fence is
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriberSnapshotCursor {
+    next_position: u64,
+    covered_until: u64,
+}
+
+impl SubscriberSnapshotCursor {
+    /// Seed the cursor for a receiver subscribed at position 0. `queued` is
+    /// the receiver's queued count read together with the initial snapshot
+    /// load under the publication gate.
+    pub fn new(queued: u64) -> Self {
+        Self {
+            next_position: 0,
+            covered_until: queued,
+        }
+    }
+
+    /// Consume the next delivered broadcast position. Returns whether the
+    /// update is NOT covered by a snapshot this stream sent and must be
+    /// forwarded.
+    pub fn admit_next(&mut self) -> bool {
+        let position = self.next_position;
+        self.next_position = self.next_position.saturating_add(1);
+        position >= self.covered_until
+    }
+
+    /// Account for `skipped` positions a `Lagged` receiver jumped over.
+    pub fn record_lag(&mut self, skipped: u64) {
+        self.next_position = self.next_position.saturating_add(skipped);
+    }
+
+    /// Record a lag-recovery FULL_SNAPSHOT. `queued` is the receiver's
+    /// queued count read together with that snapshot's load under the
+    /// publication gate. Monotonic: never lowers coverage.
+    pub fn record_snapshot(&mut self, queued: u64) {
+        self.covered_until = self
+            .covered_until
+            .max(self.next_position.saturating_add(queued));
+    }
+
+    /// Position of the next update the receiver will deliver.
+    pub fn next_position(&self) -> u64 {
+        self.next_position
+    }
+
+    /// First position not covered by a snapshot this stream sent.
+    pub fn covered_until(&self) -> u64 {
+        self.covered_until
+    }
+}
+
 /// Why a non-empty DELTA must terminate the stream (issue #2394).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaRejectionKind {

@@ -19,11 +19,11 @@ Each signal produces a 0.0-1.0 pressure ratio. When a ratio exceeds a threshold,
 
 Actions escalate with pressure. Each action is additive — higher pressure activates additional actions on top of lower ones. Thresholds are per signal (see [Configuration](#configuration)); the defaults are FD 0.80, connections 0.85, requests 0.85 for the pressure tier and 0.95 for every critical tier. Event-loop latency at or above `FERRUM_OVERLOAD_LOOP_CRITICAL_US` also triggers connection rejection.
 
-Between a signal's pressure and critical thresholds the monitor also computes a RED-style probability that ramps linearly from 0% to 100% (reported as `red_drop_probability_pct`). HTTP/1.1 and HTTP/2 responses add `Connection: close` when the binary `disable_keepalive` flag is set **or** a per-response RED sample fires.
+Between a signal's pressure and critical thresholds the monitor also computes a RED-style probability that ramps linearly from 0% to 100% (reported as `red_drop_probability_pct`). HTTP/1.1 responses add `Connection: close` when the binary `disable_keepalive` flag is set **or** a per-response RED sample fires. The shared response builder also adds this header for HTTP/2, but Hyper removes connection-specific headers before sending an H2 response, so H2 clients do not receive a per-response close signal.
 
 | Tier | Action | Effect | Hot Path Cost |
 |----------------|--------|--------|---------------|
-| **pressure** | Disable keepalive | HTTP/1.1 and HTTP/2 responses include `Connection: close`, causing clients to disconnect after each request. HTTP/3 expresses the same tier as a one-shot GOAWAY per connection (see below). This naturally frees connection slots | 1 `AtomicBool::load` per response (~1ns); HTTP/3 pays nothing per request |
+| **pressure** | Disable keepalive | HTTP/1.1 responses include `Connection: close`, causing clients to disconnect after each request. HTTP/2 removes this forbidden response header before sending, so pressure does not close H2 connections per response. HTTP/3 expresses the tier as a one-shot GOAWAY per connection (see below). | 1 `AtomicBool::load` per response (~1ns); HTTP/3 pays nothing per request |
 | **critical** | Reject new connections | TCP connections are accepted and immediately dropped (HTTP/H2). H3 connections are refused via QUIC. Existing connections continue serving | 1 `AtomicBool::load` per accept loop iteration (~1ns) |
 | **critical** (requests) | Reject new requests | New requests are rejected with `503` (gRPC `UNAVAILABLE`) once active requests reach `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` of `FERRUM_MAX_REQUESTS`. Only active when a request cap is configured (`FERRUM_MAX_REQUESTS` > 0) | 1 `AtomicBool::load` per request (~1ns) |
 
@@ -31,9 +31,13 @@ State transitions are logged at `warn` (entering overload) and `info` (recoverin
 
 ### The keepalive tier on HTTP/3
 
-HTTP/1.1 and HTTP/2 shrink the connection population one response at a time: every
+HTTP/1.1 shrinks the connection population one response at a time: every
 response emitted while `disable_keepalive` is set (or while RED sampling fires)
-carries `Connection: close`. HTTP/3 has no equivalent per-response lever — a QUIC
+carries `Connection: close`. HTTP/2 removes `Connection` and other connection-
+specific headers before sending a response, so this pressure-tier mechanism does
+not close H2 connections. H2 still has critical-tier connection rejection for
+new TCP connections and, when `FERRUM_MAX_REQUESTS` is configured, critical
+request rejection for new requests. HTTP/3 has no equivalent per-response lever — a QUIC
 connection multiplexes request streams and is not torn down by a response header —
 so the gateway expresses this tier as a **one-shot HTTP/3 GOAWAY** on each open
 connection: the peer stops opening new request streams while already-accepted
@@ -47,7 +51,7 @@ connection never receives two.
 
 Three consequences are deliberate and worth stating plainly:
 
-- **The GOAWAY is terminal for that connection.** Unlike HTTP/1.1 and HTTP/2
+- **The GOAWAY is terminal for that connection.** Unlike HTTP/1.1
   `Connection: close`, it cannot be withdrawn if pressure recovers. The peer
   reconnects, and that new connection is still admitted — only the critical tier
   (`reject_new_connections`, FD ≥ 0.95 / Conn ≥ 0.95) refuses new connections.

@@ -321,7 +321,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 - Custom CA bundle support for server certificate verification
 - No-Verify mode for testing environments (`FERRUM_TLS_NO_VERIFY`)
 - Per-proxy connection configuration overrides
-- Transparent DNS cache integration via `DnsCacheResolver` — no DNS in the hot path
+- Transparent DNS cache integration via `DnsCacheResolver` — cached and stale-while-revalidate hits avoid DNS on the request path; a cache miss is resolved in the foreground (awaited) before dispatch
 - Connection statistics and monitoring
 
 ### **5. Plugin System (`src/plugins/`)**
@@ -432,7 +432,7 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 
 Dynamic upstream target discovery from external registries:
 
-- **DNS-SD** (`dns_sd.rs`) — SRV record-based discovery; publishes every admissible RFC 2782 priority tier (after discarding `.` / port 0) and the load balancer selects the lowest HEALTHY tier at request time
+- **DNS-SD** (`dns_sd.rs`) — SRV record-based discovery; retains up to the eight lowest admissible RFC 2782 priority tiers (after discarding `.` / port 0 and deduplicating), subject to the per-upstream target cap, and the load balancer selects the lowest HEALTHY tier among retained targets at request time
 - **Kubernetes** (`kubernetes.rs`) — Kubernetes API-based endpoint discovery
 - **Consul** (`consul.rs`) — Consul service catalog discovery
 - **Ferrum Mesh** (`mesh.rs`) — CP-delivered mesh service/workload discovery

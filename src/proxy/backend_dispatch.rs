@@ -837,10 +837,10 @@ pub(crate) fn check_circuit_breaker(
         // Capture the open generation at admission so a deferred streaming outcome
         // can detect that the breaker has since opened a new cycle (#1649 round-4 B)
         // and avoid healing/reopening a HALF_OPEN cycle it never probed. The epoch
-        // is snapshotted BEFORE the admission decision (inside
-        // `can_execute_with_admission_epoch`) so a concurrent open racing this
-        // admission can only make the outcome look stale, never too-new (#1649 R6
-        // finding 3).
+        // is the one the admitting atomic operation itself decided in, so a
+        // concurrent open racing this admission can only make the outcome look
+        // stale, never too-new (#1649 R6 finding 3), and a probe guard bound to it
+        // cannot release a later cycle's slot (#6177).
         match state
             .circuit_breaker_cache
             .can_execute_with_admission_epoch(

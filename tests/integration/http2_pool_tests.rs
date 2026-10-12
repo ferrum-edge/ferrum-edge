@@ -3405,3 +3405,380 @@ async fn test_grpc_h2c_upload_coalesces_small_connection_window_increments() {
         "each 32-byte window must be held for the bounded wait: {waits:?}"
     );
 }
+
+// ============================================================================
+// Issue #6314: adaptive-concurrency settlement of a fail-closed early response
+// ============================================================================
+
+/// Direct-H2 backend for the #6314 settlement regression. `/upload` sends its
+/// response headers once the first request DATA frame arrives and then holds
+/// both directions open, so the gateway sees an early response while the
+/// client upload is unfinished. `/complete` drains the upload and answers 503.
+/// Every early answer is reported on `early_answers`.
+async fn start_early_answer_h2_tls_backend(
+    early_answers: tokio::sync::mpsc::UnboundedSender<()>,
+) -> (tokio::task::JoinHandle<()>, u16) {
+    let cert_pem = include_str!("../certs/server.crt");
+    let key_pem = include_str!("../certs/server.key");
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind early-answer backend");
+    let port = listener.local_addr().expect("backend addr").port();
+
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .filter_map(|cert| cert.ok())
+        .collect();
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("backend key");
+    let provider = rustls::crypto::ring::default_provider();
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("backend TLS versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)
+        .expect("backend TLS config");
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let handle = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            let early_answers = early_answers.clone();
+            tokio::spawn(async move {
+                let Ok(tls_stream) = acceptor.accept(socket).await else {
+                    return;
+                };
+                let service = service_fn(move |req: Request<Incoming>| {
+                    early_answer_backend_response(req, early_answers.clone())
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls_stream), service)
+                    .await;
+            });
+        }
+    });
+    (handle, port)
+}
+
+type EarlyAnswerBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+type HeldFrame = Result<hyper::body::Frame<Bytes>, std::convert::Infallible>;
+
+async fn early_answer_backend_response(
+    req: Request<Incoming>,
+    early_answers: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Result<Response<EarlyAnswerBody>, std::convert::Infallible> {
+    let complete = req.uri().path() == "/complete";
+    let mut upload = req.into_body();
+    if complete {
+        let _ = upload.collect().await;
+        let body = Full::new(Bytes::from_static(b"backend overloaded"));
+        let response = Response::builder()
+            .status(503)
+            .body(body.boxed())
+            .expect("503 response");
+        return Ok(response);
+    }
+    // Answer once the first request DATA frame arrives, while the upload is
+    // still open, and keep draining it until the gateway ends the stream.
+    let _ = upload.frame().await;
+    tokio::spawn(drain_backend_upload(upload));
+    let _ = early_answers.send(());
+    let held = http_body_util::StreamBody::new(futures_util::stream::pending::<HeldFrame>());
+    let response = Response::builder()
+        .status(200)
+        .header("content-type", "text/plain")
+        .body(held.boxed())
+        .expect("early response");
+    Ok(response)
+}
+
+async fn drain_backend_upload(mut upload: Incoming) {
+    while let Some(Ok(_)) = upload.frame().await {}
+}
+
+/// In-process gateway whose direct-H2 route carries a tracked adaptive
+/// concurrency policy (limit 4, halved by each backend failure). The request
+/// body limit keeps the early-response gate on its size-limited arm. A nonzero
+/// `backend_write_timeout_ms` installs the upload pump that types the terminal;
+/// `0` leaves this unauthenticated upload unpumped, so the adapter reads the
+/// client body directly.
+async fn start_adaptive_direct_h2_gateway(
+    backend_port: u16,
+    policy_id: &str,
+    backend_write_timeout_ms: u64,
+) -> (ProxyState, SocketAddr, tokio::task::JoinHandle<()>) {
+    let mut proxy = create_test_proxy();
+    proxy.backend_write_timeout_ms = backend_write_timeout_ms;
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = backend_port;
+    proxy.backend_tls_verify_server_cert = false;
+    proxy.pool_enable_http2 = Some(true);
+    proxy.h2_upgrade_policy = Some(H2UpgradePolicy::Upgrade);
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: policy_id.to_string(),
+    }];
+    let policy = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
+        id: policy_id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "adaptive_concurrency".to_string(),
+        config: serde_json::json!({
+            "min_limit": 1,
+            "initial_limit": 4,
+            "max_limit": 4,
+            "min_samples": 1,
+            "decrease_ratio": 0.5,
+        }),
+        enabled: true,
+        scope: ferrum_edge::config::types::PluginScope::Proxy,
+        proxy_id: Some(proxy.id.clone()),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+    };
+    let env_config = ferrum_edge::config::EnvConfig {
+        tls_no_verify: true,
+        max_request_body_size_bytes: 64,
+        ..Default::default()
+    };
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy],
+        plugin_configs: vec![policy],
+        loaded_at: chrono::Utc::now(),
+        ..Default::default()
+    };
+    let (state, _health_handles) =
+        ProxyState::new(config, create_dns_cache(), env_config, None, None).expect("proxy state");
+    let (gateway_addr, gateway_handle) = start_direct_h2_test_gateway(state.clone()).await;
+    (state, gateway_addr, gateway_handle)
+}
+
+/// Open an HTTP/1.1 chunked upload through the gateway and send its first
+/// 14-byte chunk, leaving the upload unfinished.
+async fn open_chunked_upload(gateway_addr: SocketAddr, path: &str) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: client.example\r\n\
+         Content-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n\
+         e\r\npartial upload\r\n"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write upload head");
+    stream
+}
+
+/// Read one HTTP/1.1 response: its status, and its body when it declares a
+/// `Content-Length`.
+async fn read_gateway_response(stream: &mut tokio::net::TcpStream) -> (u16, String) {
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let head_end = loop {
+        if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break end + 4;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let read = tokio::time::timeout(remaining, stream.read(&mut buf))
+            .await
+            .expect("gateway response head timed out")
+            .expect("read gateway response");
+        assert!(
+            read > 0,
+            "gateway closed before a response head: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        received.extend_from_slice(&buf[..read]);
+    };
+    let head = String::from_utf8_lossy(&received[..head_end]).into_owned();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("malformed response head: {head:?}"));
+    let content_length = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("content-length") {
+            return None;
+        }
+        value.trim().parse::<usize>().ok()
+    });
+    let mut body = received[head_end..].to_vec();
+    if let Some(content_length) = content_length {
+        while body.len() < content_length {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let read = tokio::time::timeout(remaining, stream.read(&mut buf))
+                .await
+                .expect("gateway response body timed out")
+                .expect("read gateway response body");
+            assert!(read > 0, "gateway closed mid-body: {head:?}");
+            body.extend_from_slice(&buf[..read]);
+        }
+    }
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The single tracked target once the request's permit has been released.
+async fn settled_adaptive_target(
+    state: &ProxyState,
+) -> ferrum_edge::adaptive_concurrency::AdaptiveConcurrencySnapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshots = ferrum_edge::_test_support::adaptive_concurrency_snapshots_for_test(state);
+        if let [target] = snapshots.as_slice()
+            && target.in_flight == 0
+        {
+            return target.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the request's adaptive permit was never released: {snapshots:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait for the backend's early answer, prove the request is holding its
+/// adaptive permit, then give the response headers time to reach the gateway.
+async fn await_early_answer(
+    early_answers: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    state: &ProxyState,
+) {
+    tokio::time::timeout(Duration::from_secs(10), early_answers.recv())
+        .await
+        .expect("the backend never answered early")
+        .expect("early-answer channel open");
+    let snapshots = ferrum_edge::_test_support::adaptive_concurrency_snapshots_for_test(state);
+    assert!(
+        matches!(snapshots.as_slice(), [target] if target.in_flight == 1 && target.limit == 4),
+        "the upload must hold one tracked permit at the initial limit: {snapshots:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+/// Both upload shapes the early-response gate can see: unpumped (`0`) and
+/// pumped (nonzero) `backend_write_timeout_ms`.
+const ADAPTIVE_6314_WRITE_TIMEOUTS_MS: [u64; 2] = [0, 30_000];
+
+/// Issue #6314: a direct-H2 backend answers before the client upload finishes,
+/// then the client's own upload stream fails (a malformed HTTP/1.1 chunk, which
+/// keeps the frontend handler alive to settle). The gateway still withholds the
+/// unvetted early response (502), but the surviving handler's settlement is
+/// client-side: the limit and sample count stay put and the slot is released.
+/// This holds with and without the upload pump. Reverting the fail-closed
+/// refusal's attribution to `ProtocolError` halves the limit here.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_h2_fail_closed_client_upload_error_does_not_train_adaptive_limit() {
+    for write_timeout_ms in ADAPTIVE_6314_WRITE_TIMEOUTS_MS {
+        let (early_tx, mut early_answers) = tokio::sync::mpsc::unbounded_channel();
+        let (_backend, backend_port) = start_early_answer_h2_tls_backend(early_tx).await;
+        let (state, gateway_addr, _gateway) = start_adaptive_direct_h2_gateway(
+            backend_port,
+            "adaptive-6314-source-error",
+            write_timeout_ms,
+        )
+        .await;
+
+        let mut client = open_chunked_upload(gateway_addr, "/h2test/upload").await;
+        await_early_answer(&mut early_answers, &state).await;
+        client
+            .write_all(b"zz\r\n")
+            .await
+            .expect("write malformed chunk");
+
+        let (status, body) = read_gateway_response(&mut client).await;
+        assert_eq!(
+            status, 502,
+            "write timeout {write_timeout_ms}ms: the unvetted early 200 must be refused: {body}"
+        );
+        assert!(
+            body.contains("Backend unavailable"),
+            "write timeout {write_timeout_ms}ms: the gateway's fail-closed 502: {body}"
+        );
+        let target = settled_adaptive_target(&state).await;
+        assert_eq!(
+            target.limit, 4,
+            "write timeout {write_timeout_ms}ms: client failure must not shrink"
+        );
+        assert_eq!(
+            target.samples, 0,
+            "write timeout {write_timeout_ms}ms: nor feed a latency sample"
+        );
+    }
+}
+
+/// Control for the regression above: the same tracked policy and seam do train
+/// on a genuine backend fault, with and without the upload pump.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_h2_backend_failure_trains_adaptive_limit() {
+    for write_timeout_ms in ADAPTIVE_6314_WRITE_TIMEOUTS_MS {
+        let (early_tx, _early_answers) = tokio::sync::mpsc::unbounded_channel();
+        let (_backend, backend_port) = start_early_answer_h2_tls_backend(early_tx).await;
+        let (state, gateway_addr, _gateway) = start_adaptive_direct_h2_gateway(
+            backend_port,
+            "adaptive-6314-backend-fault",
+            write_timeout_ms,
+        )
+        .await;
+
+        let mut client = open_chunked_upload(gateway_addr, "/h2test/complete").await;
+        client
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("write final chunk");
+
+        let (status, _body) = read_gateway_response(&mut client).await;
+        assert_eq!(
+            status, 503,
+            "write timeout {write_timeout_ms}ms: the backend's own 503 is relayed"
+        );
+        let target = settled_adaptive_target(&state).await;
+        assert_eq!(
+            target.limit, 2,
+            "write timeout {write_timeout_ms}ms: a backend 5xx halves the limit"
+        );
+    }
+}
+
+/// Precedence control: an authoritative oversized upload after an early
+/// response is the gateway's 413, which stays neutral too, with and without
+/// the upload pump.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_h2_oversized_upload_after_early_response_is_neutral_413() {
+    for write_timeout_ms in ADAPTIVE_6314_WRITE_TIMEOUTS_MS {
+        let (early_tx, mut early_answers) = tokio::sync::mpsc::unbounded_channel();
+        let (_backend, backend_port) = start_early_answer_h2_tls_backend(early_tx).await;
+        let (state, gateway_addr, _gateway) = start_adaptive_direct_h2_gateway(
+            backend_port,
+            "adaptive-6314-oversized",
+            write_timeout_ms,
+        )
+        .await;
+
+        let mut client = open_chunked_upload(gateway_addr, "/h2test/upload").await;
+        await_early_answer(&mut early_answers, &state).await;
+        let oversized = format!("64\r\n{}\r\n", "x".repeat(100));
+        client
+            .write_all(oversized.as_bytes())
+            .await
+            .expect("write oversized chunk");
+
+        let (status, body) = read_gateway_response(&mut client).await;
+        assert_eq!(
+            status, 413,
+            "write timeout {write_timeout_ms}ms: the authoritative size decision wins: {body}"
+        );
+        let target = settled_adaptive_target(&state).await;
+        assert_eq!(
+            target.limit, 4,
+            "write timeout {write_timeout_ms}ms: an oversized upload must not shrink"
+        );
+        assert_eq!(target.samples, 0, "write timeout {write_timeout_ms}ms");
+    }
+}

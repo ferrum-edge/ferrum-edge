@@ -5770,6 +5770,91 @@ async fn grpc_text_fields_ignore_out_of_scope_strings_and_map_keys() {
     );
 }
 
+/// Hand-encoded `scope.Reply` whose single `labels` map entry carries the
+/// known key/value fields plus `entry_extra` appended inside the entry
+/// message.
+fn scoped_reply_with_map_entry_extra(
+    map_key: &str,
+    map_value: &str,
+    entry_extra: &[u8],
+) -> Vec<u8> {
+    let mut entry = ext_pb_str_field(1, map_key);
+    entry.extend(ext_pb_str_field(2, map_value));
+    entry.extend_from_slice(entry_extra);
+    let mut reply = ext_pb_str_field(1, "clean");
+    reply.extend(ext_pb_str_field(2, "clean"));
+    reply.extend(ext_pb_len_field(3, &entry));
+    reply
+}
+
+/// The guard inspects decoded messages, not original wire bytes (#6300): an
+/// extra field inside a known map-entry wire message is discarded by protobuf
+/// map decoding before the unknown-field walk, so it is neither scanned nor
+/// refused. Ordinary unknown fields retained on the decoded message tree still
+/// fail closed.
+#[tokio::test]
+async fn grpc_map_entry_extra_field_is_outside_decoded_message_coverage() {
+    let dir = scoped_reply_descriptor_dir();
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": dir.path().join("scope.bin").to_string_lossy(),
+            "methods": {"/scope.Svc/Run": {"response_type": "scope.Reply"}}
+        }
+    }));
+
+    // Field 99, length-delimited, inside the map entry: decoding drops it.
+    let entry_extra = ext_pb_str_field(99, "ops@example.com");
+    let body = grpc_frame(&scoped_reply_with_map_entry_extra(
+        "team",
+        "edge",
+        &entry_extra,
+    ));
+    let mut ctx = grpc_ctx("/scope.Svc/Run");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+                .await,
+            PluginResult::Continue
+        ),
+        "an extra field inside a map entry is outside decoded-message coverage"
+    );
+
+    // Control: the decoded map value itself is scanned.
+    let body = grpc_frame(&scoped_reply_with_map_entry_extra(
+        "team",
+        "ops@example.com",
+        &[],
+    ));
+    let mut ctx = grpc_ctx("/scope.Svc/Run");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "decoded map values must still be scanned"
+    );
+
+    // Control: the same field 99 on the top-level message is retained as an
+    // unknown field and fails closed.
+    let mut payload = scoped_reply_with_map_entry_extra("team", "edge", &[]);
+    payload.extend(ext_pb_str_field(99, "benign"));
+    let mut ctx = grpc_ctx("/scope.Svc/Run");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &grpc_frame(&payload))
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "unknown fields retained on the decoded message must fail closed"
+    );
+}
+
 /// A browser gRPC-Web request as the proxy actually classifies it.
 ///
 /// `detect_http_flavor` calls gRPC-Web `HttpFlavor::Plain` — only the request

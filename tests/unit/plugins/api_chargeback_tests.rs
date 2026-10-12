@@ -5100,6 +5100,46 @@ fn test_charges_recorded_after_the_last_export_survive_eviction() {
     assert_eq!(registry.evict_stale(0), 1);
 }
 
+/// A recorder that computed an older timestamp before another same-row update
+/// must not overwrite the newer timestamp after the export watermark advances.
+#[test]
+fn test_delayed_row_timestamp_cannot_make_uncollected_update_evictable() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    let earlier_timestamp = registry
+        .entries
+        .iter()
+        .next()
+        .expect("recorded row exists")
+        .last_updated
+        .load(Ordering::Relaxed);
+    registry.render_json().unwrap();
+
+    // This update happens after the accepted export and is absent from it.
+    record_identity(&registry, "user-a");
+    let entry = registry.entries.iter().next().expect("recorded row exists");
+    let newer_timestamp = entry.last_updated.load(Ordering::Relaxed);
+    assert_eq!(entry.call_count.load(Ordering::Relaxed), 2);
+
+    // Model a recorder that began before the export, then was delayed until
+    // afterward to publish its previously captured time.
+    entry.publish_timestamp(earlier_timestamp);
+
+    assert_eq!(
+        entry.last_updated.load(Ordering::Relaxed),
+        newer_timestamp,
+        "a delayed older timestamp must not move the row behind the watermark"
+    );
+    drop(entry);
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "the uncollected update must remain protected from eviction"
+    );
+    assert_eq!(registry.entries.len(), 1);
+}
+
 /// Both export formats acknowledge collection, so a JSON-only collector and a
 /// Prometheus-only collector each keep the registry draining normally.
 #[test]

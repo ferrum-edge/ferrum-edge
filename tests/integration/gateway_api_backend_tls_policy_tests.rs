@@ -628,6 +628,452 @@ fn backend_tls_policy_zero_weight_uncovered_backend_does_not_fail_closed() {
 }
 
 // ---------------------------------------------------------------------------
+// Separate rules on one route-table slot (issue #6290)
+// ---------------------------------------------------------------------------
+
+const TRANSPORT_REFUSAL_WARNING: &str = "dials its backend over a different transport";
+
+fn method_rule(method: &str, path: &str, service_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "matches": [{
+            "path": { "type": "PathPrefix", "value": path },
+            "method": method
+        }],
+        "backendRefs": [{ "name": service_name, "port": 8080 }]
+    })
+}
+
+fn multi_rule_http_route(name: &str, rules: Vec<serde_json::Value>) -> K8sObject {
+    object(
+        "HTTPRoute",
+        name,
+        serde_json::json!({
+            "parentRefs": [{ "name": "edge" }],
+            "hostnames": ["app.example.com"],
+            "rules": rules
+        }),
+    )
+}
+
+fn plain_and_covered_services() -> Vec<K8sObject> {
+    vec![
+        gateway_class(),
+        gateway(),
+        service("plain", 8080, "http"),
+        service("secure", 8080, "http"),
+        backend_tls_policy_system("secure-tls", "secure"),
+    ]
+}
+
+/// The translator's unroutable placeholder for rules that never dial a backend
+/// (redirect, fault, zero-weight blackhole).
+const NON_DIALING_BACKEND_HOST: &str = "ferrum-zero-weight.invalid.";
+
+/// One backend a materialized proxy can dial: `(upstream_id, backend_host)`.
+type DialedDestination = (Option<String>, Option<String>);
+
+/// Every destination a materialized proxy can dial — its default backend and
+/// each `mesh_route_dispatch` rule destination — must use the proxy's own
+/// scheme: `https` exactly when the destination is a BackendTLSPolicy-covered
+/// upstream. A covered upstream reached through an `http` proxy would be
+/// dialed as `http://`.
+fn assert_every_destination_matches_proxy_transport(
+    translated: &ferrum_edge::config_sources::k8s::K8sTranslation,
+) {
+    let covered = |destination: &DialedDestination| {
+        destination.0.as_deref().is_some_and(|id| {
+            translated
+                .config
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.id == id && upstream.backend_tls_sni.is_some())
+        })
+    };
+    let dials = |destination: &DialedDestination| {
+        destination.0.is_some() || destination.1.as_deref() != Some(NON_DIALING_BACKEND_HOST)
+    };
+    for proxy in &translated.config.proxies {
+        let default_host = proxy
+            .upstream_id
+            .is_none()
+            .then(|| proxy.backend_host.clone());
+        let mut destinations: Vec<DialedDestination> =
+            vec![(proxy.upstream_id.clone(), default_host)];
+        for plugin in &translated.config.plugin_configs {
+            if plugin.plugin_name != "mesh_route_dispatch"
+                || plugin.namespace != proxy.namespace
+                || plugin.proxy_id.as_deref() != Some(proxy.id.as_str())
+            {
+                continue;
+            }
+            for rule in plugin
+                .config
+                .get("rules")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let field = |name: &str| {
+                    rule.get("destination")
+                        .and_then(|destination| destination.get(name))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                };
+                destinations.push((field("upstream_id"), field("backend_host")));
+            }
+        }
+        let dialed: Vec<&DialedDestination> = destinations.iter().filter(|d| dials(d)).collect();
+        let expected = if dialed.iter().any(|destination| covered(destination)) {
+            Some(BackendScheme::Https)
+        } else {
+            Some(BackendScheme::Http)
+        };
+        assert_eq!(
+            proxy.backend_scheme, expected,
+            "proxy {:?} dials destinations {:?} over the wrong transport",
+            proxy.id, dialed
+        );
+        if expected == Some(BackendScheme::Https) {
+            assert!(
+                dialed.iter().all(|destination| covered(destination)),
+                "an https proxy must not also dial an uncovered destination: {:?}",
+                dialed
+            );
+        }
+    }
+}
+
+#[test]
+fn backend_tls_policy_uncovered_rule_first_refuses_later_covered_rule_on_same_slot() {
+    let mut objects = plain_and_covered_services();
+    objects.push(multi_rule_http_route(
+        "method-split",
+        vec![
+            method_rule("GET", "/api", "plain"),
+            method_rule("POST", "/api", "secure"),
+        ],
+    ));
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert_every_destination_matches_proxy_transport(&translated);
+    assert_eq!(
+        translated.config.proxies.len(),
+        1,
+        "only the uncovered GET rule may serve the shared slot: {:?}",
+        translated.config.proxies
+    );
+    let proxy = &translated.config.proxies[0];
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Http));
+    assert!(proxy.upstream_id.is_none());
+    assert!(
+        proxy.backend_host.contains("plain"),
+        "the surviving proxy must keep the uncovered GET backend: {}",
+        proxy.backend_host
+    );
+    assert!(
+        translated
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(TRANSPORT_REFUSAL_WARNING)),
+        "the refused covered rule must be reported: {:?}",
+        translated.warnings
+    );
+}
+
+#[test]
+fn backend_tls_policy_covered_rule_first_keeps_https_and_refuses_uncovered_rule() {
+    let mut objects = plain_and_covered_services();
+    objects.push(multi_rule_http_route(
+        "method-split",
+        vec![
+            method_rule("POST", "/api", "secure"),
+            method_rule("GET", "/api", "plain"),
+        ],
+    ));
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert_every_destination_matches_proxy_transport(&translated);
+    assert_eq!(
+        translated.config.proxies.len(),
+        1,
+        "only the covered POST rule may serve the shared slot: {:?}",
+        translated.config.proxies
+    );
+    let proxy = &translated.config.proxies[0];
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Https));
+    let upstream_id = proxy
+        .upstream_id
+        .as_deref()
+        .expect("the covered rule dials through its TLS upstream");
+    let upstream = translated
+        .config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .expect("the covered upstream is materialized");
+    assert_eq!(
+        upstream.backend_tls_sni.as_deref(),
+        Some("backend.example.com")
+    );
+    assert_eq!(
+        upstream.backend_tls_server_ca_cert_path.as_deref(),
+        Some(SYSTEM_TRUST_ROOTS_SOURCE)
+    );
+    assert!(
+        translated
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(TRANSPORT_REFUSAL_WARNING)),
+        "the refused uncovered rule must be reported: {:?}",
+        translated.warnings
+    );
+}
+
+#[test]
+fn backend_tls_policy_covered_and_uncovered_rules_on_separate_paths_both_serve() {
+    let mut objects = plain_and_covered_services();
+    objects.push(multi_rule_http_route(
+        "path-split",
+        vec![
+            method_rule("GET", "/api", "plain"),
+            method_rule("POST", "/secure", "secure"),
+        ],
+    ));
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert_every_destination_matches_proxy_transport(&translated);
+    assert_eq!(translated.config.proxies.len(), 2);
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Http)
+                && proxy.backend_host.contains("plain"))
+    );
+    assert!(
+        translated
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_scheme == Some(BackendScheme::Https)
+                && proxy.upstream_id.is_some())
+    );
+    assert!(
+        !translated
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(TRANSPORT_REFUSAL_WARNING)),
+        "distinct slots never share a transport: {:?}",
+        translated.warnings
+    );
+}
+
+#[test]
+fn backend_tls_policy_covered_rule_still_merges_a_non_dialing_redirect_rule() {
+    let mut objects = plain_and_covered_services();
+    objects.push(multi_rule_http_route(
+        "redirect-split",
+        vec![
+            method_rule("POST", "/api", "secure"),
+            serde_json::json!({
+                "matches": [{
+                    "path": { "type": "PathPrefix", "value": "/api" },
+                    "method": "GET"
+                }],
+                "filters": [{
+                    "type": "RequestRedirect",
+                    "requestRedirect": { "hostname": "example.org" }
+                }]
+            }),
+        ],
+    ));
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert_every_destination_matches_proxy_transport(&translated);
+    assert!(
+        !translated
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(TRANSPORT_REFUSAL_WARNING)),
+        "a redirect rule never dials a backend, so it must not be refused: {:?}",
+        translated.warnings
+    );
+    assert_eq!(translated.config.proxies.len(), 1);
+    let proxy = &translated.config.proxies[0];
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Https));
+    let dispatch = translated
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+        })
+        .expect("the merged proxy carries a dispatch plugin");
+    let rules = dispatch
+        .config
+        .get("rules")
+        .and_then(Value::as_array)
+        .expect("dispatch rules");
+    assert!(
+        rules.iter().any(|rule| rule.get("redirect").is_some()),
+        "the redirect rule must merge into the covered proxy: {rules:?}"
+    );
+}
+
+/// Wording unique to the transport refusal's Route status message.
+const TRANSPORT_REFUSAL_STATUS: &str = "dials its backend over a different transport";
+/// Wording unique to the different-listener ambiguity message, which a
+/// transport refusal must never borrow.
+const LISTENER_AMBIGUITY_STATUS: &str = "another Gateway API listener";
+
+fn single_rule_http_route(name: &str, rule: serde_json::Value, created: &str) -> K8sObject {
+    let mut route = multi_rule_http_route(name, vec![rule]);
+    route.metadata.creation_timestamp = Some(created.to_string());
+    route
+}
+
+/// The Ferrum-owned parent status of one HTTPRoute, as the status writer
+/// would publish it for this snapshot.
+fn route_parent_status(objects: &[K8sObject], route: &str) -> Value {
+    let translated = translate_k8s_objects(objects, options()).expect("translate");
+    let update = plan_gateway_api_status_updates(objects, options(), &translated.route_conflicts)
+        .into_iter()
+        .find(|update| update.kind == "HTTPRoute" && update.name == route)
+        .unwrap_or_else(|| panic!("HTTPRoute {route} must get a status update"));
+    update.status["parents"]
+        .as_array()
+        .expect("status.parents")
+        .iter()
+        .find(|parent| {
+            parent.get("controllerName").and_then(Value::as_str)
+                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("HTTPRoute {route} must carry a Ferrum parent status"))
+}
+
+fn condition_status(parent: &Value, condition_type: &str) -> (String, String, String) {
+    let found = condition(parent, condition_type);
+    let field = |name: &str| {
+        found
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    (field("status"), field("reason"), field("message"))
+}
+
+#[test]
+fn backend_tls_policy_partial_transport_refusal_keeps_route_programmed_and_conflicted() {
+    // Both orders: one rule of the Route serves, the other is refused.
+    for rules in [
+        vec![
+            method_rule("GET", "/api", "plain"),
+            method_rule("POST", "/api", "secure"),
+        ],
+        vec![
+            method_rule("POST", "/api", "secure"),
+            method_rule("GET", "/api", "plain"),
+        ],
+    ] {
+        let mut objects = plain_and_covered_services();
+        objects.push(multi_rule_http_route("method-split", rules));
+        let translated = translate_k8s_objects(&objects, options()).expect("translate");
+        assert_eq!(
+            translated.transport_refused_route_attachments.len(),
+            1,
+            "the refused rule's claim must reach status as a transport refusal"
+        );
+        assert!(
+            translated.refused_route_attachments.is_empty(),
+            "a transport refusal is not a different-listener ambiguity: {:?}",
+            translated.refused_route_attachments
+        );
+
+        let parent = route_parent_status(&objects, "method-split");
+        let (accepted, accepted_reason, _) = condition_status(&parent, "Accepted");
+        assert_eq!(
+            accepted, "True",
+            "the surviving rule keeps the Route accepted"
+        );
+        assert_eq!(accepted_reason, "Accepted");
+        let (programmed, _, _) = condition_status(&parent, "Programmed");
+        assert_eq!(programmed, "True", "the surviving rule is still programmed");
+        let (conflicted, conflicted_reason, message) = condition_status(&parent, "Conflicted");
+        assert_eq!(conflicted, "True", "the refused rule must be reported");
+        assert_eq!(conflicted_reason, "Conflicted");
+        assert!(
+            message.contains(TRANSPORT_REFUSAL_STATUS),
+            "the message must name the transport cause: {message}"
+        );
+        assert!(
+            !message.contains(LISTENER_AMBIGUITY_STATUS),
+            "one listener exists, so the message must not claim listener ambiguity: {message}"
+        );
+    }
+}
+
+#[test]
+fn backend_tls_policy_complete_transport_refusal_withdraws_the_later_route() {
+    let mut objects = plain_and_covered_services();
+    objects.push(single_rule_http_route(
+        "a-plain-get",
+        method_rule("GET", "/api", "plain"),
+        "2026-01-01T00:00:00Z",
+    ));
+    objects.push(single_rule_http_route(
+        "b-secure-post",
+        method_rule("POST", "/api", "secure"),
+        "2026-01-02T00:00:00Z",
+    ));
+    let translated = translate_k8s_objects(&objects, options()).expect("translate");
+    assert_every_destination_matches_proxy_transport(&translated);
+    assert_eq!(translated.config.proxies.len(), 1);
+    assert_eq!(
+        translated.config.proxies[0].backend_scheme,
+        Some(BackendScheme::Http),
+        "the older uncovered route keeps the slot"
+    );
+
+    let refused = route_parent_status(&objects, "b-secure-post");
+    let (accepted, accepted_reason, accepted_message) = condition_status(&refused, "Accepted");
+    assert_eq!(accepted, "False", "nothing of the later route serves");
+    assert_eq!(accepted_reason, "Conflicted");
+    assert!(
+        accepted_message.contains(TRANSPORT_REFUSAL_STATUS)
+            && !accepted_message.contains(LISTENER_AMBIGUITY_STATUS),
+        "Accepted must carry the transport cause: {accepted_message}"
+    );
+    let (programmed, programmed_reason, programmed_message) =
+        condition_status(&refused, "Programmed");
+    assert_eq!(programmed, "False");
+    assert_eq!(programmed_reason, "Conflicted");
+    assert!(
+        programmed_message.contains(TRANSPORT_REFUSAL_STATUS),
+        "Programmed must carry the transport cause: {programmed_message}"
+    );
+    let (conflicted, _, conflicted_message) = condition_status(&refused, "Conflicted");
+    assert_eq!(conflicted, "True");
+    assert!(
+        conflicted_message.contains(TRANSPORT_REFUSAL_STATUS)
+            && !conflicted_message.contains(LISTENER_AMBIGUITY_STATUS),
+        "Conflicted must carry the transport cause: {conflicted_message}"
+    );
+
+    let survivor = route_parent_status(&objects, "a-plain-get");
+    assert_eq!(condition_status(&survivor, "Accepted").0, "True");
+    assert_eq!(condition_status(&survivor, "Programmed").0, "True");
+    assert_eq!(
+        condition_status(&survivor, "Conflicted").0,
+        "False",
+        "the surviving route is not the refused claim"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // targetRefs[].sectionName resolution
 // ---------------------------------------------------------------------------
 

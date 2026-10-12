@@ -113,7 +113,7 @@ WORKDIR /build
 # Copy only manifests and build script first, so Docker can cache the
 # expensive dependency download + compile step across source changes.
 COPY Cargo.toml Cargo.lock build.rs ./
-COPY build/protoc_preflight.rs build/builtin_plugin_names.rs ./build/
+COPY build/protoc_preflight.rs build/builtin_plugin_names.rs build/plugin_migration_exports.rs ./build/
 COPY proto ./proto
 COPY custom_plugins ./custom_plugins
 # Vendored crates referenced by [patch.crates-io] in Cargo.toml. Must be

@@ -63,13 +63,19 @@ on_final_response_headers()     ── observe-only header effects (phase 7b; st
 on_response_body()              ── can reject (buffered responses only)
   │
   ▼
-transform_response_body()       ── can transform response body (buffered only; semantic stage 10, then transport-encoding stage 10c)
+transform_response_body()       ── can transform response body (buffered only; semantic stage 10)
   │
   ▼
-on_response_body_transformed()  ── refresh representation metadata after a body replacement
+on_response_body_transformed(&mut ctx, &mut headers) ── refresh representation metadata after a replacement
   │
   ▼
-finalize_client_visible_response_body() ── can reject (authoritative output policy; phase 10b)
+finalize_client_visible_response_body() ── can reject (after semantic rewrites; phase 10b)
+  │
+  ▼
+transform_response_body()       ── optional transport encoding (stage 10c, e.g. compression)
+  │
+  ▼
+on_response_body_transformed(&mut ctx, &mut headers) ── if transport encoding replaced the body
   │
   ▼
 on_final_response_body()        ── can reject (post-transform validation)
@@ -336,8 +342,8 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_final_response_headers(&mut ctx, status, &headers)` | Post-`after_proxy` (phase 7b) | No | Header-only effects for the selected response on both buffered and streaming paths. Non-rejecting; streamed responses stop body hooks after this phase. Pair with `on_final_response_body()` only when both must be idempotent. |
 | `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client. Runs in the semantic stage (phase 10) and may run again in the transport-encoding stage (phase 10c) for plugins such as `compression`. |
-| `on_response_body_transformed(&ctx, status, &headers, &body)` | Between response transforms | No | Synchronous metadata refresh after this plugin's `transform_response_body` returns a replacement body. Not invoked when the transform returns `None`. |
-| `finalize_client_visible_response_body(&mut ctx, status, &headers, &body)` | Post-transform output policy (phase 10b) | Yes | Authoritative, rejecting policy over the exact client-visible bytes after semantic and transport transforms. Opt in with `enforces_final_client_visible_response_body()`. Header policy belongs in `finalize_client_visible_response_headers()` (phase 7c). |
+| `on_response_body_transformed(&mut ctx, &mut response_headers)` | Immediately after this plugin replaces the buffered body | No | Synchronous metadata refresh after this plugin's `transform_response_body` returns replacement bytes. Receives only mutable request context and response headers; not called when the transform returns `None`. |
+| `finalize_client_visible_response_body(&mut ctx, status, &headers, &body)` | After semantic rewrites, before transport encoding (phase 10b) | Yes | Authoritative, rejecting policy over the final semantic representation. Opt in with `enforces_final_client_visible_response_body()`. Header policy belongs in `finalize_client_visible_response_headers()` (phase 7c). |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
 | `on_response_committed(&mut ctx, status, &headers, &body)` | Post-backend (buffered commit) | No | Export the final client-visible buffered response after validators and rejection replacement; opt in with `requires_response_committed_hook()` |
 | `response_stream_inspector(&ctx, status, content_type)` | Post-backend (streaming) | No (can truncate) | Create one stateful, per-response body inspector |
@@ -755,7 +761,8 @@ async fn transform_response_body(
   `'static`, which `Arc<dyn Plugin>` already required.
 - Declaring `Never` but returning `Some` from `normalize_response_body*` /
   `transform_response_body*` remains a contract violation: the replacement is
-  refused rather than installed.
+  refused rather than installed, even when a producing peer in the same chain
+  opened a retained-response window the replacement would fit in.
 
 Exporters that must observe the response after all rejecting validators should
 also return `true` from `requires_response_committed_hook()` and emit from
@@ -1370,7 +1377,19 @@ Custom plugins that need their own database tables can declare migrations that r
 ### How It Works
 
 1. Export a `plugin_migrations()` function from your plugin file
-2. The build script detects it automatically (no registration needed)
+2. The build script detects it automatically (no registration needed). It
+   looks for a module-level `fn plugin_migrations` (any qualifiers, comments
+   or whitespace before `(`, or the raw spelling `r#plugin_migrations`), or a
+   plugin-root `use` that binds the name, such as
+   `pub use self::inner::plugin_migrations;`, a grouped
+   `pub use self::inner::{helper, plugin_migrations};`, or a rename
+   `pub use self::inner::declare as plugin_migrations;`. Mentions in comments
+   or strings, glob re-exports (`pub use self::inner::*;`), and functions
+   generated by macros are not detected. A `fn plugin_migrations` defined only
+   inside a nested item (inline `mod`, `impl` block, or function body) with no
+   plugin-root binding fails the build rather than silently dropping the
+   plugin's migrations; move it to the plugin root, re-export it there, or
+   rename it
 3. Run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` to apply pending migrations
 4. Plugin migrations run after core migrations under the same cross-process
    migration lock, using the dialect-specific transaction contract documented

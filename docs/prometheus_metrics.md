@@ -36,7 +36,7 @@ Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. 
 | `ferrum_database_delta_recoveries_total` | counter | `namespace` | Recovery after an accepted incremental apply or full reload. |
 | `ferrum_database_poll_last_completed_timestamp_seconds` | gauge | `namespace` | Poll-**task** freshness. Advances on every normally completed poll outcome, *including a handled error*, so it detects poll-task death (panic/abort/cancel/wedge) and **not** a database outage. Alert when `time() - metric` exceeds your poll SLO. |
 | `ferrum_database_config_source_connected` | gauge | `namespace` | `1` when the configuration database (database mode) or the CP's backing database (cp mode) is reachable and usable, `0` otherwise. This is the outage signal: it is the same shared flag the admin API uses to gate writes and `/health` reports as `database.available`. Alert on `min by (namespace) (…) == 0` for 5m (`FerrumGatewayDatabaseUnavailable`). |
-| `ferrum_database_poll_failures_total` | counter | `reason`, `namespace` | Poll failures by the closed reason set `connectivity`, `validation_rejected`, `migration_gate`. Reasons are compile-time labels, never derived from a backend error string. Use it to tell "the database is gone" (`connectivity`) from "the database is fine but its content is invalid" (`validation_rejected`) or "migrations are blocking recovery" (`migration_gate`). |
+| `ferrum_database_poll_failures_total` | counter | `reason`, `namespace` | Poll failures recorded by emitting paths, using the closed reason set `connectivity`, `validation_rejected`, `migration_gate`. Reasons are compile-time labels, never derived from a backend error string. `migration_gate` is not incremented by every migration-reconciliation failure: CP reconnect/failover reconciliation can mark the source unavailable without recording that reason. Read this alongside `ferrum_database_config_source_connected`; absence of a reason does not mean recovery succeeded. |
 
 **Suggested alert:** `ferrum_database_delta_consecutive_identical_rejections > 0` for 10m, or backoff bucket in `{gte_5m,max}` for 5m, while serving last-known-good. Mitigations: fix the rejected config mutation, confirm DB connectivity, and watch for a forced full reload + recovery.
 
@@ -87,10 +87,14 @@ Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. 
 `increase(ferrum_admin_audit_fail_open_unaudited_mutations_total[15m]) > 0`;
 `ferrum_admin_audit_retained_records > 0`.
 
-**Reconciliation:** the intent is fsynced before the mutation runs and the same
-stable id is finalized after it returns, so a committed mutation always has
-durable evidence. Delivery is at-least-once on that id and every backend insert
-is insert-only and idempotent, so a replayed record converges to exactly one
+**Reconciliation:** when durable intent admission succeeds, the intent is
+fsynced before the mutation runs and the same stable id is finalized after it
+returns. Under the explicit `fail_open` policy, a failed intent preparation can
+allow the mutation to proceed without durable pre-mutation evidence; the
+dedicated warning and `ferrum_admin_audit_fail_open_unaudited_mutations_total`
+record that gap. A `fail_closed` policy refuses the mutation instead. Delivery
+is at-least-once on the admitted intent's id and every backend insert is
+insert-only and idempotent, so a replayed record converges to exactly one
 immutable `audit_events` row — a duplicate delivery is success, never
 replacement. To reconcile a gap, compare
 `ferrum_admin_audit_intents_prepared_total` against
@@ -221,7 +225,7 @@ Everything except `ferrum_backend_retry_attempts_total`, `ferrum_frontend_tls_ha
 | `ferrum_overload_resource_current` / `ferrum_overload_resource_limit` | gauge | `resource`, `namespace` | The overload monitor's own view of `fd`, `connections`, and `requests`. Alert on `current / limit`, which is exactly what drives the 80/85/95% thresholds. |
 | `ferrum_overload_active_connections` / `ferrum_overload_active_requests` | gauge | `namespace` | Live RAII-guard counters, updated per connection/stream rather than per monitor tick. Use these for sub-tick resolution; use `resource_current` to reason about the thresholds. |
 | `ferrum_overload_port_exhaustion_events_total` | counter | `namespace` | Ephemeral-port exhaustion (`EADDRNOTAVAIL`). Any sustained increase means backend dials are failing before reaching the network. |
-| `ferrum_overload_draining` | gauge | `namespace` | `1` between SIGTERM and process exit. Expected to be `1` during a rolling restart; unexpected elsewhere. |
+| `ferrum_overload_draining` | gauge | `namespace` | `1` after listener and stream shutdown, when the instance has entered the active request-drain phase. This latch is set during graceful shutdown and can also be set by error-triggered shutdown; it is not the exact SIGTERM-to-process-exit interval. |
 | `ferrum_overload_event_loop_latency_seconds` | gauge | `namespace` | Most recent tokio scheduling delay. The 500ms critical threshold trips connection rejection. |
 
 **Suggested alert:** `max by (namespace) (ferrum_overload_level) >= 2` for 2m, or `ferrum_overload_resource_current / ferrum_overload_resource_limit > 0.85` for 5m. Both answer "why are requests being shed?" without polling a JWT-gated JSON endpoint.
@@ -248,7 +252,7 @@ Everything except `ferrum_backend_retry_attempts_total`, `ferrum_frontend_tls_ha
 | `ferrum_connection_pool_max_idle_per_host` | gauge | `namespace` | Configured idle ceiling per backend host for the reqwest pool. |
 | `ferrum_frontend_tls_handshake_failures_total` | counter | `reason`, `namespace` | Frontend TLS handshakes refused before any HTTP work, `reason` in `{timeout, error}`. Covers every rustls-terminating listener that routes through the shared frontend admission helper: HTTPS/H2 proxy, TCP+TLS stream proxies, admin TLS, CP gRPC TLS, and the injector webhook. HTTP/3 (QUIC) and DTLS use their own handshake machinery and are **not** counted here. |
 
-**Suggested alert:** `increase(ferrum_frontend_tls_handshake_failures_total{reason="error"}[10m]) > 0` after a client-CA or CRL rollout — TLS material is static per process, so a rotation that went wrong shows up here and nowhere in `ferrum_requests_total`.
+**Suggested alert:** `increase(ferrum_frontend_tls_handshake_failures_total{reason="error"}[10m]) > 0` after a client-CA or CRL rollout. Frontend TLS material is static per process by default and for inline-only sources. When live reload is explicitly enabled and at least one watched source is refreshable, a coherent accepted candidate can replace the active material; refused candidates leave the previous configuration active. Handshake failures occur before HTTP work, so this family is not counted in `ferrum_requests_total`.
 
 #### Cardinality
 

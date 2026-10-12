@@ -101,9 +101,14 @@ pub fn empty_k8s_overlay_slot() -> K8sOverlaySlot {
 /// `MeshConfigBroadcast::Full` carries no monotonic generation, so both apply
 /// strictly in arrival order.
 ///
+/// ConfigSync Subscribe streams also take it, only long enough to read their
+/// broadcast receiver's queued count and load `config_arc` together, so a
+/// snapshot's coverage cannot straddle a publication (issue #6163).
+///
 /// Deliberately a plain synchronous mutex. Everything it guards is a background
-/// task's CAS, serialization, and `broadcast::Sender::send` — all synchronous
-/// and short. Nothing on the proxy request path takes it, and because
+/// task's CAS, serialization, and `broadcast::Sender::send`, or a Subscribe
+/// stream's two reads — all synchronous and short. Nothing on the proxy
+/// request path takes it, and because
 /// [`Self::publish`] accepts a synchronous `FnOnce`, a future can never hold it
 /// across an `.await`; that is enforced by the signature, not by convention.
 #[derive(Clone, Default)]

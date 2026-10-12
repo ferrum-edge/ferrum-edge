@@ -7386,9 +7386,13 @@ where
         return Ok(outcome);
     }
     let grpc_web_body_ended = http_body::Body::is_end_stream(&streaming.body);
-    // Capture TTFB at header availability — before body relay / client
-    // backpressure can inflate admission-start elapsed.
-    let backend_ttfb_ms = backend_admission_start.elapsed().as_secs_f64() * 1000.0;
+    // Capture the response timing at header availability — before body relay,
+    // trailers, or client backpressure can inflate admission-start elapsed. It
+    // is both the logged TTFB and the adaptive-concurrency latency sample every
+    // settlement below records (issue #6307); the permit itself is still held
+    // until the terminal settlement, so full-body slot retention is unchanged.
+    let backend_admission_response_elapsed = backend_admission_start.elapsed();
+    let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64() * 1000.0;
     let pristine_grpc_web_trailers_only_terminal_metadata =
         (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) && grpc_web_body_ended)
             .then(|| {
@@ -7476,7 +7480,7 @@ where
                     cb_probe,
                     backend_start,
                     backend_admission_permits,
-                    backend_admission_start.elapsed(),
+                    backend_admission_response_elapsed,
                 );
                 return Ok(cross_protocol_header_write_disconnect_outcome(
                     reject_status,
@@ -7510,7 +7514,7 @@ where
             streaming.status,
             false,
             None,
-            backend_admission_start.elapsed(),
+            backend_admission_response_elapsed,
         );
         outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
@@ -7673,7 +7677,7 @@ where
             cb_probe,
             backend_start,
             backend_admission_permits,
-            backend_admission_start.elapsed(),
+            backend_admission_response_elapsed,
         );
         return Ok(cross_protocol_header_write_disconnect_outcome(
             streaming.status,
@@ -8088,7 +8092,7 @@ where
         outcome_status,
         false,
         outcome_error_class,
-        backend_admission_start.elapsed(),
+        backend_admission_response_elapsed,
     );
     let terminal_grpc_status = if request_overflowed_late {
         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
@@ -14746,7 +14750,7 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (_, is_half_open_probe) = state
+        let (_, is_half_open_probe, admission_generation) = state
             .circuit_breaker_cache
             .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
             .expect("half-open probe should be admitted");
@@ -14760,8 +14764,14 @@ mod tests {
             "single probe slot should be occupied before neutral release"
         );
 
-        crate::proxy::HalfOpenProbeGuard::new(&state, &proxy, target_key, is_half_open_probe)
-            .release_neutral();
+        crate::proxy::HalfOpenProbeGuard::new(
+            &state,
+            &proxy,
+            target_key,
+            is_half_open_probe,
+            admission_generation,
+        )
+        .release_neutral();
 
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");

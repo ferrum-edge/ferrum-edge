@@ -99,13 +99,40 @@ plugin configs, upstreams, and namespace-qualified listener/TLS entries) whose
 
 ### Memory footprint
 
-Each per-namespace channel is sized at `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`
-(default 128). With N served namespaces, the upper bound on broadcast
-memory is roughly `capacity * N * sizeof(ConfigUpdate)`. For typical
-mid-sized config snapshots (hundreds of KiB) this is well under 1 GiB even
-for hundreds of namespaces. Operators running `*` scope against thousands
-of tenants should tune `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` down (e.g.
-to 32) to keep the per-namespace channel small.
+A per-namespace broadcast channel is created the first time a DP subscribes
+to that namespace. Each channel has `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`
+slots (default 128; tokio rounds the value up to a power of two).
+
+Size memory by retained payload bytes, not by `sizeof(ConfigUpdate)`. Each
+retained `ConfigUpdate` owns its heap payload: `config_json` (the serialized
+namespace snapshot or delta), `trust_bundles_json`, and short version
+strings. A slot therefore costs roughly its encoded message size. The
+ConfigSync 16 MiB limit applies to each message; it is not a channel budget.
+
+The worst case, with every slot occupied, is about:
+
+```text
+slots_per_channel × namespaces_with_subscribers × average retained payload
+```
+
+For example, 128 slots × 100 namespaces × 100 KiB payloads is 1,310,720,000
+bytes (about 1.22 GiB) for the channels alone.
+
+That is the full-occupancy figure. Actual occupancy is usually much lower:
+
+- A send to a namespace with no subscribed DP retains nothing.
+- A slot drops its value once every receiver that existed at send time has
+  read it.
+- Retention approaches capacity only while a subscriber is lagging. Lag
+  recovery then sends a fresh full snapshot.
+
+Each subscriber's stream also holds its own clone of the message it is
+sending, which adds about one payload per connected DP on top of the channel
+figure.
+
+Operators running `*` scope against thousands of tenants, or serving large
+snapshots, should lower `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (for example
+to 32) to bound the lagging-subscriber worst case.
 
 ## JWT tenancy claim
 
@@ -130,8 +157,15 @@ The CP authorisation order is:
 
 2. **Standard JWT validation**: signature under the selected credential,
    `iss == FERRUM_CP_DP_GRPC_JWT_ISSUER`, `exp`/`iat`/`sub` present, `exp`
-   not expired. Single-namespace CPs may still use the legacy fleet-wide
-   HS256 secret here.
+   not expired, and a present `nbf` already reached. Both time checks apply
+   a 60-second clock-skew allowance (`GRPC_JWT_LEEWAY_SECONDS`): a token is
+   accepted until `exp + 60s`, and from `nbf - 60s` when it carries `nbf`.
+   An admitted configuration stream ends at that effective lease
+   (`exp + 60s`) or at the independent
+   `FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` ceiling, whichever comes
+   first (see [Authenticated stream lifetime](cp_dp_mode.md#authenticated-stream-lifetime)).
+   Single-namespace CPs may still use the legacy fleet-wide HS256 secret
+   here.
 
 3. **Namespace resolution (server-derived)**: the authorised set is the
    intersection of
@@ -487,7 +521,8 @@ Two client-side options, both applying equally to DP ConfigSync, native
   | `iss` | exactly one string, equal to `FERRUM_CP_DP_GRPC_JWT_ISSUER` (default `ferrum-edge-cp-dp`); arrays and other non-string shapes are rejected |
   | `sub` | required (present; the node id by convention) |
   | `iat` | required |
-  | `exp` | required and unexpired |
+  | `exp` | required; accepted until `exp` + 60 s clock-skew allowance, which is also the effective stream lease (the maximum stream lifetime can end a stream earlier) |
+  | `nbf` | optional; when present, accepted from `nbf` − 60 s |
   | `ns` | required by `Set`/`All` scope and by `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`; narrows the credential's allow-list |
   | `aud` | **must be absent** on DP `ConfigSync` and xDS ADS; **must be exactly `ferrum-mesh-subscribe:local`** on native `MeshSubscribe` |
 

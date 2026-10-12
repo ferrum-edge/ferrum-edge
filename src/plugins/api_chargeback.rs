@@ -498,8 +498,15 @@ impl ChargebackEntry {
             self.bytes_received_total
                 .fetch_add(bytes_received, Ordering::Relaxed);
         }
+        self.publish_timestamp(epoch.elapsed().as_nanos() as u64);
+    }
+
+    /// Publish a record timestamp without allowing a delayed recorder to move
+    /// the row's idle-age and collection state backwards.
+    #[doc(hidden)]
+    pub fn publish_timestamp(&self, timestamp_nanos: u64) {
         self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_max(timestamp_nanos, Ordering::Relaxed);
     }
 
     /// Total per-call (or per-connection) charge, computed once from exact

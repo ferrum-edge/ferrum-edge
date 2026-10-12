@@ -4144,12 +4144,19 @@ async fn handle_tcp_connection_inner(
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
                     ) {
-                        Ok((cb, is_half_open_probe)) => {
+                        Ok((cb, is_half_open_probe, admission_generation)) => {
                             if attempt == 0 {
-                                cb_info.cb_probe =
-                                    HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+                                cb_info.cb_probe = HalfOpenProbeGuard::for_admitted_probe(
+                                    &cb,
+                                    is_half_open_probe,
+                                    admission_generation,
+                                );
                             } else {
-                                cb_info.cb_probe.rearm(&cb, is_half_open_probe);
+                                cb_info.cb_probe.rearm(
+                                    &cb,
+                                    is_half_open_probe,
+                                    admission_generation,
+                                );
                             }
                             admitted_cb = Some(cb);
                         }
@@ -5034,12 +5041,19 @@ async fn handle_tcp_connection_inner(
                 current_cb_info.cb_target_key.as_deref(),
                 cb_config,
             ) {
-                Ok((cb, is_half_open_probe)) => {
+                Ok((cb, is_half_open_probe, admission_generation)) => {
                     if attempt == 0 {
-                        current_cb_info.cb_probe =
-                            HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+                        current_cb_info.cb_probe = HalfOpenProbeGuard::for_admitted_probe(
+                            &cb,
+                            is_half_open_probe,
+                            admission_generation,
+                        );
                     } else {
-                        current_cb_info.cb_probe.rearm(&cb, is_half_open_probe);
+                        current_cb_info.cb_probe.rearm(
+                            &cb,
+                            is_half_open_probe,
+                            admission_generation,
+                        );
                     }
                 }
                 Err(_) => {

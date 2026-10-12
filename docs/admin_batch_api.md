@@ -13,12 +13,14 @@ upstreams, then proxies, then plugin configs, then the proxy↔plugin
 associations — and every internal 1,000-record chunk share one transaction and
 one commit.
 
-- If any part fails, **no resource from the request is durable**. The response
-  carries no `created` counts, and `"rollback": "not_needed"` records that there
-  was never a partial graph to compensate for.
-- Because a failed batch leaves nothing behind, **retrying the identical payload
-  is idempotent** — the resources from a failed attempt cannot conflict with the
-  retry.
+- If the transaction fails, **no resource from the request is durable** and the
+  failure response carries no `created` counts. Some persistence and lease
+  failure responses also include `"rollback": "not_needed"`; that marker is
+  present only on the response paths that return it. A later live-apply failure
+  can return `503` after the transaction committed (see the error table).
+- When the transaction fails, retrying the identical payload cannot conflict
+  with resources from that attempt. A lost commit acknowledgement is the
+  separate ambiguous case described below.
 - The endpoint never returns a partial success. There is no `207 Multi-Status`
   response.
 - The namespace config-admission lease that authorized the batch is re-verified
@@ -477,9 +479,8 @@ All resources created successfully:
 
 ### Failure (nothing applied)
 
-A batch that does not commit returns an error object with no `created` counts.
-Every resource in the request is absent, so the identical payload can be retried
-once the reported cause is addressed:
+A persistence conflict response has no `created` counts and includes the
+`rollback` marker because the transaction did not apply any part of the batch:
 
 ```json
 {
@@ -498,7 +499,14 @@ Every resource in the batch is validated before any database write. If any resou
 - **Upstreams**: At least one target or service_discovery config, no duplicate names within the batch
 - **Plugin configs**: Known plugin name (`plugin_name`, same field as `POST /plugins/config`), scope/proxy_id consistency (proxy scope requires proxy_id, global and proxy_group scopes reject proxy_id), no duplicate plugin config IDs within the batch
 
-Conflicts with resources that already exist in the namespace (duplicate ID, name, listen path, or consumer identity) are detected at persistence and return `409`; nothing from the batch is written.
+Conflicts between resources in the same request are collected during graph
+validation and return `400` with `error` and `validation_errors`. The store
+preflight then checks existing consumer identities, proxy listen paths and
+names, and upstream names; a conflict returns `409` with only `error`, while a
+failed preflight lookup returns the redacted datastore `503` body. The atomic
+transaction remains the final uniqueness backstop: a collision found during
+persistence returns `409` with `rollback: not_needed`. Neither conflict path
+writes any resource from the batch.
 
 ### Error Responses
 
@@ -506,22 +514,27 @@ Conflicts with resources that already exist in the namespace (duplicate ID, name
 |--------|-----------|----------|
 | 201 | Whole graph committed (in `database` mode, and live on this gateway) | Yes, in full |
 | 202 | `?apply=async`: whole graph committed; live apply deferred (see [Deferred apply](admin_api.md#deferred-apply-for-bulk-provisioning-applyasync)) | Yes, in full |
-| 400 | Invalid JSON body, unknown top-level envelope key, or graph validation failed — payload problems only, never a database failure | No |
+| 400 | Invalid JSON body or unknown top-level envelope key — response has `error` only | No |
+| 400 | Graph validation failed, including conflicts between resources in this request — response has `error` and `validation_errors` | No |
 | 403 | Admin API is in read-only mode | No |
-| 409 | A resource conflicts with an existing resource or with another resource in the same request (duplicate ID, name, listen path, or consumer identity) | No |
+| 409 | Existing-resource conflict found by the store preflight — response has `error` only | No |
+| 409 | Uniqueness conflict found by the atomic persistence transaction, including a concurrent writer race — response has `error` and `rollback: not_needed` | No |
 | 500 | Server-side resource preparation failed, including a missing or weak `FERRUM_BASIC_AUTH_HMAC_SECRET` for plaintext Basic credentials | No |
-| 501 | The configured database deployment cannot provide the all-or-nothing guarantee (standalone MongoDB) — refused before any mutation | No |
-| 503 | No database available, a reference-check lookup or candidate-validation load failed, the datastore write failed, or the namespace config-admission lease lapsed before commit | No |
+| 501 | The configured database deployment cannot provide the all-or-nothing guarantee (standalone MongoDB) — response has `error` and `detail`, before persistence | No |
+| 503 | A pre-persistence namespace admission, reference lookup, candidate-validation load, or store-preflight lookup failed — response uses that stage's error shape | No |
+| 503 | The datastore write failed or the transaction's namespace-admission lease lapsed — response has `error` and `rollback: not_needed` | No |
 | 503 with `"applied": false` | `database` mode only: the graph committed but the live reload rejected it, timed out, or could not verify the config cursor | Yes (durable, not yet live) |
 
-Except for the `"applied": false` case, every non-2xx status leaves the
-namespace as it was, so retrying the same payload is safe. `409`, `501`, and the datastore/lease `503`s are raised by the
-persistence attempt and carry `"rollback": "not_needed"`. Statuses raised
-before persistence keep their shared shapes: `400` returns `error` +
-`validation_errors`; a namespace-admission `503` returns the shared
-admission-unavailable body; a database error while validating references
-returns `503` with the redacted `db_error_response` body. No failure body
-ever carries `created` counts.
+Except for the `"applied": false` case and the lost-acknowledgement case below,
+every non-2xx status leaves the namespace as it was. The `rollback: not_needed`
+marker appears on the atomic write's conflict, datastore-error, and lease-loss
+responses, and on the explicit pre-persist lease-expiry response; it is not a
+shared envelope for all failures. Earlier stages retain their own shapes:
+malformed input returns only `error`, graph validation returns `error` plus
+`validation_errors`, the unsupported-topology response returns `error` plus
+`detail`, and a preflight database failure uses the redacted `db_error_response`
+body. No pre-commit failure body carries `created` counts. A post-commit live
+apply failure can carry the committed counts with `"applied": false`.
 
 A database failure anywhere in the validation phase is a retryable `503`, never
 a `400`. This covers the reference lookups and the four candidate-validation

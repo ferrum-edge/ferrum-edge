@@ -57,33 +57,67 @@ impl ConfigMigrator {
             return Ok(0);
         }
 
+        // Validate the full path before mutating anything so an unsupported
+        // source version leaves the value untouched.
+        Self::plan_migration_steps(&current_version, target_version)?;
+
         let chain = Self::migration_chain();
-        let mut version = current_version.clone();
+        let mut version = current_version;
         let mut steps_applied = 0u32;
 
-        loop {
-            if version == target_version {
-                break;
+        while version != target_version {
+            let Some((from, to, migrate_fn)) = chain.iter().find(|(from, _, _)| *from == version)
+            else {
+                anyhow::bail!(
+                    "Config migration chain broken at version (<redacted scalar>) (target: {})",
+                    target_version
+                );
+            };
+            info!("Migrating config from version {} to {}", from, to);
+            migrate_fn(value)?;
+            version = to.to_string();
+            steps_applied += 1;
+        }
+
+        Ok(steps_applied)
+    }
+
+    /// Walk the migration chain from `from_version` to `target_version`
+    /// without applying any transform.
+    ///
+    /// Returns the number of steps a real migration would apply (0 when the
+    /// versions are equal). Fails with the same errors as [`Self::migrate_value`]
+    /// when no complete path exists, so dry-runs reject exactly what a real
+    /// migration rejects.
+    pub fn plan_migration_steps(
+        from_version: &str,
+        target_version: &str,
+    ) -> Result<u32, anyhow::Error> {
+        let chain = Self::migration_chain();
+        let mut version = from_version;
+        let mut steps = 0u32;
+
+        while version != target_version {
+            // A well-formed chain visits each step at most once; anything longer
+            // is a cycle and can never reach the target.
+            if steps as usize > chain.len() {
+                anyhow::bail!(
+                    "Config migration chain broken at version (<redacted scalar>) (target: {})",
+                    target_version
+                );
             }
-
-            let step = chain.iter().find(|(from, _, _)| *from == version);
-
-            match step {
-                Some((from, to, migrate_fn)) => {
-                    info!("Migrating config from version {} to {}", from, to);
-                    migrate_fn(value)?;
-                    version = to.to_string();
-                    steps_applied += 1;
+            match chain.iter().find(|(from, _, _)| *from == version) {
+                Some((_, to, _)) => {
+                    version = *to;
+                    steps += 1;
+                }
+                None if steps == 0 => {
+                    anyhow::bail!(
+                        "No config migration path from version (<redacted scalar>) to {}",
+                        target_version
+                    );
                 }
                 None => {
-                    if steps_applied == 0 {
-                        // No migration path found from the current version
-                        anyhow::bail!(
-                            "No config migration path from version (<redacted scalar>) to {}",
-                            target_version
-                        );
-                    }
-                    // We've applied some steps but can't reach the target
                     anyhow::bail!(
                         "Config migration chain broken at version (<redacted scalar>) (target: {})",
                         target_version
@@ -92,7 +126,32 @@ impl ConfigMigrator {
             }
         }
 
-        Ok(steps_applied)
+        Ok(steps)
+    }
+
+    /// Dry-run counterpart of [`Self::migrate_file`]: reads the file's version
+    /// and validates that a migration path to the current version exists,
+    /// without creating a backup or writing anything.
+    ///
+    /// Returns the result a real migration would produce, with
+    /// `backup_path = None` and `migrations_applied` holding the planned step
+    /// count. Unsupported versions are rejected with the same error as
+    /// [`Self::migrate_file`].
+    pub fn plan_file(path: &str) -> Result<ConfigMigrateResult, anyhow::Error> {
+        let from_version = Self::detect_version(path)?;
+        let target = CURRENT_CONFIG_VERSION;
+        let steps = Self::plan_migration_steps(&from_version, target)?;
+        let to_version = if steps == 0 {
+            from_version.clone()
+        } else {
+            target.to_string()
+        };
+        Ok(ConfigMigrateResult {
+            from_version,
+            to_version,
+            backup_path: None,
+            migrations_applied: steps,
+        })
     }
 
     /// Migrate a config file in-place, creating a backup first.

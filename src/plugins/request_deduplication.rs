@@ -616,6 +616,22 @@ enum DeduplicationEntry {
         /// for externally executing terminal responses until a distributed
         /// replay is known to be visible.
         retain_barrier_on_eviction: bool,
+        /// `true` while this completion's fenced Redis publication has not yet
+        /// returned a verdict.
+        ///
+        /// Until Redis settles ownership this request may be a stale owner whose
+        /// lease already expired, so the bytes must not be replay-visible: a
+        /// pending completion answers a matching retry exactly like the
+        /// in-flight marker it replaced. The operation already executed, so the
+        /// pending completion keeps its full completed retention rather than
+        /// the owner's in-flight lease: if the publication is cancelled and
+        /// never settles, the entry stays a non-replayable execution barrier
+        /// until the original protection deadline instead of re-admitting the
+        /// work. Lease-only expiry applies to genuinely unfinished work, which
+        /// never records a completion. A `Published` verdict (or an unreachable
+        /// Redis, which keeps the local replay) clears it; `NotOwner` removes
+        /// the entry instead.
+        pending_publication: bool,
     },
 }
 
@@ -1458,6 +1474,27 @@ impl RequestDeduplication {
             .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
+    /// Age every completion whose Redis publication is still pending, as if
+    /// its publisher had stopped awaiting the verdict `age` ago.
+    #[allow(dead_code)]
+    pub(crate) fn backdate_pending_publication_completions_for_tests(&self, age: Duration) {
+        let _guard = self.accounting_guard();
+        let now = Instant::now();
+        for mut entry in self.local.local_cache.iter_mut() {
+            if let DeduplicationEntry::Completed {
+                cached,
+                pending_publication: true,
+                ..
+            } = entry.value_mut()
+            {
+                cached.inserted_at = now.checked_sub(age).unwrap_or(now);
+            }
+        }
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
+    }
+
     #[allow(dead_code)]
     pub(crate) fn expire_execution_barriers_for_tests(&self) {
         let _guard = self.accounting_guard();
@@ -1675,15 +1712,24 @@ impl RequestDeduplication {
                     DeduplicationEntry::Completed {
                         cached,
                         fingerprint: cached_fingerprint,
+                        pending_publication,
                         ..
                     } => {
                         if now.duration_since(cached.inserted_at) < cached.retention {
-                            if cached_fingerprint == fingerprint {
-                                return LocalDeduplicationAction::Replay(cached.clone());
+                            if cached_fingerprint != fingerprint {
+                                return LocalDeduplicationAction::Conflict(
+                                    DeduplicationConflict::FingerprintMismatch,
+                                );
                             }
-                            return LocalDeduplicationAction::Conflict(
-                                DeduplicationConflict::FingerprintMismatch,
-                            );
+                            // Not yet authoritative: the Redis fence may still
+                            // reject this publisher, so answer as the in-flight
+                            // owner it replaced rather than replaying it.
+                            if *pending_publication {
+                                return LocalDeduplicationAction::Conflict(
+                                    DeduplicationConflict::InFlight,
+                                );
+                            }
+                            return LocalDeduplicationAction::Replay(cached.clone());
                         }
                     }
                     DeduplicationEntry::ExecutionBarrier {
@@ -1744,12 +1790,18 @@ impl RequestDeduplication {
             let DeduplicationEntry::Completed {
                 cached,
                 fingerprint: cached_fingerprint,
+                pending_publication,
                 ..
             } = entry.value()
             else {
                 return None;
             };
-            if cached_fingerprint == fingerprint
+            // A completion whose Redis publication is still pending is not
+            // replay-visible: a matching retry that observes the owner's (or a
+            // live successor's) Redis in-flight record must keep conflicting
+            // until the fence settles who owns the operation.
+            if !*pending_publication
+                && cached_fingerprint == fingerprint
                 && now.duration_since(cached.inserted_at) < cached.retention
             {
                 Some(cached.clone())
@@ -1783,15 +1835,18 @@ impl RequestDeduplication {
                     cached,
                     sequence,
                     fingerprint: cached_fingerprint,
+                    pending_publication,
                     ..
                 } => {
                     if now.duration_since(cached.inserted_at) < cached.retention {
-                        if cached_fingerprint == fingerprint {
-                            LocalDeduplicationAction::Replay(cached.clone())
-                        } else {
+                        if cached_fingerprint != fingerprint {
                             LocalDeduplicationAction::Conflict(
                                 DeduplicationConflict::FingerprintMismatch,
                             )
+                        } else if *pending_publication {
+                            LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight)
+                        } else {
+                            LocalDeduplicationAction::Replay(cached.clone())
                         }
                     } else {
                         let retained_size = cached.retained_size();
@@ -2530,6 +2585,11 @@ impl RequestDeduplication {
             fingerprint: fingerprint.to_string(),
             publisher_owner_token: owner_token.to_string(),
             retain_barrier_on_eviction,
+            // A Redis owner's completion stays replay-invisible until the
+            // fenced publication settles, while still blocking re-execution
+            // through its full retention; process-local ownership is already
+            // authoritative.
+            pending_publication: redis_owned,
         });
         self.add_completed_size_locked(entry_size);
         self.local
@@ -2543,12 +2603,18 @@ impl RequestDeduplication {
         }
     }
 
-    fn set_completed_barrier_retention(
+    /// Make this request's own completion replay-visible once its Redis
+    /// publication verdict permits local replay, optionally updating whether
+    /// eviction must leave an execution barrier behind.
+    ///
+    /// Sequence- and fingerprint-matched, so a completion that was already
+    /// evicted, expired, or replaced by a successor is left untouched.
+    fn settle_local_completed_publication(
         &self,
         key: &str,
         fingerprint: &str,
         sequence: u64,
-        retain: bool,
+        retain_barrier_on_eviction: Option<bool>,
     ) {
         let Some(mut entry) = self.local.local_cache.get_mut(key) else {
             return;
@@ -2556,13 +2622,17 @@ impl RequestDeduplication {
         if let DeduplicationEntry::Completed {
             sequence: current_sequence,
             fingerprint: current_fingerprint,
-            retain_barrier_on_eviction,
+            retain_barrier_on_eviction: current_retain,
+            pending_publication,
             ..
         } = entry.value_mut()
             && *current_sequence == sequence
             && current_fingerprint.as_str() == fingerprint
         {
-            *retain_barrier_on_eviction = retain;
+            *pending_publication = false;
+            if let Some(retain) = retain_barrier_on_eviction {
+                *current_retain = retain;
+            }
         }
     }
 
@@ -2811,6 +2881,7 @@ impl RequestDeduplication {
                 fingerprint,
                 publisher_owner_token,
                 retain_barrier_on_eviction,
+                ..
             } if *current == sequence => (
                 cached.retained_size(),
                 cached.inserted_at,
@@ -4230,16 +4301,24 @@ impl Plugin for RequestDeduplication {
                 .await
             {
                 RedisPublication::Published { replayable: true } => {
-                    // Redis now carries the replay, so ordinary capacity
+                    // The fence confirmed this request as the owner, so its
+                    // local completion is now authoritative and may replay.
+                    // Redis carries the replay as well, so ordinary capacity
                     // eviction is safe even for an externally executing
                     // terminal response.
-                    self.set_completed_barrier_retention(&key, &fingerprint, sequence, false);
+                    self.settle_local_completed_publication(
+                        &key,
+                        &fingerprint,
+                        sequence,
+                        Some(false),
+                    );
                 }
                 // The response fits local retention but not the Redis payload
                 // cap, so a non-replayable tombstone owns the distributed key.
                 // Peers get a deterministic conflict; this gateway keeps the
                 // richer local replay and protects it from eviction.
                 RedisPublication::Published { replayable: false } => {
+                    self.settle_local_completed_publication(&key, &fingerprint, sequence, None);
                     preserve_local_completion = true;
                 }
                 RedisPublication::NotOwner => {
@@ -4247,8 +4326,9 @@ impl Plugin for RequestDeduplication {
                     // operation. The completion is not authoritative: refusing
                     // the distributed write while keeping a local replay would
                     // make this gateway answer retries with a result the rest of
-                    // the deployment does not recognize. Drop it and let the
-                    // next request re-read the authoritative record.
+                    // the deployment does not recognize. It was never
+                    // replay-visible while the verdict was pending; drop it and
+                    // let the next request re-read the authoritative record.
                     self.remove_local_completed(&key, &fingerprint, sequence);
                     self.remove_matching_local_execution_barrier(
                         &key,
@@ -4263,6 +4343,7 @@ impl Plugin for RequestDeduplication {
                     // pressure must evict it. The Redis in-flight record is left
                     // to expire on its own lease, so peers stay blocked instead
                     // of splitting ownership.
+                    self.settle_local_completed_publication(&key, &fingerprint, sequence, None);
                     preserve_local_completion = true;
                 }
             }

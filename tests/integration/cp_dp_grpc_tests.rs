@@ -4363,6 +4363,211 @@ async fn test_dp_recovers_from_broadcast_channel_overflow() {
     client_handle.abort();
 }
 
+/// Issue #6163: a lagged Subscribe receiver resumes at the oldest RETAINED
+/// broadcast, so distinct deltas committed before the lag-recovery snapshot
+/// can follow it. The DP's source-blind freshness fence refuses such a delta
+/// and ends the stream. The CP must drop retained updates already folded into
+/// the recovery snapshot so a genuinely new update still applies on the same
+/// stream.
+///
+/// Runs on a current-thread runtime: the flood is sent without yielding, so
+/// the CP stream task cannot drain the 2-slot channel and is guaranteed to
+/// observe `Lagged` with older distinct deltas still retained.
+#[tokio::test]
+async fn lag_recovery_snapshot_is_not_followed_by_older_retained_deltas() {
+    let base = Utc::now();
+    let mut initial_config = create_test_config(1);
+    initial_config.loaded_at = base - chrono::Duration::seconds(60);
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(initial_config, 2).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "lag-cursor-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    let received_initial = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(received_initial.is_ok(), "DP should receive initial config");
+
+    let flood_delta = |index: i64| IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy(
+            &format!("flood-{index}"),
+            &format!("/flood-{index}"),
+        )],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: base - chrono::Duration::seconds(50 - index),
+    };
+
+    // The CP has committed every flood delta (t1 < t2 < ...) and then a
+    // newer full state t3; the recovery snapshot reads that state.
+    let mut recovered_config = create_test_config(1);
+    for index in 0..6 {
+        recovered_config.proxies.push(create_test_proxy(
+            &format!("flood-{index}"),
+            &format!("/flood-{index}"),
+        ));
+    }
+    recovered_config.loaded_at = base - chrono::Duration::seconds(30);
+    config_arc.store(Arc::new(recovered_config));
+
+    // No await between sends: the 2-slot channel overflows and the two newest
+    // distinct deltas (both older than t3) stay retained.
+    for index in 0..6 {
+        let delta = flood_delta(index);
+        let version = delta.poll_timestamp.to_rfc3339();
+        CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
+    }
+
+    let recovered = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 7 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "DP should apply the lag-recovery snapshot. Current: {}",
+        proxy_state.config.load().proxies.len()
+    );
+
+    // A genuinely new update committed after the recovery snapshot.
+    let fresh = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("after-recovery", "/after-recovery")],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: base - chrono::Duration::seconds(10),
+    };
+    let fresh_version = fresh.poll_timestamp.to_rfc3339();
+    let receivers = update_tx.receiver_count();
+    assert!(receivers >= 1, "the DP stream must still be subscribed");
+    CpGrpcServer::broadcast_delta(&update_tx, &fresh, &fresh_version);
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            let has_fresh = proxy_state
+                .config
+                .load()
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id == "after-recovery");
+            if has_fresh {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        applied.is_ok(),
+        "a new delta after lag recovery must apply on the same stream; \
+         stream ended: {}",
+        client_handle.is_finished()
+    );
+    assert!(
+        !client_handle.is_finished(),
+        "an older retained delta must not terminate the stream after lag recovery"
+    );
+    assert_eq!(proxy_state.config.load().proxies.len(), 8);
+
+    client_handle.abort();
+}
+
+/// Issue #6163 review: snapshot coverage must follow publication order, not
+/// wall-clock stamps. A CP whose clock stepped backwards publishes a NEW
+/// snapshot stamped earlier than the one this stream already sent. That
+/// publication was never part of the earlier snapshot, so the CP must
+/// deliver it, and the DP accepts it as a same-source snapshot.
+#[tokio::test]
+async fn snapshot_published_after_a_clock_step_back_is_still_delivered() {
+    let base = Utc::now();
+    let mut initial_config = create_test_config(1);
+    initial_config.loaded_at = base;
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(initial_config, 16).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "clock-step-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    assert!(
+        wait_for_proxy_id(&proxy_state, "proxy-0", Duration::from_secs(5)).await,
+        "DP should receive the initial snapshot"
+    );
+    assert_eq!(proxy_state.config.load().loaded_at, base);
+
+    // The CP clock stepped back 10s before this reload committed changed
+    // config, so its stamp is older than the stream's initial snapshot.
+    let mut stepped = create_test_config(1);
+    stepped
+        .proxies
+        .push(create_test_proxy("after-clock-step", "/after-clock-step"));
+    stepped.loaded_at = base - chrono::Duration::seconds(10);
+    config_arc.store(Arc::new(stepped.clone()));
+    assert!(
+        CpGrpcServer::broadcast_update(&update_tx, &stepped),
+        "the stepped-back snapshot must be queued to the live subscription"
+    );
+
+    assert!(
+        wait_for_proxy_id(&proxy_state, "after-clock-step", Duration::from_secs(5)).await,
+        "a snapshot published after the stream's snapshot must be delivered \
+         even when its stamp is older; stream ended: {}",
+        client_handle.is_finished()
+    );
+    assert_eq!(proxy_state.config.load().proxies.len(), 2);
+    assert!(
+        !client_handle.is_finished(),
+        "the same-source stepped-back snapshot must not end the stream"
+    );
+
+    client_handle.abort();
+}
+
 // ─── Cross-namespace rejection tests ─────────────────────────────────────────
 //
 // These tests cover the multi-tenant security gap where a DP started with

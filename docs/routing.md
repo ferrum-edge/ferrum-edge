@@ -11,7 +11,7 @@ Routing is the first half of the request path; protocol dispatch is the second. 
 
 The gateway does **not** pin gRPC or WebSocket in config — a single `https` proxy transparently serves a mix of REST, gRPC, and WebSocket traffic on the same backend pool. There are no gRPC-, WebSocket-, or HTTP/3-specific scheme values.
 
-HTTP/3 clients work against any `backend_scheme` — see [docs/http3.md](http3.md) for the dispatch model, the cross-protocol bridge, and why WebSocket upgrades on the H3 listener return 501.
+HTTP/3 clients work against any `backend_scheme` — see [docs/http3.md](http3.md) for the dispatch model, the cross-protocol bridge, and HTTP/3 WebSocket support. WebSocket dispatch is enabled by default; it returns 501 only when `FERRUM_HTTP3_WEBSOCKET_ENABLED=false` and a client still sends Extended CONNECT.
 
 ## Routing Algorithm
 
@@ -198,9 +198,10 @@ Carrying the port matters for two reasons:
   strict backends answer with a stream reset (surfacing as a 502). On HTTP/1.1 the same mismatch
   violates RFC 9112 §3.2.
 
-Set `preserve_host_header: true` on a proxy to forward the **client's** `Host` verbatim instead. In
-that mode Ferrum does not consult the selected target at all, and the backend sees exactly what the
-client sent.
+Set `preserve_host_header: true` on a proxy to forward the **client's** `Host` verbatim instead.
+For ordinary direct backends, the backend sees exactly what the client sent. A selected mesh
+sidecar mTLS target with a pinned `mesh.mtls_authority_host` uses that service authority instead;
+for native gRPC the `Host` header is synchronized with the resolved URI authority.
 
 ## Exact Path Routing
 

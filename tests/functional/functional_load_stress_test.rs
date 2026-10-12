@@ -920,6 +920,46 @@ async fn provision_resources(
 
 // --- Perf result ---
 
+/// What a `PerfResult`'s throughput, latency, and success numbers measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasurementBoundary {
+    /// reqwest phases: latency runs from request start to `send()`
+    /// completion (response head received); the response body is never
+    /// read, so a body error after a 2xx head is not counted as a failure. Success is a 2xx status. RPS is attempts
+    /// (successes and failures) divided by wall time.
+    ResponseHead,
+    /// wrk phases: wrk's own `Requests/sec` and latency figures; failures are
+    /// wrk's non-2xx/3xx responses plus socket errors.
+    WrkReported,
+}
+
+impl MeasurementBoundary {
+    fn rps_label(self) -> &'static str {
+        match self {
+            MeasurementBoundary::ResponseHead => "Attempt RPS",
+            MeasurementBoundary::WrkReported => "wrk Requests/sec",
+        }
+    }
+
+    fn latency_label(self) -> &'static str {
+        match self {
+            MeasurementBoundary::ResponseHead => {
+                "Response-head latency (send() completion; body not read)"
+            }
+            MeasurementBoundary::WrkReported => "wrk-reported latency",
+        }
+    }
+
+    fn success_label(self) -> &'static str {
+        match self {
+            MeasurementBoundary::ResponseHead => "2xx-status success rate",
+            MeasurementBoundary::WrkReported => {
+                "wrk success rate (non-2xx/3xx + socket errors fail)"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PerfResult {
     label: String,
@@ -935,6 +975,7 @@ struct PerfResult {
     p99_latency_us: f64,
     p999_latency_us: f64,
     max_latency_us: f64,
+    boundary: MeasurementBoundary,
 }
 
 fn print_perf_result(r: &PerfResult) {
@@ -946,8 +987,10 @@ fn print_perf_result(r: &PerfResult) {
         r.duration_secs, r.total_requests, r.successful_requests, r.failed_requests
     );
     println!(
-        "│  RPS: {:.0}  |  Success rate: {:.1}%",
+        "│  {}: {:.0}  |  {}: {:.1}%",
+        r.boundary.rps_label(),
         r.rps,
+        r.boundary.success_label(),
         if r.total_requests > 0 {
             r.successful_requests as f64 / r.total_requests as f64 * 100.0
         } else {
@@ -955,6 +998,7 @@ fn print_perf_result(r: &PerfResult) {
         }
     );
     println!("├──────────────────────────────────────────────────────────────────┤");
+    println!("│  {}", r.boundary.latency_label());
     println!(
         "│  Avg: {:>8.1}ms  P50: {:>7.1}ms  P95: {:>7.1}ms",
         r.avg_latency_us / 1000.0,
@@ -1196,8 +1240,10 @@ async fn run_load_phase(
     tokio::time::sleep(Duration::from_secs(duration_secs)).await;
     stop.store(true, Ordering::Relaxed);
 
+    // A worker that panicked (for example on client construction) did not
+    // participate; propagate it instead of reporting a partial phase.
     for h in handles {
-        let _ = h.await;
+        h.await?;
     }
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -1237,6 +1283,7 @@ async fn run_load_phase(
         p99_latency_us: p99,
         p999_latency_us: p999,
         max_latency_us: max,
+        boundary: MeasurementBoundary::ResponseHead,
     })
 }
 
@@ -1386,8 +1433,10 @@ async fn run_open_proxy_phase(
     tokio::time::sleep(Duration::from_secs(duration_secs)).await;
     stop.store(true, Ordering::Relaxed);
 
+    // A worker that panicked (for example on client construction) did not
+    // participate; propagate it instead of reporting a partial phase.
     for h in handles {
-        let _ = h.await;
+        h.await?;
     }
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -1427,13 +1476,280 @@ async fn run_open_proxy_phase(
         p99_latency_us: p99,
         p999_latency_us: p999,
         max_latency_us: max,
+        boundary: MeasurementBoundary::ResponseHead,
     })
 }
 
 // --- Admin mutation phase ---
 
+/// One admin write issued by the mutation phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutationOp {
+    CreateProxy,
+    CreatePlugin,
+    UpdateProxy,
+    DeletePlugin,
+    DeleteProxy,
+}
+
+impl MutationOp {
+    const ALL: [MutationOp; 5] = [
+        MutationOp::CreateProxy,
+        MutationOp::CreatePlugin,
+        MutationOp::UpdateProxy,
+        MutationOp::DeletePlugin,
+        MutationOp::DeleteProxy,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            MutationOp::CreateProxy => "create_proxy",
+            MutationOp::CreatePlugin => "create_plugin",
+            MutationOp::UpdateProxy => "update_proxy",
+            MutationOp::DeletePlugin => "delete_plugin",
+            MutationOp::DeleteProxy => "delete_proxy",
+        }
+    }
+
+    /// Documented success status for this write without `?apply=async`
+    /// (`openapi.yaml`). The default `apply=sync` contract answers 2xx only
+    /// after a covering `config_changes` generation is live on the gateway,
+    /// so an accepted write is also bounded (client timeout) evidence that
+    /// the change was applied.
+    fn expected_status(self) -> u16 {
+        match self {
+            MutationOp::CreateProxy | MutationOp::CreatePlugin => 201,
+            MutationOp::UpdateProxy => 200,
+            MutationOp::DeletePlugin | MutationOp::DeleteProxy => 204,
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Classification of one admin write against its documented success status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MutationOutcome {
+    Accepted,
+    /// The admin API answered with a status other than the documented one.
+    Rejected(u16),
+    /// No HTTP response was received (connect, timeout, or I/O error).
+    TransportFailed,
+}
+
+fn classify_mutation(op: MutationOp, result: &Result<u16, String>) -> MutationOutcome {
+    match result {
+        Ok(status) if *status == op.expected_status() => MutationOutcome::Accepted,
+        Ok(status) => MutationOutcome::Rejected(*status),
+        Err(_) => MutationOutcome::TransportFailed,
+    }
+}
+
+/// Maximum rejected/transport-failed diagnostics retained for the report.
+const MUTATION_DIAGNOSTIC_LIMIT: usize = 10;
+/// Maximum response-body bytes quoted in one rejection diagnostic.
+const MUTATION_BODY_EXCERPT_CHARS: usize = 200;
+
+#[derive(Debug, Default, Clone)]
+struct MutationOpStats {
+    attempted: u64,
+    accepted: u64,
+    rejected: u64,
+    transport_failed: u64,
+    /// Latencies of accepted writes only.
+    accepted_latencies_us: Vec<u64>,
+}
+
+/// Typed outcome of the admin mutation phase. Only writes answered with their
+/// documented success status count as accepted.
+#[derive(Debug, Default, Clone)]
+struct MutationStats {
+    per_op: [MutationOpStats; 5],
+    cycles_attempted: u64,
+    /// Cycles in which all five writes were accepted.
+    cycles_accepted: u64,
+    diagnostics: Vec<String>,
+    diagnostics_dropped: u64,
+}
+
+impl MutationStats {
+    /// Record one write and return whether it was accepted. `detail` is a
+    /// response-body excerpt (rejections) or empty.
+    fn record(
+        &mut self,
+        op: MutationOp,
+        cycle: u64,
+        result: &Result<u16, String>,
+        latency_us: u64,
+        detail: &str,
+    ) -> bool {
+        let stats = &mut self.per_op[op.index()];
+        stats.attempted += 1;
+        let diagnostic = match classify_mutation(op, result) {
+            MutationOutcome::Accepted => {
+                stats.accepted += 1;
+                stats.accepted_latencies_us.push(latency_us);
+                return true;
+            }
+            MutationOutcome::Rejected(status) => {
+                stats.rejected += 1;
+                format!(
+                    "{} (cycle {}): HTTP {} (expected {}) {}",
+                    op.label(),
+                    cycle,
+                    status,
+                    op.expected_status(),
+                    detail
+                )
+            }
+            MutationOutcome::TransportFailed => {
+                stats.transport_failed += 1;
+                let error = result.as_ref().err().map(String::as_str).unwrap_or("");
+                format!(
+                    "{} (cycle {}): transport error: {}",
+                    op.label(),
+                    cycle,
+                    error
+                )
+            }
+        };
+        if self.diagnostics.len() < MUTATION_DIAGNOSTIC_LIMIT {
+            self.diagnostics.push(diagnostic.trim_end().to_string());
+        } else {
+            self.diagnostics_dropped += 1;
+        }
+        false
+    }
+
+    fn record_cycle(&mut self, all_accepted: bool) {
+        self.cycles_attempted += 1;
+        if all_accepted {
+            self.cycles_accepted += 1;
+        }
+    }
+
+    fn attempted(&self) -> u64 {
+        self.per_op.iter().map(|s| s.attempted).sum()
+    }
+
+    fn accepted(&self) -> u64 {
+        self.per_op.iter().map(|s| s.accepted).sum()
+    }
+
+    fn rejected(&self) -> u64 {
+        self.per_op.iter().map(|s| s.rejected).sum()
+    }
+
+    fn transport_failed(&self) -> u64 {
+        self.per_op.iter().map(|s| s.transport_failed).sum()
+    }
+
+    fn summary(&self) -> String {
+        let mut out = format!(
+            "  Admin mutations: attempted={} accepted={} rejected={} transport_failed={} | cycles: attempted={} fully_accepted={}\n",
+            self.attempted(),
+            self.accepted(),
+            self.rejected(),
+            self.transport_failed(),
+            self.cycles_attempted,
+            self.cycles_accepted,
+        );
+        for op in MutationOp::ALL {
+            let stats = &self.per_op[op.index()];
+            if stats.attempted == 0 {
+                continue;
+            }
+            out.push_str(&format!(
+                "    {} (expect {}): attempted={} accepted={} rejected={} transport_failed={}",
+                op.label(),
+                op.expected_status(),
+                stats.attempted,
+                stats.accepted,
+                stats.rejected,
+                stats.transport_failed,
+            ));
+            let lats = &stats.accepted_latencies_us;
+            if let Some(max) = lats.iter().max() {
+                let avg = lats.iter().sum::<u64>() as f64 / lats.len() as f64;
+                out.push_str(&format!(
+                    ", accepted avg={:.1}ms max={:.1}ms",
+                    avg / 1000.0,
+                    *max as f64 / 1000.0,
+                ));
+            }
+            out.push('\n');
+        }
+        for diagnostic in &self.diagnostics {
+            out.push_str(&format!("    ! {}\n", diagnostic));
+        }
+        if self.diagnostics_dropped > 0 {
+            out.push_str(&format!(
+                "    ! ... {} further failures not shown\n",
+                self.diagnostics_dropped
+            ));
+        }
+        out
+    }
+
+    /// The phase certifies a reload workload only when at least one complete
+    /// create/update/delete cycle was accepted and accepted writes are a
+    /// majority of attempts (the same >50% floor as the traffic gate).
+    fn verdict(&self) -> Result<(), String> {
+        if self.cycles_accepted == 0 {
+            return Err(format!(
+                "no admin mutation cycle had all five writes accepted ({} cycles attempted)",
+                self.cycles_attempted
+            ));
+        }
+        let attempted = self.attempted();
+        let accepted = self.accepted();
+        if accepted.saturating_mul(2) <= attempted {
+            return Err(format!(
+                "only {} of {} admin mutations were accepted (rejected={}, transport_failed={})",
+                accepted,
+                attempted,
+                self.rejected(),
+                self.transport_failed()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Send one admin write, classify it, and record it. Latency stops when the
+/// response head (or transport error) arrives; a rejection's body is read
+/// afterwards only for the diagnostic excerpt.
+async fn perform_admin_mutation(
+    stats: &mut MutationStats,
+    op: MutationOp,
+    cycle: u64,
+    request: reqwest::RequestBuilder,
+) -> bool {
+    let start = Instant::now();
+    let response = request.send().await;
+    let latency_us = start.elapsed().as_micros() as u64;
+    let (result, detail) = match response {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let detail = if status == op.expected_status() {
+                String::new()
+            } else {
+                match response.text().await {
+                    Ok(body) => body.chars().take(MUTATION_BODY_EXCERPT_CHARS).collect(),
+                    Err(error) => format!("<body unavailable: {}>", error),
+                }
+            };
+            (Ok(status), detail)
+        }
+        Err(error) => (Err(error.to_string()), String::new()),
+    };
+    stats.record(op, cycle, &result, latency_us, &detail)
+}
+
 /// Run traffic + admin mutations concurrently to measure latency impact.
-/// Returns (traffic_result, mutation_stats_string).
+/// Returns (traffic_result, mutation_stats).
 async fn run_admin_mutation_phase(
     proxy_base_url: &str,
     admin_url: &str,
@@ -1442,7 +1758,7 @@ async fn run_admin_mutation_phase(
     backend_port: u16,
     duration_secs: u64,
     concurrency: usize,
-) -> Result<(PerfResult, String), Box<dyn std::error::Error>> {
+) -> Result<(PerfResult, MutationStats), Box<dyn std::error::Error>> {
     let stop = Arc::new(AtomicBool::new(false));
 
     // Admin mutation task: create, update, delete proxies/plugins during traffic
@@ -1456,140 +1772,105 @@ async fn run_admin_mutation_phase(
             .build()
             .unwrap();
 
-        let mut mutations = 0u64;
-        let mut mutation_latencies: Vec<(String, u64)> = Vec::new();
+        let mut stats = MutationStats::default();
         let mut cycle = 0u64;
 
         while !admin_stop.load(Ordering::Relaxed) {
             // Create a temporary proxy
             let temp_id = format!("temp-proxy-{}", cycle);
             let temp_path = format!("/temp/{}", cycle);
+            let mut all_accepted = true;
 
-            let start = Instant::now();
-            let resp = client
-                .post(format!("{}/proxies", admin_url_owned))
-                .header("Authorization", &admin_auth_owned)
-                .json(&json!({
-                    "id": &temp_id,
-                    "listen_path": &temp_path,
-                    "backend_scheme": "http",
-                    "backend_host": "127.0.0.1",
-                    "backend_port": backend_port,
-                    "strip_listen_path": true,
-                }))
-                .send()
-                .await;
-            let lat = start.elapsed().as_micros() as u64;
-            if resp.is_ok() {
-                mutation_latencies.push(("create_proxy".to_string(), lat));
-                mutations += 1;
-            }
+            all_accepted &= perform_admin_mutation(
+                &mut stats,
+                MutationOp::CreateProxy,
+                cycle,
+                client
+                    .post(format!("{}/proxies", admin_url_owned))
+                    .header("Authorization", &admin_auth_owned)
+                    .json(&json!({
+                        "id": &temp_id,
+                        "listen_path": &temp_path,
+                        "backend_scheme": "http",
+                        "backend_host": "127.0.0.1",
+                        "backend_port": backend_port,
+                        "strip_listen_path": true,
+                    })),
+            )
+            .await;
 
             // Add a plugin to it
-            let start = Instant::now();
-            let resp = client
-                .post(format!("{}/plugins/config", admin_url_owned))
-                .header("Authorization", &admin_auth_owned)
-                .json(&json!({
-                    "id": format!("temp-plugin-{}", cycle),
-                    "plugin_name": "cors",
-                    "scope": "proxy",
-                    "proxy_id": &temp_id,
-                    "enabled": true,
-                    "config": {
-                        "allowed_origins": ["*"],
-                        "allowed_methods": ["GET", "POST"]
-                    }
-                }))
-                .send()
-                .await;
-            let lat = start.elapsed().as_micros() as u64;
-            if resp.is_ok() {
-                mutation_latencies.push(("create_plugin".to_string(), lat));
-                mutations += 1;
-            }
+            all_accepted &= perform_admin_mutation(
+                &mut stats,
+                MutationOp::CreatePlugin,
+                cycle,
+                client
+                    .post(format!("{}/plugins/config", admin_url_owned))
+                    .header("Authorization", &admin_auth_owned)
+                    .json(&json!({
+                        "id": format!("temp-plugin-{}", cycle),
+                        "plugin_name": "cors",
+                        "scope": "proxy",
+                        "proxy_id": &temp_id,
+                        "enabled": true,
+                        "config": {
+                            "allowed_origins": ["*"],
+                            "allowed_methods": ["GET", "POST"]
+                        }
+                    })),
+            )
+            .await;
 
             // Update an existing proxy (change backend timeout)
             let update_idx = (cycle as usize) % NUM_PROXIES;
-            let start = Instant::now();
-            let resp = client
-                .put(format!("{}/proxies/proxy-{}", admin_url_owned, update_idx))
-                .header("Authorization", &admin_auth_owned)
-                .json(&json!({
-                    "id": format!("proxy-{}", update_idx),
-                    "listen_path": format!("/svc/{}", update_idx),
-                    "backend_scheme": "http",
-                    "backend_host": "127.0.0.1",
-                    "backend_port": backend_port,
-                    "strip_listen_path": true,
-                    "backend_connect_timeout_ms": 6000,
-                }))
-                .send()
-                .await;
-            let lat = start.elapsed().as_micros() as u64;
-            if resp.is_ok() {
-                mutation_latencies.push(("update_proxy".to_string(), lat));
-                mutations += 1;
-            }
+            all_accepted &= perform_admin_mutation(
+                &mut stats,
+                MutationOp::UpdateProxy,
+                cycle,
+                client
+                    .put(format!("{}/proxies/proxy-{}", admin_url_owned, update_idx))
+                    .header("Authorization", &admin_auth_owned)
+                    .json(&json!({
+                        "id": format!("proxy-{}", update_idx),
+                        "listen_path": format!("/svc/{}", update_idx),
+                        "backend_scheme": "http",
+                        "backend_host": "127.0.0.1",
+                        "backend_port": backend_port,
+                        "strip_listen_path": true,
+                        "backend_connect_timeout_ms": 6000,
+                    })),
+            )
+            .await;
 
             // Delete the temporary plugin and proxy
-            let start = Instant::now();
-            let _ = client
-                .delete(format!(
-                    "{}/plugins/config/temp-plugin-{}",
-                    admin_url_owned, cycle
-                ))
-                .header("Authorization", &admin_auth_owned)
-                .send()
-                .await;
-            let lat = start.elapsed().as_micros() as u64;
-            mutation_latencies.push(("delete_plugin".to_string(), lat));
-            mutations += 1;
+            all_accepted &= perform_admin_mutation(
+                &mut stats,
+                MutationOp::DeletePlugin,
+                cycle,
+                client
+                    .delete(format!(
+                        "{}/plugins/config/temp-plugin-{}",
+                        admin_url_owned, cycle
+                    ))
+                    .header("Authorization", &admin_auth_owned),
+            )
+            .await;
 
-            let start = Instant::now();
-            let _ = client
-                .delete(format!("{}/proxies/{}", admin_url_owned, temp_id))
-                .header("Authorization", &admin_auth_owned)
-                .send()
-                .await;
-            let lat = start.elapsed().as_micros() as u64;
-            mutation_latencies.push(("delete_proxy".to_string(), lat));
-            mutations += 1;
+            all_accepted &= perform_admin_mutation(
+                &mut stats,
+                MutationOp::DeleteProxy,
+                cycle,
+                client
+                    .delete(format!("{}/proxies/{}", admin_url_owned, temp_id))
+                    .header("Authorization", &admin_auth_owned),
+            )
+            .await;
 
+            stats.record_cycle(all_accepted);
             cycle += 1;
 
             // Small pause between mutation cycles
             tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-
-        // Build mutation stats summary
-        let mut stats = format!("  Admin mutations completed: {} operations\n", mutations);
-
-        // Group by operation type and compute averages
-        let op_types = [
-            "create_proxy",
-            "create_plugin",
-            "update_proxy",
-            "delete_plugin",
-            "delete_proxy",
-        ];
-        for op in &op_types {
-            let lats: Vec<u64> = mutation_latencies
-                .iter()
-                .filter(|(t, _)| t == op)
-                .map(|(_, l)| *l)
-                .collect();
-            if !lats.is_empty() {
-                let avg = lats.iter().sum::<u64>() as f64 / lats.len() as f64;
-                let max = *lats.iter().max().unwrap() as f64;
-                stats.push_str(&format!(
-                    "    {}: count={}, avg={:.1}ms, max={:.1}ms\n",
-                    op,
-                    lats.len(),
-                    avg / 1000.0,
-                    max / 1000.0,
-                ));
-            }
         }
 
         stats
@@ -1613,16 +1894,21 @@ async fn run_admin_mutation_phase(
 
 // --- Core test runner ---
 
-async fn run_load_stress_test(harness: &LoadTestHarness) {
-    let pool_proto = if harness.backend_pool_http2 {
-        "HTTP/2"
+/// Run label for the backend-pool setting. The setting only permits HTTP/2
+/// where the backend supports it; the embedded backend is plaintext
+/// HTTP/1.1-only (`http1::Builder`, `backend_scheme: http`), so neither run
+/// is an observed HTTP/1.1-versus-HTTP/2 backend comparison.
+fn pool_setting_label(enable_http2: bool) -> &'static str {
+    if enable_http2 {
+        "FERRUM_POOL_ENABLE_HTTP2=true, backend: plaintext HTTP/1.1"
     } else {
-        "HTTP/1.1"
-    };
-    println!(
-        "Gateway started ({}, backend pool: {}):",
-        harness.db_label, pool_proto
-    );
+        "FERRUM_POOL_ENABLE_HTTP2=false, backend: plaintext HTTP/1.1"
+    }
+}
+
+async fn run_load_stress_test(harness: &LoadTestHarness) {
+    let pool_proto = pool_setting_label(harness.backend_pool_http2);
+    println!("Gateway started ({}, {}):", harness.db_label, pool_proto);
     println!("  Proxy: {}", harness.proxy_base_url);
     println!("  Admin: {}", harness.admin_base_url);
     println!("  Backend (hyper): 127.0.0.1:{}", harness.backend_port);
@@ -1833,7 +2119,7 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
     .expect("Admin mutation phase failed");
 
     print_perf_result(&mutation_result);
-    println!("\n{}", mutation_stats);
+    println!("\n{}", mutation_stats.summary());
 
     // Compare mutation phase latency to baseline (same concurrency without mutations)
     let baseline = all_results
@@ -1865,7 +2151,11 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
     }
 
     // --- Phase 4: wrk comparison (if available) ---
+    // Once wrk is available every attempted phase must produce a result: a
+    // failed invocation or unparseable output is recorded here and fails the
+    // final gate instead of silently dropping out of the comparison.
     let mut wrk_results: Vec<PerfResult> = Vec::new();
+    let mut wrk_failures: Vec<String> = Vec::new();
 
     if is_wrk_available() {
         println!("\n=== Phase 4: wrk Comparison (native C load generator) ===");
@@ -1908,8 +2198,9 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
                 "\n  Running wrk {}s key_auth test at {} ...",
                 wrk_duration, label_suffix
             );
-            if let Some(r) = run_wrk_phase(
-                &format!("wrk key_auth {}", label_suffix),
+            let label = format!("wrk key_auth {}", label_suffix);
+            match run_wrk_phase(
+                &label,
                 &harness.proxy_base_url,
                 Some(&lua_path_str),
                 wrk_duration,
@@ -1918,8 +2209,14 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
             )
             .await
             {
-                print_perf_result(&r);
-                wrk_results.push(r);
+                Ok(r) => {
+                    print_perf_result(&r);
+                    wrk_results.push(r);
+                }
+                Err(error) => {
+                    println!("  {} produced no result: {}", label, error);
+                    wrk_failures.push(format!("{}: {}", label, error));
+                }
             }
 
             // wrk: no-plugin (open proxy)
@@ -1928,18 +2225,16 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
                 "\n  Running wrk {}s no-plugin test at {} ...",
                 wrk_duration, label_suffix
             );
-            if let Some(r) = run_wrk_phase(
-                &format!("wrk no-plugin {}", label_suffix),
-                &open_url,
-                None,
-                wrk_duration,
-                threads,
-                connections,
-            )
-            .await
-            {
-                print_perf_result(&r);
-                wrk_results.push(r);
+            let label = format!("wrk no-plugin {}", label_suffix);
+            match run_wrk_phase(&label, &open_url, None, wrk_duration, threads, connections).await {
+                Ok(r) => {
+                    print_perf_result(&r);
+                    wrk_results.push(r);
+                }
+                Err(error) => {
+                    println!("  {} produced no result: {}", label, error);
+                    wrk_failures.push(format!("{}: {}", label, error));
+                }
             }
         }
     } else {
@@ -1957,15 +2252,11 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
         .chain(wrk_results.iter())
         .collect();
 
-    let pool_proto = if harness.backend_pool_http2 {
-        "HTTP/2"
-    } else {
-        "HTTP/1.1"
-    };
+    let pool_proto = pool_setting_label(harness.backend_pool_http2);
 
     println!("\n\n======================================================================");
     println!(
-        "  LOAD & STRESS TEST SUMMARY ({}, backend pool: {})",
+        "  LOAD & STRESS TEST SUMMARY ({}, {})",
         harness.db_label, pool_proto
     );
     println!(
@@ -1983,6 +2274,12 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
         NUM_PROXIES - BASIC_AUTH_END
     );
     println!("  Payloads: GET, small JSON, medium JSON, large JSON, XML, multipart");
+    println!(
+        "  reqwest rows: RPS = attempts / wall time; latency = response head (send() completion, body not read); OK% = 2xx status"
+    );
+    println!(
+        "  wrk rows: wrk-reported Requests/sec and latency; OK% excludes non-2xx/3xx and socket errors"
+    );
     println!("======================================================================");
     println!(
         "{:<28} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}",
@@ -2099,7 +2396,7 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
                     0.0
                 };
                 println!(
-                    "  {:<24}  reqwest: {:>8.0} RPS  |  wrk: {:>8.0} RPS  ({:+.1}%)",
+                    "  {:<24}  reqwest: {:>8.0} attempt RPS  |  wrk: {:>8.0} RPS  ({:+.1}%)",
                     wr.label, rr.rps, wr.rps, rps_diff,
                 );
             }
@@ -2107,7 +2404,9 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
     }
 
     // --- Plugin overhead analysis ---
-    println!("\n--- Plugin Overhead (with-plugins vs no-plugin at same concurrency) ---");
+    println!(
+        "\n--- Plugin Overhead (with-plugins vs no-plugin at same concurrency; attempt RPS, response-head P99) ---"
+    );
     for r_with in &all_results {
         if let Some(r_open) = open_results
             .iter()
@@ -2168,24 +2467,51 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
         }
     }
 
-    // Assert minimum success rate across all phases
-    for r in &all_combined {
-        if r.total_requests > 0 {
-            let success_rate = r.successful_requests as f64 / r.total_requests as f64 * 100.0;
-            assert!(
-                success_rate > 50.0,
-                "Success rate dropped below 50% in phase '{}' at concurrency={}: {:.1}%",
-                r.label,
-                r.concurrency,
-                success_rate
-            );
-        }
+    // Final gate: every phase that ran must report requests with a success
+    // rate above 50%, every attempted wrk phase must have produced a result,
+    // and the admin mutation phase must have accepted a reload workload.
+    let mut gate_failures = phase_gate_failures(&all_combined, &wrk_failures);
+    if let Err(error) = mutation_stats.verdict() {
+        gate_failures.push(format!("admin mutation phase: {}", error));
     }
+    assert!(
+        gate_failures.is_empty(),
+        "Load & stress gate failed ({}):\n  {}",
+        harness.db_label,
+        gate_failures.join("\n  ")
+    );
 
     println!(
         "\n=== Load & Stress Test ({}) Complete ===\n",
         harness.db_label
     );
+}
+
+/// Collect final-gate failures: a phase that ran but reported no requests, a
+/// phase at or below a 50% success rate, and every attempted phase that
+/// produced no result (`missing`).
+fn phase_gate_failures(results: &[&PerfResult], missing: &[String]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for r in results {
+        if r.total_requests == 0 {
+            failures.push(format!(
+                "phase '{}' at concurrency={} reported no requests",
+                r.label, r.concurrency
+            ));
+            continue;
+        }
+        let success_rate = r.successful_requests as f64 / r.total_requests as f64 * 100.0;
+        if success_rate <= 50.0 {
+            failures.push(format!(
+                "success rate at or below 50% in phase '{}' at concurrency={}: {:.1}%",
+                r.label, r.concurrency, success_rate
+            ));
+        }
+    }
+    for missing in missing {
+        failures.push(format!("attempted phase produced no result: {}", missing));
+    }
+    failures
 }
 
 // --- wrk comparison phase ---
@@ -2298,8 +2624,43 @@ fn parse_wrk_duration(s: &str) -> f64 {
     }
 }
 
+/// Build a `PerfResult` from combined wrk stdout/stderr. Output without a
+/// positive `N requests in` total is an error, not an omitted phase.
+fn wrk_result_from_output(
+    label: &str,
+    connections: usize,
+    duration_secs: u64,
+    output: &str,
+) -> Result<PerfResult, String> {
+    let (rps, avg_us, p50_us, p99_us, max_us, total, errors) = parse_wrk_output(output)
+        .ok_or_else(|| {
+            format!(
+                "wrk output had no positive request total:\n{}",
+                output.trim_end()
+            )
+        })?;
+    Ok(PerfResult {
+        label: label.to_string(),
+        concurrency: connections,
+        total_requests: total,
+        successful_requests: total.saturating_sub(errors),
+        failed_requests: errors,
+        duration_secs: duration_secs as f64,
+        rps,
+        avg_latency_us: avg_us,
+        p50_latency_us: p50_us,
+        p95_latency_us: 0.0, // wrk --latency only shows 50/75/90/99
+        p99_latency_us: p99_us,
+        p999_latency_us: 0.0,
+        max_latency_us: max_us,
+        boundary: MeasurementBoundary::WrkReported,
+    })
+}
+
 /// Run wrk against a target URL with an optional Lua script.
-/// Returns a PerfResult comparable to the reqwest-based phases.
+/// Returns a PerfResult comparable to the reqwest-based phases, or an error
+/// when wrk could not be invoked, its worker task failed, or its output had
+/// no positive request total.
 /// Uses spawn_blocking to avoid blocking the tokio runtime (the hyper backend
 /// runs on the same runtime and must keep accepting connections).
 async fn run_wrk_phase(
@@ -2309,7 +2670,7 @@ async fn run_wrk_phase(
     duration_secs: u64,
     threads: usize,
     connections: usize,
-) -> Option<PerfResult> {
+) -> Result<PerfResult, String> {
     let label = label.to_string();
     let target_url = target_url.to_string();
     let lua_script_path = lua_script_path.map(|s| s.to_string());
@@ -2327,45 +2688,16 @@ async fn run_wrk_phase(
 
         cmd.arg(&target_url);
 
-        let output = cmd.output();
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let combined = format!("{}\n{}", stdout, stderr);
-
-                if let Some((rps, avg_us, p50_us, p99_us, max_us, total, errors)) =
-                    parse_wrk_output(&combined)
-                {
-                    let success = total.saturating_sub(errors);
-                    Some(PerfResult {
-                        label: label.clone(),
-                        concurrency: connections,
-                        total_requests: total,
-                        successful_requests: success,
-                        failed_requests: errors,
-                        duration_secs: duration_secs as f64,
-                        rps,
-                        avg_latency_us: avg_us,
-                        p50_latency_us: p50_us,
-                        p95_latency_us: 0.0, // wrk --latency only shows 50/75/90/99
-                        p99_latency_us: p99_us,
-                        p999_latency_us: 0.0,
-                        max_latency_us: max_us,
-                    })
-                } else {
-                    println!("  Failed to parse wrk output:\n{}", combined);
-                    None
-                }
-            }
-            Err(e) => {
-                println!("  Failed to run wrk: {}", e);
-                None
-            }
-        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("failed to run wrk: {}", e))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{}\n{}", stdout, stderr);
+        wrk_result_from_output(&label, connections, duration_secs, &combined)
     })
     .await
-    .unwrap_or(None)
+    .map_err(|e| format!("wrk worker task failed: {}", e))?
 }
 
 /// Generate a Lua script for wrk that sets an API key header and cycles through paths.
@@ -2471,7 +2803,7 @@ fn clean_postgres_database(_db_url: &str) {
     }
 }
 
-// ---- Single test: PostgreSQL-first with SQLite fallback, runs both HTTP/1.1 and HTTP/2 ----
+// ---- Single test: PostgreSQL-first with SQLite fallback, runs FERRUM_POOL_ENABLE_HTTP2=false then true ----
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -2491,7 +2823,9 @@ async fn test_load_stress_10k_proxies() {
         "  Concurrency ramp: {:?}  |  Phase: {}s",
         CONCURRENCY_LEVELS, PHASE_DURATION_SECS
     );
-    println!("  Backend pool modes: HTTP/1.1 then HTTP/2");
+    println!(
+        "  Backend pool settings: FERRUM_POOL_ENABLE_HTTP2=false then true (backend is plaintext HTTP/1.1 in both)"
+    );
     if !use_postgres {
         println!("  (PostgreSQL not available — using SQLite fallback)");
         println!("  For PostgreSQL, run:");
@@ -2512,9 +2846,9 @@ async fn test_load_stress_10k_proxies() {
     }
     println!("Release binary ready.\n");
 
-    // --- Run 1: HTTP/1.1 backend pool ---
+    // --- Run 1: FERRUM_POOL_ENABLE_HTTP2=false ---
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  RUN 1: Backend pool HTTP/1.1                              ║");
+    println!("║  RUN 1: FERRUM_POOL_ENABLE_HTTP2=false                       ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     {
@@ -2533,9 +2867,9 @@ async fn test_load_stress_10k_proxies() {
     }
     // harness dropped here — gateway process killed
 
-    // --- Run 2: HTTP/2 backend pool ---
+    // --- Run 2: FERRUM_POOL_ENABLE_HTTP2=true ---
     println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║  RUN 2: Backend pool HTTP/2                                ║");
+    println!("║  RUN 2: FERRUM_POOL_ENABLE_HTTP2=true                        ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     {
@@ -2552,4 +2886,245 @@ async fn test_load_stress_10k_proxies() {
 
         run_load_stress_test(&harness).await;
     }
+}
+
+// ---- Harness accounting tests (not ignored; no gateway required) ----
+
+fn perf_result(label: &str, total: u64, success: u64) -> PerfResult {
+    PerfResult {
+        label: label.to_string(),
+        concurrency: 50,
+        total_requests: total,
+        successful_requests: success,
+        failed_requests: total - success,
+        duration_secs: 30.0,
+        rps: total as f64 / 30.0,
+        avg_latency_us: 0.0,
+        p50_latency_us: 0.0,
+        p95_latency_us: 0.0,
+        p99_latency_us: 0.0,
+        p999_latency_us: 0.0,
+        max_latency_us: 0.0,
+        boundary: MeasurementBoundary::ResponseHead,
+    }
+}
+
+fn record_full_cycle(stats: &mut MutationStats, cycle: u64) {
+    let mut all_accepted = true;
+    for op in MutationOp::ALL {
+        all_accepted &= stats.record(op, cycle, &Ok(op.expected_status()), 1_000, "");
+    }
+    stats.record_cycle(all_accepted);
+}
+
+#[test]
+fn load_stress_mutation_classification_requires_the_documented_status() {
+    for op in MutationOp::ALL {
+        assert_eq!(
+            classify_mutation(op, &Ok(op.expected_status())),
+            MutationOutcome::Accepted,
+            "{}",
+            op.label()
+        );
+        for status in [401u16, 404, 409, 500, 503] {
+            assert_eq!(
+                classify_mutation(op, &Ok(status)),
+                MutationOutcome::Rejected(status),
+                "{} answered {}",
+                op.label(),
+                status
+            );
+        }
+        assert_eq!(
+            classify_mutation(op, &Err("connection reset".to_string())),
+            MutationOutcome::TransportFailed,
+            "{}",
+            op.label()
+        );
+    }
+    // A deferred 202 does not claim the generation is live, and a 2xx other
+    // than the documented one is not that write's success contract.
+    assert_eq!(
+        classify_mutation(MutationOp::CreateProxy, &Ok(202)),
+        MutationOutcome::Rejected(202)
+    );
+    assert_eq!(
+        classify_mutation(MutationOp::DeleteProxy, &Ok(200)),
+        MutationOutcome::Rejected(200)
+    );
+}
+
+#[test]
+fn load_stress_rejected_and_transport_failed_mutations_are_not_accepted() {
+    let mut stats = MutationStats::default();
+    record_full_cycle(&mut stats, 0);
+
+    // Later cycles: admin writes rejected and both DELETEs fail in transport.
+    for cycle in 1..=3 {
+        let mut all_accepted = true;
+        all_accepted &= stats.record(
+            MutationOp::CreateProxy,
+            cycle,
+            &Ok(401),
+            500,
+            "unauthorized",
+        );
+        all_accepted &= stats.record(MutationOp::CreatePlugin, cycle, &Ok(409), 500, "conflict");
+        all_accepted &= stats.record(MutationOp::UpdateProxy, cycle, &Ok(500), 500, "");
+        all_accepted &= stats.record(
+            MutationOp::DeletePlugin,
+            cycle,
+            &Err("operation timed out".to_string()),
+            30_000_000,
+            "",
+        );
+        all_accepted &= stats.record(
+            MutationOp::DeleteProxy,
+            cycle,
+            &Err("connection refused".to_string()),
+            10,
+            "",
+        );
+        stats.record_cycle(all_accepted);
+    }
+
+    assert_eq!(stats.attempted(), 20);
+    assert_eq!(stats.accepted(), 5);
+    assert_eq!(stats.rejected(), 9);
+    assert_eq!(stats.transport_failed(), 6);
+    assert_eq!(stats.cycles_attempted, 4);
+    assert_eq!(stats.cycles_accepted, 1);
+    for op in MutationOp::ALL {
+        // Only the first cycle's accepted latency is retained per operation.
+        assert_eq!(stats.per_op[op.index()].accepted_latencies_us, vec![1_000]);
+    }
+    assert_eq!(stats.diagnostics.len(), MUTATION_DIAGNOSTIC_LIMIT);
+    assert_eq!(
+        stats.diagnostics_dropped,
+        15 - MUTATION_DIAGNOSTIC_LIMIT as u64
+    );
+    assert!(stats.diagnostics[0].contains("create_proxy (cycle 1): HTTP 401 (expected 201)"));
+    assert!(stats.diagnostics[3].contains("delete_plugin (cycle 1): transport error"));
+
+    let error = stats.verdict().expect_err("a rejected majority must fail");
+    assert!(error.contains("only 5 of 20"), "{error}");
+    let summary = stats.summary();
+    assert!(summary.contains("attempted=20 accepted=5 rejected=9 transport_failed=6"));
+    assert!(!summary.contains("completed"), "{summary}");
+}
+
+#[test]
+fn load_stress_mutation_verdict_requires_an_accepted_cycle() {
+    // No success at all.
+    let mut none = MutationStats::default();
+    for cycle in 0..4 {
+        let mut all_accepted = true;
+        for op in MutationOp::ALL {
+            all_accepted &= none.record(op, cycle, &Ok(500), 1, "");
+        }
+        none.record_cycle(all_accepted);
+    }
+    assert_eq!(none.accepted(), 0);
+    assert!(none.verdict().is_err());
+
+    // No phase activity at all.
+    assert!(MutationStats::default().verdict().is_err());
+
+    // A majority of writes accepted but every cycle loses its deletes: no
+    // complete create/update/delete cycle was applied.
+    let mut partial = MutationStats::default();
+    for cycle in 0..4 {
+        let mut all_accepted = true;
+        for op in MutationOp::ALL {
+            let result = match op {
+                MutationOp::DeleteProxy => Err("connection reset".to_string()),
+                _ => Ok(op.expected_status()),
+            };
+            all_accepted &= partial.record(op, cycle, &result, 1, "");
+        }
+        partial.record_cycle(all_accepted);
+    }
+    assert_eq!(partial.accepted(), 16);
+    let error = partial.verdict().expect_err("no complete cycle");
+    assert!(error.contains("no admin mutation cycle"), "{error}");
+
+    let mut healthy = MutationStats::default();
+    for cycle in 0..3 {
+        record_full_cycle(&mut healthy, cycle);
+    }
+    assert_eq!(healthy.verdict(), Ok(()));
+}
+
+const WRK_SAMPLE_OUTPUT: &str = "Running 30s test @ http://127.0.0.1:8000/open/0
+  4 threads and 50 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.25ms  500.00us  20.00ms   90.00%
+    Req/Sec    10.00k     1.00k   12.00k    70.00%
+  Latency Distribution
+     50%    1.00ms
+     75%    1.50ms
+     90%    2.00ms
+     99%    3.00ms
+  1200000 requests in 30.00s, 150.00MB read
+  Non-2xx or 3xx responses: 100
+Requests/sec:  40000.00
+Transfer/sec:      5.00MB
+";
+
+#[test]
+fn load_stress_wrk_output_with_positive_total_yields_a_result() {
+    let result = wrk_result_from_output("wrk no-plugin c=50", 50, 30, WRK_SAMPLE_OUTPUT)
+        .expect("positive request total");
+    assert_eq!(result.total_requests, 1_200_000);
+    assert_eq!(result.failed_requests, 100);
+    assert_eq!(result.successful_requests, 1_199_900);
+    assert_eq!(result.concurrency, 50);
+    assert!((result.rps - 40_000.0).abs() < 1e-6, "{}", result.rps);
+    assert_eq!(result.boundary, MeasurementBoundary::WrkReported);
+}
+
+#[test]
+fn load_stress_wrk_output_without_positive_total_is_an_error() {
+    let zero = WRK_SAMPLE_OUTPUT.replace("1200000 requests in", "0 requests in");
+    let malformed = WRK_SAMPLE_OUTPUT.replace("1200000 requests in", "lots requests in");
+    let absent = WRK_SAMPLE_OUTPUT.replace("  1200000 requests in 30.00s, 150.00MB read\n", "");
+    for (name, output) in [
+        ("zero", zero.as_str()),
+        ("malformed", malformed.as_str()),
+        ("absent", absent.as_str()),
+        ("empty", ""),
+        (
+            "invocation error text",
+            "unable to connect to 127.0.0.1:8000 Connection refused",
+        ),
+    ] {
+        let error = wrk_result_from_output("wrk key_auth c=50", 50, 30, output).expect_err(name);
+        assert!(
+            error.contains("no positive request total"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn load_stress_phase_gate_fails_closed() {
+    let healthy = perf_result("Ramp c=50", 1_000, 1_000);
+    let barely = perf_result("Ramp c=100", 1_000, 501);
+    assert!(phase_gate_failures(&[&healthy, &barely], &[]).is_empty());
+
+    let half = perf_result("Ramp c=200", 1_000, 500);
+    let below = perf_result("No-plugin c=50", 1_000, 100);
+    let empty = perf_result("No-plugin c=100", 0, 0);
+    let failures = phase_gate_failures(&[&healthy, &half, &below, &empty], &[]);
+    assert_eq!(failures.len(), 3, "{failures:?}");
+    assert!(failures[0].contains("'Ramp c=200'"), "{failures:?}");
+    assert!(failures[1].contains("'No-plugin c=50'"), "{failures:?}");
+    assert!(failures[2].contains("reported no requests"), "{failures:?}");
+
+    // An attempted wrk phase that produced no result fails even when every
+    // retained phase is healthy.
+    let missing = ["wrk key_auth c=400: failed to run wrk: not found".to_string()];
+    let failures = phase_gate_failures(&[&healthy], &missing);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("wrk key_auth c=400"), "{failures:?}");
 }

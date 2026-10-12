@@ -868,8 +868,13 @@ value changes, but operators who key dashboards, alerts, or breaker policy on
   health. That includes `RST_STREAM(REFUSED_STREAM)`;
 - a read error while buffering a larger or size-limited reqwest response now
   reports its real class (`protocol_error`, `connection_closed`,
-  `read_write_timeout`, and so on) instead of `response_body_too_large`. A
-  `request_error`-class read error is no longer charged to the breaker;
+  `read_write_timeout`, and so on) instead of `response_body_too_large`. The
+  breaker charge is decided by the status predicate first: a buffered
+  `request_error` read error retains status `502` and is charged whenever `502`
+  is in the configured `failure_status_codes` (it is by default), even though
+  the class is not a post-wire backend-failure class. Only an outcome whose
+  status is not in that list falls back to the class predicate, where
+  `request_error` is not charged on that basis alone;
 - a reqwest read timeout while buffering that response is now `504`
   (`backend_timeout`), and the other read errors' `502` body is now
   `{"error":"Backend response body read failed"}` instead of
@@ -899,9 +904,15 @@ expected inventory.
 `DELETE /proxies/{id}` or `PUT /api-specs/{id}` that fails before commit now
 returns `503` with `durable: "not_started"` (failure ahead of the transaction)
 or `durable: "not_committed"` (rolled-back transaction) instead of
-`"unknown"`. Only a failed commit or commit acknowledgement still reports
-`"unknown"`. None of these values authorizes cleanup or replay; retain the
-original evidence and journal as for any other refusal. See
+`"unknown"`. The pre-transaction guarantee is not universal: the SQL stores
+open their write transaction with a bare `begin_write_tx().await?`, so a raw
+pool-checkout or `BEGIN` error that occurs before any transaction opens
+carries no typed `not_started` marker and is reported through the generic
+503/`not_committed` fallback, not `not_started`. Only a failure explicitly
+tagged ahead of the transaction by the store reports `not_started`. Only a
+failed commit or commit acknowledgement still reports `"unknown"`. None of
+these values authorizes cleanup or replay; retain the original evidence and
+journal as for any other refusal. See
 [deployment mutations](deployment_mutations.md).
 
 ## Upgrading to 0.9.13
@@ -2205,8 +2216,17 @@ jq '.counts' "ferrum-backup-${NS}.json"
 ```
 
 The `counts` object reports `proxies`, `consumers`, `plugin_configs`,
-`upstreams`, `api_specs`, and `gateway_trust_bundles`. Confirm every resource
-class you expect is non-zero (or intentionally empty) before continuing.
+`upstreams`, `api_specs`, and `gateway_trust_bundles`. Confirm, per namespace,
+before continuing:
+
+- the export request succeeded and the payload's `source` is `"database"`, not
+  `"cached"` — after an authoritative config-load failure the gateway can serve
+  a labeled cached fallback that omits `api_specs` and
+  `gateway_trust_bundles` entirely;
+- the `api_specs` and `gateway_trust_bundles` sections are present, not just
+  non-zero `counts`;
+- every resource class you expect is non-zero (or intentionally empty), and the
+  counts match the source database's independently observed resource counts.
 
 #### 2. Provision a fresh database from the current baseline
 
@@ -2791,17 +2811,29 @@ FERRUM_MODE=cp \
   FERRUM_DB_TYPE=postgres \
   FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_new \
   FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50052 \
+  FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
   FERRUM_ADMIN_HTTP_PORT=9100 \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
   ./ferrum-edge-new
 ```
 
+The staging examples use plaintext CP/DP config sync on a non-loopback
+address, so both sides must set `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` as an
+explicit opt-in; without it the new CP refuses a plaintext bind on
+`0.0.0.0:` and the new DP refuses a plaintext `http://` CP URL. This is
+staging-validation only — restrict it to a test network and do not run it in
+the same shape against production. For real deployments, give the CP
+`FERRUM_CP_GRPC_TLS_CERT_PATH` / `FERRUM_CP_GRPC_TLS_KEY_PATH`, point the DP at
+an `https://` URL with `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` (or mTLS), or keep
+both sides on a loopback address, and omit the plaintext opt-in flag.
+
 Optionally connect a test DP to the staging CP to verify the full gRPC config sync pipeline:
 
 ```bash
 FERRUM_MODE=dp \
   FERRUM_DP_CP_GRPC_URLS=http://cp-host:50052 \
+  FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
   FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
   FERRUM_PROXY_HTTP_PORT=8100 \
   FERRUM_ADMIN_HTTP_PORT=9200 \

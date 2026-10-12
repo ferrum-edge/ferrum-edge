@@ -230,8 +230,8 @@ impl NativeMeshTlsPrep {
 ///
 /// When a CA bundle is configured, the exclusive WebPKI verifier is installed
 /// through tonic's custom-verifier API (CA PEM must not also be set on
-/// `ClientTlsConfig`). Without a CA, this keeps the existing tonic identity /
-/// system-root path.
+/// `ClientTlsConfig`). Without a CA, this uses the shared tonic identity path,
+/// which trusts the bundled Mozilla (webpki) roots.
 pub fn prepare_native_mesh_tls(
     tls: &DpGrpcTlsConfig,
     host: Option<&str>,

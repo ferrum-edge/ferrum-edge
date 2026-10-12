@@ -52,7 +52,7 @@ Client request headers are forwarded to the backend WebSocket server during the 
 
 - `connection`, `upgrade`, `transfer-encoding`, `te`, `trailer`, `keep-alive`
 - `sec-websocket-key`, `sec-websocket-version`, `sec-websocket-accept`
-- `sec-websocket-extensions` — stripped so `permessage-deflate` cannot negotiate end to end; message bodies therefore stay uncompressed and inspectable by frame-level plugins such as `waf`
+- `sec-websocket-extensions` — stripped by default so `permessage-deflate` cannot negotiate end to end; message bodies therefore stay uncompressed and inspectable by frame-level plugins such as `waf`. With `websocket_permessage_deflate: passthrough`, the offer is forwarded only when no enabled plugin requires frame parsing; if the backend negotiates the extension, the session uses a raw byte relay that bypasses frame parsing, masking validation, and `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`, so compressed messages are not inspectable by frame-level plugins and peers remain responsible for RFC 6455 masking.
 - `x-consumer-*` (`x-consumer-username`, `x-consumer-custom-id`, and any other `x-consumer-` prefix) — stripped so a client cannot forge gateway-asserted consumer identity; the gateway re-injects authenticated values after the plugin pipeline when applicable
 - `x-geo-country` — stripped so a client cannot forge gateway-asserted geography; the gateway re-injects the lookup result from `geo_restriction` when configured
 - `host`, `proxy-authorization`, `proxy-connection`
@@ -89,9 +89,16 @@ Tunnel takeover preserves any backend bytes read together with the
 `101 Switching Protocols` response and forwards them before starting the raw
 relay, so a server-push frame coalesced with the upgrade response is not lost.
 
-Tunnel mode does not apply to HTTP/3 WebSockets. QUIC has no underlying raw TCP
-stream to copy, so H3 sessions always use frame parsing and retain frame-level
-plugin behavior even when `FERRUM_WEBSOCKET_TUNNEL_MODE=true`.
+The process-wide `FERRUM_WEBSOCKET_TUNNEL_MODE` setting does not select tunnel
+mode for HTTP/3 WebSockets. QUIC has no underlying raw TCP stream to copy, so
+H3 sessions normally parse frames and retain frame-level plugin behavior even
+when that flag is `true`. There is one negotiated-compression exception:
+`websocket_permessage_deflate: passthrough` forwards the extension offer only
+when no enabled plugin requires frame parsing. If the backend negotiates the
+extension, H3 uses a raw byte relay that bypasses frame parsing, masking
+validation, and `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`; the peers remain
+responsible for RFC 6455 masking rules. This behavior comes from the negotiated
+extension, not the process-wide tunnel flag.
 
 ## URL Routing
 

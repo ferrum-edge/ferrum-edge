@@ -69,7 +69,7 @@ MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI
 | Max pool size | `maxPoolSize` URI option | MongoDB equivalent of pool capacity. Example: `?maxPoolSize=100` |
 | Minimum idle pool size | `minPoolSize` URI option | Keeps warm driver connections open. Example: `?minPoolSize=5` |
 | Idle connection age | `maxIdleTimeMS` URI option | Driver-side idle eviction. Example: `?maxIdleTimeMS=600000` |
-| Pool checkout wait | `waitQueueTimeoutMS` URI option | Driver-side wait for an available connection. |
+| Pool checkout wait | Not supported | The pinned `mongodb` 3.8.2 driver parses `waitQueueTimeoutMS` from the URI but does not implement it as a connection-checkout deadline; pooling waits on a connection request without a checkout timeout. Do not rely on it when tuning under pool pressure. |
 | Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | Read preference | Ignored by Ferrum's config store | Runtime config reads are forced to primary for authoritative polling consistency. |
