@@ -833,7 +833,7 @@ curl "https://gateway/api-specs/$SPEC_ID" \
 # specific -- the quoted "<content_hash>-json" or "<content_hash>-yaml" --
 # so capture and replay the exact ETag a previous GET returned; a bare
 # content hash never matches.
-ETAG=$(curl -si "https://gateway/api-specs/$SPEC_ID" \
+ETAG=$(curl -sS -D - -o /dev/null "https://gateway/api-specs/$SPEC_ID" \
   -H "Authorization: Bearer $JWT" \
   -H "Accept: application/yaml" | awk 'tolower($1)=="etag:"{print $2}' | tr -d '\r')
 curl "https://gateway/api-specs/$SPEC_ID" \

@@ -2684,7 +2684,7 @@ curl https://gateway/api-specs/SPEC_ID \
   -H "Accept: application/yaml"
 
 # Conditional GET -- capture and replay the exact returned ETag (same Accept)
-ETAG=$(curl -si https://gateway/api-specs/SPEC_ID \
+ETAG=$(curl -sS -D - -o /dev/null https://gateway/api-specs/SPEC_ID \
   -H "Authorization: Bearer $JWT" \
   -H "Accept: application/yaml" | awk 'tolower($1)=="etag:"{print $2}' | tr -d '\r')
 curl https://gateway/api-specs/SPEC_ID \
