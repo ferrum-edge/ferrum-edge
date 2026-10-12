@@ -1197,7 +1197,9 @@ impl MeshConfigSync for ReportScriptedMeshCp {
             Some(code) if code != tonic::Code::Ok => {
                 Err(Status::new(code, "scripted status-report refusal"))
             }
-            _ => Ok(Response::new(ferrum_edge::grpc::proto::MeshSliceStatusResponse {})),
+            _ => Ok(Response::new(
+                ferrum_edge::grpc::proto::MeshSliceStatusResponse {},
+            )),
         }
     }
 }
@@ -1316,10 +1318,7 @@ async fn a_transiently_failed_status_report_is_retried_at_most_three_times() {
     ];
     let reports = status_reports_for(
         vec![(script, true)],
-        vec![
-            tonic::Code::Unavailable,
-            tonic::Code::FailedPrecondition,
-        ],
+        vec![tonic::Code::Unavailable, tonic::Code::FailedPrecondition],
     )
     .await;
     assert_eq!(reports, vec!["v1", "v1", SENTINEL_VERSION]);

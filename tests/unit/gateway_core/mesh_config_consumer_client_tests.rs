@@ -46,7 +46,10 @@ fn status_report_retry_predicate_admits_only_transient_codes() {
         tonic::Code::ResourceExhausted,
         tonic::Code::Unknown,
     ] {
-        assert!(status_report_failure_is_transient(code), "{code:?} must stay retryable");
+        assert!(
+            status_report_failure_is_transient(code),
+            "{code:?} must stay retryable"
+        );
     }
     for code in [
         tonic::Code::FailedPrecondition,
