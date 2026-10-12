@@ -1681,15 +1681,6 @@ async fn functional_mesh_stock_xds_live_datapath_matrix() {
 
 // ── issue #3853: negative transport admission on the real binary ──────────
 
-/// Same resolution order the mesh spawn helper uses.
-fn stock_xds_gateway_binary_path() -> std::path::PathBuf {
-    let debug = std::path::PathBuf::from("./target/debug/ferrum-edge");
-    if debug.exists() {
-        return debug;
-    }
-    std::path::PathBuf::from("./target/release/ferrum-edge")
-}
-
 /// The complete primary/fallback endpoint set is admitted as ONE
 /// transport-security posture before anything can dial. This drives the real
 /// `ferrum-edge` binary through the three refusals that matter most in
@@ -1759,7 +1750,7 @@ async fn functional_mesh_stock_xds_refuses_plaintext_transport_postures() {
         // reaches the stock-xDS plaintext refusal.
         let svids = generate_two_gateway_svids(temp.path(), A_SPIFFE, B_SPIFFE);
 
-        let mut command = std::process::Command::new(stock_xds_gateway_binary_path());
+        let mut command = std::process::Command::new(crate::common::gateway_binary_path());
         command
             .arg("validate")
             .env("FERRUM_MODE", "mesh")

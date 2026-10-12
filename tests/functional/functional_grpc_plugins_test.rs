@@ -157,14 +157,6 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 fn mint_observability_token() -> String {
     format!(
         "ferrum-edge-grpc-plugins-probe-{}",
@@ -178,7 +170,7 @@ fn start_gateway(
     admin_port: u16,
     observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let child = std::process::Command::new(gateway_binary_path())
+    let child = std::process::Command::new(crate::common::gateway_binary_path())
         .arg("run")
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

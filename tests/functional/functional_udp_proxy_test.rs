@@ -20,10 +20,7 @@ use crate::scaffolding::ports::{reserve_udp_port, unbound_tcp_port, unbound_udp_
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use crate::common::{
-    GatewayChildGuard, SpawnedGatewayIdentity, configure_coverage_gateway_command,
-    explicit_test_binary,
-};
+use crate::common::{GatewayChildGuard, SpawnedGatewayIdentity, configure_coverage_gateway_command};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -103,17 +100,6 @@ async fn start_udp_push_server(socket: UdpSocket) -> tokio::task::JoinHandle<()>
 // Gateway Helpers
 // ============================================================================
 
-fn gateway_binary_path() -> String {
-    if let Some(path) = explicit_test_binary() {
-        return path.to_string_lossy().into_owned();
-    }
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge".to_string()
-    } else {
-        "./target/release/ferrum-edge".to_string()
-    }
-}
-
 /// Shut a spawned gateway down early. The guard would do this on drop; calling
 /// it explicitly keeps the graceful teardown at the point the test intends,
 /// and is idempotent so the drop path cannot reap the child twice.
@@ -140,7 +126,7 @@ fn start_gateway_with_extra_env(
     extra_env: &[(&str, &str)],
 ) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     let admin_port = unbound_tcp_port()?;
-    let mut cmd = std::process::Command::new(gateway_binary_path());
+    let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -178,7 +164,7 @@ fn start_gateway_with_dtls_and_env(
     extra_env: &[(&str, &str)],
 ) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     let admin_port = unbound_tcp_port()?;
-    let mut cmd = std::process::Command::new(gateway_binary_path());
+    let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

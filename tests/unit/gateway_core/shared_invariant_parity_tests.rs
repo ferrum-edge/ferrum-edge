@@ -175,8 +175,14 @@ fn source(relative: &str) -> String {
 
 /// Every `.rs` file under `src/`, sorted, as `(repository-relative path, text)`.
 fn production_sources() -> Vec<(String, String)> {
+    rust_sources_under(&["src"])
+}
+
+/// Every `.rs` file under the repository-relative `dirs`, sorted, as
+/// `(repository-relative path, text)`.
+fn rust_sources_under(dirs: &[&str]) -> Vec<(String, String)> {
     let root = repository_root();
-    let mut stack = vec![root.join("src")];
+    let mut stack: Vec<PathBuf> = dirs.iter().map(|dir| root.join(dir)).collect();
     let mut out = Vec::new();
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -3293,4 +3299,58 @@ fn extended_connect_websocket_session_logs_record_the_wire_method() {
         !h3.contains("http_method: \"GET\""),
         "H3 WebSocket session records must not log the policy method"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Functional gateway spawners launch the harness-selected binary
+// ---------------------------------------------------------------------------
+//
+// Issue #6379: local `scripts/coverage.sh --functional` builds an instrumented
+// gateway under `target/llvm-cov-target/` and selects it only through
+// `FERRUM_EDGE_TEST_BIN`. `TestGateway` honored that selection, but bespoke
+// spawners resolved a fixed `target/debug` / `target/release` path, so they ran
+// a stale ordinary build or failed when only the instrumented build existed.
+// `tests/common/gateway_harness.rs` owns resolution; every other functional
+// source calls `gateway_binary_path()` or `locate_binary()`.
+
+const GATEWAY_BINARY_HARNESS: &str = "tests/common/gateway_harness.rs";
+const FIXED_GATEWAY_BINARY_TOKENS: [&str; 3] = [
+    "target/debug/ferrum-edge",
+    "target/release/ferrum-edge",
+    "CARGO_BIN_EXE_ferrum-edge",
+];
+
+#[test]
+fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
+    let mut offenders = Vec::new();
+    for (path, text) in rust_sources_under(&["tests/functional", "tests/common"]) {
+        if path == GATEWAY_BINARY_HARNESS {
+            continue;
+        }
+        for token in FIXED_GATEWAY_BINARY_TOKENS {
+            if text.contains(token) {
+                offenders.push(format!("{path}: {token}"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "resolve the gateway through crate::common::gateway_binary_path() or \
+         locate_binary(), not a fixed path: {offenders:#?}"
+    );
+
+    let harness = source(GATEWAY_BINARY_HARNESS);
+    let candidates = item_body(&harness, "fn explicit_binary_candidates()", "\n}\n");
+    assert!(candidates.contains("\"FERRUM_EDGE_TEST_BIN\""));
+    let select = item_body(&harness, "pub fn select_gateway_binary(", "\n}\n");
+    let explicit_at = select.find("explicit.iter()").expect("explicit lookup");
+    let fixed_at = select.find("root.join(").expect("fixed-path fallback");
+    assert!(
+        explicit_at < fixed_at,
+        "an explicit binary must win over a fixed-path build"
+    );
+    let locate = item_body(&harness, "pub fn locate_binary(", "\n}\n");
+    assert!(locate.contains("select_gateway_binary(&explicit_binary_candidates(),"));
+    let path = item_body(&harness, "pub fn gateway_binary_path()", "\n}\n");
+    assert!(path.contains("locate_binary(false)"));
 }

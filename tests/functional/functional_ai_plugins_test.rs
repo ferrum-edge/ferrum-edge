@@ -1068,15 +1068,6 @@ async fn start_counted_json_server_on(
     }
 }
 
-/// Detect the gateway binary path (debug preferred, fallback to release).
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Start the gateway in file mode with the given config and ports.
 fn start_gateway(
     config_path: &str,
@@ -1084,7 +1075,7 @@ fn start_gateway(
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> std::process::Child {
-    let binary_path = gateway_binary_path();
+    let binary_path = crate::common::gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
     cmd.arg("run");

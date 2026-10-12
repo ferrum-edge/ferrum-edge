@@ -222,20 +222,18 @@ impl ScalePerfHarness {
             return Err("Failed to build ferrum-edge".into());
         }
 
-        let binary_path = if std::path::Path::new("./target/release/ferrum-edge").exists() {
-            "./target/release/ferrum-edge"
-        } else if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        let binary_path =
+            crate::common::locate_binary(true).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+        if !binary_path.starts_with("./target/release") {
             eprintln!(
-                "WARNING: Using debug build — performance numbers will not be meaningful. Run `cargo build --release` first."
+                "WARNING: Using {} — performance numbers will not be meaningful. Run `cargo build --release` first.",
+                binary_path.display()
             );
-            "./target/debug/ferrum-edge"
-        } else {
-            return Err("ferrum-edge binary not found. Run `cargo build --release` first.".into());
-        };
+        }
 
         // Run migrations first for postgres
         if db_type == "postgres" {
-            let migrate_status = Command::new(binary_path)
+            let migrate_status = Command::new(&binary_path)
                 .arg("run")
                 .env("FERRUM_MODE", "migrate")
                 .env("FERRUM_DB_TYPE", db_type)
@@ -247,7 +245,7 @@ impl ScalePerfHarness {
             }
         }
 
-        let mut command = Command::new(binary_path);
+        let mut command = Command::new(&binary_path);
         command.arg("run");
         command
             .env("FERRUM_MODE", "database")

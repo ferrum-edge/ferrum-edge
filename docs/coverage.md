@@ -55,7 +55,15 @@ scripts/coverage.sh --functional
 
 This opt-in path builds Cargo's instrumented `ferrum-edge` binary and exports
 its path through `FERRUM_EDGE_TEST_BIN` so subprocess-based functional tests
-contribute to the same coverage report. MongoDB functional tests are included
+contribute to the same coverage report. Every functional gateway spawner
+resolves the binary through `gateway_binary_path()` / `locate_binary()` in
+`tests/common/gateway_harness.rs`, which prefers `FERRUM_EDGE_TEST_BIN` over a
+`target/debug` or `target/release` build. The selected instrumented binary is
+therefore launched even when a stale ordinary debug build exists, and is found
+when it is the only build. A structural parity test in
+`tests/unit/gateway_core/shared_invariant_parity_tests.rs` rejects a fixed
+gateway path anywhere else under `tests/functional/` or `tests/common/`
+(#6379). MongoDB functional tests are included
 in the filter list and skip gracefully when local MongoDB is not available.
 
 ## Database/File Mode Regression Notes
@@ -140,8 +148,9 @@ treats coverage as a main-branch backstop:
   matrix so the tooling change is exercised before it lands.
 - Push to `main`, `schedule`, `workflow_dispatch`, empty or unavailable diffs,
   and malformed or hostile changed-path transport fail closed to the full
-  matrix (lib-unit, the five integration shards, and the three functional
-  shards), which enforces the overall and `src/plugins/` floors. Classifiable
+  matrix (lib-unit, the five scoped integration shards, the two
+  integration-remainder shards, and the three functional shards), which
+  enforces the overall and `src/plugins/` floors. Classifiable
   paths use the conservative repository-relative `[A-Za-z0-9._+@~ /-]`
   alphabet, so Markdown controls cannot alter the Coverage Plan summary. A
   skipped planned shard cannot green the merge aggregate.
@@ -278,13 +287,35 @@ Path-scoped plans never select the functional shards; a scoped plan that
 selects every integration shard is promoted to the full matrix, which includes
 them.
 
+## Integration remainder shards
+
+The five scoped integration shards (`admin-api`, `admin-config`,
+`mesh-routing`, `mesh-platform`, `protocols-data-plane`) select modules with
+positional nextest filters, so path-scoped plans can run only the owning
+family. Every full plan also adds `integration-remainder-1` and
+`integration-remainder-2`, which carry no positional filters. Their shared
+filterset, `INTEGRATION_REMAINDER_FILTERSET` in
+`.github/scripts/coverage_plan.py`, is `not test(/integration::(...)/)` over
+every scoped filter, split with `nextest --partition hash:N/2`. A positional
+filter and the unanchored regex both match a substring of the test name, so
+the remainder is exactly the complement of the scoped shards. Every registered
+module therefore runs in full coverage, and a new module needs no filter edit
+(#6377). The remainder runs non-ignored tests only, like every integration
+coverage shard, so ignored live-store regressions stay outside coverage.
+
+`verify_coverage_workflow.py` parses `tests/integration/mod.rs` and requires
+every declared module to reach exactly one of a scoped filter or the
+remainder. It also rejects a scoped filter that matches no registered module.
+Path-scoped plans never select the remainder shards.
+
 Each functional shard first builds `functional_tests` under
 `cargo llvm-cov nextest` with a filter that selects no test, which also builds
 the instrumented `ferrum-edge` binary into `target/llvm-cov-target/debug/`. The
-step exports it as `FERRUM_EDGE_TEST_BIN` and hard-links it to the fixed
-`target/debug/ferrum-edge` path several suites still use. It is a hard link, not
-a symlink, because `functional_cli_test` hard-links that path into temp
-directories, and a relative symlink copied that way dangles. The test run
+step exports it as `FERRUM_EDGE_TEST_BIN`, which every functional spawner
+resolves first, and hard-links it to the fixed `target/debug/ferrum-edge`
+fallback path so no resolution path can launch an uninstrumented build. It is a
+hard link, not a symlink, because `functional_cli_test` hard-links the resolved
+binary into temp directories, and a relative symlink copied that way dangles. The test run
 reuses that binary: `--no-report` implies cargo-llvm-cov's `--no-clean` (the two
 flags conflict), so it does not run `cargo clean -p ferrum-edge` and rebuild the
 linked binary. The step sets `FERRUM_SKIP_GATEWAY_BUILD=1` so no test process
@@ -313,8 +344,20 @@ The merge job downloads the compressed ZIP through the Actions artifact API
 and streams its single tar member through `unzip -p` into `tar -xpf -`.
 This avoids writing and rereading the intermediate uncompressed tar. It stages
 only one compressed archive at a time and preserves the planner's sequential
-extraction/overwrite order, including all shared paths. No objects are stripped,
-deduplicated, renamed, or selected differently; no profiles are pre-merged.
+extraction/overwrite order for objects and other shared paths. No objects are
+stripped, deduplicated, renamed, or selected differently; no profiles are
+pre-merged.
+
+Raw profiles are the exception to shared-path overwriting (#6378). Their
+target-relative names can coincide across runners. cargo-llvm-cov's default
+`<package>-%p-%Nm.profraw` name repeats when two runners reuse a pid for the
+same binary signature. The functional shards' pooled
+`ferrum-edge-functional-%4m.profraw` name carries only the binary signature.
+Right after each shard's tar is extracted, every `*.profraw` it produced is
+renamed in place to `<name>.fanin-<shard>.profraw`, before the next shard is
+extracted. An existing destination fails the step. `cargo llvm-cov report`
+merges every top-level `*.profraw` in `target/llvm-cov-target/` whatever its
+name, so every shard's counters reach the report.
 
 Artifact IDs come only from the current workflow run's paginated artifact list.
 Each planned name must resolve uniquely to a non-expired artifact, and its ZIP
@@ -372,8 +415,9 @@ Hosted workflow regression tests exercise the actual transport shell using
 small ZIP/tar fixtures: forced ZIP64 headers, pagination, unplanned artifacts,
 retried partial downloads, exhausted retries, missing/expired/duplicate planned
 artifacts, wrong/extra ZIP members, CRC errors, invalid tars, missing
-profiles, profile bytes, executable modes, and sequential shared-object
-overwrites. Actual coverage artifacts retain their format and objects; ZIP CRC
+profiles, profile bytes, executable modes, sequential shared-object
+overwrites, and two shard artifacts carrying the same raw-profile path, which
+must both survive as shard-tagged top-level profiles. Actual coverage artifacts retain their format and objects; ZIP CRC
 checks validate the stream on every hosted merge. The step summary now records
 exact ZIP/tar bytes, download/extraction seconds per shard, and fan-in wall time
 for comparison with subsequent exact-head CI.
