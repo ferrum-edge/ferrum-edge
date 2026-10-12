@@ -2320,10 +2320,14 @@ pub fn select_gateway_binary(
 pub fn locate_binary(
     prefer_release: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    select_gateway_binary(&explicit_binary_candidates(), Path::new("."), prefer_release)
-        .ok_or_else(|| {
-            "ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.".into()
-        })
+    select_gateway_binary(
+        &explicit_binary_candidates(),
+        Path::new("."),
+        prefer_release,
+    )
+    .ok_or_else(|| {
+        "ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.".into()
+    })
 }
 
 /// The `ferrum-edge` binary a bespoke functional spawner launches, resolved

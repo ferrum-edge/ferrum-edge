@@ -20,7 +20,9 @@ use crate::scaffolding::ports::{reserve_udp_port, unbound_tcp_port, unbound_udp_
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use crate::common::{GatewayChildGuard, SpawnedGatewayIdentity, configure_coverage_gateway_command};
+use crate::common::{
+    GatewayChildGuard, SpawnedGatewayIdentity, configure_coverage_gateway_command,
+};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;

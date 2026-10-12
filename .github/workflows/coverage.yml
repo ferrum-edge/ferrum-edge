@@ -237,30 +237,12 @@ jobs:
             [ -z "$filter" ] && continue
             filters+=("$filter")
           done <<< "$INTEGRATION_FILTERS"
-          # The full-plan integration-remainder shards carry no positional
-          # filters: a filterset excluding every scoped shard's modules plus a
-          # hash partition selects all other registered modules (#6377).
-          nextest_args=()
-          if [ -n "$INTEGRATION_FILTERSET" ]; then
-            nextest_args+=(-E "$INTEGRATION_FILTERSET")
-          fi
-          if [ -n "$INTEGRATION_PARTITION" ]; then
-            nextest_args+=(--partition "$INTEGRATION_PARTITION")
-          fi
-          if [ "${#filters[@]}" -eq 0 ] && [ "${#nextest_args[@]}" -eq 0 ]; then
-            echo "::error::integration shard ${COVERAGE_SHARD} has no test selection"
-            exit 1
-          fi
           cargo llvm-cov --no-report \
             nextest --test integration_tests \
             --no-fail-fast \
-            "${nextest_args[@]}" \
             "${filters[@]}"
         env:
-          COVERAGE_SHARD: ${{ matrix.shard }}
           INTEGRATION_FILTERS: ${{ matrix.filters }}
-          INTEGRATION_FILTERSET: ${{ matrix.filterset }}
-          INTEGRATION_PARTITION: ${{ matrix.partition }}
           RUST_BACKTRACE: 1
 
       - name: Start functional data-plane service containers
@@ -401,12 +383,11 @@ jobs:
             nextest --test functional_tests \
             --no-tests=pass \
             -E 'none()'
-          # Every functional spawner resolves FERRUM_EDGE_TEST_BIN first
-          # through tests/common/gateway_harness.rs (#6379). Keep the fixed
-          # ./target/debug/ferrum-edge fallback pointing at the same
-          # instrumented binary so no path can launch an uninstrumented build.
-          # A symlink would be linked as a dangling relative link by the CLI
-          # suite's temp-directory hard links, so hard-link the real binary.
+          # Several functional suites resolve the gateway through the fixed
+          # ./target/debug/ferrum-edge path rather than FERRUM_EDGE_TEST_BIN,
+          # and the CLI suite hard-links that path into temp directories.
+          # A symlink would be linked as a dangling relative link there, so
+          # hard-link the real instrumented binary instead.
           mkdir -p target/debug
           ln -f target/llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge
           filters=()
@@ -645,21 +626,6 @@ jobs:
             # Drain any tar end padding so unzip always reaches its CRC check.
             # pipefail propagates corrupt ZIPs AND tar extraction failures.
             unzip -p "$archive" "$member" | { tar -xpf - && cat > /dev/null; }
-            # Raw-profile names can coincide across runners: cargo-llvm-cov's
-            # default `%p-%Nm` name reuses pids, and the functional shards'
-            # pooled `%4m` name carries only the binary signature (#6378). Tag
-            # every profile this shard just extracted with its shard name before
-            # the next shard can overwrite it. The report merges every
-            # top-level `*.profraw`, whatever its name.
-            shard="${artifact_name#coverage-data-}"
-            while IFS= read -r -d '' profile; do
-              tagged="${profile%.profraw}.fanin-${shard}.profraw"
-              if [ -e "$tagged" ]; then
-                echo "::error::coverage profile ${tagged} already exists"
-                exit 1
-              fi
-              mv -- "$profile" "$tagged"
-            done < <(find target/llvm-cov-target -name '*.profraw' ! -name '*.fanin-*.profraw' -print0)
             extract_seconds=$((SECONDS - extract_started))
             echo "| ${artifact_name} | ${zip_bytes} | ${tar_bytes} | ${download_seconds} | ${extract_seconds} |" >> "$GITHUB_STEP_SUMMARY"
             rm -rf coverage-data

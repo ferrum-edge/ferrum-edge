@@ -3349,8 +3349,17 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
         explicit_at < fixed_at,
         "an explicit binary must win over a fixed-path build"
     );
-    let locate = item_body(&harness, "pub fn locate_binary(", "\n}\n");
-    assert!(locate.contains("select_gateway_binary(&explicit_binary_candidates(),"));
+    // rustfmt may wrap the call's arguments, so compare without whitespace.
+    let locate: String = item_body(&harness, "pub fn locate_binary(", "\n}\n")
+        .split_whitespace()
+        .collect();
+    let delegation: String = "select_gateway_binary(&explicit_binary_candidates(),"
+        .split_whitespace()
+        .collect();
+    assert!(
+        locate.contains(&delegation),
+        "locate_binary must delegate to select_gateway_binary with the explicit candidates"
+    );
     let path = item_body(&harness, "pub fn gateway_binary_path()", "\n}\n");
     assert!(path.contains("locate_binary(false)"));
 }

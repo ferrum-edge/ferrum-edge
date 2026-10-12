@@ -148,9 +148,8 @@ treats coverage as a main-branch backstop:
   matrix so the tooling change is exercised before it lands.
 - Push to `main`, `schedule`, `workflow_dispatch`, empty or unavailable diffs,
   and malformed or hostile changed-path transport fail closed to the full
-  matrix (lib-unit, the five scoped integration shards, the two
-  integration-remainder shards, and the three functional shards), which
-  enforces the overall and `src/plugins/` floors. Classifiable
+  matrix (lib-unit, the five integration shards, and the three functional
+  shards), which enforces the overall and `src/plugins/` floors. Classifiable
   paths use the conservative repository-relative `[A-Za-z0-9._+@~ /-]`
   alphabet, so Markdown controls cannot alter the Coverage Plan summary. A
   skipped planned shard cannot green the merge aggregate.
@@ -287,27 +286,6 @@ Path-scoped plans never select the functional shards; a scoped plan that
 selects every integration shard is promoted to the full matrix, which includes
 them.
 
-## Integration remainder shards
-
-The five scoped integration shards (`admin-api`, `admin-config`,
-`mesh-routing`, `mesh-platform`, `protocols-data-plane`) select modules with
-positional nextest filters, so path-scoped plans can run only the owning
-family. Every full plan also adds `integration-remainder-1` and
-`integration-remainder-2`, which carry no positional filters. Their shared
-filterset, `INTEGRATION_REMAINDER_FILTERSET` in
-`.github/scripts/coverage_plan.py`, is `not test(/integration::(...)/)` over
-every scoped filter, split with `nextest --partition hash:N/2`. A positional
-filter and the unanchored regex both match a substring of the test name, so
-the remainder is exactly the complement of the scoped shards. Every registered
-module therefore runs in full coverage, and a new module needs no filter edit
-(#6377). The remainder runs non-ignored tests only, like every integration
-coverage shard, so ignored live-store regressions stay outside coverage.
-
-`verify_coverage_workflow.py` parses `tests/integration/mod.rs` and requires
-every declared module to reach exactly one of a scoped filter or the
-remainder. It also rejects a scoped filter that matches no registered module.
-Path-scoped plans never select the remainder shards.
-
 Each functional shard first builds `functional_tests` under
 `cargo llvm-cov nextest` with a filter that selects no test, which also builds
 the instrumented `ferrum-edge` binary into `target/llvm-cov-target/debug/`. The
@@ -344,20 +322,8 @@ The merge job downloads the compressed ZIP through the Actions artifact API
 and streams its single tar member through `unzip -p` into `tar -xpf -`.
 This avoids writing and rereading the intermediate uncompressed tar. It stages
 only one compressed archive at a time and preserves the planner's sequential
-extraction/overwrite order for objects and other shared paths. No objects are
-stripped, deduplicated, renamed, or selected differently; no profiles are
-pre-merged.
-
-Raw profiles are the exception to shared-path overwriting (#6378). Their
-target-relative names can coincide across runners. cargo-llvm-cov's default
-`<package>-%p-%Nm.profraw` name repeats when two runners reuse a pid for the
-same binary signature. The functional shards' pooled
-`ferrum-edge-functional-%4m.profraw` name carries only the binary signature.
-Right after each shard's tar is extracted, every `*.profraw` it produced is
-renamed in place to `<name>.fanin-<shard>.profraw`, before the next shard is
-extracted. An existing destination fails the step. `cargo llvm-cov report`
-merges every top-level `*.profraw` in `target/llvm-cov-target/` whatever its
-name, so every shard's counters reach the report.
+extraction/overwrite order, including all shared paths. No objects are stripped,
+deduplicated, renamed, or selected differently; no profiles are pre-merged.
 
 Artifact IDs come only from the current workflow run's paginated artifact list.
 Each planned name must resolve uniquely to a non-expired artifact, and its ZIP
@@ -415,9 +381,8 @@ Hosted workflow regression tests exercise the actual transport shell using
 small ZIP/tar fixtures: forced ZIP64 headers, pagination, unplanned artifacts,
 retried partial downloads, exhausted retries, missing/expired/duplicate planned
 artifacts, wrong/extra ZIP members, CRC errors, invalid tars, missing
-profiles, profile bytes, executable modes, sequential shared-object
-overwrites, and two shard artifacts carrying the same raw-profile path, which
-must both survive as shard-tagged top-level profiles. Actual coverage artifacts retain their format and objects; ZIP CRC
+profiles, profile bytes, executable modes, and sequential shared-object
+overwrites. Actual coverage artifacts retain their format and objects; ZIP CRC
 checks validate the stream on every hosted merge. The step summary now records
 exact ZIP/tar bytes, download/extraction seconds per shard, and fan-in wall time
 for comparison with subsequent exact-head CI.
