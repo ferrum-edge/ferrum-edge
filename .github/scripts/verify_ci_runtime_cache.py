@@ -4203,12 +4203,118 @@ def check_distroless_digest_consistency(
 # The refresh cannot move the distroless pin in `ci.yml`'s `main-linux-image`
 # job (frozen by the trusted Cross policy), so a rewritten distroless digest
 # would fail `check_distroless_digest_consistency` before its PR opens. The
-# refresh must hold that drift for a direct-to-main rotation instead.
-BASE_IMAGE_REFRESH_HOLD_MARKERS = (
-    "      HELD_IMAGE: gcr.io/distroless/cc-debian13\n",
-    '              "${HELD_IMAGE}":*)\n',
-    "        if: always() && steps.resolve.outputs.held == 'true'\n",
-)
+# refresh must hold that drift for a direct-to-main rotation instead: the
+# held arm bypasses the rewrite, the resolve step publishes `held=true` before
+# any early exit, and a final always-run step fails the run.
+BASE_IMAGE_REFRESH_HELD_ENV = "      HELD_IMAGE: gcr.io/distroless/cc-debian13\n"
+BASE_IMAGE_REFRESH_HOLD_IF = "always() && steps.resolve.outputs.held == 'true'"
+
+
+def named_step(steps: list[str], name: str) -> str | None:
+    """Return the single step whose `- name:` is exactly `name`."""
+
+    matches = [
+        step for step in steps if step.startswith(f"      - name: {name}\n")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def step_run_block_commands(step: str) -> list[str]:
+    """Return a literal `run: |` block's non-empty, non-comment lines, stripped."""
+
+    match = re.search(r"(?m)^        run:[ \t]+\|[ \t]*\n", step)
+    if match is None:
+        return []
+    commands: list[str] = []
+    for line in step[match.end() :].splitlines():
+        stripped = line.strip()
+        if stripped and len(line) - len(line.lstrip(" ")) < 10:
+            break
+        if stripped and not stripped.startswith("#"):
+            commands.append(stripped)
+    return commands
+
+
+def base_image_refresh_hold_errors(workflow: str) -> list[str]:
+    """Return why the digest refresh fails to hold distroless drift."""
+
+    job = extract_job(workflow, "refresh")
+    if not job:
+        return ["the `refresh` job is missing"]
+    errors: list[str] = []
+    if BASE_IMAGE_REFRESH_HELD_ENV not in job:
+        errors.append(f"missing {BASE_IMAGE_REFRESH_HELD_ENV.strip()!r}")
+    steps = job_steps(job)
+
+    resolve = named_step(steps, "Resolve current digests")
+    if resolve is None or not re.search(r"(?m)^        id: resolve$", resolve):
+        errors.append("missing one `Resolve current digests` step with `id: resolve`")
+        commands: list[str] = []
+    else:
+        commands = step_run_block_commands(resolve)
+
+    def index_of(command: str, start: int = 0) -> int:
+        for index in range(max(start, 0), len(commands)):
+            if commands[index] == command:
+                return index
+        return -1
+
+    loop = index_of("for ref in ${refs}; do")
+    case = index_of('case "${tagged}" in', loop + 1) if loop >= 0 else -1
+    arm = index_of('"${HELD_IMAGE}":*)', case + 1) if case >= 0 else -1
+    arm_end = index_of(";;", arm + 1) if arm >= 0 else -1
+    esac = index_of("esac", arm_end + 1) if arm_end >= 0 else -1
+    rewrites = [
+        index
+        for index, command in enumerate(commands)
+        if re.match(r"sed\s", command)
+    ]
+    if esac < 0:
+        errors.append(
+            "the resolve loop must match `\"${HELD_IMAGE}\":*)` in a "
+            "`case \"${tagged}\" in` arm"
+        )
+    else:
+        held_arm = commands[arm + 1 : arm_end]
+        if not held_arm or held_arm[-1] != "continue":
+            errors.append(
+                "the held distroless arm must end with `continue` to bypass the rewrite"
+            )
+        if not any(command.startswith('held="${held}') for command in held_arm):
+            errors.append("the held distroless arm must record the drift in `held`")
+        if not rewrites or any(index < esac for index in rewrites):
+            errors.append(
+                "every `sed` rewrite must follow the held distroless `case` in the "
+                "resolve loop"
+            )
+
+    publish = index_of('echo "held=true" >> "${GITHUB_OUTPUT}"')
+    early_exits = [
+        index for index, command in enumerate(commands) if command == "exit 0"
+    ]
+    if (
+        publish < 1
+        or commands[publish - 1] != 'if [ -n "${held}" ]; then'
+        or (rewrites and publish < max(rewrites))
+        or any(index < publish for index in early_exits)
+    ):
+        errors.append(
+            "the resolve step must publish `held=true` to GITHUB_OUTPUT after the "
+            "loop and before any `exit 0`"
+        )
+
+    fail = named_step(steps, "Fail on held distroless drift")
+    if (
+        fail is None
+        or steps[-1] is not fail
+        or step_if(fail) != BASE_IMAGE_REFRESH_HOLD_IF
+        or not step_run_ends_with_exit(fail, 1)
+    ):
+        errors.append(
+            "the final `Fail on held distroless drift` step must run "
+            f"`if: {BASE_IMAGE_REFRESH_HOLD_IF}` and end with `exit 1`"
+        )
+    return errors
 
 
 def check_base_image_refresh_holds_distroless(
@@ -4216,12 +4322,10 @@ def check_base_image_refresh_holds_distroless(
 ) -> None:
     """Require the digest refresh to hold, report, and fail on distroless drift."""
 
-    for marker in BASE_IMAGE_REFRESH_HOLD_MARKERS:
-        require(
-            marker in workflow,
+    for error in base_image_refresh_hold_errors(workflow):
+        failures.append(
             "base-image-digest-refresh.yml must hold distroless drift for a "
-            f"direct-to-main rotation; missing {marker.strip()!r}",
-            failures,
+            f"direct-to-main rotation: {error}"
         )
 
 
@@ -5350,22 +5454,48 @@ def self_test() -> int:
         "self-test: stale distroless image refs must fail with their path",
         failures,
     )
-    held_refresh = "".join(BASE_IMAGE_REFRESH_HOLD_MARKERS)
+    refresh_workflow = BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8")
     pin_failures = []
-    check_base_image_refresh_holds_distroless(held_refresh, pin_failures)
+    check_base_image_refresh_holds_distroless(refresh_workflow, pin_failures)
     require(
         not pin_failures,
-        "self-test: a refresh that holds distroless drift should pass",
+        "self-test: the real refresh workflow must hold distroless drift",
         failures,
     )
-    for marker in BASE_IMAGE_REFRESH_HOLD_MARKERS:
+    for label, original, mutation in (
+        (
+            "without the held-arm `continue`",
+            "                continue\n                ;;\n",
+            "                ;;\n",
+        ),
+        (
+            "without `held=true` publication",
+            '            echo "held=true" >> "${GITHUB_OUTPUT}"\n',
+            "",
+        ),
+        (
+            "without the final `exit 1`",
+            'see the step summary"\n          exit 1\n',
+            'see the step summary"\n',
+        ),
+        (
+            "without `always()` on the final failure",
+            "        if: always() && steps.resolve.outputs.held == 'true'\n",
+            "        if: steps.resolve.outputs.held == 'true'\n",
+        ),
+    ):
+        require(
+            refresh_workflow.count(original) == 1,
+            f"self-test: the refresh mutation {label} must match the workflow once",
+            failures,
+        )
         pin_failures = []
         check_base_image_refresh_holds_distroless(
-            held_refresh.replace(marker, ""), pin_failures
+            refresh_workflow.replace(original, mutation), pin_failures
         )
         require(
-            len(pin_failures) == 1,
-            f"self-test: a refresh missing {marker.strip()!r} must fail",
+            bool(pin_failures),
+            f"self-test: a refresh {label} must fail",
             failures,
         )
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
