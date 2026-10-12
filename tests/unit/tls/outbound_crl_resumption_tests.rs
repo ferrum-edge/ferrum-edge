@@ -294,8 +294,10 @@ fn uncovered_issuer_remains_accepted_after_another_issuers_crl_expires() {
     assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
 }
 
+/// Real wall-clock expiry (about five seconds): required unit selections may
+/// not carry ignored tests, and priming is an in-memory handshake that finishes
+/// well inside the window.
 #[test]
-#[ignore = "natural-expiry validation under the serial runtime lease"]
 fn ticket_enabled_backend_reconnect_is_refused_after_natural_crl_expiry() {
     let fixture = Fixture::new(&rustls::version::TLS13, true);
     let deadline = fixture.now + TimeDuration::seconds(5);
