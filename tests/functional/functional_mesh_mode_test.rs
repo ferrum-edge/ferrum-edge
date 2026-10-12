@@ -15515,11 +15515,14 @@ impl LiveTwoClusterSpire {
             .drop_and_take_port();
         let a_root = cluster_a.path().display().to_string();
         let b_root = cluster_b.path().display().to_string();
-        run_live_xc_spire(&["start", &a_root, LIVE_XC_TD_A, &port_a.to_string()])?;
+        // Own cleanup before the FIRST start. The helper rolls back its own
+        // partial start, and `stop` on a root with no PID files is a no-op, so
+        // arming early can only add a stop attempt, never signal a stranger.
         let mut setup_guard = LiveXcSpireSetupGuard {
             roots: vec![a_root.clone(), b_root.clone()],
             armed: true,
         };
+        run_live_xc_spire(&["start", &a_root, LIVE_XC_TD_A, &port_a.to_string()])?;
         run_live_xc_spire(&["start", &b_root, LIVE_XC_TD_B, &port_b.to_string()])?;
         run_live_xc_spire(&["federate", &a_root, LIVE_XC_TD_A, &b_root, LIVE_XC_TD_B])?;
         run_live_xc_spire(&[

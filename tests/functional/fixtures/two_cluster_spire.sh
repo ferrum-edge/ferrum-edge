@@ -25,6 +25,40 @@ server_cli() {
   spire-server "$@" -socketPath "$root/server.sock"
 }
 
+# Children launched by this `start` invocation, as `pid:pidfile`. A start that
+# fails after a launch stops exactly these before the helper exits, so a caller
+# never inherits a half-started root. They are this shell's own children, so
+# `wait` observes their termination, which a PID file alone cannot prove. Their
+# PID files are removed afterwards so a later `stop` cannot signal a PID that
+# has since been reused.
+started_children=()
+
+terminate_started_child() {
+  local pid="$1"
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+roll_back_failed_start() {
+  local status=$? entry
+  trap - EXIT
+  if [[ "$status" -ne 0 ]]; then
+    for entry in "${started_children[@]+"${started_children[@]}"}"; do
+      terminate_started_child "${entry%%:*}"
+      rm -f "${entry#*:}"
+    done
+  fi
+  exit "$status"
+}
+
 wait_for_workload_svid() {
   local root="$1" workload_id="$2" workload_uid="$3"
   for _ in $(seq 1 100); do
@@ -49,6 +83,7 @@ case "$command_name" in
     root="${1:?root directory is required}"
     trust_domain="${2:?trust domain is required}"
     server_port="${3:?server port is required}"
+    trap roll_back_failed_start EXIT
     mkdir -p "$root/server-data" "$root/agent-data"
     chmod 0755 "$root"
 
@@ -76,6 +111,7 @@ plugins {
 EOF
 
     spire-server run -config "$root/server.conf" >"$root/server.log" 2>&1 &
+    started_children+=("$!:$root/server.pid")
     echo "$!" >"$root/server.pid"
     wait_for_socket "$root/server.sock" "SPIRE server"
     server_cli "$root" bundle show -format pem >"$root/bundle.pem"
@@ -110,6 +146,7 @@ plugins {
 EOF
 
     spire-agent run -config "$root/agent.conf" -joinToken "$token" >"$root/agent.log" 2>&1 &
+    started_children+=("$!:$root/agent.pid")
     echo "$!" >"$root/agent.pid"
     wait_for_socket "$root/agent.sock" "SPIRE agent"
     chmod 0777 "$root/agent.sock"

@@ -54,6 +54,21 @@ INITIAL_REVERSE_FEDERATION_SUCCESS_AT=0 INITIAL_REVERSE_DISCOVERY_SUCCESSES=0
 INITIAL_FEDERATION_FAILURES=0 INITIAL_DISCOVERY_FAILURES=0
 TRANSIENT_FEDERATION_FAILURE_DELTA=0 TRANSIENT_DISCOVERY_FAILURE_DELTA=0
 RECORDED=" "
+# Docker identities of the resources THIS invocation created. Cleanup removes
+# only these, by id and never by name, so a refused preflight, a partial start,
+# or a same-name replacement owned by another invocation is never deleted.
+OWNED_TOXIPROXY_ID="" OWNED_CLUSTER_A_NODE_ID="" OWNED_CLUSTER_B_NODE_ID=""
+# A run-private kubeconfig: kind writes this run's contexts here and nowhere
+# else, so removing it removes exactly the entries this run created and never a
+# same-name context another invocation wrote to a shared kubeconfig.
+RUN_KUBECONFIG_DIR="$( mktemp -d)"
+export KUBECONFIG="$RUN_KUBECONFIG_DIR/config"
+# Run-private node provenance: a random token in this directory is bind-mounted
+# into every kind node this run creates, and a node is adopted only after its
+# immutable id is shown to carry that token. A same-name node another
+# invocation created cannot carry it, so it is never adopted or deleted.
+RUN_PROVENANCE_DIR="$( mktemp -d)"
+RUN_PROVENANCE_MOUNT=/ferrum-run-provenance
 
 mkdir -p "$RESULTS_DIR" "$ARTIFACT_DIR"
 
@@ -67,12 +82,35 @@ record() {
   RECORDED="$RECORDED$id "
 }
 
+cluster_node_id() {
+  docker inspect -f '{{.Id}}' "$1-control-plane" 2>/dev/null
+}
+
+# kind's default topology is a single control-plane node, so the node container
+# this run recorded is the whole cluster. It is removed by that immutable id and
+# the cluster name is never resolved again: a same-name replacement created at
+# any point, even after an ownership check, has another id and survives.
+release_owned_cluster() {
+  local owned_node_id="$1"
+  [[ -n "$owned_node_id" ]] || return 0
+  docker rm -f -v "$owned_node_id" >/dev/null 2>&1
+}
+
 cleanup() {
   set +e
   if [[ -n "$TOXI_IP" ]]; then collect_diagnostics; fi
-  docker rm -f "$TOXIPROXY_CONTAINER" >/dev/null 2>&1
-  kind delete cluster --name "$CLUSTER_A" >/dev/null 2>&1
-  kind delete cluster --name "$CLUSTER_B" >/dev/null 2>&1
+  # By container id, never by name: a same-name replacement is not ours.
+  if [[ -n "$OWNED_TOXIPROXY_ID" ]]; then
+    docker rm -f "$OWNED_TOXIPROXY_ID" >/dev/null 2>&1
+  fi
+  release_owned_cluster "$OWNED_CLUSTER_A_NODE_ID"
+  release_owned_cluster "$OWNED_CLUSTER_B_NODE_ID"
+  if [[ -n "$RUN_KUBECONFIG_DIR" ]]; then
+    rm -rf "$RUN_KUBECONFIG_DIR"
+  fi
+  if [[ -n "$RUN_PROVENANCE_DIR" ]]; then
+    rm -rf "$RUN_PROVENANCE_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -312,18 +350,68 @@ mint_admin_jwt() {
     mint-admin-jwt "$ADMIN_SECRET"
 }
 
+write_provenance_kind_config() {
+  mkdir -p "$RUN_PROVENANCE_DIR/mount"
+  openssl rand -hex 16 >"$RUN_PROVENANCE_DIR/mount/token"
+  [[ -s "$RUN_PROVENANCE_DIR/mount/token" ]] || {
+    echo "could not generate the run provenance token" >&2
+    return 1
+  }
+  cat >"$RUN_PROVENANCE_DIR/kind-config.yaml" <<YAML
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: $RUN_PROVENANCE_DIR/mount
+        containerPath: $RUN_PROVENANCE_MOUNT
+        readOnly: true
+YAML
+}
+
+# The id is captured first and the provenance is then read through that id, so
+# the node proven to be this run's is exactly the node recorded. A node that was
+# replaced between `kind create` and this inspection does not carry the token
+# and is refused: not recorded, so cleanup never deletes it.
+record_created_cluster() {
+  local cluster="$1" node_id expected observed
+  node_id="$( cluster_node_id "$cluster")" || node_id=""
+  [[ -n "$node_id" ]] || {
+    echo "could not record the control-plane identity of kind cluster $cluster; it is left for manual removal" >&2
+    return 1
+  }
+  expected="$( cat "$RUN_PROVENANCE_DIR/mount/token")" || expected=""
+  observed="$( docker exec "$node_id" cat "$RUN_PROVENANCE_MOUNT/token" 2>/dev/null)" || observed=""
+  [[ -n "$expected" && "$observed" == "$expected" ]] || {
+    echo "the control-plane node of kind cluster $cluster does not carry this run's provenance token; refusing to adopt or delete it" >&2
+    return 1
+  }
+  printf '%s' "$node_id"
+}
+
+# Ownership is claimed only after each create succeeds and the created node
+# proves this run's provenance. A failed `kind create` removes the nodes it made
+# itself (no --retain), and a name taken between preflight and create fails the
+# create, so neither is ever adopted here.
 create_clusters_and_fault_layer() {
-  kind create cluster --name "$CLUSTER_A" --wait 180s
-  kind create cluster --name "$CLUSTER_B" --wait 180s
+  write_provenance_kind_config
+  kind create cluster --name "$CLUSTER_A" --config "$RUN_PROVENANCE_DIR/kind-config.yaml" --wait 180s
+  OWNED_CLUSTER_A_NODE_ID="$( record_created_cluster "$CLUSTER_A")"
+  kind create cluster --name "$CLUSTER_B" --config "$RUN_PROVENANCE_DIR/kind-config.yaml" --wait 180s
+  OWNED_CLUSTER_B_NODE_ID="$( record_created_cluster "$CLUSTER_B")"
   kind load docker-image "$IMAGE" --name "$CLUSTER_A"
   kind load docker-image "$IMAGE" --name "$CLUSTER_B"
   NODE_A="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_A-control-plane")"
   NODE_B="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_B-control-plane")"
   [[ -n "$NODE_A" && -n "$NODE_B" ]] || { echo "kind node IP discovery failed" >&2; return 1; }
 
-  docker run -d --name "$TOXIPROXY_CONTAINER" --network kind "$TOXIPROXY_IMAGE" \
-    -host=0.0.0.0 -proxy-metrics >/dev/null
-  TOXI_IP="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TOXIPROXY_CONTAINER")"
+  # Create, record, then start: a container whose start fails is still ours to
+  # remove, and the id (not the name) is what cleanup removes.
+  OWNED_TOXIPROXY_ID="$( docker create --name "$TOXIPROXY_CONTAINER" --network kind "$TOXIPROXY_IMAGE" \
+    -host=0.0.0.0 -proxy-metrics)"
+  [[ -n "$OWNED_TOXIPROXY_ID" ]] || { echo "Toxiproxy create returned no container id" >&2; return 1; }
+  docker start "$OWNED_TOXIPROXY_ID" >/dev/null
+  TOXI_IP="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$OWNED_TOXIPROXY_ID")"
   [[ -n "$TOXI_IP" ]] || { echo "Toxiproxy IP discovery failed" >&2; return 1; }
   wait_for_curl "Toxiproxy API" 30 -fsS "http://$TOXI_IP:8474/version" >/dev/null
 
