@@ -10201,7 +10201,7 @@ impl ProxyState {
         let collect_state = self.clone();
         let rebuild_state = self.clone();
         Some(
-            crate::tls::source::subscription::spawn_dynamic_material_set_reload_task(
+            crate::tls::source::subscription::spawn_backend_material_set_reload_task(
                 crate::tls::source::subscription::DynamicMaterialSetReloadConfig {
                     surface: "backend_tls",
                     collect_sources: Box::new(move || {

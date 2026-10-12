@@ -10543,7 +10543,7 @@ fn apply_destination_rules(
 }
 
 /// [`apply_destination_rules`] against an explicit tenant TLS file root list.
-fn apply_destination_rules_with_tenant_file_roots(
+pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
@@ -10812,16 +10812,16 @@ fn apply_destination_rules_with_tenant_file_roots(
 
         // Slice validation admitted this rule's local TLS files lexically.
         // This node is about to project them onto its upstreams, so re-check
-        // each one after symlink resolution. Only rules that reach a local
+        // and bind each reference to confined loading. Only rules that reach a local
         // upstream are checked: a file's presence is per-node state, so one
         // tenant's missing or escaping file must fail only the destinations
         // that rule governs, never the whole slice.
-        let escape = crate::modes::mesh::config::destination_rule_tls_file_escape_error(
+        let prepared = crate::modes::mesh::config::bind_destination_rule_tls_files(
             dr,
             &mesh_slice.istio_root_namespace,
             tenant_file_roots,
         );
-        if let Some(error) = escape {
+        if let Err(error) = &prepared {
             // HBONE and Sidecar mesh-mTLS dispatch never reads backend TLS
             // material: those transports run only for plaintext-scheme proxies
             // and authenticate with the gateway SVID. Refusing the material
@@ -10863,6 +10863,7 @@ fn apply_destination_rules_with_tenant_file_roots(
             }
             tls_file_refused_upstreams.extend(matching_upstream_indices.iter().copied());
         }
+        let dr = prepared.as_ref().map_or(dr, |prepared| prepared.as_ref());
 
         let connect_timeout_ms = dr
             .traffic_policy
@@ -29608,8 +29609,13 @@ mod tests {
         let reviews = &config.upstreams[0];
         assert_eq!(
             reviews.backend_tls_server_ca_cert_path.as_deref(),
-            Some(present.as_str()),
-            "the valid rule's destination keeps its TLS"
+            crate::tls::source::bind_tenant_file_reference(
+                &present,
+                crate::tls::source::MaterialKind::CaBundle
+            )
+            .expect("valid reference")
+            .as_deref(),
+            "the valid rule's destination keeps confined, refreshable TLS"
         );
         assert!(reviews.backend_tls_client_cert_path.is_none());
         assert!(reviews.backend_tls_verify_server_cert);

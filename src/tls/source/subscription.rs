@@ -591,11 +591,36 @@ pub fn spawn_dynamic_material_set_reload_task(
     config: DynamicMaterialSetReloadConfig,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
+    spawn_dynamic_material_set_reload_task_inner(config, shutdown_rx, false)
+}
+
+/// Backend rebuilds already isolate refused destinations. Keep a refused
+/// tenant file from blocking fingerprints and rotations for other destinations.
+/// Global/trusted source failures retain the existing all-or-nothing behavior.
+pub(crate) fn spawn_backend_material_set_reload_task(
+    config: DynamicMaterialSetReloadConfig,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+) -> JoinHandle<()> {
+    spawn_dynamic_material_set_reload_task_inner(config, shutdown_rx, true)
+}
+
+fn spawn_dynamic_material_set_reload_task_inner(
+    config: DynamicMaterialSetReloadConfig,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    isolate_tenant_files: bool,
+) -> JoinHandle<()> {
     let surface = config.surface;
     let (force_tx, force_rx) = mpsc::channel(1);
     force_reload_registry().insert(surface, force_tx.clone());
     tokio::spawn(async move {
-        run_dynamic_material_set_reload_loop(config, shutdown_rx, force_rx, force_tx).await;
+        run_dynamic_material_set_reload_loop(
+            config,
+            shutdown_rx,
+            force_rx,
+            force_tx,
+            isolate_tenant_files,
+        )
+        .await;
     })
 }
 
@@ -1150,11 +1175,56 @@ async fn run_async_material_set_reload_loop(
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct DynamicMaterialFingerprint {
+    material: MaterialSetFingerprint,
+    // Source-set identity is tracked separately by watched_source_signature.
+    // Refusal/recovery participates in equality so cached material is invalidated
+    // once at each transition, without repeatedly rebuilding at every poll.
+    refused: Vec<(usize, &'static str)>,
+}
+
+async fn dynamic_material_fingerprint(
+    sources: &[WatchedMaterialSource],
+    max_bytes: usize,
+    isolate_tenant_files: bool,
+) -> Result<(DynamicMaterialFingerprint, Vec<(usize, MaterialError)>), MaterialError> {
+    let mut entries = Vec::with_capacity(sources.len());
+    let mut errors = Vec::new();
+    for (index, watched) in sources.iter().enumerate() {
+        match material_fingerprint_async_with(watched, max_bytes).await {
+            Ok(entry) => entries.push(entry),
+            Err(error)
+                if isolate_tenant_files
+                    && matches!(
+                        &watched.source,
+                        CertSource::Uri(uri) if super::is_tenant_file_uri(uri)
+                    ) =>
+            {
+                errors.push((index, error))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let refused = errors
+        .iter()
+        .map(|(index, error)| (*index, error.failure_class()))
+        .collect();
+    Ok((
+        DynamicMaterialFingerprint {
+            material: MaterialSetFingerprint { entries },
+            refused,
+        },
+        errors,
+    ))
+}
+
 async fn run_dynamic_material_set_reload_loop(
     config: DynamicMaterialSetReloadConfig,
     mut shutdown_rx: Option<watch::Receiver<bool>>,
     mut force_rx: mpsc::Receiver<()>,
     force_tx: mpsc::Sender<()>,
+    isolate_tenant_files: bool,
 ) {
     let DynamicMaterialSetReloadConfig {
         surface,
@@ -1167,7 +1237,7 @@ async fn run_dynamic_material_set_reload_loop(
     } = config;
     let rebuild: SharedMaterialSetRebuildFn = Arc::from(rebuild);
 
-    let mut last_fingerprint: Option<MaterialSetFingerprint> = None;
+    let mut last_fingerprint: Option<DynamicMaterialFingerprint> = None;
     let mut load_failures = LoadFailureTransitionTracker::default();
     let mut last_source_signature: Option<Vec<(MaterialKind, String)>> = None;
     let mut k8s_targets = Vec::new();
@@ -1212,21 +1282,33 @@ async fn run_dynamic_material_set_reload_loop(
             continue;
         }
 
-        let next_fingerprint = match material_set_fingerprint_async_with(
+        let (next_fingerprint, confined_errors) = match dynamic_material_fingerprint(
             &sources,
             max_material_bytes,
+            isolate_tenant_files,
         )
         .await
         {
-            Ok(fingerprint) => {
+            Ok((fingerprint, errors)) => {
                 if load_failures.observe_recovery() {
-                    crate::tls::events::record_load_recovery(surface, &sources);
+                    let recovered = sources
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| {
+                            !fingerprint
+                                .refused
+                                .iter()
+                                .any(|(refused_index, _)| refused_index == index)
+                        })
+                        .map(|(_, source)| source.clone())
+                        .collect::<Vec<_>>();
+                    crate::tls::events::record_load_recovery(surface, &recovered);
                     info!(
                         surface,
-                        "TLS material source watcher recovered source access"
+                        "TLS material source watcher resumed fingerprinting readable sources"
                     );
                 }
-                fingerprint
+                (fingerprint, errors)
             }
             Err(error) => {
                 record_refresh_for_sources(surface, &sources, "load_error");
@@ -1247,7 +1329,34 @@ async fn run_dynamic_material_set_reload_loop(
             }
         };
 
-        if last_fingerprint.is_none() {
+        for (index, error) in &confined_errors {
+            if last_fingerprint
+                .as_ref()
+                .is_none_or(|last| !last.refused.contains(&(*index, error.failure_class())))
+            {
+                let source = std::slice::from_ref(&sources[*index]);
+                record_refresh_for_sources(surface, source, "load_error");
+                crate::tls::events::record_load_error(surface, source, &error.event_detail());
+                warn!(surface, source_id = %sources[*index].source.redacted_source_id(), error = %error,
+                    "Tenant TLS file refused; destination remains fail-closed while unrelated source rotations continue");
+            }
+        }
+        if let Some(last) = &last_fingerprint {
+            for (index, _) in &last.refused {
+                if !next_fingerprint
+                    .refused
+                    .iter()
+                    .any(|(next_index, _)| next_index == index)
+                {
+                    crate::tls::events::record_load_recovery(
+                        surface,
+                        std::slice::from_ref(&sources[*index]),
+                    );
+                }
+            }
+        }
+
+        if last_fingerprint.is_none() && next_fingerprint.refused.is_empty() {
             last_fingerprint = Some(next_fingerprint);
             if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
                 cleanup_dynamic_reload(surface, &mut k8s_handles);
@@ -1257,7 +1366,7 @@ async fn run_dynamic_material_set_reload_loop(
         }
 
         if last_fingerprint.as_ref() == Some(&next_fingerprint) {
-            record_refresh_for_entries(surface, &next_fingerprint.entries, "unchanged");
+            record_refresh_for_entries(surface, &next_fingerprint.material.entries, "unchanged");
             if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
                 cleanup_dynamic_reload(surface, &mut k8s_handles);
                 return;
@@ -1267,8 +1376,8 @@ async fn run_dynamic_material_set_reload_loop(
 
         match run_material_set_rebuild(&rebuild).await {
             Ok(()) => {
-                let event_entries = next_fingerprint.entries.clone();
-                record_refresh_for_entries(surface, &next_fingerprint.entries, "rotated");
+                let event_entries = next_fingerprint.material.entries.clone();
+                record_refresh_for_entries(surface, &next_fingerprint.material.entries, "rotated");
                 last_fingerprint = Some(next_fingerprint);
                 revision_tx.send_modify(|r| *r = r.saturating_add(1));
                 let revision = *revision_tx.borrow();
@@ -1280,10 +1389,14 @@ async fn run_dynamic_material_set_reload_loop(
                 );
             }
             Err(error) => {
-                record_refresh_for_entries(surface, &next_fingerprint.entries, "rebuild_error");
+                record_refresh_for_entries(
+                    surface,
+                    &next_fingerprint.material.entries,
+                    "rebuild_error",
+                );
                 crate::tls::events::record_rebuild_error(
                     surface,
-                    &next_fingerprint.entries,
+                    &next_fingerprint.material.entries,
                     &error,
                 );
                 last_fingerprint = Some(next_fingerprint);

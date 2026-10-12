@@ -40,8 +40,12 @@ fn operator_token(namespaces: &[&str]) -> String {
 }
 
 fn token(role: &str, namespaces: &[&str]) -> String {
+    token_with_claim(role, Some(namespaces))
+}
+
+fn token_with_claim(role: &str, namespaces: Option<&[&str]>) -> String {
     let now = Utc::now();
-    let claims = json!({
+    let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": format!("tenant-a-{role}"),
         "role": role,
@@ -51,6 +55,9 @@ fn token(role: &str, namespaces: &[&str]) -> String {
         "exp": (now + chrono::Duration::seconds(600)).timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
+    if namespaces.is_none() {
+        claims.as_object_mut().unwrap().remove("ns");
+    }
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
@@ -264,6 +271,139 @@ fn is_scope_refusal(response: &Value) -> bool {
         || error.contains("gateway filesystem")
 }
 
+fn route_plugin_with_tls(id: &str, tls: Value) -> Value {
+    json!({
+        "id": id, "plugin_name": "mesh_route_dispatch", "scope": "proxy",
+        "proxy_id": "p-partner", "enabled": true,
+        "config": {"rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8443, "backend_tls": tls}
+        }]}
+    })
+}
+
+#[tokio::test]
+async fn namespace_claim_confines_route_plugin_tls_on_create_and_put() {
+    let temp = TempDir::new().unwrap();
+    for require in [false, true] {
+        let db = sqlite_store(&temp, &format!("plugin-scope-{require}.db")).await;
+        let mut state = tenant_control_plane_state(db);
+        state.admin_require_namespace_claim = require;
+        let (base, _shutdown) = start_admin(state).await;
+        let operator = operator_token(&["tenant-a"]);
+        let (status, response) = post(
+            &base,
+            "/proxies",
+            &operator,
+            &proxy_with("backend_tls_server_ca_cert_path", "system://"),
+        )
+        .await;
+        assert!((200..300).contains(&status), "{response}");
+        let own = json!({
+            "client_cert_path": "k8s://tenant-a/material#tls.crt",
+            "client_key_path": "k8s://tenant-a/material#tls.key",
+            "server_ca_cert_path": "system://"
+        });
+        for field in ["client_cert_path", "client_key_path", "server_ca_cert_path"] {
+            for value in [
+                "k8s://tenant-b/material",
+                "vault://secret/tenant-b",
+                "managed://material/foreign",
+                "/absent/platform/material.pem",
+            ] {
+                let id = format!("route-{field}");
+                let mut foreign = own.clone();
+                foreign[field] = json!(value);
+                let forbidden = route_plugin_with_tls(&id, foreign);
+                let (status, response) =
+                    post(&base, "/plugins/config", &operator, &forbidden).await;
+                assert_eq!(status, 400, "{require} {field}: {response}");
+                assert!(is_scope_refusal(&response), "{response}");
+                assert!(!response.to_string().contains(value), "{response}");
+                let (status, response) = post(
+                    &base,
+                    "/plugins/config",
+                    &operator,
+                    &route_plugin_with_tls(&id, own.clone()),
+                )
+                .await;
+                assert!(
+                    (200..300).contains(&status),
+                    "own references must pass without provider resolution: {response}"
+                );
+                let (status, response) = put(
+                    &base,
+                    &format!("/plugins/config/{id}"),
+                    &operator,
+                    &forbidden,
+                )
+                .await;
+                assert_eq!(status, 400, "{require} {field}: {response}");
+                assert!(is_scope_refusal(&response), "{response}");
+                let response = reqwest::Client::new()
+                    .delete(format!("{base}/plugins/config/{id}"))
+                    .bearer_auth(&operator)
+                    .header("X-Ferrum-Namespace", "tenant-a")
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+            }
+        }
+        let stored = route_plugin_with_tls(
+            "admin-route",
+            json!({"server_ca_cert_path": "/admin/ca.pem"}),
+        );
+        let (status, response) = post(
+            &base,
+            "/plugins/config",
+            &token("admin", &["tenant-a"]),
+            &stored,
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "admin material exemption: {response}"
+        );
+        let mut unrelated = stored.clone();
+        unrelated["config"]["rules"][0]["match"] = json!({"methods": ["POST"]});
+        let (status, response) =
+            put(&base, "/plugins/config/admin-route", &operator, &unrelated).await;
+        assert!(
+            (200..300).contains(&status),
+            "exact stored field exemption: {response}"
+        );
+        let additional = unrelated["config"]["rules"][0].clone();
+        unrelated["config"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(additional);
+        let (status, response) =
+            put(&base, "/plugins/config/admin-route", &operator, &unrelated).await;
+        assert_eq!(
+            status, 400,
+            "a new rule must not inherit the stored exemption: {response}"
+        );
+        assert!(is_scope_refusal(&response), "{response}");
+        if !require {
+            let (status, response) = post(
+                &base,
+                "/plugins/config",
+                &token_with_claim("operator", None),
+                &route_plugin_with_tls(
+                    "claimless-route",
+                    json!({"server_ca_cert_path": "/admin/ca.pem"}),
+                ),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&status),
+                "claimless global authority: {response}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn namespace_scoped_operator_keeps_material_it_may_reference() {
     let temp_dir = TempDir::new().unwrap();
@@ -292,7 +432,7 @@ async fn namespace_scoped_operator_keeps_material_it_may_reference() {
 }
 
 #[tokio::test]
-async fn admin_tokens_and_unenforced_planes_are_unaffected() {
+async fn admin_tokens_and_claimless_unenforced_planes_are_unaffected() {
     let temp_dir = TempDir::new().unwrap();
     let ca_file = write_ca(&temp_dir, "platform-ca.pem");
 
@@ -323,8 +463,7 @@ async fn admin_tokens_and_unenforced_planes_are_unaffected() {
         "an admin token is not namespace-scoped for TLS material: {status} {response}"
     );
 
-    // Without `ns`-claim enforcement the namespace header is only a routing
-    // selector, so the scope check does not apply.
+    // A claimless token on a plane that does not require claims remains global.
     let db = sqlite_store(&temp_dir, "tenant_tls_reference_unenforced.db").await;
     let mut state = tenant_control_plane_state(db);
     state.admin_require_namespace_claim = false;
@@ -332,7 +471,7 @@ async fn admin_tokens_and_unenforced_planes_are_unaffected() {
     let (status, response) = post(
         &base,
         "/upstreams",
-        &operator_token(&["tenant-a"]),
+        &token_with_claim("operator", None),
         &named_upstream("u-unenforced", &ca_file),
     )
     .await;
@@ -386,4 +525,87 @@ async fn an_update_may_keep_a_stored_value_but_not_introduce_a_new_one() {
         "a new gateway file must be refused: {response}"
     );
     assert!(is_scope_refusal(&response), "{response}");
+}
+
+#[tokio::test]
+async fn present_namespace_claim_confines_tls_when_claim_requirement_is_off() {
+    let temp = TempDir::new().unwrap();
+    for require in [false, true] {
+        let db = sqlite_store(&temp, &format!("scope-{require}.db")).await;
+        let mut state = tenant_control_plane_state(db);
+        state.admin_require_namespace_claim = require;
+        let (base, _shutdown) = start_admin(state).await;
+        let operator = operator_token(&["tenant-a"]);
+        for field in [
+            "backend_tls_client_cert_path",
+            "backend_tls_client_key_path",
+            "backend_tls_server_ca_cert_path",
+        ] {
+            for value in [
+                "k8s://tenant-b/material",
+                "vault://secret/data/tenant-b",
+                "managed://certificates/platform",
+                "/absent/platform/material.pem",
+            ] {
+                for (route, mut body) in [
+                    ("/proxies", proxy_with(field, value)),
+                    ("/upstreams", upstream_with(field, value)),
+                ] {
+                    let (status, response) = post(&base, route, &operator, &body).await;
+                    assert_eq!(status, 400, "{require} {route} {field}: {response}");
+                    assert!(is_scope_refusal(&response), "{response}");
+                    assert!(!response.to_string().contains(value), "{response}");
+                    // Create a legitimate resource, then verify PUT uses the same boundary.
+                    body.as_object_mut().unwrap().remove(field);
+                    body["backend_tls_server_ca_cert_path"] = json!("system://");
+                    let (status, response) = post(&base, route, &operator, &body).await;
+                    assert!((200..300).contains(&status), "{response}");
+                    body[field] = json!(value);
+                    let id = body["id"].as_str().unwrap();
+                    let (status, response) =
+                        put(&base, &format!("{route}/{id}"), &operator, &body).await;
+                    assert_eq!(status, 400, "{require} {route} {field}: {response}");
+                    assert!(is_scope_refusal(&response), "{response}");
+                    // Remove it so the next matrix row can reuse the same id.
+                    let response = reqwest::Client::new()
+                        .delete(format!("{base}{route}/{id}"))
+                        .bearer_auth(&operator)
+                        .header("X-Ferrum-Namespace", "tenant-a")
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(response.status().is_success());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn claimed_operator_keeps_admin_material_with_requirement_off_but_cannot_replace_it() {
+    let temp = TempDir::new().unwrap();
+    let stored = write_ca(&temp, "stored.pem");
+    let other = write_ca(&temp, "other.pem");
+    let db = sqlite_store(&temp, "stored-optional-claim.db").await;
+    let mut state = tenant_control_plane_state(db);
+    state.admin_require_namespace_claim = false;
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("admin", &["tenant-a"]);
+    let operator = operator_token(&["tenant-a"]);
+    for (route, make) in [
+        ("/proxies", proxy_with as fn(&str, &str) -> Value),
+        ("/upstreams", upstream_with as fn(&str, &str) -> Value),
+    ] {
+        let mut body = make("backend_tls_server_ca_cert_path", &stored);
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, response) = post(&base, route, &admin, &body).await;
+        assert!((200..300).contains(&status), "{response}");
+        body["name"] = json!("unrelated change");
+        let (status, response) = put(&base, &format!("{route}/{id}"), &operator, &body).await;
+        assert!((200..300).contains(&status), "{response}");
+        body["backend_tls_server_ca_cert_path"] = json!(&other);
+        let (status, response) = put(&base, &format!("{route}/{id}"), &operator, &body).await;
+        assert_eq!(status, 400, "{response}");
+        assert!(is_scope_refusal(&response), "{response}");
+    }
 }

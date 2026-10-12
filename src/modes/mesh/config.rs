@@ -8310,28 +8310,65 @@ pub(crate) fn destination_rule_tls_reference_error(
     }
 }
 
-/// Load-time re-check of a tenant DestinationRule's local TLS files on the
-/// node that reads them: each file must still resolve, after symlinks, under
-/// one of `tenant_file_roots` (`FERRUM_MESH_TENANT_TLS_FILE_ROOTS`). A file
-/// that is missing or cannot be resolved is refused too. Root-namespace rules
-/// are exempt. Returns the first refusal as a schema path plus a fixed reason;
-/// the referenced value is never echoed.
-pub(crate) fn destination_rule_tls_file_escape_error(
-    dr: &MeshDestinationRule,
+/// Re-check and bind each tenant file reference before runtime projection.
+/// The original slice remains reference-only and unchanged; the runtime copy
+/// carries confinement through every subsequent load, cache, and file watch.
+/// Root-namespace rules retain their intentionally unrestricted references.
+pub(crate) fn bind_destination_rule_tls_files<'a>(
+    dr: &'a MeshDestinationRule,
     root_namespace: &str,
     tenant_file_roots: &[std::path::PathBuf],
-) -> Option<String> {
-    use crate::tls::source::check_tenant_file_reference_resolved;
+) -> Result<std::borrow::Cow<'a, MeshDestinationRule>, String> {
+    use crate::tls::source::{bind_tenant_file_reference, check_tenant_file_reference_resolved};
     if destination_rule_is_root_policy(&dr.namespace, root_namespace) {
-        return None;
+        return Ok(std::borrow::Cow::Borrowed(dr));
     }
     for (field, value, kind) in destination_rule_tls_references(dr) {
         let verdict = check_tenant_file_reference_resolved(value, kind, tenant_file_roots);
         if let Err(refusal) = verdict {
-            return Some(format!("{field}: {}", refusal.reason()));
+            return Err(format!("{field}: {}", refusal.reason()));
         }
     }
-    None
+    let mut bound = dr.clone();
+    let mut policies = Vec::new();
+    policies.extend(bound.traffic_policy.iter_mut());
+    policies.extend(bound.port_level_settings.values_mut());
+    policies.extend(
+        bound
+            .subsets
+            .iter_mut()
+            .filter_map(|subset| subset.traffic_policy.as_mut()),
+    );
+    for policy in policies {
+        let Some(tls) = policy.tls.as_mut() else {
+            continue;
+        };
+        for (field, value, kind) in [
+            (
+                "ca_certificates",
+                &mut tls.ca_certificates,
+                crate::tls::source::MaterialKind::CaBundle,
+            ),
+            (
+                "client_certificate",
+                &mut tls.client_certificate,
+                crate::tls::source::MaterialKind::Cert,
+            ),
+            (
+                "private_key",
+                &mut tls.private_key,
+                crate::tls::source::MaterialKind::Key,
+            ),
+        ] {
+            if let Some(original) = value.as_deref()
+                && let Some(reference) = bind_tenant_file_reference(original, kind)
+                    .map_err(|error| format!("{field}: {}", error.event_detail()))?
+            {
+                *value = Some(reference);
+            }
+        }
+    }
+    Ok(std::borrow::Cow::Owned(bound))
 }
 
 fn destination_rule_is_root_policy(rule_namespace: &str, root_namespace: &str) -> bool {

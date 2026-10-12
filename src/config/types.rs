@@ -6300,6 +6300,14 @@ pub(crate) fn validate_tls_material_source_field(
         validate_pkcs11_key_source(field_name, uri)?;
     }
     validate_tls_source_field_kind(field_name, value, kind)?;
+    if let Some(path) = crate::tls::source::tenant_file_reference_path(value)
+        .map_err(|error| format!("{field_name}: {error}"))?
+    {
+        // The runtime constraint encodes the original path and options; it
+        // must not shrink the existing admission limit for Unicode/reserved bytes.
+        validate_string_field(field_name, value, MAX_FILE_PATH_LENGTH * 3 + 256)?;
+        return validate_string_field(field_name, &path.to_string_lossy(), MAX_FILE_PATH_LENGTH);
+    }
     match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)

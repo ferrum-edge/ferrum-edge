@@ -2583,7 +2583,7 @@ pub(crate) trait AdminResource:
 
     /// TLS material references this resource asks the gateway to resolve, as
     /// `(field, value, field kind)`. Default: none.
-    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
         Vec::new()
     }
 
@@ -3808,7 +3808,7 @@ impl AdminResource for Upstream {
         Some(&mut self.labels)
     }
 
-    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
         backend_tls_material_references(
             self.backend_tls_client_cert_path.as_deref(),
             self.backend_tls_client_key_path.as_deref(),
@@ -4249,6 +4249,41 @@ pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
 
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
+    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
+        if self.plugin_name != "mesh_route_dispatch" {
+            return Vec::new();
+        }
+        let Some(rules) = self.config.get("rules").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut references = Vec::new();
+        for (index, rule) in rules.iter().enumerate() {
+            let Some(tls) = rule
+                .get("destination")
+                .and_then(|destination| destination.get("backend_tls"))
+            else {
+                continue;
+            };
+            for (field, kind) in [
+                ("client_cert_path", MaterialKind::Cert),
+                ("client_key_path", MaterialKind::Key),
+                ("server_ca_cert_path", MaterialKind::CaBundle),
+            ] {
+                if let Some(value) = tls.get(field).and_then(Value::as_str) {
+                    // Preserve the exact field identity for the existing-value
+                    // exemption: moving an admin's reference to another rule
+                    // is a new material use, not an unrelated update.
+                    references.push((
+                        format!("config.rules[{index}].destination.backend_tls.{field}"),
+                        value,
+                        kind,
+                    ));
+                }
+            }
+        }
+        references
+    }
+
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
         Some(&mut self.labels)
     }
@@ -4787,7 +4822,7 @@ impl AdminResource for Proxy {
         Some(&mut self.labels)
     }
 
-    fn tls_material_references(&self) -> Vec<(&'static str, &str, MaterialKind)> {
+    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
         backend_tls_material_references(
             self.backend_tls_client_cert_path.as_deref(),
             self.backend_tls_client_key_path.as_deref(),
@@ -5802,7 +5837,7 @@ fn backend_tls_material_references<'a>(
     client_cert_path: Option<&'a str>,
     client_key_path: Option<&'a str>,
     server_ca_path: Option<&'a str>,
-) -> Vec<(&'static str, &'a str, MaterialKind)> {
+) -> Vec<(String, &'a str, MaterialKind)> {
     let candidates = [
         (
             "backend_tls_client_cert_path",
@@ -5823,7 +5858,7 @@ fn backend_tls_material_references<'a>(
     let mut references = Vec::new();
     for (field, value, kind) in candidates {
         if let Some(value) = value {
-            references.push((field, value, kind));
+            references.push((field.to_string(), value, kind));
         }
     }
     references
@@ -5847,16 +5882,21 @@ fn tls_reference_refusal<R: AdminResource>(
     resource: &R,
     existing: Option<&R>,
 ) -> Option<Response<Full<Bytes>>> {
-    if !state.admin_require_namespace_claim || actor.role == AdminRole::Admin {
+    if actor.role == AdminRole::Admin
+        || !(state.admin_require_namespace_claim || actor.allowed_namespaces.is_present())
+    {
         return None;
     }
-    let stored = existing
+    let stored: HashSet<_> = existing
         .map(|existing| existing.tls_material_references())
-        .unwrap_or_default();
-    for (field, value, kind) in resource.tls_material_references() {
-        if stored.contains(&(field, value, kind)) {
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    for reference in resource.tls_material_references() {
+        if stored.contains(&reference) {
             continue;
         }
+        let (field, value, kind) = reference;
         let verdict = check_namespace_scoped_material_reference(value, kind, namespace, &[]);
         if let Err(refusal) = verdict {
             return Some(super::json_response(

@@ -104,6 +104,59 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    pub fn spawn_backend_material_reload_for_test(
+        config: crate::tls::source::subscription::DynamicMaterialSetReloadConfig,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> tokio::task::JoinHandle<()> {
+        crate::tls::source::subscription::spawn_backend_material_set_reload_task(config, shutdown)
+    }
+
+    pub fn validate_tls_material_source_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+    ) -> Result<(), String> {
+        crate::config::types::validate_tls_material_source_field("test-source", value, kind)
+    }
+
+    pub fn bind_tenant_tls_file_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+    ) -> Result<Option<String>, crate::tls::source::MaterialError> {
+        crate::tls::source::bind_tenant_file_reference(value, kind)
+    }
+
+    pub fn load_tenant_tls_file_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+        roots: &[std::path::PathBuf],
+        max_bytes: usize,
+    ) -> Result<crate::tls::source::MaterializedMaterial, crate::tls::source::MaterialError> {
+        crate::tls::source::load_material_blocking_with_tenant_roots(
+            &crate::tls::source::CertSource::parse(value, kind),
+            kind,
+            max_bytes,
+            Some(roots),
+        )
+    }
+
+    pub fn open_resolved_tenant_tls_file_for_test(
+        root: &std::path::Path,
+        resolved: &std::path::Path,
+    ) -> std::io::Result<std::fs::File> {
+        crate::tls::source::open_resolved_tenant_file(root, resolved)
+    }
+
+    pub fn apply_destination_rules_with_tenant_roots_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        runtime: &crate::modes::mesh::MeshRuntimeConfig,
+        slice: &crate::modes::mesh::slice::MeshSlice,
+        roots: &[std::path::PathBuf],
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::mesh::apply_destination_rules_with_tenant_file_roots(
+            config, runtime, slice, roots,
+        )
+    }
+
     /// The origin-form request target the direct HTTP/1.1 pool sends for an
     /// absolute backend URL (issue #5588), for parity checks against the `url`
     /// serialization reqwest used.
@@ -12049,6 +12102,36 @@ pub mod _test_support {
             url,
             headers,
             body,
+            crate::http3::client::H3Authorization::new(None, None),
+            || tls_config,
+        )
+        .await
+    }
+
+    /// Open the production native-H3 backend's independently driven halves.
+    /// The fixture owns protocol/authorization bounds for this unbounded call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn h3_pool_open_bidi_with_target_for_test<F>(
+        pool: &crate::http3::client::Http3ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        (host, port, policy_port): (&str, u16, u16),
+        method: &str,
+        url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        tls_config: F,
+    ) -> crate::http3::client::H3PoolResult<crate::http3::client::H3BidiBackendStream>
+    where
+        F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        pool.open_bidi_backend_stream_with_target(
+            proxy,
+            host,
+            port,
+            policy_port,
+            method,
+            url,
+            headers,
+            None,
             crate::http3::client::H3Authorization::new(None, None),
             || tls_config,
         )

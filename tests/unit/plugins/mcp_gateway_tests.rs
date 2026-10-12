@@ -16806,3 +16806,165 @@ async fn aggregate_upstream_calls_carry_the_proxy_hop_count() {
         }
     }
 }
+
+/// A transport failure before response headers at each real MCP caller. Successful
+/// earlier stages use the same secret-bearing path, so notification/discovery/
+/// deletion coverage cannot accidentally stop at the initialize failure.
+async fn mcp_transport_failure_server(
+    fail_method: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let (header_end, content_length) = loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break (0, 0);
+                }
+                data.extend_from_slice(&buffer[..count]);
+                if let Some(end) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+                assert!(data.len() < 32768);
+            };
+            if header_end == 0 {
+                continue;
+            }
+            while data.len() < header_end + content_length {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&buffer[..count]);
+            }
+            let delete = data.starts_with(b"DELETE ");
+            let body: Value = if delete {
+                json!({})
+            } else {
+                serde_json::from_slice(&data[header_end..header_end + content_length]).unwrap()
+            };
+            let method = if delete {
+                "DELETE"
+            } else {
+                body["method"].as_str().unwrap()
+            };
+            if method == fail_method {
+                socket.shutdown().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                    "serverInfo": {"name": "redaction-control", "version": "1"}
+                }),
+                "tools/list" => json!({"tools": []}),
+                "resources/list" => json!({"resources": []}),
+                "resources/templates/list" => json!({"resourceTemplates": []}),
+                "prompts/list" => json!({"prompts": []}),
+                _ => json!({}),
+            };
+            let payload = json!({"jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null), "result": result}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: upstream-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    (origin, task)
+}
+
+#[tokio::test]
+async fn mcp_transport_errors_withhold_path_credentials_at_all_four_sinks() {
+    use tracing::instrument::WithSubscriber;
+    super::plugin_utils::install_interest_floor();
+    for failed_method in [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "DELETE",
+    ] {
+        let (origin, server) = mcp_transport_failure_server(failed_method).await;
+        let token = "MCP_HOSTED_PATH_CREDENTIAL_6a31";
+        let upstream = format!("{origin}/hosted/{token}/mcp");
+        let plugin = create_plugin("mcp_gateway", &aggregate_config(&upstream))
+            .unwrap()
+            .unwrap();
+        let session = initialize(&plugin).await;
+        let logs = super::plugin_utils::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let details = async {
+            let (mut ctx, mut headers) =
+                mcp_ctx(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
+            headers.insert("mcp-session-id".to_string(), session.clone());
+            let (_, response, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+            assert!(
+                ctx.plugin_http_call_ns.load(Ordering::Relaxed) > 0,
+                "tracked timing survives"
+            );
+            if failed_method == "DELETE" {
+                assert!(
+                    response.get("result").is_some(),
+                    "earlier stages must succeed: {response}"
+                );
+                let mut ctx = create_test_context();
+                ctx.method = "DELETE".to_string();
+                ctx.path = "/mcp".to_string();
+                let mut headers = HashMap::from([("mcp-session-id".to_string(), session)]);
+                let (_, response, _) =
+                    reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+                assert!(ctx.plugin_http_call_ns.load(Ordering::Relaxed) > 0);
+                response.to_string()
+            } else {
+                assert!(
+                    response.get("error").is_some(),
+                    "failure must reach caller: {response}"
+                );
+                response.to_string()
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        server.abort();
+        let logs = logs.contents();
+        let expected = match failed_method {
+            "initialize" => "MCP upstream initialize request failed",
+            "notifications/initialized" => "MCP upstream initialized notification failed",
+            "tools/list" => "MCP upstream request failed",
+            _ => "MCP upstream session delete failed",
+        };
+        assert!(
+            logs.contains(expected),
+            "the intended sink must run: {logs}"
+        );
+        assert!(
+            logs.contains(&format!("{origin}/redacted")),
+            "retain safe origin: {logs}"
+        );
+        for output in [&logs, &details] {
+            assert!(
+                !output.contains(token) && !output.contains(&upstream),
+                "{failed_method}: {output}"
+            );
+        }
+    }
+}

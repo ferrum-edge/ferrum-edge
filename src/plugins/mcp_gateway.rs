@@ -27,7 +27,7 @@ use url::Url;
 
 use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer};
 use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
-use crate::plugins::utils::mcp_jsonrpc;
+use crate::plugins::utils::{mcp_jsonrpc, redacted_endpoint_url_str};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
@@ -2768,7 +2768,12 @@ impl McpGateway {
         let request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
-            .execute_tracked(request, "mcp_gateway.initialize", &ctx.plugin_http_call_ns)
+            .execute_redacted_tracked(
+                request,
+                "mcp_gateway.initialize",
+                &redacted_endpoint_url_str(upstream_url),
+                &ctx.plugin_http_call_ns,
+            )
             .await
             .map_err(|error| {
                 warn!(
@@ -2898,9 +2903,10 @@ impl McpGateway {
         request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
-            .execute_tracked(
+            .execute_redacted_tracked(
                 request.json(&body),
                 "mcp_gateway.initialized_notification",
+                &redacted_endpoint_url_str(upstream_url),
                 &ctx.plugin_http_call_ns,
             )
             .await
@@ -3011,9 +3017,10 @@ impl McpGateway {
             let request = stamp_upstream_proxy_hops(request, ctx);
             match self
                 .http_client
-                .execute_tracked(
+                .execute_redacted_tracked(
                     request,
                     "mcp_gateway.session_delete",
+                    &redacted_endpoint_url_str(upstream_url),
                     &ctx.plugin_http_call_ns,
                 )
                 .await
@@ -3569,9 +3576,10 @@ impl McpGateway {
         request = stamp_upstream_proxy_hops(request, ctx);
         let response = self
             .http_client
-            .execute_tracked(
+            .execute_redacted_tracked(
                 request.json(&body),
                 "mcp_gateway.discovery",
+                &redacted_endpoint_url_str(upstream_url),
                 &ctx.plugin_http_call_ns,
             )
             .await

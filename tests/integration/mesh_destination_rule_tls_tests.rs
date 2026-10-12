@@ -8,6 +8,8 @@
 //! to drive the default when unset. These tests pin both halves of that
 //! contract.
 
+use std::collections::HashMap;
+
 use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::{
     GatewayConfig, MAX_TARGET_WEIGHT, Proxy, Upstream, UpstreamTarget,
@@ -1032,5 +1034,172 @@ fn dr_subset_istio_mutual_without_runtime_svid_fails_closed() {
     assert!(
         err_str.contains("v1") && err_str.contains("reviews-u"),
         "error should identify the offending subset and upstream, got: {err_str}"
+    );
+}
+
+#[test]
+fn tenant_file_confinement_survives_every_runtime_tls_projection_without_inline_secrets() {
+    use ferrum_edge::_test_support::{
+        apply_destination_rules_with_tenant_roots_for_test as apply,
+        bind_tenant_tls_file_for_test as bind,
+    };
+    use ferrum_edge::modes::mesh::config::{MeshDestinationRule, MeshSubset};
+    use ferrum_edge::tls::source::MaterialKind;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("tenant-key.pem");
+    let secret = "PRIVATE_MATERIAL_MUST_NOT_APPEAR_IN_CONFIG";
+    std::fs::write(&path, secret).unwrap();
+    let value = path.to_str().unwrap().to_string();
+    let policy = MeshTrafficPolicy {
+        tls: Some(MeshTrafficPolicyTls {
+            mode: MtlsMode::Mutual,
+            ca_certificates: Some(value.clone()),
+            client_certificate: Some(value.clone()),
+            private_key: Some(value.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let rule = MeshDestinationRule {
+        name: "tenant-material".to_string(),
+        namespace: "default".to_string(),
+        host: "reviews.default.svc.cluster.local".to_string(),
+        traffic_policy: Some(policy.clone()),
+        port_level_settings: HashMap::from([(8080, policy.clone())]),
+        subsets: vec![MeshSubset {
+            name: "v1".to_string(),
+            labels: HashMap::new(),
+            traffic_policy: Some(policy),
+        }],
+        export_to: vec!["*".to_string()],
+    };
+    let slice = MeshSlice {
+        namespace: "default".to_string(),
+        istio_root_namespace: "istio-system".to_string(),
+        destination_rules: vec![rule],
+        ..Default::default()
+    };
+    let before = serde_json::to_value(&slice).unwrap();
+    let mut config = GatewayConfig {
+        upstreams: vec![build_matching_upstream(
+            "reviews-u",
+            "reviews.default.svc.cluster.local",
+        )],
+        ..Default::default()
+    };
+    apply(
+        &mut config,
+        &test_runtime(),
+        &slice,
+        &[root.path().to_path_buf()],
+    )
+    .unwrap();
+    let upstream = &config.upstreams[0];
+    let bound = bind(&value, MaterialKind::Cert).unwrap().unwrap();
+    assert_eq!(
+        upstream.backend_tls_client_cert_path.as_deref(),
+        Some(bound.as_str())
+    );
+    assert_eq!(
+        upstream.backend_tls_client_key_path.as_deref(),
+        Some(bound.as_str())
+    );
+    assert_eq!(
+        upstream.backend_tls_server_ca_cert_path.as_deref(),
+        Some(bound.as_str())
+    );
+    for tls in [
+        upstream.port_overrides[&8080].tls.as_ref().unwrap(),
+        upstream.resolved_subset_tls["v1"].tls.as_ref().unwrap(),
+    ] {
+        assert_eq!(tls.client_cert_path.as_deref(), Some(bound.as_str()));
+        assert_eq!(tls.client_key_path.as_deref(), Some(bound.as_str()));
+        assert_eq!(tls.server_ca_cert_path.as_deref(), Some(bound.as_str()));
+    }
+    assert_eq!(
+        serde_json::to_value(&slice).unwrap(),
+        before,
+        "original slice is unchanged"
+    );
+    assert!(!serde_json::to_string(&config).unwrap().contains(secret));
+    assert!(!format!("{config:?}").contains(secret));
+    // Kind/poll options survive conversion independently of material field.
+    let configured = format!("file://{value}?poll=7&kind=cert");
+    assert!(
+        bind(&configured, MaterialKind::Cert)
+            .unwrap()
+            .unwrap()
+            .contains("poll=7")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_root_rules_keep_unconfined_paths_even_when_tenant_rules_use_the_same_path() {
+    use ferrum_edge::_test_support::{
+        apply_destination_rules_with_tenant_roots_for_test as apply,
+        bind_tenant_tls_file_for_test as bind,
+    };
+    use ferrum_edge::modes::mesh::config::MeshDestinationRule;
+    use ferrum_edge::tls::source::MaterialKind;
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("ca.pem");
+    std::fs::write(&file, "material").unwrap();
+    let value = file.to_str().unwrap();
+    let make = |namespace: &str| MeshDestinationRule {
+        name: "material".to_string(),
+        namespace: namespace.to_string(),
+        host: "reviews.default.svc.cluster.local".to_string(),
+        traffic_policy: Some(MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Simple,
+                ca_certificates: Some(value.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        port_level_settings: HashMap::new(),
+        subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
+    };
+    let mut config = GatewayConfig {
+        upstreams: vec![build_matching_upstream(
+            "reviews-u",
+            "reviews.default.svc.cluster.local",
+        )],
+        ..Default::default()
+    };
+    let mut slice = MeshSlice {
+        namespace: "default".to_string(),
+        istio_root_namespace: "istio-system".to_string(),
+        destination_rules: vec![make("default")],
+        ..Default::default()
+    };
+    apply(
+        &mut config,
+        &test_runtime(),
+        &slice,
+        &[root.path().to_path_buf()],
+    )
+    .unwrap();
+    let tenant = config.upstreams[0]
+        .backend_tls_server_ca_cert_path
+        .clone()
+        .unwrap();
+    assert_eq!(
+        tenant,
+        bind(value, MaterialKind::CaBundle).unwrap().unwrap()
+    );
+    slice.destination_rules = vec![make("istio-system")];
+    apply(&mut config, &test_runtime(), &slice, &[]).unwrap();
+    assert_eq!(
+        config.upstreams[0]
+            .backend_tls_server_ca_cert_path
+            .as_deref(),
+        Some(value)
+    );
+    assert_ne!(
+        tenant, value,
+        "a same-path authority transition changes cache/source identity"
     );
 }
