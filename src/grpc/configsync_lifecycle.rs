@@ -727,14 +727,14 @@ pub fn evaluate_delta_authority(
 /// Coverage is proven by publication ORDER, never by committed timestamps: a
 /// CP wall clock can step backwards, so a newer publication may carry an
 /// older stamp. The cursor counts broadcast-channel positions relative to the
-/// stream's subscription. Before loading a snapshot, the stream records how
-/// many publications are already queued; those positions were sent before
-/// the load. Every CP publisher commits its config to the shared `ArcSwap`
-/// before broadcasting it, under one publication gate, so a publication sent
-/// before the load is contained in the loaded snapshot. Only those positions
-/// are dropped. A publication sent after the queued count was taken is always
-/// forwarded, even when its content may already be in the snapshot; the DP
-/// fence remains the safety net. The DP fence is unchanged.
+/// stream's subscription. The stream reads how many publications are queued
+/// and loads the snapshot together, inside the CP publication gate that every
+/// publisher holds across committing its config to the shared `ArcSwap` and
+/// broadcasting it. No publication is half-done while the gate is held, so
+/// the queued positions are exactly the publications the snapshot contains,
+/// and every later position was committed after the load. Only the queued
+/// positions are dropped; every later one is forwarded. The DP fence is
+/// unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriberSnapshotCursor {
     next_position: u64,
@@ -743,8 +743,8 @@ pub struct SubscriberSnapshotCursor {
 
 impl SubscriberSnapshotCursor {
     /// Seed the cursor for a receiver subscribed at position 0. `queued` is
-    /// the receiver's queued count taken BEFORE the initial snapshot was
-    /// loaded.
+    /// the receiver's queued count read together with the initial snapshot
+    /// load under the publication gate.
     pub fn new(queued: u64) -> Self {
         Self {
             next_position: 0,
@@ -767,8 +767,8 @@ impl SubscriberSnapshotCursor {
     }
 
     /// Record a lag-recovery FULL_SNAPSHOT. `queued` is the receiver's
-    /// queued count taken BEFORE that snapshot was loaded. Monotonic: never
-    /// lowers coverage.
+    /// queued count read together with that snapshot's load under the
+    /// publication gate. Monotonic: never lowers coverage.
     pub fn record_snapshot(&mut self, queued: u64) {
         self.covered_until = self
             .covered_until

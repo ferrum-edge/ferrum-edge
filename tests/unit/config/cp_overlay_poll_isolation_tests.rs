@@ -15,9 +15,9 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    CpPublicationGate, K8sOverlaySlot, cas_publish_db_snapshot_with_k8s_overlay_for_test,
-    cas_publish_incremental_partitions_for_test, compose_db_with_k8s_overlay,
-    compose_incremental_partitions_for_test, empty_k8s_overlay_slot,
+    CpPublicationGate, K8sOverlaySlot, capture_configsync_snapshot_coverage_for_test,
+    cas_publish_db_snapshot_with_k8s_overlay_for_test, cas_publish_incremental_partitions_for_test,
+    compose_db_with_k8s_overlay, compose_incremental_partitions_for_test, empty_k8s_overlay_slot,
     publish_cp_full_reload_for_test, publish_cp_incremental_for_test, publish_k8s_reconcile,
     store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
@@ -25,6 +25,10 @@ use ferrum_edge::config::db_backend::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::gateway_trust::TrustPublicationScope;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
+};
+use ferrum_edge::grpc::configsync_lifecycle::{
+    AppliedSnapshotAuthority, GatewayTrustEquivalenceState, SubscriberSnapshotCursor,
+    evaluate_delta_authority,
 };
 use ferrum_edge::grpc::cp_server::{CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
@@ -741,6 +745,93 @@ fn reconcile_full_never_erases_a_newer_committed_poll_delta() {
         apply_dp_event(&mut dp_state, event);
     }
     assert_eq!(dp_state, committed, "the DP stream must not roll back");
+}
+
+#[test]
+fn subscribe_snapshot_coverage_cannot_straddle_a_concurrent_publication() {
+    // Issue #6163 review: a Subscribe stream reads its receiver's queued count
+    // and loads the snapshot it sends. If a publisher could commit and
+    // broadcast DELTA(t2), then commit a newer t3, between those two reads,
+    // the stream would send SNAPSHOT(t3) while counting DELTA(t2) as
+    // uncovered and forward it afterwards. The DP's source-blind freshness
+    // fence refuses that delta, ends the stream, and raises divergence. The
+    // capture seam injects exactly that publisher between the two reads.
+    let base = Utc::now() - chrono::Duration::seconds(60);
+    let mut initial = GatewayConfig::default();
+    initial.proxies.push(make_proxy("db-base", "ferrum"));
+    initial.loaded_at = base;
+    let (harness, mut dp_rx) = PublicationHarness::new(initial);
+    let harness = Arc::new(harness);
+
+    let (published_tx, published_rx) = mpsc::channel::<()>();
+    let mut publisher = None;
+    let mut published_inside_window = false;
+    let (queued, snapshot) = capture_configsync_snapshot_coverage_for_test(
+        &harness.gate,
+        &dp_rx,
+        harness.config_arc.as_ref(),
+        || {
+            let harness = Arc::clone(&harness);
+            publisher = Some(thread::spawn(move || {
+                for (round, offset) in [(1_usize, 10_i64), (2, 20)] {
+                    let mut delta = empty_incremental();
+                    delta.added_or_modified_proxies =
+                        vec![make_proxy(&format!("db-delta-{round}"), "ferrum")];
+                    delta.poll_timestamp = base + chrono::Duration::seconds(offset);
+                    let partitions = HashMap::from([("ferrum".to_string(), delta)]);
+                    harness.publish_incremental(&partitions, round);
+                }
+                let _ = published_tx.send(());
+            }));
+            // Give the publisher every chance to run inside the window. It
+            // cannot: both publications need the gate this capture holds.
+            let window = Duration::from_millis(250);
+            published_inside_window = published_rx.recv_timeout(window).is_ok();
+        },
+    );
+    assert!(
+        !published_inside_window,
+        "a publication completed between the queued count and the snapshot load"
+    );
+    let publisher = publisher.expect("the seam must run");
+    publisher.join().expect("publisher thread");
+    published_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("both publications must commit once the capture releases the gate");
+
+    // The DP side: apply the snapshot, then every broadcast the cursor
+    // forwards, through the same freshness fence the DP runs.
+    let mut cursor = SubscriberSnapshotCursor::new(queued);
+    let mut authority = AppliedSnapshotAuthority {
+        version: Some(snapshot.loaded_at),
+        source_cp_url: "http://cp:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Unknown,
+    };
+    let mut dp_state = proxy_ids(&snapshot);
+    let events = drain(&mut dp_rx);
+    assert_eq!(events.len(), 2, "both deltas must be broadcast");
+    let mut forwarded = 0;
+    for event in &events {
+        if !cursor.admit_next() {
+            continue;
+        }
+        forwarded += 1;
+        assert_eq!(event.update_type, 1, "the publisher sends deltas only");
+        let delta: IncrementalResult =
+            serde_json::from_str(&event.config_json).expect("delta payload must parse");
+        assert!(
+            evaluate_delta_authority(Some(&authority), delta.poll_timestamp).is_ok(),
+            "a delta older than the snapshot the stream sent must not follow it"
+        );
+        authority.version = authority.version.max(Some(delta.poll_timestamp));
+        apply_dp_event(&mut dp_state, event);
+    }
+    assert_eq!(
+        forwarded, 2,
+        "publications committed after the snapshot load must be forwarded"
+    );
+    let committed = proxy_ids(&harness.config_arc.load_full());
+    assert_eq!(dp_state, committed, "the DP must end on the committed config");
 }
 
 #[test]

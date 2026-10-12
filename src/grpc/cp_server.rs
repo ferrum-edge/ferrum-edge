@@ -6,9 +6,10 @@
 //!   If a DP lags behind the broadcast channel (default capacity 128, configurable
 //!   via `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`), it receives a fresh
 //!   full snapshot instead of the missed deltas. Retained broadcasts that were
-//!   queued before that snapshot was loaded (by channel position, never by
-//!   timestamp) are then dropped, so the DP's stale-delta fence does not end
-//!   the stream (issue #6163).
+//!   queued when that snapshot was loaded (by channel position, captured with
+//!   the load under the CP publication gate, never by timestamp) are then
+//!   dropped, so the DP's stale-delta fence does not end the stream
+//!   (issue #6163).
 //! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
 //!
 //! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
@@ -76,6 +77,7 @@ use super::response_admission::FullConfigPermitHandle;
 use crate::FERRUM_VERSION;
 use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
+use crate::k8s_controller::CpPublicationGate;
 use crate::modes::mesh::config::{
     MeshConfig, MeshSidecar, MeshSidecarEgress, NodeWaypointAssertor, PeerAuthentication,
     PolicyScope, SidecarHostPattern, Workload, WorkloadSelector,
@@ -472,9 +474,39 @@ impl DpNodeRegistry {
 struct ConfigSyncBroadcastState {
     rx: broadcast::Receiver<ConfigUpdate>,
     snapshot_cursor: SubscriberSnapshotCursor,
+    publication_gate: CpPublicationGate,
     config: Arc<ArcSwap<GatewayConfig>>,
     namespace: String,
     scope: CpScope,
+}
+
+/// Capture what one ConfigSync snapshot covers on `rx`: the receiver's queued
+/// broadcast count and the config to snapshot, read together inside the CP
+/// publication gate (issue #6163).
+///
+/// Every production publisher commits to `config` and broadcasts inside that
+/// gate, so while it is held no publication sits between its commit and its
+/// broadcast. The queued positions are then exactly the publications the
+/// loaded config contains, and every later position was committed after the
+/// load. Read outside the gate, a publication could commit and broadcast
+/// between the two reads, and the cursor would forward a delta the snapshot
+/// already contains.
+///
+/// `between_reads` runs inside the gate after the count and before the load;
+/// production passes a no-op. It is the deterministic seam for injecting a
+/// concurrent publication. The gate is released before the caller filters
+/// and serializes the snapshot.
+pub(crate) fn capture_configsync_snapshot_coverage(
+    publication_gate: &CpPublicationGate,
+    rx: &broadcast::Receiver<ConfigUpdate>,
+    config: &ArcSwap<GatewayConfig>,
+    between_reads: impl FnOnce(),
+) -> (u64, Arc<GatewayConfig>) {
+    publication_gate.publish(|| {
+        let queued = rx.len() as u64;
+        between_reads();
+        (queued, config.load_full())
+    })
 }
 
 /// A stream wrapper that removes its own registry entry when the gRPC stream
@@ -547,6 +579,10 @@ pub struct CpGrpcServer {
     /// same value before receiving configuration, making this an enforced
     /// cluster ownership contract rather than a CP-local assumption.
     real_ip_header: Option<String>,
+    /// The gate every CP config publisher holds across commit + broadcast.
+    /// Subscribe streams take it only to capture a snapshot's broadcast
+    /// coverage (issue #6163).
+    publication_gate: CpPublicationGate,
 }
 
 impl CpGrpcServer {
@@ -573,6 +609,7 @@ impl CpGrpcServer {
             scope: CpScope::Single(default_namespace()),
             require_ns_claim: false,
             real_ip_header: None,
+            publication_gate: CpPublicationGate::new(),
         }
     }
 
@@ -1827,13 +1864,11 @@ impl CpGrpcServer {
     /// namespaces' config.
     #[allow(clippy::result_large_err)]
     fn configsync_lag_recovery_snapshot(
-        config: &ArcSwap<GatewayConfig>,
+        current: &GatewayConfig,
         namespace: &str,
         scope: &CpScope,
     ) -> Result<ConfigUpdate, Status> {
-        let current = config.load_full();
-        let publication =
-            Self::filter_config_and_trust_for_scope(current.as_ref(), namespace, scope);
+        let publication = Self::filter_config_and_trust_for_scope(current, namespace, scope);
         let (filtered, trust_bundles_json) = match publication {
             Ok(publication) => publication,
             Err(failure_class) => {
@@ -2162,6 +2197,7 @@ pub struct CpGrpcServerBuilder {
     scope: CpScope,
     require_ns_claim: bool,
     real_ip_header: Option<String>,
+    publication_gate: CpPublicationGate,
 }
 
 impl CpGrpcServerBuilder {
@@ -2211,6 +2247,14 @@ impl CpGrpcServerBuilder {
         self
     }
 
+    /// Share the gate the CP config publishers hold across commit +
+    /// broadcast. Without it the server uses a private gate, which orders
+    /// nothing against callers that publish without it (issue #6163).
+    pub fn publication_gate(mut self, publication_gate: CpPublicationGate) -> Self {
+        self.publication_gate = publication_gate;
+        self
+    }
+
     /// Finish construction. Per-namespace senders are reached through
     /// [`CpGrpcServer::broadcasts`].
     pub fn build(self) -> CpGrpcServer {
@@ -2248,6 +2292,7 @@ impl CpGrpcServerBuilder {
             scope: self.scope,
             require_ns_claim: self.require_ns_claim,
             real_ip_header: self.real_ip_header,
+            publication_gate: self.publication_gate,
         }
     }
 }
@@ -2363,14 +2408,15 @@ impl ConfigSync for CpGrpcServer {
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
         let rx = namespace_tx.subscribe();
-        // Publications already queued before the load were committed to the
-        // config `ArcSwap` before they were sent, so the snapshot contains
-        // them (issue #6163).
-        let snapshot_cursor = SubscriberSnapshotCursor::new(rx.len() as u64);
+        // The queued count and the snapshot are read together under the
+        // publication gate, so the queued positions are exactly the
+        // publications the snapshot contains (issue #6163).
+        let (queued, config) =
+            capture_configsync_snapshot_coverage(&self.publication_gate, &rx, &self.config, || {});
+        let snapshot_cursor = SubscriberSnapshotCursor::new(queued);
 
         // Send initial full config — filtered to the DP's namespace so the
         // initial snapshot matches the per-namespace broadcast stream.
-        let config = self.config.load_full();
         let (filtered, trust_bundles_json) =
             Self::filter_config_and_trust_for_scope(config.as_ref(), &dp_namespace, &self.scope)
                 .map_err(|failure_class| {
@@ -2454,6 +2500,7 @@ impl ConfigSync for CpGrpcServer {
         let broadcast_state = ConfigSyncBroadcastState {
             rx,
             snapshot_cursor,
+            publication_gate: self.publication_gate.clone(),
             config: self.config.clone(),
             namespace: dp_namespace.clone(),
             scope: self.scope.clone(),
@@ -2473,12 +2520,17 @@ impl ConfigSync for CpGrpcServer {
                             "DP config stream lagged behind by {} updates — sending full snapshot to recover",
                             n
                         );
-                        // Taken before the load: every publication queued now
-                        // was committed before it was sent, so the recovery
-                        // snapshot contains it.
-                        let queued = state.rx.len() as u64;
-                        let recovery = Self::configsync_lag_recovery_snapshot(
+                        // Captured together under the publication gate: the
+                        // retained positions queued now are exactly the
+                        // publications the recovery snapshot contains.
+                        let (queued, current) = capture_configsync_snapshot_coverage(
+                            &state.publication_gate,
+                            &state.rx,
                             &state.config,
+                            || {},
+                        );
+                        let recovery = Self::configsync_lag_recovery_snapshot(
+                            current.as_ref(),
                             &state.namespace,
                             &state.scope,
                         );

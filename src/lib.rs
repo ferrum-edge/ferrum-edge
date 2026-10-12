@@ -16787,6 +16787,23 @@ pub mod _test_support {
         (accepted, rejected)
     }
 
+    /// Thin wrapper over the ConfigSync Subscribe snapshot-coverage capture
+    /// (issue #6163). `between_reads` runs inside the publication gate after
+    /// the receiver's queued count is read and before the snapshot loads.
+    pub fn capture_configsync_snapshot_coverage_for_test(
+        publication_gate: &CpPublicationGate,
+        rx: &tokio::sync::broadcast::Receiver<crate::grpc::proto::ConfigUpdate>,
+        config: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        between_reads: impl FnOnce(),
+    ) -> (u64, std::sync::Arc<crate::config::types::GatewayConfig>) {
+        crate::grpc::cp_server::capture_configsync_snapshot_coverage(
+            publication_gate,
+            rx,
+            config,
+            between_reads,
+        )
+    }
+
     pub fn cas_publish_db_snapshot_with_k8s_overlay_for_test(
         config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
         overlay_slot: &K8sOverlaySlot,
