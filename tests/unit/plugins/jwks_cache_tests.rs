@@ -877,22 +877,13 @@ async fn shared_uri_strictest_arbitration_spans_committed_and_late_consumers() {
 // Concurrent reconciliation ordering (issue #6310)
 // ---------------------------------------------------------------------------
 
-/// Clears the reconciliation hook even when an assertion unwinds.
-struct ReconcileHookReset;
-
-impl Drop for ReconcileHookReset {
-    fn drop(&mut self) {
-        ferrum_edge::plugins::utils::jwks_cache::set_reconcile_snapshot_hook_for_test(None);
-    }
-}
-
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn older_reconciliation_snapshot_cannot_overwrite_newer_active_requirements() {
     use ferrum_edge::plugins::utils::jwks_cache::{
-        LateActiveRequirement, cached_active, set_reconcile_snapshot_hook_for_test,
+        LateActiveRequirement, cached_active,
+        retain_active_requirements_with_after_snapshot_hook_for_test,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
     let server = wiremock::MockServer::start().await;
@@ -921,66 +912,74 @@ async fn older_reconciliation_snapshot_cannot_overwrite_newer_active_requirement
     assert_eq!(cached_active(&late_uri), Some(false));
     assert_eq!(cached_requirement(&uri), Some(relaxed));
 
-    // Pause the first reconciliation after it computed its union and before
-    // it applies it.
-    let hook_reset = ReconcileHookReset;
-    let armed = Arc::new(AtomicBool::new(true));
-    let (paused_tx, paused_rx) = mpsc::channel::<()>();
-    let (release_tx, release_rx) = mpsc::channel::<()>();
-    let paused_tx = std::sync::Mutex::new(paused_tx);
-    let release_rx = std::sync::Mutex::new(release_rx);
-    set_reconcile_snapshot_hook_for_test(Some(Arc::new(move || {
-        if armed.swap(false, Ordering::AcqRel) {
-            let _ = paused_tx.lock().unwrap().send(());
-            // A dropped sender (unwinding test) releases immediately.
-            let _ = release_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30));
-        }
-    })));
-
     let runtime = tokio::runtime::Handle::current();
 
     // Caller A: a committed publication that still carries only the relaxed
-    // consumer. It copies the older union and stalls before applying it.
+    // consumer. It copies the older union and pauses, holding the gate, before
+    // applying it. A dropped release sender (unwinding test) releases it.
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
     let committed = HashMap::from([(uri.clone(), relaxed)]);
     let a_runtime = runtime.clone();
     let caller_a = std::thread::spawn(move || {
         let _entered = a_runtime.enter();
-        retain_active_requirements(&committed);
+        let pause = || {
+            let _ = paused_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        };
+        retain_active_requirements_with_after_snapshot_hook_for_test(&committed, &pause);
     });
     paused_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("caller A must reach its apply point");
 
-    // Caller B: an independent discovery owner publishes a stricter
-    // requirement on the same URI and a URI absent from A's union.
-    let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
-    let b_runtime = runtime.clone();
-    let (b_uri, b_late_uri) = (uri.clone(), late_uri.clone());
-    let caller_b = std::thread::spawn(move || {
-        let _entered = b_runtime.enter();
-        let strict_contribution = LateActiveRequirement::register(&b_uri, strict);
-        let late_contribution = LateActiveRequirement::register(&b_late_uri, relaxed);
-        let _ = b_done_tx.send(());
-        (strict_contribution, late_contribution)
-    });
+    // Callers B: independent discovery owners publish a stricter requirement
+    // on the same URI and a URI absent from A's union. Each reports when its
+    // reconciliation finds the gate held, immediately before blocking on it.
+    let (contended_tx, contended_rx) = mpsc::channel::<&'static str>();
+    let (done_tx, done_rx) = mpsc::channel::<&'static str>();
+    let spawn_caller_b = |name: &'static str, jwks_uri: String, requirement| {
+        let b_runtime = runtime.clone();
+        let contended_tx = contended_tx.clone();
+        let done_tx = done_tx.clone();
+        std::thread::spawn(move || {
+            let _entered = b_runtime.enter();
+            let report_contention = || {
+                let _ = contended_tx.send(name);
+            };
+            let contribution = LateActiveRequirement::register_with_gate_contended_hook_for_test(
+                &jwks_uri,
+                requirement,
+                &report_contention,
+            );
+            let _ = done_tx.send(name);
+            contribution
+        })
+    };
+    let caller_b_strict = spawn_caller_b("strict", uri.clone(), strict);
+    let caller_b_late = spawn_caller_b("late", late_uri.clone(), relaxed);
 
-    // B's newer reconciliation must not return while A still holds an older
-    // copy it has not applied: otherwise A would overwrite B afterwards.
-    assert!(
-        b_done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+    // Both newer reconciliations positively contend on the gate A holds with
+    // its older union still unapplied, so neither can have completed.
+    let mut contended = HashSet::new();
+    for _ in 0..2 {
+        contended.insert(
+            contended_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("caller B must contend on the reconciliation gate"),
+        );
+    }
+    assert_eq!(contended, HashSet::from(["strict", "late"]));
+    assert_eq!(
+        done_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
         "a newer reconciliation must not complete while an older union is pending application"
     );
 
     release_tx.send(()).expect("release caller A");
     caller_a.join().expect("caller A");
-    b_done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("caller B must complete after caller A applies");
-    let (strict_contribution, late_contribution) = caller_b.join().expect("caller B");
-    drop(hook_reset);
+    let strict_contribution = caller_b_strict.join().expect("caller B strict");
+    let late_contribution = caller_b_late.join().expect("caller B late");
 
     assert_eq!(
         cached_requirement(&uri),

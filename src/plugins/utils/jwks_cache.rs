@@ -38,7 +38,7 @@ use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, TryLockError};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -214,11 +214,6 @@ static LATE_ACTIVE_REQUIREMENTS: OnceLock<DashMap<u64, (String, JwksRefreshRequi
 static LATE_ACTIVE_REQUIREMENT_IDS: AtomicU64 = AtomicU64::new(0);
 /// Serializes the snapshot-and-apply of [`reconcile_active_requirements`].
 static RECONCILE_GATE: Mutex<()> = Mutex::new(());
-/// Callback type for [`set_reconcile_snapshot_hook_for_test`].
-pub type ReconcileSnapshotHook = Arc<dyn Fn() + Send + Sync>;
-/// Test-only hook run after a reconciliation computed its union and before it
-/// applies it. Lets external tests force a concurrent interleaving.
-static RECONCILE_SNAPSHOT_HOOK: Mutex<Option<ReconcileSnapshotHook>> = Mutex::new(None);
 /// Precomputed active-remote trust aggregate for O(1) `/health` and `/status`.
 static TRUST_HEALTH: OnceLock<arc_swap::ArcSwap<JwksTrustHealthAggregate>> = OnceLock::new();
 /// Generation for the deadline-watcher task; bumping invalidates a stale
@@ -292,9 +287,37 @@ impl LateActiveRequirement {
     /// Publish this consumer's requirement immediately, without waiting for
     /// another configuration reload.
     pub fn register(jwks_uri: &str, requirement: JwksRefreshRequirement) -> Self {
+        Self::register_inner(jwks_uri, requirement, ReconcileInterleaveHooks::default())
+    }
+
+    /// [`Self::register`], running `hook` only when this registration's
+    /// reconciliation finds the reconciliation gate already held, immediately
+    /// before it blocks on it. Lets external tests observe contention.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn register_with_gate_contended_hook_for_test(
+        jwks_uri: &str,
+        requirement: JwksRefreshRequirement,
+        hook: &dyn Fn(),
+    ) -> Self {
+        Self::register_inner(
+            jwks_uri,
+            requirement,
+            ReconcileInterleaveHooks {
+                on_gate_contended: Some(hook),
+                after_snapshot: None,
+            },
+        )
+    }
+
+    fn register_inner(
+        jwks_uri: &str,
+        requirement: JwksRefreshRequirement,
+        hooks: ReconcileInterleaveHooks<'_>,
+    ) -> Self {
         let id = LATE_ACTIVE_REQUIREMENT_IDS.fetch_add(1, Ordering::Relaxed);
         late_active_requirements().insert(id, (jwks_uri.to_string(), requirement));
-        reconcile_active_requirements();
+        reconcile_active_requirements_inner(hooks);
         Self { id }
     }
 
@@ -674,8 +697,43 @@ fn reconfigure_refresh_policy(
 /// Trust-health republication runs only after `retain` returns so it never
 /// iterates the map under the retain shard guard.
 pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefreshRequirement>) {
+    retain_active_requirements_inner(active_requirements, ReconcileInterleaveHooks::default());
+}
+
+/// [`retain_active_requirements`], running `hook` after its reconciliation
+/// computed the active union and before it applies it, while the
+/// reconciliation gate is held. Lets external tests force an interleaving.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn retain_active_requirements_with_after_snapshot_hook_for_test(
+    active_requirements: &HashMap<String, JwksRefreshRequirement>,
+    hook: &dyn Fn(),
+) {
+    retain_active_requirements_inner(
+        active_requirements,
+        ReconcileInterleaveHooks {
+            on_gate_contended: None,
+            after_snapshot: Some(hook),
+        },
+    );
+}
+
+fn retain_active_requirements_inner(
+    active_requirements: &HashMap<String, JwksRefreshRequirement>,
+    hooks: ReconcileInterleaveHooks<'_>,
+) {
     committed_requirements_slot().store(Arc::new(active_requirements.clone()));
-    reconcile_active_requirements();
+    reconcile_active_requirements_inner(hooks);
+}
+
+/// Test-only interleaving points inside [`reconcile_active_requirements`].
+/// Production reconciliation always passes the empty default.
+#[derive(Default)]
+struct ReconcileInterleaveHooks<'a> {
+    /// Runs when the gate is already held, immediately before blocking on it.
+    on_gate_contended: Option<&'a dyn Fn()>,
+    /// Runs under the gate after the union is computed, before it is applied.
+    after_snapshot: Option<&'a dyn Fn()>,
 }
 
 /// Recompute the active set as `committed generation ∪ late contributions` and
@@ -693,10 +751,11 @@ pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefr
 /// reconciliation, and no path reconciles while holding a `DashMap` shard
 /// guard, so the gate-then-shard lock order cannot invert.
 fn reconcile_active_requirements() {
-    let _gate = match RECONCILE_GATE.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    reconcile_active_requirements_inner(ReconcileInterleaveHooks::default());
+}
+
+fn reconcile_active_requirements_inner(hooks: ReconcileInterleaveHooks<'_>) {
+    let _gate = acquire_reconcile_gate(hooks.on_gate_contended);
     let mut effective: JwksRequirementMap = (**committed_requirements_slot().load()).clone();
     if let Some(late) = LATE_ACTIVE_REQUIREMENTS.get() {
         for entry in late.iter() {
@@ -708,7 +767,9 @@ fn reconcile_active_requirements() {
         }
     }
 
-    run_reconcile_snapshot_hook();
+    if let Some(hook) = hooks.after_snapshot {
+        hook();
+    }
 
     let cache = global_cache();
     cache.retain(|uri, entry| {
@@ -725,26 +786,18 @@ fn reconcile_active_requirements() {
     republish_trust_health();
 }
 
-fn run_reconcile_snapshot_hook() {
-    let hook = match RECONCILE_SNAPSHOT_HOOK.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    if let Some(hook) = hook {
-        hook();
+fn acquire_reconcile_gate(on_contended: Option<&dyn Fn()>) -> MutexGuard<'static, ()> {
+    if let Some(on_contended) = on_contended {
+        match RECONCILE_GATE.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => on_contended(),
+        }
     }
-}
-
-/// Install (or clear with `None`) a hook that runs inside every reconciliation
-/// between computing the active union and applying it.
-#[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
-pub fn set_reconcile_snapshot_hook_for_test(hook: Option<ReconcileSnapshotHook>) {
-    let mut slot = match RECONCILE_SNAPSHOT_HOOK.lock() {
+    match RECONCILE_GATE.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
-    };
-    *slot = hook;
+    }
 }
 
 /// Remove JWKS cache entries whose URIs are not in `active_uris`.
