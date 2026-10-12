@@ -508,10 +508,14 @@ FERRUM_DB_URL=postgres://user:pass@rds-endpoint.amazonaws.com/ferrum
 **stdout**. Docker's log collection combines both streams, so ingest either or
 both. The image defaults `FERRUM_LOG_LEVEL` to `warn`, so under the default
 ordinary `INFO` diagnostics are filtered out and visible output appears only on
-stderr. Bootstrap startup errors also write JSON to stderr. Transaction
-access-log and plugin output is a separate sink: it always goes to stdout as
-JSON, is gated by plugin enablement rather than `FERRUM_LOG_LEVEL`, and is not
-part of the severity split above.
+stderr. Bootstrap startup errors also write JSON to stderr. The `stdout_logging`
+plugin writes JSON access records to stdout independently of `FERRUM_LOG_LEVEL`
+(subject to the plugin being enabled and its configured access-log filters). Its
+records are separate from the severity split above. Other plugins' destinations
+and filtering depend on their implementation and configuration: for example,
+`http_logging` posts transaction summaries to its configured endpoint, while
+`transaction_debugger` emits DEBUG tracing that is gated by the active log
+level.
 
 ```bash
 # Raise verbosity from the image default (warn)
