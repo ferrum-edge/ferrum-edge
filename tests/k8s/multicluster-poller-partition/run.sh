@@ -55,10 +55,14 @@ INITIAL_FEDERATION_FAILURES=0 INITIAL_DISCOVERY_FAILURES=0
 TRANSIENT_FEDERATION_FAILURE_DELTA=0 TRANSIENT_DISCOVERY_FAILURE_DELTA=0
 RECORDED=" "
 # Docker identities of the resources THIS invocation created. Cleanup removes
-# only these, and a kind cluster only while the same control-plane container
-# still holds its name, so a refused preflight, a partial start, or a same-name
-# replacement owned by another invocation is never deleted.
+# only these, by id and never by name, so a refused preflight, a partial start,
+# or a same-name replacement owned by another invocation is never deleted.
 OWNED_TOXIPROXY_ID="" OWNED_CLUSTER_A_NODE_ID="" OWNED_CLUSTER_B_NODE_ID=""
+# A run-private kubeconfig: kind writes this run's contexts here and nowhere
+# else, so removing it removes exactly the entries this run created and never a
+# same-name context another invocation wrote to a shared kubeconfig.
+RUN_KUBECONFIG_DIR="$( mktemp -d)"
+export KUBECONFIG="$RUN_KUBECONFIG_DIR/config"
 
 mkdir -p "$RESULTS_DIR" "$ARTIFACT_DIR"
 
@@ -76,15 +80,14 @@ cluster_node_id() {
   docker inspect -f '{{.Id}}' "$1-control-plane" 2>/dev/null
 }
 
+# kind's default topology is a single control-plane node, so the node container
+# this run recorded is the whole cluster. It is removed by that immutable id and
+# the cluster name is never resolved again: a same-name replacement created at
+# any point, even after an ownership check, has another id and survives.
 release_owned_cluster() {
-  local cluster="$1" owned_node_id="$2" current_node_id
+  local owned_node_id="$1"
   [[ -n "$owned_node_id" ]] || return 0
-  current_node_id="$( cluster_node_id "$cluster")"
-  if [[ "$current_node_id" != "$owned_node_id" ]]; then
-    echo "leaving kind cluster $cluster: its control-plane node is not the one this run created" >&2
-    return 0
-  fi
-  kind delete cluster --name "$cluster" >/dev/null 2>&1
+  docker rm -f -v "$owned_node_id" >/dev/null 2>&1
 }
 
 cleanup() {
@@ -94,8 +97,11 @@ cleanup() {
   if [[ -n "$OWNED_TOXIPROXY_ID" ]]; then
     docker rm -f "$OWNED_TOXIPROXY_ID" >/dev/null 2>&1
   fi
-  release_owned_cluster "$CLUSTER_A" "$OWNED_CLUSTER_A_NODE_ID"
-  release_owned_cluster "$CLUSTER_B" "$OWNED_CLUSTER_B_NODE_ID"
+  release_owned_cluster "$OWNED_CLUSTER_A_NODE_ID"
+  release_owned_cluster "$OWNED_CLUSTER_B_NODE_ID"
+  if [[ -n "$RUN_KUBECONFIG_DIR" ]]; then
+    rm -rf "$RUN_KUBECONFIG_DIR"
+  fi
 }
 trap cleanup EXIT
 

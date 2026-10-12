@@ -3143,10 +3143,14 @@ recorded_expect_blocked() {
   local url="$5"
   local family="${6:-}"
   local outcome="${7:-blocked-not-http-200}"
-  local source_spiffe destination_spiffe
+  local source_spiffe destination_spiffe refusal=fail-closed
+  # A row that records a policy denial must observe the policy's own refusal.
+  if [[ "$outcome" == "denied-by-authorization-policy" ]]; then
+    refusal=authorization-policy
+  fi
   source_spiffe="$(spiffe_for_sa "$from")"
   destination_spiffe="$(spiffe_for_sa "$destination")"
-  if expect_blocked "$from" "$label" "$url" "$family"; then
+  if expect_blocked "$from" "$label" "$url" "$family" "$refusal"; then
     record_live_assertion \
       "$assertion_id" \
       pass \
@@ -3204,38 +3208,68 @@ expect_blocked() {
   local label="$2"
   local url="$3"
   local family="${4:-}"
-  expect_blocked_from_namespace "$WORKLOAD_NS" "$from" "$label" "$url" "$family"
+  local refusal="${5:-fail-closed}"
+  expect_blocked_from_namespace "$WORKLOAD_NS" "$from" "$label" "$url" "$family" "$refusal"
 }
 
 # Classify one HTTP denial probe from its kubectl exec status and output.
 # curl runs inside the source pod with `-w "\n%{http_code}"`, so a three-digit
 # trailer is the evidence that curl itself executed; an exec, image, or API
-# failure leaves none. Prints the refusal mechanism and returns 0 only for an
-# observed refusal: an HTTP 4xx/5xx answer, or a transport refusal curl reported
-# with no HTTP status (7 connect refused, 28 timeout, 52 empty reply, 55 send
-# failure, 56 receive failure/reset). Returns 1 for an unexpected 2xx/3xx answer
-# and 2 when nothing proves the request was refused (missing trailer, DNS or
-# other curl setup failure, or a transport error with a status code).
+# failure leaves none. `refusal` names the refusal the row expects:
+# - `fail-closed` (direct Pod IP and inbound guard rows): any HTTP 4xx/5xx
+#   answer, or a transport refusal curl reported with no HTTP status (7 connect
+#   refused, 28 timeout, 52 empty reply, 55 send failure, 56 receive
+#   failure/reset), because a guard may drop or reset the connection.
+# - `authorization-policy` (Service AuthorizationPolicy rows): only the policy's
+#   own refusal, a direct HTTP 403 or the source waypoint's 502 naming the
+#   destination peer's 403 (forged_assertion_response_is_policy_rejection). A
+#   route miss, an unrelated 5xx, or a dropped or timed-out connection does not
+#   show that the policy refused this request, as in expect_policy_denied.
+# Prints the refusal mechanism (or failure reason). Returns 0 for the expected
+# refusal, 1 for an unexpected 2xx/3xx answer, and 2 when nothing proves the
+# expected refusal (missing trailer, curl setup failure, a transport error with
+# a status code, or a refusal of another kind).
 classify_http_denial_probe() {
-  local status="$1" output="$2" code
+  local status="$1" output="$2" refusal="${3:-fail-closed}" code body=""
+  case "$refusal" in
+    fail-closed|authorization-policy) ;;
+    *)
+      printf 'unknown-expected-refusal-%s' "$refusal"
+      return 2
+      ;;
+  esac
   code="${output##*$'\n'}"
   if [[ ! "$code" =~ ^[0-9]{3}$ ]]; then
     printf 'no-curl-trailer exec_status=%s' "$status"
     return 2
   fi
+  if [[ "$output" == *$'\n'* ]]; then
+    body="${output%$'\n'*}"
+  fi
   if [[ "$status" -eq 0 ]]; then
     case "$code" in
-      4??|5??)
-        printf 'http-%s' "$code"
-        return 0
-        ;;
+      4??|5??) ;;
       *)
         printf 'unexpected-http-%s' "$code"
         return 1
         ;;
     esac
+    if [[ "$refusal" == "fail-closed" ]]; then
+      printf 'http-%s' "$code"
+      return 0
+    fi
+    if ! forged_assertion_response_is_policy_rejection "$code" "$body"; then
+      printf 'unattributed-http-%s' "$code"
+      return 2
+    fi
+    if [[ "$code" == "403" ]]; then
+      printf 'policy-http-403'
+    else
+      printf 'peer-policy-403-via-http-%s' "$code"
+    fi
+    return 0
   fi
-  if [[ "$code" == "000" ]]; then
+  if [[ "$code" == "000" && "$refusal" == "fail-closed" ]]; then
     case "$status" in
       7|28|52|55|56)
         printf 'curl-exit-%s' "$status"
@@ -3257,12 +3291,13 @@ expect_blocked_from_namespace() {
   local label="$3"
   local url="$4"
   local family="${5:-}"
+  local refusal="${6:-fail-closed}"
   local output err evidence verdict
   err="$(mktemp)"
   set +e
   output="$(curl_for_family_from_namespace "$namespace" "$family" "$from" "$url" 2>"$err")"
   local status=$?
-  evidence="$(classify_http_denial_probe "$status" "$output")"
+  evidence="$(classify_http_denial_probe "$status" "$output" "$refusal")"
   verdict=$?
   set -e
   LAST_HTTP_DENIAL_EVIDENCE="$evidence"
@@ -3273,7 +3308,7 @@ expect_blocked_from_namespace() {
   if [[ "$verdict" -eq 1 ]]; then
     echo "expected block for $label from $from to $url, got $evidence" >&2
   else
-    echo "denial for $label from $from to $url was not observed ($evidence); a probe that did not run is not a refusal" >&2
+    echo "$refusal denial for $label from $from to $url was not observed ($evidence); a probe that did not run, or a refusal of another kind, is not that denial" >&2
   fi
   head -c 2048 "$err" >&2 || true
   rm -f "$err"
@@ -4144,7 +4179,8 @@ run_traffic_checks() {
         "$(spiffe_for_sa dst-a)"
       return 1
     fi
-    if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+    if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4 \
+      authorization-policy; then
       record_live_assertion \
         node_waypoint.identity.stale_cleanup \
         fail \
@@ -4350,7 +4386,8 @@ run_traffic_checks() {
       "cni-ip-reuse"
     return 1
   fi
-  if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4; then
+  if ! expect_blocked src-b "post-recreation AuthorizationPolicy DENY" "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" 4 \
+    authorization-policy; then
     record_live_assertion \
       node_waypoint.identity.stale_cleanup \
       fail \

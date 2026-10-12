@@ -10,7 +10,8 @@
 //! - #6302: the poller-partition fixture removes only resources it created,
 //!   by the identity it recorded when it created them.
 //! - #6303: NodeWaypoint HTTP and DTLS denial rows require evidence that the
-//!   probe ran and, for DTLS, that the backend log was actually read.
+//!   probe ran and, for DTLS, that the backend log was actually read; Service
+//!   AuthorizationPolicy rows require the policy's own 403.
 //! - #6306: a failed SPIRE `start` stops the children it launched.
 
 use std::fs;
@@ -348,9 +349,20 @@ fn cni_fixture_routes_recovery_checks_through_the_observation_helpers() {
 
 /// Recording stubs. kind clusters live in `$STATE/clusters`; a control-plane
 /// container id lives in `$STATE/id-<name>`; a container exists while
-/// `$STATE/container-<name>` exists.
+/// `$STATE/container-<name>` exists. `docker rm` removes a node only by its
+/// exact id and `kind delete` resolves the cluster by name, the way the real
+/// tools do. `REPLACE_BEFORE_DELETE` swaps that cluster's node for another
+/// invocation's same-name replacement immediately before the first
+/// destructive call, after every ownership check the fixture could make.
 const POLLER_STUBS: &str = r#"set -euo pipefail
 log_call() { printf '%s\n' "$*" >>"$STATE/calls"; }
+replace_before_delete() {
+  if [[ -n "${REPLACE_BEFORE_DELETE:-}" && ! -e "$STATE/replaced" ]]; then
+    touch "$STATE/replaced"
+    printf 'node-%s-theirs' "$REPLACE_BEFORE_DELETE" \
+      >"$STATE/id-$REPLACE_BEFORE_DELETE-control-plane"
+  fi
+}
 python3() {
   log_call "python3 $*"
   if [[ "$*" == *verify_signal_reload_guard* && "${GUARD_FAIL:-0}" == 1 ]]; then
@@ -378,6 +390,12 @@ kind() {
       fi
       printf '%s\n' "$4" >>"$STATE/clusters"
       printf 'node-%s-ours' "$4" >"$STATE/id-$4-control-plane"
+      printf 'context kind-%s\n' "$4" >>"$KUBECONFIG"
+      printf '%s' "$KUBECONFIG" >"$STATE/kubeconfig-path"
+      ;;
+    "delete cluster")
+      replace_before_delete
+      rm -f "$STATE/id-$4-control-plane"
       ;;
   esac
 }
@@ -396,6 +414,15 @@ docker() {
     create)
       touch "$STATE/container-$3"
       printf 'toxi-ours'
+      ;;
+    rm)
+      replace_before_delete
+      local id="${*: -1}" file
+      for file in "$STATE"/id-*; do
+        if [[ -f "$file" && "$(cat "$file")" == "$id" ]]; then
+          rm -f "$file"
+        fi
+      done
       ;;
   esac
 }
@@ -419,6 +446,10 @@ struct PollerRun {
     status: i32,
     calls: Vec<String>,
     stderr: String,
+    /// The control-plane id each cluster name resolves to after cleanup.
+    nodes_after: Vec<(String, String)>,
+    /// The kubeconfig kind wrote this run's contexts to, if a cluster was made.
+    kubeconfig: Option<PathBuf>,
 }
 
 impl PollerRun {
@@ -428,6 +459,13 @@ impl PollerRun {
             .map(String::as_str)
             .filter(|call| call.starts_with("docker rm") || call.starts_with("kind delete"))
             .collect()
+    }
+
+    fn node_after(&self, cluster: &str) -> Option<&str> {
+        self.nodes_after
+            .iter()
+            .find(|(name, _)| name == cluster)
+            .map(|(_, id)| id.as_str())
     }
 }
 
@@ -440,7 +478,12 @@ fn run_poller(
     envs: &[(&str, &str)],
 ) -> PollerRun {
     let source = read(POLLER_RUN_SH);
-    let owned = shell_line(&source, "OWNED_TOXIPROXY_ID=");
+    let owned = [
+        shell_line(&source, "OWNED_TOXIPROXY_ID="),
+        shell_line(&source, "RUN_KUBECONFIG_DIR="),
+        shell_line(&source, "export KUBECONFIG="),
+    ]
+    .concat();
     let functions = shell_functions(
         &source,
         &[
@@ -484,6 +527,7 @@ fn run_poller(
         .arg(script)
         .current_dir(state.path())
         .env("STATE", state.path())
+        .env("TMPDIR", state.path())
         .env_remove("FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE");
     for (key, value) in &all_envs {
         command.env(key, value);
@@ -494,10 +538,23 @@ fn run_poller(
         .lines()
         .map(str::to_string)
         .collect();
+    let nodes_after = ["custom-a", "custom-b"]
+        .iter()
+        .filter_map(|cluster| {
+            fs::read_to_string(state.path().join(format!("id-{cluster}-control-plane")))
+                .ok()
+                .map(|id| ((*cluster).to_string(), id))
+        })
+        .collect();
+    let kubeconfig = fs::read_to_string(state.path().join("kubeconfig-path"))
+        .ok()
+        .map(PathBuf::from);
     PollerRun {
         status: output.status.code().unwrap_or(-1),
         calls,
         stderr: stderr_of(&output),
+        nodes_after,
+        kubeconfig,
     }
 }
 
@@ -590,11 +647,19 @@ fn poller_cleanup_after_successful_creation_removes_exactly_the_created_resource
     assert_eq!(
         destructive,
         vec![
+            "docker rm -f -v node-custom-a-ours",
+            "docker rm -f -v node-custom-b-ours",
             "docker rm -f toxi-ours",
-            "kind delete cluster --name custom-a",
-            "kind delete cluster --name custom-b",
         ],
-        "the container is removed by the id this run created, never by name"
+        "every container is removed by the id this run created, never by name"
+    );
+    assert_eq!(run.node_after("custom-a"), None);
+    assert_eq!(run.node_after("custom-b"), None);
+    let kubeconfig = run.kubeconfig.expect("kind wrote a kubeconfig");
+    assert!(
+        !kubeconfig.exists(),
+        "the run-private kubeconfig holding this run's contexts is removed: {}",
+        kubeconfig.display()
     );
 }
 
@@ -609,7 +674,7 @@ fn poller_cleanup_after_partial_creation_removes_only_the_acquired_subset() {
     assert_ne!(run.status, 0);
     assert_eq!(
         run.destructive_calls(),
-        vec!["kind delete cluster --name custom-a"],
+        vec!["docker rm -f -v node-custom-a-ours"],
         "only cluster A was created; stderr: {}",
         run.stderr
     );
@@ -629,15 +694,47 @@ fn poller_cleanup_preserves_a_same_name_replacement() {
     assert_eq!(
         destructive,
         vec![
+            "docker rm -f -v node-custom-a-ours",
+            "docker rm -f -v node-custom-b-ours",
             "docker rm -f toxi-ours",
-            "kind delete cluster --name custom-b",
         ],
-        "cluster A's control-plane is no longer the node this run created"
+        "cleanup never resolves a cluster by name"
     );
-    assert!(
-        run.stderr.contains("leaving kind cluster custom-a"),
-        "stderr: {}",
-        run.stderr
+    assert_eq!(
+        run.node_after("custom-a"),
+        Some("node-custom-a-theirs"),
+        "the same-name replacement survives cleanup"
+    );
+    assert_eq!(run.node_after("custom-b"), None);
+}
+
+#[test]
+fn poller_cleanup_preserves_a_replacement_made_after_the_ownership_check() {
+    // Every ownership check sees this run's own node; the replacement lands
+    // only between those checks and the deletion itself.
+    let run = run_poller(
+        "preflight\ncreate_clusters_and_fault_layer\nexit 0",
+        &[],
+        false,
+        &[ACK, ("REPLACE_BEFORE_DELETE", "custom-a")],
+    );
+    assert_eq!(run.status, 0, "stderr: {}", run.stderr);
+    assert_eq!(
+        run.node_after("custom-a"),
+        Some("node-custom-a-theirs"),
+        "a replacement created between inspection and deletion survives; calls: {:?}",
+        run.destructive_calls()
+    );
+    assert_eq!(run.node_after("custom-b"), None);
+    let mut destructive = run.destructive_calls();
+    destructive.sort_unstable();
+    assert_eq!(
+        destructive,
+        vec![
+            "docker rm -f -v node-custom-a-ours",
+            "docker rm -f -v node-custom-b-ours",
+            "docker rm -f toxi-ours",
+        ]
     );
 }
 
@@ -686,6 +783,7 @@ fn node_waypoint_functions() -> String {
         &source,
         &[
             "classify_http_denial_probe",
+            "forged_assertion_response_is_policy_rejection",
             "expect_blocked_from_namespace",
             "expect_blocked",
             "recorded_expect_blocked",
@@ -699,6 +797,13 @@ fn node_waypoint_functions() -> String {
     prelude
 }
 
+/// The source waypoint's exact body for a CONNECT the destination peer refused
+/// with 403, and the same wrapper for an unrelated peer status.
+const PEER_403_BODY: &str =
+    r#"{"error":"HBONE backend unavailable: tunnel rejected by peer with status 403"}"#;
+const PEER_503_BODY: &str =
+    r#"{"error":"HBONE backend unavailable: tunnel rejected by peer with status 503"}"#;
+
 #[test]
 fn node_waypoint_http_denial_requires_an_executed_probe_and_an_observed_refusal() {
     let functions = node_waypoint_functions();
@@ -707,7 +812,7 @@ fn node_waypoint_http_denial_requires_an_executed_probe_and_an_observed_refusal(
         r#"{NODE_WAYPOINT_STUBS}{functions}
 check() {{
   local evidence verdict=0
-  evidence="$(classify_http_denial_probe "$1" "$(printf '%b' "$2")")" || verdict=$?
+  evidence="$(classify_http_denial_probe "$1" "$(printf '%b' "$2")" fail-closed)" || verdict=$?
   printf '%s|%s|%s\n' "$1" "$verdict" "$evidence"
 }}
 check 0 'denied\n403'
@@ -751,6 +856,60 @@ check 28 'partial\n200'
 }
 
 #[test]
+fn node_waypoint_policy_denial_requires_the_policy_refusal_itself() {
+    let functions = node_waypoint_functions();
+    let state = TempDir::new().expect("state dir");
+    let script = format!(
+        r#"{NODE_WAYPOINT_STUBS}{functions}
+check() {{
+  local evidence verdict=0
+  evidence="$(classify_http_denial_probe "$1" "$2" authorization-policy)" || verdict=$?
+  printf '%s|%s\n' "$verdict" "$evidence"
+}}
+check 0 $'denied\n403'
+check 0 $'{PEER_403_BODY}\n502'
+check 0 $'{{"error":"Not Found"}}\n404'
+check 0 $'bad gateway\n502'
+check 0 $'{PEER_403_BODY}\n503'
+check 0 $'{PEER_503_BODY}\n502'
+check 0 $'upstream connect error\n503'
+check 0 $'\n503'
+check 28 $'\n000'
+check 7 $'\n000'
+check 56 $'\n000'
+check 0 $'ok-a\n200'
+check 1 ''
+classify_http_denial_probe 0 $'denied\n403' guessed || echo "UNKNOWN=$?"
+"#
+    );
+    let output = run_bash(&script, state.path(), &[]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let expected = [
+        "0|policy-http-403",
+        "0|peer-policy-403-via-http-502",
+        "2|unattributed-http-404",
+        "2|unattributed-http-502",
+        "2|unattributed-http-503",
+        "2|unattributed-http-502",
+        "2|unattributed-http-503",
+        "2|unattributed-http-503",
+        "2|inconclusive-curl-exit-28-http-000",
+        "2|inconclusive-curl-exit-7-http-000",
+        "2|inconclusive-curl-exit-56-http-000",
+        "1|unexpected-http-200",
+        "2|no-curl-trailer exec_status=1",
+        "unknown-expected-refusal-guessedUNKNOWN=2",
+    ];
+    assert_eq!(
+        stdout_of(&output).lines().collect::<Vec<_>>(),
+        expected,
+        "a Service AuthorizationPolicy row passes only on a direct 403 or the \
+         source waypoint's attributed peer 403; a route miss, an unrelated 5xx, \
+         or a dropped or timed-out connection is inconclusive"
+    );
+}
+
+#[test]
 fn node_waypoint_recorded_http_denial_fails_when_the_probe_never_ran() {
     let functions = node_waypoint_functions();
     let cases = [
@@ -773,14 +932,35 @@ fn node_waypoint_recorded_http_denial_fails_when_the_probe_never_ran() {
             "denied\\n403",
             "0",
             "node_waypoint.ipv4.service_deny_same_node|pass|\
-             denied-by-authorization-policy;refusal=http-403",
+             denied-by-authorization-policy;refusal=policy-http-403",
+        ),
+        (
+            "0",
+            "{\"error\":\"HBONE backend unavailable: tunnel rejected by peer with status 403\"}\\n502",
+            "0",
+            "node_waypoint.ipv4.service_deny_same_node|pass|\
+             denied-by-authorization-policy;refusal=peer-policy-403-via-http-502",
+        ),
+        (
+            "0",
+            "{\"error\":\"Not Found\"}\\n404",
+            "1",
+            "node_waypoint.ipv4.service_deny_same_node|fail|\
+             expected-denied-by-authorization-policy;observed=unattributed-http-404",
+        ),
+        (
+            "0",
+            "upstream\\n503",
+            "1",
+            "node_waypoint.ipv4.service_deny_same_node|fail|\
+             expected-denied-by-authorization-policy;observed=unattributed-http-503",
         ),
         (
             "28",
             "\\n000",
-            "0",
-            "node_waypoint.ipv4.service_deny_same_node|pass|\
-             denied-by-authorization-policy;refusal=curl-exit-28",
+            "1",
+            "node_waypoint.ipv4.service_deny_same_node|fail|\
+             expected-denied-by-authorization-policy;observed=inconclusive-curl-exit-28-http-000",
         ),
     ];
     for (status, output, expected_return, expected_record) in cases {
