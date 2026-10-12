@@ -68,6 +68,9 @@ FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 PERFORMANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
+BASE_IMAGE_REFRESH_WORKFLOW = (
+    REPO_ROOT / ".github" / "workflows" / "base-image-digest-refresh.yml"
+)
 DISTROLESS_IMAGE_PATTERN = re.compile(
     r"gcr\.io/distroless/cc-debian13:[^\s@]+@sha256:([0-9a-fA-F]{64})"
 )
@@ -4047,6 +4050,14 @@ def check_dockerfile_log_level(
 
 DIGEST_PINNED_REFERENCE = re.compile(r"@sha256:[0-9a-f]{64}$")
 DIGESTLESS_BASES = frozenset({"scratch"})
+# The only FROM/ARG shapes the pin contract reads. A Dockerfile comment is a
+# WHOLE line beginning with `#`: text after an instruction is part of it.
+DOCKERFILE_FROM_INSTRUCTION = re.compile(
+    r"FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.IGNORECASE
+)
+DOCKERFILE_ARG_INSTRUCTION = re.compile(
+    r"ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(\S+))?", re.IGNORECASE
+)
 
 
 def _arg_value_looks_like_image(value: str) -> bool:
@@ -4075,11 +4086,7 @@ def dockerfile_image_references(dockerfile: str) -> list[tuple[int, str, str]]:
     references: list[tuple[int, str, str]] = []
     for number, line in enumerate(dockerfile.splitlines(), start=1):
         stripped = line.strip()
-        from_match = re.fullmatch(
-            r"FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?",
-            stripped,
-            re.IGNORECASE,
-        )
+        from_match = DOCKERFILE_FROM_INSTRUCTION.fullmatch(stripped)
         if from_match is not None:
             target, alias = from_match.group(1), from_match.group(2)
             internal = target.lower() in stages or target.startswith("${")
@@ -4088,10 +4095,37 @@ def dockerfile_image_references(dockerfile: str) -> list[tuple[int, str, str]]:
             if alias:
                 stages.add(alias.lower())
             continue
-        arg_match = re.fullmatch(r"ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(\S+)", stripped)
-        if arg_match is not None and _arg_value_looks_like_image(arg_match.group(2)):
+        arg_match = DOCKERFILE_ARG_INSTRUCTION.fullmatch(stripped)
+        if (
+            arg_match is not None
+            and arg_match.group(2) is not None
+            and _arg_value_looks_like_image(arg_match.group(2))
+        ):
             references.append((number, f"ARG {arg_match.group(1)}", arg_match.group(2)))
     return references
+
+
+def unsupported_image_instructions(dockerfile: str) -> list[tuple[int, str]]:
+    """Every FROM/ARG instruction the pin contract cannot read completely.
+
+    `dockerfile_image_references` skips a line it cannot match, so a note
+    appended after a pinned reference would drop that reference while the
+    remaining ones still satisfy the nonempty guard. Name such a line instead.
+    """
+
+    unsupported: list[tuple[int, str]] = []
+    for number, line in enumerate(dockerfile.splitlines(), start=1):
+        stripped = line.strip()
+        keyword = stripped.split(None, 1)[0].upper() if stripped else ""
+        if keyword == "FROM":
+            pattern = DOCKERFILE_FROM_INSTRUCTION
+        elif keyword == "ARG":
+            pattern = DOCKERFILE_ARG_INSTRUCTION
+        else:
+            continue
+        if pattern.fullmatch(stripped) is None:
+            unsupported.append((number, stripped))
+    return unsupported
 
 
 def check_dockerfile_image_pins(
@@ -4104,6 +4138,13 @@ def check_dockerfile_image_pins(
     release images with nothing failing. `scratch` is the sole exception.
     """
 
+    for number, instruction in unsupported_image_instructions(dockerfile):
+        failures.append(
+            f"{label}:{number} has the unsupported instruction '{instruction}'; "
+            "the pin contract reads only 'FROM [--flag ...] <image> [AS <alias>]' "
+            "and 'ARG <NAME>[=<value>]', and a Dockerfile comment is a whole line "
+            "beginning with '#' (docs/dependency-policy.md -> 'Base image pinning')"
+        )
     references = dockerfile_image_references(dockerfile)
     require(
         bool(references),
@@ -4157,6 +4198,31 @@ def check_distroless_digest_consistency(
                     f"{path} uses distroless digest {match.group(1)}, but Dockerfile "
                     f"pins {expected_digest}"
                 )
+
+
+# The refresh cannot move the distroless pin in `ci.yml`'s `main-linux-image`
+# job (frozen by the trusted Cross policy), so a rewritten distroless digest
+# would fail `check_distroless_digest_consistency` before its PR opens. The
+# refresh must hold that drift for a direct-to-main rotation instead.
+BASE_IMAGE_REFRESH_HOLD_MARKERS = (
+    "      HELD_IMAGE: gcr.io/distroless/cc-debian13\n",
+    '              "${HELD_IMAGE}":*)\n',
+    "        if: always() && steps.resolve.outputs.held == 'true'\n",
+)
+
+
+def check_base_image_refresh_holds_distroless(
+    workflow: str, failures: list[str]
+) -> None:
+    """Require the digest refresh to hold, report, and fail on distroless drift."""
+
+    for marker in BASE_IMAGE_REFRESH_HOLD_MARKERS:
+        require(
+            marker in workflow,
+            "base-image-digest-refresh.yml must hold distroless drift for a "
+            f"direct-to-main rotation; missing {marker.strip()!r}",
+            failures,
+        )
 
 
 def workflow_permissions_are_read_only(text: str) -> bool:
@@ -5247,6 +5313,9 @@ def check_dockerfile(failures: list[str]) -> None:
             continue
         repository_files.append((path.relative_to(REPO_ROOT).as_posix(), contents))
     check_distroless_digest_consistency(repository_files, dockerfile, failures)
+    check_base_image_refresh_holds_distroless(
+        BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8"), failures
+    )
 
 
 def self_test() -> int:
@@ -5281,6 +5350,24 @@ def self_test() -> int:
         "self-test: stale distroless image refs must fail with their path",
         failures,
     )
+    held_refresh = "".join(BASE_IMAGE_REFRESH_HOLD_MARKERS)
+    pin_failures = []
+    check_base_image_refresh_holds_distroless(held_refresh, pin_failures)
+    require(
+        not pin_failures,
+        "self-test: a refresh that holds distroless drift should pass",
+        failures,
+    )
+    for marker in BASE_IMAGE_REFRESH_HOLD_MARKERS:
+        pin_failures = []
+        check_base_image_refresh_holds_distroless(
+            held_refresh.replace(marker, ""), pin_failures
+        )
+        require(
+            len(pin_failures) == 1,
+            f"self-test: a refresh missing {marker.strip()!r} must fail",
+            failures,
+        )
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
         workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
         producer = extract_job(workflow, job_name)
@@ -5611,6 +5698,43 @@ def self_test() -> int:
         "self-test: a mutable iproute2 runtime BASE_IMAGE default must fail closed",
         failures,
     )
+    for original, replacement, line, kind in (
+        (
+            " AS builder\n",
+            " AS builder # resolved today\n",
+            3,
+            "FROM tail",
+        ),
+        (
+            "aaaa\nARG IPROUTE2_VERSION",
+            "aaaa # resolved today\nARG IPROUTE2_VERSION",
+            1,
+            "image ARG tail",
+        ),
+        (
+            "ARG IPROUTE2_VERSION=6.15.0-1\n",
+            "ARG IPROUTE2_VERSION=6.15.0-1 # note\n",
+            2,
+            "version ARG tail",
+        ),
+        (" AS runtime\n", " AS runtime extra\n", 5, "FROM extra token"),
+    ):
+        tailed = pinned_dockerfile.replace(original, replacement, 1)
+        require(
+            tailed != pinned_dockerfile,
+            f"self-test: the {kind} fixture must change the pinned Dockerfile",
+            failures,
+        )
+        pin_failures = []
+        check_dockerfile_image_pins("synthetic", tailed, pin_failures)
+        require(
+            any(
+                f"synthetic:{line} has the unsupported instruction" in failure
+                for failure in pin_failures
+            ),
+            f"self-test: a {kind} must fail closed as an unsupported instruction",
+            failures,
+        )
     pin_failures = []
     check_dockerfile_image_pins("synthetic", "FROM scratch\n", pin_failures)
     require(

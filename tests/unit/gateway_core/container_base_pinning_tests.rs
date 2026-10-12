@@ -37,29 +37,65 @@ fn instruction_line(line: &str) -> &str {
     }
 }
 
-fn parse_arg_defaults(dockerfile: &str) -> HashMap<String, String> {
-    let mut defaults = HashMap::new();
-    for line in dockerfile.lines() {
-        let trimmed = instruction_line(line);
-        let Some(rest) = trimmed.strip_prefix("ARG ") else {
-            continue;
-        };
-        let Some((name, value)) = rest.split_once('=') else {
-            continue;
-        };
-        defaults.insert(name.trim().to_string(), value.trim().to_string());
-    }
-    defaults
+fn instruction_keyword(instruction: &str) -> &str {
+    instruction.split_whitespace().next().unwrap_or_default()
 }
 
-fn from_image_token(line: &str) -> Option<String> {
+fn is_arg_name(name: &str) -> bool {
+    let word = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(first) if word(first) && !first.is_ascii_digit() => bytes.all(word),
+        _ => false,
+    }
+}
+
+/// `ARG <NAME>[=<value>]` and nothing else. `None` when the line is not an
+/// `ARG` instruction; `Err` when it is one this gate cannot read completely,
+/// such as a pinned default followed by a note.
+fn parse_arg_instruction(line: &str) -> Option<Result<(String, Option<String>), String>> {
     let trimmed = instruction_line(line);
-    let rest = trimmed.strip_prefix("FROM ")?;
-    let image = rest.split_whitespace().next().unwrap_or_default().trim();
-    if image.is_empty() {
+    if !instruction_keyword(trimmed).eq_ignore_ascii_case("ARG") {
         return None;
     }
-    Some(image.to_string())
+    let unsupported = format!("unsupported `ARG` instruction `{trimmed}`");
+    let tokens: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+    let [declaration] = tokens.as_slice() else {
+        return Some(Err(unsupported));
+    };
+    let (name, value) = match declaration.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (*declaration, None),
+    };
+    if !is_arg_name(name) || value.is_some_and(str::is_empty) {
+        return Some(Err(unsupported));
+    }
+    Some(Ok((name.to_string(), value.map(str::to_string))))
+}
+
+/// `FROM [--flag=value ...] <image> [AS <alias>]` and nothing else. `None` when
+/// the line is not a `FROM` instruction; `Err` when it is one this gate cannot
+/// read completely, such as a pinned reference followed by a note.
+fn parse_from_instruction(line: &str) -> Option<Result<String, String>> {
+    let trimmed = instruction_line(line);
+    if !instruction_keyword(trimmed).eq_ignore_ascii_case("FROM") {
+        return None;
+    }
+    let mut tokens = trimmed
+        .split_whitespace()
+        .skip(1)
+        .skip_while(|token| token.starts_with("--"));
+    let image = tokens.next();
+    let rest: Vec<&str> = tokens.collect();
+    let complete = match rest.as_slice() {
+        [] => true,
+        [keyword, _alias] => keyword.eq_ignore_ascii_case("AS"),
+        _ => false,
+    };
+    match image {
+        Some(image) if complete => Some(Ok(image.to_string())),
+        _ => Some(Err(format!("unsupported `FROM` instruction `{trimmed}`"))),
+    }
 }
 
 fn is_local_stage_reference(image: &str) -> bool {
@@ -79,29 +115,39 @@ fn resolve_image_reference(image: &str, arg_defaults: &HashMap<String, String>) 
     image.to_string()
 }
 
-fn assert_digest_pinned(file: &str, line_no: usize, line: &str, resolved: &str) {
-    assert!(
-        resolved.contains("@sha256:"),
-        "{file}:{line_no}: production Dockerfile `FROM` must pin external bases by \
-         `@sha256:` digest (allow `scratch` or a local stage alias); got `{line}`"
-    );
+/// The whole reference must end in `@sha256:<64 lowercase hex>`; containing the
+/// marker somewhere is not enough.
+fn is_digest_pinned(reference: &str) -> bool {
+    let Some((image, digest)) = reference.rsplit_once("@sha256:") else {
+        return false;
+    };
+    let hex = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'f');
+    !image.is_empty()
+        && !image.contains(char::is_whitespace)
+        && digest.len() == 64
+        && digest.bytes().all(hex)
 }
 
-fn assert_rust_channel_approved(file: &str, line_no: usize, line: &str, resolved: &str) {
+fn rust_channel_violation(
+    file: &str,
+    line_no: usize,
+    line: &str,
+    resolved: &str,
+) -> Option<String> {
     let repo = resolved.split('@').next().unwrap_or(resolved);
     let is_rust = repo == "rust"
         || repo.ends_with("/rust")
         || repo.ends_with("/library/rust")
         || repo == "docker.io/library/rust";
     if !is_rust {
-        return;
+        return None;
     }
 
     // `repo:tag@sha256:...` is the pinned form this repository already uses for
     // `IPROUTE2_BASE`: the digest decides which bytes are pulled and the tag is
     // documentation, so a floating tag is only a finding when NO digest pins it.
-    if resolved.contains("@sha256:") {
-        return;
+    if is_digest_pinned(resolved) {
+        return None;
     }
 
     let tag = resolved
@@ -109,29 +155,113 @@ fn assert_rust_channel_approved(file: &str, line_no: usize, line: &str, resolved
         .map(|(_, tag)| tag)
         .unwrap_or("latest");
 
-    assert!(
-        !FLOATING_RUST_TAGS.contains(&tag),
+    if !FLOATING_RUST_TAGS.contains(&tag) {
+        return None;
+    }
+    Some(format!(
         "{file}:{line_no}: unapproved floating Rust channel `{tag}` in `{line}`; pin the \
          manifest-list digest as `rust:<tag>@sha256:<digest>`"
-    );
+    ))
+}
+
+/// Every pin violation in one Dockerfile. An instruction this gate cannot read
+/// completely is itself a violation, so it can never drop out of the scan.
+fn dockerfile_pin_violations(file: &str, dockerfile: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut arg_defaults = HashMap::new();
+    for (idx, line) in dockerfile.lines().enumerate() {
+        match parse_arg_instruction(line) {
+            Some(Ok((name, Some(value)))) => {
+                arg_defaults.insert(name, value);
+            }
+            Some(Err(error)) => violations.push(format!("{file}:{}: {error}", idx + 1)),
+            Some(Ok((_, None))) | None => {}
+        }
+    }
+    for (idx, line) in dockerfile.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim();
+        let image = match parse_from_instruction(line) {
+            Some(Ok(image)) => image,
+            Some(Err(error)) => {
+                violations.push(format!("{file}:{line_no}: {error}"));
+                continue;
+            }
+            None => continue,
+        };
+        if image == "scratch" || is_local_stage_reference(&image) {
+            continue;
+        }
+
+        let resolved = resolve_image_reference(&image, &arg_defaults);
+        if !is_digest_pinned(&resolved) {
+            violations.push(format!(
+                "{file}:{line_no}: production Dockerfile `FROM` must pin external bases by \
+                 `@sha256:` digest (allow `scratch` or a local stage alias); got `{trimmed}`"
+            ));
+        }
+        if let Some(violation) = rust_channel_violation(file, line_no, trimmed, &resolved) {
+            violations.push(violation);
+        }
+    }
+    violations
 }
 
 #[test]
 fn production_dockerfiles_pin_external_bases_by_digest() {
     for (file, dockerfile) in PRODUCTION_DOCKERFILES {
-        let arg_defaults = parse_arg_defaults(dockerfile);
-        for (idx, line) in dockerfile.lines().enumerate() {
-            let line_no = idx + 1;
-            let Some(image) = from_image_token(line) else {
-                continue;
-            };
-            if image == "scratch" || is_local_stage_reference(&image) {
-                continue;
-            }
-
-            let resolved = resolve_image_reference(&image, &arg_defaults);
-            assert_digest_pinned(file, line_no, line.trim(), &resolved);
-            assert_rust_channel_approved(file, line_no, line.trim(), &resolved);
-        }
+        let violations = dockerfile_pin_violations(file, dockerfile);
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
     }
+}
+
+const PINNED_FIXTURE: &str = "\
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG IPROUTE2_VERSION=6.15.0-1
+# Digest resolved YYYY-MM-DD; the tag is kept for readability, the digest is authoritative.
+FROM debian:13-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS data-dir
+FROM ${RUNTIME_BASE} AS runtime
+";
+
+#[test]
+fn pinned_fixture_has_no_violations() {
+    let violations = dockerfile_pin_violations("fixture", PINNED_FIXTURE);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// Issue #6382: a note appended after a `FROM` or image `ARG` instruction must
+/// fail as an unsupported instruction, not be read as its first token.
+#[test]
+fn trailing_text_after_a_pin_instruction_is_rejected() {
+    let cases = [
+        (" AS data-dir\n", " AS data-dir # resolved today\n", 4),
+        (" AS runtime\n", " AS runtime extra\n", 5),
+        ("aaaa\nARG IPROUTE2", "aaaa # resolved today\nARG IPROUTE2", 1),
+        ("6.15.0-1\n", "6.15.0-1 # note\n", 2),
+    ];
+    for (original, replacement, line_no) in cases {
+        let tailed = PINNED_FIXTURE.replacen(original, replacement, 1);
+        assert!(
+            tailed != PINNED_FIXTURE,
+            "fixture replacement `{original}` must apply"
+        );
+        let violations = dockerfile_pin_violations("fixture", &tailed);
+        let prefix = format!("fixture:{line_no}: unsupported");
+        assert!(
+            violations.iter().any(|v| v.starts_with(&prefix)),
+            "trailing text on line {line_no} must be rejected; got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn digest_must_terminate_the_reference() {
+    let digest = "b".repeat(64);
+    let truncated = PINNED_FIXTURE.replacen(&digest, &digest[1..], 1);
+    let violations = dockerfile_pin_violations("fixture", &truncated);
+    let prefix = "fixture:4: production Dockerfile";
+    assert!(
+        violations.iter().any(|v| v.starts_with(prefix)),
+        "a short digest must not count as pinned; got {violations:?}"
+    );
 }
