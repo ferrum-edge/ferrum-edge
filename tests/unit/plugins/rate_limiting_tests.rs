@@ -2100,16 +2100,24 @@ fn composed_limiter(requests_per_minute: u64, expose_headers: bool) -> Arc<dyn P
     }))) as Arc<dyn Plugin>
 }
 
-fn composed_window_limiter(policy_id: &str, window_seconds: u64) -> Arc<dyn Plugin> {
+fn composed_budget_limiter(
+    policy_id: &str,
+    max_requests: u64,
+    window_seconds: u64,
+) -> Arc<dyn Plugin> {
     let config = rate_limiting_config(json!({
         "limit_by": "ip",
         "expose_headers": true,
         "window_seconds": window_seconds,
-        "max_requests": 2,
+        "max_requests": max_requests,
     }));
     Arc::new(
         RateLimiting::new_with_config_id(&config, PluginHttpClient::default(), policy_id).unwrap(),
     ) as Arc<dyn Plugin>
+}
+
+fn composed_window_limiter(policy_id: &str, window_seconds: u64) -> Arc<dyn Plugin> {
+    composed_budget_limiter(policy_id, 2, window_seconds)
 }
 
 fn meta<'a>(ctx: &'a RequestContext, key: &str) -> Option<&'a str> {
@@ -2327,6 +2335,70 @@ async fn composed_admitted_limiters_break_equal_remaining_ties_independent_of_or
             .await,
     );
     assert_eq!(reversed_headers, headers);
+}
+
+/// Equal remaining counts and windows prefer the smaller limit, regardless
+/// of which policy's priority makes it run first.
+#[tokio::test]
+async fn composed_admitted_limit_ties_choose_the_smaller_limit_in_either_order() {
+    let smaller = composed_budget_limiter("smaller-limit-policy", 2, 1);
+    let larger = composed_budget_limiter("larger-limit-policy", 3, 1);
+    let mut ctx = create_test_context();
+    assert_continue(smaller.on_request_received(&mut ctx).await);
+    assert_continue(larger.on_request_received(&mut ctx).await);
+
+    assert_eq!(meta(&ctx, "ratelimit_limit"), Some("2"));
+    assert_eq!(meta(&ctx, "ratelimit_remaining"), Some("1"));
+    let mut headers = HashMap::new();
+    assert_continue(smaller.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_continue(larger.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_eq!(headers.get("x-ratelimit-limit").map(String::as_str), Some("2"));
+
+    let smaller_reversed = composed_budget_limiter("smaller-limit-policy", 2, 1);
+    let larger_reversed = composed_budget_limiter("larger-limit-policy", 3, 1);
+    let mut reversed = create_test_context();
+    assert_continue(larger_reversed.on_request_received(&mut reversed).await);
+    assert_continue(smaller_reversed.on_request_received(&mut reversed).await);
+
+    assert_eq!(meta(&reversed, "ratelimit_limit"), Some("2"));
+    assert_eq!(meta(&reversed, "ratelimit_remaining"), Some("1"));
+    let mut reversed_headers = HashMap::new();
+    assert_continue(
+        larger_reversed
+            .after_proxy(&mut reversed, 200, &mut reversed_headers)
+            .await,
+    );
+    assert_continue(
+        smaller_reversed
+            .after_proxy(&mut reversed, 200, &mut reversed_headers)
+            .await,
+    );
+    assert_eq!(reversed_headers, headers);
+}
+
+/// Otherwise identical budgets use the lexicographically smaller policy id
+/// as the stable owner in either plugin order.
+#[tokio::test]
+async fn composed_admitted_policy_id_ties_choose_the_smaller_id_in_either_order() {
+    let smaller_id = composed_budget_limiter("a-policy", 2, 1);
+    let larger_id = composed_budget_limiter("z-policy", 2, 1);
+    let mut ctx = create_test_context();
+    assert_continue(smaller_id.on_request_received(&mut ctx).await);
+    assert_continue(larger_id.on_request_received(&mut ctx).await);
+    assert_eq!(
+        meta(&ctx, "ratelimit_authority"),
+        Some("admitted:1:2:1:a-policy")
+    );
+
+    let smaller_id_reversed = composed_budget_limiter("a-policy", 2, 1);
+    let larger_id_reversed = composed_budget_limiter("z-policy", 2, 1);
+    let mut reversed = create_test_context();
+    assert_continue(larger_id_reversed.on_request_received(&mut reversed).await);
+    assert_continue(smaller_id_reversed.on_request_received(&mut reversed).await);
+    assert_eq!(
+        meta(&reversed, "ratelimit_authority"),
+        Some("admitted:1:2:1:a-policy")
+    );
 }
 
 #[test]

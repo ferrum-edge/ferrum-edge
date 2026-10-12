@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -84,11 +85,21 @@ impl HeaderAuthority<'_> {
                 limit,
                 window_seconds,
                 policy_id,
-            } => format!(
-                "{RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX}{remaining}:{}:{}:{policy_id}",
-                limit.map_or_else(|| "-".to_string(), |value| value.to_string()),
-                window_seconds.map_or_else(|| "-".to_string(), |value| value.to_string()),
-            ),
+            } => {
+                let mut authority = String::with_capacity(
+                    RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX.len() + 3 * 20 + 3 + policy_id.len(),
+                );
+                let _ = write!(
+                    authority,
+                    "{RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX}{remaining}:"
+                );
+                write_optional_authority_number(&mut authority, *limit);
+                authority.push(':');
+                write_optional_authority_number(&mut authority, *window_seconds);
+                authority.push(':');
+                authority.push_str(policy_id);
+                authority
+            }
         }
     }
 
@@ -113,13 +124,22 @@ impl HeaderAuthority<'_> {
                 window_seconds,
                 policy_id,
             } => {
-                let candidate = (*remaining, *limit, *window_seconds, policy_id.as_str());
+                let candidate = (*remaining, *limit, *window_seconds, *policy_id);
                 let current = existing
                     .strip_prefix(RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX)
                     .and_then(parse_admitted_authority);
                 current.is_none_or(|current| candidate < current)
             }
         }
+    }
+}
+
+fn write_optional_authority_number(output: &mut String, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            let _ = write!(output, "{value}");
+        }
+        None => output.push('-'),
     }
 }
 
