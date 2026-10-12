@@ -10,11 +10,14 @@
 
 use ferrum_edge::circuit_breaker::CircuitBreakerCache;
 use ferrum_edge::config::types::{
-    CircuitBreakerConfig, GatewayConfig, PassiveHealthCheck, Upstream, UpstreamTarget,
+    CircuitBreakerConfig, GatewayConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Upstream,
+    UpstreamTarget,
 };
 use ferrum_edge::data_path_metrics;
 use ferrum_edge::health_check::HealthChecker;
+use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::overload::OverloadState;
+use ferrum_edge::service_discovery::merge_targets;
 use std::sync::atomic::Ordering;
 
 const NS_LABEL: &str = ",namespace=\"ferrum\"";
@@ -43,6 +46,14 @@ fn target_fixture(host: &str) -> UpstreamTarget {
 fn passive_fixture() -> PassiveHealthCheck {
     let json = serde_json::json!({"unhealthy_threshold": 1});
     serde_json::from_value(json).expect("passive policy fixture")
+}
+
+/// Render the upstream-health families from the load balancer's active
+/// target set, exactly as the `/metrics` scrape does.
+fn render_health(load_balancer: &LoadBalancerCache, health: &HealthChecker) -> String {
+    let mut out = String::new();
+    data_path_metrics::render_upstream_health(&mut out, &load_balancer.load(), health, NS_LABEL);
+    out
 }
 
 /// Every sample line for `metric` in `text`, without the trailing newline.
@@ -137,8 +148,7 @@ fn active_and_passive_ejections_render_as_bounded_counts() {
         Some(&passive),
     );
 
-    let mut out = String::new();
-    data_path_metrics::render_upstream_health(&mut out, &config, &health, NS_LABEL);
+    let out = render_health(&LoadBalancerCache::new(&config), &health);
 
     assert!(
         out.contains(
@@ -176,8 +186,7 @@ fn a_healthy_upstream_still_publishes_a_zero_unhealthy_series() {
     let config = upstream_fixture();
     let health = HealthChecker::new();
 
-    let mut out = String::new();
-    data_path_metrics::render_upstream_health(&mut out, &config, &health, NS_LABEL);
+    let out = render_health(&LoadBalancerCache::new(&config), &health);
 
     assert!(
         out.contains(
@@ -185,6 +194,207 @@ fn a_healthy_upstream_still_publishes_a_zero_unhealthy_series() {
         ),
         "recovery must be a value change, not a vanishing series:\n{out}"
     );
+}
+
+/// A discovery-only upstream with no static targets, a mixed upstream with one
+/// static target, and a same-id upstream in another namespace that discovery
+/// never touches.
+fn discovery_fixture() -> GatewayConfig {
+    let mut config = GatewayConfig::default();
+    for json in [
+        serde_json::json!({"id": "pods", "namespace": "ferrum", "targets": []}),
+        serde_json::json!({
+            "id": "mixed",
+            "namespace": "ferrum",
+            "targets": [{"host": "static-a.internal", "port": 8080}]
+        }),
+        serde_json::json!({
+            "id": "pods",
+            "namespace": "tenant",
+            "targets": [{"host": "tenant-a.internal", "port": 8080}]
+        }),
+    ] {
+        let upstream: Upstream = serde_json::from_value(json).expect("upstream fixture");
+        config.upstreams.push(upstream);
+    }
+    config
+}
+
+/// Install `discovered` the way service discovery does: merge it under the
+/// upstream's static targets, publish the merged set to the load balancer, and
+/// prune active-health state for targets that left it.
+fn install_discovered(
+    load_balancer: &LoadBalancerCache,
+    health: &HealthChecker,
+    id: &str,
+    static_targets: &[UpstreamTarget],
+    discovered: &[UpstreamTarget],
+) {
+    let merged = merge_targets(static_targets, discovered);
+    load_balancer.update_targets(
+        "ferrum",
+        id,
+        merged.clone(),
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+    );
+    health.remove_stale_targets("ferrum", id, &merged);
+}
+
+/// The value of one per-upstream gauge sample, if the series is present.
+fn upstream_gauge(out: &str, metric: &str, namespace: &str, upstream_id: &str) -> Option<u64> {
+    let prefix = format!(
+        "{metric}{{upstream_id=\"{upstream_id}\",upstream_namespace=\"{namespace}\",namespace=\"ferrum\"}} "
+    );
+    out.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|value| value.parse().expect("gauge value"))
+}
+
+fn targets_and_unhealthy(out: &str, namespace: &str, upstream_id: &str) -> (u64, u64) {
+    let targets = upstream_gauge(out, "ferrum_upstream_targets", namespace, upstream_id);
+    let unhealthy = upstream_gauge(
+        out,
+        "ferrum_upstream_unhealthy_targets",
+        namespace,
+        upstream_id,
+    );
+    match (targets, unhealthy) {
+        (Some(targets), Some(unhealthy)) => (targets, unhealthy),
+        _ => panic!("missing series for {namespace}/{upstream_id}:\n{out}"),
+    }
+}
+
+/// #6354: the ejection-ratio denominator counts the same merged static +
+/// discovered target set the load balancer serves and active probes run
+/// against, not only the configured `upstream.targets`.
+#[test]
+fn upstream_targets_count_the_discovered_active_target_set() {
+    let config = discovery_fixture();
+    let load_balancer = LoadBalancerCache::new(&config);
+    let health = HealthChecker::new();
+    let static_mixed = vec![target_fixture("static-a.internal")];
+
+    let out = render_health(&load_balancer, &health);
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "pods"), (0, 0));
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "mixed"), (1, 0));
+
+    install_discovered(
+        &load_balancer,
+        &health,
+        "pods",
+        &[],
+        &[
+            target_fixture("pod-a.internal"),
+            target_fixture("pod-b.internal"),
+            target_fixture("pod-c.internal"),
+        ],
+    );
+    // The discovered copy of the static target is merged away, exactly as the
+    // probe set is.
+    install_discovered(
+        &load_balancer,
+        &health,
+        "mixed",
+        &static_mixed,
+        &[
+            target_fixture("static-a.internal"),
+            target_fixture("pod-d.internal"),
+        ],
+    );
+    for key in [
+        "ferrum|pods::pod-a.internal:8080",
+        "ferrum|pods::pod-b.internal:8080",
+        "ferrum|mixed::pod-d.internal:8080",
+    ] {
+        health.active_unhealthy_targets.insert(key.to_string(), 1);
+    }
+
+    let out = render_health(&load_balancer, &health);
+    assert_eq!(
+        targets_and_unhealthy(&out, "ferrum", "pods"),
+        (3, 2),
+        "a discovery-only upstream must not report a zero denominator:\n{out}"
+    );
+    assert_eq!(
+        targets_and_unhealthy(&out, "ferrum", "mixed"),
+        (2, 1),
+        "a mixed upstream must count static and discovered targets together:\n{out}"
+    );
+    assert_eq!(
+        targets_and_unhealthy(&out, "tenant", "pods"),
+        (1, 0),
+        "the same upstream id in another namespace is a distinct series:\n{out}"
+    );
+    assert_eq!(samples(&out, "ferrum_upstream_targets").len(), 3, "{out}");
+    assert!(
+        !out.contains(".internal"),
+        "no target host may appear in any label:\n{out}"
+    );
+}
+
+/// #6354: the denominator follows staleness withdrawal, recovery, and endpoint
+/// churn, and a withdrawn upstream keeps a zero-valued series.
+#[test]
+fn upstream_targets_follow_discovery_withdrawal_recovery_and_churn() {
+    let config = discovery_fixture();
+    let load_balancer = LoadBalancerCache::new(&config);
+    let health = HealthChecker::new();
+    let static_mixed = vec![target_fixture("static-a.internal")];
+    let first = vec![
+        target_fixture("pod-a.internal"),
+        target_fixture("pod-b.internal"),
+    ];
+
+    install_discovered(&load_balancer, &health, "pods", &[], &first);
+    install_discovered(&load_balancer, &health, "mixed", &static_mixed, &first);
+    health
+        .active_unhealthy_targets
+        .insert("ferrum|pods::pod-a.internal:8080".to_string(), 1);
+    let out = render_health(&load_balancer, &health);
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "pods"), (2, 1));
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "mixed"), (3, 0));
+
+    // Staleness withdrawal republishes the static targets alone.
+    install_discovered(&load_balancer, &health, "pods", &[], &[]);
+    install_discovered(&load_balancer, &health, "mixed", &static_mixed, &[]);
+    let out = render_health(&load_balancer, &health);
+    assert_eq!(
+        targets_and_unhealthy(&out, "ferrum", "pods"),
+        (0, 0),
+        "withdrawal must be a value change, not a vanishing series:\n{out}"
+    );
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "mixed"), (1, 0));
+
+    // Recovery republishes the discovered set.
+    install_discovered(&load_balancer, &health, "pods", &[], &first);
+    install_discovered(&load_balancer, &health, "mixed", &static_mixed, &first);
+    let out = render_health(&load_balancer, &health);
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "pods"), (2, 0));
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "mixed"), (3, 0));
+
+    // Churn: a replacement endpoint set of a different size. Health state for
+    // an endpoint that left the set is pruned with it.
+    health
+        .active_unhealthy_targets
+        .insert("ferrum|pods::pod-a.internal:8080".to_string(), 1);
+    install_discovered(
+        &load_balancer,
+        &health,
+        "pods",
+        &[],
+        &[
+            target_fixture("pod-c.internal"),
+            target_fixture("pod-d.internal"),
+            target_fixture("pod-e.internal"),
+        ],
+    );
+    health
+        .active_unhealthy_targets
+        .insert("ferrum|pods::pod-c.internal:8080".to_string(), 1);
+    let out = render_health(&load_balancer, &health);
+    assert_eq!(targets_and_unhealthy(&out, "ferrum", "pods"), (3, 1));
+    assert_eq!(targets_and_unhealthy(&out, "tenant", "pods"), (1, 0));
 }
 
 #[test]

@@ -2331,7 +2331,7 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         gateway_ns_label,
     );
     output.push_str(
-        "# HELP ferrum_mesh_udp_placement_migration_adoption_proof Node-specific proof that authorized a recordless Ambient UDP placement adoption (one bounded proof is 1).\n",
+        "# HELP ferrum_mesh_udp_placement_migration_adoption_proof Node-specific proof of the last Ambient UDP placement adoption recorded by this process without a same-incarnation durable ownership record (no record, or a record from an earlier boot of this node UID); one bounded proof is 1, and none is 1 until this process records an adoption.\n",
     );
     output.push_str("# TYPE ferrum_mesh_udp_placement_migration_adoption_proof gauge\n");
     for proof in [
@@ -2348,7 +2348,7 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         ));
     }
     output.push_str(
-        "# HELP ferrum_mesh_udp_placement_migration_adoptions_total Recordless Ambient UDP placement adoptions by bounded node-specific proof.\n",
+        "# HELP ferrum_mesh_udp_placement_migration_adoptions_total Ambient UDP placement adoptions recorded by this process without a same-incarnation durable ownership record (no record, or a record from an earlier boot of this node UID), by bounded node-specific proof; process-local, not durable adoption history.\n",
     );
     output.push_str("# TYPE ferrum_mesh_udp_placement_migration_adoptions_total counter\n");
     for proof in [
