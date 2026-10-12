@@ -63,6 +63,15 @@ jobs:
           python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
           python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
 
+      # Pure gate-logic self-tests (no sockets, no benchmarks): a timed run with
+      # no successful responses must fail the overhead check, and semantic-cache
+      # Criterion samples are refused without verified fixture evidence.
+      - name: Self-test overhead and semantic-cache benchmark gates
+        run: |
+          set -euo pipefail
+          python3 tests/performance/ci_overhead_bench.py --self-test
+          python3 .github/scripts/verify_ai_semantic_cache_cleanup_benchmark.py --self-test
+
       - name: Detect performance-sensitive changes
         id: perf_changes
         shell: bash
@@ -259,13 +268,19 @@ jobs:
           python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
           bash .github/scripts/run_rr_selection_comparison.sh
 
-      - name: Run AI semantic-cache cleanup p99 microbenchmark
+      - name: Run AI semantic-cache cleanup microbenchmark
         if: steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
         run: |
+          set -euo pipefail
+          # The bench writes this only after verifying, outside the timed loop,
+          # that every entry was seeded and retained through the production
+          # final-body hooks; the evaluator refuses samples without it.
+          export AI_SEMANTIC_CACHE_FIXTURE_EVIDENCE="${GITHUB_WORKSPACE}/tests/performance/ci_results/ai_semantic_cache_cleanup_fixture.json"
           cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench ai_semantic_cache_cleanup
           python3 .github/scripts/verify_ai_semantic_cache_cleanup_benchmark.py \
             --criterion-root tests/performance/mesh/target/criterion \
             --max-scaling-ratio 3 \
+            --fixture-evidence "${AI_SEMANTIC_CACHE_FIXTURE_EVIDENCE}" \
             --output tests/performance/ci_results/ai_semantic_cache_cleanup.json
 
       - name: Build release binaries
@@ -388,7 +403,7 @@ jobs:
           fi
           if [ "${RUN_AI_SEMANTIC_CACHE}" = "true" ]; then
             {
-              echo "AI semantic-cache cleanup guard executed: Criterion sample p99 at 10,000 and 100,000 retained entries; 100,000/10,000 p99 ratio <= 3x."
+              echo "AI semantic-cache cleanup guard executed: p99 of Criterion sample means (not per-request p99) for an exact local miss through the final-request-body hook at 10,000 and 100,000 entries, each seeded and replayed as a retained hit before timing; 100,000/10,000 ratio <= 3x."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
