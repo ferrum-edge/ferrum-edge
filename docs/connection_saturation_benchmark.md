@@ -78,6 +78,9 @@ Trigger via GitHub Actions: **Connection Saturation Benchmark** → Run workflow
 
 ### Local (ferrum only)
 
+Run this block from the repository root; it stays there throughout (the
+backend launch runs in a subshell so the parent directory never changes).
+
 ```bash
 # Build
 cd tests/performance/multi_protocol && cargo build --release && cd -
@@ -89,8 +92,7 @@ sudo sysctl -w net.inet.ip.portrange.hifirst=1024
 ulimit -n 524288
 
 # Start backend
-cd tests/performance/multi_protocol && ./target/release/proto_backend &
-cd -
+(cd tests/performance/multi_protocol && ./target/release/proto_backend) &
 sleep 3
 
 # Substitute the CA_PATH placeholder with the backend's generated CA, then start the gateway

@@ -479,18 +479,46 @@ is set above `0`: `reason="error"` counts every rustls accept failure, including
 mid-handshake client disconnects and scanners, so a `0` threshold would fire
 permanently on an internet-facing listener. Enabling metrics does **not**
 change `admin.bindAddress`; you must explicitly expose admin for cluster
-scraping:
+scraping. Choose **one** of the two alternatives below — they are not a single
+block to copy together, and neither is a complete installation recipe.
+
+CIDR-only (no Bearer [REDACTED]; the scrape source IP is the credential):
 
 ```yaml
 metrics:
   enabled: true
-  allowedCidrs: "10.0.0.0/8"   # Prometheus subnet, OR:
+  allowedCidrs: "10.0.0.0/8"   # Prometheus subnet
+  serviceMonitor:
+    enabled: true
+admin:
+  bindAddress: "0.0.0.0"
+  service:
+    enabled: true
+  allowedCidrs: "10.0.0.0/8,127.0.0.0/8"   # database/cp: required for plaintext admin
+```
+
+Bearer [REDACTED] (requires admin HTTPS plus a verifying scrape `tlsConfig`;
+replace the Secret/certificate placeholders with operator-provided values):
+
+```yaml
+metrics:
+  enabled: true
   bearerToken:
     existingSecret:
       name: ferrum-metrics
       key: metrics-bearer-token
   serviceMonitor:
     enabled: true
+    tlsConfig:
+      ca:
+        secret:
+          name: ferrum-admin-tls   # Secret holding the admin CA bundle
+          key: ca.crt
+      serverName: ferrum-gateway-admin.ferrum.svc   # name on the admin certificate
+tls:
+  admin:
+    enabled: true
+    secretName: ferrum-admin-tls   # admin server certificate/key Secret
 admin:
   bindAddress: "0.0.0.0"
   service:

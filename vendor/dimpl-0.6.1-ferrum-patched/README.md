@@ -71,6 +71,7 @@ references into your provided buffer:
 - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
 - `Connected`: handshake complete
 - `PeerCert(&[u8])`: peer leaf certificate (DER) — validate in your app
+- `PeerCertChain`: complete peer certificate chain, leaf‑first — validate in your app
 - `KeyingMaterial(KeyingMaterial, SrtpProfile)`: DTLS‑SRTP export
 - `ApplicationData(&[u8])`: plaintext received from peer
 - `CloseNotify`: peer sent a `close_notify` alert (graceful shutdown)
@@ -90,6 +91,7 @@ fn send_udp(_bytes: &[u8]) {}
 
 fn example_event_loop(mut dtls: Dtls) -> Result<(), dimpl::Error> {
     let mut next_wake: Option<Instant> = None;
+    let mut close_received = false;
     loop {
         // Drain engine output until we have to wait for I/O or a timer
         let mut out_buf = vec![0u8; 2048];
@@ -101,7 +103,11 @@ fn example_event_loop(mut dtls: Dtls) -> Result<(), dimpl::Error> {
                     // DTLS established — application may start sending
                 }
                 Output::PeerCert(_der) => {
-                    // Inspect peer leaf certificate if desired
+                    // Application MUST validate the peer leaf certificate
+                    // against its own policy (see "Certificate model" above)
+                }
+                Output::PeerCertChain(_chain) => {
+                    // Application MUST validate the peer chain per its policy
                 }
                 Output::KeyingMaterial(_km, _profile) => {
                     // Provide to SRTP stack
@@ -110,11 +116,19 @@ fn example_event_loop(mut dtls: Dtls) -> Result<(), dimpl::Error> {
                     // Deliver plaintext to application
                 }
                 Output::CloseNotify => {
-                    // Peer initiated graceful shutdown
-                    break;
+                    // Peer initiated graceful shutdown. Record it and keep
+                    // draining: `Timeout` is the last output of a poll cycle
+                    // and internal state is only consistent after reaching it,
+                    // so never break the inner loop here.
+                    close_received = true;
                 }
                 _ => {}
             }
+        }
+
+        // The poll cycle reached `Timeout`; only now act on the close.
+        if close_received {
+            return Ok(());
         }
 
         // Block waiting for either UDP input or the scheduled timeout
