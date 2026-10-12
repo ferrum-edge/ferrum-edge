@@ -702,9 +702,7 @@ impl Plugin for Opa {
 
 /// Parse `opa_host` + `policy_path` into the wire decision URL, its
 /// diagnostic-safe rendering, and the hostname used for DNS warmup.
-fn parse_decision_endpoint(
-    object: &Map<String, Value>,
-) -> Result<(Url, String, String), String> {
+fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(Url, String, String), String> {
     let opa_host = required_string(object, "opa_host")?;
     let parsed =
         Url::parse(opa_host).map_err(|error| format!("opa: invalid `opa_host`: {error}"))?;
