@@ -86,6 +86,28 @@ ignore = [
     # (tests/scaffolding/matrix.rs, dev-dependency). Dropping our dev-dependency
     # alone would not remove the crate while tikv-jemalloc-ctl keeps it.
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained; proc-macro only (tikv-jemalloc-ctl, still paste ^1 in 0.7.0 as of 2026-09-24, plus the test matrix dev-dependency), no runtime or network surface. Re-evaluate when tikv-jemalloc-ctl drops paste. [expires:2026-12-31]" },
+
+    # ── unsafe-libyaml 0.2.11 — RUSTSEC-2024-0449, unmaintained (repository
+    # archived 2024-03-25; `patched = []`, 0.2.11 is the last release). An
+    # informational advisory, not a known vulnerability: the crate is a c2rust
+    # translation of libyaml and future bugs will not be fixed upstream. Parents
+    # (root Cargo.lock, and fuzz/Cargo.lock through ferrum-edge; not in
+    # ebpf/Cargo.lock):
+    #   - serde_yaml 0.9.34+deprecated, used by the file-mode / mesh file
+    #     config loaders, config migration, and API-spec YAML export.
+    #   - ferrum-edge itself: a direct pin that drives the libyaml event parser
+    #     in src/admin/api_specs/bounded_yaml.rs and
+    #     src/config/yaml_alias_budget.rs to bound alias expansion before any
+    #     document is materialized (#3307, PR #3843).
+    # Input trust: file-backed gateway/mesh config, config-migration input, and
+    # the Kubernetes MeshConfig ConfigMap are operator-controlled; API-spec
+    # bodies come from authenticated Admin API callers under body-size,
+    # node, depth, alias, and work budgets. No unauthenticated network input
+    # reaches libyaml. The serde_yaml forks (e.g. serde_yaml_ng) still depend
+    # on unsafe-libyaml, so retiring this needs a migration of both serde_yaml
+    # and the two event parsers to a safe-Rust YAML parser (saphyr /
+    # serde-saphyr).
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability). Parents: serde_yaml 0.9.34+deprecated and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2026-12-31]" },
 ]
 
 [bans]

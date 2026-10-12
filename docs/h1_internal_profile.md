@@ -93,8 +93,8 @@ CPU time. Unscoped process traffic can be derived only from a complete snapshot.
 
 | Source site | Exact observation | Boundary / limitation |
 | --- | --- | --- |
-| `body.rs::direct_streaming_body` reqwest byte stream | input DATA/frame bytes, poll/Pending/error/EOF, disjoint size buckets | response input only; reqwest has already adapted wire framing |
-| `body.rs::coalescing_body` reqwest byte stream | same, separate counters | input before aggregation; no direct-H2/H3/upload coverage claimed |
+| `body.rs::direct_streaming_body` reqwest response frame adapter | input DATA/frame bytes, poll/Pending/error/EOF, disjoint size buckets | observes logical frames after trailer stripping/governance and suppression; not every raw backend frame or wire event |
+| `body.rs::coalescing_body` reqwest response frame adapter | same, separate counters | observes logical frames before aggregation, after trailer stripping/governance and suppression; not every raw backend frame or wire event; no direct-H2/H3/upload coverage claimed |
 | `proxy/mod.rs` `StreamingH2` arm, `body.rs::observe_h1_backend_input` over an HTTP/1.x `hyper::body::Incoming` | same two boundaries: the direct adapters (cutoff 0, and the >= 512 KiB declared-length passthrough) count as `direct`, the coalescer as `coalesced` | direct HTTP/1.1 pool and Unix-socket/HBONE inner HTTP/1.1 bodies, only while `FERRUM_POOL_HTTP1_DIRECT=true`; hyper has already decoded wire framing; HTTP/2 backend bodies on that arm are not observed |
 | `body.rs::ProxyBody::poll_frame` | output DATA/non-DATA, bytes, poll/Pending/error/EOF, size buckets | shared output across protocols, not H1-only; known EOF may let Hyper skip a final poll |
 | `CoalesceBuffer::push`, Single promotion, both `extend_from_slice` calls | `first.len()` plus `data.len()` copied, after each executed call | exact explicit source copies, all coalescer users |

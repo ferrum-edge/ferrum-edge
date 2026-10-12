@@ -14,8 +14,16 @@ pub struct ControllerMetrics {
     /// is empty (fairness must still progress), or after a successful
     /// status-patch batch on the serialized reconcile path. Patch errors and
     /// batch timeouts leave the cursor unchanged so the same bounded window is
-    /// retried on the next reconcile.
+    /// retried on the next reconcile, until the window has failed
+    /// `STATUS_WINDOW_MAX_FAILED_BATCHES` times in a row; then it advances so a
+    /// persistently failing object cannot starve candidates outside the window
+    /// (#6370).
     pub gateway_api_status_plan_cursor: AtomicU64,
+    /// Consecutive failed Gateway API status patch batches recorded against
+    /// [`Self::gateway_api_status_plan_cursor`] (#6370). Bookkeeping for the
+    /// bounded window retry, not a metric; deliberately absent from
+    /// [`MetricsSnapshot`].
+    pub gateway_api_status_window_failed_batches: AtomicU64,
     /// Reflector generations restarted because a watch scope produced no event
     /// for the configured idle window (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`), or
     /// because a replacement generation never finished its initial list.
@@ -130,6 +138,7 @@ impl ControllerMetrics {
             errors: AtomicU64::new(0),
             last_reconcile_duration_ms: AtomicU64::new(0),
             gateway_api_status_plan_cursor: AtomicU64::new(0),
+            gateway_api_status_window_failed_batches: AtomicU64::new(0),
             watch_idle_relists: AtomicU64::new(0),
             watch_deletes: AtomicU64::new(0),
             config_publications: AtomicU64::new(0),

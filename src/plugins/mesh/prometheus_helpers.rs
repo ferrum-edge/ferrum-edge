@@ -1193,11 +1193,14 @@ pub fn set_mesh_inbound_plaintext_allowed(allowed: bool) {
     MESH_INBOUND_PLAINTEXT_ALLOWED.store(u64::from(allowed), Ordering::Relaxed);
 }
 
-/// Count a NACK of a required mesh-slice type that occurred while the DP is
-/// still waiting for its first slice. A persistently NACKing required type
-/// wedges `wait_for_first_slice()` until the NACK circuit breaker trips, so a
-/// non-zero, growing value here is the operator signal that startup
-/// convergence is blocked by a malformed required resource.
+/// Count a NACK emitted while the consumer's xDS accumulator is incomplete.
+/// Each consumer applies its own predicate (Ferrum xDS: a required mesh-slice
+/// type while a required type is absent; stock xDS: any type while the stock
+/// accumulator is not ready), so this is not runtime first-slice state. A
+/// persistently NACKing required type wedges `wait_for_first_slice()` until
+/// the NACK circuit breaker trips, so a non-zero, growing value here is the
+/// operator signal that startup convergence is blocked by a malformed required
+/// resource.
 pub fn increment_xds_first_slice_nack(namespace: impl AsRef<str>, type_url: impl AsRef<str>) {
     let key = XdsFirstSliceNackKey {
         namespace: Arc::from(namespace.as_ref()),
@@ -1486,7 +1489,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
 
     if !MESH_CONFIG_STREAM_ATTEMPTS.is_empty() {
         output.push_str(
-            "# HELP ferrum_mesh_config_stream_attempts_total Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a dial failure while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure.\n",
+            "# HELP ferrum_mesh_config_stream_attempts_total Completed mesh configuration-stream attempts by consumer protocol (native/xds/stock_xds) and closed-set outcome. A remote clean EOF is an endpoint failure, not a success. Local retirements (shutdown, tls_reload, credential_rotated, credential_source_invalid, credential_deadline, primary_retry) never rotate the endpoint or grow backoff. transport_failure is a pre-establishment attempt failure, such as a dial failure or an RPC-open refusal (xds and stock_xds count every RPC-open refusal here, RESOURCE_EXHAUSTED included), while established_transport_failure is an already-open stream going dark; heartbeat_silence_timeout is the native application-silence bound, not an HTTP/2 keepalive timeout. admission_refused is emitted only by the native consumer, for a CP stream-admission capacity/tenancy refusal (RESOURCE_EXHAUSTED): the control plane is alive and answering, so it is deliberately not a transport failure.\n",
         );
         output.push_str("# TYPE ferrum_mesh_config_stream_attempts_total counter\n");
         for entry in MESH_CONFIG_STREAM_ATTEMPTS.iter() {
@@ -1736,7 +1739,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
 
     if !XDS_FIRST_SLICE_NACKS.is_empty() {
         output.push_str(
-            "# HELP ferrum_xds_first_slice_nacks_total NACKs of a required mesh-slice type while the data plane is still waiting for its first slice.\n",
+            "# HELP ferrum_xds_first_slice_nacks_total xDS NACKs counted while the consumer's accumulator is incomplete, by protocol-specific predicate: xds counts a required mesh-slice type while a required type is absent (recorded before the NACK is enqueued); stock_xds counts any supported type while CDS or a subscribed EDS is missing (recorded after the NACK is enqueued). Not runtime first-slice state: a control-plane reset can re-arm it after a slice exists, and version skew among present types is not counted.\n",
         );
         output.push_str("# TYPE ferrum_xds_first_slice_nacks_total counter\n");
         for entry in XDS_FIRST_SLICE_NACKS.iter() {
@@ -1838,7 +1841,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     let workload_api_rpcs_rejected = WORKLOAD_API_RPCS_REJECTED.load(Ordering::Relaxed);
     if workload_api_rpcs_rejected > 0 {
         output.push_str(
-            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total SPIFFE Workload API RPCs shed by RPC admission — the service-wide concurrency ceiling or the per-peer-UID quota — before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.\n",
+            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total SPIFFE Workload API RPCs refused by RPC admission before any producer work was spawned: shed by the service-wide concurrency ceiling or the per-peer-UID quota (RESOURCE_EXHAUSTED), or refused for missing kernel-attested peer credentials (PERMISSION_DENIED, defence in depth behind the connection gate). The HTTP/2 stream is already open, so this is not a protocol-level stream refusal.\n",
         );
         output.push_str("# TYPE ferrum_mesh_workload_api_rpcs_rejected_total counter\n");
         render_mesh_process_metric(
