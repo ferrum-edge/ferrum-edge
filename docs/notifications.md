@@ -124,7 +124,7 @@ Bounds (all enforced, all fail closed or truncate visibly):
 | `${fields}` block | 8 KiB hard ceiling (names, values, separators, truncation marker); 512 B per value |
 | SMTP reply | 1 KiB per line, 64 lines, 16 KiB total |
 | Concurrent SMTP sessions per channel | 4 (further dispatches fail immediately rather than queue) |
-| Timeouts | `connect_timeout_ms` applies independently to DNS resolution, TCP connect, and the TLS handshake (so a stalled connect can take up to 3× the configured value before it fails); `command_timeout_ms` bounds each command/reply exchange including `DATA` |
+| Timeouts | `connect_timeout_ms` applies independently to DNS resolution, TCP connect, and the TLS handshake (so a stalled connect can take up to 3× the configured value before it fails); `command_timeout_ms` is a per-phase budget, not a total wall-clock bound for the exchange — it applies independently to each write+flush and then to each reply read (a single command/reply exchange can therefore take up to 2× the value), and the `DATA` body write, terminator write, and final reply read each carry their own independent budget |
 
 Security notes:
 

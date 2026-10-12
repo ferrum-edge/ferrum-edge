@@ -357,31 +357,39 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | Field | Limit | Description |
 |-------|-------|-------------|
 | `default_weight` | 1–65,535 | Default weight for discovered targets |
-| `dns_sd.service_name` | 255 chars, non-empty | DNS SRV record name |
+| `dns_sd.service_name` | 255 UTF-8 bytes, non-empty | DNS SRV record name |
 | `dns_sd.poll_interval_seconds` | 1–3,600 | DNS poll interval |
-| `kubernetes.namespace` | 255 chars | K8s namespace |
-| `kubernetes.service_name` | 255 chars, non-empty | K8s service name |
-| `kubernetes.port_name` | 255 chars | Optional EndpointSlice port name |
-| `kubernetes.label_selector` | 1024 chars | Optional label selector |
+| `kubernetes.namespace` | 255 UTF-8 bytes | K8s namespace |
+| `kubernetes.service_name` | 255 UTF-8 bytes, non-empty | K8s service name |
+| `kubernetes.port_name` | 255 UTF-8 bytes | Optional EndpointSlice port name |
+| `kubernetes.label_selector` | 1024 UTF-8 bytes | Optional label selector |
 | `kubernetes.poll_interval_seconds` | 1–3,600 | K8s poll interval |
-| `consul.address` | 2048 chars, non-empty | Consul HTTP API address |
-| `consul.service_name` | 255 chars, non-empty | Consul service name |
-| `consul.datacenter` | 255 chars | Optional datacenter filter |
-| `consul.tag` | 255 chars | Optional service tag filter |
-| `consul.token` | 4096 chars | Optional ACL token |
+| `consul.address` | 2048 UTF-8 bytes, non-empty | Consul HTTP API address |
+| `consul.service_name` | 255 UTF-8 bytes, non-empty | Consul service name |
+| `consul.datacenter` | 255 UTF-8 bytes | Optional datacenter filter |
+| `consul.tag` | 255 UTF-8 bytes | Optional service tag filter |
+| `consul.token` | 4096 UTF-8 bytes | Optional ACL token |
 | `consul.poll_interval_seconds` | 1–3,600 | Consul poll interval |
-| `mesh.service_name` | 255 chars, non-empty | Mesh service name |
-| `mesh.namespace` | 254 chars | Optional mesh namespace override |
+| `mesh.service_name` | 255 UTF-8 bytes, non-empty | Mesh service name |
+| `mesh.namespace` | 254 UTF-8 bytes | Optional mesh namespace override |
 | `mesh.port` | 1–65,535 | Optional mesh service port |
 | `mesh.poll_interval_seconds` | 1–3,600 | Mesh snapshot poll interval |
+
+These string ceilings are measured in **UTF-8 bytes** (Rust `str::len()`, which the
+config validator compares against the limit), not characters: 128 `é` characters
+occupy 256 bytes and exceed a 255-byte ceiling despite containing 128
+characters; ASCII values have equal byte and character counts. The validator's
+diagnostic message labels the bound as "characters" while enforcing the byte
+count. Other field or provider grammar (for example DNS/Kubernetes/Consul name
+syntax) can independently restrict valid values.
 
 ### Plugin Config Fields
 
 | Field | Limit | Description |
 |-------|-------|-------------|
 | `plugin_name` | 255 chars | Plugin name |
-| `config` (JSON size) | 1 MiB | Maximum serialized config size (14 MiB for `openapi_validator`) |
-| `config` (nesting depth) | 10 levels | Maximum JSON nesting (64 for `openapi_validator`) |
+| `config` (JSON size) | 1 MiB | Maximum serialized config size (14 MiB for `openapi_validator` and for an `mcp_gateway` that declares an OpenAPI bridge server — an object-valued `servers.*.openapi` block; upstream-only `mcp_gateway` configs and `mcp_gateway` configs without such a block keep the ordinary budget) |
+| `config` (nesting depth) | 10 levels | Maximum JSON nesting (64 for `openapi_validator` and for an `mcp_gateway` with the same OpenAPI bridge-server shape) |
 
 ### Circuit Breaker Fields
 

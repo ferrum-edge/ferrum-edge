@@ -566,20 +566,27 @@ When `observability.emit_metadata` is on (default), the plugin writes
 `redacted_tools` — are aggregated across every governed surface of one request
 and every completed batch of one response stream, so each one is explicitly
 bounded: at most **64 distinct values** (matching the 64-call per-batch
-governable limit, so one well-formed batch is never truncated) and at most
-**8192 UTF-8 bytes** per field, with each individual value retained to at most
-**256 UTF-8 bytes** plus a trailing `…` when it was shortened. A stream that
-keeps emitting batches of distinct tool names therefore cannot grow this state
-without limit — the documented `0` (unlimited) response-byte policy leaves no
-wire-byte ceiling that could serve as the bound. Values are deduplicated, and
-order of first observation is preserved.
+governable limit) and at most **8192 UTF-8 bytes** per field, with each
+individual value retained to at most **256 UTF-8 bytes** plus a trailing `…`
+when it was shortened. The entry and byte ceilings are **independent**, so even
+one admissible 64-call batch can exhaust the 8192-byte budget: 64 tool names at
+the full 256-byte per-value width plus the 63 delimiter bytes total 16,447 CSV
+bytes, so the ledger retains only the first 31 names and counts the remaining 33
+as omitted. A single well-formed batch therefore does **not** guarantee complete
+metadata; `ai_tool_governor.observations_omitted` is the completeness indicator.
+A stream that keeps emitting batches of distinct tool names cannot grow this
+state without limit — the documented `0` (unlimited) response-byte policy
+leaves no wire-byte ceiling that could serve as the bound. Values are
+deduplicated, and order of first observation is preserved.
 
 When a ledger is full, further distinct values are counted in
 `ai_tool_governor.observations_omitted` (absent when nothing was dropped) so a
 capped field is never silently short. Truncation changes nothing about
 enforcement: every tool call is still governed, the highest-severity `decision`
-and the maximum `risk` are still recorded, and a higher-severity batch still
-replaces a weaker decision's ledger in full.
+and the maximum `risk` are still recorded, and a higher-severity batch replaces
+a weaker decision's ledger basis — still under the same entry and byte ceilings,
+so the replacement is bounded too and can also omit values counted in
+`observations_omitted`.
 
 Raw arguments are **never** placed in metadata and never logged unless
 `observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked

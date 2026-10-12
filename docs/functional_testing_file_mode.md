@@ -4,13 +4,13 @@ This document describes the functional testing strategy for Ferrum Edge when run
 
 ## Overview
 
-File mode allows Ferrum Edge to load and manage configurations from static YAML/JSON files rather than a database. The functional tests verify that the gateway correctly:
+File mode allows Ferrum Edge to load and manage configurations from static YAML/JSON files rather than a database. The functional tests exercise:
 
-1. Loads configuration files
-2. Routes requests to configured backends
-3. Reloads configuration on SIGHUP signal
-4. Handles multiple proxies and backends
-5. Manages empty configurations gracefully
+1. Loading configuration files
+2. Sending requests to configured proxy paths
+3. Attempting to reload configuration on SIGHUP
+4. Starting with multiple proxies and backends configured
+5. Starting with empty configurations
 
 ## Test Files
 
@@ -80,29 +80,41 @@ Verifies basic request routing through the gateway:
 2. Starts a local echo HTTP server on a reserved port
 3. Starts the gateway binary with `FERRUM_MODE=file`
 4. Sends a test request through the proxy at `/echo/test-path`
-5. Verifies the request is routed correctly and returns 200 OK
+5. Verifies the request completes and returns a success (2xx) status
 
 **What it tests:**
 - Gateway startup in file mode
 - Configuration loading from file
 - HTTP request routing to backend
-- Path stripping behavior
 - Basic proxy functionality
+
+The proof is limited to `resp.status().is_success()` (any 2xx); it does not
+assert an exact `200`, the stripped path as seen by the backend, or backend
+identity.
 
 #### Test: `test_file_mode_config_reload_on_sighup`
 
-Verifies configuration reload on SIGHUP signal:
+Exercises a configuration reload attempt using SIGHUP:
 
 1. Creates a temporary config with one proxy
 2. Starts echo server and gateway
-3. Verifies initial proxy is accessible
+3. Sends a request to the initial path and checks that an HTTP response is
+   received
 4. Updates the config file to add a second proxy
-5. Sends SIGHUP signal to the gateway process (Unix only)
-6. Verifies the new proxy is accessible after reload
+5. Attempts to send SIGHUP to the gateway process (Unix only; the command
+   result is ignored)
+6. Sends a request to the added path and checks that an HTTP response is
+   received
 
 **What it tests:**
-- SIGHUP signal handling
-- Live configuration reloading
+- Attempting to signal the gateway with SIGHUP
+- An attempted live-configuration reload followed by an HTTP request
+
+Both assertions use `reqwest::Client::send(...).is_ok()`, which checks only that
+the request completed and received an HTTP response, regardless of status. The
+test attempts a SIGHUP reload but does not establish that the signal was
+delivered, that reloading succeeded, or that the new route became active. It
+does not prove routing to a backend or inspect the response body.
 
 #### Test: `test_file_mode_empty_config`
 
@@ -119,18 +131,22 @@ Verifies graceful handling of empty configurations:
 
 #### Test: `test_file_mode_multiple_backends`
 
-Verifies routing to multiple backend services:
+Configures two backends and sends a request to each configured path:
 
 1. Creates a config with two proxies on different paths
 2. Starts two echo servers on different ports
 3. Starts the gateway
 4. Sends requests to both backend paths
-5. Verifies both requests are routed correctly
+5. Verifies both requests complete
 
 **What it tests:**
 - Multiple proxy configurations
-- Routing to different backends
-- Path isolation between proxies
+- HTTP requests to both configured paths complete and receive a response
+
+As with the reload test, each assertion is `reqwest::Client::send(...).is_ok()`
+(any response, including a 404, satisfies it); the test does not assert exact
+status codes, routing to either backend, the stripped path as seen by each
+backend, which backend served a request, or path isolation between proxies.
 
 #### Test: `test_file_mode_consumer_identity_headers_forwarded`
 

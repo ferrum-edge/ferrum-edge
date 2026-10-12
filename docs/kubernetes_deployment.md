@@ -308,15 +308,28 @@ disabled by default:
 - `injector.enabled=false`
 - `ca.enabled=false`
 
-This is intentional. `FERRUM_MODE=cp` cannot start without all of:
+This is intentional. In `cp` mode the runtime refuses to start without all of:
 
 - `FERRUM_DB_TYPE`
 - `FERRUM_DB_URL`
 - `FERRUM_ADMIN_JWT_SECRET`
-- `FERRUM_CP_DP_GRPC_JWT_SECRET`
 
-The chart validates these requirements during `helm template` and `helm
-install` when `controlPlane.enabled=true` or `ca.enabled=true`. When
+`FERRUM_CP_DP_GRPC_JWT_SECRET` is required **unless**
+`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` is configured: a successfully loaded
+CP/DP trust bundle (namespace-bound verification credentials, see
+[docs/cp_namespace_tenancy.md](cp_namespace_tenancy.md)) replaces the legacy
+shared secret as the CP/DP admission source, and the bundle load failure is
+fatal rather than falling back to a lesser verifier. Whenever a secret *is*
+configured it must still clear the 32-character minimum on every mode.
+
+The Helm chart separately requires its two credential sources —
+`controlPlane.credentials.adminJwtSecret` and
+`controlPlane.credentials.cpDpGrpcJwtSecret` (each exactly one of `value`,
+`existingSecret.name`, or `valueFrom`, minimum 32 characters) — whenever
+`controlPlane.enabled=true` or `ca.enabled=true`. A runtime trust-bundle
+alternative to the legacy secret does not let the chart omit those credential
+fields. The chart validates these requirements during `helm template` and `helm
+install`. When
 `controlPlane.enabled=true` and Gateway API RBAC is enabled, the chart also
 creates the cluster-scoped `GatewayClass` Ferrum owns (`gatewayClass.create`,
 default name `ferrum`, `controllerName: ferrum.io/gateway-controller`). Ferrum
@@ -513,10 +526,22 @@ feature gate). There is no ordinary-container fallback, so with
 1.29 (`ferrum-mesh.validateInjectorKubeVersion`) rather than let a
 `failurePolicy: Fail` webhook mutate pods the apiserver will then reject. The
 chart carries no `Chart.yaml: kubeVersion:` constraint, so everything else still
-installs on an older cluster with `injector.enabled=false`. HTTP `httpGet` and TCP
-`tcpSocket` probe ports on every container in the pod are added to the inbound
-capture exclusion set; `exec`/`grpc` probes are not. Unresolved named probe
-ports fail admission. See [docs/mesh.md](mesh.md#sidecar-container).
+installs on an older cluster with `injector.enabled=false`. Kubelet
+application probes — `httpGet`, `tcpSocket`, and `grpc` — are **rewritten by
+default** to an `httpGet` against the sidecar's own probe port, where the
+sidecar re-runs the original handler against loopback; `exec` probes are not
+rewritten. The original application ports stay captured: only the sidecar's own
+probe port is added to the inbound capture exclusion set (a TCP-only rule), and
+only when the rewrite produced (or recovered) at least one probe the sidecar
+will serve; unprobed pods get no automatic exclusion. Operator port exclusions
+(`excludeInboundPorts` annotations or the injector-level default) remain
+additive. Opting out
+(`ferrum.io/rewriteAppProbes: "false"` or
+`sidecar.istio.io/rewriteAppHTTPProbers: "false"`) leaves probes pointing at the
+application ports **and** leaves those ports captured, so under strict mesh
+mTLS such probes fail; the opt-out does not exempt the original application
+port. Unresolved named probe ports fail admission. See
+[docs/mesh.md](mesh.md#sidecar-container).
 
 The chart mounts the injector serving certificate through a Secret volume when
 the injector is enabled; the injector process does not read Kubernetes Secrets
@@ -588,9 +613,15 @@ Each workload's `admin.bindAddress` must be an IP literal and its
 `admin.allowedCidrs` (and `observability.metrics.allowedCidrs`) is validated
 entry-for-entry against the runtime's strict CIDR parser. For `controlPlane` and
 `ca` a full-family allowlist (`0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a
-covering union) is not accepted as plaintext-admin protection, and while the
-computed exec probes are enabled the allowlist must cover the exact probe source
-(`127.0.0.1` for an IPv4/wildcard bind, `::1` for an IPv6 wildcard bind). An
+covering union) is not accepted as plaintext-admin protection. While the
+computed exec probes are enabled, the chart predicts the probe's source address
+from the bind: wildcard and loopback IPv4 binds (`""`, `*`, `0.0.0.0`, and any
+`127/8` address) are predicted as `127.0.0.1`, a wildcard IPv6 bind `::` as
+`::1`, but a specific non-loopback IPv4 bind (for example `10.0.0.5`) is
+predicted as that exact address, not loopback. The allowlist must cover the
+predicted source (or a CIDR covering it); this is chart-side prediction, not an
+observed OS source address, and overriding or disabling every computed probe
+handler — or disabling plaintext admin — drops the source-address tie-in. An
 enabled computed probe with no usable handler — for example `admin.httpPort: 0`
 with readiness still enabled — fails render instead of silently omitting the
 probe.

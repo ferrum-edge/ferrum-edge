@@ -356,11 +356,18 @@ verifier enforces this contract.
 mesh DNS proxy resolution latency are **not** criterion micro-benches; they ship
 as live E2E harnesses that spin up `ferrum-edge` plus stub peers:
 
-| Suite | Path | Measures | Residual |
+| Suite | Path | Measures | Baseline |
 |---|---|---|---|
-| In-process mesh Criterion | `tests/performance/mesh/` | `authz_match`, `ip_restriction`, `slice_apply`, `xds_translation` | Hosted collection workflow landed; `baseline.md` result cells stay `_TBD_` until a successful artifact is published — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
-| HBONE gateway overhead | `tests/performance/mesh-hbone-e2e/` | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS | Same two-stage publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
-| Mesh DNS proxy | `tests/performance/mesh-dns-e2e/` | Transparent mesh DNS proxy latency/QPS over UDP and TCP | Same two-stage publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+| In-process mesh Criterion | `tests/performance/mesh/` | `authz_match`, `ip_restriction`, `slice_apply`, `xds_translation` | Published — [mesh/baseline.md](../tests/performance/mesh/baseline.md), run `31820671032` at `5c3a58cd5fc1083911796621d5f2cd0237946c09` ([#4088](https://github.com/ferrum-edge/ferrum-edge/pull/4088), closed [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332)) |
+| HBONE gateway overhead | `tests/performance/mesh-hbone-e2e/` | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS | Published — [mesh-hbone-e2e/baseline.md](../tests/performance/mesh-hbone-e2e/baseline.md), same run `31820671032` at `5c3a58cd5fc1083911796621d5f2cd0237946c09` ([#4088](https://github.com/ferrum-edge/ferrum-edge/pull/4088)) |
+| Mesh DNS proxy | `tests/performance/mesh-dns-e2e/` | Transparent mesh DNS proxy latency/QPS over UDP and TCP | Published — [mesh-dns-e2e/baseline.md](../tests/performance/mesh-dns-e2e/baseline.md), separate DNS-only run `31917782760` at `a7921ea2176360c7812da6d2c2dff356ad99f5d8` ([#4088](https://github.com/ferrum-edge/ferrum-edge/pull/4088)) |
+
+The mesh and HBONE tables share one hosted collection; the DNS table came from a
+separate DNS-only run after the TCP-stub repair. The earlier all-suite run
+attempted DNS and that portion failed acceptance, so it is not DNS evidence.
+Runner-image provenance also differs (the published numbers were collected on
+`ubuntu-24.04`; new collections use `ubuntu-26.04`) and must not be compared as
+absolute regression gates.
 
 Hosted collection (stage 1) lives in
 `.github/workflows/mesh-performance-baselines.yml` and is dispatched after the
@@ -380,9 +387,9 @@ misconfigured reusable caller cannot consume an unbounded hosted-runner budget.
 surface**: every path under `tests/performance/` is treated as protected
 executable/configuration prose, including Markdown. Its historical
 "Benches deferred (not yet implemented)" section is **not** the current
-backlog source of truth and must remain unchanged. Live suite status,
-`mesh-hbone-e2e` / `mesh-dns-e2e` pointers, and the [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332)
-baseline-publication residual are documented here (and in
+backlog source of truth and must remain unchanged. Live suite status and the
+published `mesh-hbone-e2e` / `mesh-dns-e2e` baseline pointers are documented
+here (and in
 [`docs/backlog/issue_2110_register.md`](backlog/issue_2110_register.md))
 instead of rewriting that protected README.
 
