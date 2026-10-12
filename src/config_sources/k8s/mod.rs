@@ -514,6 +514,19 @@ pub struct K8sTranslation {
     /// whenever it keeps serving through any other listener or claim. A refused
     /// claim therefore never withdraws a surviving parent or listener.
     pub refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
+    /// Route claims this translation refused because they share one listener's
+    /// `(hosts, listen path)` slot with an earlier same-kind claim that dials
+    /// its backend over a different transport (BackendTLSPolicy coverage
+    /// differs). One route-table slot keeps one backend scheme, so the later
+    /// claim is withdrawn while the earlier one keeps serving.
+    ///
+    /// Kept apart from [`Self::refused_route_attachments`] so status can name
+    /// the real cause instead of a different-listener ambiguity. A refused
+    /// claim can share its attachment identity with a claim that still serves
+    /// (two rules of one Route on one listener); whether the parentRef is
+    /// withdrawn is decided by [`Self::materialized_route_parents`] exactly as
+    /// for listener ambiguity.
+    pub transport_refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
     /// EndpointSlice attribution verdicts for Gateway API backendRefs to core
     /// Services (issue #6108). The status writer reads this so `ResolvedRefs`
     /// matches what translation refused.
@@ -1072,6 +1085,10 @@ pub(crate) struct K8sAccumulator {
     /// Claims refused for same-slot listener ambiguity. Resolved against the
     /// credit map above in [`K8sAccumulator::resolve_refused_route_attachments`].
     pub(crate) gateway_api_refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
+    /// Claims refused because their backend transport differs from the
+    /// same-slot claim they would merge into. Resolved alongside the
+    /// listener-ambiguity refusals above.
+    pub(crate) gateway_api_transport_refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
     /// Terminating-TLS listeners whose `certificateRefs` all resolved, awaiting
@@ -1169,6 +1186,7 @@ impl K8sAccumulator {
             gateway_api_route_upstream_owners: HashMap::new(),
             gateway_api_materialized_route_attachments: HashMap::new(),
             gateway_api_refused_route_attachments: HashSet::new(),
+            gateway_api_transport_refused_route_attachments: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
@@ -1688,8 +1706,20 @@ impl K8sAccumulator {
             .extend(attachments);
     }
 
-    /// Project the same-slot listener-ambiguity refusals onto the status
-    /// boundary, and withdraw the materialized-parent records they invalidate.
+    /// Mark claims refused because their backend transport differs from the
+    /// same-slot claim they would merge into. Only the later claim is
+    /// recorded: the earlier one keeps serving.
+    pub(crate) fn record_gateway_api_transport_refused_route_attachments(
+        &mut self,
+        attachments: Vec<GatewayApiRouteAttachment>,
+    ) {
+        self.gateway_api_transport_refused_route_attachments
+            .extend(attachments);
+    }
+
+    /// Project the same-slot refusals (listener ambiguity and mixed backend
+    /// transport) onto the status boundary, and withdraw the
+    /// materialized-parent records they invalidate.
     ///
     /// A materialized-parent record is withdrawn only when that parentRef has
     /// no proxy left serving any of its claims: a Route that still serves
@@ -1697,8 +1727,13 @@ impl K8sAccumulator {
     /// same listener keeps reporting programmed there, and only reports the
     /// refusal as a conflict. Cold path, bounded by the number of route proxies
     /// in the pass.
+    ///
+    /// Returns the listener-ambiguity refusals; the transport refusals stay in
+    /// their own accumulator set for [`Self::finish`] to publish.
     fn resolve_refused_route_attachments(&mut self) -> HashSet<GatewayApiRouteAttachment> {
-        if self.gateway_api_refused_route_attachments.is_empty() {
+        if self.gateway_api_refused_route_attachments.is_empty()
+            && self.gateway_api_transport_refused_route_attachments.is_empty()
+        {
             return HashSet::new();
         }
         let live_parents: HashSet<GatewayApiMaterializedRouteParent> = self
@@ -1711,7 +1746,10 @@ impl K8sAccumulator {
             })
             .collect();
         let refused = std::mem::take(&mut self.gateway_api_refused_route_attachments);
-        for attachment in &refused {
+        for attachment in refused
+            .iter()
+            .chain(&self.gateway_api_transport_refused_route_attachments)
+        {
             let parent = GatewayApiMaterializedRouteParent {
                 route: attachment.route.clone(),
                 parent_ref: attachment.parent_ref.clone(),
@@ -1786,6 +1824,8 @@ impl K8sAccumulator {
         // is known, because a later claim can still materialize the same
         // parentRef on a surviving listener.
         let refused_route_attachments = self.resolve_refused_route_attachments();
+        let transport_refused =
+            std::mem::take(&mut self.gateway_api_transport_refused_route_attachments);
         // An empty mesh still serializes as `None` so `mesh.is_some()` keeps
         // meaning "this deployment has mesh state" for every reader; the
         // authority marker above, not `mesh`, is what carries the withdrawal.
@@ -1811,6 +1851,7 @@ impl K8sAccumulator {
             listener_conflicts: self.gateway_api_listener_conflicts,
             frontend_tls_hostname_conflicts: self.gateway_api_frontend_tls_hostname_conflicts,
             refused_route_attachments,
+            transport_refused_route_attachments: transport_refused,
             endpoint_slices: self.endpoint_slice_guard,
         }
     }

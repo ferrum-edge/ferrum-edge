@@ -3372,7 +3372,7 @@ fn upsert_http_route_resources(
             if let Some(key) = proxy_key {
                 acc.gateway_api_route_proxy_listeners.remove(&key);
             }
-            acc.record_gateway_api_refused_route_attachments(attachments);
+            acc.record_gateway_api_transport_refused_route_attachments(attachments);
             continue;
         }
         if let Some(merged_into) = merge_http_route_proxy(acc, &proxy, &route_plugins, route_kind) {
