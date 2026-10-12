@@ -498,8 +498,9 @@ response is gateway-authored only when its rejection site recorded it in the
 request's diagnostic slot before the head was written, and
 only on a head whose status is the one that rejection recorded (a rejection a
 later phase replaced marks nothing). An ordinary relayed backend `5xx` receives
-the compiled `backend_error` token and may carry a diagnostic reference when
-diagnostics are enabled. Backend `4xx` responses do not receive a reference.
+a compiled gateway token (`backend_timeout` for a relayed `504`, `backend_error`
+for any other `5xx`) and may carry a diagnostic reference when diagnostics are
+enabled. Backend `4xx` responses do not receive a reference.
 Neither do marked origin-served plugin replays or short-circuits (a
 `response_caching` or `ai_semantic_cache` hit, a `request_deduplication`
 idempotent replay, a `serverless_function` terminate reply, an `ai_federation`
