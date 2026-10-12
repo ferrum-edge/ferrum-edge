@@ -3167,7 +3167,11 @@ fn adaptive_concurrency_client_upload_refusal_is_neutral_but_backend_terminals_b
     let config = limiter_config(4);
 
     let client_failures = [
-        (Some(RequestBodyOutcome::Errored), true, Some(Pump::SourceError)),
+        (
+            Some(RequestBodyOutcome::Errored),
+            true,
+            Some(Pump::SourceError),
+        ),
         (None, true, Some(Pump::SourceError)),
         (Some(RequestBodyOutcome::Errored), false, None),
     ];
@@ -3188,9 +3192,21 @@ fn adaptive_concurrency_client_upload_refusal_is_neutral_but_backend_terminals_b
     // the client, so these still back the backend off.
     let backend_terminals = [
         (Some(RequestBodyOutcome::Errored), true, None),
-        (Some(RequestBodyOutcome::Errored), true, Some(Pump::Cancelled)),
-        (Some(RequestBodyOutcome::Errored), true, Some(Pump::ConsumerGone)),
-        (Some(RequestBodyOutcome::Abandoned), true, Some(Pump::Completed)),
+        (
+            Some(RequestBodyOutcome::Errored),
+            true,
+            Some(Pump::Cancelled),
+        ),
+        (
+            Some(RequestBodyOutcome::Errored),
+            true,
+            Some(Pump::ConsumerGone),
+        ),
+        (
+            Some(RequestBodyOutcome::Abandoned),
+            true,
+            Some(Pump::Completed),
+        ),
         (None, true, None),
         (Some(RequestBodyOutcome::Abandoned), false, None),
         (None, false, None),

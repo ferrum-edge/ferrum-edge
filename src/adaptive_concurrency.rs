@@ -1315,12 +1315,10 @@ impl AdaptiveConcurrencyBaselineWindows {
             if !baseline_closed_window_replaces_prior(closed.sequence, prior, current) {
                 return;
             }
-            match self.prior.compare_exchange(
-                prior,
-                candidate,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .prior
+                .compare_exchange(prior, candidate, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return,
                 Err(observed) => prior = observed,
             }

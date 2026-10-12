@@ -297,7 +297,10 @@ pub(crate) const fn early_response_upload_refusal_error_class(
     let client_source_failed = if upload_pumped {
         matches!(pump_outcome, Some(UploadPumpOutcome::SourceError))
     } else {
-        matches!(body_outcome, Some(crate::proxy::body::RequestBodyOutcome::Errored))
+        matches!(
+            body_outcome,
+            Some(crate::proxy::body::RequestBodyOutcome::Errored)
+        )
     };
     if client_source_failed {
         crate::retry::ErrorClass::ClientDisconnect
