@@ -50,8 +50,8 @@ const RATE_LIMIT_AUTHORITY_KEY: &str = "ratelimit_authority";
 /// Encoded [`HeaderAuthority::Refused`] verdict.
 const RATE_LIMIT_AUTHORITY_REFUSED: &str = "refused";
 
-/// Prefix of an encoded [`HeaderAuthority::Admitted`] verdict, followed by the
-/// admitted budget's remaining count.
+/// Prefix of an encoded [`HeaderAuthority::Admitted`] verdict, followed by its
+/// remaining count, limit, window, and stable policy id.
 const RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX: &str = "admitted:";
 
 /// Which composed limiter's telemetry the public `x-ratelimit-*` headers carry.
@@ -60,21 +60,35 @@ const RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX: &str = "admitted:";
 /// route publish the same headers however they are prioritized:
 /// a refusal outranks every admitted budget (the refusing limiter is the one
 /// that produced the status the client sees), and among admitted budgets the
-/// tightest `remaining` wins — the same "tightest window" rule a single
-/// instance already applies across its own windows.
+/// lowest remaining count wins. Ties use the smaller limit, then smaller
+/// window, then lexicographically smaller policy id. The first three fields
+/// select the tighter and then shorter published budget; policy id makes even
+/// otherwise identical candidates choose a stable owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HeaderAuthority {
-    Admitted(u64),
+enum HeaderAuthority<'a> {
+    Admitted {
+        remaining: u64,
+        limit: Option<u64>,
+        window_seconds: Option<u64>,
+        policy_id: &'a str,
+    },
     Refused,
 }
 
-impl HeaderAuthority {
-    fn encode(self) -> String {
+impl HeaderAuthority<'_> {
+    fn encode(&self) -> String {
         match self {
             Self::Refused => RATE_LIMIT_AUTHORITY_REFUSED.to_string(),
-            Self::Admitted(remaining) => {
-                format!("{RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX}{remaining}")
-            }
+            Self::Admitted {
+                remaining,
+                limit,
+                window_seconds,
+                policy_id,
+            } => format!(
+                "{RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX}{remaining}:{}:{}:{policy_id}",
+                limit.map_or_else(|| "-".to_string(), |value| value.to_string()),
+                window_seconds.map_or_else(|| "-".to_string(), |value| value.to_string()),
+            ),
         }
     }
 
@@ -83,7 +97,7 @@ impl HeaderAuthority {
     /// An absent or unrecognized owner yields to the candidate: staged
     /// telemetry with no recorded owner cannot be attributed, and publishing
     /// the current verdict is the fail-safe direction.
-    fn outranks(self, existing: Option<&str>) -> bool {
+    fn outranks(&self, existing: Option<&str>) -> bool {
         let Some(existing) = existing else {
             return true;
         };
@@ -93,11 +107,36 @@ impl HeaderAuthority {
         }
         match self {
             Self::Refused => true,
-            Self::Admitted(remaining) => existing
-                .strip_prefix(RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX)
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_none_or(|current| remaining < current),
+            Self::Admitted {
+                remaining,
+                limit,
+                window_seconds,
+                policy_id,
+            } => {
+                let candidate = (*remaining, *limit, *window_seconds, policy_id.as_str());
+                let current = existing
+                    .strip_prefix(RATE_LIMIT_AUTHORITY_ADMITTED_PREFIX)
+                    .and_then(parse_admitted_authority);
+                current.is_none_or(|current| candidate < current)
+            }
         }
+    }
+}
+
+fn parse_admitted_authority(value: &str) -> Option<(u64, Option<u64>, Option<u64>, &str)> {
+    let mut fields = value.splitn(4, ':');
+    let remaining = fields.next()?.parse().ok()?;
+    let limit = parse_optional_authority_number(fields.next()?)?;
+    let window_seconds = parse_optional_authority_number(fields.next()?)?;
+    let policy_id = fields.next()?;
+    Some((remaining, limit, window_seconds, policy_id))
+}
+
+fn parse_optional_authority_number(value: &str) -> Option<Option<u64>> {
+    if value == "-" {
+        Some(None)
+    } else {
+        value.parse().ok().map(Some)
     }
 }
 
@@ -253,6 +292,7 @@ enum RateVerdict {
 }
 
 pub struct RateLimiting {
+    policy_id: String,
     limit_by: LimitBy,
     ipv6_prefix: u8,
     expose_headers: bool,
@@ -404,6 +444,7 @@ impl RateLimiting {
         .map_err(|error| format!("rate_limiting: {error}"))?;
 
         Ok(Self {
+            policy_id: config_id.to_string(),
             limit_by,
             ipv6_prefix,
             expose_headers,
@@ -746,7 +787,12 @@ impl RateLimiting {
         // A composed sibling may already own the public header set. Only the
         // tightest admitted budget publishes, so the client is told to back off
         // against the limit that will actually refuse it next.
-        let authority = HeaderAuthority::Admitted(remaining);
+        let authority = HeaderAuthority::Admitted {
+            remaining,
+            limit: outcome.limit,
+            window_seconds: outcome.window_seconds,
+            policy_id: &self.policy_id,
+        };
         let owner = ctx.metadata.get(RATE_LIMIT_AUTHORITY_KEY);
         if !authority.outranks(owner.map(String::as_str)) {
             return;

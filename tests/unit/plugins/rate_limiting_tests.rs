@@ -2100,6 +2100,18 @@ fn composed_limiter(requests_per_minute: u64, expose_headers: bool) -> Arc<dyn P
     }))) as Arc<dyn Plugin>
 }
 
+fn composed_window_limiter(policy_id: &str, window_seconds: u64) -> Arc<dyn Plugin> {
+    let config = rate_limiting_config(json!({
+        "limit_by": "ip",
+        "expose_headers": true,
+        "window_seconds": window_seconds,
+        "max_requests": 2,
+    }));
+    Arc::new(
+        RateLimiting::new_with_config_id(&config, PluginHttpClient::default(), policy_id).unwrap(),
+    ) as Arc<dyn Plugin>
+}
+
 fn meta<'a>(ctx: &'a RequestContext, key: &str) -> Option<&'a str> {
     ctx.metadata.get(key).map(String::as_str)
 }
@@ -2263,6 +2275,52 @@ async fn composed_admitted_limiters_publish_the_tightest_budget_in_either_order(
         "plugin order must not decide which budget the client sees"
     );
     assert_eq!(meta(&reversed, "ratelimit_remaining"), Some("4"));
+}
+
+/// Equal remaining counts still have one stable owner: the smaller window
+/// wins, regardless of which policy's priority makes it run first.
+#[tokio::test]
+async fn composed_admitted_limiters_break_equal_remaining_ties_independent_of_order() {
+    let short = composed_window_limiter("short-window-policy", 1);
+    let long = composed_window_limiter("long-window-policy", 60);
+    let mut ctx = create_test_context();
+    assert_continue(short.on_request_received(&mut ctx).await);
+    assert_continue(long.on_request_received(&mut ctx).await);
+
+    assert_eq!(meta(&ctx, "ratelimit_limit"), Some("2"));
+    assert_eq!(meta(&ctx, "ratelimit_remaining"), Some("1"));
+    assert_eq!(meta(&ctx, "ratelimit_window"), Some("1"));
+    let mut headers = HashMap::new();
+    assert_continue(short.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_continue(long.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_eq!(headers.get("x-ratelimit-limit").map(String::as_str), Some("2"));
+    assert_eq!(
+        headers.get("x-ratelimit-remaining").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(headers.get("x-ratelimit-window").map(String::as_str), Some("1"));
+
+    let short_reversed = composed_window_limiter("short-window-policy", 1);
+    let long_reversed = composed_window_limiter("long-window-policy", 60);
+    let mut reversed = create_test_context();
+    assert_continue(long_reversed.on_request_received(&mut reversed).await);
+    assert_continue(short_reversed.on_request_received(&mut reversed).await);
+
+    assert_eq!(meta(&reversed, "ratelimit_limit"), Some("2"));
+    assert_eq!(meta(&reversed, "ratelimit_remaining"), Some("1"));
+    assert_eq!(meta(&reversed, "ratelimit_window"), Some("1"));
+    let mut reversed_headers = HashMap::new();
+    assert_continue(
+        long_reversed
+            .after_proxy(&mut reversed, 200, &mut reversed_headers)
+            .await,
+    );
+    assert_continue(
+        short_reversed
+            .after_proxy(&mut reversed, 200, &mut reversed_headers)
+            .await,
+    );
+    assert_eq!(reversed_headers, headers);
 }
 
 #[test]
