@@ -3795,6 +3795,13 @@ pub mod _test_support {
         plugin.expire_completed_entries_for_tests();
     }
 
+    pub fn request_deduplication_backdate_pending_publication_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        age: std::time::Duration,
+    ) {
+        plugin.backdate_pending_publication_completions_for_tests(age);
+    }
+
     pub fn request_deduplication_expire_inflight_entries_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) {

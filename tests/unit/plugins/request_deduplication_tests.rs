@@ -7064,3 +7064,614 @@ fn anonymous_scope_rejections_keep_rendered_context_and_withhold_normalized_valu
         assert!(!rendered.contains('\n'), "{rendered}");
     }
 }
+
+// ── Pending Redis publication must not expose a local replay (issue #6312) ──
+
+/// `INFO` payload that passes both connect screens a retention authority runs:
+/// not a Cluster, and a non-evicting memory policy.
+const SCRIPTED_REDIS_INFO: &str =
+    "# Cluster\r\ncluster_enabled:0\r\n# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n";
+
+/// Shared keyspace and `EXEC` gate of [`spawn_scripted_dedup_redis`].
+struct ScriptedDedupRedisState {
+    values: std::sync::Mutex<HashMap<String, String>>,
+    /// How many upcoming `EXEC`s are held until [`ScriptedDedupRedis::release_exec`].
+    holds_remaining: std::sync::atomic::AtomicUsize,
+    exec_arrived: tokio::sync::mpsc::UnboundedSender<()>,
+    release_exec: tokio::sync::Notify,
+}
+
+impl ScriptedDedupRedisState {
+    fn get(&self, key: &str) -> Option<String> {
+        self.values
+            .lock()
+            .expect("scripted redis keyspace")
+            .get(key)
+            .cloned()
+    }
+
+    /// Apply one non-transactional command (or one queued transaction member).
+    fn apply(&self, args: &[String]) -> Vec<u8> {
+        let command = args
+            .first()
+            .map(|command| command.to_ascii_uppercase())
+            .unwrap_or_default();
+        let mut values = self.values.lock().expect("scripted redis keyspace");
+        match command.as_str() {
+            "PING" => b"+PONG\r\n".to_vec(),
+            "INFO" => resp_bulk(SCRIPTED_REDIS_INFO),
+            "GET" => match values.get(&args[1]) {
+                Some(value) => resp_bulk(value),
+                None => b"$-1\r\n".to_vec(),
+            },
+            "SET" => {
+                let nx = args[3..]
+                    .iter()
+                    .any(|option| option.eq_ignore_ascii_case("NX"));
+                if nx && values.contains_key(&args[1]) {
+                    return b"$-1\r\n".to_vec();
+                }
+                values.insert(args[1].clone(), args[2].clone());
+                b"+OK\r\n".to_vec()
+            }
+            "DEL" => {
+                let removed = values.remove(&args[1]).is_some();
+                format!(":{}\r\n", usize::from(removed)).into_bytes()
+            }
+            // Connection setup (`CLIENT SETINFO`, ...) and anything else.
+            _ => b"+OK\r\n".to_vec(),
+        }
+    }
+}
+
+fn resp_bulk(value: &str) -> Vec<u8> {
+    format!("${}\r\n{value}\r\n", value.len()).into_bytes()
+}
+
+fn parse_scripted_resp_command(buf: &[u8]) -> Option<(Vec<String>, usize)> {
+    fn read_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+        let rest = buf.get(from..)?;
+        let idx = rest.windows(2).position(|w| w == b"\r\n")?;
+        Some((&rest[..idx], from + idx + 2))
+    }
+
+    if *buf.first()? != b'*' {
+        return None;
+    }
+    let (count_line, mut cursor) = read_line(buf, 1)?;
+    let argc: usize = std::str::from_utf8(count_line).ok()?.parse().ok()?;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if *buf.get(cursor)? != b'$' {
+            return None;
+        }
+        let (len_line, after_len) = read_line(buf, cursor + 1)?;
+        let len: usize = std::str::from_utf8(len_line).ok()?.parse().ok()?;
+        let end = after_len.checked_add(len)?;
+        let payload = buf.get(after_len..end)?;
+        if buf.get(end..end + 2)? != b"\r\n" {
+            return None;
+        }
+        args.push(String::from_utf8_lossy(payload).to_string());
+        cursor = end + 2;
+    }
+    Some((args, cursor))
+}
+
+/// Minimal single-endpoint RESP server with a real string keyspace and real
+/// `WATCH` / `MULTI` / `EXEC` semantics: queued commands answer `+QUEUED`, and
+/// an `EXEC` whose watched key changed since `WATCH` aborts with a nil array,
+/// exactly the fence `set_bytes_with_expire_if_value_matches` relies on.
+struct ScriptedDedupRedis {
+    port: u16,
+    state: Arc<ScriptedDedupRedisState>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ScriptedDedupRedis {
+    fn release_exec(&self) {
+        self.state.release_exec.notify_one();
+    }
+
+    /// Replace the single stored in-flight record with a live successor's: the
+    /// same request fingerprint under a different owner token, as written by a
+    /// gateway that acquired the key after the original lease expired.
+    fn install_live_successor(&self) {
+        let mut values = self.state.values.lock().expect("scripted redis keyspace");
+        assert_eq!(values.len(), 1, "exactly one operation record");
+        let record = values.values_mut().next().expect("operation record");
+        let mut parsed: serde_json::Value = serde_json::from_str(record).expect("record is JSON");
+        assert_eq!(parsed["state"], "inflight");
+        parsed["owner_token"] = json!("live-successor-owner-token");
+        *record = parsed.to_string();
+    }
+
+    fn single_record(&self) -> serde_json::Value {
+        let values = self.state.values.lock().expect("scripted redis keyspace");
+        assert_eq!(values.len(), 1, "exactly one operation record");
+        let record = values.values().next().expect("operation record");
+        serde_json::from_str(record).expect("record is JSON")
+    }
+
+    fn clear(&self) {
+        self.state
+            .values
+            .lock()
+            .expect("scripted redis keyspace")
+            .clear();
+    }
+}
+
+impl Drop for ScriptedDedupRedis {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+async fn spawn_scripted_dedup_redis(
+    held_execs: usize,
+) -> (ScriptedDedupRedis, tokio::sync::mpsc::UnboundedReceiver<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind scripted redis");
+    let port = listener.local_addr().expect("local_addr").port();
+    let (exec_arrived, exec_arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let state = Arc::new(ScriptedDedupRedisState {
+        values: std::sync::Mutex::new(HashMap::new()),
+        holds_remaining: std::sync::atomic::AtomicUsize::new(held_execs),
+        exec_arrived,
+        release_exec: tokio::sync::Notify::new(),
+    });
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let accept_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break; };
+                    tokio::spawn(serve_scripted_dedup_redis(stream, Arc::clone(&accept_state)));
+                }
+            }
+        }
+    });
+    (
+        ScriptedDedupRedis {
+            port,
+            state,
+            shutdown: Some(shutdown_tx),
+        },
+        exec_arrivals,
+    )
+}
+
+async fn serve_scripted_dedup_redis(
+    mut stream: tokio::net::TcpStream,
+    state: Arc<ScriptedDedupRedisState>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut watched: Option<(String, Option<String>)> = None;
+    let mut queued: Option<Vec<Vec<String>>> = None;
+    loop {
+        let n = match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        pending.extend_from_slice(&buf[..n]);
+        while let Some((args, consumed)) = parse_scripted_resp_command(&pending) {
+            pending.drain(..consumed);
+            let command = args
+                .first()
+                .map(|command| command.to_ascii_uppercase())
+                .unwrap_or_default();
+            let reply = match command.as_str() {
+                "EXEC" => {
+                    let commands = queued.take().unwrap_or_default();
+                    let held = state
+                        .holds_remaining
+                        .try_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |remaining| remaining.checked_sub(1),
+                        )
+                        .is_ok();
+                    if held {
+                        let _ = state.exec_arrived.send(());
+                        state.release_exec.notified().await;
+                    }
+                    let aborted = watched
+                        .take()
+                        .is_some_and(|(key, snapshot)| state.get(&key) != snapshot);
+                    if aborted {
+                        b"*-1\r\n".to_vec()
+                    } else {
+                        let mut reply = format!("*{}\r\n", commands.len()).into_bytes();
+                        for command in &commands {
+                            reply.extend_from_slice(&state.apply(command));
+                        }
+                        reply
+                    }
+                }
+                _ if queued.is_some() => {
+                    queued.as_mut().expect("open transaction").push(args);
+                    b"+QUEUED\r\n".to_vec()
+                }
+                "MULTI" => {
+                    queued = Some(Vec::new());
+                    b"+OK\r\n".to_vec()
+                }
+                "WATCH" => {
+                    let key = args[1].clone();
+                    let snapshot = state.get(&key);
+                    watched = Some((key, snapshot));
+                    b"+OK\r\n".to_vec()
+                }
+                "UNWATCH" => {
+                    watched = None;
+                    b"+OK\r\n".to_vec()
+                }
+                _ => state.apply(&args),
+            };
+            if stream.write_all(&reply).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn scripted_redis_dedup_plugin(port: u16) -> RequestDeduplication {
+    make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": format!("redis://127.0.0.1:{port}/0"),
+        "redis_connect_timeout_seconds": 5,
+        // One pooled slot, so the retry reuses the owner's screened socket.
+        "redis_pool_size": 1,
+        // No background recovery dial during the test.
+        "redis_health_check_interval_seconds": 3600
+    }))
+}
+
+fn pending_publication_request() -> (RequestContext, HashMap<String, String>) {
+    let ctx = new_ctx("POST", "/api");
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "pending-publication-key".to_string(),
+    );
+    (ctx, headers)
+}
+
+async fn wait_for_held_exec(exec_arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), exec_arrivals.recv())
+        .await
+        .expect("the fenced publication must reach EXEC")
+        .expect("scripted redis stays alive");
+}
+
+fn assert_in_progress_conflict(result: PluginResult, context: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409, "{context}: {body}");
+            assert!(body.contains("already in progress"), "{context}: {body}");
+        }
+        PluginResult::RejectBinary { .. } => panic!("{context}: replayed before settlement"),
+        other => panic!("{context}: expected a 409 in-progress conflict, got {other:?}"),
+    }
+}
+
+fn assert_completed_replay(result: PluginResult, context: &str) {
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+            ..
+        } => {
+            assert_eq!(status_code, 201, "{context}");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true"),
+                "{context}"
+            );
+            assert_eq!(&body[..], b"{\"ok\":true}", "{context}");
+        }
+        other => panic!("{context}: expected the completed replay, got {other:?}"),
+    }
+}
+
+/// Issue #6312: a stale owner's completion is inserted locally before its
+/// fenced Redis publication returns. While that verdict is pending, a matching
+/// retry that observes the Redis in-flight record — here a LIVE SUCCESSOR's,
+/// same fingerprint, different owner token — must not be answered from the
+/// local completion. Once the fence rejects the stale owner, the completion is
+/// discarded and the successor's record is untouched.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn pending_redis_publication_is_not_replayed_to_a_matching_retry() {
+    let _policy = pinned_policy_guard();
+    let (server, mut exec_arrivals) = spawn_scripted_dedup_redis(1).await;
+    let plugin = scripted_redis_dedup_plugin(server.port);
+
+    let (mut owner, mut owner_headers) = pending_publication_request();
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        request_identity(&plugin, &owner).is_some(),
+        "the owner must hold Redis and local in-flight ownership"
+    );
+    assert_eq!(server.single_record()["state"], "inflight");
+
+    let publish = complete_response(&plugin, &mut owner);
+    let observe = async {
+        wait_for_held_exec(&mut exec_arrivals).await;
+        // The owner's lease expired and a successor acquired the key with the
+        // same request fingerprint; the stale owner's EXEC is still in flight.
+        server.install_live_successor();
+        let (mut retry, mut retry_headers) = pending_publication_request();
+        let during_pending = plugin.before_proxy(&mut retry, &mut retry_headers).await;
+        server.release_exec();
+        during_pending
+    };
+    let ((), during_pending) = tokio::join!(publish, observe);
+    assert_in_progress_conflict(
+        during_pending,
+        "a matching retry during the pending publication",
+    );
+
+    // The fence refused the stale owner: its record write never landed and its
+    // non-authoritative local completion was discarded.
+    let record = server.single_record();
+    assert_eq!(record["state"], "inflight");
+    assert_eq!(record["owner_token"], "live-successor-owner-token");
+    assert_eq!(
+        assert_completed_size_exact(&plugin),
+        0,
+        "a NotOwner verdict must discard the stale owner's local completion"
+    );
+    let (mut retry, mut retry_headers) = pending_publication_request();
+    assert_in_progress_conflict(
+        plugin.before_proxy(&mut retry, &mut retry_headers).await,
+        "a matching retry after the stale owner was refused",
+    );
+}
+
+/// Control for issue #6312: the same pending window refuses replay, but a
+/// publication the fence ACCEPTS promotes the completion. The retry then
+/// replays from Redis, and — with the Redis record gone — from the now
+/// authoritative local completion.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn settled_redis_publication_makes_the_local_completion_replayable() {
+    let _policy = pinned_policy_guard();
+    let (server, mut exec_arrivals) = spawn_scripted_dedup_redis(1).await;
+    let plugin = scripted_redis_dedup_plugin(server.port);
+
+    let (mut owner, mut owner_headers) = pending_publication_request();
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+
+    let publish = complete_response(&plugin, &mut owner);
+    let observe = async {
+        wait_for_held_exec(&mut exec_arrivals).await;
+        let (mut retry, mut retry_headers) = pending_publication_request();
+        let during_pending = plugin.before_proxy(&mut retry, &mut retry_headers).await;
+        server.release_exec();
+        during_pending
+    };
+    let ((), during_pending) = tokio::join!(publish, observe);
+    assert_in_progress_conflict(
+        during_pending,
+        "a matching retry during the pending publication",
+    );
+
+    let record = server.single_record();
+    assert_eq!(record["state"], "completed");
+    assert!(
+        record["replay"].is_object(),
+        "the owner publishes a replayable record"
+    );
+    let (mut retry, mut retry_headers) = pending_publication_request();
+    assert_completed_replay(
+        plugin.before_proxy(&mut retry, &mut retry_headers).await,
+        "a retry after publication replays the Redis record",
+    );
+
+    // Lose the Redis record: only the settled local completion can answer now.
+    server.clear();
+    let (mut retry, mut retry_headers) = pending_publication_request();
+    assert_completed_replay(
+        plugin.before_proxy(&mut retry, &mut retry_headers).await,
+        "a settled local completion replays once its publication was accepted",
+    );
+}
+
+// ── A cancelled publication must not reopen an operation that already ran ──
+
+/// Redis-owned plugin whose completed TTL far outlives its in-flight lease.
+fn cancelled_publication_dedup_plugin(port: u16) -> RequestDeduplication {
+    make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": format!("redis://127.0.0.1:{port}/0"),
+        "redis_connect_timeout_seconds": 5,
+        "redis_pool_size": 1,
+        "redis_health_check_interval_seconds": 3600,
+        "ttl_seconds": 300,
+        "inflight_ttl_seconds": 10
+    }))
+}
+
+/// Complete a Redis-owned operation, then cancel its publication while the
+/// fenced `EXEC` is held: the publisher's future is dropped before the
+/// compare-and-set runs, so no verdict ever settles the local completion.
+async fn complete_and_cancel_publication(
+    plugin: &RequestDeduplication,
+    exec_arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    external_operation: bool,
+) {
+    let (mut owner, mut owner_headers) = pending_publication_request();
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+    if external_operation {
+        owner.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+    let mut publish = Box::pin(complete_response(plugin, &mut owner));
+    tokio::select! {
+        () = &mut publish => panic!("the fenced publication must still be awaiting EXEC"),
+        () = wait_for_held_exec(exec_arrivals) => {}
+    }
+    drop(publish);
+}
+
+/// Let the owner's Redis lease expire and age the cancelled publication's
+/// unsettled local completion by `age` without it ever settling.
+fn lapse_redis_lease_and_age_pending_completion(
+    server: &ScriptedDedupRedis,
+    plugin: &RequestDeduplication,
+    age: std::time::Duration,
+) {
+    use ferrum_edge::_test_support::request_deduplication_backdate_pending_publication_for_test;
+
+    // The fenced write never executed: Redis still holds the owner's lease.
+    assert_eq!(server.single_record()["state"], "inflight");
+    // The scripted keyspace has no TTLs, so expire the lease by removing it.
+    server.clear();
+    request_deduplication_backdate_pending_publication_for_test(plugin, age);
+}
+
+/// Past the ten-second in-flight lease, well inside the 300s completed TTL.
+const PAST_INFLIGHT_LEASE: std::time::Duration = std::time::Duration::from_secs(11);
+/// Past the 300s completed TTL.
+const PAST_COMPLETED_TTL: std::time::Duration = std::time::Duration::from_secs(301);
+
+/// Two matching retries are refused as in progress without taking ownership.
+async fn assert_retries_refused_without_ownership(plugin: &RequestDeduplication, window: &str) {
+    for attempt in ["first", "second"] {
+        let (mut retry, mut retry_headers) = pending_publication_request();
+        let context = format!("{attempt} matching retry {window}");
+        assert_in_progress_conflict(
+            plugin.before_proxy(&mut retry, &mut retry_headers).await,
+            &context,
+        );
+        assert!(
+            request_identity(plugin, &retry).is_none(),
+            "{context}: the retry must not take ownership of the completed operation"
+        );
+    }
+}
+
+/// Issue #6312 follow-up: hiding a pending completion's replay must not shorten
+/// the protection of an external operation that already executed. With
+/// `ttl_seconds=300` and `inflight_ttl_seconds=10`, cancelling the publication
+/// before its fenced Redis write and letting both leases lapse must still leave
+/// a token-matched execution barrier: a matching retry that re-acquires Redis
+/// ownership is refused as in progress instead of executing again.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn cancelled_publication_keeps_a_completed_external_operation_blocked() {
+    let _policy = pinned_policy_guard();
+    let (server, mut exec_arrivals) = spawn_scripted_dedup_redis(1).await;
+    let plugin = cancelled_publication_dedup_plugin(server.port);
+
+    complete_and_cancel_publication(&plugin, &mut exec_arrivals, true).await;
+    lapse_redis_lease_and_age_pending_completion(&server, &plugin, PAST_INFLIGHT_LEASE);
+
+    assert_retries_refused_without_ownership(&plugin, "inside the 300s protection window").await;
+    assert!(
+        assert_completed_size_exact(&plugin) > 0,
+        "the unsettled external-operation completion must stay retained"
+    );
+}
+
+/// The same protection covers an ordinary backend response, not only a marked
+/// external operation: a buffered POST that returned 201 already executed, so
+/// cancelling its publication and letting both leases lapse must still refuse a
+/// matching retry until the original 300s completed deadline. Only after that
+/// deadline is the key re-admitted.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn cancelled_publication_keeps_a_completed_backend_response_blocked_until_its_ttl() {
+    use ferrum_edge::_test_support::request_deduplication_backdate_pending_publication_for_test;
+
+    let _policy = pinned_policy_guard();
+    let (server, mut exec_arrivals) = spawn_scripted_dedup_redis(1).await;
+    let plugin = cancelled_publication_dedup_plugin(server.port);
+
+    complete_and_cancel_publication(&plugin, &mut exec_arrivals, false).await;
+    lapse_redis_lease_and_age_pending_completion(&server, &plugin, PAST_INFLIGHT_LEASE);
+
+    assert_retries_refused_without_ownership(&plugin, "inside the 300s completed TTL").await;
+    assert!(
+        assert_completed_size_exact(&plugin) > 0,
+        "the unsettled backend completion must stay retained until its TTL"
+    );
+
+    // Past the completed deadline the protection ends and a retry is admitted.
+    request_deduplication_backdate_pending_publication_for_test(&plugin, PAST_COMPLETED_TTL);
+    let (mut retry, mut retry_headers) = pending_publication_request();
+    let result = plugin.before_proxy(&mut retry, &mut retry_headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a retry after the completed TTL must be admitted; got {result:?}"
+    );
+    assert!(request_identity(&plugin, &retry).is_some());
+}
+
+/// Control: genuinely unfinished work records no completion, so it keeps the
+/// lease-bounded expiry. An owner that never completed refuses a matching retry
+/// while its lease is live and re-admits it once both leases have lapsed.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn unfinished_work_without_a_completion_expires_with_the_inflight_lease() {
+    let _policy = pinned_policy_guard();
+    let (server, _exec_arrivals) = spawn_scripted_dedup_redis(1).await;
+    let plugin = cancelled_publication_dedup_plugin(server.port);
+
+    let (mut owner, mut owner_headers) = pending_publication_request();
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&plugin, &owner).is_some());
+
+    let (mut retry, mut retry_headers) = pending_publication_request();
+    assert_in_progress_conflict(
+        plugin.before_proxy(&mut retry, &mut retry_headers).await,
+        "a matching retry while the unfinished owner's lease is live",
+    );
+
+    // The owner never completes: its Redis lease expires and the local
+    // in-flight lease lapses.
+    assert_eq!(server.single_record()["state"], "inflight");
+    server.clear();
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+    assert_eq!(
+        assert_completed_size_exact(&plugin),
+        0,
+        "unfinished work never records a completion"
+    );
+
+    let (mut retry, mut retry_headers) = pending_publication_request();
+    let result = plugin.before_proxy(&mut retry, &mut retry_headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "unfinished work must re-admit after its lease; got {result:?}"
+    );
+    assert!(request_identity(&plugin, &retry).is_some());
+    drop(owner);
+}
