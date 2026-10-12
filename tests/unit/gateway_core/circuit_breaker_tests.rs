@@ -2856,8 +2856,9 @@ fn breaker_with_admitted_probe() -> (Arc<CircuitBreaker>, HalfOpenProbeGuard) {
     let cb = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
     cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
-    let (is_half_open_probe, admission_generation) =
-        cb.can_execute_with_generation().expect("timeout 0 admits a probe");
+    let (is_half_open_probe, admission_generation) = cb
+        .can_execute_with_generation()
+        .expect("timeout 0 admits a probe");
     assert!(
         is_half_open_probe,
         "the admission must claim the probe slot"
