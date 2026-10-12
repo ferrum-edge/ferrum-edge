@@ -2509,7 +2509,9 @@ impl ConfigSync for CpGrpcServer {
             namespace: dp_namespace.clone(),
             scope: self.scope.clone(),
         };
-        let stream = stream::unfold(broadcast_state, |mut state| async move {
+        // Boxed: the unfold future is `!Unpin` and `TrackedStream` requires
+        // `Unpin`; one allocation per subscription, not per frame.
+        let stream = Box::pin(stream::unfold(broadcast_state, |mut state| async move {
             loop {
                 match state.rx.recv().await {
                     Ok(update) => {
@@ -2546,7 +2548,7 @@ impl ConfigSync for CpGrpcServer {
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
-        });
+        }));
 
         // Prepend initial config, interleave application heartbeats for
         // silent-partition detection, then wrap in TrackedStream so the DP is
