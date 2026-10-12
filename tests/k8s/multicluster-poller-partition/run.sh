@@ -54,6 +54,11 @@ INITIAL_REVERSE_FEDERATION_SUCCESS_AT=0 INITIAL_REVERSE_DISCOVERY_SUCCESSES=0
 INITIAL_FEDERATION_FAILURES=0 INITIAL_DISCOVERY_FAILURES=0
 TRANSIENT_FEDERATION_FAILURE_DELTA=0 TRANSIENT_DISCOVERY_FAILURE_DELTA=0
 RECORDED=" "
+# Docker identities of the resources THIS invocation created. Cleanup removes
+# only these, and a kind cluster only while the same control-plane container
+# still holds its name, so a refused preflight, a partial start, or a same-name
+# replacement owned by another invocation is never deleted.
+OWNED_TOXIPROXY_ID="" OWNED_CLUSTER_A_NODE_ID="" OWNED_CLUSTER_B_NODE_ID=""
 
 mkdir -p "$RESULTS_DIR" "$ARTIFACT_DIR"
 
@@ -67,12 +72,30 @@ record() {
   RECORDED="$RECORDED$id "
 }
 
+cluster_node_id() {
+  docker inspect -f '{{.Id}}' "$1-control-plane" 2>/dev/null
+}
+
+release_owned_cluster() {
+  local cluster="$1" owned_node_id="$2" current_node_id
+  [[ -n "$owned_node_id" ]] || return 0
+  current_node_id="$( cluster_node_id "$cluster")"
+  if [[ "$current_node_id" != "$owned_node_id" ]]; then
+    echo "leaving kind cluster $cluster: its control-plane node is not the one this run created" >&2
+    return 0
+  fi
+  kind delete cluster --name "$cluster" >/dev/null 2>&1
+}
+
 cleanup() {
   set +e
   if [[ -n "$TOXI_IP" ]]; then collect_diagnostics; fi
-  docker rm -f "$TOXIPROXY_CONTAINER" >/dev/null 2>&1
-  kind delete cluster --name "$CLUSTER_A" >/dev/null 2>&1
-  kind delete cluster --name "$CLUSTER_B" >/dev/null 2>&1
+  # By container id, never by name: a same-name replacement is not ours.
+  if [[ -n "$OWNED_TOXIPROXY_ID" ]]; then
+    docker rm -f "$OWNED_TOXIPROXY_ID" >/dev/null 2>&1
+  fi
+  release_owned_cluster "$CLUSTER_A" "$OWNED_CLUSTER_A_NODE_ID"
+  release_owned_cluster "$CLUSTER_B" "$OWNED_CLUSTER_B_NODE_ID"
 }
 trap cleanup EXIT
 
@@ -312,18 +335,37 @@ mint_admin_jwt() {
     mint-admin-jwt "$ADMIN_SECRET"
 }
 
+record_created_cluster() {
+  local cluster="$1" node_id
+  node_id="$( cluster_node_id "$cluster")" || node_id=""
+  [[ -n "$node_id" ]] || {
+    echo "could not record the control-plane identity of kind cluster $cluster; it is left for manual removal" >&2
+    return 1
+  }
+  printf '%s' "$node_id"
+}
+
+# Ownership is claimed only after each create succeeds. A failed `kind create`
+# removes the nodes it made itself (no --retain), and a name taken between
+# preflight and create fails the create, so neither is ever adopted here.
 create_clusters_and_fault_layer() {
   kind create cluster --name "$CLUSTER_A" --wait 180s
+  OWNED_CLUSTER_A_NODE_ID="$( record_created_cluster "$CLUSTER_A")"
   kind create cluster --name "$CLUSTER_B" --wait 180s
+  OWNED_CLUSTER_B_NODE_ID="$( record_created_cluster "$CLUSTER_B")"
   kind load docker-image "$IMAGE" --name "$CLUSTER_A"
   kind load docker-image "$IMAGE" --name "$CLUSTER_B"
   NODE_A="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_A-control-plane")"
   NODE_B="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER_B-control-plane")"
   [[ -n "$NODE_A" && -n "$NODE_B" ]] || { echo "kind node IP discovery failed" >&2; return 1; }
 
-  docker run -d --name "$TOXIPROXY_CONTAINER" --network kind "$TOXIPROXY_IMAGE" \
-    -host=0.0.0.0 -proxy-metrics >/dev/null
-  TOXI_IP="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$TOXIPROXY_CONTAINER")"
+  # Create, record, then start: a container whose start fails is still ours to
+  # remove, and the id (not the name) is what cleanup removes.
+  OWNED_TOXIPROXY_ID="$( docker create --name "$TOXIPROXY_CONTAINER" --network kind "$TOXIPROXY_IMAGE" \
+    -host=0.0.0.0 -proxy-metrics)"
+  [[ -n "$OWNED_TOXIPROXY_ID" ]] || { echo "Toxiproxy create returned no container id" >&2; return 1; }
+  docker start "$OWNED_TOXIPROXY_ID" >/dev/null
+  TOXI_IP="$( docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$OWNED_TOXIPROXY_ID")"
   [[ -n "$TOXI_IP" ]] || { echo "Toxiproxy IP discovery failed" >&2; return 1; }
   wait_for_curl "Toxiproxy API" 30 -fsS "http://$TOXI_IP:8474/version" >/dev/null
 

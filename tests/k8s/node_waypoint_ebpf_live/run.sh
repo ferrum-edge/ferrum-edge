@@ -3152,7 +3152,7 @@ recorded_expect_blocked() {
       pass \
       "$from" \
       "$destination" \
-      "$outcome" \
+      "$outcome;refusal=$LAST_HTTP_DENIAL_EVIDENCE" \
       "$source_spiffe" \
       "$destination_spiffe"
   else
@@ -3161,7 +3161,7 @@ recorded_expect_blocked() {
       fail \
       "$from" \
       "$destination" \
-      "unexpected-http-200" \
+      "expected-$outcome;observed=$LAST_HTTP_DENIAL_EVIDENCE" \
       "$source_spiffe" \
       "$destination_spiffe"
     return 1
@@ -3183,7 +3183,7 @@ recorded_expect_blocked_unmanaged() {
       pass \
       "$from" \
       "$destination" \
-      "$outcome" \
+      "$outcome;refusal=$LAST_HTTP_DENIAL_EVIDENCE" \
       "none" \
       "$(spiffe_for_sa "$destination")"
   else
@@ -3192,7 +3192,7 @@ recorded_expect_blocked_unmanaged() {
       fail \
       "$from" \
       "$destination" \
-      "unexpected-http-200" \
+      "expected-$outcome;observed=$LAST_HTTP_DENIAL_EVIDENCE" \
       "none" \
       "$(spiffe_for_sa "$destination")"
     return 1
@@ -3207,27 +3207,78 @@ expect_blocked() {
   expect_blocked_from_namespace "$WORKLOAD_NS" "$from" "$label" "$url" "$family"
 }
 
+# Classify one HTTP denial probe from its kubectl exec status and output.
+# curl runs inside the source pod with `-w "\n%{http_code}"`, so a three-digit
+# trailer is the evidence that curl itself executed; an exec, image, or API
+# failure leaves none. Prints the refusal mechanism and returns 0 only for an
+# observed refusal: an HTTP 4xx/5xx answer, or a transport refusal curl reported
+# with no HTTP status (7 connect refused, 28 timeout, 52 empty reply, 55 send
+# failure, 56 receive failure/reset). Returns 1 for an unexpected 2xx/3xx answer
+# and 2 when nothing proves the request was refused (missing trailer, DNS or
+# other curl setup failure, or a transport error with a status code).
+classify_http_denial_probe() {
+  local status="$1" output="$2" code
+  code="${output##*$'\n'}"
+  if [[ ! "$code" =~ ^[0-9]{3}$ ]]; then
+    printf 'no-curl-trailer exec_status=%s' "$status"
+    return 2
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    case "$code" in
+      4??|5??)
+        printf 'http-%s' "$code"
+        return 0
+        ;;
+      *)
+        printf 'unexpected-http-%s' "$code"
+        return 1
+        ;;
+    esac
+  fi
+  if [[ "$code" == "000" ]]; then
+    case "$status" in
+      7|28|52|55|56)
+        printf 'curl-exit-%s' "$status"
+        return 0
+        ;;
+    esac
+  fi
+  printf 'inconclusive-curl-exit-%s-http-%s' "$status" "$code"
+  return 2
+}
+
+# Last refusal mechanism (or failure reason) from expect_blocked_from_namespace,
+# for the recording wrappers.
+LAST_HTTP_DENIAL_EVIDENCE=""
+
 expect_blocked_from_namespace() {
   local namespace="$1"
   local from="$2"
   local label="$3"
   local url="$4"
   local family="${5:-}"
-  local output code err
+  local output err evidence verdict
   err="$(mktemp)"
   set +e
   output="$(curl_for_family_from_namespace "$namespace" "$family" "$from" "$url" 2>"$err")"
   local status=$?
+  evidence="$(classify_http_denial_probe "$status" "$output")"
+  verdict=$?
   set -e
-  code="${output##*$'\n'}"
-  if [[ "$status" -eq 0 && "$code" == "200" ]]; then
-    echo "expected block for $label from $from to $url, got HTTP 200" >&2
-    cat "$err" >&2 || true
+  LAST_HTTP_DENIAL_EVIDENCE="$evidence"
+  if [[ "$verdict" -eq 0 ]]; then
     rm -f "$err"
-    collect_traffic_failure_diagnostics
-    return 1
+    return 0
   fi
+  if [[ "$verdict" -eq 1 ]]; then
+    echo "expected block for $label from $from to $url, got $evidence" >&2
+  else
+    echo "denial for $label from $from to $url was not observed ($evidence); a probe that did not run is not a refusal" >&2
+  fi
+  head -c 2048 "$err" >&2 || true
   rm -f "$err"
+  collect_traffic_failure_diagnostics
+  return "$verdict"
 }
 
 expect_policy_denied() {
@@ -5157,6 +5208,85 @@ dtls_echo_backend_received() {
   dtls_backend_received "$WORKLOAD_NS" dtls-echo "$1"
 }
 
+# Count backend log lines carrying `payload`. Unlike dtls_backend_received this
+# fails (status 1, no output) when the log itself cannot be read, so a denial
+# row never mistakes an unreadable log for "the backend saw zero datagrams".
+backend_log_payload_count() {
+  local ns="$1" deploy="$2" payload="$3" logs count
+  logs="$(kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null)" || return 1
+  count="$(grep -c "^recv:${payload}$" <<<"$logs")" || [[ "$count" == "0" ]] || return 1
+  printf '%s' "$count"
+}
+
+DTLS_PROBE_RC_MARKER="FERRUM_DTLS_PROBE_RC:"
+
+# DTLS denial probe that keeps its provenance. Same handshake and datagram as
+# dtls_probe_from, but openssl's stderr is kept and the status of `timeout
+# openssl` is appended INSIDE the pod as `FERRUM_DTLS_PROBE_RC:<rc>`, so a
+# kubectl/exec/image failure (no marker) stays distinguishable from a probe that
+# ran and got nothing back. A timeout is a legitimate denial outcome, so the
+# status is evidence that the probe ran, not a pass/fail verdict by itself.
+dtls_denial_probe_from() {
+  local ns="$1" app="$2" target="$3" port="$4" payload="$5" wait_secs="${6:-8}"
+  printf '%s\n' "$payload" | kubectl -n "$ns" exec -i "deploy/$app" -c dtls -- \
+    sh -c 'timeout "$1" openssl s_client -dtls1_2 -connect "$2" -quiet 2>&1; printf "\n%s%s\n" "$3" "$?"' \
+    -- "$wait_secs" "$target:$port" "$DTLS_PROBE_RC_MARKER" 2>&1 || true
+}
+
+# Did the denial probe demonstrably run? Prints the probe evidence and returns
+# 0 when the in-pod status marker is present and the client neither lacked its
+# tools nor failed before it could send (name resolution, local connect,
+# ICMP-refused port). Returns 2 otherwise.
+classify_dtls_denial_probe() {
+  local report="$1" rc
+  rc="$(printf '%s\n' "$report" | sed -n "s/^${DTLS_PROBE_RC_MARKER}//p" | tail -n1)"
+  if [[ ! "$rc" =~ ^[0-9]+$ ]]; then
+    printf 'probe-did-not-run'
+    return 2
+  fi
+  case "$rc" in
+    126|127)
+      printf 'probe-tool-unavailable rc=%s' "$rc"
+      return 2
+      ;;
+  esac
+  if grep -qiE 'getaddrinfo|BIO_lookup|does not resolve|nodename nor servname|unable to resolve|connect:errno|errno=111|connection refused|: not found' <<<"$report"; then
+    printf 'probe-setup-failed rc=%s' "$rc"
+    return 2
+  fi
+  printf 'probe-ran-no-echo rc=%s' "$rc"
+}
+
+# Verdict for one DTLS denial row: the probe report, the echo that must NOT
+# come back, and the backend log read (status + count). Prints the evidence.
+# Returns 0 for a proven denial (probe ran, no echo, log read with zero
+# matches), 1 when the denial was violated (echo returned or the backend saw
+# the payload), and 2 when the evidence was unavailable.
+dtls_denial_verdict() {
+  local report="$1" expected_echo="$2" log_status="$3" hits="$4" probe
+  if [[ "$report" == *"$expected_echo"* ]]; then
+    printf 'echo-returned backend_hits=%s' "${hits:-unread}"
+    return 1
+  fi
+  if [[ "$log_status" -eq 0 && "$hits" =~ ^[0-9]+$ && "$hits" != "0" ]]; then
+    printf 'backend_hits=%s' "$hits"
+    return 1
+  fi
+  if ! probe="$(classify_dtls_denial_probe "$report")"; then
+    printf '%s' "$probe"
+    return 2
+  fi
+  if [[ "$log_status" -ne 0 || ! "$hits" =~ ^[0-9]+$ ]]; then
+    printf '%s backend-log-unavailable' "$probe"
+    return 2
+  fi
+  printf '%s backend_hits=0' "$probe"
+}
+
+dtls_report_excerpt() {
+  printf '%s' "$1" | tr '\n' ' ' | cut -c1-240
+}
+
 wait_for_dtls_echo_on() {
   local ns="$1" app="$2" listener_ip="$3" port="$4" expected_prefix="$5" payload="$6"
   local budget="${7:-20}" cert="${8:-}" key="${9:-}"
@@ -5246,7 +5376,7 @@ dtls_report_snippet() {
 # one.
 run_node_waypoint_dtls_service_path_checks() {
   log "running NodeWaypoint DTLS Service-path datapath checks (issue #3286 root review)"
-  local service_dns service_ip reply hits
+  local service_dns service_ip reply hits log_status evidence verdict
 
   service_dns="dtls-echo.${WORKLOAD_NS}.svc.cluster.local"
   service_ip="$(kubectl -n "$WORKLOAD_NS" get svc dtls-echo -o jsonpath='{.spec.clusterIP}')"
@@ -5286,19 +5416,22 @@ run_node_waypoint_dtls_service_path_checks() {
   # 2. A source the namespace-scoped policy denies reaches the same steered
   #    listener and is refused there. Reply-absence alone would be vacuous, so
   #    the backend log is the authority.
-  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-b "$service_dns" "$DTLS_LISTENER_PORT" \
+  reply="$(dtls_denial_probe_from "$WORKLOAD_NS" dtls-src-b "$service_dns" "$DTLS_LISTENER_PORT" \
     dtls-svc-b 8)"
   sleep 2
-  hits="$(dtls_echo_backend_received dtls-svc-b)"
-  if [[ "$reply" == *"dtls-ok:dtls-svc-b"* || "$hits" != "0" ]]; then
+  log_status=0
+  hits="$(backend_log_payload_count "$WORKLOAD_NS" dtls-echo dtls-svc-b)" || log_status=$?
+  verdict=0
+  evidence="$(dtls_denial_verdict "$reply" "dtls-ok:dtls-svc-b" "$log_status" "$hits")" || verdict=$?
+  if [[ "$verdict" -ne 0 ]]; then
     record_live_assertion node_waypoint.dtls.service_path_deny_scoped_policy fail \
-      dtls-src-b dtls-echo "observed=$reply backend_hits=$hits" \
+      dtls-src-b dtls-echo "$evidence observed=$(dtls_report_excerpt "$reply")" \
       "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
     collect_traffic_failure_diagnostics
     return 1
   fi
   record_live_assertion node_waypoint.dtls.service_path_deny_scoped_policy pass \
-    dtls-src-b dtls-echo "no application data returned and backend_hits=0" \
+    dtls-src-b dtls-echo "no application data returned: $evidence" \
     "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
 
   # 3. An UNENROLLED source. No steering rule names its interface, so its
@@ -5306,19 +5439,22 @@ run_node_waypoint_dtls_service_path_checks() {
   #    the backing pod and the pod-veth guard drops it. Nothing reaches the
   #    backend and no application data comes back — the fail-closed contract,
   #    proven for the Service address rather than only for a node address.
-  reply="$(dtls_probe_from "$UNMANAGED_NS" dtls-unmanaged "$service_dns" "$DTLS_LISTENER_PORT" \
+  reply="$(dtls_denial_probe_from "$UNMANAGED_NS" dtls-unmanaged "$service_dns" "$DTLS_LISTENER_PORT" \
     dtls-svc-x 8)"
   sleep 2
-  hits="$(dtls_echo_backend_received dtls-svc-x)"
-  if [[ "$reply" == *"dtls-ok:dtls-svc-x"* || "$hits" != "0" ]]; then
+  log_status=0
+  hits="$(backend_log_payload_count "$WORKLOAD_NS" dtls-echo dtls-svc-x)" || log_status=$?
+  verdict=0
+  evidence="$(dtls_denial_verdict "$reply" "dtls-ok:dtls-svc-x" "$log_status" "$hits")" || verdict=$?
+  if [[ "$verdict" -ne 0 ]]; then
     record_live_assertion node_waypoint.dtls.service_path_deny_unattributed_source fail \
-      dtls-unmanaged dtls-echo "observed=$reply backend_hits=$hits" "" \
+      dtls-unmanaged dtls-echo "$evidence observed=$(dtls_report_excerpt "$reply")" "" \
       "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
     collect_traffic_failure_diagnostics
     return 1
   fi
   record_live_assertion node_waypoint.dtls.service_path_deny_unattributed_source pass \
-    dtls-unmanaged dtls-echo "no application data returned and backend_hits=0" "" \
+    dtls-unmanaged dtls-echo "no application data returned: $evidence" "" \
     "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
 }
 
@@ -5388,19 +5524,23 @@ material" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-
 
   # 3. A source the namespace-scoped policy denies gets nothing through, and —
   #    the load-bearing half — the backend never sees its datagram.
-  reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-b "$listener_ip" "$DTLS_LISTENER_PORT" dtls-b 8)"
+  reply="$(dtls_denial_probe_from "$WORKLOAD_NS" dtls-src-b "$listener_ip" "$DTLS_LISTENER_PORT" \
+    dtls-b 8)"
   sleep 2
-  local dtls_deny_hits
-  dtls_deny_hits="$(dtls_echo_backend_received dtls-b)"
-  if [[ "$reply" == *"dtls-ok:dtls-b"* || "$dtls_deny_hits" != "0" ]]; then
+  local dtls_deny_hits dtls_deny_log_status=0 dtls_deny_evidence dtls_deny_verdict=0
+  dtls_deny_hits="$(backend_log_payload_count "$WORKLOAD_NS" dtls-echo dtls-b)" ||
+    dtls_deny_log_status=$?
+  dtls_deny_evidence="$(dtls_denial_verdict "$reply" "dtls-ok:dtls-b" \
+    "$dtls_deny_log_status" "$dtls_deny_hits")" || dtls_deny_verdict=$?
+  if [[ "$dtls_deny_verdict" -ne 0 ]]; then
     record_live_assertion node_waypoint.dtls.listener_deny_scoped_policy fail \
-      dtls-src-b dtls-echo "observed=$reply backend_hits=$dtls_deny_hits" \
+      dtls-src-b dtls-echo "$dtls_deny_evidence observed=$(dtls_report_excerpt "$reply")" \
       "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
     collect_traffic_failure_diagnostics
     return 1
   fi
   record_live_assertion node_waypoint.dtls.listener_deny_scoped_policy pass \
-    dtls-src-b dtls-echo "no application data returned and backend_hits=0" \
+    dtls-src-b dtls-echo "no application data returned: $dtls_deny_evidence" \
     "$(spiffe_for_sa src-b)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
 }
 
