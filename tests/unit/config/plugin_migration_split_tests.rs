@@ -378,14 +378,49 @@ fn postgres_keywords_inside_comments_or_quotes_keep_transactional_execution() {
     }
     // Only PostgreSQL ever selects the top-level path.
     let sqlite_statements = ["CREATE INDEX CONCURRENTLY idx ON t (id)"];
-    assert!(!statements_require_non_transactional_postgres("sqlite", &sqlite_statements));
+    assert!(!statements_require_non_transactional_postgres(
+        "sqlite",
+        &sqlite_statements
+    ));
+}
+
+#[test]
+fn postgres_dollar_inside_identifier_does_not_expose_keywords() {
+    // PostgreSQL identifiers may contain `$` after the first character, so
+    // `idx$CONCURRENTLY` is one ordinary index name, not the keyword.
+    for sql in [
+        "CREATE INDEX idx$CONCURRENTLY ON plugin_data (id);\nINSERT INTO missing_plugin_table VALUES (1);",
+        "CREATE UNIQUE INDEX idx$concurrently ON plugin_data (id);",
+        "DROP INDEX idx$$CONCURRENTLY$$;",
+        "CREATE TABLE plugin$VACUUM (id INT);",
+    ] {
+        assert!(!postgres_requires_top_level(sql), "{sql}");
+    }
+    // Controls: the real keyword still selects top-level execution, including
+    // next to an identifier that contains `$`.
+    for sql in [
+        "CREATE INDEX CONCURRENTLY idx$plugin ON plugin_data (id);",
+        "CREATE INDEX CONCURRENTLY idx_plugin ON plugin_data (id);",
+        "DROP INDEX CONCURRENTLY idx$plugin;",
+    ] {
+        assert!(postgres_requires_top_level(sql), "{sql}");
+    }
+    // Dollar quotes at a token boundary are still recognized as bodies.
+    let sql = "CREATE FUNCTION f() RETURNS void AS $body$ BEGIN PERFORM 'CREATE INDEX CONCURRENTLY'; END $body$ LANGUAGE plpgsql;\nCREATE INDEX CONCURRENTLY idx$plugin ON plugin_data (id);";
+    let statements = split_plugin_migration_statements(sql, "postgres").unwrap();
+    assert_eq!(statements.len(), 2);
+    assert!(!statements_require_non_transactional_postgres("postgres", &statements[..1]));
+    assert!(statements_require_non_transactional_postgres("postgres", &statements[1..]));
+    assert!(!postgres_requires_top_level("DO $$ BEGIN EXECUTE 'VACUUM plugin_data'; END $$;"));
 }
 
 #[test]
 fn mysql_leading_whitespace_padding_is_scanned_linearly() {
     // Before #6375 every padding byte rescanned the bytes before and after it
-    // (quadratic). The bound is orders of magnitude above linear cost.
-    let padding = " ".repeat(200_000);
+    // (quadratic: ~10^12 byte visits at this size). Linear scanning finishes in
+    // milliseconds, so the generous bound cannot flake on slow runners while a
+    // quadratic regression still cannot meet it.
+    let padding = " ".repeat(1_000_000);
     let sql = format!("{padding}SELECT 1;");
     let started = Instant::now();
     let statements = split_plugin_migration_statements(&sql, "mysql").unwrap();
@@ -400,7 +435,7 @@ fn mysql_leading_whitespace_padding_is_scanned_linearly() {
         ["CREATE PROCEDURE p() BEGIN SELECT 1; END", "SELECT 2"]
     );
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(120),
         "padding scan took {:?}",
         started.elapsed()
     );

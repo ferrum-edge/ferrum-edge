@@ -969,7 +969,7 @@ fn sql_keyword_tokens(statement: &str, dialect: SplitDialect) -> Vec<&str> {
             }
             b if is_keyword_token_byte(b) => {
                 let mut end = i + 1;
-                while end < bytes.len() && is_keyword_token_byte(bytes[end]) {
+                while end < bytes.len() && continues_keyword_token(bytes[end]) {
                     end += 1;
                 }
                 tokens.push(&statement[i..end]);
@@ -991,6 +991,13 @@ fn sql_keyword_tokens(statement: &str, dialect: SplitDialect) -> Vec<&str> {
 /// identifier is never split out as its own token.
 fn is_keyword_token_byte(b: u8) -> bool {
     is_ident_byte(b) || !b.is_ascii()
+}
+
+/// `$` continues an identifier after its first character (PostgreSQL, MySQL,
+/// and SQLite all allow it), so `idx$CONCURRENTLY` stays one word. Only a `$`
+/// at a token boundary can open a PostgreSQL dollar quote.
+fn continues_keyword_token(b: u8) -> bool {
+    is_keyword_token_byte(b) || b == b'$'
 }
 
 fn token_is(tokens: &[&str], index: usize, keyword: &str) -> bool {
