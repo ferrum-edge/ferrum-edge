@@ -72,19 +72,22 @@ same defect.
 Observability is tiered by default; the goal of this section is to keep it that
 way and to give scrapers a credential rather than opening the tier.
 
-| Endpoint | Unauthenticated | Authenticated |
+| Endpoint | Without detail authorization | With detail authorization |
 |---|---|---|
 | `/live` | always available, `{"status":"ok"}` | same |
-| `/health`, `/status` | `status` + `ready` only | full diagnostics |
+| `/health`, `/status` | `status` + `ready`; namespace JWT alone gets bounded tenant tier | full diagnostics |
 | `/overload` | coarse level only | full snapshot |
-| `/metrics` | `401` | full metrics |
+| `/metrics` | `401` (`403` for a namespace JWT) | full metrics |
 
-"Authenticated" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`,
-or a source IP inside `FERRUM_METRICS_ALLOWED_CIDRS`. An admin JWT carrying an
-`ns` claim is a tenant credential: it never unlocks the detailed tier (it gets
-the bounded tenant tier of `/health` and `/status`) and is refused on
-fleet-global admin routes, `/metrics` included, even from an allowlisted
-source IP.
+"Detail authorization" means a valid admin JWT that is not namespace-bounded,
+a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP inside
+`FERRUM_METRICS_ALLOWED_CIDRS`. An admin JWT carrying an
+`ns` claim is a tenant credential: by itself it does not unlock the detailed
+tier (it gets the bounded tenant tier of `/health` and `/status`). An
+independent observability grant, such as a matching metrics bearer token or an
+allowlisted source IP, can authorize detail on those endpoints. Presenting a
+namespace JWT on the fleet-global `/metrics` endpoint remains refused with
+`403`, even from an allowlisted source IP.
 
 | Do this | Setting | Secure value | Reference |
 |---|---|---|---|
