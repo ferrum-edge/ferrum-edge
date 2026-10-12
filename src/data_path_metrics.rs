@@ -34,8 +34,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::config::types::GatewayConfig;
 use crate::health_check::HealthChecker;
+use crate::load_balancer::LoadBalancerCacheInner;
 use crate::overload::{OverloadLevel, OverloadState, RED_PROBABILITY_SCALE};
 use crate::plugins::prometheus_metrics::escape_label_value;
 use crate::proxy::ProxyState;
@@ -167,8 +167,12 @@ pub fn render_prometheus(proxy_state: Option<&ProxyState>, ns_label: &str) -> St
     render_process_families(&mut output, ns_label);
     if let Some(state) = proxy_state {
         render_overload(&mut output, &state.overload, ns_label);
-        let config = state.current_config();
-        render_upstream_health(&mut output, &config, &state.health_checker, ns_label);
+        // The load balancer's published snapshot, not `current_config()`:
+        // service discovery installs its merged static + discovered target
+        // set there (and restarts active probes for exactly that set) while
+        // the request epoch keeps the configured upstream unchanged.
+        let load_balancer = state.load_balancer_cache.load_inner();
+        render_upstream_health(&mut output, &load_balancer, &state.health_checker, ns_label);
         render_circuit_breakers(&mut output, &state.circuit_breaker_cache, ns_label);
         let (http_entries, max_idle_per_host) = state.connection_pool.pool_gauges();
         let pools = [
@@ -363,6 +367,13 @@ pub fn render_overload(output: &mut String, overload: &OverloadState, ns_label: 
 
 /// Append the upstream-health families, aggregated per configured resource.
 ///
+/// The target denominator is the active target set the load balancer serves
+/// for each upstream: configured static targets merged with the endpoints
+/// service discovery last installed, which is also the set active health
+/// probes run against. Counting configured targets alone would give a
+/// discovery-only upstream a zero denominator and a mixed upstream a ratio
+/// whose numerator and denominator cover different sets.
+///
 /// Active-probe ejections are upstream-scoped and passive ejections are
 /// proxy-scoped, matching the two-layer split in
 /// [`crate::health_check::HealthChecker`]. Both are reduced to a **count** so
@@ -370,13 +381,13 @@ pub fn render_overload(output: &mut String, overload: &OverloadState, ns_label: 
 /// endpoint set.
 pub fn render_upstream_health(
     output: &mut String,
-    config: &GatewayConfig,
+    load_balancer: &LoadBalancerCacheInner,
     health_checker: &HealthChecker,
     ns_label: &str,
 ) {
-    // (namespace, upstream_id) → (configured targets, active-unhealthy targets)
+    // (namespace, upstream_id) → (active targets, active-unhealthy targets)
     let mut upstreams: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
-    for upstream in &config.upstreams {
+    for upstream in load_balancer.upstreams().values() {
         let entry = upstreams
             .entry((upstream.namespace.clone(), upstream.id.clone()))
             .or_default();
@@ -398,7 +409,7 @@ pub fn render_upstream_health(
     }
 
     output.push_str(
-        "# HELP ferrum_upstream_targets Targets configured on an upstream, including service-discovery resolved endpoints.\n",
+        "# HELP ferrum_upstream_targets Targets the load balancer currently serves for an upstream: configured static targets merged with service-discovery resolved endpoints.\n",
     );
     output.push_str("# TYPE ferrum_upstream_targets gauge\n");
     for ((namespace, upstream_id), (configured, _)) in &upstreams {
@@ -542,7 +553,7 @@ pub fn render_connection_pools(
     ns_label: &str,
 ) {
     output.push_str(
-        "# HELP ferrum_connection_pool_entries Resident entries per gateway backend pool: cached reqwest clients for http, live multiplexed connections for the others.\n",
+        "# HELP ferrum_connection_pool_entries Resident entries per gateway backend pool, counted at scrape without a health filter: cached reqwest clients for http, resident multiplexed-connection entries for the others. Health and idle cleanup can lag the scrape.\n",
     );
     output.push_str("# TYPE ferrum_connection_pool_entries gauge\n");
     for (pool, entries) in pools {
