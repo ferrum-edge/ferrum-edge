@@ -650,3 +650,254 @@ async fn every_built_in_registration_constructs_a_trusted_type() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Documented active phases follow the hooks a built-in actually implements
+// (issue #6255). The phase cell is a prose inventory, so a hook override can
+// land without its phase (or a phase can outlive its hook) while the exact
+// doc/metadata string comparison above still passes. These plugins' hook sets
+// are pinned structurally against their `impl Plugin` blocks in both
+// directions: every listed hook is overridden and documented, every
+// overridden lifecycle hook is listed, and every documented phase is backed
+// by a listed hook.
+// ---------------------------------------------------------------------------
+
+/// `Plugin` trait methods that are lifecycle hooks (not capability
+/// declarations). An override of any of these must appear in the table below.
+const LIFECYCLE_HOOKS: &[&str] = &[
+    "on_request_received",
+    "authenticate",
+    "authorize",
+    "on_backend_path_resolved",
+    "before_proxy",
+    "transform_request_body",
+    "transform_request_body_with_context",
+    "enforce_final_backend_header_policy",
+    "on_final_request_body",
+    "on_final_request_body_with_context",
+    "after_proxy",
+    "apply_websocket_handshake_response_headers",
+    "on_final_response_headers",
+    "normalize_response_body_with_context",
+    "on_response_body",
+    "transform_response_body",
+    "transform_response_body_with_context",
+    "on_response_body_transformed",
+    "on_final_response_body",
+    "response_stream_inspector",
+    "on_response_stream_terminated",
+    "log",
+    "on_ws_frame",
+    "prepare_ws_frame_delivery",
+    "emit_ws_frame_delivery",
+    "on_ws_disconnect",
+    "on_stream_connect",
+    "on_stream_disconnect",
+    "on_udp_datagram",
+];
+
+struct OperationalPhaseDeclaration {
+    plugin: &'static str,
+    source: &'static str,
+    /// `(overridden Plugin trait method, documented active phase)`.
+    hooks: &'static [(&'static str, &'static str)],
+}
+
+const OPERATIONAL_PHASE_DECLARATIONS: &[OperationalPhaseDeclaration] = &[
+    OperationalPhaseDeclaration {
+        plugin: "jwks_auth",
+        source: include_str!("../../../src/plugins/jwks_auth.rs"),
+        hooks: &[
+            ("authenticate", "authenticate"),
+            // Claim-header publication.
+            ("before_proxy", "before_proxy"),
+        ],
+    },
+    OperationalPhaseDeclaration {
+        plugin: "ai_stream_router",
+        source: include_str!("../../../src/plugins/ai_stream_router.rs"),
+        hooks: &[
+            ("before_proxy", "before_proxy"),
+            (
+                "transform_request_body_with_context",
+                "transform_request_body",
+            ),
+            (
+                "enforce_final_backend_header_policy",
+                "enforce_final_backend_header_policy",
+            ),
+            (
+                "on_final_request_body_with_context",
+                "on_final_request_body",
+            ),
+            (
+                "normalize_response_body_with_context",
+                "normalize_response_body",
+            ),
+            // Provider-response header normalization.
+            ("after_proxy", "after_proxy"),
+            ("response_stream_inspector", "response_stream_inspector"),
+        ],
+    },
+    OperationalPhaseDeclaration {
+        plugin: "a2a_gateway",
+        source: include_str!("../../../src/plugins/a2a_gateway.rs"),
+        hooks: &[
+            ("before_proxy", "before_proxy"),
+            (
+                "on_final_request_body_with_context",
+                "on_final_request_body",
+            ),
+            ("after_proxy", "after_proxy"),
+            (
+                "normalize_response_body_with_context",
+                "normalize_response_body",
+            ),
+            ("on_response_body", "on_response_body"),
+            (
+                "transform_response_body_with_context",
+                "transform_response_body",
+            ),
+            // Per-replacement callback of the transform phase, not a phase.
+            ("on_response_body_transformed", "transform_response_body"),
+            ("on_final_response_body", "on_final_response_body"),
+            ("response_stream_inspector", "response_stream_inspector"),
+            // Terminal stream observations.
+            (
+                "on_response_stream_terminated",
+                "on_response_stream_terminated",
+            ),
+        ],
+    },
+    OperationalPhaseDeclaration {
+        plugin: "ai_rate_limiter",
+        source: include_str!("../../../src/plugins/ai_rate_limiter.rs"),
+        hooks: &[
+            ("before_proxy", "before_proxy"),
+            // Conditional final-body classification.
+            (
+                "on_final_request_body_with_context",
+                "on_final_request_body_with_context",
+            ),
+            ("after_proxy", "after_proxy"),
+            ("on_response_body", "on_response_body"),
+            ("response_stream_inspector", "response_stream_inspector"),
+            (
+                "on_response_stream_terminated",
+                "on_response_stream_terminated",
+            ),
+        ],
+    },
+    OperationalPhaseDeclaration {
+        plugin: "ws_frame_logging",
+        source: include_str!("../../../src/plugins/ws_frame_logging.rs"),
+        hooks: &[
+            // Policy observations (including Close) on the frame chain.
+            ("on_ws_frame", "on_ws_frame"),
+            // Delivery observations after a successful destination send.
+            ("prepare_ws_frame_delivery", "prepare_ws_frame_delivery"),
+            ("emit_ws_frame_delivery", "emit_ws_frame_delivery"),
+            ("on_ws_disconnect", "on_ws_disconnect"),
+        ],
+    },
+];
+
+/// Method names defined directly in the file's single `impl Plugin for`
+/// block (four-space-indented `fn` / `async fn` items up to the closing `}`).
+fn plugin_impl_method_names(plugin: &str, source: &str) -> BTreeSet<String> {
+    let mut impl_starts = Vec::new();
+    for marker in [
+        "\nimpl Plugin for ",
+        "\nimpl super::Plugin for ",
+        "\nimpl crate::plugins::Plugin for ",
+    ] {
+        impl_starts.extend(source.match_indices(marker).map(|(idx, _)| idx + 1));
+    }
+    assert_eq!(
+        impl_starts.len(),
+        1,
+        "{plugin} source must contain exactly one `impl Plugin for` block"
+    );
+
+    let mut methods = BTreeSet::new();
+    for line in source[impl_starts[0]..].lines().skip(1) {
+        if line == "}" {
+            return methods;
+        }
+        let Some(rest) = line
+            .strip_prefix("    fn ")
+            .or_else(|| line.strip_prefix("    async fn "))
+        else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        methods.insert(name);
+    }
+    panic!("{plugin} `impl Plugin for` block is not terminated by a column-zero `}}`");
+}
+
+#[test]
+fn documented_active_phases_match_implemented_plugin_hooks() {
+    let meta_by_name: BTreeMap<_, _> = BUILTIN_PLUGIN_PARITY_META
+        .iter()
+        .map(|m| (m.name, m))
+        .collect();
+    let doc_phases_by_name: BTreeMap<_, _> = parse_complete_order_table(EXECUTION_ORDER_DOC)
+        .into_iter()
+        .map(|row| (row.name, row.active_phases))
+        .collect();
+
+    for declaration in OPERATIONAL_PHASE_DECLARATIONS {
+        let plugin = declaration.plugin;
+        let meta = meta_by_name
+            .get(plugin)
+            .unwrap_or_else(|| panic!("{plugin} has no parity metadata"));
+        let doc_phases = doc_phases_by_name
+            .get(plugin)
+            .unwrap_or_else(|| panic!("{plugin} has no complete-order row"));
+        let meta_phases: BTreeSet<_> = meta.active_phases.split(',').map(str::trim).collect();
+        let row_phases: BTreeSet<_> = doc_phases.split(',').map(str::trim).collect();
+        assert_eq!(
+            meta_phases, row_phases,
+            "{plugin} documented phases drifted from parity metadata"
+        );
+
+        let implemented = plugin_impl_method_names(plugin, declaration.source);
+        let mut covered_phases = BTreeSet::new();
+        for (hook, phase) in declaration.hooks {
+            assert!(
+                LIFECYCLE_HOOKS.contains(hook),
+                "{plugin} declaration lists {hook}, which is not a lifecycle hook"
+            );
+            assert!(
+                implemented.contains(*hook),
+                "{plugin} declares {hook} but its `impl Plugin` block does not override it"
+            );
+            assert!(
+                meta_phases.contains(phase),
+                "{plugin} overrides {hook} but its documented active phases omit {phase}"
+            );
+            covered_phases.insert(*phase);
+        }
+
+        for method in &implemented {
+            if LIFECYCLE_HOOKS.contains(&method.as_str()) {
+                assert!(
+                    declaration
+                        .hooks
+                        .iter()
+                        .any(|(hook, _)| *hook == method.as_str()),
+                    "{plugin} overrides lifecycle hook {method} that its operational \
+                     declaration (and documented active phases) do not list"
+                );
+            }
+        }
+        assert_eq!(
+            meta_phases, covered_phases,
+            "{plugin} documents active phases that no overridden hook implements"
+        );
+    }
+}

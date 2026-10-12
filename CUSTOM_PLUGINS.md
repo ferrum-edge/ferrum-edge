@@ -63,13 +63,19 @@ on_final_response_headers()     ── observe-only header effects (phase 7b; st
 on_response_body()              ── can reject (buffered responses only)
   │
   ▼
-transform_response_body()       ── can transform response body (buffered only; semantic stage 10, then transport-encoding stage 10c)
+transform_response_body()       ── can transform response body (buffered only; semantic stage 10)
   │
   ▼
-on_response_body_transformed()  ── refresh representation metadata after a body replacement
+on_response_body_transformed(&mut ctx, &mut headers) ── refresh representation metadata after a replacement
   │
   ▼
-finalize_client_visible_response_body() ── can reject (authoritative output policy; phase 10b)
+finalize_client_visible_response_body() ── can reject (after semantic rewrites; phase 10b)
+  │
+  ▼
+transform_response_body()       ── optional transport encoding (stage 10c, e.g. compression)
+  │
+  ▼
+on_response_body_transformed(&mut ctx, &mut headers) ── if transport encoding replaced the body
   │
   ▼
 on_final_response_body()        ── can reject (post-transform validation)
@@ -336,8 +342,8 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_final_response_headers(&mut ctx, status, &headers)` | Post-`after_proxy` (phase 7b) | No | Header-only effects for the selected response on both buffered and streaming paths. Non-rejecting; streamed responses stop body hooks after this phase. Pair with `on_final_response_body()` only when both must be idempotent. |
 | `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client. Runs in the semantic stage (phase 10) and may run again in the transport-encoding stage (phase 10c) for plugins such as `compression`. |
-| `on_response_body_transformed(&ctx, status, &headers, &body)` | Between response transforms | No | Synchronous metadata refresh after this plugin's `transform_response_body` returns a replacement body. Not invoked when the transform returns `None`. |
-| `finalize_client_visible_response_body(&mut ctx, status, &headers, &body)` | Post-transform output policy (phase 10b) | Yes | Authoritative, rejecting policy over the exact client-visible bytes after semantic and transport transforms. Opt in with `enforces_final_client_visible_response_body()`. Header policy belongs in `finalize_client_visible_response_headers()` (phase 7c). |
+| `on_response_body_transformed(&mut ctx, &mut response_headers)` | Immediately after this plugin replaces the buffered body | No | Synchronous metadata refresh after this plugin's `transform_response_body` returns replacement bytes. Receives only mutable request context and response headers; not called when the transform returns `None`. |
+| `finalize_client_visible_response_body(&mut ctx, status, &headers, &body)` | After semantic rewrites, before transport encoding (phase 10b) | Yes | Authoritative, rejecting policy over the final semantic representation. Opt in with `enforces_final_client_visible_response_body()`. Header policy belongs in `finalize_client_visible_response_headers()` (phase 7c). |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
 | `on_response_committed(&mut ctx, status, &headers, &body)` | Post-backend (buffered commit) | No | Export the final client-visible buffered response after validators and rejection replacement; opt in with `requires_response_committed_hook()` |
 | `response_stream_inspector(&ctx, status, content_type)` | Post-backend (streaming) | No (can truncate) | Create one stateful, per-response body inspector |
