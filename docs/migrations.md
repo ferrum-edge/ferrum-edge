@@ -143,10 +143,31 @@ CREATE TABLE _ferrum_migrations (
 
 ### Upgrading from Pre-Migration Versions
 
-Databases that predate migration tracking are not auto-bootstrapped. Back up
-the database and rebuild it from the current baseline before starting a current
-binary against it. The same applies whenever the `V001` baseline changes during
-build-out (see [Build-Out Schema Policy](#build-out-schema-policy)).
+Ferrum does not detect or special-case untracked schemas. When
+`_ferrum_migrations` is missing or empty, `V001` is simply pending and runs
+like it would on a fresh database. Its schema statements use
+`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` (on MySQL, an
+already-existing unique index is tolerated), and the default-namespace seed
+does nothing if the row already exists. As a result:
+
+- **Compatible untracked schema:** if the existing tables already have every
+  column and index the current baseline references, `V001` completes and its
+  tracking row is recorded. The database is adopted as-is. Ferrum does not
+  compare live table definitions against the baseline, so success does not
+  prove they match.
+- **Incompatible untracked schema:** if a baseline statement references a
+  column or table shape the existing schema lacks (for example an older
+  pre-tracking layout), `V001` fails, startup or `up` returns an error, and
+  no tracking row is recorded, so `V001` stays pending.
+
+Do not rely on adoption. Back up the database and rebuild it from the current
+baseline before starting a current binary against a database that predates
+migration tracking. The same applies whenever the `V001` baseline changes
+during build-out (see [Build-Out Schema Policy](#build-out-schema-policy)).
+Once tracking rows exist, the history checks in
+[Migration History Integrity](#migration-history-integrity) apply instead. The
+stored `V001` checksum covers the migration source, not the live schema, so a
+changed baseline is refused as checksum drift.
 
 ### Cross-Database Support
 
@@ -454,6 +475,11 @@ FERRUM_MODE=migrate \
 
 Database dry-run uses the same read-only status path: it does not create core
 or custom-plugin tracking tables, schema objects, collections, or indexes.
+
+Config dry-run (`FERRUM_MIGRATE_ACTION=config`) checks the migration path the
+same way a real run does: a current-version file reports no migration, and a
+version with no migration path (for example `version: "0"`) fails with the
+same error a real run returns. It never creates a backup or rewrites the file.
 
 ## Environment Variables Reference
 

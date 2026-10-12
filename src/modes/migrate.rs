@@ -379,11 +379,18 @@ fn run_config_migration(env_config: &EnvConfig, dry_run: bool) -> Result<(), any
     }
 
     if dry_run {
-        println!(
-            "\nDry run mode — config file would be migrated from version {} to {}.",
-            current_version, CURRENT_CONFIG_VERSION
-        );
-        println!("A backup would be created before migration.");
+        // Reject versions with no migration path exactly as a real run would,
+        // so the preview never promises a backup/write that cannot happen.
+        let plan = ConfigMigrator::plan_file(config_path)?;
+        if plan.migrations_applied > 0 {
+            println!(
+                "\nDry run mode — config file would be migrated from version {} to {} ({} step(s)).",
+                plan.from_version, plan.to_version, plan.migrations_applied
+            );
+            println!("A backup would be created before migration.");
+        } else {
+            println!("\nDry run mode — no migration needed.");
+        }
     } else {
         let result = ConfigMigrator::migrate_file(config_path)?;
         if result.migrations_applied > 0 {
