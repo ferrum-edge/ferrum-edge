@@ -2126,7 +2126,7 @@ async fn ws_logging_connect_failures_charge_one_backoff_and_none_after_the_last_
             "flush_interval_ms": 600000,
             "max_retries": 0,
             "reconnect_delay_ms": 4000,
-            "connect_timeout_ms": 1000,
+            "connect_timeout_ms": 100,
             "buffer_capacity": 16
         }),
         default_client(),
@@ -2146,7 +2146,10 @@ async fn ws_logging_connect_failures_charge_one_backoff_and_none_after_the_last_
 
     // max_retries 1: exactly one reconnect back-off between the two attempts.
     // The old ladder slept reconnect_delay inside connect() on BOTH attempts
-    // and retry_delay on top (~4.0 s here); the fixed ladder takes ~1.5 s.
+    // and retry_delay on top (~7.0 s here), and a fix that only dropped the
+    // trailing sleep would still take ~5.5 s; the fixed ladder takes ~1.5 s.
+    // The 100 ms connect timeout keeps the bound valid on hosts that drop,
+    // rather than refuse, connections to port 1.
     let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
     let plugin = WsLogging::new(
         &json!({
@@ -2154,9 +2157,9 @@ async fn ws_logging_connect_failures_charge_one_backoff_and_none_after_the_last_
             "batch_size": 1,
             "flush_interval_ms": 600000,
             "max_retries": 1,
-            "retry_delay_ms": 1000,
+            "retry_delay_ms": 4000,
             "reconnect_delay_ms": 1500,
-            "connect_timeout_ms": 1000,
+            "connect_timeout_ms": 100,
             "buffer_capacity": 16
         }),
         default_client(),

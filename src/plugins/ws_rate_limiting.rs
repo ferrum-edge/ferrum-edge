@@ -50,10 +50,10 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
 
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
-/// Bounds below-cap full-map scans under high frame rates. Over-cap pressure
-/// still triggers an immediate idle-key reclaim (no cooldown), but live
-/// budgets are never force-evicted — hard cardinality is enforced by atomic
-/// admission reservation.
+/// Single-flights full-map idle sweeps, below and above the cap, to at most one
+/// per cooldown window under high frame rates. Over-cap capacity is still
+/// enforced on every frame: live budgets are never force-evicted, and hard
+/// cardinality is enforced by atomic admission reservation.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 
 pub struct WsRateLimiting {
