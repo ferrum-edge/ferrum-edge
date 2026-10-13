@@ -27,10 +27,7 @@ const ALLOW_PLAINTEXT_ENV: &str = "FERRUM_VAULT_ALLOW_PLAINTEXT";
 ///
 /// Diagnostics name the variables and the failure class only, never the
 /// address, so userinfo or a sensitive host name cannot leak through them.
-fn check_plaintext_policy(
-    addr: &url::Url,
-    allow_plaintext: Option<&str>,
-) -> Result<(), String> {
+fn check_plaintext_policy(addr: &url::Url, allow_plaintext: Option<&str>) -> Result<(), String> {
     let allow = match allow_plaintext.map(str::trim) {
         None | Some("") => false,
         Some(raw) => match raw.to_ascii_lowercase().as_str() {
