@@ -37,8 +37,8 @@ on:
     - cron: "0 5 * * 1"
   workflow_dispatch:
 
-# Every write uses BASE_IMAGE_REFRESH_TOKEN; GITHUB_TOKEN only reads.
 permissions:
+  # Every write uses BASE_IMAGE_REFRESH_TOKEN; GITHUB_TOKEN only reads.
   contents: read
 
 concurrency:
