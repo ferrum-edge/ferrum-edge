@@ -109,9 +109,13 @@ impl JwtAuth {
         if !audiences.is_empty() {
             validation.set_audience(&audiences);
             required.insert("aud".to_string());
-        } else {
-            validation.validate_aud = false;
         }
+        // With no audiences configured, keep jsonwebtoken's strict
+        // `validate_aud = true` default (same contract as `jwt_verifier.rs` and
+        // the admin verifier): a token without `aud` still passes, but a token
+        // that carries `aud` is rejected because no acceptable audience is
+        // configured (RFC 7519 §4.1.3). Disabling it would let a token minted
+        // for another service with the same consumer secret authenticate here.
         validation.required_spec_claims = required;
 
         let request_headers_to_redact = match &token_lookup {
