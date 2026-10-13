@@ -2530,6 +2530,22 @@ impl McpGateway {
             .map(|session| session.clone())
     }
 
+    /// The session's catalog and its refresh lock, cloned as two `Arc`s under
+    /// the shard guard so callers can await without deep-cloning the session.
+    fn session_catalog_locks(
+        &self,
+        downstream_session_id: &str,
+    ) -> Option<(Arc<RwLock<McpCatalog>>, Arc<Mutex<()>>)> {
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| {
+                (
+                    Arc::clone(&session.catalog),
+                    Arc::clone(&session.catalog_refresh_lock),
+                )
+            })
+    }
+
     fn catalog_for_session(&self, downstream_session_id: &str) -> Option<Arc<RwLock<McpCatalog>>> {
         // Project the one field under the shard guard instead of deep-cloning
         // the whole session (upstream-session map, client info) per call.
@@ -3725,17 +3741,17 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let session = self
-            .downstream_session_clone(downstream_session_id)
+        let (catalog_lock, refresh_lock) = self
+            .session_catalog_locks(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
-        let catalog_lock = &session.catalog;
+        let catalog_lock = &catalog_lock;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
@@ -3752,17 +3768,17 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let session = self
-            .downstream_session_clone(downstream_session_id)
+        let (catalog_lock, refresh_lock) = self
+            .session_catalog_locks(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
-        let catalog_lock = &session.catalog;
+        let catalog_lock = &catalog_lock;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
@@ -3783,11 +3799,12 @@ impl McpGateway {
         if !self.resource_response_rewrite_possible(server_id) {
             return;
         }
-        let Some(session) = self.downstream_session_clone(downstream_session_id) else {
+        let Some((catalog_lock, refresh_lock)) = self.session_catalog_locks(downstream_session_id)
+        else {
             return;
         };
         {
-            let catalog = session.catalog.read().await;
+            let catalog = catalog_lock.read().await;
             if catalog
                 .resource_templates_last_attempted_at
                 .get(server_id)
@@ -3796,9 +3813,9 @@ impl McpGateway {
                 return;
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
-            let mut catalog = session.catalog.write().await;
+            let mut catalog = catalog_lock.write().await;
             if catalog
                 .resource_templates_last_attempted_at
                 .get(server_id)
@@ -3819,7 +3836,7 @@ impl McpGateway {
                 ctx,
                 downstream_session_id,
                 server_id,
-                &session.catalog,
+                &catalog_lock,
             )
             .await
         {

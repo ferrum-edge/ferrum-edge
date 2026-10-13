@@ -19052,6 +19052,26 @@ fn ai_embedding_plaintext_opt_in_matches_schema_and_runtime() {
         json!({ "provider": provider })
     };
 
+    // `http:` without `//` still parses as a remote http URL. The firewall's
+    // `endpoint` is a plain URI, so the plaintext rule alone decides it; the
+    // cache's enabled-mode endpoint pattern already requires `scheme://`.
+    for (endpoint, opt_in, valid) in [
+        ("http:embeddings.example.com/v1", None, false),
+        ("http:embeddings.example.com/v1", Some(false), false),
+        ("http:embeddings.example.com/v1", Some(true), true),
+        ("http:/embeddings.example.com/v1", None, false),
+        ("http:/embeddings.example.com/v1", Some(false), false),
+        ("http:/embeddings.example.com/v1", Some(true), true),
+    ] {
+        let config = firewall(endpoint, opt_in);
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", &config, valid);
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
+            valid,
+            "ai_semantic_firewall runtime admission for {config}"
+        );
+    }
+
     let cases: [(&str, Option<bool>, bool); 11] = [
         ("https://embeddings.example.com/v1", None, true),
         ("http://127.0.0.1:9/v1", None, true),
