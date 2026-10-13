@@ -17,8 +17,8 @@ use crate::common::env::EnvGuard;
 use crate::common::fakes::AzureKeyVaultFake;
 use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::secrets::{
-    AzureCredentials, azure_apply_tls_version_option, azure_parse_keyvault_reference,
-    resolve_all_env_secrets, resolve_external_reference,
+    AzureCredentials, azure_apply_tls_version_option, azure_hold_ca_bundle_reader_permit_for_test,
+    azure_parse_keyvault_reference, resolve_all_env_secrets, resolve_external_reference,
 };
 use ferrum_edge::tls::inventory::TlsInventory;
 use ferrum_edge::tls::source::{CertSource, MaterialKind, SourceScheme};
@@ -684,4 +684,46 @@ async fn azure_mismatched_challenge_resource_is_rejected() {
             .all(|req| req.headers.get("authorization").is_none()),
         "no request may carry the bearer token after a mismatched challenge"
     );
+}
+
+/// CA bundle reads are admission-gated: while a reader holds the permit (as a
+/// reader stalled on a hung filesystem would, even after its caller timed
+/// out), further credential construction waits for admission instead of
+/// spawning another native reader, and proceeds once the permit is released.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn azure_ca_bundle_reads_are_admission_gated() {
+    let guard = EnvGuard::new();
+    let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
+
+    let held = azure_hold_ca_bundle_reader_permit_for_test().await;
+    // With a readable bundle, an ungated reader would finish in milliseconds;
+    // timing out proves construction is parked on admission.
+    for _ in 0..3 {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                AzureCredentials::from_static_token("dummy-token"),
+            )
+            .await
+            .is_err(),
+            "construction must wait for the held reader permit"
+        );
+    }
+    drop(held);
+
+    let creds = tokio::time::timeout(
+        Duration::from_secs(10),
+        AzureCredentials::from_static_token("dummy-token"),
+    )
+    .await
+    .expect("construction proceeds once the permit is released")
+    .expect("static-token credentials");
+    fake.mock_secret("admin-jwt", "azure-admin-jwt").await;
+    let secret = creds
+        .fetch_secret(&fake.secret_url("admin-jwt"), KEY)
+        .await
+        .expect("fetch should succeed after admission");
+    assert_eq!(secret.value, "azure-admin-jwt");
 }

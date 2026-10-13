@@ -204,6 +204,22 @@ async fn keyvault_transport() -> Result<Option<Transport>, String> {
 /// (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`).
 const CA_BUNDLE_MAX_BYTES: usize = crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES;
 
+/// Process-wide admission gate for CA bundle reader threads: at most one
+/// native reader exists at a time.
+static CA_READ_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+
+/// Test seam: hold the CA reader admission permit, as a stalled reader thread
+/// would. Not part of the supported API.
+#[doc(hidden)]
+pub async fn hold_ca_bundle_reader_permit_for_test() -> tokio::sync::OwnedSemaphorePermit {
+    CA_READ_PERMITS
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("the CA reader semaphore is never closed")
+}
+
 /// Read the CA bundle on a detached OS thread.
 ///
 /// The open is non-blocking and the opened descriptor must be a regular file,
@@ -211,11 +227,23 @@ const CA_BUNDLE_MAX_BYTES: usize = crate::config::env_config::DEFAULT_TLS_MAX_MA
 /// capped at [`CA_BUNDLE_MAX_BYTES`]. A stalled mount can still hold the
 /// detached thread, but not a Tokio worker; the registry's fetch timeout
 /// bounds the caller (the same model as `credential_file`'s detached reader).
+///
+/// Admission is gated by [`CA_READ_PERMITS`]. The permit is acquired before
+/// the thread is spawned and moved into it, so a caller that times out and
+/// drops this future does not release capacity: the permit is returned only
+/// when the native read itself finishes. Repeated refreshes against a stalled
+/// filesystem therefore wait for admission (and time out) instead of piling up
+/// blocked threads and descriptors.
 async fn read_ca_bundle_detached(path: std::ffi::OsString) -> Result<Vec<u8>, String> {
+    let permit = CA_READ_PERMITS.clone().acquire_owned().await.map_err(|_| {
+        format!("The {CA_BUNDLE_PATH_ENV} reader for Azure Key Vault TLS is closed")
+    })?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("ferrum-azure-ca-read".to_string())
         .spawn(move || {
+            // Held until the native open/read returns, even if the caller is gone.
+            let _permit = permit;
             let _ = tx.send(read_ca_bundle(std::path::Path::new(&path)));
         })
         .map_err(|_| {
