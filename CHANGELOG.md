@@ -157,8 +157,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `proxy_plugins` association rows), a reordered config file, or an
   incremental reload could change. Chains now order by priority, then plugin
   name, then scope (global, proxy, proxy group), then plugin-config id.
-  Candidate admission and every rebuild path use the same order. Defaults are
-  unaffected because no two built-in plugins share a priority.
+  Candidate admission and every rebuild path use the same order. No two
+  built-in plugins share a default priority, so chains of distinct plugin
+  types are unchanged. Several instances of one plugin at the same priority
+  now run in plugin-config id order instead of config/association order, and
+  two `cors` instances sharing a priority can no longer be split by an
+  equal-priority interloper.
 - **Documented the custom-plugin trust boundary and constructor contract**
   (issue #6616). `CUSTOM_PLUGINS.md` now states that `custom_plugins/` code is
   trusted, in-process gateway code whose declared failure policy is taken as

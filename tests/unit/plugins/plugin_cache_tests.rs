@@ -14434,18 +14434,28 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
 
 #[test]
 fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interlopers() {
-    // Equal priorities follow config order for proxy instances, not association
-    // order. Put the interloper last in associations to expose that difference.
-    for middle_name in ["ip_restriction", "udp_rate_limiting"] {
+    // Equal priorities break ties by plugin name (issue #6614), so an
+    // equal-priority HTTP interloper sorts after both `cors` instances and can
+    // no longer split them, whatever the config or association order. A
+    // distinct middle priority still splits them, and only an HTTP interloper
+    // makes that an error. Admission and runtime must agree in every scope and
+    // under both input orders.
+    for (middle_name, middle_priority, expect_ok) in [
+        ("ip_restriction", 100, true),
+        ("udp_rate_limiting", 100, true),
+        ("ip_restriction", 150, false),
+        ("udp_rate_limiting", 150, true),
+    ] {
+        let last_priority = if middle_priority == 100 { 100 } else { 200 };
         let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);
-        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(100), None);
+        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(last_priority), None);
         let mut middle = make_plugin_config_with_priority(
             "middle",
             middle_name,
             PluginScope::Proxy,
             Some("p1"),
             true,
-            Some(100),
+            Some(middle_priority),
             None,
         );
         for scope in [
@@ -14457,28 +14467,24 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
                 pc.scope = scope.clone();
                 pc.proxy_id = (scope == PluginScope::Proxy).then(|| "p1".to_string());
             }
-            let associations = if scope == PluginScope::ProxyGroup {
-                vec!["a", "middle", "b"]
-            } else {
-                vec!["a", "b", "middle"]
-            };
-            let config = make_config(
-                vec![make_proxy("p1", "/api", associations)],
-                vec![first.clone(), middle.clone(), last.clone()],
-            );
-            let admission =
-                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None);
-            let runtime = PluginCache::new(&config);
-            assert_eq!(
-                admission.is_ok(),
-                middle_name == "udp_rate_limiting",
-                "{middle_name}/{scope:?}: {admission:?}"
-            );
-            assert_eq!(
-                runtime.is_ok(),
-                admission.is_ok(),
-                "{middle_name}/{scope:?}"
-            );
+            for reversed in [false, true] {
+                let mut associations = vec!["a", "middle", "b"];
+                let mut plugin_configs = vec![first.clone(), middle.clone(), last.clone()];
+                if reversed {
+                    associations.reverse();
+                    plugin_configs.reverse();
+                }
+                let config =
+                    make_config(vec![make_proxy("p1", "/api", associations)], plugin_configs);
+                let label =
+                    format!("{middle_name}@{middle_priority}/{scope:?}/reversed={reversed}");
+                let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                    &config, None,
+                );
+                let runtime = PluginCache::new(&config);
+                assert_eq!(admission.is_ok(), expect_ok, "{label}: {admission:?}");
+                assert_eq!(runtime.is_ok(), admission.is_ok(), "{label}");
+            }
         }
     }
 }
