@@ -7419,7 +7419,7 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
 
 /// Issue #6539: a disabled `kafka_logging` entry skips plugin construction,
 /// but a native librdkafka `producer_config` key is still refused on POST and
-/// PUT (the hosted suite never sets `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`), and
+/// PUT with 422 (the hosted suite never sets `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`), and
 /// nothing is persisted.
 #[tokio::test]
 async fn disabled_kafka_spec_plugin_with_native_producer_key_is_refused() {
@@ -7454,7 +7454,7 @@ async fn disabled_kafka_spec_plugin_with_native_producer_key_is_refused() {
     });
 
     let (status, body) = client.post_json("/api-specs", &spec).await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(
         body.to_string()
             .contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
@@ -7476,7 +7476,7 @@ async fn disabled_kafka_spec_plugin_with_native_producer_key_is_refused() {
     let (status, body) = client
         .put_json(&format!("/api-specs/{spec_id}"), &spec)
         .await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert!(
         body.to_string()
             .contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
