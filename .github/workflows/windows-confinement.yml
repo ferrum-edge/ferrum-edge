@@ -48,6 +48,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       RUST_BACKTRACE: "1"
+      # Git Bash puts its own msys perl first on PATH, which lacks the modules
+      # vendored OpenSSL's Configure needs. Use the image's Strawberry Perl.
+      OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
