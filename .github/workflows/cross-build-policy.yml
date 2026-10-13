@@ -383,3 +383,4 @@ jobs:
             --proposed-automation-dir "$proposed_automation" \
             --proposed-tree-listing "${proposed_automation}.workspace-ls-tree" \
             --proposed-changes "$proposed_changes"
+# canary: touching a policy-locked file
