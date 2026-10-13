@@ -91,6 +91,19 @@ check the server version with `db.version()`.
 See [docs/mongodb.md](mongodb.md#supported-server-versions) for the full table
 and the Linux kernel note for MongoDB 8.0.21+, 8.3 and 9.0.
 
+### HTTP/3 `ctx.query_params` is percent-decoded (#6580)
+
+HTTP/3 now fills `ctx.query_params` with percent-decoded names and values, as
+HTTP/1.1 and HTTP/2 always have. Built-in plugins are unaffected. A custom
+plugin that read the raw HTTP/3 form (`%2Fadmin`) now sees `/admin`, the
+same value it already saw over HTTP/1.1 and HTTP/2. Remove any HTTP/3-only
+decoding you added. A custom plugin that called
+`RequestContext::materialize_query_params_raw()` or tested the
+`NEEDS_DECODED_QUERY_PARAMS` capability bit must drop those calls, because both
+are removed. For a security decision on the query, use
+`plugins::utils::query::canonical_query_for_policy`, as described in
+[CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md#request-context).
+
 ## Upgrading to 0.9.17
 
 0.9.17 was published on 2026-10-10 UTC from commit
