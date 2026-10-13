@@ -12250,7 +12250,7 @@ fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
 }
 
 #[test]
-fn test_decoded_query_params_capability_preserved_with_priority_override() {
+fn test_query_predicate_hint_preserved_with_priority_override() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
         "mesh_route_dispatch",
@@ -12270,47 +12270,14 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let dispatch = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "mesh_route_dispatch")
+        .expect("mesh_route_dispatch is cached");
     assert!(
-        caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
-        "mesh_route_dispatch query-param rules must opt HTTP/3 into decoded query materialization"
-    );
-}
-
-#[test]
-fn test_key_auth_query_location_enables_decoded_h3_query_capability() {
-    let query_config = make_config(
-        vec![make_proxy("p1", "/api", vec!["keyauth"])],
-        vec![make_plugin_config_with_json(
-            "keyauth",
-            "key_auth",
-            json!({"key_location": "query:api_key"}),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
-    );
-    let query_cache = PluginCache::new(&query_config).unwrap();
-    assert!(
-        query_cache
-            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
-            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
-    );
-
-    let header_config = make_config(
-        vec![make_proxy("p1", "/api", vec!["keyauth"])],
-        vec![make_plugin_config_with_json(
-            "keyauth",
-            "key_auth",
-            json!({"key_location": "header:X-API-Key"}),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
-    );
-    let header_cache = PluginCache::new(&header_config).unwrap();
-    assert!(
-        !header_cache
-            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
-            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
+        dispatch.requires_decoded_query_params(),
+        "priority_override must forward the query-predicate hint early route-total planning reads"
     );
 }
 
@@ -12472,7 +12439,7 @@ fn test_ai_federation_sets_terminal_final_body_and_finalized_egress_capabilities
 }
 
 #[test]
-fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
+fn test_query_predicate_hint_false_for_method_only_route_dispatch() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],
         vec![make_plugin_config_with_json(
@@ -12490,18 +12457,21 @@ fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let dispatch = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "mesh_route_dispatch")
+        .expect("mesh_route_dispatch is cached");
     assert!(
-        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
-        "method/header-only route dispatch must preserve HTTP/3 raw query materialization"
+        !dispatch.requires_decoded_query_params(),
+        "method/header-only route dispatch declares no query predicate"
     );
 }
 
 #[test]
-fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability() {
-    // Ordered query rules parse retained raw/outbound query themselves. Opting
-    // into the shared pre-auth decoded map would change key_auth/JWT/HMAC and
-    // cache/policy acceptance merely by attaching an unrelated transformer.
+fn test_request_transformer_query_rules_do_not_declare_query_predicates() {
+    // Ordered query rules parse the retained raw/outbound query themselves;
+    // they mutate the query rather than decide on it.
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],
         vec![make_plugin_config_with_json(
@@ -12518,11 +12488,6 @@ fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability()
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
-    assert!(
-        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
-        "request_transformer query rules must preserve HTTP/3 raw pre-auth query materialization"
-    );
     let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let transformer = plugins
         .iter()
