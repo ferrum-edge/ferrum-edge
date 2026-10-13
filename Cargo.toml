@@ -222,6 +222,7 @@ httpdate = "1"
 
 # Other utilities
 regex = "1"
+regex-syntax = "0.8"
 semver = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"

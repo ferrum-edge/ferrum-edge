@@ -3189,6 +3189,31 @@ mod virtual_service_cors {
     }
 
     #[test]
+    fn credentialed_public_suffix_regex_is_rejected() {
+        for regex in [
+            "^https://[a-z]{2,}\\.com$",
+            "^https://[a-z]+\\.com:8443$",
+            "https://[a-z]+\\.biz",
+        ] {
+            let mut credentialed = policy(vec![MeshCorsOriginMatch::Regex(regex.into())]);
+            credentialed.cors.allow_credentials = Some(true);
+            let errors = validate(vec![credentialed]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("cors.allow_credentials must not be true")),
+                "{regex}: {errors:?}"
+            );
+        }
+        let mut constrained = policy(vec![MeshCorsOriginMatch::Regex(
+            "^https://[a-z]+\\.example\\.com$".into(),
+        )]);
+        constrained.cors.allow_credentials = Some(true);
+        let errors = validate(vec![constrained]);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn credentialed_exact_star_is_rejected_without_weakening_source_policy() {
         let mut credentialed = policy(vec![MeshCorsOriginMatch::Exact("*".into())]);
         credentialed.cors.allow_credentials = Some(true);

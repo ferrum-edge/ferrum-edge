@@ -161,48 +161,6 @@ const ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES: &[&str] = &[
     "moz-extension://11111111-1111-4111-8111-111111111111",
 ];
 
-/// Public suffixes probed by [`origin_regex_is_effectively_universal`]. A regex
-/// that admits every probe label under one of these (for example
-/// `https://.*\.com` or `https://[a-z]+\.github\.io`) reflects origins that
-/// anyone can register, which is as broad as `*` for credentialed reflection.
-/// The reserved-name probes above cannot catch that shape because they never
-/// sit under a real public suffix. This is a fixed sample of high-volume
-/// ICANN and shared-hosting suffixes, not the whole Public Suffix List: a
-/// regex can only be probed, not enumerated.
-const ORIGIN_REGEX_PUBLIC_SUFFIX_PROBES: &[&str] = &[
-    "com",
-    "net",
-    "org",
-    "io",
-    "dev",
-    "app",
-    "co",
-    "ai",
-    "me",
-    "xyz",
-    "info",
-    "co.uk",
-    "com.au",
-    "github.io",
-    "gitlab.io",
-    "herokuapp.com",
-    "vercel.app",
-    "netlify.app",
-    "pages.dev",
-    "workers.dev",
-    "web.app",
-    "firebaseapp.com",
-    "appspot.com",
-    "azurewebsites.net",
-    "cloudfront.net",
-    "ngrok.io",
-];
-
-/// Host labels placed under each [`ORIGIN_REGEX_PUBLIC_SUFFIX_PROBES`] entry.
-/// Letters-only, so a regex that admits any registrable alphabetic label under
-/// a public suffix matches all of them.
-const ORIGIN_REGEX_PUBLIC_SUFFIX_PROBE_LABELS: &[&str] = &["a", "zq", "probe"];
-
 /// Construction-time breadth of one origin matcher or of a whole policy.
 ///
 /// This is the single classifier used by the credentials interlock,
@@ -330,9 +288,15 @@ pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
 /// `*.com` or `*.co.uk` matches every site under a TLD or public registry
 /// suffix, and `*.github.io` every tenant of a shared hosting suffix, so for
 /// credentialed reflection they are as broad as `*`. A suffix is therefore
-/// strict only when it has at least two labels AND is not itself a public
-/// suffix (ICANN or private section of the Public Suffix List). A suffix the
-/// list does not resolve is treated as universal (fail closed).
+/// strict only when it has at least two labels, is not itself a public suffix
+/// (ICANN or private section of the Public Suffix List), and is not the parent
+/// of a wildcard rule (`*.run.app` makes every `<x>.run.app` a public suffix,
+/// so `*.run.app` as an origin wildcard covers independent tenants). A suffix
+/// the list does not resolve is treated as universal (fail closed).
+///
+/// The list can only be queried, not enumerated, so a private suffix nested
+/// deeper below the configured domain (for example a service suffix two
+/// labels under a cloud provider apex) is not detected here.
 pub(crate) fn wildcard_suffix_is_effectively_universal(suffix: &str) -> bool {
     let domain = suffix.strip_prefix('.').unwrap_or(suffix);
     let domain = domain
@@ -342,7 +306,82 @@ pub(crate) fn wildcard_suffix_is_effectively_universal(suffix: &str) -> bool {
     if domain.is_empty() || !domain.contains('.') {
         return true;
     }
-    psl::suffix_str(&domain).is_none_or(|public_suffix| public_suffix == domain)
+    if psl::suffix_str(&domain).is_none_or(|public_suffix| public_suffix == domain) {
+        return true;
+    }
+    let child = format!("{WILDCARD_RULE_PROBE_LABEL}.{domain}");
+    psl::suffix_str(&child).is_none_or(|public_suffix| public_suffix == child)
+}
+
+/// Label placed under a wildcard suffix to detect a PSL wildcard rule
+/// (`*.<domain>`) directly beneath it. Chosen so no exception rule names it.
+const WILDCARD_RULE_PROBE_LABEL: &str = "ferrum-psl-probe";
+
+/// Positive proof that every origin a regex admits has a host pinned to a
+/// registrable domain (or below one).
+///
+/// The pattern is parsed with `regex-syntax` and its literal **suffixes** are
+/// extracted: every match must end with one of them. Each must either be
+/// exact (the whole match, so the origin is fully literal), contain the scheme
+/// separator (`://host[:port]`, so the whole authority is literal), or carry,
+/// after its first `.`, a domain that [`wildcard_suffix_is_effectively_universal`]
+/// accepts as strict, optionally followed by a literal `:port`. The text
+/// before that first `.` may be extended to the left by the match, so it never
+/// counts: `[a-z]+example\.com` leaves only `com` and is refused, while
+/// `pr-[0-9]+\.preview\.example\.com` keeps `preview.example.com`. Anything
+/// else — an unbounded suffix set, a variable port, or a public suffix
+/// (`[a-z]{2,}\.com`) — is not provable and is classified non-strict. Finite host alternations
+/// such as `^https://(?:a|b)\.github\.io$` extract as exact literals and
+/// stay strict.
+fn origin_regex_host_is_provably_constrained(re: &Regex) -> bool {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+
+    let Ok(hir) = regex_syntax::ParserBuilder::new()
+        .nest_limit(ORIGIN_REGEX_NEST_LIMIT)
+        .build()
+        .parse(re.as_str())
+    else {
+        return false;
+    };
+    let seq = Extractor::new().kind(ExtractKind::Suffix).extract(&hir);
+    let Some(literals) = seq.literals() else {
+        return false;
+    };
+    !literals.is_empty()
+        && literals
+            .iter()
+            .all(|literal| origin_suffix_literal_pins_host(literal.as_bytes(), literal.is_exact()))
+}
+
+fn origin_suffix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if let Some((_, authority)) = text.split_once("://") {
+        // The whole authority is literal: one host (and at most one port).
+        return !authority.is_empty();
+    }
+    if exact {
+        // A complete match with no scheme separator is not a host-bearing
+        // origin (for example the opaque `null`).
+        return false;
+    }
+    // The match may extend this literal to the left, so its first label is
+    // open-ended; everything after the first `.` is fixed and must be a domain
+    // that pins a registrable owner.
+    let Some((_, rest)) = text.split_once('.') else {
+        return false;
+    };
+    let host = match rest.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => rest,
+    };
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && !wildcard_suffix_is_effectively_universal(host)
 }
 
 /// A prefix is strict only when it terminates at an origin boundary, i.e. it
@@ -394,19 +433,7 @@ pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
         || matches_all(ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES)
         || matches_all(ORIGIN_REGEX_CHROME_EXTENSION_UNIVERSALITY_PROBES)
         || matches_all(ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES)
-        || origin_regex_admits_a_public_suffix(re)
-}
-
-/// Whether `re` admits every probe label under at least one sampled public
-/// suffix, for HTTPS or HTTP. Cold path only (construction / admission).
-fn origin_regex_admits_a_public_suffix(re: &Regex) -> bool {
-    ORIGIN_REGEX_PUBLIC_SUFFIX_PROBES.iter().any(|suffix| {
-        ["https", "http"].iter().any(|scheme| {
-            ORIGIN_REGEX_PUBLIC_SUFFIX_PROBE_LABELS
-                .iter()
-                .all(|label| re.is_match(&format!("{scheme}://{label}.{suffix}")))
-        })
-    })
+        || !origin_regex_host_is_provably_constrained(re)
 }
 
 const CORS_CONFIG_KEYS: &[&str] = &[

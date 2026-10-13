@@ -2394,6 +2394,9 @@ fn test_constructor_rejects_credentialed_public_suffix_wildcards() {
         "*.com.au",
         "*.github.io",
         "*.herokuapp.com",
+        // Parents of PSL wildcard rules (`*.run.app`, `*.compute.amazonaws.com`).
+        "*.run.app",
+        "*.compute.amazonaws.com",
     ] {
         let err = CorsPlugin::new(&json!({
             "allowed_origins": [origin],
@@ -2446,6 +2449,15 @@ fn test_constructor_rejects_credentialed_public_suffix_regex() {
         "https://[a-z0-9-]+\\.github\\.io",
         "http://[a-z]+\\.co\\.uk",
         "https?://[a-z]+\\.(com|net|org)",
+        // Label-length constraints, explicit ports and unlisted suffixes.
+        "^https://[a-z]{2,}\\.com$",
+        "^https://[a-z]+\\.com:8443$",
+        "https://[a-z]+\\.biz",
+        "https://[a-z]+\\.run\\.app",
+        // A suffix that starts mid-label admits `evilexample.com`.
+        "https://[a-z]+example\\.com",
+        // A variable port cannot be proven.
+        "https://app\\.example\\.com:[0-9]+",
     ] {
         let err = CorsPlugin::new(&json!({
             "allowed_origins": [{"regex": regex}],
@@ -2458,12 +2470,23 @@ fn test_constructor_rejects_credentialed_public_suffix_regex() {
             "got: {err} for {regex}"
         );
     }
-    let plugin = CorsPlugin::new(&json!({
-        "allowed_origins": [{"regex": "^https://[a-z]+\\.example\\.com$"}],
-        "allow_credentials": true
-    }))
-    .expect("host-constraining regex + credentials must construct");
-    assert!(plugin.uses_strict_origin_policy());
+    for regex in [
+        "^https://[a-z]+\\.example\\.com$",
+        "^https://[a-z]+\\.example\\.com:8443$",
+        "https://.*\\.api\\.example\\.com",
+        "(https|http)://app\\.example\\.com",
+        "^https://pr-[0-9]+\\.preview\\.example\\.com$",
+        "https://[a-z]+app\\.example\\.com",
+        // A finite host alternation is a set of exact origins.
+        "^https://(?:a|zq|probe)\\.github\\.io$",
+    ] {
+        let plugin = CorsPlugin::new(&json!({
+            "allowed_origins": [{"regex": regex}],
+            "allow_credentials": true
+        }))
+        .unwrap_or_else(|err| panic!("host-constraining regex {regex} must construct: {err}"));
+        assert!(plugin.uses_strict_origin_policy(), "{regex} must be strict");
+    }
 }
 
 #[tokio::test]

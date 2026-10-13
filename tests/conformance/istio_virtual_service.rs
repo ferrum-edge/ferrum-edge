@@ -362,6 +362,9 @@ fn vs_cors_policy_credentialed_universal_matcher_not_projected() {
         json!([{"regex": ".*"}]),
         json!([{"regex": "https://.*"}]),
         json!([{"regex": "null"}]),
+        // Public-suffix-wide regexes cannot prove a pinned host.
+        json!([{"regex": "^https://[a-z]{2,}\\.com$"}]),
+        json!([{"regex": "https://[a-z]+\\.biz"}]),
     ] {
         assert!(
             cors_plugin_for(&[virtual_service(json!({
