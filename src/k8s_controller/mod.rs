@@ -789,6 +789,32 @@ fn report_if_unregistered(registered: bool, task: &str) {
     }
 }
 
+/// Response read timeout every Ferrum Kubernetes client sets: kube 3's default.
+pub const KUBE_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(295);
+
+/// Restores the kube 3 client defaults that Ferrum's Kubernetes callers rely on.
+///
+/// kube 4 made two client defaults looser. It dropped the 295 s response read
+/// timeout (`read_timeout: None`), so a non-watch call to a stalled API server
+/// could hang without bound. It also enabled `default_retry`, which retries
+/// 429/503/504 up to 15 times with backoff of up to 1000 s. The controller, node
+/// agent, CNI hook, CLI and TLS sources bound their calls and own their retry
+/// and backoff (lease renewal, status writes, watcher re-lists), so every client
+/// is built through this function and keeps the kube 3 behavior.
+pub fn with_ferrum_client_defaults(mut config: kube::Config) -> kube::Config {
+    config.read_timeout = Some(KUBE_CLIENT_READ_TIMEOUT);
+    config.default_retry = false;
+    config
+}
+
+/// `kube::Client::try_default()` with [`with_ferrum_client_defaults`] applied.
+pub async fn try_default_kube_client() -> Result<kube::Client, kube::Error> {
+    let config = kube::Config::infer()
+        .await
+        .map_err(kube::Error::InferConfig)?;
+    kube::Client::try_from(with_ferrum_client_defaults(config))
+}
+
 async fn build_kube_client(
     kubeconfig_path: &Option<String>,
 ) -> Result<kube::Client, anyhow::Error> {
@@ -823,5 +849,5 @@ async fn build_kube_client(
         }
     };
 
-    Ok(kube::Client::try_from(config)?)
+    Ok(kube::Client::try_from(with_ferrum_client_defaults(config))?)
 }

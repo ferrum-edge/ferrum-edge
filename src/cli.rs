@@ -799,6 +799,7 @@ async fn fetch_this_node_uid(
          supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"
             .to_string()
     })?;
+    let config = crate::k8s_controller::with_ferrum_client_defaults(config);
     let client = kube::Client::try_from(config).map_err(|_| {
         "could not build an in-cluster Kubernetes client to resolve this node's UID; \
          supply FERRUM_K8S_NODE_UID or run this command inside a Kubernetes pod"

@@ -301,7 +301,7 @@ glob = "0.3"
 # Keep the transport/provider-neutral surface here; the mutually exclusive
 # backend features below choose kube-client's provider together with Ferrum's.
 kube = { version = "4.2", default-features = false, features = ["runtime", "client", "derive", "ws", "rustls-tls"] }
-k8s-openapi = { version = "0.27", features = ["latest"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
 # Used by `rcgen::CertificateParams::not_before` / `not_after` (rcgen's
 # choice — it needs `time::OffsetDateTime`). Already in `[dev-dependencies]`
 # for testing; promoting to a regular dep so the mesh CA can reference it.

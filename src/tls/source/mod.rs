@@ -2610,7 +2610,7 @@ fn resolve_k8s_secret_reference_blocking(
     name: String,
 ) -> Result<FetchedK8sSecret, String> {
     resolve_on_tls_source_runtime(async move {
-        let client = kube::Client::try_default()
+        let client = crate::k8s_controller::try_default_kube_client()
             .await
             .map_err(|error| format!("failed to create Kubernetes client: {error}"))?;
         let secrets: kube::Api<k8s_openapi::api::core::v1::Secret> =

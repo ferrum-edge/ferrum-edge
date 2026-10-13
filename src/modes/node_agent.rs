@@ -3910,7 +3910,9 @@ async fn build_node_agent_kube_client() -> Result<kube::Client, anyhow::Error> {
             }
         },
     };
-    Ok(kube::Client::try_from(config)?)
+    Ok(kube::Client::try_from(
+        crate::k8s_controller::with_ferrum_client_defaults(config),
+    )?)
 }
 
 fn pod_uid(pod: &Pod) -> Option<String> {
