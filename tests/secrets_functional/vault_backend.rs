@@ -919,12 +919,12 @@ async fn vault_redirect_limit_matches_reqwest_default() {
     }
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/ten"))
-        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/1"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/2"))
         .mount(&vault)
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/secret/data/eleven"))
-        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/0"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/1"))
         .mount(&vault)
         .await;
     // `/hop/10` redirects to `/hop/11`, which serves the secret.
@@ -936,12 +936,12 @@ async fn vault_redirect_limit_matches_reqwest_default() {
 
     guard.set("VAULT_ADDR", vault.uri());
     guard.set("VAULT_TOKEN", "redirect-limit-token");
-    // `ten` -> /hop/1 .. /hop/11: ten redirects in all.
+    // `ten` -> /hop/2 -> ... -> /hop/11: ten redirects in all.
     let resolved = resolve_external_reference("vault", "secret/data/ten#field", "FERRUM_TEST")
         .await
         .expect("ten redirects are within the limit");
     assert_eq!(resolved.value, "ten-hops");
-    // `eleven` -> /hop/0 .. /hop/11: eleven redirects.
+    // `eleven` -> /hop/1 -> ... -> /hop/11: eleven redirects.
     assert!(
         resolve_external_reference("vault", "secret/data/eleven#field", "FERRUM_TEST")
             .await
