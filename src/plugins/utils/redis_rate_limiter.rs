@@ -5686,17 +5686,20 @@ impl RedisRateLimitClient {
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
-        let watch_result: Result<(), redis::RedisError> =
+        let watch_result: Result<redis::Value, redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
-        if let Err(e) = watch_result {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                operation = "WATCH",
-                error = %e,
-                "Redis command failed"
-            );
-            self.note_command_failure(&e);
-            return Err(());
+        match watch_result {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "WATCH")?,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "WATCH",
+                    error = %e,
+                    "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                return Err(());
+            }
         }
 
         // Bounded compare: transfer at most `expected.len() + 1` bytes however
@@ -5786,6 +5789,37 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Require the exact `+OK` acknowledgement `WATCH` and `MULTI` return.
+    ///
+    /// Decoding into `()` accepts any non-error reply, including nil or another
+    /// status. A server that answered that way has not provably installed the
+    /// watch or opened the transaction, and a write sent afterwards could run
+    /// unfenced. Anything but `OK` is protocol uncertainty: fail closed and mark
+    /// the client unavailable before the write is sent. The reply is never
+    /// rendered.
+    fn require_ok_acknowledgement(
+        &self,
+        reply: &redis::Value,
+        operation: &'static str,
+    ) -> Result<(), ()> {
+        let acknowledged = match reply {
+            redis::Value::Okay => true,
+            redis::Value::SimpleString(text) => text == "OK",
+            _ => false,
+        };
+        if acknowledged {
+            return Ok(());
+        }
+        warn!(
+            redis_url = %self.config.redacted_url(),
+            operation,
+            classification = "malformed_response",
+            "Redis did not acknowledge with OK; failing closed before the write"
+        );
+        self.mark_unavailable();
+        Err(())
+    }
+
     /// Run one write as an explicit `MULTI` → `QUEUED` → `EXEC` transaction on
     /// a dedicated connection that already holds a `WATCH`.
     ///
@@ -5804,17 +5838,21 @@ impl RedisRateLimitClient {
         write: &redis::Cmd,
         operation: &'static str,
     ) -> Result<Option<T>, ()> {
-        let multi: Result<(), redis::RedisError> = redis::cmd("MULTI").query_async(conn).await;
-        if let Err(e) = multi {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                operation,
-                phase = "MULTI",
-                error = %e,
-                "Redis command failed"
-            );
-            self.note_command_failure(&e);
-            return Err(());
+        let multi: Result<redis::Value, redis::RedisError> =
+            redis::cmd("MULTI").query_async(conn).await;
+        match multi {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "MULTI")?,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation,
+                    phase = "MULTI",
+                    error = %e,
+                    "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                return Err(());
+            }
         }
         let queued: Result<String, redis::RedisError> = write.query_async(conn).await;
         match queued {
@@ -5894,11 +5932,14 @@ impl RedisRateLimitClient {
         let max_prefix = expected.len().checked_add(1).ok_or(())?;
         let mut conn = self.get_quarantine_connection().await.ok_or(())?;
 
-        let watch: Result<(), redis::RedisError> =
+        let watch: Result<redis::Value, redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
-        if let Err(e) = watch {
-            self.note_quarantine_command_failure(&e, "WATCH");
-            return Err(());
+        match watch {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "quarantine WATCH")?,
+            Err(e) => {
+                self.note_quarantine_command_failure(&e, "WATCH");
+                return Err(());
+            }
         }
 
         // Rewrites during these reads can only cause a mismatch or abort EXEC.
@@ -5939,10 +5980,14 @@ impl RedisRateLimitClient {
 
         // Never pipeline MULTI with DEL: if the ACL denies MULTI, a pipelined
         // DEL could execute outside a transaction and erase a replacement.
-        let multi: Result<(), redis::RedisError> = redis::cmd("MULTI").query_async(&mut conn).await;
-        if let Err(e) = multi {
-            self.note_quarantine_command_failure(&e, "MULTI");
-            return Err(());
+        let multi: Result<redis::Value, redis::RedisError> =
+            redis::cmd("MULTI").query_async(&mut conn).await;
+        match multi {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "quarantine MULTI")?,
+            Err(e) => {
+                self.note_quarantine_command_failure(&e, "MULTI");
+                return Err(());
+            }
         }
         let queued: Result<String, redis::RedisError> =
             redis::cmd("DEL").arg(key).query_async(&mut conn).await;
@@ -6481,17 +6526,20 @@ impl RedisRateLimitClient {
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
-        let watch_result: Result<(), redis::RedisError> =
+        let watch_result: Result<redis::Value, redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
-        if let Err(e) = watch_result {
-            warn!(
-                redis_url = %self.config.redacted_url(),
-                operation = "WATCH",
-                error = %e,
-                "Redis command failed"
-            );
-            self.note_command_failure(&e);
-            return Err(());
+        match watch_result {
+            Ok(reply) => self.require_ok_acknowledgement(&reply, "WATCH")?,
+            Err(e) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "WATCH",
+                    error = %e,
+                    "Redis command failed"
+                );
+                self.note_command_failure(&e);
+                return Err(());
+            }
         }
 
         // Bounded compare: transfer at most `expected.len() + 1` bytes however

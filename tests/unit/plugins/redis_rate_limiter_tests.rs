@@ -9292,6 +9292,24 @@ async fn spawn_scripted_value_server(
     exec_set_reply: &'static [u8],
     set_nx_reply: &'static [u8],
 ) -> ScriptedValueServer {
+    spawn_scripted_value_server_with_acks(
+        stored,
+        exec_set_reply,
+        set_nx_reply,
+        b"+OK\r\n",
+        b"+OK\r\n",
+    )
+    .await
+}
+
+/// [`spawn_scripted_value_server`] with scripted `WATCH` / `MULTI` replies.
+async fn spawn_scripted_value_server_with_acks(
+    stored: Vec<u8>,
+    exec_set_reply: &'static [u8],
+    set_nx_reply: &'static [u8],
+    watch_reply: &'static [u8],
+    multi_reply: &'static [u8],
+) -> ScriptedValueServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -9355,10 +9373,14 @@ async fn spawn_scripted_value_server(
                                     "SET" if args.iter().any(|arg| arg.eq_ignore_ascii_case("NX")) => {
                                         reply.extend_from_slice(set_nx_reply)
                                     }
+                                    "WATCH" => reply.extend_from_slice(watch_reply),
                                     "MULTI" => {
-                                        in_transaction = true;
+                                        // Only a real `OK` opens the scripted
+                                        // transaction; any other reply leaves
+                                        // later commands executing directly.
+                                        in_transaction = multi_reply == b"+OK\r\n";
                                         queued.clear();
-                                        reply.extend_from_slice(b"+OK\r\n");
+                                        reply.extend_from_slice(multi_reply);
                                     }
                                     "EXEC" => {
                                         in_transaction = false;
@@ -9518,4 +9540,62 @@ async fn deduplication_refuses_an_over_cap_record_without_downloading_it() {
     assert_eq!(ranges[0][3], read_cap.to_string());
     assert!(server.commands_named("GET").is_empty(), "no unbounded GET");
     let _ = server.shutdown.send(());
+}
+
+#[tokio::test]
+async fn ownership_writes_require_exact_ok_watch_and_multi_acknowledgements() {
+    let owner = b"owner-record".to_vec();
+    for (watch_reply, multi_reply) in [
+        (&b"+NO\r\n"[..], &b"+OK\r\n"[..]),
+        (&b"$-1\r\n"[..], &b"+OK\r\n"[..]),
+        (&b"+OK\r\n"[..], &b"+NO\r\n"[..]),
+        (&b"+OK\r\n"[..], &b"$-1\r\n"[..]),
+    ] {
+        let (watch_reply, multi_reply): (&'static [u8], &'static [u8]) = (watch_reply, multi_reply);
+        let server = spawn_scripted_value_server_with_acks(
+            owner.clone(),
+            b"+OK\r\n",
+            b"+OK\r\n",
+            watch_reply,
+            multi_reply,
+        )
+        .await;
+        let label = format!(
+            "WATCH {:?} / MULTI {:?}",
+            String::from_utf8_lossy(watch_reply),
+            String::from_utf8_lossy(multi_reply)
+        );
+
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client
+                .set_bytes_with_expire_if_value_matches("fence", &owner, b"done", 60)
+                .await,
+            Err(()),
+            "{label}: compare-and-set"
+        );
+        assert!(!client.is_available(), "{label}");
+
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client.delete_if_value_matches("fence", &owner).await,
+            Err(()),
+            "{label}: compare-and-delete"
+        );
+
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client
+                .delete_if_value_matches_bounded("fence", &owner)
+                .await,
+            Err(()),
+            "{label}: quarantine delete"
+        );
+
+        assert!(
+            server.commands_named("SET").is_empty() && server.commands_named("DEL").is_empty(),
+            "{label}: no write may follow an unacknowledged WATCH or MULTI"
+        );
+        let _ = server.shutdown.send(());
+    }
 }
