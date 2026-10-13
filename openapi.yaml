@@ -23574,7 +23574,11 @@ components:
                   two mappings may not name the same header. Framing, provenance,
                   credential-bearing and gateway-reserved destinations (including
                   cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-                  x-ferrum-*) are rejected, matching output_claim_headers. A claim value
+                  x-ferrum-*) are rejected, as for output_claim_headers. Unlike
+                  output_claim_headers, reserved names and duplicates are matched
+                  case-insensitively with _ treated as - (X_Real_IP is reserved,
+                  X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
+                  output_claim_headers). A claim value
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.
@@ -23737,7 +23741,11 @@ components:
             two mappings may not name the same header. Framing, provenance,
             credential-bearing and gateway-reserved destinations (including
             cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-            x-ferrum-*) are rejected, matching output_claim_headers. A claim value
+            x-ferrum-*) are rejected, as for output_claim_headers. Unlike
+            output_claim_headers, reserved names and duplicates are matched
+            case-insensitively with _ treated as - (X_Real_IP is reserved,
+            X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
+            output_claim_headers). A claim value
             that is not a valid header value (for example one containing CR or LF)
             or that renders to more than 8192 bytes, including a joined array,
             leaves the destination absent.
@@ -24163,7 +24171,11 @@ components:
                   two mappings may not name the same header. Framing, provenance,
                   credential-bearing and gateway-reserved destinations (including
                   cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-                  x-ferrum-*) are rejected, matching output_claim_headers. A claim value
+                  x-ferrum-*) are rejected, as for output_claim_headers. Unlike
+                  output_claim_headers, reserved names and duplicates are matched
+                  case-insensitively with _ treated as - (X_Real_IP is reserved,
+                  X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
+                  output_claim_headers). A claim value
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.
@@ -24380,7 +24392,11 @@ components:
                   two mappings may not name the same header. Framing, provenance,
                   credential-bearing and gateway-reserved destinations (including
                   cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-                  x-ferrum-*) are rejected, matching output_claim_headers. A claim value
+                  x-ferrum-*) are rejected, as for output_claim_headers. Unlike
+                  output_claim_headers, reserved names and duplicates are matched
+                  case-insensitively with _ treated as - (X_Real_IP is reserved,
+                  X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
+                  output_claim_headers). A claim value
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.
