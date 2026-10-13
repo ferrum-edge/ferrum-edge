@@ -38,7 +38,7 @@ use crate::plugins::otel_tracing::{
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::{
-    is_operator_sensitive_metadata_key, is_sensitive_metadata_key,
+    is_credential_class_metadata_key, is_operator_sensitive_metadata_key, is_sensitive_metadata_key,
 };
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -2092,10 +2092,14 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
 /// spellings. Most credential names use bounded token / known-compound
 /// matching; HTTP credential-state stems (`authorization`, `bearer`, `cookie`,
 /// and `csrf`) deliberately retain substring matching so concatenated names
-/// cannot bypass the telemetry boundary. Ordinary names such as
-/// `ISTIO_META_CLUSTER_ID` and `FERRUM_REGION` remain allowed.
+/// cannot bypass the telemetry boundary. Every credential class the metadata
+/// redactor recognizes (session identifiers, passphrases and passcodes, PINs
+/// and one-time codes, JWTs, signatures, private/access/signing keys, bearer
+/// assertions; issue #6619) is also refused here, so `GPG_PASSPHRASE`,
+/// `HSM_PIN` or `USER_SESSION_ID` cannot be copied into telemetry. Ordinary
+/// names such as `ISTIO_META_CLUSTER_ID` and `FERRUM_REGION` remain allowed.
 fn is_sensitive_environment_variable_name(name: &str) -> bool {
-    if is_operator_sensitive_metadata_key(name) {
+    if is_operator_sensitive_metadata_key(name) || is_credential_class_metadata_key(name) {
         return true;
     }
 

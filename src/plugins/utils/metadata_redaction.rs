@@ -22,7 +22,13 @@
 //! `authorization`. Token and API-key concepts use per-segment classifiers so
 //! delimiter forms (`api_key`, `api-key`), concatenated forms (`apikey`), and
 //! acronym camelCase (`APIKey`, `APIToken`) redact while usage metrics like
-//! `ai_total_tokens` stay visible.
+//! `ai_total_tokens` stay visible. Every other credential class (session
+//! identifiers, passwords and passphrases, PINs and one-time codes,
+//! credentials, JWTs, signatures, private/access/signing keys, bearer
+//! assertions, CSRF state) goes through the credential-class classifier
+//! ([`is_credential_class_metadata_key`]), which fails closed on unlisted
+//! spellings such as `userSessionIdentifier`, `x-session-id`, `GPG_PASSPHRASE`
+//! or `clientAssertion` instead of relying on an exact-name list.
 //!
 //! Request-private lifecycle keys in the `_dedup_*` namespace (case, delimiter,
 //! and camelCase spellings under a leading `_` + first segment `dedup`) are
@@ -250,6 +256,145 @@ fn is_sensitive_token_metadata_key(key: &str) -> bool {
     has_token_segment
 }
 
+/// Segments that name a credential class on their own.
+const CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
+    "session",
+    "sessions",
+    "sess",
+    "sessid",
+    "sessionid",
+    "sid",
+    "jwt",
+    "jws",
+    "jwe",
+    "passwd",
+    "pwd",
+    "passphrase",
+    "passcode",
+    "pin",
+    "otp",
+    "totp",
+    "hotp",
+    "credential",
+    "credentials",
+    "cred",
+    "creds",
+    "signature",
+    "signatures",
+    "sig",
+    "csrf",
+    "xsrf",
+];
+
+/// Credential stems that stay credential-shaped when concatenated into a
+/// longer segment (`usersession`, `dbpassword`, `gpgpassphrase`, `idjwt`,
+/// `requestsignature`, `awsaccesskey`, `rsaprivatekey`).
+const CREDENTIAL_CLASS_STEMS: &[&str] = &[
+    "session",
+    "sessid",
+    "passw",
+    "passphrase",
+    "passcode",
+    "credential",
+    "jwt",
+    "signature",
+    "privatekey",
+    "accesskey",
+    "secretkey",
+    "signingkey",
+    "sessionkey",
+    "masterkey",
+];
+
+/// Qualifiers that make a following `key` / `keys` segment a credential
+/// (`private_key`, `access-key`, `signingKey`). A bare `key` stays visible so
+/// `cache_key` and `routing_key` remain observable.
+const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
+    "private",
+    "access",
+    "secret",
+    "signing",
+    "session",
+    "client",
+    "master",
+    "encryption",
+    "decryption",
+    "ssh",
+    "pgp",
+    "gpg",
+    "hmac",
+    "jwt",
+];
+
+/// Qualifiers that make a following `assertion` a bearer credential
+/// (`client_assertion`, `saml.assertion`, `jwtAssertion`).
+const CREDENTIAL_ASSERTION_QUALIFIERS: &[&str] =
+    &["client", "saml", "jwt", "oidc", "id", "bearer", "user"];
+
+/// Credential-class classifier for metadata keys (issue #6619).
+///
+/// The key is split into segments exactly like the token classifier
+/// (delimiters, camelCase, acronyms, non-ASCII boundaries), lowercased, and
+/// judged per segment and per adjacent pair. A key is credential-shaped when:
+///
+/// * a segment is a credential-class word (`session`, `sid`, `jwt`, `pwd`,
+///   `passphrase`, `pin`, `otp`, `credential`, `signature`, `csrf`, …);
+/// * a segment embeds a long credential stem (`usersession`,
+///   `gpgpassphrase`, `awsaccesskey`), or ends in `token` after a qualifier
+///   (`accesstoken`, `csrftoken`) — `tokens` stays visible for usage counts;
+/// * a `key` / `keys` segment follows a key-material qualifier (`private`,
+///   `access`, `signing`, `client`, …);
+/// * an `assertion` segment ends the key or follows a bearer qualifier
+///   (`client_assertion`, `samlAssertion`). A trailing qualifier such as
+///   `assertion_out_of_scope` names a policy outcome, not the assertion.
+///
+/// Unlisted spellings of these classes therefore redact. The rule is deliberately
+/// narrower than outbound header stripping: ordinary dimensions such as
+/// `cache_key`, `routing_key`, `request_id`, and `ai_total_tokens` stay visible.
+pub fn is_credential_class_metadata_key(key: &str) -> bool {
+    let mut sensitive = false;
+    let mut previous = String::new();
+    let mut last_was_assertion = false;
+    for_each_metadata_key_segment(key, |segment| {
+        if sensitive {
+            return;
+        }
+        let lower = segment.to_ascii_lowercase();
+        last_was_assertion = false;
+        if CREDENTIAL_CLASS_SEGMENTS.contains(&lower.as_str())
+            || (lower.len() > "token".len() && lower.ends_with("token"))
+            || CREDENTIAL_CLASS_STEMS
+                .iter()
+                .any(|stem| lower.len() > stem.len() && lower.contains(stem))
+            || (matches!(lower.as_str(), "key" | "keys")
+                && CREDENTIAL_KEY_QUALIFIERS.contains(&previous.as_str()))
+        {
+            sensitive = true;
+            return;
+        }
+        if lower.ends_with("assertion") || lower.ends_with("assertions") {
+            let stem_len = if lower.ends_with('s') {
+                "assertions".len()
+            } else {
+                "assertion".len()
+            };
+            let qualifier = &lower[..lower.len() - stem_len];
+            if !qualifier.is_empty() {
+                // `clientassertion` / `samlassertion`: concatenated bearer.
+                sensitive = true;
+                return;
+            }
+            if CREDENTIAL_ASSERTION_QUALIFIERS.contains(&previous.as_str()) {
+                sensitive = true;
+                return;
+            }
+            last_was_assertion = true;
+        }
+        previous = lower;
+    });
+    sensitive || last_was_assertion
+}
+
 /// `api` + `key` / concatenated `apikey` credential spellings.
 ///
 /// Covers delimiter forms (`api_key`, `api-key`), concatenated (`apikey`), and
@@ -364,17 +509,38 @@ pub fn is_sensitive_metadata_key_with_extras(key: &str, extras: &[String]) -> bo
         // also fail closed if an operator tries to project them explicitly.
         return true;
     }
-    if DEFAULT_SENSITIVE_METADATA_KEYS
+    is_sensitive_name_by_listed_rules_with_extras(key, extras)
+        || is_credential_class_metadata_key(key)
+}
+
+/// The listed-name rules only: the default substrings, the token and API-key
+/// segment classifiers, and the operator extras, without the credential-class
+/// classifier.
+fn is_sensitive_name_by_listed_rules_with_extras(key: &str, extras: &[String]) -> bool {
+    DEFAULT_SENSITIVE_METADATA_KEYS
         .iter()
         .any(|needle| contains_ascii_case_insensitive(key, needle))
         || is_sensitive_token_metadata_key(key)
         || is_sensitive_api_key_metadata_key(key)
-    {
+        || extras
+            .iter()
+            .any(|needle| contains_ascii_case_insensitive(key, needle))
+}
+
+/// Sensitivity floor for names that are NOT transaction metadata keys: admin
+/// plugin-config field names and free-text debug lines.
+///
+/// Those inputs carry ordinary configuration vocabulary (`session_ttl_seconds`,
+/// `allowed_signature_algorithms`, `max_sessions_per_principal`) or prose,
+/// where the credential-class classifier would hide non-secret values. They
+/// keep the listed rules; the config projection layers its own schema-driven
+/// and name-based rules on top. Metadata, header-tag and log-schema checks use
+/// [`is_sensitive_metadata_key`].
+pub fn is_sensitive_name_by_listed_rules(key: &str) -> bool {
+    if is_internal_only_metadata_key(key) {
         return true;
     }
-    extras
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(key, needle))
+    is_sensitive_name_by_listed_rules_with_extras(key, extra_redacted_keys())
 }
 
 /// Returns true when the given metadata key is sensitive against the global

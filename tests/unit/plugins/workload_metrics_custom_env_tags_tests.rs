@@ -179,6 +179,17 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "CACHE_REQUEST_HEADERS_SNAPSHOT",
         "CLAIM_HEADER_SUBJECT",
         "LAST_EVENT_ID",
+        // Credential classes outside every exact list (issue #6619).
+        "GPG_PASSPHRASE",
+        "HSM_PIN",
+        "USER_SESSION_ID",
+        "SESSIONIDENTIFIER",
+        "TOTP_SEED",
+        "DB_PWD",
+        "SIGNING_KEY",
+        "WEBHOOK_SIGNATURE",
+        "CLIENT_ASSERTION",
+        "ID_JWT",
     ];
 
     for env_var in cases {

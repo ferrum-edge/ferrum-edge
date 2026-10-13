@@ -310,8 +310,8 @@ replaced with `[REDACTED]` at every log sink. Erroring at compile time
 is louder than letting the operator deploy a field that vanishes from
 logs.
 
-Workaround: rename the field to drop the substring (e.g.
-`secret_count` → `total_credentials` or `credential_count`).
+Workaround: rename the field so it matches neither a substring nor a
+credential class below (e.g. `secret_count` → `vault_entry_count`).
 
 ### Per-segment credential classifiers
 
@@ -324,6 +324,25 @@ outer metadata fields, and explicitly selected `static_fields`:
 |---------|--------------------|--------------------------|
 | Token | `token`, `access_token`, `refreshToken`, `id-token`, `APIToken`, `session_token` | `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `prompt_tokens` |
 | API key | `api_key`, `api-key`, `apikey`, `APIKey`, `x-api-key`, `openai_api_key` | `cache_key`, `routing_key`, `api_response_count`, `ai_total_tokens` |
+| Credential class | `session_id`, `x-session-id`, `userSessionIdentifier`, `sid`, `passwd`, `db_pwd`, `GPG_PASSPHRASE`, `doorPasscode`, `hsm_pin`, `totp_seed`, `credential`, `client_credentials`, `jwt`, `request_signature`, `private_key`, `awsAccessKey`, `signing_key`, `client_assertion`, `samlAssertion`, `x-csrf`, `accesstoken` | `request_id`, `cache_key`, `spin_count`, `pinned_version`, `auth_method`, `mesh_authz.ignored_baggage.assertion_out_of_scope` |
+
+The credential-class classifier fails closed on spellings that appear in no
+list (issue #6619). A key is credential-shaped when one of its segments is a
+credential-class word (`session`, `sessions`, `sess`, `sessid`, `sessionid`,
+`sid`, `jwt`, `jws`, `jwe`, `passwd`, `pwd`, `passphrase`, `passcode`, `pin`,
+`otp`, `totp`, `hotp`, `credential(s)`, `cred(s)`, `signature(s)`, `sig`,
+`csrf`, `xsrf`). It is also credential-shaped when a segment embeds a long
+stem (`usersession`, `dbpassword`, `gpgpassphrase`, `awsaccesskey`,
+`rsaprivatekey`) or ends in `token` after a qualifier (`accesstoken`). A
+`key` segment counts when it follows a key-material qualifier (`private`,
+`access`, `secret`, `signing`, `session`, `client`, `master`, `encryption`,
+`decryption`, `ssh`, `pgp`, `gpg`, `hmac`, `jwt`). An `assertion` segment
+counts when it ends the key or follows `client`, `saml`, `jwt`, `oidc`, `id`,
+`bearer` or `user`. Ordinary dimensions such as `cache_key`, `routing_key` and
+`ai_total_tokens` stay visible. Values under such keys are redacted on every
+sink. Schema `static_fields`, `derived_fields` names, and `rename` targets
+that match are rejected, and so are `workload_metrics` custom tag names,
+header tags, and environment-variable tags.
 
 Segmentation splits on non-alphanumeric delimiters, camelCase boundaries, and
 acronym→word boundaries (`APIKey` → `API` + `Key`, `APIToken` → `API` +

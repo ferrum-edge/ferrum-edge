@@ -545,3 +545,110 @@ fn operator_extra_keys_redact_on_native_and_shaped_views() {
         &extras
     ));
 }
+
+/// Issue #6619: credential classes redact by class, not by list. None of these
+/// spellings appears in any exact or substring list.
+const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
+    "session_id",
+    "x-session-id",
+    "userSessionIdentifier",
+    "SESSIONID",
+    "sid",
+    "passwd",
+    "db_pwd",
+    "GPG_PASSPHRASE",
+    "doorPasscode",
+    "hsm_pin",
+    "totp_seed",
+    "otp",
+    "credential",
+    "client_credentials",
+    "jwt",
+    "idJwt",
+    "request_signature",
+    "x-signature",
+    "private_key",
+    "privateKeyPem",
+    "awsAccessKey",
+    "access-key",
+    "signing_key",
+    "client_assertion",
+    "samlAssertion",
+    "assertion",
+    "x-csrf",
+    "xsrf",
+    "accesstoken",
+];
+
+/// Ordinary dimensions that share a word or stem with a credential class.
+const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
+    "ai_total_tokens",
+    "cache_key",
+    "routing_key",
+    "request_id",
+    "correlation_id",
+    "keyboard_layout",
+    "spin_count",
+    "pinned_version",
+    "auth_method",
+    "consumer_username",
+    "mesh_authz.ignored_baggage",
+    "mesh_authz.ignored_baggage.assertion_out_of_scope",
+    "ai_stream_router_pass_through",
+];
+
+#[test]
+fn credential_classes_redact_unlisted_spellings_and_keep_ordinary_dimensions() {
+    let extras: Vec<String> = Vec::new();
+    for key in UNLISTED_CREDENTIAL_CLASS_KEYS {
+        assert!(
+            is_sensitive_metadata_key_with_extras(key, &extras),
+            "{key} must be redacted"
+        );
+    }
+    for key in CREDENTIAL_CLASS_NEGATIVE_CONTROLS {
+        assert!(
+            !is_sensitive_metadata_key_with_extras(key, &extras),
+            "{key} must remain visible"
+        );
+    }
+
+    // The serializer shares the decision: values under unlisted credential
+    // names never reach a sink.
+    let mut metadata = HashMap::new();
+    for (index, key) in UNLISTED_CREDENTIAL_CLASS_KEYS.iter().enumerate() {
+        metadata.insert(
+            (*key).to_string(),
+            format!("credential-class-sentinel-{index}"),
+        );
+    }
+    metadata.insert("request_id".to_string(), "visible-request-id".to_string());
+    let summary = TransactionSummary {
+        metadata,
+        ..TransactionSummary::default()
+    };
+    let json = serde_json::to_string(&summary).expect("serialize summary");
+    assert!(
+        !json.contains("credential-class-sentinel"),
+        "credential-class value leaked: {json}"
+    );
+    assert!(json.contains("visible-request-id"));
+}
+
+#[test]
+fn credential_class_names_are_rejected_as_log_schema_field_names() {
+    for name in ["session_id", "client_assertion", "gpg_passphrase"] {
+        let compiled = SummarySchema::compile(
+            &json!({
+                "summary_type": "http",
+                "static_fields": { name: "fixed" }
+            }),
+            "test",
+            SchemaCapabilities::BASE,
+        );
+        assert!(
+            compiled.is_err(),
+            "{name} would always be redacted, so a schema must not emit it"
+        );
+    }
+}

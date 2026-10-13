@@ -94,7 +94,9 @@ use crate::plugins::utils::log_schema::{
     DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
     SummarySchema, TimestampFormat, resolve_schema,
 };
-use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
+use crate::plugins::utils::metadata_redaction::{
+    REDACTED_PLACEHOLDER, is_sensitive_metadata_key, is_sensitive_name_by_listed_rules,
+};
 use crate::proxy::tcp_proxy::StreamIoSide;
 
 /// Headers that contain sensitive credentials and must be redacted in debug output.
@@ -753,7 +755,10 @@ impl TransactionDebugger {
                 .redacted_body_fields
                 .iter()
                 .any(|n| lowered.contains(n))
-            || is_sensitive_metadata_key(&lowered)
+            // Free text: the listed rules only. The credential-class
+            // classifier is for key names and would drop prose such as
+            // `auth_method=jwt_auth` (issue #6619).
+            || is_sensitive_name_by_listed_rules(&lowered)
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
             || lowered.contains("eyj")
