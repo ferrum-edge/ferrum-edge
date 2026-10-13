@@ -180,7 +180,7 @@ tower = { version = "0.5", features = ["util"] }
 # compiled, but leaving `rust_crypto` on in a FIPS build would still link a
 # second, non-validated implementation of the same primitives, so the arms are
 # exclusive here too.
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
 # NOTE: `argon2` was declared here and referenced by nothing in `src/` or
 # `custom_plugins/`. Argon2 is not an SP 800-132 approved KDF, so an unused
 # declaration was a non-approved primitive sitting in the dependency graph for
