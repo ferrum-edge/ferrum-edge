@@ -332,7 +332,7 @@ google-cloud-auth = { version = "=1.11.0", optional = true }
 google-cloud-gax-internal = { version = "=0.7.14", default-features = false, optional = true }
 google-cloud-gax = { version = "=1.11.0", default-features = false, optional = true }
 google-cloud-wkt = { version = "=1.5.0", default-features = false, optional = true }
-opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, optional = true }
 # GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser.
 aws-smithy-json = { version = "=0.62.7", optional = true }
 azure_security_keyvault_secrets = { version = "0.14", optional = true }
