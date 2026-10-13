@@ -620,6 +620,7 @@ jobs:
             free -k
             printf 'cargo_jobs=%s\nprofile_dev_debug=%s\n' "$CARGO_BUILD_JOBS" "$CARGO_PROFILE_DEV_DEBUG"
             printf 'cold state: empty Cargo target and empty local sccache; downloaded sources may be reused\n'
+            printf 'readiness scope: core-only default selection (lib + unit_tests, UNIT_SHARD=core) plus selected inline/hardening/kTLS/ACME proofs; complete unit_plugins_a_tests, unit_plugins_b_tests and unit_gateway_core_tests targets are NOT executed\n'
           } > "$RUNNER_TEMP/unit-experiment/provenance.txt"
           date +%s > "$RUNNER_TEMP/unit-experiment/readiness-start.txt"
 
@@ -634,7 +635,7 @@ jobs:
           unit_sampler_pid=$!
           trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
           /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test --lib --test unit_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
-          kill "$unit_sampler_pid"
+          kill "$unit_sampler_pid" 2>/dev/null || true
           wait "$unit_sampler_pid"
           trap - EXIT
           cp "$CARGO_TARGET_DIR/cargo-timings/cargo-timing.html" "$RUNNER_TEMP/unit-ci/default-build.cargo-timing.html"
@@ -760,7 +761,7 @@ jobs:
           unit_sampler_pid=$!
           trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
           /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
-          kill "$unit_sampler_pid"
+          kill "$unit_sampler_pid" 2>/dev/null || true
           wait "$unit_sampler_pid"
           trap - EXIT
           cp "$CARGO_TARGET_DIR/cargo-timings/cargo-timing.html" "$RUNNER_TEMP/unit-ci/acme-build.cargo-timing.html"
@@ -820,7 +821,7 @@ jobs:
             else
               /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
             fi
-            kill "$unit_sampler_pid"
+            kill "$unit_sampler_pid" 2>/dev/null || true
             wait "$unit_sampler_pid"
             trap - EXIT
             cp "$CARGO_TARGET_DIR/cargo-timings/cargo-timing.html" "$RUNNER_TEMP/unit-ci/$phase.cargo-timing.html"

@@ -11,7 +11,7 @@ only under `fuzz/` — the production `ferrum-edge` binary does not depend on th
 | `traceparent` | W3C `traceparent` parse | 64 KiB input | Fail closed (`None`); accepted values round-trip |
 | `config_decode` | YAML/JSON config decode + validation | 64 MiB doc (loader cap), 64 KiB fuzz input | No panic; validation errors only |
 | `proxy_protocol` | PROXY v1/v2 header parse | 528-byte header cap | Fail closed; bounded address block |
-| `datagram_client_address` | Datagram PROXY v2 DGRAM header + auth/freshness TLV walk + freshness record decode | 512-byte address-block cap, 64 KiB fuzz input (both hosted lanes) | Fail closed; bounded TLV walk; exactly-one auth and freshness TLV; fixed-length freshness value; no secret/tag/sequence/address output |
+| `datagram_client_address` | Datagram PROXY v2 DGRAM header + auth/freshness TLV walk + freshness record decode | 512-byte address-block cap, 64 KiB fuzz input (both hosted lanes) | Fail closed; bounded TLV walk; at most one auth and freshness TLV (either may be absent; duplicates refused); valid lengths and freshness encoding when present; no secret/tag/sequence/address output |
 | `mesh_udp_frame` | HBONE datagram framing | 64 KiB input, 256 frames/invocation | Length prefix bounded; encode/decode round-trip |
 | `k8s_crd` | Istio/Gateway API JSON → translation | 32 objects, depth 64 | Fail-closed translation errors |
 | `plugin_config` | Representative plugin JSON validation (one selector byte followed by JSON) | depth 64 | `validate_plugin_config` never panics |
@@ -23,6 +23,12 @@ shell allowlist, and the byte-frozen `fuzz-smoke` bounded budget in
 `.github/workflows/ci.yml`. Its entry point walks the header, both
 application-reserved TLVs (`0xE0` authentication tag, `0xE1` freshness record),
 and — when a freshness TLV is present — the fixed-length freshness value.
+The structural parser the target exercises permits either TLV to be absent
+and refuses a duplicate or wrong-length occurrence of each; it does not
+require presence. Presence and authentication are enforced separately by the
+configured runtime gate (the authentication-required branch verifies the tag
+and requires freshness), so structural acceptance of an unauthenticated
+envelope here is deliberate and is not an authentication decision.
 
 Both lanes run it at `-max_len=65536`, the target's documented 64 KiB budget
 (`fuzz_support::MAX_FUZZ_INPUT_BYTES`), rather than the smoke loop's generic
@@ -77,21 +83,28 @@ rejects crash artifacts larger than 64 KiB before upload.
 sanitizer build in both lanes. That build, not the fuzzing, was the cost: the
 `Fuzz Smoke` job averaged ~47 minutes on pull requests, of which ~39 minutes was
 compiling the instrumented targets for ~48 seconds of fuzzing. The `Fuzz Smoke`
-job now uses the repository's checksum-pinned `setup-sccache` action and
-persists its bounded local cache directory through `Swatinem/rust-cache`.
-`save-if` is strictly `${{ github.event_name == 'push' && github.ref ==
+job now uses the repository's checksum-pinned `setup-sccache` action, then
+selects its cache backend: `setup-boringcache` runs first, and
+`Swatinem/rust-cache` (fuzz workspace, `fuzz-smoke` shared key) runs only as
+the legacy fallback when `CI_BORINGCACHE_ENABLED` is not `true`. The fallback
+does not archive the local `.cache/sccache` directory; BoringCache retains
+compiler objects through its own adapter instead. On the fallback, `save-if`
+is strictly `${{ github.event_name == 'push' && github.ref ==
 'refs/heads/main' }}`: pull requests (including same-repository PR refs and
 forks), `merge_group`, and `workflow_dispatch` never publish a `fuzz-smoke`
 cache. The generation that predates #3902 had no `save-if` at all, which is how
 a full-mode predecessor PR could still mint a PR-ref Fuzz cache; neither
 admitted generation can create another.
-The credential-bearing sccache GHA backend is never enabled. Every run logs
-`Fuzz property smoke seconds`, the lane shape it took, a closing
-`sccache --show-stats`, and the on-disk cache size; runs that execute the
-sanitizer budget add a second `--show-stats` just before it plus `Fuzz
-sanitizer lane seconds`, so the log shows directly whether the sanitizer build
-reused compilation. When sccache is unavailable the job emits a warning
-annotation rather than letting caching fail silently.
+The credential-bearing sccache GHA backend is never enabled. After a
+successful property-smoke command the run logs `Fuzz property smoke seconds`,
+and after a successful sanitizer budget `Fuzz sanitizer lane seconds`; both
+echoes sit after their commands under `set -e`, so a failed or skipped
+command emits no duration line. The closing report step runs on every
+outcome: it prints the lane shape the run took and whether the sccache
+wrapper is available (pointing at the BoringCache command logs for cache
+results), warning when the wrapper is unavailable. The job no longer emits
+`sccache --show-stats` or an on-disk cache-size report; before the sanitizer
+budget it only checks wrapper availability and warns when it is absent.
 
 Both hosted shapes are byte-frozen by the trusted Cross build policy. The
 `fuzz-smoke` job is admitted as two generations with a one-way transition

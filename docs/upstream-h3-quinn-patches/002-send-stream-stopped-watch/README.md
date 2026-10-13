@@ -22,7 +22,9 @@ the response direction without exclusive send-stream access.
 This patch implements `h3::quic::SendStreamStopped` for `SendStream` and
 `BidiStream` by forwarding to `quinn::SendStream::stopped` as a statically
 dispatched return-position `impl Future`. Associated-type `impl Trait` is
-avoided so the crate stays on stable Rust.
+avoided so the crate stays on stable Rust. Return-position `impl Trait` in
+traits requires Rust 1.75, so the vendored `h3` and `h3-quinn` manifests
+declare `rust-version = "1.75"` (see h3 patch 004).
 
 ## Files
 

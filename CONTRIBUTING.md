@@ -131,7 +131,7 @@ cargo build
 cargo build --release
 ```
 
-The `build.rs` runs `tonic_build` to compile `proto/ferrum.proto`, so ensure `protoc` is installed.
+The `build.rs` runs `tonic_prost_build` to compile `proto/ferrum.proto`, so ensure `protoc` is installed.
 
 ### Linting
 

@@ -4,7 +4,7 @@ In-process micro-benches for Ferrum Edge mesh and core policy hot paths. This
 standalone crate (not a workspace member of the root `ferrum-edge` crate)
 depends on the root crate by path so benches exercise the production public API.
 
-Driven by [criterion](https://bheisler.github.io/criterion.rs/book/) — each bench parameterises over input size and emits an HTML report under `target/criterion/`.
+Driven by [criterion](https://bheisler.github.io/criterion.rs/book/) — most benches parameterise over input size, while some vary decision shape, instance count, or pooling strategy instead. Each bench emits an HTML report under the default report root `target/criterion/`; `rr_selection` relocates its root when `FERRUM_RR_CRITERION_ROOT` is set.
 
 ## Quick start
 
@@ -43,6 +43,8 @@ Most benches parameterise over input size: typically `[10, 100, 1_000, 10_000]`
 for in-process traversals and `[100, 1_000, 5_000]` for slice / translation
 paths. `ip_restriction` fixes the representative rule count at 10,000 and
 parameterises over worst-case decision shape and attached instance count.
+`unix_backend_pool` runs no input-size sweep: it compares two fixed arms,
+`dial_per_request` and `pooled_reuse`.
 
 ## Benches deferred (not yet implemented)
 
@@ -53,10 +55,13 @@ Open follow-ups in `.context/mesh-audit/SP.md` track both deferrals.
 
 ## Reading results
 
-Criterion writes:
+Criterion writes (under the default report root `target/criterion/`):
 - Console summary per bench (mean ± stddev, change vs baseline).
 - HTML report at `target/criterion/<bench>/<id>/report/index.html`.
 - Baseline snapshots stored under `target/criterion/<bench>/<id>/base/`.
+
+`target/criterion/` is only the default: `rr_selection` accepts
+`FERRUM_RR_CRITERION_ROOT` to write its reports under a different root.
 
 `run.sh` does NOT clean `target/` so results accumulate across runs — `cargo criterion baseline` semantics work as documented in the criterion book.
 

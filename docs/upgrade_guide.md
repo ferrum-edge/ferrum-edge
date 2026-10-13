@@ -2250,7 +2250,7 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=postgres \
   FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_new \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 For MongoDB, set `FERRUM_DB_TYPE=mongodb`, `FERRUM_DB_URL`, and
@@ -2272,7 +2272,7 @@ FERRUM_MODE=database \
   FERRUM_PROXY_HTTPS_PORT=8543 \
   FERRUM_ADMIN_HTTP_PORT=9100 \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 ```bash
@@ -2810,7 +2810,7 @@ FERRUM_MODE=cp \
   FERRUM_ADMIN_HTTP_PORT=9100 \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 The staging examples use plaintext CP/DP config sync on a non-loopback
@@ -2833,7 +2833,7 @@ FERRUM_MODE=dp \
   FERRUM_PROXY_HTTP_PORT=8100 \
   FERRUM_ADMIN_HTTP_PORT=9200 \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 Verify the test DP receives the full config snapshot and proxies traffic correctly.
@@ -2853,9 +2853,11 @@ FERRUM_MODE=cp \
   FERRUM_DB_TYPE=postgres \
   FERRUM_DB_URL=postgres://ferrum:pass@db-host/ferrum_db_new \
   FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051 \
+  FERRUM_CP_GRPC_TLS_CERT_PATH=/certs/server.pem \
+  FERRUM_CP_GRPC_TLS_KEY_PATH=/certs/server-key.pem \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 #### 4. Upgrade the DPs
@@ -2865,11 +2867,21 @@ Upgrade CP and DP together; mixed builds are rejected at subscribe. Replace ever
 ```bash
 # On each DP node, stop old binary and start new:
 FERRUM_MODE=dp \
-  FERRUM_DP_CP_GRPC_URLS=http://cp-host:50051 \
+  FERRUM_DP_CP_GRPC_URLS=https://cp-host:50051 \
+  FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem \
   FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
+
+The production commands above carry their CP/DP transport configuration
+explicitly: the CP presents a TLS certificate/key and each DP connects over
+`https://` with the matching CA trust. Reuse your already-configured TLS (or
+mTLS) setup and certificate paths instead of the placeholders shown; a
+non-loopback plaintext CP bind or `http://` DP URL is rejected at startup
+unless both sides set `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`, which is a
+development-only opt-in (see the staging examples above). See
+[cp_dp_mode.md](cp_dp_mode.md#transport-security-tlsmtls).
 
 If a load balancer sits in front of the DP fleet, drain each node before restarting to avoid dropping in-flight requests.
 
@@ -2881,9 +2893,10 @@ When DPs are configured with `FERRUM_DP_CP_GRPC_URLS` (multiple CPs), every CP m
 # DP configured for multi-CP failover:
 FERRUM_MODE=dp \
   FERRUM_DP_CP_GRPC_URLS=https://cp1:50051,https://cp2:50051 \
+  FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem \
   FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 #### 5. Rollback path
@@ -2934,7 +2947,7 @@ FERRUM_MODE=file \
   FERRUM_ADMIN_HTTP_PORT=9100 \
   FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   FERRUM_LOG_LEVEL=info \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 Without `FERRUM_ADMIN_JWT_SECRET`, file mode generates a random admin secret and
@@ -2952,7 +2965,7 @@ Stop the old binary, start the new one on production ports:
 ```bash
 FERRUM_MODE=file \
   FERRUM_FILE_CONFIG_PATH=./config.yaml \
-  ./ferrum-edge-new
+  ./ferrum-edge-new run
 ```
 
 #### 5. Rollback Path

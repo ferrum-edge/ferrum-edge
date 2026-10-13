@@ -2,7 +2,9 @@
 version: "1"
 # TCP end-to-end TLS performance test config.
 # Client --TCP+TLS--> gateway --TCP+TLS--> backend. Every hop encrypted.
-# Used exclusively by gateways-protocol-benchmark.yml for the "tcp-tls" matrix job.
+# Used by gateways-protocol-benchmark.yml for the "tcp-tls" matrix job and
+# by the native --envoy comparison in run_protocol_test.sh (paired with
+# configs/envoy/tcp_tls.yaml, which likewise originates TLS to 3444).
 proxies:
   - id: "tcp-tls-e2e-echo"
     name: "TCP+TLS E2E Echo"

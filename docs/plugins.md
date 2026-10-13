@@ -56,7 +56,7 @@ ordering.
 
   In **file mode** nothing writes the association for you: the configuration
   file must list `plugin_config_id` under the target proxy's `plugins`.
-- **Proxy-group-scoped** plugins (`scope: "proxy_group"`) apply to a subset of proxies that reference the plugin in their `plugins` association list. `proxy_id` must be null. A **single shared plugin instance** is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. When a proxy is deleted, only the association is removed — the proxy-group plugin config survives.
+- **Proxy-group-scoped** plugins (`scope: "proxy_group"`) apply to a subset of proxies that reference the plugin in their `plugins` association list. `proxy_id` must be null. A **single shared plugin instance** is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. When a proxy is deleted, only its association is removed and the proxy-group plugin config survives while another same-namespace association remains; in SQL database mode, a successful proxy deletion or proxy update that removes the last association also deletes the now-unreferenced proxy-group plugin config (orphan cleanup), so recreate it if you need it after deleting its final member. This persisted-config lifecycle is separate from the shared runtime plugin instance, which exists only while the config is loaded.
 - Proxy and proxy-group attachment identity is `(namespace, id)`. Two namespaces may reuse the same bare proxy id and the same bare plugin config id; a proxy only ever resolves plugin configs from its own namespace, and same-id proxy-group configs in two namespaces get independent instances with independent state. Persistence enforces this, not just the runtime: `proxies` and `plugin_configs` key on `PRIMARY KEY (namespace, id)` in SQL (`_id = "{namespace}:{id}"` in MongoDB), and the SQL `proxy_plugins` junction carries its own `namespace` column with `PRIMARY KEY (namespace, proxy_id, plugin_config_id)` plus namespace-qualified foreign keys to both sides — so an association row cannot join a proxy in one namespace to a plugin config in another.
 - A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order.
 
@@ -330,7 +330,7 @@ what a plugin or backend left on the header map:
 | Final response shape | `Content-Length` on the wire |
 |---|---|
 | Buffered / synthetic body (the gateway holds the exact bytes) | Set to the exact byte count. Any surviving value is replaced. Stripped entirely for a status that forbids a body. |
-| **Ordinary streamed body** (HTTP/1.1 chunked, H2/H3 `END_STREAM`) | **Removed** — including a syntactically valid lowercase value. |
+| **Ordinary streamed body** (HTTP/1.1 chunked, H2/H3 `END_STREAM`) | **Removed from the header map** — including a syntactically valid lowercase value. The transport may still write a length it derives from a trusted exact body size hint; see the decoder-verified exception below. |
 | `HEAD` (buffered or streamed) | One valid `1*DIGIT` representation length is preserved and its key canonicalized. Invalid values, duplicate case variants, and no-body statuses are stripped. |
 | Status that forbids a body (`1xx`, `204`, `205`, `304`) | Removed. |
 | Native gRPC Trailers-Only | Removed (gRPC never frames with `Content-Length`). |
@@ -343,15 +343,39 @@ declared length while another reads to the protocol's own end-of-body
 signal — a request/response desync. Removing it is lossless for framing:
 HTTP/1.1 falls back to chunked transfer-coding (or connection close) and
 HTTP/2 / HTTP/3 frame the body with `END_STREAM` / FIN. The practical
-trade-off is that a streamed response no longer advertises its size, so
+trade-off is that most streamed responses no longer advertise their size, so
 clients relying on `Content-Length` for download progress see a chunked
 response instead.
 
-`HEAD` is the only exemption because its wire body is empty *by protocol*,
-so the field describes the representation a `GET` would have returned and
-cannot contradict the bytes sent. That exemption is selected from the
-trusted request method and the gateway-selected status — never from a
-response header name or value, so a plugin cannot buy it.
+**Decoder-verified exception (HTTP/1.x backends, H1/H2 clients).** Removing
+the header-map value does not stop the transport from writing a length it
+derives from the response body's own exact size hint. One streamed shape
+carries such a hint: an unmodified body from an HTTP/1.0 or HTTP/1.1 backend,
+on the reqwest dispatch path and on the direct HTTP/1.x path (direct H1 pool,
+Unix-socket, and HBONE inner HTTP/1.1 dispatch, while
+`FERRUM_POOL_HTTP1_DIRECT` is enabled). The hint is the length the backend
+client decoder is framing the body with, and it is exposed only when it is
+positive and equals both the canonical backend `Content-Length` captured
+before any hook ran and the value still left on the header map after the
+response hooks. The header map can therefore withdraw the length (a plugin
+that strips `Content-Length` to force streaming framing is honored) but can
+never supply a different one. Responses with a client gRPC deadline, a
+`1xx`/`204`/`304` status, an HTTP/2 or HTTP/3 backend, a gRPC-Web reframing
+adapter, or a body-inspecting/reframing stage do not qualify, and neither
+does any response with no trusted backend length. For a qualifying response
+an HTTP/1.1 client receives that `Content-Length` and no `Transfer-Encoding`,
+and an HTTP/2 client receives the same `Content-Length`; the decoder yields
+exactly that many bytes or an error, and hyper's server encoder truncates an
+overlong body and aborts on a short one, so the claim cannot disagree with
+the bytes written. HTTP/3 clients are unaffected: their streamed responses
+still carry no `Content-Length` and end at FIN.
+
+`HEAD` is the only exemption that preserves a `Content-Length` already on the
+header map, because its wire body is empty *by protocol*, so the field
+describes the representation a `GET` would have returned and cannot
+contradict the bytes sent. That exemption is selected from the trusted
+request method and the gateway-selected status — never from a response
+header name or value, so a plugin cannot buy it.
 
 Because that boundary owns these fields, plugins may not configure them as
 write destinations. `Connection`, `Content-Length`, `Keep-Alive`,
@@ -1286,7 +1310,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "request_path": "/api/v1/users",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440001",
   "proxy_name": "users-api",
-  "backend_target": "10.0.2.10:8080/api/v1/users",
+  "backend_target": "http://10.0.2.10:8080/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 201,
   "latency_total_ms": 12.45,
@@ -1312,7 +1336,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "request_path": "/api/v1/events",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440002",
   "proxy_name": "sse-events",
-  "backend_target": "10.0.2.15:8080/api/v1/events",
+  "backend_target": "http://10.0.2.15:8080/api/v1/events",
   "backend_resolved_ip": "10.0.2.15",
   "response_status_code": 200,
   "latency_total_ms": 10004.80,
@@ -1344,7 +1368,7 @@ A streamed response on a proxy with **no plugins** has no `log` hook, terminatio
   "request_path": "/api/v2/feed",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440003",
   "proxy_name": "feed-api",
-  "backend_target": "10.0.2.20:8080/api/v2/feed",
+  "backend_target": "http://10.0.2.20:8080/api/v2/feed",
   "backend_resolved_ip": "10.0.2.20",
   "response_status_code": 200,
   "latency_total_ms": 5.30,
@@ -1372,7 +1396,7 @@ HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. Only the front
   "request_path": "/myapp.UserService/GetUser",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440004",
   "proxy_name": "grpc-users",
-  "backend_target": "10.0.2.30:50051/myapp.UserService/GetUser",
+  "backend_target": "http://10.0.2.30:50051/myapp.UserService/GetUser",
   "backend_resolved_ip": "10.0.2.30",
   "response_status_code": 200,
   "latency_total_ms": 8.12,
@@ -1404,16 +1428,16 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
   "request_path": "/ws/chat",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
   "proxy_name": "ws-chat",
-  "backend_target": "10.0.2.40:8080/ws/chat",
+  "backend_target": "ws://10.0.2.40:8080/ws/chat",
   "backend_resolved_ip": "10.0.2.40",
   "response_status_code": 101,
   "latency_total_ms": 3.20,
-  "latency_gateway_processing_ms": 1.00,
+  "latency_gateway_processing_ms": 3.20,
   "latency_backend_ttfb_ms": 0.0,
   "latency_backend_total_ms": 0.0,
   "latency_plugin_execution_ms": 0.60,
   "latency_plugin_external_io_ms": 0.0,
-  "latency_gateway_overhead_ms": 0.40,
+  "latency_gateway_overhead_ms": 2.60,
   "request_user_agent": "Mozilla/5.0",
   "metadata": {"request_id": "ws-101-abc"}
 }
@@ -1432,7 +1456,7 @@ The `log` phase records the HTTP upgrade handshake once (101 Switching Protocols
   "request_path": "/ws/chat",
   "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
   "proxy_name": "ws-chat",
-  "backend_target": "10.0.2.40:8080/ws/chat",
+  "backend_target": "ws://10.0.2.40:8080/ws/chat",
   "response_status_code": 502,
   "latency_total_ms": 5012.30,
   "latency_gateway_processing_ms": 5012.30,
@@ -2527,11 +2551,11 @@ Extracts the SPIFFE ID from a trusted peer certificate's URI SAN and publishes i
 - Every request re-checks the leaf's `notBefore` / `notAfter` window, even behind the per-connection extraction cache: a certificate that crosses `notAfter` mid-connection stops authorizing new H1 keep-alive requests and new H2/H3 streams, and an expired or not-yet-valid SVID is a fixed `403` that echoes no time, subject, SAN, or serial.
 - The monotonic deadline is converted once, at the first successful admission, and later cache hits admit against that captured instant, so a wall-clock rollback cannot lengthen it. Relay traffic never refreshes it.
 - The bound is contributed earliest-wins: a longer-lived credential accepted later on the same request can never widen it.
-- An SVID whose `notAfter` is further out than the host's monotonic clock can represent (RFC 5280's `99991231235959Z`, for instance) is still admitted: it publishes no credential deadline of its own, and `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` bounds the request or session instead. Whether that conversion overflows is a property of the platform clock, never of the credential, so it never produces the fixed `403`.
+- An SVID whose `notAfter` is further out than the host's monotonic clock can represent (RFC 5280's `99991231235959Z`, for instance) is still admitted: it publishes no credential deadline of its own, and the protocol's configured maximum lifetime bounds it instead: `FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS` for every non-WebSocket request or session (HTTP-family streaming bodies, SSE, gRPC, gRPC-Web, TCP/TCP+TLS, and UDP/DTLS), and `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` for WebSocket sessions on H1/H2/H3. Whether that conversion overflows is a property of the platform clock, never of the credential, so it never produces the fixed `403`.
 - Only a **certificate-derived** identity carries this provenance. A pre-stamped kernel-attested (node-waypoint eBPF) or HBONE-asserted `peer_spiffe_id` has no leaf validity window and is deliberately not treated as certificate-bounded.
 - Because a TLS-terminating TCP listener carrying this plugin can admit such a principal, it stays on the buffered userspace path rather than the kernel-TLS `splice(2)` fast path, exactly as [`mtls_auth`](#mtls_auth) does. See [frontend_tls.md — Kernel TLS and the stream authorization deadline](frontend_tls.md#kernel-tls-and-the-stream-authorization-deadline).
 
-**Mesh injection:** Mesh mode auto-injects a global instance with reserved id `__mesh_spiffe_identity` and empty config `{}`. An operator-managed global `spiffe_identity` is an explicit override and suppresses that reserved instance (NodeWaypoint transparent capture still force-injects the reserved id). Standalone (non-mesh) gateways may attach the plugin like any other public plugin when they terminate mTLS/DTLS and want SPIFFE identity for [mesh authorization](mesh.md#authorization) or [`rate_limiting`](#rate_limiting) `limit_by: spiffe_identity`. See [mesh.md — SPIFFE Identity](mesh.md#spiffe-identity).
+**Mesh injection:** Mesh mode auto-injects a global instance with reserved id `__mesh_spiffe_identity` and empty config `{}`. An operator-managed global `spiffe_identity` is an explicit override and suppresses that reserved instance, including under transparent inbound capture: capture force-injects only the reserved `__mesh_authz` instance beside an operator `mesh_authz` global, never `__mesh_spiffe_identity`. Standalone (non-mesh) gateways may attach the plugin like any other public plugin when they terminate mTLS/DTLS and want SPIFFE identity for [mesh authorization](mesh.md#authorization) or [`rate_limiting`](#rate_limiting) `limit_by: spiffe_identity`. See [mesh.md — SPIFFE Identity](mesh.md#spiffe-identity).
 
 ```yaml
 plugin_name: spiffe_identity
@@ -3070,7 +3094,7 @@ Do not send both headers. Mixed RFC 9530 / legacy spellings on one field, duplic
 
 #### Example — RFC 9530 `Content-Digest` + `ferrum-hmac-v2`
 
-The Python snippet below computes the SHA-256 of the exact `--data-binary` bytes, builds the RFC 9530 field, and signs the documented v2 base (including the empty `{QUERY}` field when the URL has no query). It normalizes `{AUTHORITY}` like Ferrum — ASCII-lowercase host, no trailing DNS dot, no default `:80`/`:443`, non-default ports and bracketed IPv6 retained — and exits before signing when the URL has userinfo, no host, an unsupported scheme, or a malformed authority/port. Its authority validators mirror Ferrum's byte-level checks: reg-name and IPvFuture segments require ASCII alphanumerics (not Unicode letters), and scoped IPv6 zone identifiers (`%scope`) are rejected before parsing. It prints one `curl` command. Set `HMAC_SECRET` to the Consumer secret (≥32 non-whitespace characters); do not put a real secret in the script.
+The Python snippet below computes the SHA-256 of the exact `--data-binary` bytes, builds the RFC 9530 field, and signs the documented v2 base (including the empty `{QUERY}` field when the URL has no query). It normalizes `{AUTHORITY}` like Ferrum — ASCII-lowercase host, no trailing DNS dot, no default `:80`/`:443`, non-default ports and bracketed IPv6 retained — and exits before signing when the URL has userinfo, no host, an unsupported scheme, or a malformed authority/port. Its authority validators mirror Ferrum's byte-level checks: reg-name and IPvFuture segments require ASCII alphanumerics (not Unicode letters), and scoped IPv6 zone identifiers (`%scope`) are rejected before parsing. It signs the raw username but sends it as an HTTP quoted-string with `\` and `"` backslash-escaped (backslash first), so the gateway decodes the same value it verifies, and it exits before signing when the username contains a control character other than horizontal tab. `shlex.quote` only protects the printed shell arguments; it is not HTTP quoted-string encoding. It prints one `curl` command. Set `HMAC_SECRET` to the Consumer secret (≥32 non-whitespace characters); do not put a real secret in the script.
 
 ```python
 #!/usr/bin/env python3
@@ -3161,12 +3185,20 @@ def normalize_authority_for_signing(netloc: str, scheme: str) -> str:
         return f"{normalized_host}:{port}"
     return normalized_host
 
+def quote_auth_param(value: str) -> str:
+    # HTTP quoted-string: escape backslash first, then the quote character.
+    # The signing base keeps the raw value; only the wire auth-param is escaped.
+    if any((ord(c) < 0x20 and c != "\t") or ord(c) == 0x7F for c in value):
+        sys.exit("username contains control characters that cannot appear in an HTTP header")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
 secret = os.environ.get("HMAC_SECRET", "")
 if sum(not char.isspace() for char in secret) < 32:
     sys.exit("set HMAC_SECRET to the Consumer hmac_auth secret (>= 32 non-whitespace chars)")
 
 url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080/p/hmac"
 username = sys.argv[2] if len(sys.argv) > 2 else "alice"
+wire_username = quote_auth_param(username)  # validated before anything is signed
 body = b'{"ping":1}'
 namespace = os.environ.get("FERRUM_NAMESPACE", "ferrum")
 
@@ -3200,7 +3232,7 @@ signature = base64.b64encode(
     hmac.new(secret.encode(), signing_string.encode(), hashlib.sha256).digest()
 ).decode()
 auth = (
-    f'hmac username="{username}", algorithm="hmac-sha256", '
+    f'hmac username={wire_username}, algorithm="hmac-sha256", '
     f'nonce="{nonce}", signature="{signature}"'
 )
 cmd = [
@@ -3939,7 +3971,7 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. |
-| `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, or contain empty, `.`, or `..` path segments. |
+| `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, a backslash, a space, or an ASCII control character, or contain empty, `.`, or `..` path segments. The normalized decision URL must still address the path under `{opa_host}/v1/data/`. |
 | `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured, nor can the gateway-owned `X-Ferrum-Hops` (any case, `_` or `-`), which the decision request carries itself. |
 | `timeout_ms` | Integer | `1000` | Requested per-decision timeout. Every positive value is accepted; the effective timeout is capped at `30000` ms. |
 | `max_response_bytes` | Integer or null | `262144` | Maximum decoded OPA response size. Oversized declared or streamed responses use the configured fail posture. An explicit `null` selects the default, exactly like omitting the key. |
@@ -3966,7 +3998,7 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 | `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; entries must be non-empty valid HTTP header names. Built-in sensitive headers and active authentication credential headers are always omitted. |
 | `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query` and `input.query_pairs`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
 
-Unknown or misspelled top-level OPA config keys are rejected at config load. `policy_path` must be non-empty, must not start with `/`, and must contain no percent-encoding, `?`, `#`, or empty / `.` / `..` segments. `headers`, `deny_headers`, and `fail_closed_headers` names must be HTTP tokens and their values visible ASCII; `headers` additionally rejects `content-type` (case-insensitively), and the two response maps reject protocol-managed hop-by-hop and framing destinations.
+Unknown or misspelled top-level OPA config keys are rejected at config load. `policy_path` must be non-empty, must not start with `/`, and must contain no percent-encoding, `?`, `#`, `\`, space, ASCII control character, or empty / `.` / `..` segments. The URL parser treats `\` as a separator for `http`/`https`, strips tab/CR/LF, and trims trailing spaces before removing dot segments, so after building the decision URL the plugin also checks that the normalized path still sits under `{opa_host}/v1/data/` with the same number of segments as `policy_path`; anything else is rejected at config load, and decision calls are sent to exactly that admitted URL. `headers`, `deny_headers`, and `fail_closed_headers` names must be HTTP tokens and their values valid HTTP field values: visible ASCII, space, horizontal tab, and UTF-8 (obs-text) are accepted, while NUL, CR, LF, DEL, and other C0 controls are rejected; `headers` additionally rejects `content-type` (case-insensitively), and the two response maps reject protocol-managed hop-by-hop and framing destinations.
 
 #### Query canonicalization (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5)
 
@@ -4689,7 +4721,8 @@ config:
   content_type: application/json
   message: '{"error":"scheduled-maintenance"}'
 
-# Block /admin during business hours but pass other paths through
+# Block paths starting with /admin while this plugin is enabled; other paths pass through.
+# There is no schedule setting: for a time window, enable/disable the plugin externally.
 plugin_name: request_termination
 config:
   status_code: 403
@@ -6564,7 +6597,7 @@ Enables on-demand load testing of a proxy's backend by sending concurrent reques
 
 Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. Shared run-admission state (keyed by plugin-config identity) prevents concurrent cohorts across reload generations for the same instance, and a process-wide active-client budget caps aggregate detached work. Removing the last live plugin instance for that identity cancels any active cohort; a compatible replacement generation that shares the state does not. At most **one** effective `load_testing` instance is admitted per proxy after global/proxy/proxy_group merge — two same-name effective instances would each hold their own admission flag and could start overlapping high-cost cohorts against one gateway with no reload at all, so the composition is rejected at plugin-cache construction (GHSA-wmqm-6mxj-gm9p).
 
-For multi-node deployments, `gateway_addresses` fans out once from the originating controller (WITH the key plus `X-Loadtesting-Fanout: 1`). Peer receivers start a local cohort only, never re-fanout, and terminate the control request with `204` before backend dispatch. At most 32 unique peer addresses are accepted; local-loopback aliases of the selected local target (`127/8`, IPv4-mapped loopback, `::1`, `localhost`, and names beneath `.localhost` with matching scheme/effective port) are rejected.
+For multi-node deployments, `gateway_addresses` fans out once from the originating controller (WITH the key plus `X-Loadtesting-Fanout: 1`). Peer receivers start a local cohort only, never re-fanout, and terminate the control request with `204` before backend dispatch. A receiver that refuses the trigger because its process-wide active-client budget (10,000 clients) or retained replay-body budget (64 MiB) is exhausted starts no cohort, records a `Failed` run, and terminates the control request with `503` before backend dispatch instead, so the sender reports it like any other refusal. At most 32 unique peer addresses are accepted; local-loopback aliases of the selected local target (`127/8`, IPv4-mapped loopback, `::1`, `localhost`, and names beneath `.localhost` with matching scheme/effective port) are rejected.
 
 Fan-out stays fire-and-forget for the triggering application request, but a peer that answers anything other than `204` started no remote cohort. Redirects are never followed, so a `3xx` is a refusal too. Every non-`204` outcome is reported with a bounded `warn!` naming the peer's scheme/host/port label and the observed status only — never the key, raw path/query, or response body — alongside the existing transport-failure warning.
 
@@ -8260,10 +8293,15 @@ config:
 A typical AI gateway proxy combining the AI plugins with `ai_federation` for multi-provider routing:
 
 ```yaml
-# Proxy config — ai_federation handles provider routing, so backend_host is unused
+# Proxy config. ai_federation answers only eligible requests (POST with a JSON
+# content type); every other request that earlier plugins admit continues to
+# ordinary backend dispatch. allowed_methods refuses non-POST methods with 405,
+# but a non-JSON POST still reaches backend_host, so point it at a deliberate
+# fallback service (for example one that answers 415/400), not a placeholder.
 listen_path: /v1/chat/completions
+allowed_methods: [POST]
 backend_scheme: https
-backend_host: placeholder.local
+backend_host: ai-fallback.internal
 backend_port: 443
 
 # Plugins attached to this proxy, shown as plugin_name + config. In file mode each
@@ -8329,7 +8367,7 @@ plugins:
     config: {}
 ```
 
-> **Note:** `ai_federation` short-circuits normal backend dispatch via `RejectBinary`, but successful buffered synthetic bodies still run through response-body hooks: `ai_response_guard` inspects/transforms the normalized provider body, and `ai_semantic_cache` can participate through its synthetic hit re-serving/final-response behavior. `ai_token_metrics` is the deliberate exception and does not inspect federation's synthetic response; federation writes the same token metadata keys directly. Separately, `ai_rate_limiter` records federation token usage through `applies_after_proxy_on_reject` on the rejection path.
+> **Note:** `ai_federation` short-circuits normal backend dispatch via `RejectBinary` for the requests it handles, but successful buffered synthetic bodies still run through response-body hooks: `ai_response_guard` inspects/transforms the normalized provider body, and `ai_semantic_cache` can participate through its synthetic hit re-serving/final-response behavior. `ai_token_metrics` is the deliberate exception and does not inspect federation's synthetic response; federation writes the same token metadata keys directly. Separately, `ai_rate_limiter` records federation token usage through `applies_after_proxy_on_reject` on the rejection path.
 
 > **Limitation — `on_unmetered_response: "reject"` cannot replace a federated response.** Federation dispatches from the final request-body phase, so `ai_rate_limiter` performs its normal pre-reservation before provider I/O. The response still travels through the synthetic rejection pipeline, whose reconciliation hook cannot replace an already selected response. `charge_estimate` and `warn` therefore reconcile correctly, but `reject` records the violation without substituting a 502. If fail-closed unmetered responses are required, require provider usage during federation normalization or enforce it upstream.
 
@@ -9108,7 +9146,7 @@ These plugins are registered built-ins even when they are most often generated o
 
 Applies Istio-style mesh authorization (`MeshPolicy` ALLOW / DENY / AUDIT / CUSTOM) to the SPIFFE identity established by the `spiffe_identity` plugin or carried in the HBONE baggage of an ambient mTLS stream. It runs in the `authorize` phase at priority **2075** (after authentication, after `access_control`, before `opa`) and in `on_stream_connect` for Layer-4 sessions, so it covers every protocol family in the matrix: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP/TLS, and UDP/DTLS. Its failure policy is `FailClosed`.
 
-Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applicable topology, carrying a `mesh_slice`. Operators can also configure it directly on a non-mesh gateway with a flat `mesh_policies` list; that is the form documented here. An operator-managed global of the same type overrides the mesh-injected instance.
+Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applicable topology, carrying a `mesh_slice`. Operators can also configure it directly on a non-mesh gateway with a flat `mesh_policies` list; that is the form documented here. An operator-managed global `mesh_authz` suppresses ordinary injection of `__mesh_authz`. Transparent inbound capture is the exception: because it admits unauthenticated direct plaintext, capture keeps the operator instance (enabled or disabled) and additionally force-injects the slice-fed `__mesh_authz`, so both run. Native/xDS MeshSlice feeds do not currently carry operator plugin configs, so this override applies only where plugin configs reach mesh preparation directly; configuring a plugin with the reserved `__mesh_authz` id yourself is not a supported override, because mesh preparation replaces that row with the mesh-managed instance.
 
 **Evaluation order.** DENY rules are evaluated first and the first match wins. `CUSTOM` delegations run before the DENY/ALLOW tiers. If any ALLOW rule is loaded and none matches, the request is denied by the implicit-deny floor (`mesh_authz.deny_policy=implicit-deny`). A configuration with no policies at all evaluates nothing and allows every request — an empty `mesh_policies: []` is a valid scaffold, not a lockdown.
 
@@ -9130,7 +9168,7 @@ Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applica
 
 The six injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
 
-**Direct policy example.** A namespace-scoped policy that denies `/admin` outright and otherwise allows only one service account:
+**Direct policy example.** A namespace-scoped policy that denies `/admin` and every path under `/admin/` outright and otherwise allows only one service account. Both patterns are needed: `/admin/*` is a prefix match on `/admin/`, so it does not match the bare `/admin` path.
 
 ```yaml
 plugin_name: mesh_authz
@@ -9147,7 +9185,7 @@ config:
       rules:
         - action: deny
           to:
-            - paths: ["/admin/*"]
+            - paths: ["/admin", "/admin/*"]
     - name: "allow-checkout"
       namespace: "default"
       scope:

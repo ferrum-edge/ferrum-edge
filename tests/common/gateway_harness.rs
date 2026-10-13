@@ -109,7 +109,7 @@ use reqwest::Client;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::thread;
@@ -2274,15 +2274,36 @@ fn preserve_base_env(cmd: &mut Command) {
     }
 }
 
+fn explicit_binary_candidates() -> [Option<PathBuf>; 2] {
+    ["FERRUM_EDGE_TEST_BIN", "CARGO_BIN_EXE_ferrum-edge"]
+        .map(|key| std::env::var_os(key).map(PathBuf::from))
+}
+
 pub fn explicit_test_binary() -> Option<PathBuf> {
-    for key in ["FERRUM_EDGE_TEST_BIN", "CARGO_BIN_EXE_ferrum-edge"] {
-        if let Some(path) = std::env::var_os(key).map(PathBuf::from)
-            && path.exists()
-        {
-            return Some(path);
-        }
+    explicit_binary_candidates()
+        .into_iter()
+        .flatten()
+        .find(|path| path.exists())
+}
+
+/// Pure resolution behind [`locate_binary`]: the first existing `explicit`
+/// candidate, then `<root>/target/release/ferrum-edge` if `prefer_release`,
+/// then `<root>/target/debug/ferrum-edge`, then the release build.
+pub fn select_gateway_binary(
+    explicit: &[Option<PathBuf>],
+    root: &Path,
+    prefer_release: bool,
+) -> Option<PathBuf> {
+    if let Some(path) = explicit.iter().flatten().find(|path| path.exists()) {
+        return Some(path.clone());
     }
-    None
+
+    let debug = root.join("target/debug/ferrum-edge");
+    let release = root.join("target/release/ferrum-edge");
+    if prefer_release && release.exists() {
+        return Some(release);
+    }
+    [debug, release].into_iter().find(|path| path.exists())
 }
 
 /// Locate the built `ferrum-edge` binary. Preference order:
@@ -2291,25 +2312,29 @@ pub fn explicit_test_binary() -> Option<PathBuf> {
 /// 3. `target/release/ferrum-edge` if `prefer_release` (load tests).
 /// 4. `target/debug/ferrum-edge` (normal).
 /// 5. `target/release/ferrum-edge` as a fallback.
-fn locate_binary(
+///
+/// Bespoke functional spawners must resolve through this function or
+/// [`gateway_binary_path`], never a fixed `target/` path: local
+/// `scripts/coverage.sh --functional` selects its instrumented binary only
+/// through `FERRUM_EDGE_TEST_BIN` (issue #6379).
+pub fn locate_binary(
     prefer_release: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(path) = explicit_test_binary() {
-        return Ok(path);
-    }
+    select_gateway_binary(
+        &explicit_binary_candidates(),
+        Path::new("."),
+        prefer_release,
+    )
+    .ok_or_else(|| {
+        "ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.".into()
+    })
+}
 
-    let debug = PathBuf::from("./target/debug/ferrum-edge");
-    let release = PathBuf::from("./target/release/ferrum-edge");
-    if prefer_release && release.exists() {
-        return Ok(release);
-    }
-    if debug.exists() {
-        return Ok(debug);
-    }
-    if release.exists() {
-        return Ok(release);
-    }
-    Err("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.".into())
+/// The `ferrum-edge` binary a bespoke functional spawner launches, resolved
+/// exactly like [`TestGateway`] (see [`locate_binary`]). When no binary exists
+/// it returns the release path so the spawn error names a concrete file.
+pub fn gateway_binary_path() -> PathBuf {
+    locate_binary(false).unwrap_or_else(|_| PathBuf::from("./target/release/ferrum-edge"))
 }
 
 /// Build the gateway binary at most once per test-binary process. Parallel
@@ -2929,5 +2954,73 @@ mod log_filter_isolation_tests {
         let set = TestGateway::builder().log_level("debug");
         assert!(set.log_level_explicit);
         assert_eq!(set.log_level, "debug");
+    }
+}
+
+#[cfg(test)]
+mod binary_selection_tests {
+    use super::*;
+
+    fn write_stub(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("stub parent")).expect("create stub dir");
+        std::fs::write(path, b"").expect("write stub binary");
+    }
+
+    fn select(explicit: Option<&Path>, root: &Path, prefer_release: bool) -> Option<PathBuf> {
+        let explicit = [explicit.map(Path::to_path_buf), None];
+        select_gateway_binary(&explicit, root, prefer_release)
+    }
+
+    #[test]
+    fn explicit_binary_wins_over_a_stale_fixed_path_build() {
+        let root = TempDir::new().expect("temp root");
+        let target = root.path().join("target");
+        let stale = target.join("debug/ferrum-edge");
+        let instrumented = target.join("llvm-cov-target/debug/ferrum-edge");
+        write_stub(&stale);
+        write_stub(&instrumented);
+
+        for prefer_release in [false, true] {
+            assert_eq!(
+                select(Some(&instrumented), root.path(), prefer_release),
+                Some(instrumented.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_binary_is_selected_when_only_it_exists() {
+        let root = TempDir::new().expect("temp root");
+        let instrumented = root.path().join("llvm-cov-target/debug/ferrum-edge");
+        write_stub(&instrumented);
+
+        assert_eq!(
+            select(Some(&instrumented), root.path(), false),
+            Some(instrumented)
+        );
+        assert_eq!(select(None, root.path(), false), None);
+    }
+
+    #[test]
+    fn missing_explicit_binary_falls_back_to_the_fixed_path_build() {
+        let root = TempDir::new().expect("temp root");
+        let debug = root.path().join("target/debug/ferrum-edge");
+        let missing = root.path().join("missing/ferrum-edge");
+        write_stub(&debug);
+
+        assert_eq!(select(Some(&missing), root.path(), false), Some(debug));
+    }
+
+    #[test]
+    fn release_preference_applies_only_without_an_explicit_binary() {
+        let root = TempDir::new().expect("temp root");
+        let debug = root.path().join("target/debug/ferrum-edge");
+        let release = root.path().join("target/release/ferrum-edge");
+        write_stub(&debug);
+        write_stub(&release);
+
+        assert_eq!(select(None, root.path(), false), Some(debug.clone()));
+        assert_eq!(select(None, root.path(), true), Some(release));
+        assert_eq!(select(Some(&debug), root.path(), true), Some(debug));
     }
 }

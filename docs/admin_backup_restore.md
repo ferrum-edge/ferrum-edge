@@ -440,7 +440,7 @@ If the delete or any resource type fails during import, the endpoint removes the
 {
   "error": "Restore failed; restore rolled back and prior config retained",
   "restore_errors": [
-    "consumers: unique constraint violation on username"
+    "consumers: Consumer identity or credential conflicts with another Consumer in the namespace"
   ],
   "rollback": "completed"
 }
@@ -477,7 +477,7 @@ so persistent corruption is distinguishable from a retryable outage.
   "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
   "failure_class": "connectivity",
   "restore_errors": [
-    "failed to snapshot prior config for rollback: pool timed out while waiting for an open connection"
+    "failed to snapshot prior config for rollback: Database unavailable — operation failed"
   ]
 }
 ```
@@ -489,7 +489,7 @@ so persistent corruption is distinguishable from a retryable outage.
   "error": "Restore aborted: the prior configuration contains a data-integrity error and could not be snapshotted for rollback. Existing config was NOT deleted; repair the identified stored resource before retrying.",
   "failure_class": "data_integrity",
   "restore_errors": [
-    "data-integrity failure decoding proxy resource 'proxy-123'"
+    "data-integrity failure decoding proxy resource \"proxy-123\""
   ]
 }
 ```

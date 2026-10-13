@@ -93,7 +93,7 @@ adding, removing, or materially changing a workflow.
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
 | `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
-| `base-image-digest-refresh.yml` | Base Image Digest Refresh | Weekly schedule, manual | Resolves the current `@sha256:` digest for each pinned Dockerfile `FROM`/`ARG` image tag and opens an ordinary PR with the refreshed pins. |
+| `base-image-digest-refresh.yml` | Base Image Digest Refresh | Weekly schedule, manual | Resolves the current `@sha256:` digest for each pinned Dockerfile `FROM`/`ARG` image tag and opens an ordinary PR with the refreshed pins. Distroless drift is held, reported with its consumers, and fails the run for a direct-to-`main` rotation (see `docs/dependency-policy.md`). |
 | `trusted-policy-candidate.yml` | Trusted Policy Candidate | PRs and push to `main` on `.github/scripts/**` or `.github/workflows/**` | Read-only `Candidate policy self-test`: runs the candidate `verify_required_ci.py` and the candidate Cross verifier's `--self-test`; nothing consumes its output. Not a required check. |
 | `benchmark-harness-lockfile.yml` | Benchmark Harness Lockfile | PRs on the multi-protocol harness `Cargo.toml`/`Cargo.lock` | Fails on lockfile drift and retains the expected lockfile. Optional. |
 | `mesh-benchmark-lockfile.yml` | Mesh Benchmark Lockfile | PRs and push to `main` on the mesh benchmark manifests, manual | Checks the `tests/performance/mesh` locked dependency graph. Optional. |
@@ -892,10 +892,16 @@ concurrency:
 A new push to a pull request cancels that PR's superseded run. Pushes to
 `main`, dispatches, and schedules get a unique `run-<id>` group, so they are
 never cancelled and never displace a queued dispatch. `h3-live-comparison.yml`
-and `h2-guard-observation.yml` keep their own named groups but likewise cancel
-only on `pull_request`; `h3-proof-preflight.yml` uses its own group keyed on
-the PR number or ref and always cancels the superseded run. The required
-workflows keep their own event-aware groups (see below).
+and `h2-guard-observation.yml` keep their own named groups and likewise cancel
+only on `pull_request`, but their manual dispatches also get a unique
+`run-<id>` group: `cancel-in-progress: false` alone protects only a campaign
+that is already running (a group otherwise holds one running and one pending
+run, and a later same-group dispatch would replace the pending one), while the
+per-run group preserves every queued manual campaign. H2 main pushes keep the
+ref group and the coalescing described under
+[Main-push concurrency](#main-push-concurrency). `h3-proof-preflight.yml` uses
+its own group keyed on the PR number or ref and always cancels the superseded
+run. The required workflows keep their own event-aware groups (see below).
 
 **Measuring gate changes.** `.github/scripts/ci_gate_replay.py` replays merged
 pull requests through two revisions of `pr_ci_plan.py`,
@@ -1507,8 +1513,11 @@ stripped of newlines and backticks before they are written.
 **Runs**: `ubuntu-26.04`
 
 Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
-`profile.dev.debug=0`) so large integration targets stay within hosted-runner
-memory while `CARGO_BUILD_JOBS=2` restores modest compile parallelism:
+`profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
+so large integration targets stay within hosted-runner memory: even two
+parallel jobs could overlap two large integration-target clippy processes on
+a cold cache and starve the runner, so one job removes that overlap at the
+cost of wall clock, not coverage:
 
 ```bash
 cargo clippy \
@@ -2822,7 +2831,8 @@ publishing anything on an unproven result.
 ### Release Build Job
 
 **Runs**: `ubuntu-26.04`, `macos-latest`, `windows-latest` (four-target native
-matrix plus the isolated Linux ARM64 job)
+matrix) plus `ubuntu-24.04` (the isolated Linux ARM64 job,
+`build-release-arm64-cross`)
 
 Depends on `Validate release SHA`, then builds optimized release binaries for all target platforms:
 
@@ -4001,42 +4011,55 @@ trusted-main writer in this workflow. All package and billing settings stay as-i
 
 ### Shared default-profile live dependency cache (#4643)
 
-Netns Source Capture, Two-Cluster Mesh Live and Ambient host-UDP live-kernel
-use the existing `ci-netns-capture-live` key. All use `setup-rust-ci`, default
-features, the default Cargo profile, native dependencies, workspace and
-compiler flags. All three pin `ubuntu-26.04`,
-which currently resolves to the same image family. The cache still includes
-its platform/toolchain/environment hash, and Cargo checks build fingerprints.
-All three build the gateway and `functional_tests`; Netns and Ambient also
-build the inline library tests. The pinned Rust cache removes workspace
-binaries and keeps external dependencies plus the compiler store, so any
-completed producer supplies the shared dependency archive. Cargo still checks
-source fingerprints and each job independently executes its own required tests.
+This heading is historical: since the BoringCache backend rollout (#5890) the
+three live jobs no longer form one shared `ci-netns-capture-live` archive or
+producer set, and no completed producer supplies a common archive for the
+others. The current backend/profile/fallback map is:
 
-The September 7 logs showed an additional key split: Ambient's environment
-hash was `c3076958`, while Netns/Two-Cluster used `08f74bf7`. The main CI
-workflow exports `CARGO_NET_RETRY=10` and `CARGO_HTTP_MULTIPLEXING=false`;
-Ambient previously relied on the same values in `.cargo/config.toml`. The
-pinned Rust cache hashes the exported variables even though these two settings
-only affect downloading. Ambient now explicitly exports the same values and
-uses the existing Netns namespace, so the complete key can match. Merely
-changing the shared-key label without matching those inputs would still
-create two archives.
+- **Netns Source Capture** and **Two-Cluster Mesh Live** (in `ci.yml`) call
+  `setup-rust-ci` with `cache: "false"` and legacy shared key `ci-debug`, and
+  compile with `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. With
+  `cache: "false"`, `setup-rust-ci` selects BoringCache: their builds run
+  under the separate `netns-live` and `two-cluster-live` BoringCache profiles
+  when it is enabled. Only when BoringCache is unavailable does the
+  `Swatinem/rust-cache` fallback run, keyed by the legacy `ci-debug` label.
+- **Ambient host-UDP live-kernel** (`ambient-host-udp-live.yml`) supplies only
+  `shared-key: ci-netns-capture-live`. It keeps the `setup-rust-ci` defaults
+  `cache: "true"` and `save: "false"`, sets no `CARGO_PROFILE_DEV_DEBUG`
+  override, and builds with plain Cargo, so it restores through rust-cache
+  under that legacy label and never saves.
 
-The completed Ambient/Netns archives were 2,637,841,434 / 2,637,871,806 bytes.
-Sharing removes another roughly 2.64 GB duplicate producer. Ambient's separate
-GHCR image cache is unaffected. The trusted-main-only save rule and all job
-triggers, budgets, build commands, dependency edges and test assertions are
-unchanged. The frozen Ambient contract and regression mutations require the
-matching namespace and explicit network settings. Unit, lint, feature-specific
-and archive-builder profiles keep separate keys. Reassess this sharing if any
-job changes its build profile, features, toolchain, environment or target layout.
+The shared label is therefore a legacy rust-cache fallback input, not proof
+that BoringCache archives match, and matching `ubuntu-26.04` runner labels
+and Cargo download variables do not establish a shared archive. Cargo still
+checks source fingerprints and each job independently executes its own
+required tests. Do not force the callers back onto one cache just to match
+the historical description below.
 
-Hosted validation must confirm Ambient restores the full Netns key and passes
-its complete live suite. Only after integration and a successful shared-cache
-read should an unused legacy Ambient archive be retired. The broader quota
-issue still requires Unit/Lint/Artifacts retention across subsequent main runs;
-this change alone is not evidence that every required cache survives.
+Historical September sharing (pre-rollout): the September 7 logs showed an
+additional key split: Ambient's environment hash was `c3076958`, while
+Netns/Two-Cluster used `08f74bf7`. The main CI workflow exports
+`CARGO_NET_RETRY=10` and `CARGO_HTTP_MULTIPLEXING=false`; Ambient previously
+relied on the same values in `.cargo/config.toml`. The pinned Rust cache
+hashes the exported variables even though these two settings only affect
+downloading. Ambient was changed to explicitly export the same values and
+use the then-existing Netns namespace, so the complete key could match.
+Merely changing the shared-key label without matching those inputs would
+still have created two archives.
+
+The completed Ambient/Netns archives at that time were 2,637,841,434 /
+2,637,871,806 bytes, and sharing then removed another roughly 2.64 GB
+duplicate producer; those figures are historical measurements, not a current
+cache-hit, retention, quota, or compile-time claim. Ambient's separate GHCR
+image cache is unaffected. The frozen Ambient contract and regression
+mutations require the matching namespace and explicit network settings.
+Unit, lint, feature-specific and archive-builder profiles keep separate
+keys. Reassess this map if any job changes its build profile, features,
+toolchain, environment or target layout.
+
+The broader quota issue still requires Unit/Lint/Artifacts retention across
+subsequent main runs; the historical sharing change alone is not evidence
+that every required cache survives.
 
 ### Completed-job Rust cache saves (#4643)
 

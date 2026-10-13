@@ -31,15 +31,23 @@ pub trait SendStreamStopped {
 }
 ```
 
-Forward it through `BufRecvStream`, `FrameStream`, and server/client
-`RequestStream`. Implementations must take `&self` (not `&mut self`) so the
-future can be `'static` and must not borrow the send stream. Return a
-statically dispatched future via stable RPITIT, not an associated-type
-`impl Trait` and not a boxed trait object.
+Forward it through `BufRecvStream`, `FrameStream`, the shared inner
+`RequestStream`, and the public **server** `RequestStream` — that is the
+scope the applied Ferrum patch implements, because the Ferrum use case is a
+server observing client cancellation. The public client `RequestStream`
+facade has no `stopped` forwarder in the applied patch (its inner field is
+private to the client module); adding client forwarding is additional
+proposed work, not part of the implemented server scope. Implementations
+must take `&self` (not `&mut self`) so the future can be `'static` and must
+not borrow the send stream. Return a statically dispatched future via stable
+RPITIT, not an associated-type `impl Trait` and not a boxed trait object.
 
 `Ok(Some(code))` is peer `STOP_SENDING`. `Ok(None)` means the local side
-already finished and the peer acknowledged the stream. `Err` is connection
-loss.
+already finished and the peer acknowledged the stream. `Err` covers both
+connection loss (mapped to `StreamErrorIncoming::ConnectionErrorIncoming`)
+and rejected 0-RTT for the early-data stream (Quinn
+`StoppedError::ZeroRttRejected`, mapped by h3-quinn to
+`StreamErrorIncoming::Unknown`).
 
 ## Notes
 

@@ -62,11 +62,6 @@ const ZERO_TIMEOUT_HEADER_DELAY: Duration = Duration::from_secs(31);
 const ACME_IDENTIFIER: &str = "localhost";
 const ACME_KEY_AUTHORIZATION: &str = "abc_DEF-123.injector-test-thumbprint";
 
-fn gateway_binary_path() -> String {
-    std::env::var("CARGO_BIN_EXE_ferrum-edge")
-        .unwrap_or_else(|_| super::namespace_helpers::gateway_binary_path().to_string())
-}
-
 /// A spawned injector-mode gateway. `Drop` reaps the child so a failing
 /// assertion cannot leak a listener into the rest of the shard.
 struct InjectorGateway {
@@ -126,7 +121,7 @@ async fn try_start_injector(
     // this trust domain is this child and not another test's injector.
     let trust_domain = format!("injector-probe-{}-{port}.test", std::process::id());
 
-    let mut command = Command::new(gateway_binary_path());
+    let mut command = Command::new(crate::common::gateway_binary_path());
     command.arg("run");
     command
         .env("FERRUM_MODE", "injector")
