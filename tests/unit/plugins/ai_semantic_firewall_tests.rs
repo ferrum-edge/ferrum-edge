@@ -10246,7 +10246,6 @@ fn cleartext_provider_endpoint_requires_opt_in_off_loopback() {
     assert!(AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_ok());
 
     for endpoint in [
-        "http://localhost:9/v1/embeddings",
         "http://127.0.0.1:9/v1/embeddings",
         "http://[::1]:9/v1/embeddings",
         "https://embeddings.example.com/v1/embeddings",

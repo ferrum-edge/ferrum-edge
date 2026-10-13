@@ -21,7 +21,7 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::response_body::read_response_body_bounded;
-use super::utils::socket_host::is_loopback_url_host;
+use super::utils::socket_host::is_loopback_ip_url_host;
 use super::utils::sse::{
     SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
     classify_forwarded_sse_prefix, encode_sse_error_event, is_gemini_stream_frame,
@@ -3306,16 +3306,16 @@ fn validate_provider_endpoint(
     }
 
     // The embedding call carries the provider API key. Cleartext is admitted
-    // without an opt-in only to a loopback host (a local sidecar); any other
+    // without an opt-in only to a loopback IP literal (a local sidecar); any other
     // `http://` destination needs `provider.allow_plaintext: true`.
     if parsed.scheme() == "http"
         && !allow_plaintext
         && !parsed
             .host()
-            .is_some_and(|host| is_loopback_url_host(&host))
+            .is_some_and(|host| is_loopback_ip_url_host(&host))
     {
         return Err(
-            "ai_semantic_firewall: `provider.endpoint` uses `http://` to a non-loopback host, which is rejected by default; use `https://` or set `provider.allow_plaintext: true`"
+            "ai_semantic_firewall: `provider.endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `provider.allow_plaintext: true`"
                 .to_string(),
         );
     }

@@ -8509,7 +8509,6 @@ fn cleartext_embedding_endpoint_requires_opt_in_off_loopback() {
     assert!(AiSemanticCache::new(&config, PluginHttpClient::default()).is_ok());
 
     for endpoint in [
-        "http://localhost:9/embeddings",
         "http://127.0.0.1:9/embeddings",
         "http://[::1]:9/embeddings",
         "https://embeddings.example.com/v1/embeddings",

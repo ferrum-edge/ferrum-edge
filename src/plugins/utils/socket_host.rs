@@ -96,17 +96,17 @@ impl SocketHost {
     }
 }
 
-/// `true` when a parsed URL host names this machine: `localhost` (any ASCII
-/// case, with or without a trailing dot), an IPv4 loopback address, or `::1`.
+/// `true` when a parsed URL host is a literal loopback address: IPv4
+/// `127.0.0.0/8` or IPv6 `::1`.
 ///
 /// Plugins that send a credential to a configured endpoint admit cleartext
 /// `http://` without an explicit opt-in only to such a host (a local sidecar).
-pub fn is_loopback_url_host(host: &Host<&str>) -> bool {
+/// A hostname — `localhost` included — never qualifies: DNS overrides and the
+/// resolver decide where a name connects, so only an address literal proves
+/// the request stays on this machine.
+pub fn is_loopback_ip_url_host(host: &Host<&str>) -> bool {
     match host {
-        Host::Domain(name) => {
-            let name = name.strip_suffix('.').unwrap_or(name);
-            name.eq_ignore_ascii_case("localhost")
-        }
+        Host::Domain(_) => false,
         Host::Ipv4(ip) => ip.is_loopback(),
         Host::Ipv6(ip) => ip.is_loopback(),
     }

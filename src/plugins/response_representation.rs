@@ -104,12 +104,13 @@
 //! * **Streaming responses.** A response that never buffers never reaches a body
 //!   transform, so no body policy applies to it. A client `Accept:
 //!   text/event-stream` no longer releases anything on its own:
-//!   `response_transformer` keeps its pre-header buffering vote and releases a
-//!   response only after the backend headers show a genuine
-//!   `text/event-stream` representation, which is not a JSON content type and
-//!   so is outside every JSON body policy anyway. Enforcing a body policy over
-//!   a true event stream would need a streaming-side enforcement point — a
-//!   separate design.
+//!   `response_transformer` keeps its pre-header buffering vote and refines it
+//!   against the backend's declared response media type. It releases a
+//!   response whose declared type is not JSON (a genuine `text/event-stream`,
+//!   `application/octet-stream`, and similar) or is a framed gRPC type, none
+//!   of which a JSON body policy can act on; a declared or untyped JSON
+//!   response stays buffered. Enforcing a body policy over a true event stream
+//!   would need a streaming-side enforcement point — a separate design.
 //!
 //!   `response_transformer` does NOT decline client SSE intent in
 //!   `enforces_response_body_policy`: once a response buffers, the claim

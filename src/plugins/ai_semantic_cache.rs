@@ -84,7 +84,7 @@ use super::utils::redis_rate_limiter::{
 };
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::response_body::read_response_body_bounded;
-use super::utils::socket_host::is_loopback_url_host;
+use super::utils::socket_host::is_loopback_ip_url_host;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::fips::approved::{HmacSha256, Sha256};
 use crate::startup::sanitize_startup_scalar;
@@ -5930,16 +5930,16 @@ fn validate_semantic_embedding_endpoint(
     }
 
     // The embedding call carries the configured API key. Cleartext is admitted
-    // without an opt-in only to a loopback host (a local sidecar); any other
+    // without an opt-in only to a loopback IP literal (a local sidecar); any other
     // `http://` destination needs `semantic_embedding_allow_plaintext: true`.
     if parsed_endpoint.scheme() == "http"
         && !allow_plaintext
         && !parsed_endpoint
             .host()
-            .is_some_and(|host| is_loopback_url_host(&host))
+            .is_some_and(|host| is_loopback_ip_url_host(&host))
     {
         return Err(
-            "ai_semantic_cache: `semantic_embedding_endpoint` uses `http://` to a non-loopback host, which is rejected by default; use `https://` or set `semantic_embedding_allow_plaintext: true`"
+            "ai_semantic_cache: `semantic_embedding_endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `semantic_embedding_allow_plaintext: true`"
                 .to_string(),
         );
     }
