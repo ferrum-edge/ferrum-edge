@@ -14524,3 +14524,139 @@ fn candidate_topology_does_not_open_node_local_geo_database() {
         );
     }
 }
+
+// ---- PluginInstanceWrapper forwards every capability predicate (#6606) ----
+
+/// Build a single-plugin HTTP proxy whose instance carries a `priority_override`,
+/// so the cache publishes it inside `PluginInstanceWrapper`, and return that
+/// published instance.
+fn wrapped_http_instance(plugin_name: &str, config: serde_json::Value) -> Arc<dyn Plugin> {
+    let mut plugin = make_plugin_config_with_json(
+        "wrapped",
+        plugin_name,
+        config,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin.priority_override = Some(4321);
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/api", vec!["wrapped"])],
+        vec![plugin],
+    ))
+    .unwrap_or_else(|error| panic!("{plugin_name} with priority_override must admit: {error}"));
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let instance = plugins
+        .iter()
+        .find(|plugin| plugin.name() == plugin_name)
+        .unwrap_or_else(|| panic!("{plugin_name} must be published"))
+        .clone();
+    assert_eq!(
+        instance.priority(),
+        4321,
+        "the published {plugin_name} instance must be the priority-override wrapper"
+    );
+    instance
+}
+
+#[test]
+fn wrapped_mtls_auth_still_declares_an_authenticated_stream_principal() {
+    let instance = wrapped_http_instance("mtls_auth", json!({"cert_field": "subject_cn"}));
+    assert!(
+        instance.admits_authenticated_stream_principal(),
+        "a priority-overridden mtls_auth must keep its stream-principal declaration"
+    );
+    assert!(
+        !ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+            true,
+            false,
+            false,
+            std::slice::from_ref(&instance),
+        ),
+        "a wrapped mtls_auth must keep the listener off the kTLS handoff"
+    );
+}
+
+#[test]
+fn wrapped_cors_keeps_its_strict_origin_policy_declaration() {
+    let instance = wrapped_http_instance(
+        "cors",
+        json!({"allowed_origins": ["https://trusted.example"]}),
+    );
+    assert!(instance.cors_uses_strict_origin_policy());
+}
+
+#[test]
+fn wrapped_response_caching_keeps_its_origin_response_declaration() {
+    let instance = wrapped_http_instance("response_caching", json!({"ttl_seconds": 60}));
+    assert!(instance.rejects_with_origin_response());
+}
+
+/// Names of the methods declared directly inside the first `{ ... }` block
+/// that follows `header` in `source` (a trait or an `impl` block).
+fn block_method_names(source: &str, header: &str) -> std::collections::BTreeSet<String> {
+    let start = source
+        .find(header)
+        .unwrap_or_else(|| panic!("{header} must exist"));
+    let body_start = start + header.len();
+    let end = source[body_start..]
+        .find("\n}\n")
+        .map(|offset| body_start + offset)
+        .unwrap_or_else(|| panic!("{header} block must terminate"));
+    source[body_start..end]
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("    async fn ")
+                .or_else(|| line.strip_prefix("    fn "))?;
+            let name: String = rest
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Every `Plugin` trait method must be overridden by `PluginInstanceWrapper`.
+/// A missing forward silently resolves to the trait default for any instance
+/// carrying a `priority_override` or trigger, which is how #6606 dropped
+/// `admits_authenticated_stream_principal` and two CORS/diagnostic predicates.
+#[test]
+fn plugin_instance_wrapper_forwards_every_plugin_trait_method() {
+    let trait_methods = block_method_names(
+        include_str!("../../../src/plugins/mod.rs"),
+        "pub trait Plugin: Any + Send + Sync {",
+    );
+    let wrapper_methods = block_method_names(
+        include_str!("../../../src/plugin_cache.rs"),
+        "impl Plugin for PluginInstanceWrapper {",
+    );
+    assert!(
+        trait_methods.len() > 100 && wrapper_methods.len() > 100,
+        "source scan must find the Plugin trait and the wrapper impl \
+         (trait={}, wrapper={})",
+        trait_methods.len(),
+        wrapper_methods.len()
+    );
+    // The wrapper is deliberately NOT the deferred-CORS marker; see the
+    // `PluginInstanceWrapper` docs in src/plugin_cache.rs.
+    const DELIBERATELY_NOT_FORWARDED: &[&str] = &["is_deferred_cors_wrapper"];
+    let missing: Vec<&String> = trait_methods
+        .iter()
+        .filter(|name| {
+            !wrapper_methods.contains(*name) && !DELIBERATELY_NOT_FORWARDED.contains(&name.as_str())
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "PluginInstanceWrapper must forward every Plugin trait method; missing: {missing:?}"
+    );
+    let stale: Vec<&String> = wrapper_methods
+        .iter()
+        .filter(|name| !trait_methods.contains(*name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "PluginInstanceWrapper overrides names the Plugin trait no longer declares: {stale:?}"
+    );
+}
