@@ -192,9 +192,15 @@ extracted** is ungovernable.
 
 Both settings record the fixed
 `ai_tool_governor.uninspectable_reason = unrecognized_tool_call_shape`
-observation and never set `decision` — the bytes were not evaluated against
-policy, so neither `allow` nor `deny` would be a truthful label. The case is
-therefore never *silent* under either setting.
+observation. The observation writer itself never sets `decision` — the bytes
+were not evaluated against policy, so neither `allow` nor `deny` would be a
+truthful policy label — and on the forwarding paths (`allow`, or `deny` under
+`dry_run`) no decision is set for this case (a stronger decision already
+recorded by another surface still stands). The default fail-closed rejection
+path is different: when `enforce` rejects or cuts the payload, it also records
+`ai_tool_governor.decision = deny` as the rejection outcome alongside the
+fixed reason (when metadata emission is enabled). The case is therefore never
+*silent* under either setting.
 
 Scoping the posture to a positive marker is deliberate: payloads with **no**
 tool surface at all — ordinary REST JSON on a shared proxy, embeddings /
@@ -551,7 +557,8 @@ When `observability.emit_metadata` is on (default), the plugin writes
 `ai_tool_governor.*` transaction metadata: `enabled`, `mode`, `decision`
 (`allow` / `dry_run` / `deny` / `require_approval` / `approved` /
 `approval_denied`),
-`tool_names`, `risk` (max), `policy_ids`, `approval_id`, `arguments_hashes`
+`tool_names`, `risk` (the maximum within the winning decision rank; see
+below), `policy_ids`, `approval_id`, `arguments_hashes`
 (SHA-256, when `hash_arguments` is on), `redacted_tools`, and
 `uninspectable_reason` (fixed values only, never raw body bytes):
 
@@ -559,12 +566,20 @@ When `observability.emit_metadata` is on (default), the plugin writes
   duplicate-key ambiguity without blocking.
 - `unrecognized_tool_call_shape` — recorded when a payload carried an
   unreadable tool-call shape, in **both** modes and under **both**
-  `unknown_shape_action` settings. It never sets `decision`.
+  `unknown_shape_action` settings. The observation itself never sets
+  `decision`; a forwarding outcome leaves any decision to other surfaces,
+  while the default enforce rejection records `decision = deny` as the
+  rejection outcome.
 
 **Bounded observation ledgers.** The comma-delimited cumulative fields —
 `tool_names`, `policy_ids`, `approval_id`, `arguments_hashes`, and
-`redacted_tools` — are aggregated across every governed surface of one request
-and every completed batch of one response stream, so each one is explicitly
+`redacted_tools` — are aggregated by winning decision rank across the governed
+surfaces of one request and the completed batches of one response stream: a
+lower-rank batch is ignored, an equal-rank batch merges into the retained
+ledger, and a stronger batch replaces the weaker decision's ledger basis.
+`risk` follows the same rule — it is the maximum within the winning decision
+rank, so a stronger decision replaces the previous rank's risk even when that
+risk was higher. Each ledger is explicitly
 bounded: at most **64 distinct values** (matching the 64-call per-batch
 governable limit) and at most **8192 UTF-8 bytes** per field, with each
 individual value retained to at most **256 UTF-8 bytes** plus a trailing `…`
@@ -579,11 +594,12 @@ state without limit — the documented `0` (unlimited) response-byte policy
 leaves no wire-byte ceiling that could serve as the bound. Values are
 deduplicated, and order of first observation is preserved.
 
-When a ledger is full, further distinct values are counted in
-`ai_tool_governor.observations_omitted` (absent when nothing was dropped) so a
-capped field is never silently short. Truncation changes nothing about
+When a ledger is full, further distinct values dropped by an entry or byte
+cap during a merge are counted in `ai_tool_governor.observations_omitted`
+(absent when nothing was dropped; rank-displaced observations are not counted)
+so a capped field is never silently short. Truncation changes nothing about
 enforcement: every tool call is still governed, the highest-severity `decision`
-and the maximum `risk` are still recorded, and a higher-severity batch replaces
+and the winning rank's maximum `risk` are still recorded, and a higher-severity batch replaces
 a weaker decision's ledger basis — still under the same entry and byte ceilings,
 so the replacement is bounded too and can also omit values counted in
 `observations_omitted`.

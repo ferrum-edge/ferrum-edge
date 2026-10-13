@@ -152,16 +152,6 @@ fn write_file(dir: &TempDir, name: &str, data: &str) -> String {
 // Gateway Helpers
 // ============================================================================
 
-fn gw_bin() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
 /// Lease a gateway port until the test process exits.
 async fn alloc_port() -> u16 {
     crate::scaffolding::ports::unbound_port()
@@ -267,7 +257,7 @@ fn spawn_gateway_piped(
     ports: &Ports,
     envs: &[(&str, &str)],
 ) -> (TokioChild, OutputCapture) {
-    let mut cmd = TokioCommand::new(gw_bin());
+    let mut cmd = TokioCommand::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

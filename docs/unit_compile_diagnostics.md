@@ -59,9 +59,21 @@ failure; it is not a claim that the sending path has been repaired.
 Dispatch **Resources Scale Benchmark** with `benchmark=unit-compile` to compare
 one and three Cargo jobs on the same source revision. Each standard Ubuntu
 runner starts with empty Cargo target and local sccache directories after setup;
-downloaded dependency sources may be reused. The normal unit suite's default,
-hardening, kTLS and ACME selections and log verifiers run before readiness is
-recorded. Production profiles and ordinary CI scheduling remain unchanged.
+downloaded dependency sources may be reused. Production profiles and ordinary
+CI scheduling remain unchanged.
+
+Readiness in the current experiment covers a deliberately narrowed subset of
+the normal unit suite, not the complete suite: it precompiles `--lib` plus the
+`unit_tests` (core) target, runs the inline library tests, exactly four
+selected hardening cases from `unit_plugins_b_tests`, the kTLS live-kernel
+proof, `unit_tests` with `UNIT_SHARD=core`, and the ACME selections, each with
+its log verifier. It does not execute the complete `unit_plugins_a_tests`,
+`unit_plugins_b_tests`, or `unit_gateway_core_tests` targets (ordinary CI runs
+all of them). Treat its readiness timestamps as evidence about that measured
+subset only; a whole-suite readiness claim needs the complete current
+target/selection inventory before it is described that way. The warm phase
+likewise repeats only the same narrowed default build (`--lib` +
+`unit_tests`) and the ACME precompile.
 
 Each matrix lane then repeats default and ACME precompilation with its existing
 workspace artifacts. This measures same-workspace reuse after feature switching,
@@ -79,9 +91,12 @@ samples, paging, cold readiness, warm reuse and total standard-runner minutes.
 Run [34054416834](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34054416834)
 used source `8fdabdaeca9764a9e0ffc2e76b98c01521654c77` and empty compiled-artifact
 state. Both lanes passed all 18,240 external unit tests and the same required
-inline, hardening, kTLS and ACME proofs. Later workflow edits only make the
-sccache stop command explicit for policy inspection; this run's provenance is
-retained separately from final-head validation.
+inline, hardening, kTLS and ACME proofs. That complete inventory is the
+pre-split September selection at that exact source revision; it remains valid
+historical evidence for that revision, but it does not describe the current
+experiment's narrowed core-only default selection above. Later workflow edits
+only make the sccache stop command explicit for policy inspection; this run's
+provenance is retained separately from final-head validation.
 
 | Measurement | 3 Cargo jobs | 1 Cargo job |
 | --- | ---: | ---: |

@@ -23,7 +23,7 @@ Ferrum Edge supports two modes for handling backend response bodies: **streaming
 | **stream** (default) | Response chunks are forwarded to the client as they arrive from the backend | Lower — first byte arrives immediately | Lower — no full body in memory |
 | **buffer** | The entire response body is collected in memory before forwarding to the client | Higher — client waits for full response | Higher — full body held in memory |
 
-Streaming is the default because it provides better latency and memory characteristics for the majority of use cases. Buffering is required only when a plugin needs to inspect or transform the complete response body.
+Streaming is the default because it provides better latency and memory characteristics for the majority of use cases. Buffering is required when a plugin needs to inspect or transform the complete response body — and, as one compatibility exception outside body inspection, when a translated gRPC-Web request carries an active plugin that requires the buffered trailer-compatibility policy (see the Decision Flow below).
 
 ## Configuration
 
@@ -150,6 +150,11 @@ The reqwest-backed path uses a fixed 128 KiB target (`COALESCE_TARGET` in `body.
 ### Decision Flow
 
 ```
+Translated gRPC-Web request + a plugin requires the buffered
+trailer-compatibility policy (e.g. response_transformer header rules)?
+    └─ Yes → buffer entire response (precedes every branch below; a plain
+       grpc_web instance with no such plugin remains streaming)
+    └─ No →
 response_body_mode = buffer?
     └─ Yes → buffer entire response
     └─ No (stream) →
@@ -223,6 +228,14 @@ Built-in plugins with per-request refinement:
 The decision in code:
 
 ```rust
+// Translated gRPC-Web trailer-policy exception, checked first: an enabled
+// response_transformer with header rules requires this policy even though
+// its body-buffering vote below is false. A plain grpc_web instance streams.
+if request_is_grpc_web_translated(&ctx)
+    && plugins.iter().any(|p| p.requires_buffered_grpc_web_trailer_policy(&ctx))
+{
+    return false; // buffer
+}
 let should_stream = match proxy.response_body_mode {
     ResponseBodyMode::Buffer => false,
     ResponseBodyMode::Stream => {

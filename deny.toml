@@ -146,10 +146,12 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [licenses]
 # Part of the blocking CI gate (see header). Every `[licenses.exceptions]` entry
-# MUST carry an owner, a rationale, and an `[expires:YYYY-MM-DD]` token, and
-# `scripts/check_advisory_expiry.sh` ENFORCES that on the per-PR
-# `dependency-audit` job and the weekly workflow alike: a missing token or a
-# passed date fails the run, exactly as for `[advisories.ignore]`.
+# MUST carry an owner, a rationale, and an `[expires:YYYY-MM-DD]` token. The
+# owner and rationale are a review requirement;
+# `scripts/check_advisory_expiry.sh` enforces only the expiry token and its
+# date, on the per-PR `dependency-audit` job and the weekly workflow alike: a
+# missing token or a passed date fails the run, exactly as for
+# `[advisories.ignore]`.
 #
 # Token placement differs from advisories because the schema does. cargo-deny
 # 0.19.9 rejects any key inside an exceptions entry other than the crate spec

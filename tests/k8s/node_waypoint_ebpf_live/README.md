@@ -143,8 +143,9 @@ these datagrams. Assertions, all observed from the datagram outcome:
 - `node_waypoint.udp.policy_change_denies_live` /
   `node_waypoint.udp.policy_withdrawal_recovers_live` — applying then deleting a
   DENY for the admitted principal converges both ways with the ambient
-  DaemonSet's total container restart count unchanged, so recovery is a live
-  reload rather than a data-plane restart.
+  DaemonSet's pod UID / container identity set and each container's restart
+  counter unchanged, so recovery is a live reload rather than a data-plane
+  restart.
 
 ## Same-port UDP Service demultiplexing (issue #3861)
 
@@ -165,8 +166,8 @@ backend hit cannot pass.
 - `node_waypoint.udp.same_port_demux_retract_a_keeps_b` — deleting Service A
   retracts A (convergence polls time out on a dedicated probe payload; a fresh
   post-convergence proof payload also times out and backend A logs nothing for
-  it) while B continues serving, still isolated, with the ambient restart count
-  unchanged.
+  it) while B continues serving, still isolated, with the ambient pod/container
+  identity set and restart counters unchanged.
 
 IPv6 same-port UDP is not claimed here: stream listeners bind `0.0.0.0` by
 default, and IPv6 Service steering remains a documented residual.
@@ -264,8 +265,9 @@ byte-identical is unit/integration evidence, not claimed here.
   the current client CA (real handshake plus backend log) and rejects the
   stale CA, with backend_hits=0 on the reject path.
 - `node_waypoint.dtls.operator_isolated_across_reload` — captured ordinary
-  `frontend_dtls_reload.generation` and ambient restart count are unchanged
-  across that generated-owner publication. This does not prove a bound
+  `frontend_dtls_reload.generation` and the ambient pod/container identity set
+  and restart counters are unchanged across that generated-owner publication.
+  This does not prove a bound
   ordinary listener was serving live.
 
 Not exercised live, and therefore not claimed: IPv6 DTLS (and IPv6 Service

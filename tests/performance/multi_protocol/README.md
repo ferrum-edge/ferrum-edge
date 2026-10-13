@@ -173,7 +173,7 @@ Options:
                           grpc only: a new connection (TCP, TLS, HTTP/2) per call
 ```
 
-An option a protocol would ignore is refused rather than silently dropped.
+The two measurement controls above are refused rather than silently dropped when set for a protocol that would ignore them: a non-default `--h2-stream-window` is rejected outside HTTP/2/gRPC, and `--connection-per-request` is rejected outside gRPC. Other shared options are not all validated this way — for example `--ca-cert` is documented in `--help` as ignored by HTTP/1, HTTP/3, and WebSocket runs — so check each option's help text before assuming it took effect.
 
 ## Configuration
 
@@ -1029,11 +1029,11 @@ Both gateways run natively (no Docker), bind the same ports (sequentially), and 
 | Protocol | Envoy Config | Notes |
 |----------|-------------|-------|
 | HTTP/1.1 | `configs/envoy/http1.yaml` | `http_connection_manager` with `codec_type: HTTP1` |
-| HTTP/1.1+TLS | `configs/envoy/http1_tls.yaml` | Downstream TLS termination, plain HTTP to backend |
+| HTTP/1.1+TLS | `configs/envoy/http1_tls.yaml` | End-to-end TLS: downstream TLS termination and TLS origination to the backend on 3447; the Ferrum leg uses `configs/http1_tls_e2e_perf.yaml` and the direct baseline hits `https://127.0.0.1:3447/echo`, so every leg does TLS upstream work |
 | WebSocket | `configs/envoy/ws.yaml` | `upgrade_configs: websocket` on HCM |
 | gRPC | `configs/envoy/grpc.yaml` | h2c (cleartext HTTP/2) on both sides |
 | TCP | `configs/envoy/tcp.yaml` | `tcp_proxy` network filter |
-| TCP+TLS | `configs/envoy/tcp_tls.yaml` | Downstream TLS + `tcp_proxy` |
+| TCP+TLS | `configs/envoy/tcp_tls.yaml` | End-to-end TLS: downstream TLS + `tcp_proxy` with TLS origination to the backend on 3444; the Ferrum leg uses `configs/tcp_tls_e2e_perf.yaml` (`tcps`) and the direct baseline hits 3444 with `--tls` |
 | UDP | `configs/envoy/udp.yaml` | `udp_proxy` listener filter with matcher-based routing |
 
 **Skipped protocols:**
@@ -1048,7 +1048,7 @@ Envoy configs are tuned to match Ferrum Edge where applicable:
 - HTTP/2 flow control: 8 MiB stream window, 32 MiB connection window, 1000 max concurrent streams
 - Access logging disabled (`access_log: []`)
 - Log level: `error` (`-l error`)
-- Worker threads: auto (`--concurrency auto`, matches CPU cores)
+- Worker threads: numeric detected CPU count (`--concurrency "$num_cpus"` in `start_envoy`, discovered via `sysctl -n hw.ncpu`, then `nproc`, with fallback 4 when neither succeeds; the fallback need not equal the host's CPU count)
 - Admin interface on port 15000 (not benchmarked)
 
 ### Sample Comparison Output
@@ -1143,10 +1143,11 @@ This means Ferrum provides more predictable latency under load — critical for 
 - **Rust toolchain** (cargo, rustc)
 - **protoc** (protobuf compiler) for gRPC support
 - **Envoy** (optional, for `--envoy` comparison mode)
-- The following ports must be free: 3001-3006, 3010, 3443-3447, 5000-5001,
+- The following ports must be free: 3001-3006, 3010, 3443-3447, 5001,
   5003-5004, 5010, 8000, 8443, 15000 (Envoy admin), 50052-50053.
-  `run_protocol_test.sh` checks all of them except 3446, 3447 and 50053 before
-  starting (including 15000 even without `--envoy`).
+  `run_protocol_test.sh` checks every port in its shared `BENCH_PORTS` list
+  before starting (including 3446, 3447, 50053, and 15000 even without
+  `--envoy`); port 5000 is not used or claimed by the runner.
 
 Install dependencies:
 ```bash
@@ -1186,7 +1187,7 @@ cd tests/performance/multi_protocol
 ./run_connection_saturation_bench.sh --stop-at-first-break
 ```
 
-In CI, this runs as the on-demand `Connection Saturation Benchmark` workflow (`.github/workflows/connection-saturation-benchmark.yml`) — that path applies the host-level sysctl/ulimit tuning required for the headline numbers.
+In CI, this runs as the on-demand `Connection Saturation Benchmark` workflow (`.github/workflows/connection-saturation-benchmark.yml`). That workflow does not raise host ulimits: it validates the runner's inherited host/client FD ceiling against the requested connection levels (failing fast when the soft limit is below the highest N + 1024), tunes kernel sysctls, and relies on the runner script's per-container Docker `nofile` limits. Headline numbers therefore require a runner whose inherited FD capacity already fits the requested levels; larger requests belong on a suitably configured self-hosted runner.
 
 ### What "breaking point" means here
 
@@ -1213,9 +1214,9 @@ The JSON output breaks connect failures into `refused / timeout / reset / tls_er
 
 ### Methodology + caveats
 
-- **Default-config gateways**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing). `worker_connections`, `max_concurrent_conns`, etc. are left at their out-of-the-box defaults. This measures what an operator gets from `docker run`. A separate "tuned" run could be wired up later.
+- **Mostly default-config gateways, with explicit overrides listed here**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing), and headline capacity knobs such as Kong's `worker_connections` are deliberately left at their out-of-the-box defaults. Three launches carry explicit pool and timeout settings. Tyk reads the shared `configs/tyk/tyk.conf`, which sets its upstream and Redis pool sizes (`max_idle_connections_per_host: 500`, `max_conn_per_host: 0`, `optimisation_max_idle: 2000`, `optimisation_max_active: 4000`). KrakenD's `configs/krakend/http1_tls.json` sets `max_idle_connections` and `max_idle_connections_per_host` to `500` and `idle_timeout` to `120s`. The Ferrum launch in `run_connection_saturation_bench.sh` explicitly sets `FERRUM_MAX_CONNECTIONS=0` (disabling the connection limit; the parser default is `100_000`), `FERRUM_POOL_MAX_IDLE_PER_HOST=1024` (default `64`), and `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=120` (default `300`); it also restates the defaults `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true` and `FERRUM_POOL_WARMUP_ENABLED=true`. Ferrum's, Tyk's and KrakenD's numbers therefore measure those configured saturation setups, not bare `docker run` defaults. A separate fully "tuned" run for every gateway could be wired up later.
 - **Universal protocol = HTTP/1.1+TLS**. All five gateways speak this end-to-end with matched configs, so it's the apples-to-apples comparison. Other protocols would force per-gateway exclusions (KrakenD CE has no gRPC; Kong has no H2 upstream; etc. — see `run_gateway_protocol_bench.sh` for the full matrix).
-- **All gateways run in Docker with `--ulimit nofile=1048576:1048576`** so no gateway gets a per-container FD-cap advantage. The host-side ulimit/sysctl tuning is applied by the CI workflow before launching anything.
+- **All gateways run in Docker with `--ulimit nofile=1048576:1048576`** so no gateway gets a per-container FD-cap advantage. Separately, the CI workflow validates the inherited host/client FD ceiling against the requested connection levels and tunes kernel sysctls before launching anything; it does not modify host ulimits, so the operator (or runner image) must already provide enough host FD capacity.
 - **macOS hosts hit ~12K FD ceiling and aren't suitable for headline numbers**. The benchmark runs locally for development and at small N (≤4K), but the comparison numbers should always come from the Linux CI workflow.
 - **Heartbeat is intentionally low-rate** (default 1 req/sec/conn). The point is to test connection capacity, not RPS — a high heartbeat rate would conflate the two and give a different (RPS-bound) breaking point.
 - **Connect attempts are spread over `--ramp-seconds`** so the *client* doesn't SYN-flood itself. With N=50K and ramp=30s that's ~1666 connects/sec, well within typical client capacity given proper ulimit.

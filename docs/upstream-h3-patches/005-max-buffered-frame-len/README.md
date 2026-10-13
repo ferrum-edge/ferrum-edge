@@ -53,7 +53,11 @@ The same shape works with:
 - `frame.rs`: `FrameDecoder` carries `max_buffered_frame_len` (defaulting to
   `FrameDecoder::UNBOUNDED_FRAME_LEN`), decodes through `decode_bounded`, and
   maps the refusal to `FrameProtocolError::ExceedsMaxBufferedFrameLen` **without
-  arming `expected`** — so not one payload byte is retained.
+  arming `expected`** — so the declaration is refused without arming further
+  accumulation toward that oversized payload. This does not mean zero payload
+  bytes are ever in memory: `FrameStream` first reads a transport chunk into
+  `BufRecvStream` before decoding its header, that already-returned chunk may
+  already contain payload bytes, and the refusal leaves that buffer untouched.
 - `error/internal_error.rs` maps that to a connection error of type
   `H3_EXCESSIVE_LOAD` (RFC 9114 §8.1), which is what an over-declared length
   is: a resource-exhaustion attempt, not a malformed frame.
@@ -89,7 +93,8 @@ The same shape works with:
 Retirement criteria: `hyperium/h3` ships a release that bounds the declared
 payload length of a buffered non-`DATA` frame on the receive side, exposes it
 through the server (and ideally client) builder, and refuses an over-declared
-frame **before** buffering its payload. A release that only bounds the decoded
+frame **before** accumulating its payload toward the declared length (beyond
+bytes already returned in a transport chunk). A release that only bounds the decoded
 field-section size does **not** satisfy this — the OOM happens before QPACK
 decoding.
 

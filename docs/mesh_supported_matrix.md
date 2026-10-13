@@ -211,9 +211,13 @@ need them, or because they are blocked upstream / architecturally:
   ALLOW/AUDIT rule can never match. Every other documented Istio condition key is
   evaluated — see [`docs/mesh.md` → Condition
   keys](mesh.md#condition-keys) for the per-protocol matrix.
-- **`when: destination.ip` on UDP / DTLS** — no UDP capture path records an
-  original destination, so there is no trusted destination evidence for a
-  datagram session. The condition is unsourceable there and fails closed the same
+- **`when: destination.ip` on UDP / DTLS** — capturing an original
+  destination is not the same as supplying trusted `destination.ip`
+  evidence to authorization. The ordinary Linux mesh UDP capture path does
+  record one (`IP_RECVORIGDSTADDR`/`IPV6_RECVORIGDSTADDR` cmsgs, carried
+  through the receive batch to the capture handler), but that capture
+  metadata does not by itself make `destination.ip` sourceable on the
+  UDP/DTLS authorization path. The condition is unsourceable there and fails closed the same
   way (DENY still applies, ALLOW/AUDIT cannot match). HTTP-family, raw TCP, TLS
   passthrough, and captured mesh inbound all carry it.
 - **IPv6 ambient / node-waypoint capture** — sidecar serves IPv6 fully, and the
@@ -381,7 +385,7 @@ need them, or because they are blocked upstream / architecturally:
   FORGING an enrolled pod's source address over a raw socket) is refused
   because attribution is the kernel-reported ingress interface, and a policy
   change then withdrawal denies and restores that datapath with the ambient
-  DaemonSet's restart count unchanged. The relay itself is authorized past the pod-veth tc guard the same way the TCP
+  DaemonSet's pod/container identity set and restart counters unchanged. The relay itself is authorized past the pod-veth tc guard the same way the TCP
   inbound relay is: the scoped listener's frontend socket and its per-session
   backend socket carry `NODE_WAYPOINT_INBOUND_AUTH_MARK`, and `tc_inbound`'s
   UDP arms (IPv4 and IPv6) admit a node-sourced datagram carrying that mark

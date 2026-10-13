@@ -619,10 +619,16 @@ envoy_compare_protocol() {
             envoy_config="$SCRIPT_DIR/configs/envoy/http1.yaml"
             ;;
         http1-tls)
+            # End-to-end TLS topology: both gateways terminate downstream TLS
+            # and originate TLS to the backend on 3447, and the direct
+            # baseline hits that same TLS backend port. The frontend-only
+            # http1_tls_perf.yaml belongs to the Ferrum-only test_http1_tls
+            # path; pairing it here would give Ferrum plain-HTTP upstream
+            # work beside Envoy's TLS origination.
             bench_proto=http1
             bench_target="https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
             direct_target="https://127.0.0.1:3447/echo"
-            ferrum_config="$SCRIPT_DIR/configs/http1_tls_perf.yaml"
+            ferrum_config="$SCRIPT_DIR/configs/http1_tls_e2e_perf.yaml"
             envoy_config="$SCRIPT_DIR/configs/envoy/http1_tls.yaml"
             ;;
         ws)
@@ -647,10 +653,13 @@ envoy_compare_protocol() {
             envoy_config="$SCRIPT_DIR/configs/envoy/tcp.yaml"
             ;;
         tcp-tls)
+            # End-to-end TLS topology, as for http1-tls above: both gateways
+            # terminate downstream TLS and originate TLS to the backend on
+            # 3444, and the direct baseline (with --tls) hits that port.
             bench_proto=tcp
             bench_target="127.0.0.1:5001"
             direct_target="127.0.0.1:3444"
-            ferrum_config="$SCRIPT_DIR/configs/tcp_tls_perf.yaml"
+            ferrum_config="$SCRIPT_DIR/configs/tcp_tls_e2e_perf.yaml"
             envoy_config="$SCRIPT_DIR/configs/envoy/tcp_tls.yaml"
             bench_extra="--tls"
             ;;

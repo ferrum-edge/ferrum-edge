@@ -39,7 +39,13 @@ all state (read position, `all_data_read`, waker registration) lives on the
 stream. Recreating the future per poll is therefore equivalent to reusing a boxed
 one.
 
-`stop_sending` and `recv_id` become total, with no `Option::unwrap`.
+`stop_sending` and `recv_id` become total **with respect to in-flight-read
+ownership**, with no `Option::unwrap` — under the protocol-valid invariants
+they still rely on: `stop_sending` converts the `u64` code with
+`VarInt::from_u64(error_code).expect("invalid error_code")` (as the README
+example shows) and `recv_id` converts the typed stream id through an
+invariant `expect`. Arbitrary `u64` stop codes outside the QUIC varint range
+are not accepted without panic; Ferrum's caller passes typed `H3_NO_ERROR`.
 
 ## Notes
 
@@ -47,4 +53,6 @@ one.
 - Removes the per-receive-stream `ReusableBoxFuture` allocation.
 - `tokio-util` is left as a dependency in this change to keep the diff minimal;
   it can be dropped separately if nothing else needs it.
-- `pin!` requires Rust 1.68; the crate's `rust-version` is already 1.70.
+- `pin!` requires Rust 1.68; the vendored crate's `rust-version` is 1.75
+  (raised for the return-position `impl Future` stopped-watch trait in
+  patches h3 004 / h3-quinn 002, which needs Rust 1.75).

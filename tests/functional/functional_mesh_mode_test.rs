@@ -101,14 +101,6 @@ const CROSS_CLUSTER_AMBIENT_TLS_REJECTION_BODY: &str =
 const CROSS_CLUSTER_WS_REJECTION_MARKER: &str =
     "authoritative cross-cluster WebSocket mTLS rejection";
 
-fn binary_path() -> PathBuf {
-    let debug = PathBuf::from("./target/debug/ferrum-edge");
-    if debug.exists() {
-        return debug;
-    }
-    PathBuf::from("./target/release/ferrum-edge")
-}
-
 #[derive(Clone)]
 struct StaticMeshControlPlane {
     slice: Arc<MeshSlice>,
@@ -702,7 +694,7 @@ pub(crate) struct MeshGatewaySpawnOptions<'a> {
 }
 
 pub(crate) fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
-    let mut cmd = Command::new(binary_path());
+    let mut cmd = Command::new(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
     cmd.spawn().expect("spawn mesh gateway")
 }
@@ -730,7 +722,7 @@ fn spawn_mesh_gateway_in_netns_as_uid(
         .arg(format!("--reuid={uid}"))
         .arg(format!("--regid={uid}"))
         .args(["--clear-groups", "--"])
-        .arg(binary_path());
+        .arg(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
     make_mesh_registry_owned_by_uid(temp, uid);
     cmd.spawn().expect("spawn mesh gateway inside pod netns")
@@ -769,7 +761,7 @@ fn spawn_mesh_gateway_in_netns_as_root(
     let mut cmd = Command::new("nsenter");
     cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
         .arg("--")
-        .arg(binary_path());
+        .arg(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
     cmd.spawn()
         .expect("spawn privileged mesh gateway inside pod netns")

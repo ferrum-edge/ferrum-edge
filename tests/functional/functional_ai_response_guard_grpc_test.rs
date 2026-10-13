@@ -356,21 +356,13 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 fn start_gateway(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut cmd = std::process::Command::new(gateway_binary_path());
+    let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

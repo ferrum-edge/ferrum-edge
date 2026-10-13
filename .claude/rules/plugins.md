@@ -640,7 +640,7 @@ on a native-gRPC request.
 ## Transaction Logs And Redaction
 
 - `TransactionSummary` and `StreamTransactionSummary` live in `src/plugins/mod.rs`.
-- HTTP summaries carry body-streaming fields such as `body_error_class`, `body_completed`, and `bytes_streamed`.
+- HTTP summaries carry body-streaming fields such as `body_error_class` and `body_completed`; `bytes_received` accounts for response-body bytes in streaming and buffered summaries.
 - Stream summaries carry `disconnect_direction` and `disconnect_cause`.
 - Error classifiers include reqwest, gRPC proxy, boxed, H2 pool, and H3 classifiers.
 - Summary `metadata` serializes through `metadata_redaction::serialize_redacted_metadata`.
@@ -865,7 +865,8 @@ on a native-gRPC request.
   `EXPIRE` it) so the decision is
   tied to the caller's own increment, and any refusal issues ONE compensating
   atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over the one sub-bucket it charged
-  per window. A refusal therefore leaves no lasting charge on any window (issue
+  per window. When that compensation succeeds, a refusal leaves no lasting
+  charge on any window (issue
   #5517) and a tighter window's refusal never consumes a looser window's budget. Never reintroduce `WATCH`, a
   dedicated per-request connection, a retry budget, or `EVAL`/`EVALSHA`/`SCRIPT`
   — every command must be plain RESP. Between an `INCR` and its compensating
@@ -877,8 +878,9 @@ on a native-gRPC request.
   the charge, and the refused caller does not pay the second round trip inline.
   A compensation that fails goes through `note_command_failure`
   so `redis_failure_policy` governs the NEXT decision, and the refusal still
-  stands. The ONLY remaining way a refusal leaves a lasting charge is a process
-  exit between the charge and its compensation. Both transaction helpers carry
+  stands; the earlier charge then remains until the charged bucket expires.
+  A process exit between the charge and its compensation is an additional
+  residual case. Both transaction helpers carry
   their own `MAX_REDIS_ADMISSION_WINDOWS` (3) bound and fail closed above it;
   the per-request window and counter buffers are fixed-capacity and inline, not
   `Vec`s, so one transaction touches at most
@@ -1073,7 +1075,7 @@ on a native-gRPC request.
 - SQL plugin migrations are tracked in `_ferrum_plugin_migrations` by `(plugin_name, version)`.
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=false` warns on pending plugin migrations at database/cp startup; it does not mutate schema.
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true` applies pending plugin migrations before `load_full_config`; failure is fatal.
-- Standalone migrate mode always applies plugin migrations. MongoDB custom plugin migration support is constructor-created collections/indexes only.
+- Standalone SQL migrate `up` with `FERRUM_MIGRATE_DRY_RUN=false` applies pending plugin migrations independently of the startup auto-apply flag; SQL dry-run only reports pending plugin migrations without applying them, and `status`/config-file migration do not apply SQL plugin migrations. MongoDB custom plugin migration support is constructor-created collections/indexes only.
 
 ## Notifications
 

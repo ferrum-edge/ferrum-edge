@@ -123,7 +123,9 @@ process for vendored crates** — is documented in
 Key controls:
 
 - **Blocking advisory gate.** `cargo deny check advisories bans sources licenses`
-  runs on every PR (`.github/workflows/ci.yml`), once over the root workspace and
+  runs when CI selects the full dependency-audit lane (`ci-plan` full mode plus
+  `run_dependency_audit`) for an eligible pull request, merge group, push to
+  `main`, or manual dispatch (`.github/workflows/ci.yml`), once over the root workspace and
   once over the separate `ebpf/Cargo.toml` workspace with the same `deny.toml`. A
   RUSTSEC advisory not explicitly time-boxed in `deny.toml` fails the build.
 - **Weekly re-check.** `.github/workflows/dependency-audit.yml` re-runs the gate

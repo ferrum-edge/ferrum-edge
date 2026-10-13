@@ -1457,7 +1457,20 @@ impl<M: PoolManager> GenericPool<M> {
                 }
 
                 for key in keys_to_remove {
-                    if let Some((_, entry)) = entries.remove(&key) {
+                    // Recheck the current entry under the shard lock before
+                    // evicting (issue #6178): a request may have refreshed
+                    // this entry's last-use stamp, or replaced an unhealthy
+                    // handle with a healthy one, after the sweep above
+                    // selected the key. Removing on the stale selection
+                    // alone would evict that live handle and force a redial.
+                    let removed = entries.remove_if(&key, |_, entry| {
+                        pool_entry_is_idle(
+                            now_tick_ms(),
+                            entry.last_used_tick_ms.load(Ordering::Relaxed),
+                            idle_timeout_ms,
+                        ) || !manager.is_healthy(&entry.conn)
+                    });
+                    if let Some((_, entry)) = removed {
                         if let Some(kind) = manager.runtime_metrics_kind() {
                             crate::runtime_metrics::global_ref().record_pool_eviction(kind);
                         }

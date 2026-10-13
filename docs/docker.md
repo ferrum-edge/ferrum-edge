@@ -578,8 +578,14 @@ services:
 
 **Load Balancing**:
 ```bash
-# Using nginx as load balancer
+# Using nginx as load balancer. nginx must join the Compose network that
+# hosts ferrum-dp-1/ferrum-dp-2 so the upstream names below resolve (then
+# port 8000 is the containers' in-network proxy port). The bundled
+# docker-compose.yml declares `ferrum-network` without an explicit name, so
+# Docker creates it as `<project>_ferrum-network`; find yours with
+# `docker network ls | grep ferrum-network`.
 docker run -d \
+  --network <project>_ferrum-network \
   -p 80:80 \
   -v /path/to/nginx.conf:/etc/nginx/nginx.conf \
   nginx:latest
@@ -605,8 +611,12 @@ server {
 Docker sends SIGTERM to graceful shutdown:
 
 ```bash
-# Container will drain active requests before stopping
-docker stop --time=30 ferrum-edge
+# Attempts a bounded drain, then runs the rest of the shutdown sequence
+# (transport pools, background tasks, audit/observability delivery, plugin
+# finalizers). 80s covers the default worst-case budget (78s); adjust for
+# your drain/pre-drain, observability, and finalizer settings — see
+# graceful_shutdown.md#worst-case-budget-defaults.
+docker stop --time=80 ferrum-edge
 ```
 
 **In orchestration** (Kubernetes):

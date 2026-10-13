@@ -26,11 +26,15 @@ on:
   pull_request:
     paths:
       - tests/performance/**
+      - comparison/run_comparison.sh
+      - comparison/scripts/**
       - .github/workflows/benchmark-harness-tests.yml
   push:
     branches: [main]
     paths:
       - tests/performance/**
+      - comparison/run_comparison.sh
+      - comparison/scripts/**
       - .github/workflows/benchmark-harness-tests.yml
   workflow_dispatch:
 
@@ -91,6 +95,21 @@ jobs:
         run: |
           cargo test --manifest-path tests/performance/payload_size/Cargo.toml \
             --locked --test bench_bounds_tests
+
+      # Structured payload generators keep their syntax (whole records,
+      # closed envelopes) at every documented size (#6472), plus the
+      # generator's own size/parse unit tests.
+      - name: Run the payload generator validity tests
+        if: always()
+        run: |
+          cargo test --manifest-path tests/performance/payload_size/Cargo.toml \
+            --locked --lib --test payload_validity_tests
+
+      # Comparison report methodology wording and current-run result
+      # manifest (#6491, #6511, #6512).
+      - name: Run the comparison report contract tests
+        if: always()
+        run: python3 comparison/scripts/test_generate_comparison_report.py -v
 
       # Last, and unconditional, so a failed compile above still reports the
       # validity verdict instead of hiding it behind a skipped step.

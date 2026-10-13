@@ -218,14 +218,14 @@ Declaring `hosts` on an opaque listener turns it into an SNI route. Two ordinary
 ```yaml
 proxies:
   - id: "tenant-a"
-    listen_port: 8443
+    listen_port: 8444
     backend_scheme: tcp            # opaque relay; frontend_tls stays false
     hosts: ["tenant-a.example.com"]
     backend_host: "a.internal"
     backend_port: 443
 
   - id: "tenant-b"
-    listen_port: 8443
+    listen_port: 8444
     backend_scheme: tcp
     hosts: ["*.tenant-b.example.com"]
     backend_host: "b.internal"
@@ -233,7 +233,7 @@ proxies:
 
   # Optional: exactly one default route for hostnames no tier claims.
   - id: "default-route"
-    listen_port: 8443
+    listen_port: 8444
     backend_scheme: tcp
     hosts: []
     backend_host: "default.internal"
@@ -452,9 +452,13 @@ alternate IPv4 or IPv6 candidates deterministically through their relevant
 connect or handshake boundary within the proxy's single overall connect budget;
 a stalled candidate receives only its share of the remaining budget. Denied
 addresses are filtered independently and the dial fails closed if no approved
-address remains. TLS and DTLS continue to use `backend_host` (or the configured
-TLS name override) for SNI and certificate verification—the selected IP is only
-the socket peer.
+address remains. The selected IP is only the socket peer, never the verified
+hostname, but the name each protocol verifies differs. TCP TLS uses the
+configured TLS name override (`resolved_tls.sni`) when set, otherwise
+`backend_host`, for SNI and certificate verification. DTLS does not consume
+that override: when certificate verification is enabled, its verifier name is
+constructed directly from `backend_host`, and the current DTLS client setup
+does not send that name as an SNI setting.
 
 Plain UDP is different: it has no network handshake, and `UdpSocket::connect`
 does not prove that a peer is reachable. Each session deterministically selects
@@ -1122,10 +1126,10 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_KTLS_ENABLED` | `auto` | kTLS kernel probe, cipher gating, and frontend-TLS kernel handoff for TCP (**ChaCha20-Poly1305 on Linux 5.11+** is the only handoff-eligible family; AES-128-GCM / AES-256-GCM stay on the userspace rustls relay because Linux cannot report all out-of-order data admitted before a receive-buffer pin; **TLS 1.2 only** — TLS 1.3 is refused because KeyUpdate is not handled). Probes a real TCP loopback pair with full `TCP_ULP` + dummy key install at startup. Handoff runs from an unbuffered rustls handshake (`UnbufferedServerConnection` → `WriteTraffic` → `dangerous_into_kernel_connection`, issues #2955/#3619); anything unprovable falls back to the userspace relay. |
-| `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup. Uses `tokio::spawn_blocking` twice per TCP stream (one per direction), but concurrent io_uring relays are capped at 128 — beyond the cap, additional streams transparently fall back to the async libc splice path, so worst-case io_uring blocking-thread usage is 256. Keep `FERRUM_BLOCKING_THREADS` at the 512 default or higher so other `spawn_blocking` work retains headroom. Each blocking thread consumes ~2-4 MB of stack |
-| `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled (primary recv uses `recv_from` which lacks cmsg). Infrastructure ready; requires recv loop rewrite |
+| `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup. Uses `tokio::spawn_blocking` twice per TCP stream (one per direction). Concurrent io_uring relays are capped at `max(1, FERRUM_BLOCKING_THREADS / 4)` permits, derived from the blocking pool at startup — raising the pool also raises the relay allowance (at the 512-thread default this is 128 relays, i.e. at most 256 blocking worker tasks at relay saturation). Beyond the cap, additional streams transparently fall back to the async libc splice path. Except for the minimum-one permit granted to very small pools, the pool/4 derivation leaves headroom for other `spawn_blocking` work. Each blocking thread consumes ~2-4 MB of stack |
+| `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled. Ancillary (cmsg) metadata is available on the pktinfo-active primary receive branch (`readable()` + `recvmmsg`), but the pktinfo-inactive fallback still receives via `recv_from`, which lacks cmsg; enabling GRO would require correct GRO handling on every enabled receive path |
 | `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |
-| `FERRUM_UDP_PKTINFO_ENABLED` | `auto` | IP_PKTINFO / IPV6_PKTINFO on frontend UDP sockets (Linux). Captures the per-datagram local destination address (and interface index) on recv, reuses it as the reply source on send — skips one kernel routing-table lookup per flush. Combined with `UDP_SEGMENT` in one `sendmsg` cmsg. On multi-homed/wildcard binds, also ensures replies egress the same interface the client targeted. Probes both v4 and v6 on temp sockets (IPv6 ifindex preserved for link-local zones). When pktinfo is active, the UDP recv loop switches to `readable() + recvmmsg` so the first datagram of each wakeup also carries cmsg (one-shot DNS flows get the correct reply source). |
+| `FERRUM_UDP_PKTINFO_ENABLED` | `auto` | IP_PKTINFO / IPV6_PKTINFO on frontend UDP sockets (Linux). Captures the per-datagram local destination address (and interface index) on recv and reuses that address as the reply source on send (`ipi_spec_dst` / `ipi6_addr`), so replies originate from the exact local address the client targeted. Combined with `UDP_SEGMENT` in one `sendmsg` cmsg. Reply-source preservation is separate from egress-interface selection: for ordinary IPv4 and unscoped IPv6 the outbound interface index is zero and routing chooses the egress device; only scoped IPv6 sources (link-local unicast and interface/link-local multicast) retain the captured zone index. Probes both v4 and v6 on temp sockets (IPv6 ifindex preserved for link-local zones). When pktinfo is active, the UDP recv loop switches to `readable() + recvmmsg` so the first datagram of each wakeup also carries cmsg (one-shot DNS flows get the correct reply source). |
 | `FERRUM_SO_BUSY_POLL_US` | `0` | Kernel busy-poll duration (µs) on UDP sockets. Reduces latency at cost of CPU. `0` = disabled |
 | `FERRUM_TCP_FASTOPEN_ENABLED` | `auto` | TCP Fast Open on listener and outbound sockets. Saves 1 RTT for repeat connections. Checks `/proc/sys/net/ipv4/tcp_fastopen` sysctl |
 | `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall (1-1024). Each slot allocates 65535 bytes |

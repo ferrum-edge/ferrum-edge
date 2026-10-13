@@ -9,8 +9,8 @@ Ferrum Edge supports a distributed CP/DP architecture where a Control Plane (one
                           │    Control Plane      │
                           │                       │
                           │  ┌─────────────────┐  │
-        ┌─────────────────┤  │   Database /     │  │
-        │  Admin API      │  │   File Config    │  │
+        ┌─────────────────┤  │  Configuration  │  │
+        │  Admin API      │  │    Database     │  │
         │  (read/write)   │  └────────┬────────┘  │
         └─────────────────┤           │            │
                           │  ┌────────▼────────┐  │
@@ -38,6 +38,8 @@ Ferrum Edge supports a distributed CP/DP architecture where a Control Plane (one
                     │  (read-only) │  │  (read-only)  │
                     └──────────────┘  └───────────────┘
 ```
+
+CP mode requires `FERRUM_DB_TYPE` and `FERRUM_DB_URL`; standalone file mode is a separate operating mode.
 
 ## Communication Protocol
 
@@ -1171,13 +1173,16 @@ FERRUM_DB_POLL_INTERVAL=10 \
 
 The CP URL must be loopback for plaintext. For a remote CP, use the TLS/mTLS
 examples below, or set `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` (trusted network
-only).
+only). When run on the same host as the CP example above, this DP's read-only
+Admin API uses port `9001` (`http://127.0.0.1:9001`) so it does not collide
+with the CP's admin listener on the default `9000`.
 
 ```bash
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS=http://localhost:50051 \
 FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret \
 FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
+FERRUM_ADMIN_HTTP_PORT=9001 \
 FERRUM_PROXY_HTTP_PORT=8000 \
 FERRUM_PROXY_HTTPS_PORT=8443 \
 ./ferrum-edge run

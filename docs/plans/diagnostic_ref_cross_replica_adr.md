@@ -73,8 +73,9 @@ nothing.
 ## Rejected Alternatives
 
 - **Control-plane fan-out over the CP↔DP channel.** ConfigSync `Subscribe` is a
-  server-streaming RPC the data plane opens; the control plane only writes
-  configuration to it and cannot call a data plane. Fan-out would need a new
+  DP-initiated server-streaming RPC. Its messages can carry configuration and
+  control metadata, but the existing channel has no reverse diagnostic request
+  protocol, so the control plane cannot call a data plane. Fan-out would need a new
   DP-side RPC (or a request/response protocol multiplexed onto the config
   stream) that carries diagnostic detail across the network, DP-side
   authorization mapping CP admin tokens to namespaces, and time and

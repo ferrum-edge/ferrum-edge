@@ -372,8 +372,8 @@ impl FrameDecoder {
                     return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
                 }
                 // Refused on the DECLARED length: `src` is left untouched and
-                // `self.expected` is never set, so not one payload byte of the
-                // offending frame is retained.
+                // `self.expected` is never set, so no further accumulation is
+                // armed; payload bytes already in the chunk remain in `src`.
                 Err(frame::FrameError::ExceedsMaxBufferedLen { ty, len, max }) => {
                     return Err(FrameStreamError::Proto(
                         FrameProtocolError::ExceedsMaxBufferedFrameLen { ty, len, max },

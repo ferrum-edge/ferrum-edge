@@ -724,7 +724,7 @@ When a backend connection times out, the `TransactionSummary` JSON includes the 
 
 For a successful request, `error_class` is omitted entirely (skipped via `#[serde(skip_serializing_if = "Option::is_none")]`).
 
-For a TCP/DTLS session that the backend tore down mid-relay — same `proxy_id` / `proxy_name` keys as the HTTP example, plus the stream-only fields (`backend_target`, `protocol`, `listen_port`, `disconnect_*`):
+For a TCP/DTLS session whose backend TLS setup failed before any bytes were relayed (a pre-copy handshake failure, so both byte counters are `0`) — same `proxy_id` / `proxy_name` keys as the HTTP example, plus the stream-only fields (`backend_target`, `protocol`, `listen_port`, `disconnect_*`):
 
 ```json
 {
@@ -736,7 +736,7 @@ For a TCP/DTLS session that the backend tore down mid-relay — same `proxy_id` 
   "protocol": "tcps",
   "listen_port": 6379,
   "duration_ms": 1234.5,
-  "bytes_sent": 65536,
+  "bytes_sent": 0,
   "bytes_received": 0,
   "connection_error": "Backend TLS handshake failed to 10.0.2.10:6379: alert: bad_certificate",
   "error_class": "tls_error",

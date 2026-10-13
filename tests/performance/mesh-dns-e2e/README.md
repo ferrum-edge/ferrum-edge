@@ -30,11 +30,13 @@ cd tests/performance/mesh-dns-e2e
 ./run.sh --duration 60 --concurrency 200
 ./run.sh --protocol udp             # UDP only
 ./run.sh --edns 1232                # send EDNS(0) OPT records
-./run.sh --json > results.json      # machine-readable output
+./run.sh --json > results.json      # one JSON doc: {"gateway":…,"baseline":…}
 ./run.sh --skip-build               # reuse existing release binaries
 ```
 
 Without `--skip-build`, `run.sh` runs `cargo build --release` for both the harness crate and (in `$PROJECT_ROOT`) the root `ferrum-edge` binary; Cargo reuses the artifacts when sources are unchanged. `--skip-build` skips the build step entirely.
+
+With `--json`, stdout carries exactly one JSON document, `{"gateway":…,"baseline":…}`, embedding each loadgen run's JSON report; all wrapper progress, build output, and cleanup messages go to stderr (including under `--skip-build`). A failing loadgen still emits the combined document before `run.sh` exits with that loadgen's nonzero status.
 
 ## Why a stub control plane?
 
