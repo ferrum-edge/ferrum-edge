@@ -6644,6 +6644,8 @@ async fn mirror_strips_unlisted_credential_class_headers() {
         "x-pin",
         "x-userpin",
         "x-vercel-protection-bypass",
+        "x-device-code",
+        "x-usercode",
     ];
     for (idx, name) in credential_names.iter().enumerate() {
         headers.insert((*name).to_string(), format!("cred-value-{idx}"));
@@ -6699,6 +6701,7 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         "x-vercel-protection-bypass=q36&x-vercel-protection-%62ypass=q37&",
         "x-vercel-protection-%2562ypass=q38&",
         "%20code=q39&+code=q40&%2520code=q41&",
+        "user_code=q42&device_code=q43&%75ser_code=q44&%2564eviceCode=q45&",
         "continuation_token=c3&continuation%5Ftoken=c4&continuation%255Ftoken=c5&",
         "author=a1&signal=1&page=2&keyword=shoes&country_code=us&spin_count=3"
     );
@@ -6712,7 +6715,7 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         )),
         "benign pairs must be retained in order: {request_line}"
     );
-    for idx in 1..=41 {
+    for idx in 1..=45 {
         let value = format!("=q{idx}&");
         let tail = format!("=q{idx} ");
         assert!(
@@ -6784,7 +6787,8 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
 
     let mut allowed = make_ctx_with_proxy();
     allowed.set_raw_query_string(
-        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&x=1".to_string(),
+        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1"
+            .to_string(),
     );
     let allowed_line = capture_mirror_request_line_with_config(
         &mut allowed,
@@ -6795,14 +6799,15 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
                 "code",
                 "clientsid",
                 "pin",
-                "x-vercel-protection-bypass"
+                "x-vercel-protection-bypass",
+                "user_code"
             ]
         }),
     )
     .await;
     assert!(
         allowed_line.contains(
-            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&x=1 "
+            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1 "
         ),
         "exact allowlist must forward the decoded name with its raw encoding: {allowed_line}"
     );

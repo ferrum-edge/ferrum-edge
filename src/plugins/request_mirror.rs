@@ -649,9 +649,37 @@ const MIRROR_BENIGN_AUTH_SEGMENTS: &[&str] =
 /// class rule never loosens it.
 const MIRROR_BENIGN_TOKEN_QUALIFIERS: &[&str] = &["continuation"];
 
+/// Qualifiers that make `code` an authorization or one-time code rather than an
+/// ordinary code (`country_code`): as the preceding segment (`user_code`,
+/// `x-device-code`) or as a concatenated prefix (`devicecode`).
+const MIRROR_CREDENTIAL_CODE_QUALIFIERS: &[&str] = &[
+    "user",
+    "device",
+    "verification",
+    "access",
+    "recovery",
+    "backup",
+    "login",
+    "reset",
+    "security",
+    "activation",
+    "confirmation",
+    "magic",
+];
+
 /// Credential-class test for one lowercased alphanumeric segment, given the
 /// previous segment of the same name (if any).
 fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
+    if segment == "code" || segment == "codes" {
+        return previous.is_some_and(|prev| MIRROR_CREDENTIAL_CODE_QUALIFIERS.contains(&prev));
+    }
+    if let Some(prefix) = segment
+        .strip_suffix("codes")
+        .or_else(|| segment.strip_suffix("code"))
+        && MIRROR_CREDENTIAL_CODE_QUALIFIERS.contains(&prefix)
+    {
+        return true;
+    }
     if MIRROR_BENIGN_AUTH_SEGMENTS.contains(&segment) {
         return false;
     }
