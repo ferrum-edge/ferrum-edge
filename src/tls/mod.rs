@@ -2194,14 +2194,42 @@ pub fn enable_early_data(_config: &mut Arc<ServerConfig>, tls_policy: &TlsPolicy
     }
 }
 
-/// Enable TLS session resumption on an outbound `ClientConfig` using the shared
-/// `FERRUM_TLS_SESSION_CACHE_SIZE` knob; falls back to 4096 when no policy is set.
+/// Configure outbound resumption for the CRLs actually enforced by the verifier.
+///
+/// Resumed TLS 1.2/1.3 handshakes skip certificate reverification, so a ticket
+/// could outlive a CRL's `nextUpdate`. Disable resumption for a nonempty enforced
+/// set; each new connection must reach the verifier's expiration check. This
+/// also costs full handshakes for uncovered issuers sharing the config, whose
+/// chains are unknown until the handshake. Established connections are intact.
+///
+/// Pass an empty slice when verification is disabled. Without enforced CRLs,
+/// retain `FERRUM_TLS_SESSION_CACHE_SIZE` (4096 when no policy is set).
 pub fn apply_client_session_resumption(
     config: &mut rustls::ClientConfig,
     tls_policy: Option<&TlsPolicy>,
+    enforced_crls: &[CertificateRevocationListDer<'static>],
 ) {
+    if !enforced_crls.is_empty() {
+        apply_crl_enforced_client_resumption(config, enforced_crls);
+        return;
+    }
     let cache_size = tls_policy.map(|p| p.session_cache_size).unwrap_or(4096);
     config.resumption = rustls::client::Resumption::in_memory_sessions(cache_size);
+}
+
+/// Disable outbound resumption when the verifier enforces a nonempty CRL set.
+///
+/// The one resumption policy every cached CRL-enforcing `ClientConfig` shares
+/// (backend builder, health probes, rustls logging sinks, LDAP, SMTP). With no
+/// enforced CRLs, the config's existing resumption setting is left untouched.
+/// Pass an empty slice when verification is disabled.
+pub fn apply_crl_enforced_client_resumption(
+    config: &mut rustls::ClientConfig,
+    enforced_crls: &[CertificateRevocationListDer<'static>],
+) {
+    if !enforced_crls.is_empty() {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
 }
 
 /// Validate that the backend TLS policy can be converted into a QUIC-capable
@@ -2670,7 +2698,7 @@ mod tests {
     #[test]
     fn apply_client_session_resumption_compiles_and_runs() {
         let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, None);
+        apply_client_session_resumption(&mut config, None, &[]);
     }
 
     #[test]
@@ -2683,7 +2711,7 @@ mod tests {
             early_data_max_size: 0,
         };
         let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, Some(&policy));
+        apply_client_session_resumption(&mut config, Some(&policy), &[]);
     }
 
     #[tokio::test]

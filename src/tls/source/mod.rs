@@ -6,6 +6,8 @@
 //! known, and filesystem path otherwise.
 
 pub mod subscription;
+#[cfg(windows)]
+mod windows_file;
 
 use crate::fips::approved::Sha256;
 use futures_util::stream::BoxStream;
@@ -596,7 +598,7 @@ impl CertSource {
     pub fn as_file_path(&self) -> Option<PathBuf> {
         match self {
             Self::Path(path) => Some(path.clone()),
-            Self::Uri(uri) if uri.scheme == SourceScheme::File => {
+            Self::Uri(uri) if uri.scheme == SourceScheme::File && !is_tenant_file_uri(uri) => {
                 uri_file_path(&uri.identifier).map(PathBuf::from)
             }
             _ => None,
@@ -608,15 +610,25 @@ impl CertSource {
             Self::Path(path) => path.display().to_string(),
             Self::InlinePem(secret) => secret.expose_secret().to_string(),
             Self::Uri(uri) => {
+                if is_tenant_file_uri(uri) && tenant_file_uri_path(uri).is_err() {
+                    // Never launder a duplicate/malformed constraint into a valid
+                    // one by serializing the permissively parsed option map.
+                    return uri.raw.clone();
+                }
                 if uri.options.is_empty() {
                     uri.source_id()
                 } else {
-                    let query = uri
-                        .options
-                        .iter()
-                        .map(|(key, value)| format!("{key}={value}"))
-                        .collect::<Vec<_>>()
-                        .join("&");
+                    let query = if is_tenant_file_uri(uri) {
+                        url::form_urlencoded::Serializer::new(String::new())
+                            .extend_pairs(&uri.options)
+                            .finish()
+                    } else {
+                        uri.options
+                            .iter()
+                            .map(|(key, value)| format!("{key}={value}"))
+                            .collect::<Vec<_>>()
+                            .join("&")
+                    };
                     format!("{}://{}?{}", uri.scheme.as_str(), uri.identifier, query)
                 }
             }
@@ -661,6 +673,121 @@ fn uri_file_path(identifier: &str) -> Option<String> {
         return Some(identifier.to_string());
     }
     Some(identifier.to_string())
+}
+
+// A restrictive runtime reference, not a grant of filesystem authority. Every
+// read uses the process's immutable configured roots, never roots from the URI.
+const TENANT_FILE_PATH_OPTION: &str = "ferrum_tenant_path";
+const TENANT_FILE_IDENTIFIER_PREFIX: &str = "mesh-tenant/";
+
+fn is_tenant_file_uri(uri: &CertSourceUri) -> bool {
+    uri.scheme == SourceScheme::File
+        && (uri.options.contains_key(TENANT_FILE_PATH_OPTION)
+            || uri.identifier.starts_with(TENANT_FILE_IDENTIFIER_PREFIX))
+}
+
+fn invalid_tenant_file_source() -> MaterialError {
+    MaterialError::InvalidSource {
+        source_id: "tenant-tls-file".to_string(),
+        details: "file must be readable under a configured tenant root on this platform"
+            .to_string(),
+    }
+}
+
+fn tenant_file_uri_path(uri: &CertSourceUri) -> Result<PathBuf, MaterialError> {
+    let invalid = || invalid_tenant_file_source();
+    let path = uri
+        .options
+        .get(TENANT_FILE_PATH_OPTION)
+        .ok_or_else(invalid)?;
+    // parse_options is intentionally permissive for ordinary provider options.
+    // This constraint must survive parsing without duplicates or bad escapes.
+    let query = uri
+        .raw
+        .split_once('?')
+        .map(|(_, query)| query)
+        .ok_or_else(invalid)?;
+    let bytes = query.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (bytes
+                .get(index + 1)
+                .is_none_or(|byte| !byte.is_ascii_hexdigit())
+                || bytes
+                    .get(index + 2)
+                    .is_none_or(|byte| !byte.is_ascii_hexdigit()))
+        {
+            return Err(invalid());
+        }
+    }
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        for encoded in [key, value] {
+            // form_urlencoded otherwise replaces invalid UTF-8 with U+FFFD;
+            // a constraint must not silently become a different pathname.
+            let encoded = encoded.replace('+', " ");
+            percent_encoding::percent_decode_str(&encoded)
+                .decode_utf8()
+                .map_err(|_| invalid())?;
+        }
+    }
+    let count = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key == TENANT_FILE_PATH_OPTION)
+        .count();
+    let expected = format!(
+        "{TENANT_FILE_IDENTIFIER_PREFIX}{}",
+        hex::encode(Sha256::digest(path.as_bytes()))
+    );
+    if path.is_empty() || count != 1 || uri.identifier != expected {
+        return Err(invalid());
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// Carry a tenant file's confinement through existing string-shaped runtime
+/// TLS fields, caches, and file watchers without embedding its PEM bytes.
+/// Tagged references remain distinct from trusted references to the same path.
+pub(crate) fn bind_tenant_file_reference(
+    value: &str,
+    kind: MaterialKind,
+) -> Result<Option<String>, MaterialError> {
+    let source = CertSource::parse(value, kind);
+    validate_source_field_kind(&source, kind)?;
+    let path = match &source {
+        CertSource::Uri(uri) if is_tenant_file_uri(uri) => Some(tenant_file_uri_path(uri)?),
+        _ => source.as_file_path(),
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = path.to_str().ok_or_else(invalid_tenant_file_source)?;
+    let mut options = match source {
+        CertSource::Uri(uri) => {
+            if uri.has_uri_userinfo() {
+                return Err(invalid_tenant_file_source());
+            }
+            uri.options
+        }
+        _ => BTreeMap::new(),
+    };
+    options.insert(TENANT_FILE_PATH_OPTION.to_string(), path.to_string());
+    let identifier = format!(
+        "{TENANT_FILE_IDENTIFIER_PREFIX}{}",
+        hex::encode(Sha256::digest(path.as_bytes()))
+    );
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(&options)
+        .finish();
+    Ok(Some(format!("file://{identifier}?{query}")))
+}
+
+/// The original pathname length for validation of a generated tenant reference.
+/// Encoding the constraint must not reduce the ordinary file path length limit.
+pub(crate) fn tenant_file_reference_path(value: &str) -> Result<Option<PathBuf>, MaterialError> {
+    match CertSource::parse(value, MaterialKind::Unknown) {
+        CertSource::Uri(uri) if is_tenant_file_uri(&uri) => tenant_file_uri_path(&uri).map(Some),
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug)]
@@ -870,6 +997,108 @@ pub fn load_material_blocking_with(
     fallback_kind: MaterialKind,
     max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
+    load_material_blocking_with_tenant_roots(source, fallback_kind, max_bytes, None)
+}
+
+/// The shared loader with explicit roots for isolated regression tests.
+/// Production callers use the immutable process policy via the public wrapper.
+/// Production loads (no explicit roots) also honor the backend watcher's held
+/// tenant refusals; see [`publish_held_refused_tenant_files`].
+pub(crate) fn load_material_blocking_with_tenant_roots(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+    tenant_roots: Option<&[PathBuf]>,
+) -> Result<MaterializedMaterial, MaterialError> {
+    load_material_blocking_inner(
+        source,
+        fallback_kind,
+        max_bytes,
+        tenant_roots,
+        tenant_roots.is_none(),
+    )
+}
+
+/// The watcher's own fingerprint read. It must see a held tenant file
+/// recover, so it alone ignores the hold it publishes.
+pub(crate) fn load_material_blocking_for_watcher(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<MaterializedMaterial, MaterialError> {
+    load_material_blocking_inner(source, fallback_kind, max_bytes, None, false)
+}
+
+/// Async [`load_material_blocking_for_watcher`] on the shared executor.
+pub(crate) async fn load_material_for_watcher(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<MaterializedMaterial, MaterialError> {
+    let source = source.clone();
+    effective_tls_source_executor()?
+        .run_blocking(move || load_material_blocking_for_watcher(&source, fallback_kind, max_bytes))
+        .await
+}
+
+/// Tenant file identifiers each watcher surface currently holds refused.
+static HELD_REFUSED_TENANT_FILES: std::sync::LazyLock<
+    arc_swap::ArcSwap<Vec<(&'static str, String)>>,
+> = std::sync::LazyLock::new(|| arc_swap::ArcSwap::from_pointee(Vec::new()));
+
+/// Publish the tenant files `surface`'s watcher last observed as refused.
+///
+/// Until the same watcher observes a file readable again, every production
+/// load of that tenant reference fails closed. A cache, pool or client built
+/// between two polls therefore cannot capture the file during a brief window
+/// in which it resolved inside its root again: only the watcher's accepted
+/// recovery, followed by its cache-draining rebuild, lifts the hold.
+pub(crate) fn publish_held_refused_tenant_files(surface: &'static str, identifiers: Vec<String>) {
+    let current = HELD_REFUSED_TENANT_FILES.load();
+    let unchanged = current
+        .iter()
+        .filter(|(held_surface, _)| *held_surface == surface)
+        .map(|(_, identifier)| identifier)
+        .eq(identifiers.iter());
+    if unchanged {
+        return;
+    }
+    let _ = HELD_REFUSED_TENANT_FILES.rcu(|held| {
+        let mut next: Vec<(&'static str, String)> = held
+            .iter()
+            .filter(|(held_surface, _)| *held_surface != surface)
+            .cloned()
+            .collect();
+        next.extend(
+            identifiers
+                .iter()
+                .map(|identifier| (surface, identifier.clone())),
+        );
+        next
+    });
+}
+
+/// The watcher-facing tenant identifier of `source`, when it is a bound tenant
+/// file reference.
+pub(crate) fn tenant_file_identifier(source: &CertSource) -> Option<&str> {
+    match source {
+        CertSource::Uri(uri) if is_tenant_file_uri(uri) => Some(uri.identifier.as_str()),
+        _ => None,
+    }
+}
+
+fn tenant_file_held_refused(identifier: &str) -> bool {
+    let held = HELD_REFUSED_TENANT_FILES.load();
+    !held.is_empty() && held.iter().any(|(_, held)| held == identifier)
+}
+
+fn load_material_blocking_inner(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+    tenant_roots: Option<&[PathBuf]>,
+    honor_watcher_hold: bool,
+) -> Result<MaterializedMaterial, MaterialError> {
     let max_bytes = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
     validate_source_field_kind(source, fallback_kind)?;
     match source {
@@ -891,6 +1120,21 @@ pub fn load_material_blocking_with(
                     source_id: uri.redacted_source_id(),
                     details: "file URI credentials are not permitted".to_string(),
                 });
+            }
+            if is_tenant_file_uri(uri) {
+                let path = tenant_file_uri_path(uri)?;
+                if honor_watcher_hold && tenant_file_held_refused(&uri.identifier) {
+                    return Err(invalid_tenant_file_source());
+                }
+                let effective_roots;
+                let roots = match tenant_roots {
+                    Some(roots) => roots,
+                    None => {
+                        effective_roots = effective_mesh_tenant_tls_file_roots();
+                        &effective_roots
+                    }
+                };
+                return load_tenant_file_material_with(&path, fallback_kind, roots, max_bytes);
             }
             let path =
                 uri_file_path(&uri.identifier).ok_or_else(|| MaterialError::InvalidSource {
@@ -1005,8 +1249,13 @@ pub fn check_namespace_scoped_material_reference(
     match uri.scheme {
         SourceScheme::System => Ok(()),
         SourceScheme::File => {
-            let path = uri_file_path(&uri.identifier).unwrap_or_default();
-            check_tenant_file_path(Path::new(&path), tenant_file_roots)
+            let path = if is_tenant_file_uri(&uri) {
+                tenant_file_uri_path(&uri)
+                    .map_err(|_| ScopedMaterialReferenceRefusal::FileOutsideTenantRoots)?
+            } else {
+                PathBuf::from(uri_file_path(&uri.identifier).unwrap_or_default())
+            };
+            check_tenant_file_path(&path, tenant_file_roots)
         }
         SourceScheme::K8sSecret => match K8sSecretReference::parse(&uri, kind) {
             Ok(reference)
@@ -1041,11 +1290,25 @@ pub fn check_tenant_file_path(
         .any(|component| matches!(component, std::path::Component::ParentDir));
     let contained = path.is_absolute()
         && !has_parent_component
-        && tenant_file_roots.iter().any(|root| path.starts_with(root));
+        && tenant_file_roots
+            .iter()
+            .any(|root| tenant_path_has_root(path, root, true));
     if contained {
         Ok(())
     } else {
         Err(ScopedMaterialReferenceRefusal::FileOutsideTenantRoots)
+    }
+}
+
+fn tenant_path_has_root(path: &Path, root: &Path, lexical: bool) -> bool {
+    #[cfg(windows)]
+    {
+        windows_file::strip_root(path, root, lexical).is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = lexical;
+        path.starts_with(root)
     }
 }
 
@@ -1062,7 +1325,15 @@ pub fn check_tenant_file_reference_resolved(
     kind: MaterialKind,
     tenant_file_roots: &[PathBuf],
 ) -> Result<(), ScopedMaterialReferenceRefusal> {
-    let Some(path) = CertSource::parse(value, kind).as_file_path() else {
+    let source = CertSource::parse(value, kind);
+    let path = match &source {
+        CertSource::Uri(uri) if is_tenant_file_uri(uri) => Some(
+            tenant_file_uri_path(uri)
+                .map_err(|_| ScopedMaterialReferenceRefusal::FileOutsideTenantRoots)?,
+        ),
+        _ => source.as_file_path(),
+    };
+    let Some(path) = path else {
         return Ok(());
     };
     check_tenant_file_path(&path, tenant_file_roots)?;
@@ -1072,12 +1343,122 @@ pub fn check_tenant_file_reference_resolved(
     let contained = tenant_file_roots
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
-        .any(|root| resolved.starts_with(&root));
+        .any(|root| tenant_path_has_root(&resolved, &root, false));
     if contained {
         Ok(())
     } else {
         Err(ScopedMaterialReferenceRefusal::FileOutsideTenantRoots)
     }
+}
+
+/// Read the object securely opened beneath an allowed root, preserving the
+/// original reference for rotation. Roots and their ancestors are trusted
+/// operator inputs; components below an opened root may be replaced by tenants.
+pub(crate) fn load_tenant_file_material_with(
+    path: &Path,
+    kind: MaterialKind,
+    tenant_file_roots: &[PathBuf],
+    max_bytes: usize,
+) -> Result<MaterializedMaterial, MaterialError> {
+    let max_bytes = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
+    let invalid = || invalid_tenant_file_source();
+    check_tenant_file_path(path, tenant_file_roots).map_err(|_| invalid())?;
+    let resolved = std::fs::canonicalize(path).map_err(|_| invalid())?;
+    let root = tenant_file_roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .find(|root| tenant_path_has_root(&resolved, root, false))
+        .ok_or_else(invalid)?;
+    // Canonicalization permits stable in-root links (including projected
+    // Secret ..data links); the anchored walk refuses swapped symlink components.
+    let file = open_resolved_tenant_file(&root, &resolved).map_err(|_| invalid())?;
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !metadata.is_file() {
+        return Err(invalid());
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(MaterialError::Oversized { kind, max_bytes });
+    }
+    let bytes = read_bounded_material_bytes(file, kind, max_bytes)?;
+    Ok(MaterializedMaterial::from_bytes(
+        bytes,
+        SourceScheme::File,
+        path.display().to_string(),
+        kind,
+        None,
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn open_resolved_tenant_file(
+    root: &Path,
+    resolved: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let invalid = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let relative = resolved.strip_prefix(root).map_err(|_| invalid())?;
+    let mut names = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => names.push(name),
+            _ => return Err(invalid()),
+        }
+    }
+    let Some((last, directories)) = names.split_last() else {
+        return Err(invalid());
+    };
+    // The canonical root can be a real mount or resolve through an operator
+    // alias (e.g. /var on macOS). Its ancestors are operator-controlled.
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)?;
+    for (name, is_directory) in directories
+        .iter()
+        .map(|name| (*name, true))
+        .chain(std::iter::once((*last, false)))
+    {
+        let name = CString::new(name.as_bytes()).map_err(|_| invalid())?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if is_directory {
+                libc::O_DIRECTORY
+            } else {
+                libc::O_NONBLOCK
+            };
+        // SAFETY: the directory descriptor is owned and open, and the name is
+        // NUL-terminated. A successful descriptor is immediately owned by File.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor on success.
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_resolved_tenant_file(
+    root: &Path,
+    resolved: &Path,
+) -> std::io::Result<std::fs::File> {
+    windows_file::open(root, resolved)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_resolved_tenant_file(
+    _root: &Path,
+    _resolved: &Path,
+) -> std::io::Result<std::fs::File> {
+    // No ordinary File::open fallback: std does not offer component-relative
+    // no-reparse-point traversal on every supported non-Unix platform.
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 /// Immutable process snapshot of `FERRUM_MESH_TENANT_TLS_FILE_ROOTS`.

@@ -104,6 +104,134 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// The plugin material registry as `(plugin, field path, class)`, where
+    /// class is `tls`, `gateway_only` or `open_map`.
+    pub fn scoped_plugin_registry_for_test() -> Vec<(&'static str, &'static str, &'static str)> {
+        use crate::admin::crud::scoped_references::{PLUGIN_SCOPED_FIELDS, ScopedReferenceClass};
+        let mut rows = Vec::new();
+        for entry in PLUGIN_SCOPED_FIELDS {
+            for field in entry.fields {
+                let class = match field.class {
+                    ScopedReferenceClass::TlsMaterial(_) => "tls",
+                    ScopedReferenceClass::GatewayOnly => "gateway_only",
+                };
+                rows.push((entry.plugin, field.path, class));
+            }
+            for map in entry.open_maps {
+                rows.push((entry.plugin, map.path, "open_map"));
+            }
+        }
+        rows
+    }
+
+    /// Reviewed path-shaped plugin fields that name no gateway material.
+    pub fn reviewed_non_material_plugin_fields_for_test() -> &'static [(&'static str, &'static str)]
+    {
+        crate::admin::crud::scoped_references::REVIEWED_NON_MATERIAL_FIELDS
+    }
+
+    /// Concrete references the admission gate classifies in a plugin config,
+    /// as `(field path, value, class)`.
+    pub fn plugin_scoped_references_for_test(
+        plugin: &str,
+        config: &serde_json::Value,
+    ) -> Vec<(String, String, &'static str)> {
+        use crate::admin::crud::scoped_references::{
+            ScopedReferenceClass, plugin_scoped_references,
+        };
+        plugin_scoped_references(plugin, config)
+            .into_iter()
+            .map(|(path, value, class)| {
+                let class = match class {
+                    ScopedReferenceClass::TlsMaterial(_) => "tls",
+                    ScopedReferenceClass::GatewayOnly => "gateway_only",
+                };
+                (path, value.to_string(), class)
+            })
+            .collect()
+    }
+
+    pub fn spawn_backend_material_reload_for_test(
+        config: crate::tls::source::subscription::DynamicMaterialSetReloadConfig,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> tokio::task::JoinHandle<()> {
+        crate::tls::source::subscription::spawn_backend_material_set_reload_task(config, shutdown)
+    }
+
+    pub fn validate_tls_material_source_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+    ) -> Result<(), String> {
+        crate::config::types::validate_tls_material_source_field("test-source", value, kind)
+    }
+
+    pub fn bind_tenant_tls_file_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+    ) -> Result<Option<String>, crate::tls::source::MaterialError> {
+        crate::tls::source::bind_tenant_file_reference(value, kind)
+    }
+
+    pub fn load_tenant_tls_file_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+        roots: &[std::path::PathBuf],
+        max_bytes: usize,
+    ) -> Result<crate::tls::source::MaterializedMaterial, crate::tls::source::MaterialError> {
+        crate::tls::source::load_material_blocking_with_tenant_roots(
+            &crate::tls::source::CertSource::parse(value, kind),
+            kind,
+            max_bytes,
+            Some(roots),
+        )
+    }
+
+    pub fn open_resolved_tenant_tls_file_for_test(
+        root: &std::path::Path,
+        resolved: &std::path::Path,
+    ) -> std::io::Result<std::fs::File> {
+        crate::tls::source::open_resolved_tenant_file(root, resolved)
+    }
+
+    pub fn apply_destination_rules_with_tenant_roots_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        runtime: &crate::modes::mesh::MeshRuntimeConfig,
+        slice: &crate::modes::mesh::slice::MeshSlice,
+        roots: &[std::path::PathBuf],
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::mesh::apply_destination_rules_with_tenant_file_roots(
+            config, runtime, slice, roots,
+        )
+    }
+
+    /// The cached rustls config a CRL-enforcing plugin/notification client
+    /// builds from the gateway TLS inputs (`tcp_logging`, `ws_logging`,
+    /// `ldap_auth`, and SMTP `email`, which always verifies).
+    pub fn crl_enforcing_outbound_client_config_for_test(
+        surface: &str,
+        no_verify: bool,
+        ca: Option<&str>,
+        crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    ) -> Result<rustls::ClientConfig, String> {
+        use crate::notifications::channels::email;
+        use crate::plugins::{ldap_auth, tcp_logging, ws_logging};
+
+        let config = match surface {
+            "tcp_logging" => {
+                let connector = tcp_logging::build_tls_connector(no_verify, ca, crls)?;
+                Arc::clone(connector.config())
+            }
+            "ws_logging" => Arc::new(ws_logging::build_tls_client_config(no_verify, ca, crls)?),
+            "ldap_auth" => ldap_auth::build_ldap_tls_config(no_verify, ca, crls)?,
+            "email" if !no_verify => {
+                let config = email::build_client_config(ca.map(str::to_string), crls.to_vec());
+                config.map_err(|error| format!("{error:?}"))?
+            }
+            other => return Err(format!("unsupported CRL-enforcing surface {other:?}")),
+        };
+        Ok((*config).clone())
+    }
+
     /// The origin-form request target the direct HTTP/1.1 pool sends for an
     /// absolute backend URL (issue #5588), for parity checks against the `url`
     /// serialization reqwest used.
@@ -12121,6 +12249,36 @@ pub mod _test_support {
             url,
             headers,
             body,
+            crate::http3::client::H3Authorization::new(None, None),
+            || tls_config,
+        )
+        .await
+    }
+
+    /// Open the production native-H3 backend's independently driven halves.
+    /// The fixture owns protocol/authorization bounds for this unbounded call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn h3_pool_open_bidi_with_target_for_test<F>(
+        pool: &crate::http3::client::Http3ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        (host, port, policy_port): (&str, u16, u16),
+        method: &str,
+        url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        tls_config: F,
+    ) -> crate::http3::client::H3PoolResult<crate::http3::client::H3BidiBackendStream>
+    where
+        F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        pool.open_bidi_backend_stream_with_target(
+            proxy,
+            host,
+            port,
+            policy_port,
+            method,
+            url,
+            headers,
+            None,
             crate::http3::client::H3Authorization::new(None, None),
             || tls_config,
         )

@@ -26,6 +26,32 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Upgrading to the next release (unreleased)
+
+### Gateway material references from `ns`-claimed operator tokens (#6092, PR #6316)
+
+An `operator` admin token that carries an `ns` claim is now confined even when
+`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`.
+
+- **Backend TLS and TLS-material plugin fields** accept only inline PEM,
+  `system://` or a `k8s://` Secret in the addressed namespace. This covers
+  proxy and upstream `backend_tls_client_cert_path`,
+  `backend_tls_client_key_path` and `backend_tls_server_ca_cert_path`, the
+  `mesh_route_dispatch` route-local `backend_tls` fields, `udp_logging`
+  `dtls_*`, and the `soap_ws_security` trusted certificate lists.
+- **Plugin fields that name a gateway file or native library setting** are
+  refused outright. This covers the `kafka_logging` `ssl_*_location` fields
+  and non-tuning `producer_config` keys, the `api_chargeback_sink` ClickHouse
+  TLS files and `spool.dir`, gRPC descriptor paths, and `geo_restriction`
+  `db_path`.
+- **Custom (non-built-in) plugins** cannot be created or changed with such a
+  token.
+
+Anything else is refused with `400` before it is loaded. Values already stored
+at the same field path keep working and survive unrelated updates, and `admin`
+tokens are not restricted. Automation that writes these fields with
+`ns`-claimed operator tokens must use an `admin` token instead.
+
 ## Upgrading to 0.9.17
 
 0.9.17 was published on 2026-10-10 UTC from commit

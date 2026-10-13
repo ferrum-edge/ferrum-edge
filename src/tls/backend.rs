@@ -283,7 +283,9 @@ impl OwnedBackendTlsConfigInputs {
 ///
 /// Reusing the same `Arc<ClientConfig>` lets protocol pools share rustls'
 /// in-memory session resumption state across new backend connections instead
-/// of resetting it on every reconnect.
+/// of resetting it on every reconnect, unless the verifier enforces CRLs. Those
+/// configs disable resumption so each reconnect checks CRL expiration even when
+/// the cached config and CRL source bytes have not changed.
 ///
 /// Cache keys MUST be tagged with the backend SVID generation marker (or the
 /// `static` sentinel for operator-supplied certs) via
@@ -1601,7 +1603,12 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             }
         }?;
 
-        crate::tls::apply_client_session_resumption(&mut client_config, self.policy);
+        let enforced_crls = if self.skip_verification() {
+            &[][..]
+        } else {
+            self.crls
+        };
+        crate::tls::apply_client_session_resumption(&mut client_config, self.policy, enforced_crls);
         Ok(client_config)
     }
 

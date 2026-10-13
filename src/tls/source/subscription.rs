@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     CertSource, MaterialError, MaterialKind, SourceScheme, k8s_secret_watch_target,
-    load_material_blocking_with, load_material_with,
+    load_material_blocking_with,
 };
 
 pub const DEFAULT_SECRET_REFRESH_INTERVAL_SECS: u64 = 300;
@@ -364,23 +364,26 @@ pub async fn material_fingerprint_async_with(
     }
     let configured_scheme = configured_source_scheme(&watched.source);
     let started = Instant::now();
-    let material = match load_material_with(&watched.source, watched.kind, max_bytes).await {
-        Ok(material) => material,
-        Err(error) => {
-            let registry = crate::plugins::prometheus_metrics::global_registry();
-            registry.record_tls_source_fetch_duration(
-                configured_scheme.as_str(),
-                watched.kind.as_str(),
-                started.elapsed().as_secs_f64(),
-            );
-            registry.record_tls_source_fetch_failure(
-                configured_scheme.as_str(),
-                watched.kind.as_str(),
-                error.failure_class(),
-            );
-            return Err(error);
-        }
-    };
+    // The watcher must observe a held tenant file recover, so it reads past
+    // the hold it publishes; every other production load honors it.
+    let material =
+        match super::load_material_for_watcher(&watched.source, watched.kind, max_bytes).await {
+            Ok(material) => material,
+            Err(error) => {
+                let registry = crate::plugins::prometheus_metrics::global_registry();
+                registry.record_tls_source_fetch_duration(
+                    configured_scheme.as_str(),
+                    watched.kind.as_str(),
+                    started.elapsed().as_secs_f64(),
+                );
+                registry.record_tls_source_fetch_failure(
+                    configured_scheme.as_str(),
+                    watched.kind.as_str(),
+                    error.failure_class(),
+                );
+                return Err(error);
+            }
+        };
     crate::plugins::prometheus_metrics::global_registry().record_tls_source_fetch_duration(
         material.source_kind.as_str(),
         material.kind.as_str(),
@@ -591,11 +594,36 @@ pub fn spawn_dynamic_material_set_reload_task(
     config: DynamicMaterialSetReloadConfig,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
+    spawn_dynamic_material_set_reload_task_inner(config, shutdown_rx, false)
+}
+
+/// Backend rebuilds already isolate refused destinations. Keep a refused
+/// tenant file from blocking fingerprints and rotations for other destinations.
+/// Global/trusted source failures retain the existing all-or-nothing behavior.
+pub(crate) fn spawn_backend_material_set_reload_task(
+    config: DynamicMaterialSetReloadConfig,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+) -> JoinHandle<()> {
+    spawn_dynamic_material_set_reload_task_inner(config, shutdown_rx, true)
+}
+
+fn spawn_dynamic_material_set_reload_task_inner(
+    config: DynamicMaterialSetReloadConfig,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    isolate_tenant_files: bool,
+) -> JoinHandle<()> {
     let surface = config.surface;
     let (force_tx, force_rx) = mpsc::channel(1);
     force_reload_registry().insert(surface, force_tx.clone());
     tokio::spawn(async move {
-        run_dynamic_material_set_reload_loop(config, shutdown_rx, force_rx, force_tx).await;
+        run_dynamic_material_set_reload_loop(
+            config,
+            shutdown_rx,
+            force_rx,
+            force_tx,
+            isolate_tenant_files,
+        )
+        .await;
     })
 }
 
@@ -1150,11 +1178,78 @@ async fn run_async_material_set_reload_loop(
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct DynamicMaterialFingerprint {
+    material: MaterialSetFingerprint,
+    // Source-set identity is tracked separately by watched_source_signature.
+    // Refusal/recovery participates in equality so cached material is invalidated
+    // once at each transition, without repeatedly rebuilding at every poll.
+    refused: Vec<(usize, &'static str)>,
+}
+
+struct DynamicMaterialPoll {
+    fingerprint: DynamicMaterialFingerprint,
+    confined_errors: Vec<(usize, MaterialError)>,
+    /// The first unreadable trusted (non-tenant) source. Tenant refusals are
+    /// still collected past it so they are held even during that outage.
+    trusted_error: Option<MaterialError>,
+}
+
+async fn dynamic_material_fingerprint(
+    sources: &[WatchedMaterialSource],
+    max_bytes: usize,
+    isolate_tenant_files: bool,
+) -> DynamicMaterialPoll {
+    let mut entries = Vec::with_capacity(sources.len());
+    let mut errors = Vec::new();
+    let mut trusted_error = None;
+    for (index, watched) in sources.iter().enumerate() {
+        let tenant =
+            isolate_tenant_files && super::tenant_file_identifier(&watched.source).is_some();
+        if trusted_error.is_some() && !tenant {
+            continue;
+        }
+        match material_fingerprint_async_with(watched, max_bytes).await {
+            Ok(entry) => entries.push(entry),
+            Err(error) if tenant => errors.push((index, error)),
+            Err(error) => trusted_error = Some(error),
+        }
+    }
+    let refused = errors
+        .iter()
+        .map(|(index, error)| (*index, error.failure_class()))
+        .collect();
+    DynamicMaterialPoll {
+        fingerprint: DynamicMaterialFingerprint {
+            material: MaterialSetFingerprint { entries },
+            refused,
+        },
+        confined_errors: errors,
+        trusted_error,
+    }
+}
+
+/// Hold (or release) the tenant files this poll found refused.
+fn publish_refused_tenant_holds(
+    surface: &'static str,
+    sources: &[WatchedMaterialSource],
+    refused: &[(usize, &'static str)],
+) {
+    let identifiers = refused
+        .iter()
+        .filter_map(|(index, _)| sources.get(*index))
+        .filter_map(|watched| super::tenant_file_identifier(&watched.source))
+        .map(str::to_string)
+        .collect();
+    super::publish_held_refused_tenant_files(surface, identifiers);
+}
+
 async fn run_dynamic_material_set_reload_loop(
     config: DynamicMaterialSetReloadConfig,
     mut shutdown_rx: Option<watch::Receiver<bool>>,
     mut force_rx: mpsc::Receiver<()>,
     force_tx: mpsc::Sender<()>,
+    isolate_tenant_files: bool,
 ) {
     let DynamicMaterialSetReloadConfig {
         surface,
@@ -1167,7 +1262,11 @@ async fn run_dynamic_material_set_reload_loop(
     } = config;
     let rebuild: SharedMaterialSetRebuildFn = Arc::from(rebuild);
 
-    let mut last_fingerprint: Option<MaterialSetFingerprint> = None;
+    let mut last_fingerprint: Option<DynamicMaterialFingerprint> = None;
+    // A tenant refusal (or recovery) transition whose rebuild failed has not
+    // invalidated cached configs yet. Retry it on every poll, even when the
+    // fingerprint is unchanged, until a rebuild succeeds.
+    let mut refusal_rebuild_pending = false;
     let mut load_failures = LoadFailureTransitionTracker::default();
     let mut last_source_signature: Option<Vec<(MaterialKind, String)>> = None;
     let mut k8s_targets = Vec::new();
@@ -1175,7 +1274,7 @@ async fn run_dynamic_material_set_reload_loop(
 
     loop {
         if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
-            cleanup_dynamic_reload(surface, &mut k8s_handles);
+            finish_dynamic_reload(surface, &mut k8s_handles, isolate_tenant_files);
             return;
         }
 
@@ -1205,70 +1304,115 @@ async fn run_dynamic_material_set_reload_loop(
             material_set_poll_interval(&sources, file_default_interval, provider_default_interval);
 
         if sources.is_empty() {
+            if isolate_tenant_files {
+                super::publish_held_refused_tenant_files(surface, Vec::new());
+            }
             if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
-                cleanup_dynamic_reload(surface, &mut k8s_handles);
+                finish_dynamic_reload(surface, &mut k8s_handles, isolate_tenant_files);
                 return;
             }
             continue;
         }
 
-        let next_fingerprint = match material_set_fingerprint_async_with(
-            &sources,
-            max_material_bytes,
-        )
-        .await
-        {
-            Ok(fingerprint) => {
-                if load_failures.observe_recovery() {
-                    crate::tls::events::record_load_recovery(surface, &sources);
-                    info!(
-                        surface,
-                        "TLS material source watcher recovered source access"
-                    );
-                }
-                fingerprint
+        let poll =
+            dynamic_material_fingerprint(&sources, max_material_bytes, isolate_tenant_files).await;
+        if isolate_tenant_files {
+            publish_refused_tenant_holds(surface, &sources, &poll.fingerprint.refused);
+        }
+        if let Some(error) = poll.trusted_error {
+            record_refresh_for_sources(surface, &sources, "load_error");
+            if load_failures.observe_failure(error.failure_class()) {
+                crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
+                warn!(
+                    surface,
+                    error = %error,
+                    "TLS material source watcher could not load source bytes; keeping current \
+                     material (silenced until the failure class changes or access recovers)"
+                );
             }
-            Err(error) => {
-                record_refresh_for_sources(surface, &sources, "load_error");
-                if load_failures.observe_failure(error.failure_class()) {
-                    crate::tls::events::record_load_error(surface, &sources, &error.event_detail());
-                    warn!(
-                        surface,
-                        error = %error,
-                        "TLS material source watcher could not load source bytes; keeping current \
-                         material (silenced until the failure class changes or access recovers)"
-                    );
-                }
-                if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
-                    cleanup_dynamic_reload(surface, &mut k8s_handles);
-                    return;
-                }
-                continue;
+            if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
+                finish_dynamic_reload(surface, &mut k8s_handles, isolate_tenant_files);
+                return;
             }
-        };
+            continue;
+        }
+        let (next_fingerprint, confined_errors) = (poll.fingerprint, poll.confined_errors);
+        if load_failures.observe_recovery() {
+            let recovered = sources
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    !next_fingerprint
+                        .refused
+                        .iter()
+                        .any(|(refused_index, _)| refused_index == index)
+                })
+                .map(|(_, source)| source.clone())
+                .collect::<Vec<_>>();
+            crate::tls::events::record_load_recovery(surface, &recovered);
+            info!(
+                surface,
+                "TLS material source watcher resumed fingerprinting readable sources"
+            );
+        }
 
-        if last_fingerprint.is_none() {
+        for (index, error) in &confined_errors {
+            if last_fingerprint
+                .as_ref()
+                .is_none_or(|last| !last.refused.contains(&(*index, error.failure_class())))
+            {
+                let source = std::slice::from_ref(&sources[*index]);
+                record_refresh_for_sources(surface, source, "load_error");
+                crate::tls::events::record_load_error(surface, source, &error.event_detail());
+                // A TCP+TLS stream listener whose material only rotated keeps
+                // its last admitted config (stream_listener keep-last-good);
+                // every other consumer fails closed for this destination.
+                warn!(surface, source_id = %sources[*index].source.redacted_source_id(), error = %error,
+                    "Tenant TLS file refused; new backend TLS for its destinations fails closed (an unchanged TCP+TLS stream listener keeps its last admitted config) while unrelated source rotations continue");
+            }
+        }
+        if let Some(last) = &last_fingerprint {
+            for (index, _) in &last.refused {
+                if !next_fingerprint
+                    .refused
+                    .iter()
+                    .any(|(next_index, _)| next_index == index)
+                {
+                    crate::tls::events::record_load_recovery(
+                        surface,
+                        std::slice::from_ref(&sources[*index]),
+                    );
+                }
+            }
+        }
+
+        if last_fingerprint.is_none() && next_fingerprint.refused.is_empty() {
             last_fingerprint = Some(next_fingerprint);
             if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
-                cleanup_dynamic_reload(surface, &mut k8s_handles);
+                finish_dynamic_reload(surface, &mut k8s_handles, isolate_tenant_files);
                 return;
             }
             continue;
         }
 
-        if last_fingerprint.as_ref() == Some(&next_fingerprint) {
-            record_refresh_for_entries(surface, &next_fingerprint.entries, "unchanged");
+        let unchanged = last_fingerprint.as_ref() == Some(&next_fingerprint);
+        if unchanged && !refusal_rebuild_pending {
+            record_refresh_for_entries(surface, &next_fingerprint.material.entries, "unchanged");
             if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
-                cleanup_dynamic_reload(surface, &mut k8s_handles);
+                finish_dynamic_reload(surface, &mut k8s_handles, isolate_tenant_files);
                 return;
             }
             continue;
         }
 
+        let refusal_changed = last_fingerprint
+            .as_ref()
+            .is_none_or(|last| last.refused != next_fingerprint.refused);
         match run_material_set_rebuild(&rebuild).await {
             Ok(()) => {
-                let event_entries = next_fingerprint.entries.clone();
-                record_refresh_for_entries(surface, &next_fingerprint.entries, "rotated");
+                refusal_rebuild_pending = false;
+                let event_entries = next_fingerprint.material.entries.clone();
+                record_refresh_for_entries(surface, &next_fingerprint.material.entries, "rotated");
                 last_fingerprint = Some(next_fingerprint);
                 revision_tx.send_modify(|r| *r = r.saturating_add(1));
                 let revision = *revision_tx.borrow();
@@ -1280,26 +1424,46 @@ async fn run_dynamic_material_set_reload_loop(
                 );
             }
             Err(error) => {
-                record_refresh_for_entries(surface, &next_fingerprint.entries, "rebuild_error");
-                crate::tls::events::record_rebuild_error(
+                record_refresh_for_entries(
                     surface,
-                    &next_fingerprint.entries,
-                    &error,
+                    &next_fingerprint.material.entries,
+                    "rebuild_error",
                 );
+                refusal_rebuild_pending |= refusal_changed;
+                // A retry of an unchanged candidate is already reported.
+                if !unchanged {
+                    crate::tls::events::record_rebuild_error(
+                        surface,
+                        &next_fingerprint.material.entries,
+                        &error,
+                    );
+                    warn!(
+                        surface,
+                        error = %error,
+                        "TLS material sources changed but rebuild failed; keeping previous material"
+                    );
+                }
                 last_fingerprint = Some(next_fingerprint);
-                warn!(
-                    surface,
-                    error = %error,
-                    "TLS material sources changed but rebuild failed; keeping previous material"
-                );
             }
         }
 
         if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
-            cleanup_dynamic_reload(surface, &mut k8s_handles);
+            finish_dynamic_reload(surface, &mut k8s_handles, isolate_tenant_files);
             return;
         }
     }
+}
+
+/// Stop a dynamic watcher and release the tenant holds it published.
+fn finish_dynamic_reload(
+    surface: &'static str,
+    k8s_handles: &mut Vec<JoinHandle<()>>,
+    isolate_tenant_files: bool,
+) {
+    if isolate_tenant_files {
+        super::publish_held_refused_tenant_files(surface, Vec::new());
+    }
+    cleanup_dynamic_reload(surface, k8s_handles);
 }
 
 fn watched_source_signature(sources: &[WatchedMaterialSource]) -> Vec<(MaterialKind, String)> {

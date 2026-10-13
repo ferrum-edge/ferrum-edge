@@ -909,8 +909,9 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 /// It deliberately does NOT carry the destination's
 /// `connectionPool.tcp.maxConnections` slot. The pooled value is only a handle:
 /// the physical QUIC connection and its UDP socket are owned by the spawned h3
-/// driver task, which outlives every handle (`h3`'s client `poll_close` resolves
-/// on connection close/error, not on `SendRequest` drop). Parking the slot here
+/// driver task. Active request streams retain a sender: dropping the last
+/// `SendRequest` closes the h3 session even when a request stream still exists.
+/// Parking the slot here
 /// would release it as soon as the cached value and any in-flight clones dropped
 /// — on a force-drain / eviction that happens while the old connection is still
 /// open, so a replacement could be admitted past the cap. The slot therefore
@@ -948,9 +949,50 @@ impl H3PooledConnection {
     }
 }
 
-/// Type alias for the h3 client request stream (bidirectional).
+/// An opened backend stream owns the session sender until the stream is dropped.
+/// Pool eviction retires the sender for new dispatch, while this private clone
+/// preserves established traffic. The physical connection limit stays owned by
+/// the driver, so an evicted connection remains charged while it is still open.
+pub struct H3BackendStream<S> {
+    stream: S,
+    session: H3SendRequest,
+}
+
+impl<S> H3BackendStream<S> {
+    fn new(stream: S, session: H3SendRequest) -> Self {
+        Self { stream, session }
+    }
+}
+
+impl<S> std::ops::Deref for H3BackendStream<S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+
+impl<S> std::ops::DerefMut for H3BackendStream<S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
+
+/// Guarded native h3 client request stream (bidirectional).
 pub type H3RequestStream =
-    h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
+    H3BackendStream<h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>>;
+
+impl H3RequestStream {
+    /// Both independently driven directions retain the established session.
+    pub fn split(self) -> (H3BackendSendStream, H3BackendRecvStream) {
+        let Self { stream, session } = self;
+        let (send, recv) = stream.split();
+        (
+            H3BackendStream::new(send, session.clone()),
+            H3BackendStream::new(recv, session),
+        )
+    }
+}
 
 /// Quinn finishes a send stream on drop. Until the entire upload is finished,
 /// every error or cancelled future must instead reset it, including cancellation
@@ -1789,10 +1831,11 @@ pub struct H3StreamingResponse {
 
 /// Send half of a `split()` native-H3 backend request stream.
 pub type H3BackendSendStream =
-    h3::client::RequestStream<h3_quinn::SendStream<bytes::Bytes>, bytes::Bytes>;
+    H3BackendStream<h3::client::RequestStream<h3_quinn::SendStream<bytes::Bytes>, bytes::Bytes>>;
 
 /// Receive half of a `split()` native-H3 backend request stream.
-pub type H3BackendRecvStream = h3::client::RequestStream<h3_quinn::RecvStream, bytes::Bytes>;
+pub type H3BackendRecvStream =
+    H3BackendStream<h3::client::RequestStream<h3_quinn::RecvStream, bytes::Bytes>>;
 
 /// A native-H3 backend request stream whose HEADERS are on the wire but whose
 /// request body has NOT been written yet, already split into independently
@@ -3315,6 +3358,7 @@ impl Http3ConnectionPool {
         let mut stream = send_request
             .send_request(req)
             .await
+            .map(|stream| H3BackendStream::new(stream, send_request.clone()))
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
         let mut upload = H3UploadResetGuard::new(&mut stream);
@@ -3436,6 +3480,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await?;
@@ -3539,6 +3584,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await?;
@@ -3719,6 +3765,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await?;
@@ -4047,6 +4094,7 @@ impl Http3ConnectionPool {
             send_request
                 .send_request(req)
                 .await
+                .map(|stream| H3BackendStream::new(stream, send_request.clone()))
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await
@@ -5436,7 +5484,8 @@ impl Http3Client {
         let req = req_builder.body(())?;
 
         // Send request
-        let mut stream = send_request.send_request(req).await?;
+        let mut stream =
+            H3BackendStream::new(send_request.send_request(req).await?, send_request.clone());
 
         // Send the body in bounded slices, each under its own write watermark.
         //

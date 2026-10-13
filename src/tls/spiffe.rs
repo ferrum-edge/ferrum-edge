@@ -320,7 +320,7 @@ pub fn build_spiffe_outbound_config(
         bundle_slot.clone(),
         expected_peer,
         expected_trust_domain,
-        crls,
+        Arc::clone(&crls),
     );
     let resolver = SpiffeClientCertResolver::new(bundle_slot);
 
@@ -329,6 +329,9 @@ pub fn build_spiffe_outbound_config(
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_cert_resolver(Arc::new(resolver));
     cfg.alpn_protocols = alpn_protocols;
+    // Pools build one config per dial today; the shared CRL resumption policy
+    // keeps a reused config from skipping the CRL expiration check.
+    crate::tls::apply_crl_enforced_client_resumption(&mut cfg, &crls);
     Ok(Arc::new(cfg))
 }
 

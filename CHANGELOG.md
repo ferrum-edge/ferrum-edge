@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — gateway material references are default-deny for
+  namespace-claimed operators** (issue #6092; PR #6316, residual of
+  GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is
+  confined even when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`, matching
+  the namespace bound #6093 applies to every other route. A value already
+  stored in the same field path stays admitted, and `admin` tokens are
+  unaffected.
+  - Backend TLS references (`backend_tls_client_cert_path`,
+    `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) and the
+    TLS-material plugin fields admit only inline PEM, `system://` or a
+    `k8s://` Secret in the addressed namespace. The plugin fields are the
+    `mesh_route_dispatch` route-local `backend_tls` fields, the `udp_logging`
+    `dtls_*` fields, and the `soap_ws_security` `trusted_certs` and
+    `trusted_signing_certs` entries.
+  - Plugin fields that name a gateway filesystem path or a native library
+    setting are refused outright: the `kafka_logging` `ssl_*_location` fields
+    and any `producer_config` key outside a reviewed tuning-only list (for
+    example `ssl.providers`, `ssl.engine.location`, `plugin.library.paths`
+    and `sasl.kerberos.kinit.cmd`), the `api_chargeback_sink` ClickHouse TLS
+    files and `spool.dir`, the `grpc.descriptor_path` fields of
+    `ai_response_guard` and `ai_transcript_audit`, the `body_validator`
+    `protobuf_descriptor_path`, and the `geo_restriction` `db_path`.
+  - A plugin that is not a built-in (a custom plugin) cannot be classified,
+    so such an operator may not introduce or change its config.
+  - Every field is declared in one registry
+    (`src/admin/crud/scoped_references.rs`). A unit test fails when a
+    built-in plugin schema gains a path-, file-, certificate-, key-, module-
+    or library-shaped field that is neither registered nor reviewed.
+- **Tenant DestinationRule TLS files stay confined after admission** (PR
+  #6316).
+  - A file that a non-root-namespace DestinationRule names under
+    `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` is bound to a confined reference when
+    it is projected onto upstreams. Every later load, cache rebuild and file
+    watch re-resolves it under the configured roots and opens it one
+    component at a time without following swapped symlinks (`openat` +
+    `O_NOFOLLOW` on Unix, handle-relative no-reparse opens on Windows).
+    Outside material is never loaded.
+  - When the backend TLS watcher observes a tenant file refused, it holds
+    that refusal: every load of the reference fails closed until the watcher
+    itself observes the file readable again. A cache, pool or client built
+    between two polls therefore cannot capture the file during a brief
+    return inside its root. The hold applies even while a gateway-owned
+    (non-tenant) backend TLS source is unreadable. In that window, cached
+    configs stay on the last-good generation until the next successful
+    rebuild.
+  - A refusal whose rebuild fails is retried on every poll until a rebuild
+    succeeds.
+  - New backend TLS for the refused file's destinations fails closed. The
+    exception is an otherwise unchanged TCP+TLS stream listener, which keeps
+    serving with its last admitted config under the existing keep-last-good
+    rule until the file is valid again.
+  - A refused tenant file no longer stalls rotation of unrelated backend TLS
+    sources. Files named only in per-port (`portLevelSettings`) or per-subset
+    TLS overrides are now watched for rotation too.
+- **CRL-enforcing outbound TLS clients no longer resume sessions** (PR
+  #6316, follow-up to #4297). TLS 1.2 tickets and TLS 1.3 PSK resumption
+  skip certificate reverification, so a cached session could outlive a CRL's
+  `nextUpdate`. Resumption is now disabled for every cached rustls client
+  config with a nonempty CRL set: backend data paths, verified HTTPS/gRPC
+  health probes, `tcp_logging`, `ws_logging`, `ldap_auth`, SMTP
+  notifications and mesh SPIFFE outbound configs. Reconnects through those
+  configs pay a full handshake; empty-CRL and skip-verify configs keep
+  resumption.
+- **`mcp_gateway` upstream calls log a redacted endpoint** (PR #6316,
+  sibling of GHSA-4ghp-v85j-5hvq). `initialize`, the `initialized`
+  notification, session `DELETE` and discovery now use the redacted tracked
+  HTTP helper, so a credential in the upstream URL path is not written to
+  slow-call or egress-denial warnings.
+
+### Fixed
+
+- **Native HTTP/3 backend streams survive pool retirement** (PR #6316).
+  Each opened request stream (and both halves after `split()`) now holds its
+  own session sender, so evicting or force-draining a pooled H3 connection
+  stops new dispatch without closing streams that are still in flight.
+- **TLS gRPC health probes build their dial URI for the custom connector**
+  (PR #6316). The probe dials the screened address over its own rustls
+  connector with an `http://` URI, so tonic does not expect to add a second
+  TLS layer. The request keeps the original `https` origin and authority, and
+  the verifier keeps the configured server name, trust and CRLs.
+
 ## [0.9.17] - 2026-10-10
 
 This version carries forward the changes prepared for 0.9.16. That immutable tag

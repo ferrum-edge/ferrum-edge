@@ -8347,12 +8347,34 @@ fn collect_backend_tls_watched_sources(
         MaterialKind::Crl,
     );
 
+    // Per-port and per-subset overrides carry their own effective TLS (for
+    // example DestinationRule `portLevelSettings` and subset policies), so a
+    // file used only there must be watched like a top-level reference.
     for proxy in &config.proxies {
         push_backend_tls_config_sources(&mut sources, &mut seen, &proxy.resolved_tls);
+        for port_override in proxy
+            .dispatch_port_overrides
+            .iter()
+            .flat_map(|m| m.values())
+        {
+            if let Some(tls) = port_override.tls.as_ref() {
+                push_backend_tls_config_sources(&mut sources, &mut seen, tls);
+            }
+        }
     }
     for upstream in &config.upstreams {
         let tls = BackendTlsConfig::from_upstream(upstream);
         push_backend_tls_config_sources(&mut sources, &mut seen, &tls);
+        for port_override in upstream.port_overrides.values() {
+            if let Some(tls) = port_override.tls.as_ref() {
+                push_backend_tls_config_sources(&mut sources, &mut seen, tls);
+            }
+        }
+        for subset in upstream.resolved_subset_tls.values() {
+            if let Some(tls) = subset.tls.as_ref() {
+                push_backend_tls_config_sources(&mut sources, &mut seen, tls);
+            }
+        }
     }
     for plugin in &config.plugin_configs {
         if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
@@ -10217,7 +10239,7 @@ impl ProxyState {
         let collect_state = self.clone();
         let rebuild_state = self.clone();
         Some(
-            crate::tls::source::subscription::spawn_dynamic_material_set_reload_task(
+            crate::tls::source::subscription::spawn_backend_material_set_reload_task(
                 crate::tls::source::subscription::DynamicMaterialSetReloadConfig {
                     surface: "backend_tls",
                     collect_sources: Box::new(move || {
@@ -67068,6 +67090,101 @@ mod tests {
         assert!(ids.contains(&"/certs/mesh-route.pem".to_string()));
         assert!(ids.contains(&"/keys/mesh-route.key".to_string()));
         assert!(ids.contains(&"/ca/mesh-route.pem".to_string()));
+    }
+
+    /// A file named only in a per-port or per-subset override (DestinationRule
+    /// `portLevelSettings` / subset `trafficPolicy.tls`) has no top-level
+    /// reference, yet its effective TLS is cached and dialed. It must be watched
+    /// so rotation, tenant refusal and recovery invalidate that cache.
+    #[test]
+    fn backend_tls_watched_sources_include_port_and_subset_overrides() {
+        use crate::config::types::{
+            ResolvedPortOverride, ResolvedSubsetTrafficPolicy, UpstreamPortOverride,
+        };
+        fn only(ca: &str, cert: &str, key: &str) -> Option<BackendTlsConfig> {
+            Some(BackendTlsConfig {
+                client_cert_path: Some(cert.to_string()),
+                client_key_path: Some(key.to_string()),
+                server_ca_cert_path: Some(ca.to_string()),
+                verify_server_cert: true,
+                sni: None,
+                san_allow_list: Vec::new(),
+                san_allow_list_key_digest: None,
+                tls_refused: false,
+            })
+        }
+        let env_config = EnvConfig::default();
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "p1",
+                "listen_path": "/",
+                "backend_host": "api.example.com",
+                "backend_port": 443,
+                "backend_scheme": "https"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "u1",
+                "targets": [{"host": "api.example.com", "port": 443}]
+            }]
+        }))
+        .expect("config should deserialize");
+        config.proxies[0].dispatch_port_overrides = Some(
+            [(
+                9443,
+                ResolvedPortOverride {
+                    tls: only(
+                        "/ca/proxy-port.pem",
+                        "/certs/proxy-port.pem",
+                        "/keys/proxy-port.key",
+                    ),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        config.upstreams[0].port_overrides.insert(
+            8443,
+            UpstreamPortOverride {
+                tls: only(
+                    "/ca/upstream-port.pem",
+                    "/certs/upstream-port.pem",
+                    "/keys/upstream-port.key",
+                ),
+                ..Default::default()
+            },
+        );
+        config.upstreams[0].resolved_subset_tls.insert(
+            "v2".to_string(),
+            ResolvedSubsetTrafficPolicy {
+                tls: only("/ca/subset.pem", "/certs/subset.pem", "/keys/subset.key"),
+                ..Default::default()
+            },
+        );
+
+        let ids = collect_backend_tls_watched_sources(&config, &env_config)
+            .iter()
+            .map(|source| source.source.pool_key_component())
+            .collect::<Vec<_>>();
+        for expected in [
+            "/ca/proxy-port.pem",
+            "/certs/proxy-port.pem",
+            "/keys/proxy-port.key",
+            "/ca/upstream-port.pem",
+            "/certs/upstream-port.pem",
+            "/keys/upstream-port.key",
+            "/ca/subset.pem",
+            "/certs/subset.pem",
+            "/keys/subset.key",
+        ] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "{expected} missing from {ids:?}"
+            );
+        }
     }
 
     #[test]

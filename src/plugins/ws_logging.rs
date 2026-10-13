@@ -964,10 +964,22 @@ fn endpoint_authority(endpoint_url: &str) -> Option<&str> {
 fn build_tls_connector(
     http_client: &PluginHttpClient,
 ) -> Result<tokio_tungstenite::Connector, String> {
-    let tls_no_verify = http_client.tls_no_verify();
-    let ca_bundle_path = http_client.tls_ca_bundle_path();
-    let crls = http_client.tls_crls();
+    let client_config = build_tls_client_config(
+        http_client.tls_no_verify(),
+        http_client.tls_ca_bundle_path(),
+        http_client.tls_crls(),
+    )?;
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(
+        client_config,
+    )))
+}
 
+/// Build the `wss://` sink's rustls config from the gateway TLS inputs.
+pub(crate) fn build_tls_client_config(
+    tls_no_verify: bool,
+    ca_bundle_path: Option<&str>,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> Result<rustls::ClientConfig, String> {
     // Build root certificate store following the gateway's CA trust chain:
     // - Custom CA configured → empty store + only that CA (CA exclusivity)
     // - No CA configured → webpki roots as default fallback
@@ -1001,9 +1013,13 @@ fn build_tls_connector(
         // applies the shared `tls::crl_policy`.
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
             .map_err(|_| "ws_logging: failed to build TLS verifier".to_string())?;
-        rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .with_webpki_verifier(verifier)
-            .with_no_client_auth()
+            .with_no_client_auth();
+        // The connector is reused across reconnects; resumption would skip the
+        // CRL expiration check on a resumed handshake.
+        crate::tls::apply_crl_enforced_client_resumption(&mut config, crls);
+        config
     };
 
     if tls_no_verify {
@@ -1013,9 +1029,7 @@ fn build_tls_connector(
             .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
     }
 
-    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(
-        client_config,
-    )))
+    Ok(client_config)
 }
 
 #[async_trait]

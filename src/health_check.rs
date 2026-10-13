@@ -101,7 +101,9 @@ fn grpc_probe_urls(
     port: u16,
 ) -> (String, String) {
     (
-        format_probe_url(scheme, dial_addr, port, ""),
+        // TLS is supplied by the custom connector; an HTTPS dial URI would
+        // make tonic require another TLS layer. Keep the original origin below.
+        format_probe_url("http", dial_addr, port, ""),
         format_probe_url(scheme, original_host, port, ""),
     )
 }
@@ -3840,7 +3842,7 @@ async fn build_grpc_probe_channel_verified(
     let mut client_config = probe_rustls_client_config(verifier, client_auth)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     client_config.alpn_protocols = vec![b"h2".to_vec()];
-    crate::tls::apply_client_session_resumption(&mut client_config, None);
+    crate::tls::apply_client_session_resumption(&mut client_config, None, crls);
 
     let tls_connector = TlsConnector::from(Arc::new(client_config));
     let host_owned = probe_tls_server_name(tls_config, host).to_string();
@@ -4299,7 +4301,7 @@ fn build_health_check_client_with_rustls_verifier(
     } else {
         rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     }
-    crate::tls::apply_client_session_resumption(&mut rustls_config, None);
+    crate::tls::apply_client_session_resumption(&mut rustls_config, None, crls);
 
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -5106,8 +5108,238 @@ mod tests {
     #[test]
     fn grpc_probe_dials_candidate_but_preserves_original_authority() {
         let (endpoint, origin) = grpc_probe_urls("https", "backend.internal", "192.0.2.25", 8443);
-        assert_eq!(endpoint, "https://192.0.2.25:8443");
+        assert_eq!(endpoint, "http://192.0.2.25:8443");
         assert_eq!(origin, "https://backend.internal:8443");
+    }
+
+    #[test]
+    fn grpc_plaintext_probe_preserves_original_authority() {
+        let (endpoint, origin) = grpc_probe_urls("http", "backend.internal", "192.0.2.25", 8080);
+        assert_eq!(endpoint, "http://192.0.2.25:8080");
+        assert_eq!(origin, "http://backend.internal:8080");
+    }
+
+    #[test]
+    fn grpc_tls_probe_dials_ipv6_but_preserves_original_authority() {
+        let (endpoint, origin) = grpc_probe_urls("https", "backend.internal", "2001:db8::25", 8443);
+        assert_eq!(endpoint, "http://[2001:db8::25]:8443");
+        assert_eq!(origin, "https://backend.internal:8443");
+    }
+
+    #[derive(Clone)]
+    struct ProbeHealthService;
+
+    #[tonic::async_trait]
+    impl grpc_health_v1::health_server::Health for ProbeHealthService {
+        async fn check(
+            &self,
+            _: tonic::Request<grpc_health_v1::HealthCheckRequest>,
+        ) -> Result<tonic::Response<grpc_health_v1::HealthCheckResponse>, tonic::Status> {
+            Ok(tonic::Response::new(grpc_health_v1::HealthCheckResponse {
+                status: grpc_health_v1::health_check_response::ServingStatus::Serving as i32,
+            }))
+        }
+    }
+
+    // Exercise the private probe so the screened IP can differ from the
+    // original hostname without publishing another test-only public API.
+    #[tokio::test]
+    async fn grpc_screened_dial_retains_authority_tls_verification_and_revocation() {
+        use rustls::pki_types::{CertificateRevocationListDer, pem::PemObject};
+        ensure_crypto_provider();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let mut leaf_params = CertificateParams::new(vec!["backend.internal".into()]).unwrap();
+        leaf_params.serial_number = Some(rcgen::SerialNumber::from(42_u64));
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        let other_key = KeyPair::generate().unwrap();
+        let other_ca = CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&other_key)
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let crl = rcgen::CertificateRevocationListParams {
+            this_update: now - time::Duration::minutes(1),
+            next_update: now + time::Duration::days(1),
+            crl_number: rcgen::SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![rcgen::RevokedCertParams {
+                serial_number: rcgen::SerialNumber::from(42_u64),
+                revocation_time: now - time::Duration::minutes(1),
+                reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap();
+        let crl =
+            CertificateRevocationListDer::from_pem_slice(crl.pem().unwrap().as_bytes()).unwrap();
+
+        for (dial, use_tls, original_host, trust, no_verify, revoked, expected) in [
+            (
+                "127.0.0.1",
+                false,
+                "backend.internal",
+                ca.pem(),
+                false,
+                false,
+                true,
+            ),
+            (
+                "::1",
+                false,
+                "backend.internal",
+                ca.pem(),
+                false,
+                false,
+                true,
+            ),
+            (
+                "127.0.0.1",
+                true,
+                "backend.internal",
+                ca.pem(),
+                false,
+                false,
+                true,
+            ),
+            (
+                "::1",
+                true,
+                "backend.internal",
+                ca.pem(),
+                false,
+                false,
+                true,
+            ),
+            (
+                "127.0.0.1",
+                true,
+                "backend.internal",
+                other_ca.pem(),
+                false,
+                false,
+                false,
+            ),
+            (
+                "127.0.0.1",
+                true,
+                "wrong.internal",
+                ca.pem(),
+                false,
+                false,
+                false,
+            ),
+            (
+                "127.0.0.1",
+                true,
+                "backend.internal",
+                ca.pem(),
+                false,
+                true,
+                false,
+            ),
+            (
+                "127.0.0.1",
+                true,
+                "wrong.internal",
+                other_ca.pem(),
+                true,
+                false,
+                true,
+            ),
+        ] {
+            let listener = TcpListener::bind((dial, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let observations = Arc::new(Mutex::new(Vec::<http::Uri>::new()));
+            let observed = observations.clone();
+            let layer = tower::util::MapRequestLayer::new(
+                move |request: http::Request<tonic::body::Body>| {
+                    observed.lock().unwrap().push(request.uri().clone());
+                    request
+                },
+            );
+            let mut server = tonic::transport::Server::builder();
+            if use_tls {
+                server = server
+                    .tls_config(tonic::transport::ServerTlsConfig::new().identity(
+                        tonic::transport::Identity::from_pem(leaf.pem(), leaf_key.serialize_pem()),
+                    ))
+                    .unwrap();
+            }
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                server
+                    .layer(layer)
+                    .add_service(grpc_health_v1::health_server::HealthServer::new(
+                        ProbeHealthService,
+                    ))
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        async {
+                            let _ = stopped.await;
+                        },
+                    )
+                    .await
+                    .unwrap();
+            });
+            let mut tls = BackendTlsConfig::default_verify();
+            tls.server_ca_cert_path = Some(trust);
+            tls.verify_server_cert = !no_verify;
+            let crls = if revoked {
+                vec![crl.clone()]
+            } else {
+                Vec::new()
+            };
+            let result = grpc_probe(
+                original_host,
+                dial,
+                port,
+                Duration::from_secs(3),
+                use_tls,
+                "screened-control",
+                &tls,
+                None,
+                None,
+                None,
+                false,
+                &crls,
+            )
+            .await;
+            let _ = stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.success, expected,
+                "dial={dial}, TLS={use_tls}, host={original_host}, no_verify={no_verify}, revoked={revoked}: {:?}",
+                result.failure
+            );
+            let observed = observations.lock().unwrap();
+            if expected {
+                assert_eq!(observed.len(), 1);
+                assert_eq!(
+                    observed[0].authority().unwrap().as_str(),
+                    format!("{original_host}:{port}")
+                );
+                assert_eq!(
+                    observed[0].scheme_str(),
+                    Some(if use_tls { "https" } else { "http" })
+                );
+            } else {
+                assert!(
+                    observed.is_empty(),
+                    "rejected TLS must not reach the health service"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
