@@ -3415,7 +3415,7 @@ fn test_max_scan_bytes_numeric_admission_matches_the_published_contract() {
         r#"{"patterns":["ssn"],"max_scan_bytes":1024}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":1024.0}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":1}"#,
-        r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740991}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":67108864}"#,
     ] {
         let config: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
         assert!(
@@ -3430,6 +3430,8 @@ fn test_max_scan_bytes_numeric_admission_matches_the_published_contract() {
         r#"{"patterns":["ssn"],"max_scan_bytes":1024.5}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":-1}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":0}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":67108865}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740991}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740992}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":18446744073709551616}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":"1024"}"#,
@@ -4870,4 +4872,20 @@ async fn mcp_arguments_mode_rechecks_the_final_request_body() {
             .await,
         Some(400),
     );
+}
+
+#[test]
+fn custom_patterns_entry_count_is_bounded() {
+    let at_cap: Vec<_> = (0..256)
+        .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+        .collect();
+    assert!(AiPromptShield::new(&json!({"patterns": [], "custom_patterns": at_cap})).is_ok());
+    let over_cap: Vec<_> = (0..257)
+        .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+        .collect();
+    let err = match AiPromptShield::new(&json!({"patterns": [], "custom_patterns": over_cap})) {
+        Ok(_) => panic!("custom_patterns above the entry cap must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("at most 256 entries"), "{err}");
 }

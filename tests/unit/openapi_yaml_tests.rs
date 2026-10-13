@@ -10544,8 +10544,10 @@ fn ai_prompt_shield_schema_matches_runtime_validation() {
     // Written through `from_str` because `json!` would need the literals to fit
     // a Rust integer type.
     for (raw, expected_valid) in [
-        (r#"{"max_scan_bytes":9007199254740991}"#, true),
+        (r#"{"max_scan_bytes":67108864}"#, true),
         (r#"{"max_scan_bytes":1024.0}"#, true),
+        (r#"{"max_scan_bytes":67108865}"#, false),
+        (r#"{"max_scan_bytes":9007199254740991}"#, false),
         (r#"{"max_scan_bytes":9007199254740992}"#, false),
         (r#"{"max_scan_bytes":18446744073709551616}"#, false),
         (r#"{"max_scan_bytes":1024.5}"#, false),
@@ -14039,6 +14041,19 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         ])
     );
     assert_eq!(schema["properties"]["max_scan_bytes"]["minimum"], 1);
+    assert_eq!(
+        schema["properties"]["max_scan_bytes"]["maximum"],
+        67_108_864
+    );
+    assert_eq!(schema["properties"]["custom_pii_patterns"]["maxItems"], 256);
+    assert_eq!(schema["properties"]["blocked_patterns"]["maxItems"], 256);
+    assert_eq!(schema["properties"]["blocked_phrases"]["maxItems"], 1024);
+    for list in ["custom_pii_patterns", "blocked_patterns"] {
+        assert_eq!(
+            schema["properties"][list]["items"]["properties"]["name"]["maxLength"], 128,
+            "{list} name bound must match the constructor"
+        );
+    }
     assert_eq!(schema["properties"]["max_completion_length"]["minimum"], 0);
     assert_eq!(
         schema["properties"]["grpc"]["properties"]["methods"]["propertyNames"]["pattern"],
@@ -14076,6 +14091,7 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         json!({"required_fields": ["x"]}),
         json!({"custom_pii_patterns": [{"name": "x", "regex": "x"}]}),
         json!({"blocked_patterns": [{"name": "x", "regex": "x"}]}),
+        json!({"pii_patterns": ["email"], "max_scan_bytes": 67_108_864}),
         json!({
             "pii_patterns": ["email"],
             "grpc": {
@@ -14099,6 +14115,9 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     for invalid in [
         json!({"pii_patterns": ["not-real"]}),
         json!({"pii_patterns": ["email"], "max_scan_bytes": 0}),
+        json!({"pii_patterns": ["email"], "max_scan_bytes": 67_108_865}),
+        json!({"custom_pii_patterns": [{"name": "n".repeat(129), "regex": "x"}]}),
+        json!({"blocked_patterns": [{"name": "n".repeat(129), "regex": "x"}]}),
         json!({"require_json": true, "max_completion_length": -1}),
         json!({"blocked_phrases": [""]}),
         json!({"required_fields": [""]}),

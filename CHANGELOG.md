@@ -134,6 +134,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `ai_response_guard` and `ai_prompt_shield` bound their
+  pattern and scan configuration** (issue #6608). `ai_response_guard` now
+  refuses a `custom_pii_patterns` or `blocked_patterns` regex that matches
+  the empty string (parity with `ai_prompt_shield`), caps pattern names at
+  128 characters and each rendered `redaction_placeholder` at 512 bytes, and
+  charges structured (JSON, SSE, gRPC) redaction against a per-response
+  growth allowance, so sequential patterns that rewrite each other's
+  placeholders fail closed instead of compounding. A zero-width match
+  produced at run time also fails closed. Both plugins cap `max_scan_bytes`
+  at 64 MiB and custom regex lists at 256 entries (`blocked_phrases` at 1024).
+
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB

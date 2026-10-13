@@ -226,6 +226,15 @@ const ALLOWED_CUSTOM_PATTERN_KEYS: &[&str] = &["name", "regex"];
 /// separately and precisely by [`MAX_REDACTION_PLACEHOLDER_BYTES`].
 const MAX_CUSTOM_PATTERN_NAME_CHARS: usize = 128;
 
+/// Hard ceiling on `custom_patterns` entries. Each entry compiles into its own
+/// `Regex` and into the shared detection `RegexSet`, so the count is a
+/// construction-cost bound. Same bound as `ai_response_guard`.
+const MAX_CUSTOM_PATTERNS: usize = 256;
+
+/// Hard ceiling on `max_scan_bytes`: the request body this plugin regex-scans
+/// and may rewrite synchronously. Same bound as `ai_response_guard`.
+const MAX_SCAN_BYTES_CEILING: usize = 64 * 1024 * 1024;
+
 /// Upper bound on the RENDERED per-pattern redaction placeholder — the
 /// configured template with `{type}` already substituted. Bounding the rendered
 /// form rather than the template is what actually caps amplification: a
@@ -588,6 +597,11 @@ impl AiPromptShield {
 
         let max_scan_bytes =
             optional_positive_usize(config, "max_scan_bytes")?.unwrap_or(1_048_576);
+        if max_scan_bytes > MAX_SCAN_BYTES_CEILING {
+            return Err(format!(
+                "ai_prompt_shield: `max_scan_bytes` must be at most {MAX_SCAN_BYTES_CEILING}"
+            ));
+        }
 
         // Build pattern list from config
         let pattern_names: Vec<String> =
@@ -632,6 +646,11 @@ impl AiPromptShield {
 
         // Add custom patterns
         if let Some(custom) = optional_array(config, "custom_patterns")? {
+            if custom.len() > MAX_CUSTOM_PATTERNS {
+                return Err(format!(
+                    "ai_prompt_shield: `custom_patterns` must have at most {MAX_CUSTOM_PATTERNS} entries"
+                ));
+            }
             for (index, entry) in custom.iter().enumerate() {
                 // Closed member set, exactly like the top-level gate: an
                 // unsupported nested option must be diagnosed at admission

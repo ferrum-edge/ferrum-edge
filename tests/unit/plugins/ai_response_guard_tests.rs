@@ -7181,3 +7181,221 @@ async fn test_sse_other_providers_are_unaffected_by_tgi_reassembly() {
         );
     }
 }
+
+// ─── Admission bounds and bounded per-string redaction (#6608) ──────────
+
+#[test]
+fn custom_patterns_that_match_the_empty_string_are_refused() {
+    for list in ["custom_pii_patterns", "blocked_patterns"] {
+        for regex in ["a*", "x?", "^", "(?:)", "\\s*"] {
+            let config = json!({
+                list: [{"name": "zero_width", "regex": regex}],
+                "action": "redact"
+            });
+            let err = match AiResponseGuard::new(&config) {
+                Ok(_) => panic!("{list} regex {regex:?} matches \"\" and must be refused"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("must not match the empty string"),
+                "unexpected error for {list} {regex:?}: {err}"
+            );
+        }
+        // A pattern that needs at least one character is still admitted.
+        let config = json!({
+            list: [{"name": "ok", "regex": "a+"}],
+            "action": "redact"
+        });
+        assert!(AiResponseGuard::new(&config).is_ok());
+    }
+}
+
+#[test]
+fn max_scan_bytes_has_a_hard_ceiling() {
+    let ceiling: u64 = 64 * 1024 * 1024;
+    assert!(
+        AiResponseGuard::new(&json!({"pii_patterns": ["ssn"], "max_scan_bytes": ceiling})).is_ok()
+    );
+    let err = match AiResponseGuard::new(
+        &json!({"pii_patterns": ["ssn"], "max_scan_bytes": ceiling + 1}),
+    ) {
+        Ok(_) => panic!("max_scan_bytes above the ceiling must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("max_scan_bytes"), "{err}");
+    assert!(
+        AiResponseGuard::new(&json!({"pii_patterns": ["ssn"], "max_scan_bytes": u64::MAX}))
+            .is_err()
+    );
+}
+
+#[test]
+fn custom_pattern_lists_have_count_and_name_bounds() {
+    for list in ["custom_pii_patterns", "blocked_patterns"] {
+        let at_cap: Vec<_> = (0..256)
+            .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+            .collect();
+        assert!(
+            AiResponseGuard::new(&json!({list: at_cap})).is_ok(),
+            "{list} at cap"
+        );
+
+        let over_cap: Vec<_> = (0..257)
+            .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+            .collect();
+        let err = match AiResponseGuard::new(&json!({list: over_cap})) {
+            Ok(_) => panic!("{list} above the entry cap must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.contains("at most 256 entries"), "{err}");
+
+        let long_name = "n".repeat(129);
+        assert!(
+            AiResponseGuard::new(&json!({list: [{"name": long_name, "regex": "abc"}]})).is_err(),
+            "{list} name above 128 characters must be refused"
+        );
+        let max_name = "é".repeat(128);
+        assert!(
+            AiResponseGuard::new(&json!({list: [{"name": max_name, "regex": "abc"}]})).is_ok(),
+            "{list} name bound is counted in characters"
+        );
+    }
+
+    let phrases: Vec<String> = (0..1025).map(|i| format!("phrase {i}")).collect();
+    assert!(AiResponseGuard::new(&json!({"blocked_phrases": phrases})).is_err());
+}
+
+#[test]
+fn rendered_redaction_placeholder_is_bounded() {
+    let template = "P".repeat(500) + "{type}";
+    // `pii:ssn` renders to 507 bytes: admitted.
+    assert!(
+        AiResponseGuard::new(&json!({
+            "pii_patterns": ["ssn"],
+            "redaction_placeholder": template
+        }))
+        .is_ok()
+    );
+    // `pii:email` renders to 509 bytes, still admitted; a longer custom name
+    // pushes the rendered placeholder past 512 bytes and is refused.
+    let err = match AiResponseGuard::new(&json!({
+        "custom_pii_patterns": [{"name": "long_custom_name", "regex": "abc"}],
+        "redaction_placeholder": template
+    })) {
+        Ok(_) => panic!("a rendered placeholder above 512 bytes must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("redaction_placeholder"), "{err}");
+}
+
+/// Sequential patterns can compound: every pass re-matches the placeholders
+/// written by the previous one. The per-string scalar redactor must refuse the
+/// growth instead of materialising it, and the response must fail closed.
+#[tokio::test]
+async fn compounding_structured_redaction_fails_closed_within_budget() {
+    let name = "z".repeat(128);
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": name.clone(), "regex": "[a-z]"},
+            {"name": name.clone(), "regex": "[a-z]"},
+            {"name": name, "regex": "[a-z]"}
+        ],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let body = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "hello"}}]
+    }))
+    .unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // 5 chars → 640 → 81 920 → … : far beyond the 64 KiB floor allowance.
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a redaction that cannot complete inside its budget must reject"
+    );
+    assert!(
+        plugin
+            .transform_response_body(&body, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "no partially redacted document may be produced"
+    );
+
+    // The scan-all walker shares the same bound.
+    let scan_all = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "z".repeat(128), "regex": "[a-z]"},
+            {"name": "z".repeat(128), "regex": "[a-z]"},
+            {"name": "z".repeat(128), "regex": "[a-z]"}
+        ],
+        "redaction_placeholder": "{type}",
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    assert!(
+        scan_all
+            .transform_response_body(&body, Some("application/json"), &headers)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ordinary_expanding_redaction_still_succeeds() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "digit", "regex": "[0-9]"}],
+        "action": "redact"
+    }));
+    let body = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "code 1234"}}]
+    }))
+    .unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("a modest expansion redacts normally");
+    let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "code [REDACTED:digit][REDACTED:digit][REDACTED:digit][REDACTED:digit]"
+    );
+}
+
+/// `\b` does not match the empty string, so admission accepts it, but it only
+/// ever produces zero-width spans. Redaction must refuse those instead of
+/// inserting a placeholder at every word boundary.
+#[tokio::test]
+async fn runtime_zero_width_matches_are_refused_by_every_redaction_path() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "boundary", "regex": "\\b"}],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert!(
+        plugin
+            .transform_response_body(b"hello world", Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "whole-body text redaction must refuse zero-width spans"
+    );
+
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body = br#"{"choices":[{"message":{"content":"hello world"}}]}"#;
+    assert!(
+        plugin
+            .transform_response_body(body, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "structured redaction must refuse zero-width spans"
+    );
+}

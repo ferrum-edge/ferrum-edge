@@ -8108,11 +8108,11 @@ This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-de
 |---|---|---|---|
 | `action` | String | `"reject"` | `reject`, `redact`, or `warn` |
 | `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable |
-| `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns. Closed member set: an unknown member is fatal. `regex` must not match the empty string; `name` is at most 128 characters |
+| `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns, at most 256 entries. Closed member set: an unknown member is fatal. `regex` must not match the empty string; `name` is at most 128 characters |
 | `scan_fields` | String | `"content"` | `content` (LLM prompt fields only), `all` (entire body), or `mcp_arguments` (only `params.arguments` of MCP `tools/call` requests — see **MCP tool arguments** below) |
 | `exclude_roles` | String[] | `[]` | Message roles to skip scanning. **`scan_fields: "content"` only** — see below |
 | `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text; the rendered result is at most 512 UTF-8 bytes |
-| `max_scan_bytes` | Integer | `1048576` | Maximum scanned body size, `1`–`9007199254740991`; `reject`/`redact` fail closed above it, while `warn` records an oversize warning and continues |
+| `max_scan_bytes` | Integer | `1048576` | Maximum scanned body size, `1`–`67108864` (64 MiB hard ceiling); `reject`/`redact` fail closed above it, while `warn` records an oversize warning and continues |
 
 **Built-in patterns**: `ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`
 
@@ -8219,12 +8219,12 @@ Validates and filters LLM response content before it reaches the client. Complem
 |---|---|---|---|
 | `action` | String | `"reject"` | `reject` (502), `redact`, or `warn` |
 | `pii_patterns` | String[] | `[]` | Built-in PII patterns to scan for in responses |
-| `custom_pii_patterns` | Object[] | `[]` | Custom `{name, regex}` PII patterns |
-| `blocked_phrases` | String[] | `[]` | Case-insensitive literal phrases to block |
-| `blocked_patterns` | Object[] | `[]` | Custom `{name, regex}` content patterns to block |
+| `custom_pii_patterns` | Object[] | `[]` | Custom `{name, regex}` PII patterns, at most 256 entries. `regex` must not match the empty string; `name` is at most 128 characters |
+| `blocked_phrases` | String[] | `[]` | Case-insensitive literal phrases to block, at most 1024 entries |
+| `blocked_patterns` | Object[] | `[]` | Custom `{name, regex}` content patterns to block, at most 256 entries. `regex` must not match the empty string; `name` is at most 128 characters |
 | `scan_fields` | String | `"content"` | `content` (supported completion and tool/function-call fields) or `all` (entire body) |
-| `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text |
-| `max_scan_bytes` | Integer | `1048576` | Maximum governed buffered body size, including buffered non-2xx error bodies and the aggregate decoded/decompressed native-gRPC payload across frames; reject/redact and structural rules fail closed above it, while warn-only content rules record a bounded warning and pass through |
+| `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text; the rendered result is at most 512 UTF-8 bytes |
+| `max_scan_bytes` | Integer | `1048576` | Maximum governed buffered body size (hard ceiling `67108864`, 64 MiB), including buffered non-2xx error bodies and the aggregate decoded/decompressed native-gRPC payload across frames; reject/redact and structural rules fail closed above it, while warn-only content rules record a bounded warning and pass through |
 | `require_json` | bool | `false` | Reject responses that are not valid JSON |
 | `required_fields` | String[] | `[]` | Required top-level JSON fields (rejects with 502 if missing) |
 | `max_completion_length` | Integer | `0` | Maximum completion text length in characters — Unicode scalar values, not UTF-8 bytes (0 = unlimited) |
@@ -8263,6 +8263,8 @@ Unknown built-in pattern names and built-in patterns that fail to compile are fa
 In `scan_fields: "all"` mode, the recursive redactor preserves only **top-level scalar** structural fields (`id`, `model`, `created`, `role`, `type`, `index`, `finish_reason`, `usage`, etc.) so timestamps and identifiers that look like dotted-quad IPs or other PII patterns are not corrupted. It always recurses into nested objects and arrays — including nested occurrences of those same key names — so PII cannot evade redaction by being nested under a structural key (e.g. `{"choices":[{"message":{"type":"<SSN>"}}]}` is still redacted). This recursive behavior applies across the full decoded JSON tree; `scan_fields: "content"` alone limits rewriting to supported completion fields.
 
 The `redaction_placeholder` template is emitted literally: any `$`-sequences in it or in an operator-supplied custom pattern name are written verbatim and are never interpreted as regex capture-group references. Literal blocked phrases never become public identifiers: placeholders, reject bodies, metadata, and logs use bounded positional IDs such as `blocked_phrase:0`, never the configured phrase itself.
+
+**Bounded redaction output.** The same controls as `ai_prompt_shield` apply. A `custom_pii_patterns` or `blocked_patterns` regex that matches the empty string is refused at construction, and a zero-width span produced at run time by a contextual assertion (for example a bare `\b`) makes redaction fail closed instead of inserting a placeholder at every position. Pattern names are capped at 128 characters and each rendered placeholder at 512 bytes. Whole-body text redaction is written through the response's retained-body ceiling; structured JSON, SSE, and gRPC redaction, which rewrites one string at a time, shares one growth allowance per response of four times the body size (64 KiB floor, 64 MiB ceiling). Sequential patterns that keep rewriting each other's placeholders exhaust that allowance and the response fails closed (502) rather than delivering a partially redacted body.
 
 **Streaming (SSE):** Request-controlled `Accept: text/event-stream` and internal streaming markers never waive the guard. An active guard buffers conservatively until the pristine backend representation is known. A genuine backend `text/event-stream` response is decided before header commit: `reject`, `redact`, and structural enforcement reject with HTTP 502 because complete inspection of an unbounded stream cannot be promised; a genuinely warn-only guard records the uninspectable response and permits it. A later response-header plugin cannot manufacture or erase the pristine content type used for this decision, and a missing or ambiguous backend type remains on the ordinary buffered inspection path. The existing bounded SSE parser remains applicable to finite gateway-generated or otherwise already-buffered SSE bodies: it joins legal multi-`data:` events, accepts LF, CRLF, or lone-CR line ends in any mix after ignoring leading UTF-8 BOMs (inspection and redaction split lines identically, so such streams are redacted rather than refused), preserves each line's original terminator and any leading BOMs when rewriting (except that an LF-terminated blank line directly after a line ending in a lone CR is written as CRLF, so the pair cannot merge into one line end and swallow the blank line that dispatches the event), and fails closed for enforcing/redacting malformed or non-UTF-8 content.
 
