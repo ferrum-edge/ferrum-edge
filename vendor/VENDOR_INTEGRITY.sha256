@@ -17,7 +17,7 @@ e6e01088110a9449721862af9875e9aa6ff249f72457c99c2a93fd29af156256  vendor/dimpl-0
 df7c99c8ebd5b246bea89599a598c81db6db92599414630dee7e53e82284f0fd  vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml.orig
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  vendor/dimpl-0.6.1-ferrum-patched/LICENSE-APACHE.txt
 5b460f37be48ac4cf2181596181cc6cae432fc2caae05944873f380730829a4b  vendor/dimpl-0.6.1-ferrum-patched/LICENSE-MIT.txt
-e9b1d0a23059bc0812643b881a52b358f6b39c95bef35258e931cbdb71b6e057  vendor/dimpl-0.6.1-ferrum-patched/README.md
+7134b26cb31c7e1c1c0a91b94c0276de7c50cdd55590191e9dcaaf0ddc2c1e09  vendor/dimpl-0.6.1-ferrum-patched/README.md
 b11c250576e50c550cd7236eec6464e2058211abfcd2b692bd89086128a13fc5  vendor/dimpl-0.6.1-ferrum-patched/cargo_deny.sh
 d10ea9bda37371ca7dafa463a0d3173b2d6e26ef56014bff09ee059a7ad31572  vendor/dimpl-0.6.1-ferrum-patched/clippy.toml
 e03c98143e694653963665100c2c65b16aa14282f7c3a9462d1e3810ce2fbedf  vendor/dimpl-0.6.1-ferrum-patched/deny.toml
@@ -107,7 +107,7 @@ bd4d5e738169c73253e4cc1522b1bb06048af71cf4f715d3eb006cc47190e9ae  vendor/dimpl-0
 8f80a4c75fcb6d559c212dbcef8c1019b5fe873b58a4849f0df133805da38073  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/queue.rs
 f974a3dcb851f4f23e5b83135d00af3d86136f6f4c4f36a970868baf8f2d3d74  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/server.rs
 86baeacfb53745cee38cbc156c688ba6a85b06811c78fc8b8c6e382e43bb972d  vendor/dimpl-0.6.1-ferrum-patched/src/error.rs
-ce5fc7f60e2828816dedd815f25dc3566ccb0953bd79369e704b71b6236cdb17  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
+f0e57022fb10d8b3a1cddfd6a58ae9e49109715e87dc83e91b2d7fe09b39ce2d  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
 fae07477be7a08625fc6bdc9d949b08b744ce8d7d0119f3616f56e80ad5ad1d1  vendor/dimpl-0.6.1-ferrum-patched/src/rng.rs
 49caabfeb201e65a21a4f0cb1ef76020030ca985997d4ba063322f0d2889ceba  vendor/dimpl-0.6.1-ferrum-patched/src/time_tricks.rs
 f134d1fb91dc327fed41cf9667be7e44a4413658aff2846d3fb61bfc77e0f5e6  vendor/dimpl-0.6.1-ferrum-patched/src/timer.rs
@@ -545,7 +545,7 @@ b3f8369b474af3e73ae544dae200e5634c45f84a62788c7d6ce50d2eefc8dd1e  vendor/tokio-t
 58e610b11d36e969ecb311d6e8f048db2f19049c8b3787752c53a511f86e39d9  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/compat.rs
 2e73c599a8de04240c543a24b2b564319c75ebef73fb434d116ede5d389ead30  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/connect.rs
 2030d6e704a97606cd88c3cf16404e9fded9beef9b9f661c9ddb988528e1873d  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/handshake.rs
-01df8cf5dc07d04021205b3b6da91d83d36314a41080271f4e90135ac8bcc221  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/lib.rs
+19a139f9d7ac9e54109c2cd0938ad557e1f96cc0fa6e6071ebde5b3c63251808  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/lib.rs
 1a3c9595145c913a4b29a7ff3fc8caaea171b1946e96243edb280986b6eb6172  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/stream.rs
 ede833940750523f43aecad570e38d9b21de8e4128c8efc3f5e8900116d7c211  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/tls.rs
 6a87c272eaced3a6db1d4a1b1f63bbfe9052ff5a0e8dc52aec3765b65c7dfc38  vendor/tokio-tungstenite-0.29.0-ferrum-patched/tests/into_inner_with_read_buffer.rs

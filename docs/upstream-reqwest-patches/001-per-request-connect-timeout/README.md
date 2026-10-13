@@ -32,8 +32,13 @@ they're applied per-request and override the (now absent) client default.
 
 - PR: <https://github.com/seanmonstar/reqwest/pull/3017>
 - Title: *feat: request-scoped connect timeouts*
-- Branch: `feat/request-connect-timeout` (head SHA pinned in
-  [`reqwest-3017.patch`](reqwest-3017.patch) at fetch time)
+- Branch: `feat/request-connect-timeout`. The saved
+  [`reqwest-3017.patch`](reqwest-3017.patch) is a raw diff and does **not**
+  record the PR head commit at fetch time: it contains no 40-hex commit
+  SHA and no mail-format `From` header, and its abbreviated `index` hashes
+  identify file blobs, not a head commit. The historical fetched head is
+  therefore not pinned anywhere in this directory; do not substitute the
+  current upstream PR head for it.
 - Status as of vendoring: `OPEN`, `mergeStateStatus: BLOCKED`
 
 ## Vendored crate
