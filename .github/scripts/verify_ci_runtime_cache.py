@@ -4215,6 +4215,13 @@ BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
     'consumers="${consumers}${file} "',
     "for file in ${consumers}; do",
     'sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"',
+    # The resolution date governing each rewritten pin moves with it (#6546).
+    "for file in ${consumers}; do",
+    """awk -v ref="${tagged}@${resolved}" -v today="$(date -u +%F)" '""",
+    "while (j >= 1 && line[j] ~ /^[[:space:]]*(FROM|ARG)[[:space:]]/) j--",
+    'if (j >= 1 && line[j] ~ ("^[[:space:]]*# Digest resolved " date)) {',
+    "sub(date, today, line[j])",
+    'cat "${file}.resolved" > "${file}"',
 )
 
 
@@ -5435,6 +5442,21 @@ def self_test() -> int:
             "that never collects a consumer",
             '                  consumers="${consumers}${file} "\n',
             "                  true\n",
+        ),
+        (
+            "that leaves resolution dates stale",
+            "                      sub(date, today, line[j])\n",
+            "                      true\n",
+        ),
+        (
+            "that never writes the dated file back",
+            '              cat "${file}.resolved" > "${file}"\n',
+            "",
+        ),
+        (
+            "that only redates a directly preceding comment",
+            "                    while (j >= 1 && line[j] ~ /^[[:space:]]*(FROM|ARG)[[:space:]]/) j--\n",
+            "",
         ),
         (
             "that stages only the Dockerfiles",
