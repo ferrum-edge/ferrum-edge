@@ -712,10 +712,14 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   `.github/required-publication-checks.json` succeeds on the exact head, with
   no other check failing or pending, and merges that head with a merge commit
   (`--merge --match-head-commit`), which keeps the PR head as the second parent
-  the publication gate binds to. A required context counts only as a successful
-  check run from GitHub Actions (app 15368, the producer branch protection
-  binds) inside a run of that context's `workflow_path` from the inventory;
-  skipped, neutral, foreign-app and other-workflow results never count. A failing check or a moved
+  the publication gate binds to. On every poll and again immediately before
+  merging, the PR must still be open at that head, target `main`, and come from
+  this repository's `deps/base-image-digests` branch. A required context counts
+  only when every pull-request run of its inventory `workflow_path` for that
+  branch and head has completed successfully and each carries a successful
+  check of that name from GitHub Actions (app 15368, the producer branch
+  protection binds). Skipped, neutral, foreign-app and other-workflow results
+  never count, and a queued or check-less canonical run keeps the gate waiting. A failing check or a moved
   head stops the merge and fails the run.
   The trusted Cross policy freezes the whole workflow file by SHA-256
   (`DIGEST_REFRESH_WORKFLOW_SHA256`), which closes its job set, top-level
@@ -723,8 +727,10 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   refuses any other workflow that references `BASE_IMAGE_REFRESH_TOKEN` or the
   environment, declares any deployment environment, uses indexed
   (`secrets[...]`), wildcard (`secrets.*`), bulk (`toJSON(secrets...)`) or
-  inherited (`secrets: inherit`) secret access, or uses a YAML `\u`/`\U`/`\x`
-  escape that could spell one of those after decoding. Changing the rotation or the merge gate is
+  inherited (`secrets: inherit`) secret access, or uses YAML syntax that could
+  spell an `environment` key or secret reference only after decoding (`\u`,
+  `\U` and `\x` escapes, explicit `?` keys, and tags). An `environment` key in
+  any quoting is refused outright. Changing the rotation or the merge gate is
   therefore a trusted-policy migration. `verify_ci_runtime_cache.py`
   additionally fails if the workflow stops rotating every consumer, runs
   repository code in the credentialed job, uses another token, or weakens the

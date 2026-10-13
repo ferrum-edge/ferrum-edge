@@ -4225,10 +4225,12 @@ BASE_IMAGE_REFRESH_OPEN_TOKEN = (
 )
 BASE_IMAGE_REFRESH_MERGE_MARKERS = (
     "inventory=.github/required-publication-checks.json",
-    'if [ "${head}" != "OPEN ${HEAD_SHA}" ]; then',
+    'expected="OPEN ${HEAD_SHA} main ${BRANCH} false"',
+    'if [ "${state}" != "${expected}" ]; then',
     'if [ -n "${failed}" ]; then',
-    'missing="$(jq -r --argjson checks "${checks}" --argjson runs "${runs}" \'[.required_checks[] as $r | select(([$runs[] | select(.path == $r.workflow_path and (.event == "pull_request" or .event == "pull_request_target")) | .suite]) as $suites | [$checks[] | select(.name == $r.context and .app == 15368 and .conclusion == "success" and (.suite as $s | $suites | index($s)))] | length == 0) | $r.context] | join(", ")\' "${inventory}")"',
+    'missing="$(jq -r --argjson checks "${checks}" --argjson runs "${runs}" \'[.required_checks[] as $r | select(([$runs[] | select(.path == $r.workflow_path)]) as $canonical | ($canonical | length) == 0 or any($canonical[]; .status != "completed" or .conclusion != "success" or (.suite as $s | [$checks[] | select(.suite == $s and .name == $r.context and .app == 15368 and .conclusion == "success")] | length) == 0)) | $r.context] | join(", ")\' "${inventory}")"',
     'if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then',
+    'if [ "${state}" != "${expected}" ]; then',
     'gh pr merge "${PR}" --merge --match-head-commit "${HEAD_SHA}"',
 )
 
@@ -5508,8 +5510,13 @@ def self_test() -> int:
         ),
         (
             "that accepts a skipped required check",
-            '.conclusion == "success" and',
-            '(.conclusion == "success" or .conclusion == "skipped") and',
+            '.app == 15368 and .conclusion == "success")',
+            '.app == 15368 and (.conclusion == "success" or .conclusion == "skipped"))',
+        ),
+        (
+            "that ignores a retargeted base",
+            'expected="OPEN ${HEAD_SHA} main ${BRANCH} false"',
+            'expected="OPEN ${HEAD_SHA}"',
         ),
         (
             "that accepts any check producer",

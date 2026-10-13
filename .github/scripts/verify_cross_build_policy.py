@@ -14010,7 +14010,7 @@ def cross_image_refresh_errors(workflows: dict[str, str], source: str) -> list[s
 # every other workflow is refused any environment, any mention of the token or
 # environment, any indexed, wildcard, bulk or inherited secret access, and any
 # YAML escape sequence that could spell one of those after decoding.
-DIGEST_REFRESH_WORKFLOW_SHA256 = "b0ed63455cbd1488c2a44183b66ca23603377070220191c513a43d046922a949"
+DIGEST_REFRESH_WORKFLOW_SHA256 = "2ebdbb516429f9453b79b54cb490aefca30cad8b1edcbf8582357f21d0c625dd"
 DIGEST_REFRESH_TOKEN_NAME = "BASE_IMAGE_REFRESH_TOKEN"
 DIGEST_REFRESH_ENVIRONMENT = "base-image-refresh"
 INDIRECT_SECRET_ACCESS = re.compile(
@@ -14023,7 +14023,12 @@ INDIRECT_SECRET_ACCESS = re.compile(
 # never sees. Only the hex/Unicode escapes can spell an ASCII character other
 # than whitespace or punctuation, and no workflow needs them.
 YAML_DECODING_ESCAPE = re.compile(r"\\[uUx]")
-WORKFLOW_ENVIRONMENT_KEY = re.compile(r"(?im)(?:^|[\s{,\-])environment\s*:")
+# An `environment` mapping key in any quoting. Implicit YAML keys cannot span
+# lines, so with explicit (`?`) keys, tags and hex/Unicode escapes refused, a
+# key that decodes to `environment` must contain this literal text.
+WORKFLOW_ENVIRONMENT_KEY = re.compile(r"(?i)environment\s*[\"']?\s*:")
+YAML_EXPLICIT_KEY = re.compile(r"(?m)^\s*\?(?:\s|$)")
+YAML_TAG = re.compile(r"!!|!<")
 
 
 def digest_refresh_automation_errors(
@@ -14054,6 +14059,11 @@ def digest_refresh_automation_errors(
             )
         if name == CROSS_IMAGE_REFRESH_WORKFLOW:
             continue
+        if YAML_EXPLICIT_KEY.search(text) or YAML_TAG.search(text):
+            errors.append(
+                f"{source}/{name} uses an explicit YAML key or tag, which could "
+                "decode to a deployment environment key"
+            )
         lowered = text.lower()
         if (
             DIGEST_REFRESH_TOKEN_NAME.lower() in lowered
@@ -14143,6 +14153,20 @@ def digest_refresh_automation_self_test() -> list[str]:
         ("the refresh environment", "    environment: base-image-refresh\n"),
         ("another deployment environment", "    environment:\n      name: prod\n"),
         ("a flow-mapped environment", "    with: {environment: prod}\n"),
+        (
+            "a quoted, computed environment with a continued secret name",
+            "jobs:\n  leak:\n    runs-on: ubuntu-26.04\n"
+            "    \"environment\": ${{ format('base-image-{0}', 'refresh') }}\n"
+            "    steps:\n      - env:\n"
+            "          TOKEN: \"${{ secrets.BASE_IMAGE_\\\n            REFRESH_TOKEN }}\"\n"
+            "        run: true\n",
+        ),
+        ("a single-quoted environment key", "    'environment': prod\n"),
+        (
+            "an explicit continued environment key",
+            "    ? \"envi\\\n      ronment\"\n    : prod\n",
+        ),
+        ("a tagged environment key", "    !!binary ZW52aXJvbm1lbnQ=: prod\n"),
     ):
         if not digest_refresh_automation_errors({**workflows, "other.yml": text}, "self-test"):
             failures.append(f"{label} in another workflow was admitted")
