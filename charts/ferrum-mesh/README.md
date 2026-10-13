@@ -161,9 +161,12 @@ The chart requires **exactly one** trust source when the injector is enabled:
    `cert-manager.io/inject-ca-from` on the `MutatingWebhookConfiguration`.
 
 Render fails with an actionable message when neither or both are set, when
-`caBundle` is not valid base64 PEM, or when `injectCaFrom` is not
-`namespace/name`. The chart never changes `failurePolicy` to `Ignore` to make a
-broken configuration render.
+`caBundle` is not single-line base64 whose decoded value contains
+`BEGIN CERTIFICATE`, or when `injectCaFrom` is not `namespace/name`. These are
+lexical checks only: the chart does not verify a complete PEM envelope or parse
+an X.509 CA certificate, so operators must separately provide a valid PEM CA
+certificate appropriate for the serving certificate. The chart never changes
+`failurePolicy` to `Ignore` to make a broken configuration render.
 
 ## High availability and disruption
 

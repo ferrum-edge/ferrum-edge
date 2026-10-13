@@ -8,7 +8,11 @@
 //! # Goals
 //! - **DTLS 1.2 and 1.3**: Implements the DTLS handshake and record layer used by WebRTC.
 //! - **Safety**: `forbid(unsafe_code)` throughout the crate.
-//! - **Minimal Rust‑only deps**: Uses small, well‑maintained Rust crypto crates.
+//! - **Minimal deps**: Aims for a small dependency set. Whether the crypto
+//!   dependencies are Rust-only depends on the selected crypto provider (see
+//!   "Crypto providers" below): the default features select `aws-lc-rs`,
+//!   which enables the native `aws-lc-sys`, while the `rust-crypto` feature
+//!   selects the RustCrypto provider instead.
 //! - **Low overhead**: Tight control over allocations and buffers; Sans‑IO integration.
 //!
 //! ## Non‑goals
@@ -45,6 +49,18 @@
 //! - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_AES_256_GCM`,
 //!   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
 //! - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
+//!
+//! ## Crypto providers
+//!
+//! Two built-in providers are available behind Cargo features: `aws-lc-rs`
+//! (backed by AWS-LC through the native `aws-lc-sys` dependency) and
+//! `rust-crypto` (backed by RustCrypto crates). The crate's default features
+//! are `aws-lc-rs` and `rcgen`, and `rcgen` also selects `aws-lc-rs`, so a
+//! default build is **not** Rust-only; a Rust-only crypto configuration
+//! requires selecting the `rust-crypto` feature (without `aws-lc-rs` /
+//! `rcgen`). At runtime the provider is resolved in this order: an explicit
+//! `with_crypto_provider()` value, an installed default provider, AWS-LC if
+//! its feature is enabled, then RustCrypto if its feature is enabled.
 //!
 //! ## Certificate model
 //! During the handshake the engine emits
@@ -341,6 +357,15 @@ impl fmt::Debug for DtlsPrivateKey {
 /// Existing single-certificate callers can keep using this type. The private
 /// key bytes and every clone are explicitly cleared on drop. Endpoint state
 /// immediately converts this compatibility type into [`DtlsPrivateKey`].
+///
+/// The drop-time clearing covers only the `private_key` allocation this
+/// value still owns when it is dropped. `private_key` is a public
+/// `Vec<u8>`: replacing it (e.g. by assignment or `std::mem::replace`) or
+/// extracting it (e.g. `std::mem::take`) releases or moves the previous
+/// allocation independently of this type's `Drop`, so callers that mutate
+/// the raw field are responsible for clearing the displaced bytes
+/// themselves — or should use the protected [`DtlsPrivateKey`] owner via
+/// [`DtlsCertificateChain`] instead.
 #[derive(Clone)]
 pub struct DtlsCertificate {
     /// Certificate in DER format.
@@ -380,7 +405,20 @@ impl DtlsCertificateChain {
     /// Maximum certificate count supported by the DTLS message parsers.
     pub const MAX_CERTIFICATES: usize = 32;
 
-    /// Build a validated leaf-first certificate chain.
+    /// Build a leaf-first certificate chain after **structural** validation.
+    ///
+    /// The checks here are structural only: the chain must be non-empty, each
+    /// certificate must be non-empty and fit the DTLS wire lengths, and the
+    /// private key must be non-empty. This constructor does **not** parse
+    /// the certificates or the private key with the selected crypto
+    /// provider, so an `Ok` result does not establish that endpoint
+    /// construction can use the key. Certificate-authenticated
+    /// [`Dtls::new_12`], [`Dtls::new_13`], and [`Dtls::new_auto`] parse the
+    /// key through the configured provider's key loader and **panic** if
+    /// that parse fails (see their "Panics" sections); callers that build a
+    /// chain from untrusted or not-yet-validated material should first
+    /// verify the key loads with that provider, e.g. via
+    /// `config.crypto_provider().key_provider.load_private_key(..)`.
     pub fn new(
         certificates: Vec<Vec<u8>>,
         private_key: impl Into<DtlsPrivateKey>,
@@ -672,6 +710,18 @@ impl Dtls {
     /// [`Output::PeerCert`] and its complete leaf-first chain via
     /// [`Output::PeerCertChain`]. It is up to the application to validate the
     /// chain according to its security policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the leaf certificate is empty, or if the private key
+    /// cannot be parsed by the configured crypto provider's key loader.
+    /// [`DtlsCertificateChain::new`] performs structural checks only and
+    /// does not parse the key, so callers must pre-validate the key with
+    /// the same provider (e.g.
+    /// `config.crypto_provider().key_provider.load_private_key(..)`) when
+    /// the material has not already been validated. This also applies to
+    /// chains converted from [`DtlsCertificate`], which skip even the
+    /// structural checks.
     pub fn new_12(
         config: Arc<Config>,
         certificate: impl Into<DtlsCertificateChain>,
@@ -710,6 +760,17 @@ impl Dtls {
     /// [`Output::PeerCert`] and its complete leaf-first chain via
     /// [`Output::PeerCertChain`]. It is up to the application to validate the
     /// chain according to its security policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the private key cannot be parsed by the configured crypto
+    /// provider's key loader. [`DtlsCertificateChain::new`] performs
+    /// structural checks only and does not parse the key, so callers must
+    /// pre-validate the key with the same provider (e.g.
+    /// `config.crypto_provider().key_provider.load_private_key(..)`) when
+    /// the material has not already been validated. This also applies to
+    /// chains converted from [`DtlsCertificate`], which skip even the
+    /// structural checks.
     pub fn new_13(
         config: Arc<Config>,
         certificate: impl Into<DtlsCertificateChain>,
@@ -733,6 +794,14 @@ impl Dtls {
     /// and 1.3 servers and forks into the correct handshake once the
     /// server responds. If the configuration only enables PSK DTLS 1.2
     /// suites, `new_auto` delegates to the DTLS 1.2 PSK state machine.
+    ///
+    /// # Panics
+    ///
+    /// On the certificate-authenticated path, panics if the private key
+    /// cannot be parsed by the configured crypto provider's key loader,
+    /// exactly as [`Dtls::new_13`] does; see its "Panics" section for the
+    /// pre-validation prerequisite. The PSK-only delegation described
+    /// above does not parse the certificate's private key.
     pub fn new_auto(
         config: Arc<Config>,
         certificate: impl Into<DtlsCertificateChain>,
@@ -1022,6 +1091,13 @@ impl Dtls {
     /// connection can simply drop the [`Dtls`] value.
     ///
     /// The alert is not retransmitted (per RFC 6347 §4.2.7 / RFC 9147 §5.10).
+    ///
+    /// `close()` only changes protocol state; the endpoint and its engine
+    /// (including any retained private-key owner) stay alive in this value.
+    /// Managed private-key DER is cleared when the [`Dtls`] value is
+    /// **dropped**, not by `close()` itself, so callers that need the
+    /// key material erased must drop the endpoint after closing rather
+    /// than merely retaining a closed one.
     pub fn close(&mut self) -> Result<(), Error> {
         let inner = self.inner.as_mut().unwrap();
 

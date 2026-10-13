@@ -10,7 +10,11 @@ verification and SRTP key export yourself.
 ## Goals
 - **DTLS 1.2 and 1.3**: Implements the DTLS handshake and record layer used by WebRTC.
 - **Safety**: `forbid(unsafe_code)` throughout the crate.
-- **Minimal Rust‑only deps**: Uses small, well‑maintained Rust crypto crates.
+- **Minimal deps**: Aims for a small dependency set. Whether the crypto
+  dependencies are Rust-only depends on the selected crypto provider (see
+  "Crypto providers" below): the default features select `aws-lc-rs`,
+  which enables the native `aws-lc-sys`, while the `rust-crypto` feature
+  selects the RustCrypto provider instead.
 - **Low overhead**: Tight control over allocations and buffers; Sans‑IO integration.
 
 ### Non‑goals
@@ -47,6 +51,18 @@ Four constructors control which DTLS version is used:
 - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_AES_256_GCM`,
   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
 - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
+
+### Crypto providers
+
+Two built-in providers are available behind Cargo features: `aws-lc-rs`
+(backed by AWS-LC through the native `aws-lc-sys` dependency) and
+`rust-crypto` (backed by RustCrypto crates). The crate's default features
+are `aws-lc-rs` and `rcgen`, and `rcgen` also selects `aws-lc-rs`, so a
+default build is **not** Rust-only; a Rust-only crypto configuration
+requires selecting the `rust-crypto` feature (without `aws-lc-rs` /
+`rcgen`). At runtime the provider is resolved in this order: an explicit
+`with_crypto_provider()` value, an installed default provider, AWS-LC if
+its feature is enabled, then RustCrypto if its feature is enabled.
 
 ### Certificate model
 During the handshake the engine emits
