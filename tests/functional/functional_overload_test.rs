@@ -136,16 +136,6 @@ async fn start_slow_backend_on(listener: TcpListener, delay_ms: u64, stop: Arc<A
 // authenticated `/health` detail + `ready: true` via
 // [`crate::common::probe_gateway_identity`].
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
 async fn ephemeral_port() -> u16 {
     crate::scaffolding::ports::unbound_port()
         .await
@@ -203,7 +193,7 @@ fn start_gateway(
     observability_token: &str,
     capture_log_path: Option<&std::path::Path>,
 ) -> std::process::Child {
-    let binary_path = gateway_binary_path();
+    let binary_path = crate::common::gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
     cmd.arg("run");

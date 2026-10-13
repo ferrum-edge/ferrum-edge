@@ -30,16 +30,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::Instant;
 
-/// Locate the already-built `ferrum-edge` binary. Match the same fallback
-/// order the other functional tests use.
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Write a YAML config to disk. Kept local so tests can tweak the
 /// config without jumping through the harness builder (stream proxies
 /// need `listen_port` which the Phase-1 helpers don't set).
@@ -74,7 +64,7 @@ fn spawn_gateway(
     observability_token: &str,
     capture_paths: Option<(&std::path::Path, &std::path::Path)>,
 ) -> std::io::Result<std::process::Child> {
-    let mut cmd = std::process::Command::new(gateway_binary_path());
+    let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

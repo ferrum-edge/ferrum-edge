@@ -235,8 +235,11 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 ## Advisory Gate
 
-- `cargo deny check advisories bans sources licenses` is BLOCKING on every PR
-  (`dependency-audit` job in `.github/workflows/ci.yml`) and re-runs weekly in
+- `cargo deny check advisories bans sources licenses` is BLOCKING when the
+  full dependency-audit lane is selected for an eligible event (pull request,
+  merge group, push to `main`, or manual dispatch)
+  (`dependency-audit` job in `.github/workflows/ci.yml`, gated on full mode
+  plus `run_dependency_audit`) and re-runs weekly in
   `.github/workflows/dependency-audit.yml`.
 - The gate covers BOTH workspaces: the root graph, and `ebpf/Cargo.toml` via
   `cargo deny --manifest-path ebpf/Cargo.toml check --config deny.toml ...`, in the per-PR

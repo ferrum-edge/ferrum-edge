@@ -385,7 +385,7 @@ need them, or because they are blocked upstream / architecturally:
   FORGING an enrolled pod's source address over a raw socket) is refused
   because attribution is the kernel-reported ingress interface, and a policy
   change then withdrawal denies and restores that datapath with the ambient
-  DaemonSet's restart count unchanged. The relay itself is authorized past the pod-veth tc guard the same way the TCP
+  DaemonSet's pod/container identity set and restart counters unchanged. The relay itself is authorized past the pod-veth tc guard the same way the TCP
   inbound relay is: the scoped listener's frontend socket and its per-session
   backend socket carry `NODE_WAYPOINT_INBOUND_AUTH_MARK`, and `tc_inbound`'s
   UDP arms (IPv4 and IPv6) admit a node-sourced datagram carrying that mark

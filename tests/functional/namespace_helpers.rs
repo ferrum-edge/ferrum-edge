@@ -34,17 +34,6 @@ pub fn admin_jwt() -> String {
     encode(&header, &claims, &key).expect("encode admin JWT")
 }
 
-/// Locate the `ferrum-edge` binary built by `cargo build`.
-pub fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
 /// Send an authenticated admin API request with an optional `X-Ferrum-Namespace`
 /// header. When `namespace` is `None` the header is omitted so server-side
 /// defaulting behavior can be exercised.

@@ -10,5 +10,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let _ = ferrum_edge::fuzz_support::parse_traceparent_header(text);
-    let _ = ferrum_edge::fuzz_support::traceparent_round_trip_invariant(text);
+    assert!(
+        ferrum_edge::fuzz_support::traceparent_round_trip_invariant(text),
+        "accepted traceparent must round-trip"
+    );
 });

@@ -51,7 +51,7 @@ cargo fmt --all && cargo fmt --all -- --check
 cargo clippy --lib --tests -p ferrum-edge -- -D warnings
 ```
 
-Prerequisite: `protoc`; `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
+Prerequisite: `protoc`; `build.rs` runs `tonic_prost_build` on `proto/ferrum.proto`.
 
 ## Testing Policy
 

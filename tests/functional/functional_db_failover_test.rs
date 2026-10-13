@@ -72,14 +72,6 @@ fn mint_failover_identity(label: &str) -> crate::common::SpawnedGatewayIdentity 
     crate::common::SpawnedGatewayIdentity::mint(label)
 }
 
-fn binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Build the gateway binary. Thin wrapper over the shared
 /// [`crate::common::ensure_gateway_built`] so this file's tests share the
 /// same `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1` contract as
@@ -221,7 +213,7 @@ async fn test_db_failover_urls_startup() {
 
         let identity = mint_failover_identity("db-failover-urls");
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -575,7 +567,7 @@ async fn test_db_config_backup_bootstrap() {
 
         let identity = mint_failover_identity("db-failover-backup");
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -716,7 +708,7 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         let bogus_primary = "sqlite:/nonexistent/bootstrap/bogus-invalid-backup.db?mode=ro";
         let identity = mint_failover_identity("db-failover-backup-reject");
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -948,7 +940,7 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
         let identity = mint_failover_identity("db-failover-backup-namespace");
 
         let log_file = std::fs::File::create(&log_path).expect("create stderr log");
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -1129,7 +1121,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
 
         let identity = mint_failover_identity("db-failover-recovery");
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -1314,7 +1306,7 @@ async fn test_db_read_replica_startup() {
 
         let identity = mint_failover_identity("db-failover-replica");
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -1468,7 +1460,7 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
 
         let identity = mint_failover_identity("db-failover-authoritative");
 
-        let mut cmd = Command::new(binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
