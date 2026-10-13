@@ -434,16 +434,25 @@ avoid unread-pipe deadlocks and remain owned through child shutdown. Existing
 identity probes and child checks before/after listener probes remain required.
 
 `TestGatewayBuilder::spawn` therefore mints per-spawn-attempt credentials
-(admin JWT secret/issuer plus `FERRUM_METRICS_BEARER_TOKEN`) and treats
-startup as complete only once the admin port answers `/health` in the
-**authenticated detail tier** for that instance's token *and* reports
-`ready: true`:
+(admin JWT secret/issuer plus `FERRUM_METRICS_BEARER_TOKEN`; effective
+caller overrides win) and, on the standard spawn path with admin-auth
+verification, treats startup as complete only once all three hold
+(`wait_for_owned_gateway_identity`): the admin port answers `/health` with
+`ready: true`, JWT-only `GET /proxies` returns HTTP 200 for a token minted
+from the effective attempt identity, and `Child::try_wait` shows the child
+still alive around those waits and immediately before success:
 
-- The detail tier requires the instance credential, so a foreign gateway
-  is rejected instead of impersonating the child.
+- `/health` detail alone is not ownership: it is also granted by a matching
+  metrics token or an allowed source IP (`FERRUM_METRICS_ALLOWED_CIDRS`), so
+  a CIDR-granted foreign gateway can serve ready detail despite a wrong
+  metrics bearer. `GET /proxies` is JWT-only and cannot be satisfied that
+  way, so a foreign gateway is rejected instead of impersonating the child.
 - `ready` flips only after every listener bind succeeded, including the
-  proxy HTTP listener, so an identified ready child is also proof that it
-  — not a squatter — owns the proxy port for its whole lifetime.
+  proxy HTTP listener, so a live, JWT-owned, ready child is also proof that
+  it — not a squatter — owns the proxy port for its whole lifetime.
+- When admin-auth verification is not enabled, the spawn caller takes an
+  explicit health-only alternative instead; not every builder/mode takes
+  the JWT path.
 
 That last claim requires an exclusive proxy bind. Production binds one
 exclusive listen socket and duplicates it for `FERRUM_ACCEPT_THREADS`

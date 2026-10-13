@@ -640,7 +640,7 @@ on a native-gRPC request.
 ## Transaction Logs And Redaction
 
 - `TransactionSummary` and `StreamTransactionSummary` live in `src/plugins/mod.rs`.
-- HTTP summaries carry body-streaming fields such as `body_error_class`, `body_completed`, and `bytes_streamed`.
+- HTTP summaries carry body-streaming fields such as `body_error_class` and `body_completed`; `bytes_received` accounts for response-body bytes in streaming and buffered summaries.
 - Stream summaries carry `disconnect_direction` and `disconnect_cause`.
 - Error classifiers include reqwest, gRPC proxy, boxed, H2 pool, and H3 classifiers.
 - Summary `metadata` serializes through `metadata_redaction::serialize_redacted_metadata`.

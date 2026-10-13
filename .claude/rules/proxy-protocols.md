@@ -74,7 +74,7 @@ paths:
 
 ## Protocol Paths
 
-- HTTP/1.1: hyper to reqwest through `ConnectionPool`; streaming default.
+- HTTP/1.1: hyper frontend to Ferrum's direct hyper HTTP/1.1 backend pool by default (`FERRUM_POOL_HTTP1_DIRECT=true`, hyper `client::conn::http1`) when `direct_h1_dispatch_eligible` admits the body state and HTTP/1-only backend selection; reqwest through `ConnectionPool` when the flag is off or eligibility fails. Streaming is the configured/default body mode, not a guarantee for every response: small known-length bodies may be eagerly buffered under the response-buffer cutoff (SSE always streams).
 - HTTP/2: hyper ALPN to reqwest or `Http2ConnectionPool`; streaming default.
 - HTTP/3: quinn/h3 standalone server to `Http3ConnectionPool` or cross-protocol bridge; streaming through the shared H3 coalescer.
 - gRPC: hyper H2 direct through `GrpcConnectionPool`, not reqwest, to preserve trailers.
@@ -138,7 +138,7 @@ paths:
 
 ## Capability, Errors, And Health
 
-- Backend capability registry chooses native H3, direct H2, or reqwest for plain HTTPS by concrete target. `Unknown` and `Unsupported` route through reqwest.
+- Backend capability registry chooses native H3, direct H2, or reqwest for plain HTTPS by concrete target, but capability state is only one input to dispatch, not a universal reqwest guarantee for `Unknown`/`Unsupported`. An eligible `Unknown` target may still take direct H2 when an `Upgrade` (`h2UpgradePolicy`) preference applies or a per-request SNI override requires it (`Upgrade` alone never overrides a proven `Unsupported` verdict), and an eligible H2-TLS `Unsupported` target may take the default-enabled direct-H1 pool when `direct_h1_dispatch_eligible` admits it. Reqwest remains the path where the relevant direct-H2/direct-H1 predicates do not select a direct pool.
 - Warmup populates capabilities when `FERRUM_POOL_WARMUP_ENABLED=true`; otherwise the refresh task runs an initial probe. Reloads coalesce to at most one in-flight refresh and one queued rerun.
 - H3 downgrade must use `mark_h3_unsupported`/`mark_h2_tls_unsupported` guards and must not treat client disconnects, payload-size errors, graceful remote close, or `H3_NO_ERROR` GOAWAY as capability failures.
 - `BackendResponse::connection_error` means exactly "the request body never reached the backend application layer."
