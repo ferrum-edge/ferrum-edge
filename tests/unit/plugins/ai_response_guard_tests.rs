@@ -7192,26 +7192,29 @@ async fn sse_index_families_past_the_ceiling_fail_closed() {
         "blocked_phrases": ["never-present-phrase"],
         "action": "reject"
     }));
-    let frame_sets: Vec<(&str, Box<dyn Fn(usize) -> serde_json::Value>)> = vec![
-        (
-            "chat content (shared reassembler)",
-            Box::new(|i| json!({"choices": [{"index": i, "delta": {"content": "c"}}]})),
-        ),
-        (
-            "chat refusal (guard side accumulator)",
-            Box::new(|i| json!({"choices": [{"index": i, "delta": {"refusal": "r"}}]})),
-        ),
+    type FrameBuilder = fn(usize) -> serde_json::Value;
+    fn chat_content(i: usize) -> serde_json::Value {
+        json!({"choices": [{"index": i, "delta": {"content": "c"}}]})
+    }
+    fn chat_refusal(i: usize) -> serde_json::Value {
+        json!({"choices": [{"index": i, "delta": {"refusal": "r"}}]})
+    }
+    fn legacy_function_call(i: usize) -> serde_json::Value {
+        json!({"choices": [{"index": i, "delta": {"function_call": {"name": "n"}}}]})
+    }
+    fn responses_refusal(i: usize) -> serde_json::Value {
+        json!({"type": "response.refusal.delta", "output_index": i, "delta": "r"})
+    }
+    let frame_sets: [(&str, FrameBuilder); 4] = [
+        ("chat content (shared reassembler)", chat_content),
+        ("chat refusal (guard side accumulator)", chat_refusal),
         (
             "legacy function_call name (guard side accumulator)",
-            Box::new(
-                |i| json!({"choices": [{"index": i, "delta": {"function_call": {"name": "n"}}}]}),
-            ),
+            legacy_function_call,
         ),
         (
             "Responses refusal (guard side accumulator)",
-            Box::new(
-                |i| json!({"type": "response.refusal.delta", "output_index": i, "delta": "r"}),
-            ),
+            responses_refusal,
         ),
     ];
     for (label, frame) in frame_sets {
