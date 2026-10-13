@@ -30,7 +30,6 @@ env:
   # workflow builds without a compiler cache.
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
-  AWS_LC_SYS_PREBUILT_NASM: "1"
 
 # A newer push to the same pull request cancels the superseded run. Every
 # other event gets a unique group so it always runs to completion.
@@ -58,9 +57,9 @@ jobs:
         with:
           toolchain: stable
 
-      # Only PROTOC is exported; PATH is left untouched. aws-lc-sys uses its
-      # prebuilt NASM objects instead of a downloaded assembler.
-      - name: Install protoc
+      # Same checksum-pinned protoc and NASM the native release builds use.
+      # Vendored OpenSSL needs NASM on Windows.
+      - name: Install protoc and NASM
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -81,6 +80,24 @@ jobs:
             throw "protoc.exe was not found after extracting $protocZip"
           }
           "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+          $nasmVersion = "3.02"
+          $nasmZip = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
+          $nasmRoot = Join-Path $env:RUNNER_TEMP "nasm"
+          Invoke-WebRequest `
+            -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
+            -OutFile $nasmZip
+          $expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
+          $actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip).Hash.ToLowerInvariant()
+          if ($actualNasmSha256 -ne $expectedNasmSha256) {
+            throw "NASM archive SHA-256 mismatch: expected $expectedNasmSha256, got $actualNasmSha256"
+          }
+          Expand-Archive -Path $nasmZip -DestinationPath $nasmRoot -Force
+          $nasmBin = Join-Path $nasmRoot "nasm-$nasmVersion"
+          if (!(Test-Path (Join-Path $nasmBin "nasm.exe"))) {
+            throw "nasm.exe was not found after extracting $nasmZip"
+          }
+          $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Compile the unit test binary
         shell: bash
