@@ -4756,10 +4756,19 @@ sys.stdout.write("FORGED-SENT")
 ' "$target_ip" "$port" "$source_ip" "$mark" "$payload" 2>/dev/null || echo "FORGED-UNAVAILABLE:exec"
 }
 
+# Count backend log lines carrying `payload`. Fails (status 1, no output) when
+# the log itself cannot be read, so no assertion ever mistakes an unreadable
+# log for "the backend saw zero datagrams" (issues #6303, #6513). Callers must
+# capture that status separately from the count.
+backend_log_payload_count() {
+  local ns="$1" deploy="$2" payload="$3" logs count
+  logs="$(kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null)" || return 1
+  count="$(grep -c "^recv:${payload}$" <<<"$logs")" || [[ "$count" == "0" ]] || return 1
+  printf '%s' "$count"
+}
+
 udp_backend_received() {
-  local ns="$1" deploy="$2" payload="$3"
-  kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null |
-    grep -c "^recv:${payload}$" || true
+  backend_log_payload_count "$1" "$2" "$3"
 }
 
 # How many datagrams carrying `payload` the udp-echo backend actually received.
@@ -4770,10 +4779,45 @@ udp_echo_backend_received() {
   udp_backend_received "$WORKLOAD_NS" udp-echo "$1"
 }
 
-ambient_restart_total() {
+# Stable ambient identity snapshot (issue #6514): one sorted
+# `<pod-uid>\t<container>\t<containerID>\t<restartCount>` line per ambient
+# container. Comparing two snapshots binds a no-restart claim to the same pod
+# and container population -- an aggregate restart total cannot, because
+# replacing a zero-restart pod with another zero-restart pod leaves it
+# unchanged. Fails (status 1, no usable output) when the pod list cannot be
+# read or any identity field is missing, so callers must treat capture
+# failure as inconclusive rather than as continuity.
+ambient_restart_snapshot() {
   kubectl -n "$MESH_NS" get pods -l app.kubernetes.io/component=ambient \
-    -o jsonpath='{range .items[*]}{.status.containerStatuses[*].restartCount}{"\n"}{end}' 2>/dev/null |
-    awk '{ for (i = 1; i <= NF; i++) total += $i } END { print total + 0 }'
+    -o json 2>/dev/null | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+rows = []
+for pod in data.get("items") or []:
+    uid = (pod.get("metadata") or {}).get("uid")
+    statuses = (pod.get("status") or {}).get("containerStatuses") or []
+    if not uid or not statuses:
+        sys.exit(1)
+    for status in statuses:
+        name = status.get("name")
+        container_id = status.get("containerID")
+        restarts = status.get("restartCount")
+        if not name or not container_id or not isinstance(restarts, int):
+            sys.exit(1)
+        rows.append("%s\t%s\t%s\t%s" % (uid, name, container_id, restarts))
+if not rows:
+    sys.exit(1)
+print("\n".join(sorted(rows)))
+'
+}
+
+ambient_snapshot_restart_total() {
+  awk -F '\t' '{ total += $4 } END { print total + 0 }' <<<"$1"
 }
 
 # The node-local address the NodeWaypoint UDP/DTLS listeners are PROBED at.
@@ -4848,7 +4892,7 @@ wait_for_udp_outcome() {
 
 run_node_waypoint_udp_datapath_checks() {
   log "running NodeWaypoint UDP listener datapath checks (issue #3286)"
-  local listener_ip reply restarts_before restarts_after echo_pod_ip
+  local listener_ip reply ambient_before ambient_after echo_pod_ip
 
   listener_ip="$(node_waypoint_listener_ip)"
   if [[ -z "$listener_ip" ]]; then
@@ -4871,7 +4915,13 @@ run_node_waypoint_udp_datapath_checks() {
     return 1
   fi
   local allow_backend_hits
-  allow_backend_hits="$(udp_echo_backend_received ping-a)"
+  if ! allow_backend_hits="$(udp_echo_backend_received ping-a)"; then
+    record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
+      udp-src-a udp-echo "backend log unavailable, so the backend hit count is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$allow_backend_hits" == "0" ]]; then
     record_live_assertion node_waypoint.udp.listener_allow_attributed_source fail \
       udp-src-a udp-echo "the echo arrived but the backend logged no datagram" \
@@ -4912,7 +4962,8 @@ run_node_waypoint_udp_datapath_checks() {
     # way back to the enrolled source pod. Record it so the failure is
     # actionable from the job log alone.
     local unreplied_backend_hits
-    unreplied_backend_hits="$(udp_echo_backend_received svc-a)"
+    unreplied_backend_hits="$(udp_echo_backend_received svc-a)" ||
+      unreplied_backend_hits="unavailable"
     record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
       udp-src-a udp-echo \
       "service_ip=$service_ip observed=$service_reply backend_hits=$unreplied_backend_hits" \
@@ -4922,7 +4973,13 @@ run_node_waypoint_udp_datapath_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  service_backend_hits="$(udp_echo_backend_received svc-a)"
+  if ! service_backend_hits="$(udp_echo_backend_received svc-a)"; then
+    record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
+      udp-src-a udp-echo "backend log unavailable, so the backend hit count is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$service_backend_hits" == "0" ]]; then
     record_live_assertion node_waypoint.udp.service_path_allow_attributed_source fail \
       udp-src-a udp-echo "the echo arrived but the backend logged no Service-path datagram" \
@@ -4959,7 +5016,14 @@ run_node_waypoint_udp_datapath_checks() {
   fi
   sleep 2
   local unattributed_backend_hits
-  unattributed_backend_hits="$(udp_echo_backend_received ping-x)"
+  if ! unattributed_backend_hits="$(udp_echo_backend_received ping-x)"; then
+    record_live_assertion node_waypoint.udp.listener_deny_unattributed_source fail \
+      udp-unmanaged udp-echo \
+      "backend log unavailable, so the zero-hit evidence is inconclusive observed=$reply" "" \
+      "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$unattributed_backend_hits" != "0" ]]; then
     record_live_assertion node_waypoint.udp.listener_deny_unattributed_source fail \
       udp-unmanaged udp-echo \
@@ -4981,7 +5045,16 @@ run_node_waypoint_udp_datapath_checks() {
     "$UDP_LISTENER_PORT" "$src_a_pod_ip" ping-spoof 4)"
   sleep 2
   local spoof_backend_hits
-  spoof_backend_hits="$(udp_echo_backend_received ping-spoof)"
+  spoof_backend_hits="$(udp_echo_backend_received ping-spoof)" ||
+    spoof_backend_hits="unavailable"
+  if [[ "$spoof_reply" == SPOOF-SENT:* && "$spoof_backend_hits" == "unavailable" ]]; then
+    record_live_assertion node_waypoint.udp.listener_deny_spoofed_source fail \
+      udp-unmanaged udp-echo \
+      "forged_source=$src_a_pod_ip backend log unavailable, so the zero-hit evidence is inconclusive" "" \
+      "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   # A refusal is only recorded when the forged datagram was ACTUALLY emitted
   # (`SPOOF-SENT:` is printed after `sendto` returns) and the backend proved it
   # never arrived. A sandbox that cannot forge fails the gate closed rather than
@@ -5060,7 +5133,14 @@ refusal was observed" "" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
       return 1
     fi
     sleep 2
-    forged_backend_hits="$(udp_echo_backend_received "$forged_payload")"
+    if ! forged_backend_hits="$(udp_echo_backend_received "$forged_payload")"; then
+      record_live_assertion node_waypoint.udp.listener_deny_forged_relay_mark fail \
+        udp-forger udp-echo \
+        "shape=$shape backend log unavailable, so the zero-hit evidence is inconclusive" "" \
+        "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
     if [[ "$forged_backend_hits" != "0" ]]; then
       record_live_assertion node_waypoint.udp.listener_deny_forged_relay_mark fail \
         udp-forger udp-echo \
@@ -5079,7 +5159,14 @@ mark=$NODE_WAYPOINT_INBOUND_AUTH_MARK backend_hits=0" "" "$(spiffe_for_sa dst-a)
 
   # 5. Policy CHANGE: deny the previously admitted source and prove the live
   #    data plane converges with no restart.
-  restarts_before="$(ambient_restart_total)"
+  if ! ambient_before="$(ambient_restart_snapshot)"; then
+    record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
+      udp-src-a udp-echo \
+      "ambient identity snapshot unavailable before the policy change, so continuity is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   kubectl apply -f - <<EOF
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
@@ -5102,18 +5189,25 @@ EOF
     collect_traffic_failure_diagnostics
     return 1
   fi
-  restarts_after="$(ambient_restart_total)"
-  if [[ "$restarts_after" != "$restarts_before" ]]; then
+  if ! ambient_after="$(ambient_restart_snapshot)"; then
     kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
     record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
       udp-src-a udp-echo \
-      "convergence required a data plane restart before=$restarts_before after=$restarts_after" \
+      "ambient identity snapshot unavailable after the policy change, so continuity is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    return 1
+  fi
+  if [[ "$ambient_after" != "$ambient_before" ]]; then
+    kubectl -n "$WORKLOAD_NS" delete authorizationpolicy deny-src-a-udp --ignore-not-found=true
+    record_live_assertion node_waypoint.udp.policy_change_denies_live fail \
+      udp-src-a udp-echo \
+      "convergence changed the ambient pod/container identity set or a restart counter" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
     return 1
   fi
   record_live_assertion node_waypoint.udp.policy_change_denies_live pass \
     udp-src-a udp-echo \
-    "observed=TIMEOUT ambient_restarts=$restarts_after (unchanged)" \
+    "observed=TIMEOUT ambient_identities=stable ambient_restarts=$(ambient_snapshot_restart_total "$ambient_after")" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
 
   # 6. Policy WITHDRAWAL: removing it restores the datapath, still with no
@@ -5127,17 +5221,23 @@ EOF
     collect_traffic_failure_diagnostics
     return 1
   fi
-  restarts_after="$(ambient_restart_total)"
-  if [[ "$restarts_after" != "$restarts_before" ]]; then
+  if ! ambient_after="$(ambient_restart_snapshot)"; then
     record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live fail \
       udp-src-a udp-echo \
-      "recovery required a data plane restart before=$restarts_before after=$restarts_after" \
+      "ambient identity snapshot unavailable after withdrawal, so continuity is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
+    return 1
+  fi
+  if [[ "$ambient_after" != "$ambient_before" ]]; then
+    record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live fail \
+      udp-src-a udp-echo \
+      "recovery changed the ambient pod/container identity set or a restart counter" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
     return 1
   fi
   record_live_assertion node_waypoint.udp.policy_withdrawal_recovers_live pass \
     udp-src-a udp-echo \
-    "observed=$reply ambient_restarts=$restarts_after (unchanged)" \
+    "observed=$reply ambient_identities=stable ambient_restarts=$(ambient_snapshot_restart_total "$ambient_after")" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
 }
 
@@ -5233,26 +5333,16 @@ dtls_probe_from() {
 }
 
 dtls_backend_received() {
-  local ns="$1" deploy="$2" payload="$3"
-  kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null |
-    grep -c "^recv:${payload}$" || true
+  backend_log_payload_count "$1" "$2" "$3"
 }
 
 # How many decrypted datagrams carrying `payload` the dtls-echo backend received.
 # Reply-absence alone would not distinguish "denied before the backend" from
-# "reply lost", so the backend log is the authority for the deny case.
+# "reply lost", so the backend log is the authority for the deny case. Like
+# backend_log_payload_count this fails when the log cannot be read (issue
+# #6513); callers must capture that status separately from the count.
 dtls_echo_backend_received() {
   dtls_backend_received "$WORKLOAD_NS" dtls-echo "$1"
-}
-
-# Count backend log lines carrying `payload`. Unlike dtls_backend_received this
-# fails (status 1, no output) when the log itself cannot be read, so a denial
-# row never mistakes an unreadable log for "the backend saw zero datagrams".
-backend_log_payload_count() {
-  local ns="$1" deploy="$2" payload="$3" logs count
-  logs="$(kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null)" || return 1
-  count="$(grep -c "^recv:${payload}$" <<<"$logs")" || [[ "$count" == "0" ]] || return 1
-  printf '%s' "$count"
 }
 
 DTLS_PROBE_RC_MARKER="FERRUM_DTLS_PROBE_RC:"
@@ -5487,7 +5577,14 @@ run_node_waypoint_dtls_service_path_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits="$(dtls_echo_backend_received dtls-svc-a)"
+  if ! hits="$(dtls_echo_backend_received dtls-svc-a)"; then
+    record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
+      dtls-src-a dtls-echo \
+      "backend log unavailable, so the backend hit count is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$hits" == "0" ]]; then
     record_live_assertion node_waypoint.dtls.service_path_allow_attributed_source fail \
       dtls-src-a dtls-echo \
@@ -5598,7 +5695,13 @@ material" "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-
     return 1
   fi
   local dtls_allow_hits
-  dtls_allow_hits="$(dtls_echo_backend_received dtls-a)"
+  if ! dtls_allow_hits="$(dtls_echo_backend_received dtls-a)"; then
+    record_live_assertion node_waypoint.dtls.listener_allow_attributed_source fail \
+      dtls-src-a dtls-echo "backend log unavailable, so the backend hit count is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-listener"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$dtls_allow_hits" == "0" ]]; then
     record_live_assertion node_waypoint.dtls.listener_allow_attributed_source fail \
       dtls-src-a dtls-echo "the echo arrived but the backend logged no decrypted datagram" \
@@ -5702,7 +5805,7 @@ sys.stdout.write("|".join(out))
 # the backend logs plus the echo prefix, never reply-absence alone.
 run_node_waypoint_udp_same_port_demux_checks() {
   log "running NodeWaypoint same-port UDP Service demultiplex checks (issue #3861)"
-  local ip_a ip_b reply hits_a hits_b restarts_before restarts_after
+  local ip_a ip_b reply hits_a hits_b ambient_before ambient_after
 
   ip_a="$(service_cluster_ip "$WORKLOAD_NS" udp-demux-a 4)"
   ip_b="$(service_cluster_ip "$WORKLOAD_NS" udp-demux-b 4)"
@@ -5723,8 +5826,15 @@ run_node_waypoint_udp_same_port_demux_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-a)"
-  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)"
+  if ! hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-a)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
+      udp-src-a udp-demux-a "backend A log unavailable, so the backend hit count is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)" ||
+    hits_b="unavailable"
   if [[ "$hits_a" == "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_serves_a fail \
       udp-src-a udp-demux-a "echo arrived but backend A logged no datagram" \
@@ -5744,8 +5854,15 @@ run_node_waypoint_udp_same_port_demux_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-b)"
-  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-b)"
+  if ! hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-b)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_serves_b fail \
+      udp-src-a udp-demux-b "backend B log unavailable, so the backend hit count is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-ping-b)" ||
+    hits_a="unavailable"
   if [[ "$hits_b" == "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_serves_b fail \
       udp-src-a udp-demux-b "echo arrived but backend B logged no datagram" \
@@ -5757,6 +5874,13 @@ run_node_waypoint_udp_same_port_demux_checks() {
     udp-src-a udp-demux-b "cluster_ip=$ip_b observed=$reply backend_hits=$hits_b" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
 
+  if [[ "$hits_a" == "unavailable" ]]; then
+    record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
+      udp-src-a udp-demux-a "backend A log unavailable, so the zero-hit evidence is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$hits_a" != "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
       udp-src-a udp-demux-a "payload for B reached backend A hits=$hits_a" \
@@ -5764,7 +5888,13 @@ run_node_waypoint_udp_same_port_demux_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)"
+  if ! hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-ping-a)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
+      udp-src-a udp-demux-b "backend B log unavailable, so the zero-hit evidence is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$hits_b" != "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_isolated fail \
       udp-src-a udp-demux-b "payload for A reached backend B hits=$hits_b" \
@@ -5781,13 +5911,19 @@ run_node_waypoint_udp_same_port_demux_checks() {
     "$DEMUX_UDP_PORT" demux-shared-a demux-shared-b 3)"; then
     shared="EXECFAIL"
   fi
-  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-a)"
-  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-b)"
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-a)" ||
+    hits_a="unavailable"
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-b)" ||
+    hits_b="unavailable"
   local misroute_a misroute_b
-  misroute_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-a)"
-  misroute_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-b)"
+  misroute_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-shared-a)" ||
+    misroute_a="unavailable"
+  misroute_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-shared-b)" ||
+    misroute_b="unavailable"
   if [[ "$shared" != *"A:demux-a:demux-shared-a"* || "$shared" != *"B:demux-b:demux-shared-b"* \
-    || "$hits_a" == "0" || "$hits_b" == "0" || "$misroute_a" != "0" || "$misroute_b" != "0" ]]; then
+    || "$hits_a" == "0" || "$hits_a" == "unavailable" \
+    || "$hits_b" == "0" || "$hits_b" == "unavailable" \
+    || "$misroute_a" != "0" || "$misroute_b" != "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_shared_client_tuple fail \
       udp-src-a udp-demux-a "observed=$shared hits_a=$hits_a hits_b=$hits_b misroute_a=$misroute_a misroute_b=$misroute_b" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
@@ -5798,7 +5934,14 @@ run_node_waypoint_udp_same_port_demux_checks() {
     udp-src-a udp-demux-a "one bound client socket addressed both ClusterIPs without collision" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
 
-  restarts_before="$(ambient_restart_total)"
+  if ! ambient_before="$(ambient_restart_snapshot)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a \
+      "ambient identity snapshot unavailable before the Service delete, so continuity is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   kubectl -n "$WORKLOAD_NS" delete svc udp-demux-a --wait=true --timeout=60s
   # Convergence polls use a dedicated payload so pre-convergence datagrams that
   # still reach backend A cannot pollute the post-convergence backend evidence.
@@ -5818,7 +5961,13 @@ run_node_waypoint_udp_same_port_demux_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-retract-proof-a)"
+  if ! hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-retract-proof-a)"; then
+    record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
+      udp-src-a udp-demux-a "backend A log unavailable, so the zero-hit evidence is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
   if [[ "$hits_a" != "0" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
       udp-src-a udp-demux-a "backend A still received demux-retract-proof-a after Service delete" \
@@ -5834,20 +5983,28 @@ run_node_waypoint_udp_same_port_demux_checks() {
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-keep-b)"
-  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-keep-b)"
-  restarts_after="$(ambient_restart_total)"
-  if [[ "$hits_b" == "0" || "$hits_a" != "0" || "$restarts_before" != "$restarts_after" ]]; then
+  hits_b="$(udp_backend_received "$WORKLOAD_NS" udp-demux-b demux-keep-b)" ||
+    hits_b="unavailable"
+  hits_a="$(udp_backend_received "$WORKLOAD_NS" udp-demux-a demux-keep-b)" ||
+    hits_a="unavailable"
+  local ambient_stable=true
+  if ! ambient_after="$(ambient_restart_snapshot)"; then
+    ambient_stable="unavailable"
+  elif [[ "$ambient_before" != "$ambient_after" ]]; then
+    ambient_stable=false
+  fi
+  if [[ "$hits_b" == "0" || "$hits_b" == "unavailable" || "$hits_a" != "0" \
+    || "$ambient_stable" != "true" ]]; then
     record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b fail \
       udp-src-a udp-demux-b \
-      "hits_b=$hits_b hits_a=$hits_a restarts_before=$restarts_before restarts_after=$restarts_after" \
+      "hits_b=$hits_b hits_a=$hits_a ambient_identities_stable=$ambient_stable" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
     collect_traffic_failure_diagnostics
     return 1
   fi
   record_live_assertion node_waypoint.udp.same_port_demux_retract_a_keeps_b pass \
     udp-src-a udp-demux-b \
-    "A retracted cluster_ip=$ip_a, B still isolated on $ip_b, ambient restarts unchanged=$restarts_after" \
+    "A retracted cluster_ip=$ip_a, B still isolated on $ip_b, ambient_identities=stable ambient_restarts=$(ambient_snapshot_restart_total "$ambient_after")" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-same-port-demux"
 }
 
@@ -5893,7 +6050,7 @@ run_node_waypoint_dtls_reload_isolation_checks() {
   log "running NodeWaypoint DTLS owner-scoped reload isolation checks (issue #3858)"
   local listener_ip current_cert current_key stale_cert stale_key
   local overload_before overload_after health_file report reply hits
-  local gen_before gen_after restarts_before restarts_after attempt payload snippet
+  local gen_before gen_after ambient_before ambient_after attempt payload snippet
   local ambient_pod stale_payload
 
   listener_ip="$(node_waypoint_listener_ip)"
@@ -5911,7 +6068,14 @@ run_node_waypoint_dtls_reload_isolation_checks() {
   overload_after="$RESULTS_DIR/dtls-reload-overload-after.json"
   health_file="$RESULTS_DIR/dtls-reload-health.json"
   ambient_pod="$(ambient_pod_on_node "$NODE_A")"
-  restarts_before="$(ambient_restart_total)"
+  if ! ambient_before="$(ambient_restart_snapshot)"; then
+    record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
+      dtls-src-a dtls-echo \
+      "ambient identity snapshot unavailable before generated-owner publication, so continuity is inconclusive" \
+      "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
+    collect_traffic_failure_diagnostics
+    return 1
+  fi
 
   if ! fetch_ambient_admin_json "$NODE_A" /health "$health_file" \
     || ! health_ready "$health_file"; then
@@ -5974,7 +6138,7 @@ print(json.dumps(obj))
       # probe plus the backend log still prove no plaintext mutation.
       reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
         "$DTLS_LISTENER_PORT" "$payload" 2)"
-      hits="$(dtls_echo_backend_received "$payload")"
+      hits="$(dtls_echo_backend_received "$payload")" || hits="unavailable"
       if [[ "$reply" != *"dtls-ok:$payload"* && "$hits" == "0" ]]; then
         break
       fi
@@ -6015,10 +6179,10 @@ print(json.dumps(obj))
     collect_traffic_failure_diagnostics
     return 1
   fi
-  hits="$(dtls_echo_backend_received dtls-reload-current)"
+  hits="$(dtls_echo_backend_received dtls-reload-current)" || hits="unavailable"
   report="$(dtls_handshake_report_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
     "$DTLS_LISTENER_PORT" 10 "$current_cert" "$current_key")"
-  if [[ "$hits" == "0" ]] || ! dtls_handshake_completed "$report"; then
+  if [[ "$hits" == "0" || "$hits" == "unavailable" ]] || ! dtls_handshake_completed "$report"; then
     snippet="$(dtls_report_snippet "$report")"
     record_live_assertion node_waypoint.dtls.reload_current_ca_admitted fail \
       dtls-src-a dtls-echo "backend_hits=$hits report=${snippet}" \
@@ -6048,7 +6212,7 @@ print(json.dumps(obj))
     if dtls_handshake_incomplete_against_generated_listener "$report"; then
       reply="$(dtls_probe_from "$WORKLOAD_NS" dtls-src-a "$listener_ip" \
         "$DTLS_LISTENER_PORT" "$stale_payload" 2 "$stale_cert" "$stale_key")"
-      hits="$(dtls_echo_backend_received "$stale_payload")"
+      hits="$(dtls_echo_backend_received "$stale_payload")" || hits="unavailable"
       if [[ "$reply" != *"dtls-ok:$stale_payload"* && "$hits" == "0" ]]; then
         break
       fi
@@ -6078,7 +6242,12 @@ print(json.dumps(obj))
     return 1
   fi
   gen_after="$(frontend_dtls_reload_generation "$overload_after")" || gen_after=""
-  restarts_after="$(ambient_restart_total)"
+  local ambient_stable=true
+  if ! ambient_after="$(ambient_restart_snapshot)"; then
+    ambient_stable="unavailable"
+  elif [[ "$ambient_before" != "$ambient_after" ]]; then
+    ambient_stable=false
+  fi
   if [[ -z "$gen_after" ]]; then
     record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
       dtls-src-a dtls-echo "frontend_dtls_reload.generation missing from /overload after generated-owner publication" \
@@ -6086,17 +6255,17 @@ print(json.dumps(obj))
     collect_traffic_failure_diagnostics
     return 1
   fi
-  if [[ "$gen_after" != "$gen_before" || "$restarts_before" != "$restarts_after" ]]; then
+  if [[ "$gen_after" != "$gen_before" || "$ambient_stable" != "true" ]]; then
     record_live_assertion node_waypoint.dtls.operator_isolated_across_reload fail \
       dtls-src-a dtls-echo \
-      "ordinary frontend_dtls_reload.generation or ambient restarts changed gen_before=$gen_before gen_after=$gen_after restarts_before=$restarts_before restarts_after=$restarts_after" \
+      "ordinary frontend_dtls_reload.generation changed or ambient continuity unproven gen_before=$gen_before gen_after=$gen_after ambient_identities_stable=$ambient_stable" \
       "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
     collect_traffic_failure_diagnostics
     return 1
   fi
   record_live_assertion node_waypoint.dtls.operator_isolated_across_reload pass \
     dtls-src-a dtls-echo \
-    "ordinary /overload frontend_dtls_reload.generation captured pre/post generated-owner publication unchanged=$gen_after, ambient restarts unchanged=$restarts_after, no bound ordinary listener claimed" \
+    "ordinary /overload frontend_dtls_reload.generation captured pre/post generated-owner publication unchanged=$gen_after, ambient_identities=stable ambient_restarts=$(ambient_snapshot_restart_total "$ambient_after"), no bound ordinary listener claimed" \
     "$(spiffe_for_sa src-a)" "$(spiffe_for_sa dst-a)" "node-waypoint-dtls-reload"
 }
 

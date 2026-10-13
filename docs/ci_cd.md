@@ -892,10 +892,16 @@ concurrency:
 A new push to a pull request cancels that PR's superseded run. Pushes to
 `main`, dispatches, and schedules get a unique `run-<id>` group, so they are
 never cancelled and never displace a queued dispatch. `h3-live-comparison.yml`
-and `h2-guard-observation.yml` keep their own named groups but likewise cancel
-only on `pull_request`; `h3-proof-preflight.yml` uses its own group keyed on
-the PR number or ref and always cancels the superseded run. The required
-workflows keep their own event-aware groups (see below).
+and `h2-guard-observation.yml` keep their own named groups and likewise cancel
+only on `pull_request`, but their manual dispatches also get a unique
+`run-<id>` group: `cancel-in-progress: false` alone protects only a campaign
+that is already running (a group otherwise holds one running and one pending
+run, and a later same-group dispatch would replace the pending one), while the
+per-run group preserves every queued manual campaign. H2 main pushes keep the
+ref group and the coalescing described under
+[Main-push concurrency](#main-push-concurrency). `h3-proof-preflight.yml` uses
+its own group keyed on the PR number or ref and always cancels the superseded
+run. The required workflows keep their own event-aware groups (see below).
 
 **Measuring gate changes.** `.github/scripts/ci_gate_replay.py` replays merged
 pull requests through two revisions of `pr_ci_plan.py`,
@@ -2822,7 +2828,8 @@ publishing anything on an unproven result.
 ### Release Build Job
 
 **Runs**: `ubuntu-26.04`, `macos-latest`, `windows-latest` (four-target native
-matrix plus the isolated Linux ARM64 job)
+matrix) plus `ubuntu-24.04` (the isolated Linux ARM64 job,
+`build-release-arm64-cross`)
 
 Depends on `Validate release SHA`, then builds optimized release binaries for all target platforms:
 

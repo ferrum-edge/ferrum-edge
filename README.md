@@ -27,7 +27,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
 - **Built-in plugin system**: Authentication, authorization, OPA policy decisions, adaptive concurrency, WAF content threat detection, OpenAPI contract validation, rate limiting, fault injection, compression, response security headers, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), MCP / Agent Tool Gateway routing, A2A agent gateway observability/policy, load testing, API chargeback, and observability
 - **Eight operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, Node Agent, and Migrate
-- **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
+- **Lock-free cached reads**: Configuration snapshots and cached request-path lookups use `ArcSwap` or `DashMap` without a mutex; on a cache miss, request-driven connection creation may briefly coalesce on a creation lock so concurrent misses share one dial
 - **Zero-downtime config reloads**: Atomic config swap via DB polling (database/cp), CP push (dp), or SIGHUP (file mode, and mesh with a local file/xDS config source — other modes log and ignore SIGHUP)
 - **Service mesh**: Six topologies (sidecar, ambient, **Experimental** node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
 - **Runtime observability**: JWT-gated `/metrics/runtime` JSON snapshot with system/process state, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP resets, log counters, and overload state
@@ -623,7 +623,7 @@ new release tag:
 
 ## CI/CD
 
-On every PR and push to `main`: format check, clippy, and unit, integration, and functional (E2E) tests. Performance regression suites run on a schedule rather than per PR. Version tags trigger multi-platform release builds with Docker images.
+On every push to `main`: format check, clippy, and unit, integration, and functional (E2E) tests. Pull requests run the validation selected by their diff — the full Rust checks in the selected Rust lane, and light CI for ordinary documentation-only changes. Performance regression suites run on a schedule rather than per PR. Version tags trigger multi-platform release builds with Docker images.
 
 See [docs/ci_cd.md](docs/ci_cd.md) for pipeline details.
 

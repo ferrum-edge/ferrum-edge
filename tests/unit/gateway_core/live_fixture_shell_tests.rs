@@ -13,6 +13,9 @@
 //!   probe ran and, for DTLS, that the backend log was actually read; Service
 //!   AuthorizationPolicy rows require the policy's own 403.
 //! - #6306: a failed SPIRE `start` stops the children it launched.
+//! - #6513/#6514: every remaining NodeWaypoint UDP/DTLS backend-log read
+//!   distinguishes an unreadable log from zero hits, and no-restart rows bind
+//!   to a stable ambient pod/container identity snapshot.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -804,6 +807,7 @@ fn poller_refuses_a_node_replaced_before_its_identity_is_recorded() {
 
 const NODE_WAYPOINT_STUBS: &str = r#"set -euo pipefail
 WORKLOAD_NS=ferrum-ebpf-live
+MESH_NS=ferrum
 collect_traffic_failure_diagnostics() { :; }
 spiffe_for_sa() { printf 'spiffe://cluster.local/ns/ferrum-ebpf-live/sa/%s' "$1"; }
 record_live_assertion() { printf '%s|%s|%s\n' "$1" "$2" "$5" >>"$STATE/records"; }
@@ -813,6 +817,13 @@ curl_for_family_from_namespace() {
 }
 kubectl() {
   case " $* " in
+    *" get pods "*)
+      if [[ "${PODS_FAIL:-0}" == 1 ]]; then
+        echo 'Error from server: connection refused' >&2
+        return 1
+      fi
+      printf '%s' "${AMBIENT_PODS_JSON:-}"
+      ;;
     *" logs "*)
       if [[ "${LOGS_FAIL:-0}" == 1 ]]; then
         echo 'Error from server (NotFound): deployments.apps "dtls-echo" not found' >&2
@@ -849,6 +860,12 @@ fn node_waypoint_functions() -> String {
             "expect_blocked",
             "recorded_expect_blocked",
             "backend_log_payload_count",
+            "udp_backend_received",
+            "udp_echo_backend_received",
+            "dtls_backend_received",
+            "dtls_echo_backend_received",
+            "ambient_restart_snapshot",
+            "ambient_snapshot_restart_total",
             "dtls_denial_probe_from",
             "classify_dtls_denial_probe",
             "dtls_denial_verdict",
@@ -1208,6 +1225,133 @@ fn node_waypoint_dtls_denial_rows_use_the_provenance_preserving_helpers() {
         source.matches("dtls_denial_probe_from \"$").count(),
         3,
         "all three DTLS denial rows must use the provenance-preserving probe"
+    );
+}
+
+#[test]
+fn node_waypoint_remaining_log_readers_distinguish_unreadable_from_zero() {
+    let functions = node_waypoint_functions();
+    let state = TempDir::new().expect("state dir");
+    let script = format!(
+        r#"{NODE_WAYPOINT_STUBS}{functions}
+show() {{
+  local count status=0
+  count="$("$1" "${{@:2}}")" || status=$?
+  printf '%s|%s|%s\n' "$1" "$status" "$count"
+}}
+LOGS_FAIL=1
+show udp_echo_backend_received ping-x
+show udp_backend_received ferrum-ebpf-live udp-demux-b demux-ping-a
+show dtls_echo_backend_received dtls-reload-stale-0
+show dtls_backend_received ferrum-ebpf-live dtls-echo dtls-a
+LOGS_FAIL=0
+BACKEND_LOGS='recv:ping-x\nrecv:dtls-a\n'
+show udp_echo_backend_received ping-x
+show dtls_echo_backend_received dtls-reload-stale-0
+show dtls_backend_received ferrum-ebpf-live dtls-echo dtls-a
+BACKEND_LOGS=''
+show udp_backend_received ferrum-ebpf-live udp-demux-b demux-ping-a
+"#
+    );
+    let output = run_bash(&script, state.path(), &[]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        stdout_of(&output).lines().collect::<Vec<_>>(),
+        [
+            "udp_echo_backend_received|1|",
+            "udp_backend_received|1|",
+            "dtls_echo_backend_received|1|",
+            "dtls_backend_received|1|",
+            "udp_echo_backend_received|0|1",
+            "dtls_echo_backend_received|0|0",
+            "dtls_backend_received|0|1",
+            "udp_backend_received|0|0",
+        ],
+        "every remaining UDP/DTLS reader must fail on a retrieval error, \
+         not report it as zero hits (issue #6513)"
+    );
+}
+
+#[test]
+fn node_waypoint_every_backend_log_assignment_captures_its_status() {
+    let source = read(NODE_WAYPOINT_RUN_SH);
+    assert!(
+        !source.contains("grep -c \"^recv:${payload}$\" || true"),
+        "no backend-log reader may swallow a retrieval failure as zero"
+    );
+    for line in source.lines() {
+        let reads_log = [
+            "udp_backend_received",
+            "udp_echo_backend_received",
+            "dtls_backend_received",
+            "dtls_echo_backend_received",
+            "backend_log_payload_count",
+        ]
+        .iter()
+        .any(|reader| line.contains(&format!("=\"$({reader} ")));
+        if reads_log {
+            assert!(
+                line.contains("if !") || line.contains("||"),
+                "backend-log assignment must capture the retrieval status: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn node_waypoint_ambient_snapshot_binds_identities_and_restart_counts() {
+    let functions = node_waypoint_functions();
+    let state = TempDir::new().expect("state dir");
+    let script = format!(
+        r#"{NODE_WAYPOINT_STUBS}{functions}
+snap() {{
+  local value status=0
+  value="$(ambient_restart_snapshot)" || status=$?
+  printf '%s|%s\n' "$status" "$value"
+}}
+compare() {{
+  local before after
+  before="$(ambient_restart_snapshot)"
+  AMBIENT_PODS_JSON="$1"
+  after="$(ambient_restart_snapshot)"
+  if [[ "$before" == "$after" ]]; then echo stable; else echo changed; fi
+}}
+BASE='{{"items":[{{"metadata":{{"uid":"uid-b"}},"status":{{"containerStatuses":[{{"name":"ferrum","containerID":"containerd://b","restartCount":2}}]}}}},{{"metadata":{{"uid":"uid-a"}},"status":{{"containerStatuses":[{{"name":"ferrum","containerID":"containerd://a","restartCount":0}}]}}}}]}}'
+AMBIENT_PODS_JSON="$BASE"
+snap
+printf 'total=%s\n' "$(ambient_snapshot_restart_total "$(ambient_restart_snapshot)")"
+compare "$BASE"
+AMBIENT_PODS_JSON="$BASE"
+compare '{{"items":[{{"metadata":{{"uid":"uid-replacement"}},"status":{{"containerStatuses":[{{"name":"ferrum","containerID":"containerd://r","restartCount":2}}]}}}},{{"metadata":{{"uid":"uid-a"}},"status":{{"containerStatuses":[{{"name":"ferrum","containerID":"containerd://a","restartCount":0}}]}}}}]}}'
+AMBIENT_PODS_JSON="$BASE"
+compare '{{"items":[{{"metadata":{{"uid":"uid-b"}},"status":{{"containerStatuses":[{{"name":"ferrum","containerID":"containerd://b","restartCount":3}}]}}}},{{"metadata":{{"uid":"uid-a"}},"status":{{"containerStatuses":[{{"name":"ferrum","containerID":"containerd://a","restartCount":0}}]}}}}]}}'
+PODS_FAIL=1
+snap
+PODS_FAIL=0
+AMBIENT_PODS_JSON='{{"items":[]}}'
+snap
+AMBIENT_PODS_JSON='{{"items":[{{"metadata":{{"uid":"uid-a"}},"status":{{"containerStatuses":[{{"name":"ferrum","restartCount":0}}]}}}}]}}'
+snap
+"#
+    );
+    let output = run_bash(&script, state.path(), &[]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        stdout_of(&output).lines().collect::<Vec<_>>(),
+        [
+            "0|uid-a\tferrum\tcontainerd://a\t0",
+            "uid-b\tferrum\tcontainerd://b\t2",
+            "total=2",
+            "stable",
+            "changed",
+            "changed",
+            "1|",
+            "1|",
+            "1|",
+        ],
+        "a replaced zero-restart pod, a raised restart counter, an unreadable \
+         pod list, and a missing container identity must never read as the \
+         same continuity snapshot (issue #6514)"
     );
 }
 
