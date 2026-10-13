@@ -152,6 +152,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The streamed-SSE reassembler bounds its OpenAI-style index families**
+  (issue #6624). Chat choices, legacy Completions choices, `(choice, tool)`
+  tool calls, and Responses-API output text and arguments were keyed by
+  unbounded provider-supplied indexes. Each family now holds at most 128 live
+  accumulators, and further keys fold into one overflow accumulator whose
+  text is still inspected. The stream is marked uninspectable so enforcing
+  callers fail closed, the same rule the Anthropic and Gemini paths already
+  apply. The streamed-inspect `texts()` snapshot no longer deep-clones the
+  reassembler on every call.
+
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
   fuzz lane compiled the stock registry crate instead of the patched DB-TLS
