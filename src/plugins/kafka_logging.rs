@@ -2511,6 +2511,22 @@ pub(crate) fn disabled_config_native_key_refusal(
         .find_map(|key| native_producer_key_error(key))
 }
 
+/// [`disabled_config_native_key_refusal`] over every plugin config of a
+/// snapshot, enabled or not, for the shared publication validator. A node
+/// without the opt-in therefore refuses a snapshot (full or incremental) that
+/// carries a native key, even when an opted-in control plane admitted it.
+pub(crate) fn snapshot_native_key_refusals(
+    plugin_configs: &[crate::config::types::PluginConfig],
+) -> Vec<String> {
+    plugin_configs
+        .iter()
+        .filter_map(|plugin_config| {
+            disabled_config_native_key_refusal(&plugin_config.plugin_name, &plugin_config.config)
+                .map(|error| format!("PluginConfig {:?}: {error}", plugin_config.id))
+        })
+        .collect()
+}
+
 /// Admit `producer_config` overrides (budgets, forbidden keys, CRL conflict)
 /// without constructing a Kafka producer.
 fn admit_producer_config(

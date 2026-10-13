@@ -2176,3 +2176,48 @@ fn ordinary_tuning_keys_do_not_need_the_opt_in() {
     )
     .expect("tuning keys stay admitted without the opt-in");
 }
+
+/// The shared publication validator (full snapshots and incremental updates on
+/// every node, including a data plane fed by an opted-in control plane) refuses
+/// a disabled row carrying a native key under this node's own opt-in.
+#[test]
+fn snapshot_validator_refuses_disabled_native_rows_under_the_local_opt_in() {
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let now = chrono::Utc::now();
+    let row =
+        |id: &str, producer_config: serde_json::Value| ferrum_edge::config::types::PluginConfig {
+            labels: Default::default(),
+            id: id.to_string(),
+            plugin_name: "kafka_logging".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            config: json!({
+                "broker_list": "localhost:9092",
+                "topic": "logs",
+                "producer_config": producer_config
+            }),
+            scope: ferrum_edge::config::types::PluginScope::Global,
+            proxy_id: None,
+            enabled: false,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+    let rows = vec![
+        row("tuning", json!({"linger.ms": "5"})),
+        row(
+            "native",
+            json!({"ssl.engine.location": "/opt/attacker/engine.so"}),
+        ),
+    ];
+    let refusals = ferrum_edge::_test_support::kafka_snapshot_native_key_refusals_for_test(&rows);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(refusals[0].contains("\"native\"") && refusals[0].contains("ssl.engine.location"));
+    assert!(!refusals[0].contains("/opt/attacker"));
+
+    env.set("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG", "true");
+    assert!(
+        ferrum_edge::_test_support::kafka_snapshot_native_key_refusals_for_test(&rows).is_empty()
+    );
+}

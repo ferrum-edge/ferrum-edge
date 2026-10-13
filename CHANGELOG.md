@@ -49,7 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sasl.oauthbearer.assertion.jwt.template.file`, `https.ca.location`,
   `offset.store.path`).
   - These keys are now refused at admission (disabled rows included, for
-    admin writes, batch, restore and file/database/CP config loads) and at
+    admin writes, batch, restore, API-spec imports, file/database/CP config
+    loads, and every node's snapshot publication, so a data plane without the
+    opt-in rejects a snapshot from an opted-in control plane) and at
     plugin construction, case-insensitively and with or without a `topic.`
     prefix, unless the node sets the new
     `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG=true` (default `false`; a malformed

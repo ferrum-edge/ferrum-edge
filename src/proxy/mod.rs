@@ -12955,6 +12955,11 @@ impl ProxyState {
         if let Err(errs) = validate_runtime_resource_ids(config, trusted_mesh_ids) {
             errors.extend(errs);
         }
+        // Native librdkafka keys follow THIS node's opt-in, disabled rows
+        // included (issue #6539).
+        errors.extend(crate::plugins::kafka_logging::snapshot_native_key_refusals(
+            &config.plugin_configs,
+        ));
         if let Err(errs) = config.validate_regex_listen_paths() {
             errors.extend(errs);
         }
