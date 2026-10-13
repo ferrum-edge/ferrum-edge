@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (issue #6577). Any non-empty key used to be accepted, including a single
   character. Consumer create, update, batch, restore, and the dedicated
   credential endpoints now reject a shorter key with `400`, and file-mode
-  config loading fails on one. Database and CP snapshots that already hold a
-  shorter key keep serving it with a validation warning, so rotate those keys.
+  config loading fails on one. A database-mode gateway or CP that already
+  stores a shorter key keeps serving it with a validation warning, but a data
+  plane refuses a CP snapshot containing one and keeps its previous config, so
+  rotate short keys before upgrading.
   The OpenAPI `KeyAuthCredential` and `KeyAuthCredentialBackup` schemas carry
   the same floor. The floor is lower than the 32-character HMAC/JWT secret
   minimum because an API key can only be guessed online, while those secrets

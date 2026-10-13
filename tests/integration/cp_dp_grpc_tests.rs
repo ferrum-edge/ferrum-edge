@@ -2437,6 +2437,71 @@ async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
     client_handle.abort();
 }
 
+/// A CP snapshot carrying a keyauth key below the 16-character floor (a key
+/// stored before the floor existed) is refused by the DP, which keeps its last
+/// valid config (issue #6577). The upgrade guide therefore requires rotating
+/// short keys before upgrading CP/DP deployments.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_keeps_last_good_snapshot_after_short_keyauth_key() {
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
+        )
+        .await;
+    });
+
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received.is_ok(), "Should receive initial config");
+
+    let mut short_key_config = create_test_config(2);
+    short_key_config.consumers.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "legacy-consumer",
+            "username": "legacy-user",
+            "namespace": "ferrum",
+            "credentials": {"keyauth": [{"key": "short-key"}]}
+        }))
+        .expect("consumer fixture"),
+    );
+    CpGrpcServer::broadcast_update(&update_tx, &short_key_config);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let live = proxy_state.config.load();
+    assert_eq!(
+        live.proxies.len(),
+        1,
+        "DP must keep the last valid config after a short-key snapshot"
+    );
+    assert!(live.consumers.is_empty());
+
+    client_handle.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update() {
     let cp_config = create_test_config(1);
