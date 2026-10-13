@@ -7769,13 +7769,27 @@ jobs:
           name: ferrum-cni-debug-Linux-X64
           path: image-bin
 
+      # The runtime base is the reviewed, digest-pinned `RUNTIME_BASE` in
+      # `Dockerfile`, so the scheduled base-image refresh never has to edit
+      # this frozen job (or any workflow file) to rotate it.
+      - name: Read the Dockerfile runtime base pin
+        id: runtime-base
+        run: |
+          set -euo pipefail
+          base="$(sed -n 's/^ARG RUNTIME_BASE=//p' Dockerfile)"
+          if [[ ! "$base" =~ ^gcr\.io/distroless/cc-debian13:nonroot@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Dockerfile must pin exactly one digest-pinned distroless RUNTIME_BASE (got '${base}')" >&2
+            exit 1
+          fi
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+
       - name: Package tested Linux binaries
         uses: ./.github/actions/package-ferrum-runtime-image
         with:
           binary-path: image-bin/ferrum-edge
           cni-binary-path: image-bin/ferrum-cni
           image: ferrum-edge:ci-${{ github.sha }}
-          base-image: gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+          base-image: ${{ steps.runtime-base.outputs.base }}
 
       - name: Smoke Linux image
         env:

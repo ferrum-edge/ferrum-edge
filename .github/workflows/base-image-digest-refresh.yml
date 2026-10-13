@@ -16,26 +16,15 @@
 # the full required CI (multi-arch build, FIPS, eBPF, ABI scan, chart smoke)
 # gates like any other change.
 #
-# Every tracked file that pins a drifted reference is rewritten together, so
-# the distroless runtime base also moves in `ci.yml`'s `main-linux-image` job and
-# `tests/performance/multi_protocol/h3_proof/Dockerfile.live`. The trusted
-# Cross policy admits that one protected-job change only when the new digest is
-# the one the registry serves for the same tag when the policy runs, and
-# `verify_ci_runtime_cache.py` still requires every distroless reference to
-# match `Dockerfile`. The two trusted policy files are never rewritten.
-#
-# `refresh` resolves, rewrites and runs the repository verifier on a runner
-# that never holds a write credential. `open` repeats the same rotation with
-# this frozen shell alone, proceeds only if it is identical to the verified
-# one, and pushes and opens the pull request with `BASE_IMAGE_REFRESH_TOKEN` (a
-# fine-grained personal access token; see docs/ci_cd.md) so its CI runs: events
-# from `GITHUB_TOKEN` start no workflows, and only a token with workflow-write
-# access may change `ci.yml`. `merge` waits for every context in
-# `.github/required-publication-checks.json` to succeed on the exact head, with
-# no other check failing or pending, and merges that head with a merge commit.
-# The trusted Cross policy freezes these three jobs and this workflow's
-# top-level shape by SHA-256 and confines the token to them, so neither the
-# rotation nor the merge gate can change in an ordinary pull request.
+# Every tracked non-workflow file that pins a drifted reference is rewritten
+# together, so the distroless runtime base also moves in
+# `tests/performance/multi_protocol/h3_proof/Dockerfile.live`; `ci.yml`'s
+# `main-linux-image` job reads it from `Dockerfile`, so no workflow file pins it.
+# The job runs with its own `GITHUB_TOKEN` only (no stored credential), which
+# cannot change workflow files: a drifted reference pinned in a workflow fails
+# the run instead. Pull requests opened by `GITHUB_TOKEN` start no CI, so a
+# maintainer closes and reopens the refresh PR (or merges `main` into it) to run
+# the required checks, reviews it, and merges it.
 name: Base Image Digest Refresh
 
 on:
@@ -45,8 +34,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  # Every write uses BASE_IMAGE_REFRESH_TOKEN; GITHUB_TOKEN only reads.
-  contents: read
+  contents: write
+  pull-requests: write
 
 concurrency:
   group: base-image-digest-refresh
@@ -54,28 +43,23 @@ concurrency:
 
 jobs:
   refresh:
-    name: Resolve and verify current base image digests
-    # The credentialed jobs below depend on this one, so a dispatch from any
-    # other ref never reaches the refresh token.
-    if: github.ref == 'refs/heads/main'
+    name: Resolve and propose current base image digests
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       # One inventory for resolution and staging, including the live image layer.
       DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer Dockerfile.iproute2-layer"
-    outputs:
-      rotations: ${{ steps.resolve.outputs.rotations }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Resolve current digests
         id: resolve
         run: |
           set -euo pipefail
-          rotations=""
+          changed=""
           # Every pinned reference in the governed Dockerfiles, deduplicated.
           refs="$(grep -hoE '[A-Za-z0-9][A-Za-z0-9./_-]*:[A-Za-z0-9][A-Za-z0-9._-]*@sha256:[0-9a-f]{64}' \
             ${DOCKERFILES} | sort -u)"
@@ -88,21 +72,24 @@ jobs:
             current="${ref##*@}"
             resolved="$(docker buildx imagetools inspect "${tagged}" \
               --format '{{json .Manifest.Digest}}' | tr -d '"')"
-            if [[ ! "${resolved}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::could not resolve a manifest digest for ${tagged} (got '${resolved}')"
-              exit 1
-            fi
+            case "${resolved}" in
+              sha256:[0-9a-f][0-9a-f]*) ;;
+              *)
+                echo "::error::could not resolve a manifest digest for ${tagged} (got '${resolved}')"
+                exit 1
+                ;;
+            esac
             if [ "${resolved}" = "${current}" ]; then
               echo "up to date: ${tagged} -> ${resolved}"
               continue
             fi
-            # Every tracked Dockerfile and YAML consumer of the old reference
-            # moves together; prose and history (CHANGELOG, docs) keep theirs.
+            # Every tracked consumer of the old reference moves together;
+            # prose and history (CHANGELOG, docs) keep theirs.
             consumers=""
             for file in $(git grep -lF "${tagged}@${current}"); do
               case "${file}" in
-                .github/scripts/verify_cross_build_policy.py|.github/workflows/cross-build-policy.yml)
-                  echo "::error::${file} pins ${tagged}@${current}; trusted policy files are never rewritten by the refresh"
+                .github/workflows/*|.github/scripts/verify_cross_build_policy.py)
+                  echo "::error::${file} pins ${tagged}@${current}; the refresh cannot rewrite workflow or trusted policy files, so move that pin into a Dockerfile it reads"
                   exit 1
                   ;;
                 *Dockerfile*|*.yml|*.yaml)
@@ -117,144 +104,56 @@ jobs:
             for file in ${consumers}; do
               sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"
             done
-            rotations="${rotations}${tagged} ${current} ${resolved} ${consumers% }\n"
+            changed="${changed}- \`${tagged}\`: \`${current}\` -> \`${resolved}\` (${consumers% })\n"
           done
-          {
-            echo "rotations<<ROTATIONS_EOF"
-            printf '%b' "${rotations}"
-            echo "ROTATIONS_EOF"
-          } >> "${GITHUB_OUTPUT}"
-
-      # Repository code runs only here, on a runner that never holds the
-      # refresh token. The `open` job repeats the rotation itself and proceeds
-      # only when it is identical to the one verified here.
-      - name: Verify the pin contract still holds
-        if: steps.resolve.outputs.rotations != ''
-        run: python3 .github/scripts/verify_ci_runtime_cache.py
-
-  open:
-    name: Open the refresh pull request
-    needs: refresh
-    if: github.ref == 'refs/heads/main' && needs.refresh.outputs.rotations != ''
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    # The refresh token is an environment secret; the environment admits only
-    # `main`, so no pull-request or branch run can read it.
-    environment: base-image-refresh
-    env:
-      DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer Dockerfile.iproute2-layer"
-    outputs:
-      pr: ${{ steps.open.outputs.pr }}
-      head: ${{ steps.open.outputs.head }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          persist-credentials: false
-
-      # No repository code runs in this job: only this frozen shell, git,
-      # docker and gh touch the checkout before the token is used.
-      - name: Repeat the verified rotation
-        id: rotate
-        env:
-          VERIFIED_ROTATIONS: ${{ needs.refresh.outputs.rotations }}
-        run: |
-          set -euo pipefail
-          rotations=""
-          # Every pinned reference in the governed Dockerfiles, deduplicated.
-          refs="$(grep -hoE '[A-Za-z0-9][A-Za-z0-9./_-]*:[A-Za-z0-9][A-Za-z0-9._-]*@sha256:[0-9a-f]{64}' \
-            ${DOCKERFILES} | sort -u)"
-          if [ -z "${refs}" ]; then
-            echo "::error::no digest-pinned image references found; the refresh must fail closed"
-            exit 1
+          if [ -z "${changed}" ]; then
+            echo "updated=false" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
-          for ref in ${refs}; do
-            tagged="${ref%@*}"
-            current="${ref##*@}"
-            resolved="$(docker buildx imagetools inspect "${tagged}" \
-              --format '{{json .Manifest.Digest}}' | tr -d '"')"
-            if [[ ! "${resolved}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::could not resolve a manifest digest for ${tagged} (got '${resolved}')"
-              exit 1
-            fi
-            if [ "${resolved}" = "${current}" ]; then
-              echo "up to date: ${tagged} -> ${resolved}"
-              continue
-            fi
-            # Every tracked Dockerfile and YAML consumer of the old reference
-            # moves together; prose and history (CHANGELOG, docs) keep theirs.
-            consumers=""
-            for file in $(git grep -lF "${tagged}@${current}"); do
-              case "${file}" in
-                .github/scripts/verify_cross_build_policy.py|.github/workflows/cross-build-policy.yml)
-                  echo "::error::${file} pins ${tagged}@${current}; trusted policy files are never rewritten by the refresh"
-                  exit 1
-                  ;;
-                *Dockerfile*|*.yml|*.yaml)
-                  consumers="${consumers}${file} "
-                  ;;
-                *)
-                  echo "not rewritten (not a Dockerfile or YAML consumer): ${file}"
-                  ;;
-              esac
-            done
-            echo "refresh: ${tagged} ${current} -> ${resolved} in ${consumers}"
-            for file in ${consumers}; do
-              sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"
-            done
-            rotations="${rotations}${tagged} ${current} ${resolved} ${consumers% }\n"
-          done
-          if [ "$(printf '%b' "${rotations}")" != "$(printf '%s' "${VERIFIED_ROTATIONS}")" ]; then
-            echo "::error::the registry or tree changed since verification; not opening a pull request"
-            exit 1
-          fi
+          echo "updated=true" >> "${GITHUB_OUTPUT}"
           {
             echo "body<<PR_BODY_EOF"
             echo "## Summary"
             echo
             echo "Automated refresh of the digest pins on Ferrum's container build inputs."
             echo "Each reference keeps its image and tag; only the digest its tag currently"
-            echo "resolves to changed, in every Dockerfile and YAML file that pinned it."
+            echo "resolves to changed."
             echo
             echo "## Changes"
             echo
-            printf '%b' "${rotations}" | while read -r tagged current resolved consumers; do
-              echo "- \`${tagged}\`: \`${current}\` -> \`${resolved}\` (${consumers})"
-            done
+            printf '%b' "${changed}"
             echo
             echo "## Test plan"
             echo
             echo "Normal required CI on this pull request: multi-arch image build, FIPS,"
-            echo "eBPF, the GNU ABI scan, and the Helm chart smoke. A distroless digest"
-            echo "change is admitted by the trusted Cross policy only if it equals the"
-            echo "digest the registry serves for the tag when the policy runs."
+            echo "eBPF, the GNU ABI scan, and the Helm chart smoke."
             echo
-            echo "The refresh workflow merges this pull request itself once every"
-            echo "required check succeeds on its exact head."
+            echo "This pull request was opened with the workflow's GITHUB_TOKEN, which"
+            echo "starts no CI. Close and reopen it (or merge main into it) to run the"
+            echo "required checks, verify each digest against its registry, then merge."
             echo
             echo "Refs #4444"
             echo "PR_BODY_EOF"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Verify the pin contract still holds
+        if: steps.resolve.outputs.updated == 'true'
+        run: python3 .github/scripts/verify_ci_runtime_cache.py
+
       - name: Open or update the refresh pull request
-        id: open
+        if: steps.resolve.outputs.updated == 'true'
         env:
-          GH_TOKEN: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}
-          PR_BODY: ${{ steps.rotate.outputs.body }}
+          GH_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ steps.resolve.outputs.body }}
           BRANCH: deps/base-image-digests
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::error::configure the BASE_IMAGE_REFRESH_TOKEN secret (contents, pull requests and workflows write) so the refresh pull request runs CI and can change ci.yml"
-            exit 1
-          fi
-          gh auth setup-git
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "${BRANCH}"
           git add --update
-          git commit --no-verify -m "deps: refresh container base image digests"
-          git push --no-verify --force origin "${BRANCH}"
+          git commit -m "deps: refresh container base image digests"
+          git push --force origin "${BRANCH}"
           if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[].number')" ]; then
             gh pr edit "${BRANCH}" --body "${PR_BODY}"
           else
@@ -265,82 +164,6 @@ jobs:
               --body "${PR_BODY}" \
               --label dependencies
           fi
-          echo "pr=$(gh pr view "${BRANCH}" --json number --jq .number)" >> "${GITHUB_OUTPUT}"
-          echo "head=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
-
-  merge:
-    name: Merge the refresh pull request after required CI
-    needs: open
-    if: github.ref == 'refs/heads/main' && needs.open.outputs.pr != ''
-    runs-on: ubuntu-26.04
-    timeout-minutes: 300
-    environment: base-image-refresh
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          persist-credentials: false
-
-      - name: Wait for required checks on the exact head, then merge
-        env:
-          GH_TOKEN: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}
-          PR: ${{ needs.open.outputs.pr }}
-          HEAD_SHA: ${{ needs.open.outputs.head }}
-          BRANCH: deps/base-image-digests
-        run: |
-          set -euo pipefail
-          # The merging token may be able to bypass branch protection, so this
-          # job enforces the gate itself instead of trusting a merge to be refused.
-          # Evidence is read for the exact head and this pull request's own
-          # runs: a required context counts only when every run of its canonical
-          # workflow for this branch and head has completed successfully and
-          # each of those runs carries a successful check of that name from
-          # GitHub Actions (app 15368, the producer branch protection binds).
-          inventory=.github/required-publication-checks.json
-          if [ "$(jq '.required_checks | length' "${inventory}")" -eq 0 ]; then
-            echo "::error::the required-check inventory is empty; refusing to merge"
-            exit 1
-          fi
-          expected="OPEN ${HEAD_SHA} main ${BRANCH} false"
-          pr_state() {
-            gh pr view "${PR}" --json state,headRefOid,baseRefName,headRefName,isCrossRepository \
-              --jq '[.state, .headRefOid, .baseRefName, .headRefName, (.isCrossRepository | tostring)] | join(" ")'
-          }
-          while :; do
-            state="$(pr_state)"
-            if [ "${state}" != "${expected}" ]; then
-              echo "::error::refresh pull request #${PR} is no longer the open ${BRANCH} -> main pull request at ${HEAD_SHA} (${state}); not merging"
-              exit 1
-            fi
-            runs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" \
-              --jq '.workflow_runs[] | {suite: .check_suite_id, path: .path, event: .event, status: .status, conclusion: .conclusion, branch: .head_branch, repo: .head_repository.full_name}' | jq -s \
-              --arg branch "${BRANCH}" --arg repo "${GITHUB_REPOSITORY}" \
-              '[.[] | select(.branch == $branch and .repo == $repo and (.event == "pull_request" or .event == "pull_request_target"))]')"
-            checks="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
-              --jq '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, app: .app.id, suite: .check_suite.id}' | jq -s .)"
-            failed="$(jq -r '[.[] | select(.status == "completed" and (.conclusion as $c | ["failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"] | index($c))) | .name] | unique | join(", ")' <<<"${checks}")"
-            if [ -n "${failed}" ]; then
-              echo "::error::refresh pull request #${PR} has failing checks: ${failed}; not merging"
-              exit 1
-            fi
-            pending="$(jq -n --argjson checks "${checks}" --argjson runs "${runs}" '[$checks[] | select(.status != "completed")] + [$runs[] | select(.status != "completed")] | length')"
-            # Only SUCCESS satisfies a required context; skipped or neutral never does.
-            missing="$(jq -r --argjson checks "${checks}" --argjson runs "${runs}" '[.required_checks[] as $r | select(([$runs[] | select(.path == $r.workflow_path)]) as $canonical | ($canonical | length) == 0 or any($canonical[]; .status != "completed" or .conclusion != "success" or (.suite as $s | [$checks[] | select(.suite == $s and .name == $r.context and .app == 15368 and .conclusion == "success")] | length) == 0)) | $r.context] | join(", ")' "${inventory}")"
-            if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then
-              break
-            fi
-            sleep 60
-          done
-          # Re-read the pull request immediately before merging.
-          state="$(pr_state)"
-          if [ "${state}" != "${expected}" ]; then
-            echo "::error::refresh pull request #${PR} changed before merge (${state}); not merging"
-            exit 1
-          fi
-          # A merge commit keeps the PR head as the second parent, which the
-          # publication gate uses to bind a main commit to its reviewed head.
-          gh pr merge "${PR}" --merge --match-head-commit "${HEAD_SHA}"
-          echo "Merged refresh pull request #${PR} at ${HEAD_SHA}" >> "${GITHUB_STEP_SUMMARY}"
 
   cross-image-drift:
     name: Inspect the admitted Cross image pin

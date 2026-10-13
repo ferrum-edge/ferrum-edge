@@ -4200,38 +4200,20 @@ def check_distroless_digest_consistency(
                 )
 
 
-# The refresh rotates every pin, including the distroless runtime base in
-# `ci.yml`'s `main-linux-image` job, which the trusted Cross policy admits only
-# as a swap to the digest the registry serves for the same tag. The refresh
-# must rewrite every Dockerfile/YAML consumer of a drifted reference together
-# (so `check_distroless_digest_consistency` holds), never rewrite the two trusted
-# policy files, open the PR with the refresh token so required CI runs, and
-# merge only the exact head after every required context passes. Repository
-# code (this verifier) runs only in `refresh`; the credentialed `open` job
-# repeats the rotation itself and runs no repository step before the token.
+# The refresh rotates every pin, including the distroless runtime base, with its
+# own GITHUB_TOKEN. It must rewrite every non-workflow consumer of a drifted
+# reference together (so `check_distroless_digest_consistency` holds), refuse to
+# rewrite workflow files (GITHUB_TOKEN cannot change them, and `main-linux-image`
+# reads the base from `Dockerfile`) or the trusted policy, and stage every
+# rewritten consumer.
 BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
     'for file in $(git grep -lF "${tagged}@${current}"); do',
-    ".github/scripts/verify_cross_build_policy.py|.github/workflows/cross-build-policy.yml)",
-    'echo "::error::${file} pins ${tagged}@${current}; trusted policy files are never rewritten by the refresh"',
+    ".github/workflows/*|.github/scripts/verify_cross_build_policy.py)",
+    'echo "::error::${file} pins ${tagged}@${current}; the refresh cannot rewrite workflow or trusted policy files, so move that pin into a Dockerfile it reads"',
+    "exit 1",
     "*Dockerfile*|*.yml|*.yaml)",
-    'for file in ${consumers}; do',
+    "for file in ${consumers}; do",
     'sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"',
-)
-BASE_IMAGE_REFRESH_ROTATION_MATCH = (
-    """if [ "$(printf '%b' "${rotations}")" != "$(printf '%s' "${VERIFIED_ROTATIONS}")" ]; then"""
-)
-BASE_IMAGE_REFRESH_OPEN_TOKEN = (
-    "          GH_TOKEN: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n"
-)
-BASE_IMAGE_REFRESH_MERGE_MARKERS = (
-    "inventory=.github/required-publication-checks.json",
-    'expected="OPEN ${HEAD_SHA} main ${BRANCH} false"',
-    'if [ "${state}" != "${expected}" ]; then',
-    'if [ -n "${failed}" ]; then',
-    'missing="$(jq -r --argjson checks "${checks}" --argjson runs "${runs}" \'[.required_checks[] as $r | select(([$runs[] | select(.path == $r.workflow_path)]) as $canonical | ($canonical | length) == 0 or any($canonical[]; .status != "completed" or .conclusion != "success" or (.suite as $s | [$checks[] | select(.suite == $s and .name == $r.context and .app == 15368 and .conclusion == "success")] | length) == 0)) | $r.context] | join(", ")\' "${inventory}")"',
-    'if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then',
-    'if [ "${state}" != "${expected}" ]; then',
-    'gh pr merge "${PR}" --merge --match-head-commit "${HEAD_SHA}"',
 )
 
 
@@ -4261,88 +4243,38 @@ def step_run_block_commands(step: str) -> list[str]:
 
 
 def base_image_refresh_rotation_errors(workflow: str) -> list[str]:
-    """Return why the digest refresh does not rotate and merge every pin safely."""
+    """Return why the digest refresh does not rotate every consumer safely."""
 
-    errors: list[str] = []
     job = extract_job(workflow, "refresh")
     if not job:
         return ["the `refresh` job is missing"]
+    errors: list[str] = []
     if "HELD_IMAGE" in job:
         errors.append("the refresh must not hold any image back from rotation")
     steps = job_steps(job)
     resolve = named_step(steps, "Resolve current digests")
-    commands = step_run_block_commands(resolve) if resolve is not None else []
     if resolve is None or not re.search(r"(?m)^        id: resolve$", resolve):
-        errors.append("missing one `Resolve current digests` step with `id: resolve`")
-    else:
-        index = -1
-        for marker in BASE_IMAGE_REFRESH_RESOLVE_MARKERS:
-            try:
-                index = commands.index(marker, index + 1)
-            except ValueError:
-                errors.append(
-                    f"the resolve loop must contain, in order, `{marker}`"
-                )
-                break
-        if any(command.startswith("for file in ${DOCKERFILES}") for command in commands):
-            errors.append("the resolve loop must rewrite every consumer, not only the Dockerfiles")
-    if BASE_IMAGE_REFRESH_OPEN_TOKEN.split(":", 1)[1].strip() in job:
-        errors.append("the `refresh` job runs repository code and must never hold the refresh token")
-    open_job = extract_job(workflow, "open")
-    if not open_job:
-        return [*errors, "the `open` job is missing"]
-    open_steps = job_steps(open_job)
-    rotate = named_step(open_steps, "Repeat the verified rotation")
-    rotate_commands = step_run_block_commands(rotate) if rotate is not None else []
+        return [*errors, "missing one `Resolve current digests` step with `id: resolve`"]
+    commands = step_run_block_commands(resolve)
     index = -1
-    for marker in (*BASE_IMAGE_REFRESH_RESOLVE_MARKERS, BASE_IMAGE_REFRESH_ROTATION_MATCH):
+    for marker in BASE_IMAGE_REFRESH_RESOLVE_MARKERS:
         try:
-            index = rotate_commands.index(marker, index + 1)
+            index = commands.index(marker, index + 1)
         except ValueError:
-            errors.append(f"the `open` rotation must contain, in order, `{marker}`")
+            errors.append(f"the resolve loop must contain, in order, `{marker}`")
             break
-    if re.search(
-        r"(?m)^(?!\s*#).*(?:\bpython3?\b|\bnode\b|\bmake\b|\bnpm\b|\bcargo\b|"
-        r"uses:\s*\./|(?:^|\s)(?:bash|sh|source|\.)\s+\S|\s\./)",
-        open_job,
-    ):
-        errors.append("the credentialed `open` job must not run repository code")
-    opener = named_step(open_steps, "Open or update the refresh pull request")
-    if opener is None or BASE_IMAGE_REFRESH_OPEN_TOKEN not in opener:
-        errors.append(
-            "the refresh pull request must be pushed and opened with "
-            "`secrets.BASE_IMAGE_REFRESH_TOKEN` so its required CI runs"
-        )
-    elif "git add --update" not in step_run_block_commands(opener):
+    if any(command.startswith("for file in ${DOCKERFILES}") for command in commands):
+        errors.append("the resolve loop must rewrite every consumer, not only the Dockerfiles")
+    opener = named_step(steps, "Open or update the refresh pull request")
+    if opener is None or "git add --update" not in step_run_block_commands(opener):
         errors.append("the refresh pull request must stage every rewritten consumer")
-
-    merge = extract_job(workflow, "merge")
-    if not merge:
-        errors.append("the `merge` job is missing")
-    else:
-        if "    needs: open\n" not in merge:
-            errors.append("the `merge` job must need `open`")
-        merge_steps = job_steps(merge)
-        gate = named_step(
-            merge_steps, "Wait for required checks on the exact head, then merge"
-        )
-        gate_commands = step_run_block_commands(gate) if gate is not None else []
-        index = -1
-        for marker in BASE_IMAGE_REFRESH_MERGE_MARKERS:
-            try:
-                index = gate_commands.index(marker, index + 1)
-            except ValueError:
-                errors.append(f"the merge gate must contain, in order, `{marker}`")
-                break
-        if gate_commands and gate_commands[-2:-1] != [BASE_IMAGE_REFRESH_MERGE_MARKERS[-1]]:
-            errors.append("the merge gate must end by merging the exact verified head")
     return errors
 
 
 def check_base_image_refresh_rotates_all_pins(
     workflow: str, failures: list[str]
 ) -> None:
-    """Require the digest refresh to rotate every consumer and gate its merge."""
+    """Require the digest refresh to rotate every non-workflow consumer."""
 
     for error in base_image_refresh_rotation_errors(workflow):
         failures.append(f"base-image-digest-refresh.yml: {error}")
@@ -5485,69 +5417,38 @@ def self_test() -> int:
     for label, original, mutation in (
         (
             "that rewrites only the Dockerfiles",
-            '            for file in ${consumers}; do\n',
-            '            for file in ${DOCKERFILES}; do\n',
+            "            for file in ${consumers}; do\n",
+            "            for file in ${DOCKERFILES}; do\n",
         ),
         (
-            "that may rewrite the trusted policy files",
-            "                .github/scripts/verify_cross_build_policy.py|.github/workflows/cross-build-policy.yml)\n",
-            "                .github/workflows/cross-build-policy.yml)\n",
+            "that may rewrite workflow files",
+            "                .github/workflows/*|.github/scripts/verify_cross_build_policy.py)\n",
+            "                .github/scripts/verify_cross_build_policy.py)\n",
         ),
         (
-            "opened with GITHUB_TOKEN",
-            "          GH_TOKEN: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n          PR_BODY:",
-            "          GH_TOKEN: ${{ github.token }}\n          PR_BODY:",
+            "that skips a refused consumer instead of failing",
+            "move that pin into a Dockerfile it reads\"\n                  exit 1\n",
+            "move that pin into a Dockerfile it reads\"\n",
         ),
         (
-            "that merges without the required-check inventory",
-            "          inventory=.github/required-publication-checks.json\n",
-            "          inventory=/dev/null\n",
+            "that stages only the Dockerfiles",
+            "          git add --update\n",
+            "          git add -- ${DOCKERFILES}\n",
         ),
         (
-            "that merges with failing checks",
-            '            if [ -n "${failed}" ]; then\n',
-            '            if false; then\n',
-        ),
-        (
-            "that accepts a skipped required check",
-            '.app == 15368 and .conclusion == "success")',
-            '.app == 15368 and (.conclusion == "success" or .conclusion == "skipped"))',
-        ),
-        (
-            "that ignores a retargeted base",
-            'expected="OPEN ${HEAD_SHA} main ${BRANCH} false"',
-            'expected="OPEN ${HEAD_SHA}"',
-        ),
-        (
-            "that accepts any check producer",
-            ".app == 15368 and",
-            "",
-        ),
-        (
-            "that runs repository code in the credentialed job",
-            "      - name: Open or update the refresh pull request\n",
-            "      - name: Lint\n        run: python3 .github/scripts/verify_ci_runtime_cache.py\n\n"
-            "      - name: Open or update the refresh pull request\n",
-        ),
-        (
-            "that does not compare with the verified rotation",
-            """if [ "$(printf '%b' "${rotations}")" != "$(printf '%s' "${VERIFIED_ROTATIONS}")" ]; then""",
-            """if false; then""",
-        ),
-        (
-            "that merges a moved head",
-            '          gh pr merge "${PR}" --merge --match-head-commit "${HEAD_SHA}"\n',
-            '          gh pr merge "${PR}" --merge\n',
+            "that holds an image back",
+            "    steps:\n      - name: Checkout\n",
+            "    env2:\n      HELD_IMAGE: x\n    steps:\n      - name: Checkout\n",
         ),
     ):
         require(
-            original in refresh_workflow,
-            f"self-test: the refresh mutation {label} must match the workflow",
+            refresh_workflow.count(original) == 1,
+            f"self-test: the refresh mutation {label} must match the workflow once",
             failures,
         )
         pin_failures = []
         check_base_image_refresh_rotates_all_pins(
-            refresh_workflow.replace(original, mutation, 1), pin_failures
+            refresh_workflow.replace(original, mutation), pin_failures
         )
         require(
             bool(pin_failures),

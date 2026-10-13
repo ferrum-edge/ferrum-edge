@@ -13,8 +13,6 @@ import re
 import shlex
 import sys
 import tomllib
-import urllib.error
-import urllib.request
 from collections.abc import Callable, Iterable
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
@@ -110,9 +108,9 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "main-linux-image",
-        # Hashed with the distroless runtime digest replaced by
-        # DISTROLESS_DIGEST_PLACEHOLDER; see `protected_job_contract_text`.
-        "b2f131296dc2f8e2779e5c36ff7956aa93e0d16309d8155da5f82c057aae5a44",
+        # The job reads its distroless runtime base from Dockerfile's reviewed
+        # `RUNTIME_BASE` pin, so base-image digest rotation never edits it.
+        "2ae821353d25d3c46ddf7a8d8db7b76f04d1818c2bd8288ee937822d179bc2ec",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -13999,179 +13997,6 @@ def cross_image_refresh_errors(workflows: dict[str, str], source: str) -> list[s
     return errors
 
 
-
-# The scheduled digest refresh also rotates the distroless runtime base inside
-# the protected `main-linux-image` job and merges its own pull request with a
-# write-capable token, so the whole workflow is trusted automation: freeze it
-# byte-for-byte here, where an ordinary pull request cannot move it. That
-# closes its job set, top-level `env`/`defaults`/permissions, and every step
-# that can see the token. The token is a secret of the `main`-only
-# `base-image-refresh` environment, so pull-request runs never receive it, and
-# every other workflow is refused any environment, any mention of the token or
-# environment, any indexed, wildcard, bulk or inherited secret access, and any
-# YAML escape sequence that could spell one of those after decoding.
-DIGEST_REFRESH_WORKFLOW_SHA256 = "2ebdbb516429f9453b79b54cb490aefca30cad8b1edcbf8582357f21d0c625dd"
-DIGEST_REFRESH_TOKEN_NAME = "BASE_IMAGE_REFRESH_TOKEN"
-DIGEST_REFRESH_ENVIRONMENT = "base-image-refresh"
-INDIRECT_SECRET_ACCESS = re.compile(
-    r"\bsecrets\s*\[|\bsecrets\s*\.\s*\*|\btojson\s*\(\s*secrets\b"
-    r"|\bsecrets\s*:\s*inherit\b",
-    re.IGNORECASE,
-)
-# YAML double-quoted escapes decode before expressions are evaluated, so they
-# could spell a forbidden secret or environment reference that a raw-text scan
-# never sees. Only the hex/Unicode escapes can spell an ASCII character other
-# than whitespace or punctuation, and no workflow needs them.
-YAML_DECODING_ESCAPE = re.compile(r"\\[uUx]")
-# An `environment` mapping key in any quoting. Implicit YAML keys cannot span
-# lines, so with explicit (`?`) keys, tags and hex/Unicode escapes refused, a
-# key that decodes to `environment` must contain this literal text.
-WORKFLOW_ENVIRONMENT_KEY = re.compile(r"(?i)environment\s*[\"']?\s*:")
-YAML_EXPLICIT_KEY = re.compile(r"(?m)^\s*\?(?:\s|$)")
-YAML_TAG = re.compile(r"!!|!<")
-
-
-def digest_refresh_automation_errors(
-    workflows: dict[str, str], source: str
-) -> list[str]:
-    errors: list[str] = []
-    contents = workflows.get(CROSS_IMAGE_REFRESH_WORKFLOW)
-    if contents is None:
-        errors.append(f"{source} is missing {CROSS_IMAGE_REFRESH_WORKFLOW}")
-    else:
-        actual = hashlib.sha256(contents.encode("utf-8")).hexdigest()
-        if actual != DIGEST_REFRESH_WORKFLOW_SHA256:
-            errors.append(
-                f"{source}/{CROSS_IMAGE_REFRESH_WORKFLOW} differs from the trusted "
-                f"digest-refresh automation contract (expected SHA-256 "
-                f"{DIGEST_REFRESH_WORKFLOW_SHA256}, got {actual})"
-            )
-    for name, text in sorted(workflows.items()):
-        if INDIRECT_SECRET_ACCESS.search(text):
-            errors.append(
-                f"{source}/{name} uses indexed, bulk or inherited secret access, "
-                "which could reach the digest-refresh token"
-            )
-        if YAML_DECODING_ESCAPE.search(text):
-            errors.append(
-                f"{source}/{name} uses a YAML escape sequence that could hide a "
-                "secret or environment reference"
-            )
-        if name == CROSS_IMAGE_REFRESH_WORKFLOW:
-            continue
-        if YAML_EXPLICIT_KEY.search(text) or YAML_TAG.search(text):
-            errors.append(
-                f"{source}/{name} uses an explicit YAML key or tag, which could "
-                "decode to a deployment environment key"
-            )
-        lowered = text.lower()
-        if (
-            DIGEST_REFRESH_TOKEN_NAME.lower() in lowered
-            or DIGEST_REFRESH_ENVIRONMENT in lowered
-        ):
-            errors.append(
-                f"{source}/{name} references {DIGEST_REFRESH_TOKEN_NAME} or the "
-                f"{DIGEST_REFRESH_ENVIRONMENT} environment, which only "
-                f"{CROSS_IMAGE_REFRESH_WORKFLOW} may use"
-            )
-        if WORKFLOW_ENVIRONMENT_KEY.search(text):
-            errors.append(
-                f"{source}/{name} declares a deployment environment; only "
-                f"{CROSS_IMAGE_REFRESH_WORKFLOW} may, so no other job can receive "
-                "an environment secret"
-            )
-    return errors
-
-def digest_refresh_automation_self_test() -> list[str]:
-    path = Path(".github/workflows") / CROSS_IMAGE_REFRESH_WORKFLOW
-    if not path.is_file():
-        return []
-    real = path.read_text(encoding="utf-8")
-    failures: list[str] = []
-    workflows = {CROSS_IMAGE_REFRESH_WORKFLOW: real, "other.yml": "name: Other\n"}
-    if digest_refresh_automation_errors(workflows, "self-test"):
-        failures.append("the real digest-refresh workflow was rejected")
-    for label, original, replacement in (
-        (
-            "a merge gate that ignores failing checks",
-            'not merging"\n              exit 1\n            fi\n            pending=',
-            'not merging"\n            fi\n            pending=',
-        ),
-        (
-            "a merge gate that overrides readiness",
-            '            if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then\n',
-            '            pending=0\n            missing=""\n'
-            '            if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then\n',
-        ),
-        (
-            "a rotation that may rewrite trusted policy files",
-            '                  exit 1\n                  ;;\n                *Dockerfile*',
-            '                  ;;\n                *Dockerfile*',
-        ),
-        (
-            "write permissions on GITHUB_TOKEN",
-            "  contents: read\n\nconcurrency:",
-            "  contents: write\n\nconcurrency:",
-        ),
-        (
-            "an inherited BASH_ENV",
-            "\nconcurrency:",
-            "\nenv:\n  BASH_ENV: .github/scripts/hook.sh\n\nconcurrency:",
-        ),
-        (
-            "inherited run defaults",
-            "\nconcurrency:",
-            "\ndefaults:\n  run:\n    shell: bash --rcfile hook.sh {0}\n\nconcurrency:",
-        ),
-        (
-            "an extra job",
-            "  cross-image-drift:\n",
-            "  extra:\n    runs-on: ubuntu-26.04\n    steps:\n      - run: true\n\n"
-            "  cross-image-drift:\n",
-        ),
-    ):
-        if original not in real:
-            failures.append(f"the {label} digest-refresh mutation is stale")
-            continue
-        mutated = {**workflows, CROSS_IMAGE_REFRESH_WORKFLOW: real.replace(original, replacement, 1)}
-        if not digest_refresh_automation_errors(mutated, "self-test"):
-            failures.append(f"{label} was admitted")
-    for label, text in (
-        ("a named token reference", "x: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n"),
-        ("a case-varied token reference", "x: ${{ secrets.base_image_refresh_token }}\n"),
-        ("an indexed secret", "x: ${{ secrets['BASE_IMAGE_REFRESH_TOKEN'] }}\n"),
-        ("a computed index", "x: ${{ secrets[format('{0}_TOKEN', 'X')] }}\n"),
-        ("bulk secret serialization", "x: ${{ toJSON(secrets) }}\n"),
-        ("inherited reusable-workflow secrets", "    secrets: inherit\n"),
-        ("wildcard secret serialization", "x: ${{ toJSON(secrets.*) }}\n"),
-        ("a secret wildcard", "x: ${{ join(secrets.*, ',') }}\n"),
-        (
-            "a YAML-escaped token name",
-            'x: "${{ secrets.BASE\\u005fIMAGE_REFRESH_TOKEN }}"\n',
-        ),
-        ("a YAML-escaped expression", 'x: "\\x24{{ secrets.X }}"\n'),
-        ("the refresh environment", "    environment: base-image-refresh\n"),
-        ("another deployment environment", "    environment:\n      name: prod\n"),
-        ("a flow-mapped environment", "    with: {environment: prod}\n"),
-        (
-            "a quoted, computed environment with a continued secret name",
-            "jobs:\n  leak:\n    runs-on: ubuntu-26.04\n"
-            "    \"environment\": ${{ format('base-image-{0}', 'refresh') }}\n"
-            "    steps:\n      - env:\n"
-            "          TOKEN: \"${{ secrets.BASE_IMAGE_\\\n            REFRESH_TOKEN }}\"\n"
-            "        run: true\n",
-        ),
-        ("a single-quoted environment key", "    'environment': prod\n"),
-        (
-            "an explicit continued environment key",
-            "    ? \"envi\\\n      ronment\"\n    : prod\n",
-        ),
-        ("a tagged environment key", "    !!binary ZW52aXJvbm1lbnQ=: prod\n"),
-    ):
-        if not digest_refresh_automation_errors({**workflows, "other.yml": text}, "self-test"):
-            failures.append(f"{label} in another workflow was admitted")
-    return failures
-
 def cross_image_refresh_scan_contents(name: str, contents: str) -> str:
     """Withhold only the exact frozen registry-inspection job from Cross scans.
 
@@ -18981,194 +18806,6 @@ def validate_trusted_policy_extraction(contents: str, source: str) -> list[str]:
     return errors
 
 
-# The protected `main-linux-image` job packages the CI image on the distroless
-# runtime base, so its whole-job SHA-256 would otherwise freeze that base's
-# digest and block the scheduled base-image refresh. The contract therefore
-# hashes the job with this one digest replaced by a placeholder, and a pull
-# request may change the protected job only by swapping that digest to the
-# value the registry serves for the same tag at verification time. Any other
-# byte of the job, a different repository or tag, or a digest the registry
-# does not serve right now is still refused.
-DISTROLESS_RUNTIME_TAG = "gcr.io/distroless/cc-debian13:nonroot"
-DISTROLESS_RUNTIME_REFERENCE = re.compile(
-    re.escape(DISTROLESS_RUNTIME_TAG) + r"@(sha256:[0-9a-f]{64})(?![0-9A-Za-z])"
-)
-DISTROLESS_DIGEST_PLACEHOLDER = "sha256:<registry-verified-distroless-digest>"
-DISTROLESS_ROTATION_JOB = "main-linux-image"
-DISTROLESS_REGISTRY_MANIFEST_URL = (
-    "https://gcr.io/v2/distroless/cc-debian13/manifests/nonroot"
-)
-DISTROLESS_REGISTRY_TOKEN_URL = (
-    "https://gcr.io/v2/token?service=gcr.io&scope=repository:distroless/cc-debian13:pull"
-)
-DISTROLESS_REGISTRY_ACCEPT = ", ".join(
-    (
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-    )
-)
-DISTROLESS_REGISTRY_MAX_MANIFEST_BYTES = 1024 * 1024
-
-
-def normalize_distroless_digest(block: str) -> str:
-    """Replace the distroless runtime digest with the contract placeholder."""
-    return DISTROLESS_RUNTIME_REFERENCE.sub(
-        f"{DISTROLESS_RUNTIME_TAG}@{DISTROLESS_DIGEST_PLACEHOLDER}", block
-    )
-
-
-def protected_job_contract_text(job_name: str, block: str) -> str:
-    """The protected-job text the whole-job SHA-256 contract covers."""
-    if job_name == DISTROLESS_ROTATION_JOB:
-        return normalize_distroless_digest(block)
-    return block
-
-
-def _read_registry_response(request: urllib.request.Request) -> tuple[bytes, Any]:
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = response.read(DISTROLESS_REGISTRY_MAX_MANIFEST_BYTES + 1)
-        return body, response.headers
-
-
-def resolve_distroless_registry_digest() -> str:
-    """Return the content digest the registry serves for the distroless tag.
-
-    The digest is computed from the manifest bytes themselves (OCI digests are
-    content addresses), and the registry's own `Docker-Content-Digest` header
-    must agree. Anonymous access is tried first, then the registry's anonymous
-    pull-token flow. Any failure raises, so the caller fails closed.
-    """
-    headers = {"Accept": DISTROLESS_REGISTRY_ACCEPT}
-    request = urllib.request.Request(DISTROLESS_REGISTRY_MANIFEST_URL, headers=headers)
-    try:
-        body, response_headers = _read_registry_response(request)
-    except urllib.error.HTTPError as error:
-        if error.code != 401:
-            raise
-        token_request = urllib.request.Request(DISTROLESS_REGISTRY_TOKEN_URL)
-        with urllib.request.urlopen(token_request, timeout=30) as response:
-            token_document = json.loads(response.read(64 * 1024))
-        token = token_document.get("token") or token_document.get("access_token")
-        if not isinstance(token, str) or not token:
-            raise RuntimeError("registry token response carried no token") from error
-        request = urllib.request.Request(
-            DISTROLESS_REGISTRY_MANIFEST_URL,
-            headers={**headers, "Authorization": f"Bearer {token}"},
-        )
-        body, response_headers = _read_registry_response(request)
-    if len(body) > DISTROLESS_REGISTRY_MAX_MANIFEST_BYTES:
-        raise RuntimeError("registry manifest exceeds the size bound")
-    digest = "sha256:" + hashlib.sha256(body).hexdigest()
-    advertised = response_headers.get("Docker-Content-Digest")
-    if advertised is not None and advertised != digest:
-        raise RuntimeError(
-            f"registry Docker-Content-Digest {advertised} does not match the "
-            f"served manifest bytes {digest}"
-        )
-    return digest
-
-
-# Replaced only by the self-test; production always asks the registry.
-DISTROLESS_REGISTRY_RESOLVER: Callable[[], str] = resolve_distroless_registry_digest
-
-
-def distroless_rotation_errors(
-    baseline: str, proposed: str, source: str, job_name: str
-) -> list[str] | None:
-    """Admit a protected-job change that is only a registry-verified digest swap.
-
-    Returns None when the change is not a distroless digest swap at all (the
-    caller then reports the ordinary refusal), an empty list when the swap is
-    admitted, and the reasons when it is a swap that cannot be admitted.
-    """
-    if job_name != DISTROLESS_ROTATION_JOB:
-        return None
-    if normalize_distroless_digest(baseline) != normalize_distroless_digest(proposed):
-        return None
-    proposed_digests = set(DISTROLESS_RUNTIME_REFERENCE.findall(proposed))
-    if len(proposed_digests) != 1:
-        return [
-            f"{source} protected job {job_name!r} must pin exactly one "
-            f"{DISTROLESS_RUNTIME_TAG} digest"
-        ]
-    (proposed_digest,) = proposed_digests
-    try:
-        served = DISTROLESS_REGISTRY_RESOLVER()
-    except Exception as error:  # noqa: BLE001 - every failure is fail-closed
-        return [
-            f"{source} protected job {job_name!r} changes the {DISTROLESS_RUNTIME_TAG} "
-            f"digest, but the registry digest could not be verified ({error})"
-        ]
-    if served != proposed_digest:
-        return [
-            f"{source} protected job {job_name!r} pins {proposed_digest} for "
-            f"{DISTROLESS_RUNTIME_TAG}, but the registry currently serves {served}; "
-            "only a swap to the registry's current digest is admitted"
-        ]
-    return []
-
-
-def distroless_rotation_self_test() -> list[str]:
-    global DISTROLESS_REGISTRY_RESOLVER
-    failures: list[str] = []
-    old = "sha256:" + "a" * 64
-    new = "sha256:" + "b" * 64
-    job = (
-        "  main-linux-image:\n"
-        "    steps:\n"
-        "      - uses: ./.github/actions/package-ferrum-runtime-image\n"
-        "        with:\n"
-        f"          base-image: {DISTROLESS_RUNTIME_TAG}@{old}\n"
-    )
-    swapped = job.replace(old, new)
-    production_resolver = DISTROLESS_REGISTRY_RESOLVER
-    try:
-        DISTROLESS_REGISTRY_RESOLVER = lambda: new
-        if protected_job_contract_text(DISTROLESS_ROTATION_JOB, job) != (
-            protected_job_contract_text(DISTROLESS_ROTATION_JOB, swapped)
-        ):
-            failures.append("a distroless digest swap changed the protected-job contract text")
-        if protected_job_contract_text("build-release-arm64-cross", job) != job:
-            failures.append("the distroless placeholder leaked into another protected job")
-        if distroless_rotation_errors(job, swapped, "CI workflow", DISTROLESS_ROTATION_JOB) != []:
-            failures.append("a registry-verified distroless digest swap was refused")
-        if distroless_rotation_errors(job, swapped, "CI workflow", "other-job") is not None:
-            failures.append("a digest swap was admitted outside main-linux-image")
-        for label, mutated in (
-            ("an extra step", swapped + "      - run: echo extra\n"),
-            ("a different tag", swapped.replace(":nonroot@", ":debug-nonroot@")),
-            ("a different repository", swapped.replace("cc-debian13", "base-debian13")),
-            ("a truncated digest", swapped.replace(new, new[:-1])),
-        ):
-            if distroless_rotation_errors(
-                job, mutated, "CI workflow", DISTROLESS_ROTATION_JOB
-            ) == []:
-                failures.append(f"a distroless rotation with {label} was admitted")
-        two_pins = swapped + f"          other: {DISTROLESS_RUNTIME_TAG}@{old}\n"
-        if not distroless_rotation_errors(
-            job + f"          other: {DISTROLESS_RUNTIME_TAG}@{old}\n",
-            two_pins,
-            "CI workflow",
-            DISTROLESS_ROTATION_JOB,
-        ):
-            failures.append("a partial distroless rotation was admitted")
-        DISTROLESS_REGISTRY_RESOLVER = lambda: old
-        if not distroless_rotation_errors(job, swapped, "CI workflow", DISTROLESS_ROTATION_JOB):
-            failures.append("a digest the registry does not serve was admitted")
-
-        def unavailable() -> str:
-            raise RuntimeError("registry unavailable")
-
-        DISTROLESS_REGISTRY_RESOLVER = unavailable
-        if not distroless_rotation_errors(job, swapped, "CI workflow", DISTROLESS_ROTATION_JOB):
-            failures.append("an unverifiable distroless digest swap was admitted")
-    finally:
-        DISTROLESS_REGISTRY_RESOLVER = production_resolver
-    return failures
-
-
 def validate_workflow_contract(
     contents: str,
     source: str,
@@ -19181,9 +18818,7 @@ def validate_workflow_contract(
     if failures:
         return failures
     assert block is not None
-    actual = hashlib.sha256(
-        protected_job_contract_text(job_name, block).encode("utf-8")
-    ).hexdigest()
+    actual = hashlib.sha256(block.encode("utf-8")).hexdigest()
     errors: list[str] = []
     if actual != expected_sha256:
         errors.append(
@@ -19823,17 +19458,9 @@ def compare_pr_workflow_job(
             # the trusted checkout, before any new CI job can be admitted.
             errors.extend(nonpublishing_ci_errors(proposed_contents, source))
     if baseline != proposed:
-        rotation = (
-            distroless_rotation_errors(baseline, proposed, source, job_name)
-            if source == "CI workflow" and baseline is not None and proposed is not None
-            else None
+        errors.append(
+            f"{source} protected job {job_name!r} cannot be changed by a pull request"
         )
-        if rotation is None:
-            errors.append(
-                f"{source} protected job {job_name!r} cannot be changed by a pull request"
-            )
-        else:
-            errors.extend(rotation)
 
     baseline_env, baseline_env_failures = extract_top_level_block(
         merge_base_contents, f"merge-base {source}", "env", required=False
@@ -20015,8 +19642,7 @@ def compare_pr_workflow_job(
 
 
 def self_test() -> list[str]:
-    failures: list[str] = distroless_rotation_self_test()
-    failures.extend(digest_refresh_automation_self_test())
+    failures: list[str] = []
 
     # Repeated scans must retain quoting, malformed-input and content-change
     # behavior. Cache only lexical data, never a decision from a scanner scope.
@@ -32444,7 +32070,6 @@ def main() -> int:
     failures.extend(workflow_directory_failures)
     if not workflow_directory_failures:
         failures.extend(validate_workflow_collection(workflows, "workflow directory"))
-        failures.extend(digest_refresh_automation_errors(workflows, "workflow directory"))
 
     actions, action_directory_failures = load_action_directory(
         args.actions_dir,
@@ -32561,11 +32186,6 @@ def main() -> int:
                     merge_base_workflows,
                     proposed_workflows,
                     "workflow directory",
-                )
-            )
-            failures.extend(
-                digest_refresh_automation_errors(
-                    proposed_workflows, "proposed workflow directory"
                 )
             )
 

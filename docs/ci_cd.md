@@ -93,7 +93,7 @@ adding, removing, or materially changing a workflow.
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
 | `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
-| `base-image-digest-refresh.yml` | Base Image Digest Refresh | Weekly schedule, manual | Resolves the current `@sha256:` digest for each pinned Dockerfile `FROM`/`ARG` image tag and rotates every Dockerfile/YAML consumer of a drifted pin, including the distroless base in `ci.yml`'s `main-linux-image` job. A credential-free job runs the verifier; a separate job repeats the identical rotation, opens the PR with `BASE_IMAGE_REFRESH_TOKEN`, and the workflow merges the exact head (merge commit) itself after every required check succeeds. The trusted Cross policy freezes the whole workflow (see `docs/dependency-policy.md`). |
+| `base-image-digest-refresh.yml` | Base Image Digest Refresh | Weekly schedule, manual | Resolves the current `@sha256:` digest for each pinned Dockerfile `FROM`/`ARG` image tag and opens an ordinary PR with every non-workflow consumer of a drifted pin rotated, including the distroless runtime base. It uses only its own `GITHUB_TOKEN`, so a maintainer reopens the PR to start CI, then reviews and merges it (see `docs/dependency-policy.md`). |
 | `trusted-policy-candidate.yml` | Trusted Policy Candidate | PRs and push to `main` on `.github/scripts/**` or `.github/workflows/**` | Read-only `Candidate policy self-test`: runs the candidate `verify_required_ci.py` and the candidate Cross verifier's `--self-test`; nothing consumes its output. Not a required check. |
 | `benchmark-harness-lockfile.yml` | Benchmark Harness Lockfile | PRs on the multi-protocol harness `Cargo.toml`/`Cargo.lock` | Fails on lockfile drift and retains the expected lockfile. Optional. |
 | `mesh-benchmark-lockfile.yml` | Mesh Benchmark Lockfile | PRs and push to `main` on the mesh benchmark manifests, manual | Checks the `tests/performance/mesh` locked dependency graph. Optional. |
@@ -3702,32 +3702,6 @@ and `permissions: { id-token: write, packages: write }` only for release and
 `main-latest-image.yml` image signing and attestation. Repository **Settings → Actions → General → Workflow
 permissions** must allow read/write access (including `packages: write`) for
 those per-job grants to take effect.
-
-#### Base image digest refresh
-
-- `BASE_IMAGE_REFRESH_TOKEN` - an **environment** secret of the
-  `base-image-refresh` environment (not a repository secret, which every
-  same-repository pull-request run could read). The environment must admit only
-  the `main` branch. The token is a fine-grained personal access token scoped to
-  `ferrum-edge/ferrum-edge` with **Contents: read and write**, **Pull requests:
-  read and write**, and **Workflows: read and write**. Choose the longest
-  expiration the organization allows; an expired token makes the refresh fail
-  with an authentication error until the secret is replaced. A GitHub App
-  installation token is not suitable: it expires after one hour, so a stored
-  one is invalid by the next weekly run. `base-image-digest-refresh.yml` uses it to push
-  `deps/base-image-digests`, open the refresh PR, and merge it. `GITHUB_TOKEN`
-  cannot substitute: pull requests it opens start no CI, and it can never change
-  `.github/workflows/ci.yml`, which pins the distroless runtime base. Without the
-  secret the refresh still resolves digests but fails before opening a PR.
-
-```bash
-gh api -X PUT repos/ferrum-edge/ferrum-edge/environments/base-image-refresh \
-  -F 'deployment_branch_policy[protected_branches]=false' \
-  -F 'deployment_branch_policy[custom_branch_policies]=true'
-gh api -X POST repos/ferrum-edge/ferrum-edge/environments/base-image-refresh/deployment-branch-policies \
-  -f name=main -f type=branch
-gh secret set BASE_IMAGE_REFRESH_TOKEN -R ferrum-edge/ferrum-edge --env base-image-refresh
-```
 
 ### Secret Usage in Workflows
 
