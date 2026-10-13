@@ -157,7 +157,7 @@ jobs:
           python3 tests/performance/multi_protocol/h2_cpu_profile.py report h2-cpu-evidence
       - name: Retain raw profiles, coverage limits, counters and controls
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: h2-cpu-${{ inputs.protocol }}-${{ inputs.payload }}-${{ github.sha }}
           path: h2-cpu-evidence/

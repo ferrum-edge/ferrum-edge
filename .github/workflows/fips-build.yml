@@ -491,7 +491,7 @@ jobs:
       - name: Download exact inter-run FIPS handoff artifact
         if: github.event.inputs.force_cold_cache != 'true' && github.event_name == 'workflow_dispatch' && inputs.warm_source_run_id != ''
         id: inter-run-fips-handoff
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ inputs.warm_source_run_id }}-${{ inputs.warm_source_run_attempt }}
           path: ${{ runner.temp }}/inter-run-fips-handoff
@@ -827,7 +827,7 @@ jobs:
       # the same-run compile-to-consumer channel and the inter-run warm source.
       - name: Publish FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ env.FIPS_HANDOFF_ARTIFACT }}
           path: ${{ runner.temp }}/fips-producer-handoff.tar.zst
@@ -928,7 +928,7 @@ jobs:
       # when several attempts exist; promotion below admits both layouts.
       - name: Download FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*
           path: ${{ runner.temp }}/fips-producer-channel
@@ -1500,7 +1500,7 @@ jobs:
       # when several attempts exist; promotion below admits both layouts.
       - name: Download FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*
           path: ${{ runner.temp }}/fips-producer-channel
@@ -2068,7 +2068,7 @@ jobs:
       # when several attempts exist; promotion below admits both layouts.
       - name: Download FIPS producer handoff
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*
           path: ${{ runner.temp }}/fips-producer-channel
@@ -2623,7 +2623,7 @@ jobs:
           exit "$status"
 
       - name: Publish exact FIPS test executables
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/target/fips-test-bundle
@@ -2665,7 +2665,7 @@ jobs:
       # instead of asking for an artifact the skipped producer never published
       # at attempt N.
       - name: Download exact FIPS test executables
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: fips-test-binaries-${{ github.run_id }}-*
           path: ${{ runner.temp }}/fips-test-channel

@@ -134,7 +134,7 @@ jobs:
             tar --exclude=target -czf "$RUNNER_TEMP/h2-guard/evidence/patched-source.tgz" -C "$crate" .
             sha256sum "$RUNNER_TEMP/h2-guard/evidence/patched-source.tgz" > "$RUNNER_TEMP/h2-guard/evidence/patched-source.sha256"
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: h2-guard-checks-${{ github.sha }}-${{ github.run_attempt }}
@@ -242,7 +242,7 @@ jobs:
           if [ -f tests/performance/multi_protocol/target/release/proto_bench ]; then
             sha256sum tests/performance/multi_protocol/target/release/proto_bench tests/performance/multi_protocol/target/release/proto_backend > "$RUNNER_TEMP/h2-guard/evidence/harness-binaries.sha256"
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: h2-guard-${{ matrix.protocol }}-${{ github.sha }}-${{ github.run_attempt }}
