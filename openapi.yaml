@@ -31588,7 +31588,7 @@ components:
                 type: string
                 minLength: 16
                 maxLength: 4096
-                pattern: "^[!-~]+$"
+                pattern: "^[!-~]+$(?![\\s\\S])"
               default: {}
               description: >-
                 Header name to shared secret. A request skips validation only
