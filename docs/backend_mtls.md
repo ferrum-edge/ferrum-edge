@@ -280,11 +280,13 @@ proxies:
   - id: "public-api"
     listen_path: "/public"
     backend_host: "public-api.example.com"
+    backend_port: 443
     # Uses global mTLS settings
     
   - id: "secure-api"  
     listen_path: "/secure"
     backend_host: "secure-api.example.com"
+    backend_port: 443
     # Override with specific certificates
     backend_tls_client_cert_path: "/etc/ssl/certs/secure-client.pem"
     backend_tls_client_key_path: "/etc/ssl/private/secure-client-key.pem"

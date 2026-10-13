@@ -242,9 +242,13 @@ FERRUM_CP_GRPC_LISTEN_ADDR="127.0.0.1:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-dev-cp-dp-secret-min-32-chars" \
 cargo run --release -- run
 
-# Data Plane (single CP, loopback — local development only)
+# Data Plane (single CP, loopback — local development only; its read-only
+# Admin API is on http://127.0.0.1:9001 so it does not collide with the CP's
+# admin listener on 9000 on the same host)
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="http://localhost:50051" \
+FERRUM_ADMIN_JWT_SECRET="change-me-dev-admin-secret-min-32-chars" \
+FERRUM_ADMIN_HTTP_PORT=9001 \
 FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-dev-cp-dp-secret-min-32-chars" \
 cargo run --release -- run
 
@@ -252,6 +256,7 @@ cargo run --release -- run
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URLS="https://cp1:50051,https://cp2:50051,https://cp3:50051" \
 FERRUM_DP_GRPC_TLS_CA_CERT_PATH="/certs/ca.pem" \
+FERRUM_ADMIN_JWT_SECRET="change-me-dev-admin-secret-min-32-chars" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-dev-cp-dp-secret-min-32-chars" \
 cargo run --release -- run
 ```

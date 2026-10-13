@@ -2568,11 +2568,11 @@ remain separate.
   "generated_at": "2025-01-15T10:30:00Z",
   "consumers": {
     "alice": {
-      "total_charges": 1.55,
+      "total_charges": 1.5502,
       "total_calls": 150042,
       "per_call_charges": 1.50,
       "stream_connection_charges": 0.021,
-      "bandwidth_charges": 0.029,
+      "bandwidth_charges": 0.0292,
       "proxies": {
         "proxy-abc": {
           "namespace": "ferrum",
@@ -3132,7 +3132,7 @@ Response:
     {
       "pod_uid": "11111111-1111-1111-1111-111111111111",
       "spiffe_id": "spiffe://cluster.local/ns/default/sa/api",
-      "workload_spiffe_hash": 12345678901234567890,
+      "workload_spiffe_hash": 7034895985921056185,
       "orig_dst4_cookies": 5,
       "orig_dst6_cookies": 0,
       "has_policy_scope": true
@@ -3140,7 +3140,7 @@ Response:
     {
       "pod_uid": "22222222-2222-2222-2222-222222222222",
       "spiffe_id": "spiffe://cluster.local/ns/default/sa/billing",
-      "workload_spiffe_hash": 9876543210987654321,
+      "workload_spiffe_hash": 11217503067615104173,
       "orig_dst4_cookies": 12,
       "orig_dst6_cookies": 0,
       "has_policy_scope": false
@@ -3329,7 +3329,7 @@ Response (truncated):
       }
     ],
     "destination_rules": [
-      {"namespace": "alpha", "name": "reviews", "hosts": ["reviews.alpha.svc.cluster.local"], "ports": []}
+      {"namespace": "alpha", "name": "reviews", "hosts": ["reviews.alpha.svc.cluster.local"]}
     ],
     "known_destinations": ["reviews.alpha.svc.cluster.local:8080"]
   },
