@@ -199,12 +199,12 @@ pub trait SendStream<B: Buf> {
 /// borrow the send stream and must not box a trait object per call. Return-
 /// position `impl Future` is used so this stays on stable Rust.
 pub trait SendStreamStopped {
-    /// Completes when the peer stops this send stream or the connection is lost.
+    /// Completes when peer stops this stream, connection lost, or 0-RTT rejected.
     ///
     /// `Ok(Some(code))` is a peer `STOP_SENDING`. `Ok(None)` means the local
     /// side already finished and the peer acknowledged the stream, after which
-    /// `STOP_SENDING` is no longer meaningful. `Err` is a connection-level
-    /// failure.
+    /// `STOP_SENDING` is no longer meaningful. `Err` is connection loss or
+    /// rejected 0-RTT (h3-quinn maps the latter to `Unknown`).
     fn stopped(
         &self,
     ) -> impl Future<Output = Result<Option<u64>, StreamErrorIncoming>> + Send + 'static;

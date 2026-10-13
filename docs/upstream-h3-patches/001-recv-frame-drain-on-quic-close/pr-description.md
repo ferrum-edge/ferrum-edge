@@ -2,6 +2,16 @@ frame: drain buffered bytes before propagating QUIC connection error
 
 Fixes #338.
 
+> Current applicability note (not part of the filed upstream text below):
+> the "first `poll_next` or `poll_data` that finds nothing buffered" sentence
+> needs the body-EOF boundary in the vendored 0.0.8 port — once
+> `remaining_data` is zero, `poll_data` returns `Ok(None)` before checking
+> the deferred error, so a completed DATA payload yields body EOF and a
+> subsequent `poll_next` observes the deferred connection error; only a
+> still-incomplete (truncated) DATA payload can surface it from `poll_data`.
+> See this patch's README. The filed text below is kept as the historical
+> record.
+
 ## Problem
 
 When a QUIC stack delivers stream data and a connection close in the same receive batch (for example a coalesced `STREAM` + `CONNECTION_CLOSE(H3_NO_ERROR)` on Linux with batched `recvmsg`), `FrameStream` could read the connection error while complete frames or DATA body bytes were already sitting in `BufRecvStream`'s buffer. The error was propagated with `?` and those bytes were thrown away, so a response that was already on the wire came back as a connection error. `H3_NO_ERROR` is the RFC 9114 §8.1 code for a graceful shutdown, so backends that close correctly (request limits, draining, rolling deploys) showed up as failures.

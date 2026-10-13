@@ -117,20 +117,33 @@ is identical to the published crate's.
    [`docs/vendored-patch-lifecycle.json`](../../vendored-patch-lifecycle.json)
    with the issue and PR numbers.
 
-## Behavioral regression coverage (must survive retirement)
+## Regression coverage (must survive retirement)
 
-- `tests/unit/gateway_core/http3_server_dispatch_tests.rs` —
-  `h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read`
-  pins the vendored shape (inline ownership, no `Option::unwrap` in
-  `stop_sending`) so the panic hazard cannot silently return.
-- `tests/unit/gateway_core/http3_server_dispatch_tests.rs` —
-  `h3_native_grpc_upload_pump_halts_the_frontend_receive_half_gracefully` and
-  `h3_cross_protocol_grpc_upload_pump_halts_the_frontend_receive_half_gracefully`
-  pin that both request-upload pumps call the graceful
-  `STOP_SENDING(H3_NO_ERROR)` unconditionally.
-- `tests/functional/scripted_backend_h3_tests.rs` —
-  `h3_native_grpc_bidi_server_responds_before_client_half_close` exercises the
-  live cancellation path end to end.
+These tests do not all prove the same thing; do not read them as proof of
+every cancellation exit or of the wire stop code:
+
+- **Source-shape checks** (string assertions over source text, not runtime
+  behavior):
+  - `tests/unit/gateway_core/http3_server_dispatch_tests.rs` —
+    `h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read`
+    checks inline ownership (`stream: quinn::RecvStream`), absence of
+    `ReusableBoxFuture` and of `unwrap()` inside `stop_sending`, and the
+    per-poll `pin!(self.stream.read_chunk(usize::MAX, true))` expression, so
+    the old `Option` ownership hazard cannot silently return.
+  - `tests/unit/gateway_core/http3_server_dispatch_tests.rs` —
+    `h3_native_grpc_upload_pump_halts_the_frontend_receive_half_gracefully` and
+    `h3_cross_protocol_grpc_upload_pump_halts_the_frontend_receive_half_gracefully`
+    check source text: both request-upload pumps call
+    `halt_request_body(...)` (the graceful `STOP_SENDING(H3_NO_ERROR)` helper)
+    unconditionally rather than an idle-gated variant.
+- **Functional early-response scenario** (ignored, end-to-end):
+  `tests/functional/scripted_backend_h3_tests.rs` —
+  `h3_native_grpc_bidi_server_responds_before_client_half_close` asserts the
+  response arrives before client half-close, the response body/trailers, and
+  that the native backend received the request DATA. It does not synchronize
+  a pending frontend read and does not assert the `STOP_SENDING` error code
+  on the wire. Stronger behavioral coverage — a deterministic pending-read
+  barrier plus an observable stop code — would be a separate focused test.
 
 ## Retirement
 

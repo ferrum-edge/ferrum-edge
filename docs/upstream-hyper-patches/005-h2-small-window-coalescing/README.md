@@ -118,8 +118,14 @@ deadlock:
 - **End of a chunk.** A chunk that fits the assigned capacity is sent at
   once; the pipe never waits for the next chunk. A tail smaller than the
   coalescing threshold that does not fit is held for at most 2 ms.
-- **512-byte windows.** A 512-byte stream window grants at least 256 bytes per
-  increment, so it is never held.
+- **512-byte windows.** The bypass is decided by the capacity available for
+  the pending chunk, not by the peer's stream-window setting: capacity of at
+  least `min(remaining, 256)` bypasses the hold. A 512-byte stream-window
+  setting does not impose that minimum on each assignment — smaller
+  `WINDOW_UPDATE` increments or remaining connection credit can leave a
+  smaller assignment, which can still enter the bounded coalescing wait even
+  with a 512-byte peer stream window. (The separate whole-chunk
+  assigned-window bypass above is unchanged.)
 - **Bounded hold.** Held capacity stays assigned to the stream for at most one
   wait. A hold is not a write stall: patch 004's timer still runs only while
   assigned capacity is zero.
