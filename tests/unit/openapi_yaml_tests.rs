@@ -2651,7 +2651,6 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_consumers": ["alice"]}),
         json!({"disallowed_consumers": ["bad"], "allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true}),
-        json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
         json!({"allowed_consumers": ["  alice  "]}),
         // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
         json!({"allowed_consumers": ["\u{feff}"]}),
@@ -2680,6 +2679,11 @@ fn access_control_schema_matches_runtime_validation() {
         json!({}),
         json!({"allowed_consumer": ["alice"]}),
         json!({"allowed_consumers": [], "allowed_groups": []}),
+        // Issue #6607: an explicitly empty allow-list is refused, not allow-all.
+        json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
+        json!({"allowed_consumers": [], "disallowed_consumers": ["mallory"]}),
+        json!({"allowed_groups": [], "disallowed_groups": ["banned"]}),
+        json!({"allowed_consumers": [], "allowed_groups": ["engineering"]}),
         json!({"allowed_consumers": ["alice"], "allow_authenticated_identity": true}),
         json!({"allowed_groups": ["engineering"], "allow_authenticated_identity": true}),
         json!({"allowed_consumers": [""]}),

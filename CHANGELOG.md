@@ -134,6 +134,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `access_control` refuses an explicitly empty allow-list**
+  (issue #6607). `allowed_consumers: []` or `allowed_groups: []` used to mean
+  "no allow restriction", so emptying the list to lock a route down admitted
+  every consumer the deny side did not name. A present but empty allow-list is
+  now a config validation error (`minItems: 1` in `openapi.yaml`); omit the key
+  for no allow restriction. A non-object config error no longer echoes the
+  rejected value.
+- **`ip_restriction` `mode` is deprecated and documented as
+  decision-neutral** (issue #6610). `allow_first` and `deny_first` never
+  changed whether a request is admitted: a deny match always rejects and a
+  non-empty `allow` list always rejects addresses outside it. The key only
+  selects the rejection reason for an address failing both checks. It still
+  loads, is marked `deprecated` in `openapi.yaml`, and a test pins the
+  decision across both modes.
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB

@@ -225,7 +225,63 @@ async fn test_access_control_empty_consumer_lists_reject_creation() {
     });
     let result = AccessControl::new(&config);
     assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .contains("`allowed_consumers` must not be an empty array")
+    );
+
+    let result = AccessControl::new(&json!({"disallowed_consumers": []}));
     assert!(result.err().unwrap().contains("at least one"));
+}
+
+// ---- Issue #6607: an explicitly empty allow-list is refused, not allow-all ----
+
+#[tokio::test]
+async fn test_access_control_explicitly_empty_allow_list_is_refused() {
+    // Each of these used to construct with the empty allow-list treated as "no
+    // allow restriction", silently admitting every consumer the deny side did
+    // not name.
+    for config in [
+        json!({"allowed_consumers": [], "disallowed_consumers": ["mallory"]}),
+        json!({"allowed_groups": [], "disallowed_groups": ["banned"]}),
+        json!({"allowed_consumers": [], "allow_authenticated_identity": true}),
+        json!({"allowed_groups": [], "allow_authenticated_identity": true}),
+        json!({"allowed_consumers": [], "allowed_groups": ["engineering"]}),
+        json!({"allowed_consumers": ["alice"], "allowed_groups": []}),
+    ] {
+        let error = AccessControl::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("explicitly empty allow-list must be refused: {config}"));
+        assert!(
+            error.contains("must not be an empty array"),
+            "{config}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_access_control_omitted_allow_list_means_no_allow_restriction() {
+    // Omitted allow-lists keep their meaning: only the deny side applies.
+    let plugin = AccessControl::new(&json!({"disallowed_consumers": ["mallory"]})).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups("alice", vec![])));
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups("mallory", vec![])));
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_non_object_config_error_omits_the_value() {
+    let error = AccessControl::new(&json!(["secret-principal"]))
+        .err()
+        .expect("non-object config must be refused");
+    assert!(error.contains("must be an object"), "{error}");
+    assert!(!error.contains("secret-principal"), "{error}");
 }
 
 #[tokio::test]
@@ -697,6 +753,14 @@ async fn test_access_control_empty_groups_reject_creation() {
     });
     let result = AccessControl::new(&config);
     assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .contains("`allowed_groups` must not be an empty array")
+    );
+
+    let result = AccessControl::new(&json!({"disallowed_groups": []}));
     assert!(result.err().unwrap().contains("at least one"));
 }
 

@@ -27,6 +27,10 @@
 //!
 //! Evaluation order: deny (consumer + group) → allow (consumer + group).
 //! If no rules match, the request is allowed (open by default).
+//!
+//! An omitted allow-list means "no allow restriction". An allow-list that is
+//! present but empty is refused at construction (issue #6607): it would
+//! otherwise read as "allow nobody" while behaving as "no restriction".
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
@@ -61,15 +65,18 @@ pub struct AccessControl {
 
 impl AccessControl {
     pub fn new(config: &Value) -> Result<Self, String> {
+        // Name only the JSON type: the rejected value may carry principal
+        // names, and this message reaches admin responses and logs.
         let object = config.as_object().ok_or_else(|| {
             format!(
-                "access_control: config must be an object, got: {config:?}",
-                config = config.to_string()
+                "access_control: config must be an object, got {}",
+                json_type_name(config)
             )
         })?;
 
         reject_removed_ip_keys(object)?;
         reject_unknown_keys(object)?;
+        reject_explicitly_empty_allow_lists(object)?;
 
         let allowed = parse_string_set(
             object,
@@ -307,6 +314,44 @@ fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// Refuse an allow-list that is present but empty.
+///
+/// An omitted allow-list means "no allow restriction". An explicitly empty one
+/// reads like "allow nobody", but with no entries there is nothing to match, so
+/// treating it as "no restriction" would silently open a route an operator was
+/// emptying to lock it down. Neither reading is safe to guess, so the
+/// configuration is refused and the operator must omit the key or name at
+/// least one principal.
+fn reject_explicitly_empty_allow_lists(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    for key in ["allowed_consumers", "allowed_groups"] {
+        if object
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.is_empty())
+        {
+            return Err(format!(
+                "access_control: `{key}` must not be an empty array; omit it for no allow \
+                 restriction, or list at least one entry (an empty allow-list does not mean \
+                 deny-all)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 fn parse_string_set(
