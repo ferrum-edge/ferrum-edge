@@ -482,7 +482,7 @@ change `admin.bindAddress`; you must explicitly expose admin for cluster
 scraping. Choose **one** of the two alternatives below — they are not a single
 block to copy together, and neither is a complete installation recipe.
 
-CIDR-only (no Bearer [REDACTED]; the scrape source IP is the credential):
+CIDR-only (no Bearer authorization; the scrape source IP is the credential):
 
 ```yaml
 metrics:
@@ -497,7 +497,7 @@ admin:
   allowedCidrs: "10.0.0.0/8,127.0.0.0/8"   # database/cp: required for plaintext admin
 ```
 
-Bearer [REDACTED] (requires admin HTTPS plus a verifying scrape `tlsConfig`;
+Bearer authorization (requires admin HTTPS plus a verifying scrape `tlsConfig`;
 replace the Secret/certificate placeholders with operator-provided values):
 
 ```yaml
