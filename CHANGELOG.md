@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — `openapi_validator` `bypass.header_present` requires a
-  shared secret.** Each entry now maps a header name to a secret of
+  shared secret.** (issue n/a, PR #6634) Each entry now maps a header name to a secret of
   16–4096 visible ASCII characters, and a request skips validation only
   when that header carries exactly the secret, compared in constant time.
   Presence-only entries (`null`) and short, padded, non-ASCII or control
