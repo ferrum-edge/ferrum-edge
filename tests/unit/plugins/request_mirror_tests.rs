@@ -2949,7 +2949,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
                 "mirror_host": "mirror.local",
                 "sensitive_query_patterns": ["x-vendor-"],
                 "forward_sensitive_query": true,
-                "forward_sensitive_query_allowlist": ["x-vendor-token"]
+                "forward_sensitive_query_allowlist": ["x-vendor-value"]
             }),
             PluginHttpClient::default(),
         )
@@ -3616,7 +3616,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
                 "mirror_host": "mirror.local",
                 "sensitive_header_patterns": ["x-vendor-"],
                 "forward_sensitive_headers": true,
-                "forward_sensitive_header_allowlist": ["x-vendor-token"]
+                "forward_sensitive_header_allowlist": ["x-vendor-value"]
             }),
             PluginHttpClient::default(),
         )
@@ -4443,7 +4443,7 @@ async fn sensitive_header_patterns_and_substrings_strip_vendor_credentials() {
     // Caught by the built-in `security-token` substring:
     headers.insert("x-amz-security-token".to_string(), "amz-tok".to_string());
     // Caught only by the operator pattern `x-vault-`:
-    headers.insert("x-vault-token".to_string(), "vault-tok".to_string());
+    headers.insert("x-vault-value".to_string(), "vault-tok".to_string());
     // Benign: contains only the excluded bare `token` substring — must survive.
     headers.insert("x-continuation-token".to_string(), "page2".to_string());
     headers.insert("x-custom".to_string(), "keep-me".to_string());
@@ -4459,7 +4459,7 @@ async fn sensitive_header_patterns_and_substrings_strip_vendor_credentials() {
         "x-openai-api-key:",
         "x-datadog-api-key:",
         "x-amz-security-token:",
-        "x-vault-token:",
+        "x-vault-value:",
         "sk-openai",
         "dd-key",
         "amz-tok",
@@ -6631,6 +6631,8 @@ async fn mirror_strips_unlisted_credential_class_headers() {
         "x-sso-ticket",
         "x-hmac",
         "x-passphrase",
+        "x-ssoticket",
+        "x-clientassertion",
     ];
     for (idx, name) in credential_names.iter().enumerate() {
         headers.insert((*name).to_string(), format!("cred-value-{idx}"));
@@ -6677,16 +6679,21 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
     const RAW: &str = concat!(
         "keep=1&session_id=q1&sessionId=q2&jwt=q3&access_key=q4&private_key=q5&",
         "key=q6&sid=q7&pwd=q8&ticket=q9&auth=q10&x.auth.code=q11&otp=q12&",
-        "continuation_token=c3&author=a1&signal=1&page=2"
+        "ssoTicket=q13&clientAssertion=q14&%73essionid=q15&sess%2569on_key=q16&",
+        "continuation_token=c3&continuation%5Ftoken=c4&continuation%255Ftoken=c5&",
+        "author=a1&signal=1&page=2"
     );
     ctx.set_raw_query_string(RAW.to_string());
 
     let request_line = capture_mirror_request_line(&mut ctx).await;
     assert!(
-        request_line.contains("?keep=1&continuation_token=c3&author=a1&signal=1&page=2 "),
+        request_line.contains(concat!(
+            "?keep=1&continuation_token=c3&continuation%5Ftoken=c4&",
+            "continuation%255Ftoken=c5&author=a1&signal=1&page=2 "
+        )),
         "benign pairs must be retained in order: {request_line}"
     );
-    for idx in 1..=12 {
+    for idx in 1..=16 {
         let value = format!("=q{idx}&");
         let tail = format!("=q{idx} ");
         assert!(
@@ -6699,6 +6706,49 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         Some(RAW),
         "primary raw query must remain byte-for-byte unchanged"
     );
+}
+
+/// Operator patterns still decide names outside every built-in classifier.
+#[test]
+fn operator_pattern_alone_makes_a_vendor_name_sensitive() {
+    for (patterns_key, forward_key, allow_key) in [
+        (
+            "sensitive_header_patterns",
+            "forward_sensitive_headers",
+            "forward_sensitive_header_allowlist",
+        ),
+        (
+            "sensitive_query_patterns",
+            "forward_sensitive_query",
+            "forward_sensitive_query_allowlist",
+        ),
+    ] {
+        let without_pattern = RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                forward_key: true,
+                allow_key: ["x-vendor-value"]
+            }),
+            PluginHttpClient::default(),
+        );
+        assert!(
+            without_pattern.is_err(),
+            "{allow_key}: x-vendor-value is not built-in sensitive and must be rejected"
+        );
+        let with_pattern = RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                patterns_key: ["x-vendor-"],
+                forward_key: true,
+                allow_key: ["x-vendor-value"]
+            }),
+            PluginHttpClient::default(),
+        );
+        assert!(
+            with_pattern.is_ok(),
+            "{allow_key}: the operator pattern must make x-vendor-value allowlistable"
+        );
+    }
 }
 
 /// Names caught only by the credential-class rule are still opt-in-able

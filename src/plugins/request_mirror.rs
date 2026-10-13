@@ -582,6 +582,9 @@ const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "saml",
     "csrf",
     "xsrf",
+    "ticket",
+    "assertion",
+    "hmac",
 ];
 
 /// Whole segments that contain the `auth` stem but name authorship or a URI
@@ -697,8 +700,17 @@ fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) ->
 /// built-in substrings, and operator `sensitive_query_patterns` all deny.
 /// Never logs the name.
 fn is_mirror_sensitive_query_name(name_lower: &str, operator_patterns: &[String]) -> bool {
-    query_name_has_built_in_credential_segment(name_lower)
+    is_mirror_sensitive_query_name_staged(name_lower, operator_patterns)
         || name_has_credential_class(name_lower)
+}
+
+/// The list-based part of [`is_mirror_sensitive_query_name`], applied to every
+/// staged decode layer. The class rule ([`name_has_credential_class`]) runs
+/// only on the fully decoded name, because a raw `%XX` escape splits segments
+/// (`continuation%5Ftoken` would read as `continuation` + `5ftoken`) and would
+/// defeat its narrow exceptions.
+fn is_mirror_sensitive_query_name_staged(name_lower: &str, operator_patterns: &[String]) -> bool {
+    query_name_has_built_in_credential_segment(name_lower)
         || query_name_has_adjacent_segments(name_lower, "api", "key")
         || MIRROR_SENSITIVE_QUERY_SUBSTRINGS
             .iter()
@@ -886,7 +898,12 @@ fn classify_mirror_query_name(
             } else {
                 Cow::Owned(current.to_ascii_lowercase())
             };
-            if is_mirror_sensitive_query_name(lower.as_ref(), operator_patterns) {
+            // The class rule runs once, on the fully decoded layer (see
+            // `is_mirror_sensitive_query_name_staged`).
+            if is_mirror_sensitive_query_name_staged(lower.as_ref(), operator_patterns)
+                || (!name_has_valid_percent_escape(current.as_ref())
+                    && name_has_credential_class(lower.as_ref()))
+            {
                 sensitive = true;
             }
         }
