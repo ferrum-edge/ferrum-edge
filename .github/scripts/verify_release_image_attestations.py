@@ -157,8 +157,18 @@ def validate_release_workflow(workflow: str) -> list[str]:
             "manifest provenance is generated after assembly"
         )
 
+    # Any full-commit pin: which upstream release it is, is governed by the
+    # trusted action pin rotation check (docs/dependency-policy.md →
+    # "Automated action pin rotation").
+    if not re.search(
+        r"(?m)^\s*(?:-\s+)?uses:\s+sigstore/cosign-installer@[0-9a-f]{40}(?:\s+#.*)?$",
+        attest_job,
+    ):
+        errors.append(
+            "jobs.attest-release-images must install cosign with a "
+            "full-commit-pinned sigstore/cosign-installer"
+        )
     required_tokens = (
-        "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
         SYFT_IMAGE,
         "for platform in linux/amd64 linux/arm64; do",
         '--platform "$platform"',

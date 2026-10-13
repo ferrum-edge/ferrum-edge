@@ -28,7 +28,7 @@ The root CLAUDE.md "Testing Policy" applies (test what changed; CI is the full g
 ## Cargo Target Isolation
 
 - Leave `CARGO_TARGET_DIR` unset across parallel worktrees so each uses its own `target/`. A stale inherited value causes `Blocking waiting for file lock on build directory`; work around it per command with `unset CARGO_TARGET_DIR && cargo ...`.
-- Sharing `SCCACHE_DIR` is safe; the repo `.cargo/config.toml` already uses `sccache`.
+- Sharing `SCCACHE_DIR` is safe. The repo `.cargo/config.toml` names no `rustc-wrapper` (Dependabot's cargo updater has no sccache), so sccache runs only where the user-level `$CARGO_HOME/config.toml` or `RUSTC_WRAPPER` enables it; `scripts/install-build-deps.sh` sets the former.
 - Within one workspace, run fmt, clippy, and tests sequentially because they share that workspace's target dir.
 
 ## Environment Isolation

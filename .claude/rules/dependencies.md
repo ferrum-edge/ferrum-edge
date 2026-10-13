@@ -49,6 +49,27 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 - External GitHub Actions must be pinned to a full commit SHA (see
   `docs/dependency-policy.md` → "CI Actions and Kubernetes tooling").
+- Action pins rotate without a policy edit or override
+  (`docs/dependency-policy.md` → "Automated action pin rotation"). Every frozen
+  surface in `verify_cross_build_policy.py` compares pin-normalized text
+  (`normalize_action_pins`: `owner/repo@<sha> # comment` →
+  `owner/repo@<placeholder>`). `action_pin_rotation_errors` in `Trusted Cross
+  Build Policy` judges the pins on YAML lines the PR adds (its three-dot diff,
+  `--proposed-changes`). It admits a new commit only when it is an upstream
+  release-tag commit (from `git ls-remote` of `github.com/<owner>/<repo>`) that
+  descends from every trusted pin of that repository. Never re-freeze a literal action
+  commit in a template, digest, PR-tier verifier, or test. Match the action
+  path plus `[0-9a-f]{40}`, or normalize first; the trusted rotation check is
+  the only place a commit is judged. A new template must be written in
+  normalized form, and a job digest is taken over normalized text.
+  `cross-build-policy.yml` and the `CI Plan` early guard admit a pin-only change
+  of `cross-build-policy.yml` through `--pin-normalized-equal`;
+  `verify_cross_build_policy.py` stays byte-protected.
+- Dependabot covers every action (`/` and `/.github/actions/*`) except
+  `dtolnay/rust-toolchain`, which has no release tags.
+  `dependabot-auto-merge.yml` queues merge-commit auto-merge on Dependabot's
+  own non-major PRs with only `GITHUB_TOKEN`. Its merges start no push
+  workflows, so a Dependabot merge commit is never itself a release candidate.
 - `docker://` action refs and local-action Dockerfile bases must use full
   SHA-256 image digests; `scratch` is the only unpinned Dockerfile base.
 - kind / kubectl / Helm install only via
@@ -217,6 +238,27 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   their retirement conditions are whatever `verify_cross_build_policy.py`
   holds on `main` — read them there, never from this file. Background:
   `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+
+## Cargo Dependabot And The Rustc Wrapper
+
+- The committed `.cargo/config.toml` must not set `[build] rustc-wrapper`. Every
+  cargo process under the root reads it, including Dependabot's cargo updater,
+  which runs `rustc -vV` through the wrapper and has no sccache. From #821 until
+  the wrapper was removed, every cargo version and security update failed with
+  `dependency_file_not_resolvable`. `verify_cross_build_policy.py`
+  (`EXPECTED_CARGO_BUILD`) allowlists exactly `incremental = false` and rejects
+  a committed wrapper; changing it is a direct-to-`main` / admin-merge change.
+- sccache is selected by environment: `setup-sccache` exports `RUSTC_WRAPPER` /
+  `CARGO_BUILD_RUSTC_WRAPPER` as the verified binary (or clears them), Cross and
+  the GNU sysroot build pass them empty, and `scripts/install-build-deps.sh`
+  writes the user-level `$CARGO_HOME/config.toml` wrapper locally.
+- Dependabot `cargo` version updates cover `/` and `/tests/performance/mesh`,
+  with minor/patch grouped. Every `[patch.crates-io]` crate plus `sqlx*` is in
+  `ignore`: a bump past the vendored version silently drops the patch (Cargo
+  only warns "patch was not used"). Keep those entries equal to the patch table.
+  The one compatibility entry, `mongodb` `>= 3.9`, mirrors the `Cargo.toml`
+  cap that keeps MongoDB 4.2 support; do not drop it while the cap stands.
+  See `docs/dependency-policy.md` → "Cargo dependency updates".
 
 ## Drift Guard
 

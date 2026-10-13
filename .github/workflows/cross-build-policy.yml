@@ -43,6 +43,7 @@ jobs:
           MERGE_GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
         run: |
           set -euo pipefail
+          extraction_contract_moved=false
 
           if [ "$EVENT_NAME" = "merge_group" ]; then
             if [[ ! "$MERGE_GROUP_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -119,11 +120,11 @@ jobs:
             # cannot be re-executed from the live tip, so authenticate it by
             # comparison and fail closed when the trusted tip has moved it. The
             # verifier itself is not subject to that limit and is executed from
-            # the live tip below.
+            # the live tip below. A move that only rotates action pins changes
+            # no extraction logic; the live verifier decides that below.
             if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \
               -- ".github/workflows/cross-build-policy.yml"; then
-              echo "::error::the trusted extraction contract changed on ${BASE_REF} after this event was created; re-run once the pull request base is updated" >&2
-              exit 1
+              extraction_contract_moved=true
             fi
 
             git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
@@ -153,6 +154,26 @@ jobs:
           trusted_policy_workflow="$trusted_dir/cross-build-policy.yml"
           git show "$trusted_base:.github/workflows/cross-build-policy.yml" > "$trusted_policy_workflow"
 
+          # True only when the two revisions of a workflow differ in nothing
+          # but external action pins (commit and trailing comment). The live
+          # trusted verifier decides it, and its action pin rotation check then
+          # governs the pinned commits themselves.
+          pin_only_change() {
+            local from="$1" to="$2" path="$3" scratch
+            scratch="$(mktemp -d "$RUNNER_TEMP/pin-only.XXXXXX")"
+            git show "${from}:${path}" > "$scratch/from.yml" \
+              && git show "${to}:${path}" > "$scratch/to.yml" \
+              && python3 -I "$trusted_verifier" --pin-normalized-equal \
+                "$scratch/from.yml" "$scratch/to.yml"
+          }
+
+          if [ "$extraction_contract_moved" = true ] \
+            && ! pin_only_change "$BASE_SHA" "$trusted_base" \
+              ".github/workflows/cross-build-policy.yml"; then
+            echo "::error::the trusted extraction contract changed on ${BASE_REF} after this event was created; re-run once the pull request base is updated" >&2
+            exit 1
+          fi
+
           proposed_cross="$RUNNER_TEMP/proposed-Cross.toml"
           proposed_cargo="$RUNNER_TEMP/proposed-Cargo.toml"
           proposed_cargo_tool="$RUNNER_TEMP/proposed-cargo-config.toml"
@@ -167,13 +188,16 @@ jobs:
           merge_base_actions="$RUNNER_TEMP/current-base-actions"
           proposed_automation="$RUNNER_TEMP/proposed-automation"
           merge_base_automation="$RUNNER_TEMP/current-base-automation"
+          proposed_changes="$RUNNER_TEMP/proposed-yaml-changes.diff"
 
           # These files define and invoke the trusted policy. Once this
           # bootstrap workflow is on main, changes to either require an
           # explicit branch-protection bypass rather than an ordinary PR. Use
           # the merge base with the live trusted tip so unrelated changes made
           # later on main do not make an otherwise untouched PR appear to
-          # modify these files.
+          # modify these files. The one ordinary change admitted is an action
+          # pin rotation of this workflow's own steps: its text must equal the
+          # live trusted copy apart from external action pins.
           protected_paths=(
             ".github/scripts/verify_cross_build_policy.py"
             ".github/workflows/cross-build-policy.yml"
@@ -181,6 +205,11 @@ jobs:
           for protected_path in "${protected_paths[@]}"; do
             if ! git diff --no-ext-diff --quiet \
               "$trusted_base...$proposed_commit" -- "$protected_path"; then
+              if [ "$protected_path" = ".github/workflows/cross-build-policy.yml" ] \
+                && pin_only_change "$trusted_base" "$proposed_commit" "$protected_path"; then
+                echo "::notice file=${protected_path}::only external action pins changed; the action pin rotation check governs them"
+                continue
+              fi
               echo "::error file=${protected_path}::trusted cross-build policy files cannot be changed by a pull request" >&2
               exit 1
             fi
@@ -318,6 +347,13 @@ jobs:
           extract_automation "$proposed_commit" "$proposed_automation"
           extract_automation "$trusted_base" "$merge_base_automation"
 
+          # The pull request's own YAML lines, relative to its merge base with
+          # the live trusted tip. The action pin rotation check judges only the
+          # pins these lines introduce, so a branch cut before a rotation does
+          # not read as a downgrade of the pins it never touched.
+          git diff --no-ext-diff --no-textconv --no-renames --unified=0 \
+            "$trusted_base...$proposed_commit" -- '*.yml' '*.yaml' > "$proposed_changes"
+
           # Proposed publication-gate code and inventory are materialized only
           # as data. The trusted verifier refuses their byte drift before its
           # later candidate-automation inspection and never executes them.
@@ -345,4 +381,5 @@ jobs:
             --proposed-actions-dir "$proposed_actions" \
             --merge-base-automation-dir "$merge_base_automation" \
             --proposed-automation-dir "$proposed_automation" \
-            --proposed-tree-listing "${proposed_automation}.workspace-ls-tree"
+            --proposed-tree-listing "${proposed_automation}.workspace-ls-tree" \
+            --proposed-changes "$proposed_changes"

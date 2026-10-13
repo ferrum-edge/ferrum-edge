@@ -9,14 +9,76 @@ import contextlib
 import hashlib
 import itertools
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Callable, Iterable
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
+
+
+# Every frozen workflow, local-action, and template comparison in this file is
+# made over pin-normalized text: an external `uses: owner/repo@<40-hex sha>`
+# reference keeps its action path but its commit and trailing comment are
+# replaced by this placeholder, so a frozen surface freezes WHICH action runs
+# and how, not which upstream release of it. The commit itself is governed by
+# `action_pin_rotation_errors`, which admits a changed pin only when the new
+# commit is an upstream release tag that descends from every trusted pin of
+# the same action. See docs/dependency-policy.md → "Automated action pin
+# rotation".
+PINNED_ACTION_SHA_PLACEHOLDER = "0" * 40
+EXTERNAL_ACTION_PIN = re.compile(
+    r"(?m)^(?P<lead>[ \t]*(?:-[ \t]+)?uses:[ \t]+)(?P<quote>['\"]?)"
+    r"(?P<action>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+"
+    r"(?:/[A-Za-z0-9_.-]+)*)@(?P<sha>[0-9a-f]{40})(?P=quote)"
+    r"(?P<comment>[ \t]+#[^\n]*)?[ \t]*$"
+)
+PIN_NORMALIZED_SUFFIXES = frozenset({".yml", ".yaml"})
+
+
+def normalize_action_pins(contents: str) -> str:
+    """Replace every pinned external action commit with the placeholder."""
+
+    return EXTERNAL_ACTION_PIN.sub(
+        lambda match: (
+            f"{match['lead']}{match['quote']}{match['action']}"
+            f"@{PINNED_ACTION_SHA_PLACEHOLDER}{match['quote']}"
+        ),
+        contents,
+    )
+
+
+def pin_normalized_equal(merge_base: str, proposed: str) -> bool:
+    """True when two texts differ in nothing but external action pins."""
+
+    return normalize_action_pins(merge_base) == normalize_action_pins(proposed)
+
+
+def pin_normalized_equal_main(merge_base_path: Path, proposed_path: Path) -> int:
+    """Back `cross-build-policy.yml`'s pin-only check of its own protected text."""
+
+    failures: list[str] = []
+    texts: list[str] = []
+    for path in (merge_base_path, proposed_path):
+        contents, load_failures = load_text(path)
+        failures.extend(load_failures)
+        if contents is not None:
+            if "\x00" in contents:
+                failures.append(f"{path} contains a NUL byte")
+            texts.append(contents)
+    if not failures and not pin_normalized_equal(*texts):
+        failures.append(
+            f"{proposed_path} differs from {merge_base_path} in more than "
+            "external action pins"
+        )
+    for failure in failures:
+        print(f"::error::{failure}", file=sys.stderr)
+    return 1 if failures else 0
 
 
 TARGET = "aarch64-unknown-linux-gnu"
@@ -76,8 +138,11 @@ EXPECTED_PASSTHROUGH = (
     "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
     "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar",
 )
+# No committed `rustc-wrapper`: every cargo process that reads the root config
+# would have to exec it, including Dependabot's cargo updater, which has no
+# sccache. CI selects the verified sccache binary through RUSTC_WRAPPER /
+# CARGO_BUILD_RUSTC_WRAPPER (setup-sccache), and Cross clears both.
 EXPECTED_CARGO_BUILD = {
-    "rustc-wrapper": "sccache",
     "incremental": False,
 }
 EXPECTED_CARGO_TARGETS = {
@@ -110,7 +175,7 @@ WORKFLOW_CONTRACTS = (
         "main-linux-image",
         # The job reads its distroless runtime base from Dockerfile's reviewed
         # `RUNTIME_BASE` pin, so base-image digest rotation never edits it.
-        "2ae821353d25d3c46ddf7a8d8db7b76f04d1818c2bd8288ee937822d179bc2ec",
+        "683e209827f4ccc5b6d2521b2d354b15664ddd6eac0000b3d4225612bbe28bba",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -120,7 +185,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "fbe45f0ac9bf7527d1520865d78f4199f0d501214d1d66899b0aec6f2decfffd",
+        "ae1d437205538c96e35974d6a6d9b1247de512d1bcd67c5c1f750a8e7c0ddf38",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -180,10 +245,10 @@ DOCKER_CONTEXT_STEP = (
 # contract in the same commit.
 DOCKER_PUBLISH_STEPS_PREFIX = (
     "    steps:\n"
-    "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+    "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
     "\n"
     "      - name: Download Linux binary\n"
-    "        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+    "        uses: actions/download-artifact@0000000000000000000000000000000000000000\n"
     "        with:\n"
 )
 DOCKER_PUBLISH_STEPS_MIDDLE = (
@@ -193,24 +258,24 @@ DOCKER_PUBLISH_STEPS_MIDDLE = (
 DOCKER_PUBLISH_STEPS_TAIL = (
     "\n"
     "      - name: Set up Docker Buildx\n"
-    "        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4\n"
+    "        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000\n"
     "\n"
     "      - name: Log in to GitHub Container Registry\n"
-    "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4\n"
+    "        uses: docker/login-action@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          registry: ghcr.io\n"
     "          username: ${{ github.actor }}\n"
     "          password: ${{ secrets.GITHUB_TOKEN }}\n"
     "\n"
     "      - name: Log in to Docker Hub\n"
-    "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4\n"
+    "        uses: docker/login-action@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          username: ${{ secrets.DOCKERHUB_USERNAME }}\n"
     "          password: ${{ secrets.DOCKERHUB_TOKEN }}\n"
     "\n"
     "      - name: Build and push per-platform digest\n"
     "        id: build\n"
-    "        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7\n"
+    "        uses: docker/build-push-action@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          context: docker-context\n"
     "          platforms: ${{ matrix.platform }}\n"
@@ -226,7 +291,7 @@ DOCKER_PUBLISH_STEPS_TAIL = (
     "          touch \"/tmp/digests/${digest#sha256:}\"\n"
     "\n"
     "      - name: Upload digest\n"
-    "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+    "        uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          name: docker-digest-${{ matrix.arch_dir }}\n"
     "          path: /tmp/digests/*\n"
@@ -246,7 +311,7 @@ DOCKER_PUBLISH_STEPS_TAIL = (
 DOCKER_MANIFEST_DOWNLOAD_STEP = (
     "      - name: Download digests\n"
     "        uses: actions/download-artifact"
-    "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+    "@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          path: /tmp/digests\n"
     "          pattern: docker-digest-*\n"
@@ -259,7 +324,7 @@ DOCKER_EBPF_MANIFEST_DOWNLOAD_STEP = DOCKER_MANIFEST_DOWNLOAD_STEP.replace(
 DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP = (
     "      - name: Download tools digests\n"
     "        uses: actions/download-artifact"
-    "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+    "@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          path: /tmp/digests-tools\n"
     "          pattern: docker-ebpf-tools-digest-*\n"
@@ -268,7 +333,7 @@ DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP = (
 DOCKER_EBPF_UPLOAD_DIGEST_STEP = (
     "      - name: Upload digest\n"
     "        uses: actions/upload-artifact"
-    "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+    "@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          name: docker-ebpf-digest-${{ matrix.arch_dir }}\n"
     "          path: /tmp/digests/*\n"
@@ -288,7 +353,7 @@ DOCKER_EBPF_TOOLS_BUILD_STEP = (
     "      - name: Build and push per-platform eBPF tools digest\n"
     "        id: build_tools\n"
     "        uses: docker/build-push-action"
-    "@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7\n"
+    "@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          context: .\n"
     "          file: Dockerfile\n"
@@ -313,7 +378,7 @@ DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP = (
 DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP = (
     "      - name: Upload tools digest\n"
     "        uses: actions/upload-artifact"
-    "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+    "@0000000000000000000000000000000000000000\n"
     "        with:\n"
     "          name: docker-ebpf-tools-digest-${{ matrix.arch_dir }}\n"
     "          path: /tmp/digests-tools/*\n"
@@ -363,7 +428,7 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
             "Download Linux binary": (
                 "      - name: Download Linux binary\n"
                 "        uses: actions/download-artifact"
-                "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+                "@0000000000000000000000000000000000000000\n"
                 "        with:\n"
                 "          name: binary-${{ matrix.binary_target }}\n"
                 "          path: downloaded-artifacts\n"
@@ -398,7 +463,7 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
             "Download Linux binary": (
                 "      - name: Download Linux binary\n"
                 "        uses: actions/download-artifact"
-                "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+                "@0000000000000000000000000000000000000000\n"
                 "        with:\n"
                 "          name: release-binaries-${{ matrix.binary_target }}\n"
                 "          path: downloaded-artifacts\n"
@@ -430,38 +495,38 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
 # Changing one is a trusted-base change, exactly like the protected build job.
 
 CI_LATEST_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
       # start with the same prefix, so an unrelated job could contribute files
       # to the published `latest` release.
       - name: Download native binary artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: binary-x86_64-unknown-linux-gnu
           path: downloaded-artifacts/binary-x86_64-unknown-linux-gnu
 
       - name: Download protected ARM64 binary artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: binary-aarch64-unknown-linux-gnu
           path: downloaded-artifacts/binary-aarch64-unknown-linux-gnu
 
       - name: Download macOS x86_64 binary artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: binary-x86_64-apple-darwin
           path: downloaded-artifacts/binary-x86_64-apple-darwin
 
       - name: Download macOS aarch64 binary artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: binary-aarch64-apple-darwin
           path: downloaded-artifacts/binary-aarch64-apple-darwin
 
       - name: Download Windows binary artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: binary-x86_64-pc-windows-msvc
           path: downloaded-artifacts/binary-x86_64-pc-windows-msvc
@@ -560,24 +625,24 @@ CI_LATEST_RELEASE_STEPS = r"""    steps:
 
 CI_DOCKER_MANIFEST_STEPS = r"""    steps:
       - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           path: /tmp/digests
           pattern: docker-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -627,38 +692,38 @@ RELEASE_CREATE_RELEASE_NAME = (
 )
 
 RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
       # start with the same prefix, so an unrelated job could contribute files
       # to a published release.
       - name: Download native release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: release-binaries-x86_64-unknown-linux-gnu
           path: downloaded-artifacts/release-binaries-x86_64-unknown-linux-gnu
 
       - name: Download protected ARM64 release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: release-binaries-aarch64-unknown-linux-gnu
           path: downloaded-artifacts/release-binaries-aarch64-unknown-linux-gnu
 
       - name: Download macOS x86_64 release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: release-binaries-x86_64-apple-darwin
           path: downloaded-artifacts/release-binaries-x86_64-apple-darwin
 
       - name: Download macOS aarch64 release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: release-binaries-aarch64-apple-darwin
           path: downloaded-artifacts/release-binaries-aarch64-apple-darwin
 
       - name: Download Windows release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           name: release-binaries-x86_64-pc-windows-msvc
           path: downloaded-artifacts/release-binaries-x86_64-pc-windows-msvc
@@ -790,7 +855,7 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
           NOTES
 
       - name: Create Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        uses: softprops/action-gh-release@0000000000000000000000000000000000000000
         with:
           tag_name: ${{ steps.release_notes.outputs.TAG_NAME }}
           body_path: RELEASE_NOTES.md
@@ -803,20 +868,20 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
 
 RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@0000000000000000000000000000000000000000
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1193,24 +1258,24 @@ RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
           echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
 
       - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           path: /tmp/digests
           pattern: docker-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1273,24 +1338,24 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
           echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
 
       - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           path: /tmp/digests
           pattern: docker-ebpf-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1590,24 +1655,24 @@ RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
       # variants into one directory would hand `imagetools create` four
       # descriptors and publish a manifest spanning both images.
       - name: Download tools digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@0000000000000000000000000000000000000000
         with:
           path: /tmp/digests-tools
           pattern: docker-ebpf-tools-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1658,27 +1723,27 @@ RELEASE_TOOLS_FAMILY_TOKENS = (
 # direct job-field contract in both admitted generations, and the closed-field
 # set below rejects every additional job-level execution control.
 RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push per-platform eBPF digest
         id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -1696,7 +1761,7 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@0000000000000000000000000000000000000000
         with:
           name: docker-ebpf-digest-${{ matrix.arch_dir }}
           path: /tmp/digests/*
@@ -1705,7 +1770,7 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
 
 RELEASE_DOCKER_EBPF_BUILD_STEP = r"""      - name: Build and push per-platform eBPF digest
         id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2313,7 +2378,7 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           fetch-depth: 0
 
@@ -2570,7 +2635,7 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
 
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@0000000000000000000000000000000000000000
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -2622,7 +2687,7 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
     + r"""
       - name: Upload bounded diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@0000000000000000000000000000000000000000
         with:
           name: ambient-host-udp-live-results
           path: target/ambient-host-udp-live
@@ -2639,10 +2704,10 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
 
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@0000000000000000000000000000000000000000
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       # GitHub Actions cache is a 10 GB repository quota with LRU eviction
       # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
@@ -2658,7 +2723,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2671,7 +2736,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2718,7 +2783,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2774,12 +2839,12 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
 
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       # Registry cache leaves the Actions cache allowance for compiler data.
       # Each target has its own cache graph. Missing cache still builds cold.
@@ -2789,7 +2854,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2801,7 +2866,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2847,7 +2912,7 @@ AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2900,19 +2965,19 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
 
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
       - name: Log in to cache registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       # Registry cache leaves the Actions cache allowance for compiler data.
       # Each target has its own cache graph. Missing cache still builds cold.
@@ -2922,7 +2987,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
       # the full target is smoked below; running it first surfaces a broken tool
       # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
       - name: Build the capture tool base stage
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2935,7 +3000,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
 
       # The exact target the mesh chart's `-ebpf-tools` tag publishes.
       - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -2982,7 +3047,7 @@ AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
       # distroless. Proving the tools image alone would let a later change
       # "fix" this finding by quietly adding a shell to `-ebpf` instead.
       - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -3251,7 +3316,7 @@ NODE_WAYPOINT_PLAN_JOB = r"""  production-dockerfile-plan:
       relevant: ${{ steps.filter.outputs.relevant }}
       node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -3407,7 +3472,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
     timeout-minutes: 90
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
@@ -3415,7 +3480,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
         run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -3438,7 +3503,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
 
       - name: Build ordinary production runtime with registry cache
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -3452,7 +3517,7 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
 
       - name: Build ordinary production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -3520,7 +3585,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
     timeout-minutes: 90
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
@@ -3529,14 +3594,14 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
 
       - name: Log in to cache registry
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@0000000000000000000000000000000000000000
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
 
       - name: Record registry cache policy
         if: github.event.inputs.force_cold_cache != 'true'
@@ -3559,7 +3624,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
 
       - name: Build ordinary production runtime with registry cache
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -3574,7 +3639,7 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
 
       - name: Build ordinary production runtime (cold cache)
         if: github.event.inputs.force_cold_cache == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
         with:
           context: .
           file: Dockerfile
@@ -3910,7 +3975,7 @@ CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
@@ -3938,7 +4003,7 @@ CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
         with:
           toolchain: nightly-2026-09-30
 
@@ -3951,7 +4016,7 @@ CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
       # lazily started sccache server indexes the restored entries.
       - uses: ./.github/actions/setup-sccache
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
@@ -4215,7 +4280,7 @@ CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB = r"""  fuzz-smoke:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
@@ -4243,7 +4308,7 @@ CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB = r"""  fuzz-smoke:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
         with:
           toolchain: nightly-2026-09-30
 
@@ -4256,7 +4321,7 @@ CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB = r"""  fuzz-smoke:
       # lazily started sccache server indexes the restored entries.
       - uses: ./.github/actions/setup-sccache
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
@@ -4521,7 +4586,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
@@ -4549,7 +4614,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
         with:
           toolchain: nightly-2026-09-30
 
@@ -4564,7 +4629,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
       - name: BoringCache Cargo
         uses: ./.github/actions/setup-boringcache
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
         if: env.CI_BORINGCACHE_ENABLED != 'true'
         with:
           workspaces: fuzz -> target
@@ -4966,9 +5031,10 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-    # The repository-root Cargo config selects sccache and host linker flags,
-    # but this isolated fuzz job installs neither sccache nor mold. Disable both
-    # Cargo wrapper inputs and inherited rustflags explicitly.
+    # The repository-root Cargo config selects host linker flags (mold), and a
+    # runner- or user-level rustc-wrapper may select sccache, but this isolated
+    # fuzz job installs neither sccache nor mold. Disable both Cargo wrapper
+    # inputs and inherited rustflags explicitly.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
@@ -4986,7 +5052,7 @@ jobs:
           - plugin_config
           - datagram_client_address
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@0000000000000000000000000000000000000000
         with:
           persist-credentials: false
 
@@ -5017,11 +5083,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
         with:
           toolchain: nightly-2026-09-30
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-sanitized
@@ -5096,7 +5162,7 @@ jobs:
       # on job failure: a skipped or failed bound must never publish.
       - name: Upload bounded crash artifacts
         if: always() && steps.bound.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@0000000000000000000000000000000000000000
         with:
           name: fuzz-crash-${{ matrix.fuzz_target }}
           path: fuzz/artifacts/${{ matrix.fuzz_target }}
@@ -6152,8 +6218,7 @@ def validate_cargo_tool_configuration(parsed: Any) -> list[str]:
     errors.extend(exact_keys(build, set(EXPECTED_CARGO_BUILD), ".cargo config build"))
     if not errors and build != EXPECTED_CARGO_BUILD:
         errors.append(
-            ".cargo config build must retain the approved rustc-wrapper and "
-            "incremental values"
+            ".cargo config build must retain the approved incremental value"
         )
 
     targets = parsed["target"]
@@ -18764,6 +18829,15 @@ def validate_trusted_policy_extraction(contents: str, source: str) -> list[str]:
         # contract itself cannot be re-executed from the live tip and must
         # instead fail closed once the trusted tip has moved it.
         'git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \\',
+        # Only the live trusted verifier may admit a pin-only move of this
+        # workflow, and only for its own text: the verifier file stays exact.
+        'python3 -I "$trusted_verifier" --pin-normalized-equal \\',
+        '&& ! pin_only_change "$BASE_SHA" "$trusted_base" \\',
+        'if [ "$protected_path" = ".github/workflows/cross-build-policy.yml" ] \\',
+        '&& pin_only_change "$trusted_base" "$proposed_commit" "$protected_path"; then',
+        # The pin rotation check judges the pull request's own YAML lines.
+        '"$trusted_base...$proposed_commit" -- \'*.yml\' \'*.yaml\' > "$proposed_changes"',
+        '--proposed-changes "$proposed_changes"',
     )
     for required in required_live_base_inputs:
         if required not in contents:
@@ -19643,6 +19717,7 @@ def compare_pr_workflow_job(
 
 def self_test() -> list[str]:
     failures: list[str] = []
+    failures.extend(action_pin_rotation_self_test())
 
     # Repeated scans must retain quoting, malformed-input and content-change
     # behavior. Cache only lexical data, never a decision from a scanner scope.
@@ -20246,6 +20321,14 @@ pre_build = []
         "custom rustc": {
             **valid_cargo_tool,
             "build": {**valid_cargo_tool["build"], "rustc": "./ci/rustc"},
+        },
+        "committed rustc wrapper": {
+            **valid_cargo_tool,
+            "build": {**valid_cargo_tool["build"], "rustc-wrapper": "sccache"},
+        },
+        "repository rustc wrapper": {
+            **valid_cargo_tool,
+            "build": {**valid_cargo_tool["build"], "rustc-wrapper": "./ci/wrapper"},
         },
         "workspace rustc wrapper": {
             **valid_cargo_tool,
@@ -21171,11 +21254,11 @@ pre_build = []
     benign_remote_action_workflow = safe_extra_workflow.replace(
         "      - run: echo safe\n",
         "      - uses: actions/checkout"
-        "@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+        "@0000000000000000000000000000000000000000\n"
         "        with:\n"
         "          persist-credentials: false\n"
         "      - uses: actions/upload-artifact"
-        "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "@0000000000000000000000000000000000000000\n"
         "        with:\n"
         "          name: report\n"
         "          path: results/\n",
@@ -28413,6 +28496,17 @@ pre_build = []
         '  -- ".github/workflows/cross-build-policy.yml"; then\n'
         "  exit 1\n"
         "fi\n"
+        'python3 -I "$trusted_verifier" --pin-normalized-equal \\\n'
+        '  "$scratch/from.yml" "$scratch/to.yml"\n'
+        'if [ "$extraction_contract_moved" = true ] \\\n'
+        '  && ! pin_only_change "$BASE_SHA" "$trusted_base" \\\n'
+        '    ".github/workflows/cross-build-policy.yml"; then\n'
+        "  exit 1\n"
+        "fi\n"
+        'if [ "$protected_path" = ".github/workflows/cross-build-policy.yml" ] \\\n'
+        '  && pin_only_change "$trusted_base" "$proposed_commit" "$protected_path"; then\n'
+        "  continue\n"
+        "fi\n"
         'python3 -I "$trusted_verifier" \\\n'
         '  --ci-workflow "$merge_base_ci" \\\n'
         '  --release-workflow "$merge_base_release" \\\n'
@@ -28420,7 +28514,10 @@ pre_build = []
         '  --workflows-dir "$merge_base_workflows" \\\n'
         '  --actions-dir "$merge_base_actions" \\\n'
         '  --automation-dir "$merge_base_automation" \\\n'
-        '  --proposed-tree-listing "${proposed_automation}.workspace-ls-tree"\n'
+        '  --proposed-tree-listing "${proposed_automation}.workspace-ls-tree" \\\n'
+        '  --proposed-changes "$proposed_changes"\n'
+        'git diff --no-ext-diff --no-textconv --no-renames --unified=0 \\\n'
+        '  "$trusted_base...$proposed_commit" -- \'*.yml\' \'*.yaml\' > "$proposed_changes"\n'
         'if ! git ls-tree -rz --name-only "$commit" -- workflows > "$listing"; then\n'
         "  return 1\n"
         "fi\n"
@@ -28439,6 +28536,17 @@ pre_build = []
         "self-test trusted policy",
     ):
         failures.append("valid checked live-base extraction was rejected")
+    for pin_guard in (
+        '&& pin_only_change "$trusted_base" "$proposed_commit" "$protected_path"; then',
+        '&& ! pin_only_change "$BASE_SHA" "$trusted_base" \\',
+    ):
+        if not validate_trusted_policy_extraction(
+            trusted_extraction_fixture.replace(pin_guard, "&& true; then"),
+            "self-test trusted policy",
+        ):
+            failures.append(
+                f"an extraction without the pin-only guard {pin_guard!r} was accepted"
+            )
     stale_extraction_fixture = trusted_extraction_fixture.replace(
         'extract_workflows "$trusted_base" "$merge_base_workflows"',
         'extract_workflows "$merge_base" "$merge_base_workflows"',
@@ -28466,8 +28574,13 @@ pre_build = []
         "dropped proposed tree listing": trusted_extraction_fixture.replace(
             '  --automation-dir "$merge_base_automation" \\\n'
             '  --proposed-tree-listing "${proposed_automation}'
-            '.workspace-ls-tree"\n',
-            '  --automation-dir "$merge_base_automation"\n',
+            '.workspace-ls-tree" \\\n',
+            '  --automation-dir "$merge_base_automation" \\\n',
+        ),
+        # Without the pull request's own YAML diff the pin rotation check
+        # would have no lines to judge.
+        "dropped proposed YAML changes": trusted_extraction_fixture.replace(
+            '  --proposed-changes "$proposed_changes"\n', "\n"
         ),
     }.items():
         if not validate_trusted_policy_extraction(
@@ -29813,7 +29926,7 @@ pre_build = []
             "            *) ;;\n",
         ),
         "unpinned trusted checkout": (
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@0000000000000000000000000000000000000000",
             "actions/checkout@v6",
         ),
         "widened relevance-job permissions": (
@@ -30019,7 +30132,7 @@ pre_build = []
             "",
         ),
         "unpinned planner checkout": (
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@0000000000000000000000000000000000000000",
             "actions/checkout@v6",
         ),
         "renamed planner job": (
@@ -30780,11 +30893,11 @@ pre_build = []
             'bash scripts/fuzz_smoke.sh --codegen-units 16 "$fuzz_target" -- \\',
         ),
         "mutable action ref": (
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@0000000000000000000000000000000000000000",
             "actions/checkout@v6",
         ),
         "local action substitution": (
-            ("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
+            ("uses: Swatinem/rust-cache@0000000000000000000000000000000000000000",
              "uses: ./.github/actions/setup-boringcache"),
             "uses: ./.github/actions/fuzz-cache",
         ),
@@ -31341,11 +31454,11 @@ pre_build = []
             '          if false; then\n',
         ),
         "local action substitution": (
-            "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+            "uses: actions/upload-artifact@0000000000000000000000000000000000000000",
             "uses: ./.github/actions/publish",
         ),
         "mutable action ref": (
-            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@0000000000000000000000000000000000000000",
             "actions/checkout@v6",
         ),
         "shell indirection": (
@@ -31417,7 +31530,7 @@ pre_build = []
         "\n"
         "      - name: Upload artifacts\n"
         "        uses: actions/upload-artifact"
-        "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+        "@0000000000000000000000000000000000000000\n"
         "        with:\n"
         "          name: binary-${{ matrix.target }}\n"
         "          path: release-assets/\n"
@@ -31453,7 +31566,7 @@ pre_build = []
     gnu_upload_step = (
         "      - name: Upload artifacts\n"
         "        uses: actions/upload-artifact"
-        "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+        "@0000000000000000000000000000000000000000\n"
         "        with:\n"
         "          name: binary-${{ matrix.target }}\n"
         "          path: release-assets/\n"
@@ -31468,7 +31581,7 @@ pre_build = []
     )
     gnu_checkout_step = (
         "      - uses: actions/checkout"
-        "@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "@0000000000000000000000000000000000000000\n"
         "        with:\n"
         "          persist-credentials: false\n"
     )
@@ -31537,7 +31650,7 @@ pre_build = []
             + "    steps:\n"
             + "      - name: Upload artifacts\n"
             + "        uses: actions/upload-artifact"
-            + "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+            + "@0000000000000000000000000000000000000000\n"
             + "        with:\n"
             + "          name: binary-x86_64-unknown-linux-gnu\n"
             + "          path: elsewhere/\n",
@@ -31567,7 +31680,7 @@ pre_build = []
         "credential-persisting checkout": (
             gnu_checkout_step,
             "      - uses: actions/checkout"
-            "@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n",
+            "@0000000000000000000000000000000000000000\n",
         ),
         "no checkout at all": (gnu_checkout_step + "\n", ""),
     }
@@ -31676,6 +31789,517 @@ pre_build = []
     return failures
 
 
+# ── Automated action pin rotation ──────────────────────────────────────────
+#
+# Frozen surfaces compare pin-normalized text (`normalize_action_pins`), so a
+# Dependabot update that only moves `owner/repo@<sha>` no longer trips them.
+# This is the control that replaces the frozen commit: on a pull request, every
+# pin on a YAML line the pull request itself adds (its three-dot diff against
+# the live trusted base) for an action the trusted base already pins must be
+# the commit of an upstream release tag of that same repository, and must
+# descend from every commit the trusted base pins for it, so a rotation can only
+# move forward along upstream's own history. Judging the pull request's own
+# lines, not its whole tree, keeps a branch cut before a rotation from looking
+# like a downgrade: the merge keeps the trusted base's newer pin there. Release tags are resolved from
+# `https://github.com/<owner>/<repo>` itself, never from the fork network a bare
+# commit SHA may also resolve in. A newly introduced action is outside this
+# check: it changes the normalized text, which frozen surfaces still refuse.
+UPSTREAM_ACTION_OWNER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+UPSTREAM_ACTION_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+UPSTREAM_RELEASE_TAG = re.compile(r"^v?[0-9]+(?:\.[0-9]+){0,3}$")
+UPSTREAM_GIT_TIMEOUT_SECONDS = 180
+
+
+def action_pin_repository(action: str) -> str:
+    """Name the upstream repository an `owner/repo[/path]` action lives in."""
+
+    return "/".join(action.split("/")[:2])
+
+
+def collect_action_pins(
+    files: dict[str, str],
+) -> dict[str, dict[str, list[str]]]:
+    """Map upstream repository -> pinned commit -> sites, from raw YAML text."""
+
+    pins: dict[str, dict[str, list[str]]] = {}
+    for name, contents in sorted(files.items()):
+        for match in EXTERNAL_ACTION_PIN.finditer(contents):
+            line = contents.count("\n", 0, match.start()) + 1
+            repository = action_pin_repository(match["action"])
+            pins.setdefault(repository, {}).setdefault(match["sha"], []).append(
+                f"{name}:{line}"
+            )
+    return pins
+
+
+def load_raw_pin_sources(
+    roots: Iterable[tuple[str, Path]],
+) -> tuple[dict[str, str], list[str]]:
+    """Read every raw YAML file under the extracted trees for pin collection.
+
+    The loaders above already refused symlinks, NUL bytes, and unreadable
+    files in these same trees, so this pass only needs the unnormalized text.
+    """
+
+    files: dict[str, str] = {}
+    errors: list[str] = []
+    for label, root in roots:
+        try:
+            candidates = sorted(root.rglob("*"))
+        except OSError as error:
+            errors.append(f"cannot enumerate {label} for action pins: {error}")
+            continue
+        for candidate in candidates:
+            if candidate.suffix.lower() not in PIN_NORMALIZED_SUFFIXES:
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            try:
+                contents = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                errors.append(f"cannot read {label} action pins: {error}")
+                continue
+            files[f"{label}/{candidate.relative_to(root).as_posix()}"] = contents
+    return files, errors
+
+
+DIFF_HUNK_HEADER = re.compile(
+    r"^@@ -[0-9]+(?:,(?P<old>[0-9]+))? \+(?P<start>[0-9]+)(?:,(?P<new>[0-9]+))? @@"
+)
+
+
+def added_yaml_lines(diff: str) -> tuple[dict[str, str], list[str]]:
+    """Return the YAML lines a `git diff --unified=0` adds, at their line numbers.
+
+    Each file maps to text holding only its added lines, every other line left
+    empty, so `collect_action_pins` reports real proposed line numbers. Hunk
+    bodies are consumed by their declared counts, so content that looks like a
+    `+++` header inside a hunk is still read as content. Anything that does not
+    parse fails closed.
+    """
+
+    files: dict[str, dict[int, str]] = {}
+    errors: list[str] = []
+    path: str | None = None
+    yaml_path = False
+    old_remaining = new_remaining = 0
+    line_number = 0
+    for raw in diff.split("\n"):
+        if old_remaining or new_remaining:
+            if raw.startswith("-") and old_remaining:
+                old_remaining -= 1
+            elif raw.startswith("+") and new_remaining:
+                if yaml_path and path is not None:
+                    files.setdefault(path, {})[line_number] = raw[1:]
+                line_number += 1
+                new_remaining -= 1
+            elif raw.startswith("\\"):
+                continue
+            else:
+                errors.append(f"cannot parse the proposed YAML diff near {raw[:80]!r}")
+                return {}, errors
+            continue
+        if raw.startswith("diff --git "):
+            path = None
+            yaml_path = False
+        elif raw.startswith("+++ "):
+            target = raw[4:]
+            unquoted = target.strip('"')
+            path = unquoted[2:] if unquoted.startswith("b/") else None
+            yaml_path = path is not None and (
+                PurePosixPath(path).suffix.lower() in PIN_NORMALIZED_SUFFIXES
+            )
+        elif raw.startswith("@@"):
+            header = DIFF_HUNK_HEADER.match(raw)
+            if header is None:
+                errors.append(f"cannot parse the proposed YAML diff hunk {raw[:80]!r}")
+                return {}, errors
+            old_remaining = int(header["old"] or "1")
+            new_remaining = int(header["new"] or "1")
+            line_number = int(header["start"])
+        elif raw.startswith("\\"):
+            continue
+    if old_remaining or new_remaining:
+        errors.append("the proposed YAML diff ends inside a hunk")
+        return {}, errors
+    added: dict[str, str] = {}
+    for name, lines in files.items():
+        last = max(lines)
+        added[name] = "\n".join(lines.get(number, "") for number in range(1, last + 1))
+    return added, errors
+
+
+class GitUpstreamActionResolver:
+    """Resolve upstream release tags and ancestry with plain `git` over HTTPS.
+
+    Every argv is a literal so the automation scan in this file can read it;
+    the repository URL and the fetched tag reach `git` only as configuration
+    of a remote named `upstream`, through the environment.
+    """
+
+    ATTEMPTS = 3
+
+    def __init__(self) -> None:
+        self._tags: dict[str, dict[str, tuple[str, ...]] | None] = {}
+
+    @staticmethod
+    def _environment(repository: str, release_tag: str | None = None) -> dict[str, str]:
+        environment = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": tempfile.gettempdir(),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "LC_ALL": "C",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "remote.upstream.url",
+            "GIT_CONFIG_VALUE_0": f"https://github.com/{repository}.git",
+        }
+        if release_tag is not None:
+            environment["GIT_CONFIG_COUNT"] = "2"
+            environment["GIT_CONFIG_KEY_1"] = "remote.upstream.fetch"
+            environment["GIT_CONFIG_VALUE_1"] = (
+                f"+refs/tags/{release_tag}:refs/ferrum/release"
+            )
+        return environment
+
+    def release_tags(self, repository: str) -> dict[str, tuple[str, ...]] | None:
+        """Map each commit to the upstream release tags that peel to it."""
+
+        if repository in self._tags:
+            return self._tags[repository]
+        environment = self._environment(repository)
+        listing: str | None = None
+        with tempfile.TemporaryDirectory(prefix="ferrum-action-tags-") as scratch:
+            for _attempt in range(self.ATTEMPTS):
+                try:
+                    result = subprocess.run(
+                        ["git", "ls-remote", "--tags", "upstream"],
+                        cwd=scratch,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=UPSTREAM_GIT_TIMEOUT_SECONDS,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+                if result.returncode == 0:
+                    listing = result.stdout
+                    break
+        resolved: dict[str, tuple[str, ...]] | None = None
+        if listing is not None:
+            direct: dict[str, str] = {}
+            peeled: dict[str, str] = {}
+            for line in listing.splitlines():
+                sha, _, reference = line.partition("\t")
+                if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                    continue
+                if not reference.startswith("refs/tags/"):
+                    continue
+                name = reference.removeprefix("refs/tags/")
+                if name.endswith("^{}"):
+                    peeled[name.removesuffix("^{}")] = sha
+                else:
+                    direct[name] = sha
+            commits: dict[str, list[str]] = {}
+            for name, sha in direct.items():
+                if UPSTREAM_RELEASE_TAG.fullmatch(name):
+                    commits.setdefault(peeled.get(name, sha), []).append(name)
+            resolved = {sha: tuple(sorted(names)) for sha, names in commits.items()}
+        self._tags[repository] = resolved
+        return resolved
+
+    def descends_from(
+        self,
+        repository: str,
+        ancestor: str,
+        descendant_tag: str,
+        descendant: str,
+    ) -> bool | None:
+        """Report whether `ancestor` is in the history of the release tag."""
+
+        if UPSTREAM_RELEASE_TAG.fullmatch(descendant_tag) is None:
+            return None
+        environment = self._environment(repository, descendant_tag)
+        with tempfile.TemporaryDirectory(prefix="ferrum-action-pin-") as scratch:
+            try:
+                initialized = subprocess.run(
+                    ["git", "init", "--quiet", "--bare", "."],
+                    cwd=scratch,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=UPSTREAM_GIT_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                if initialized.returncode != 0:
+                    return None
+                fetched = None
+                for _attempt in range(self.ATTEMPTS):
+                    fetched = subprocess.run(
+                        [
+                            "git",
+                            "fetch",
+                            "--quiet",
+                            "--no-tags",
+                            "--filter=tree:0",
+                            "upstream",
+                        ],
+                        cwd=scratch,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=UPSTREAM_GIT_TIMEOUT_SECONDS,
+                        check=False,
+                    )
+                    if fetched.returncode == 0:
+                        break
+                if fetched is None or fetched.returncode != 0:
+                    return None
+                tip = subprocess.run(
+                    ["git", "rev-parse", "--verify", "--quiet", "refs/ferrum/release^{commit}"],
+                    cwd=scratch,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=UPSTREAM_GIT_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                if tip.returncode != 0 or tip.stdout.strip() != descendant:
+                    return None
+                history = subprocess.run(
+                    ["git", "rev-list", "refs/ferrum/release"],
+                    cwd=scratch,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=UPSTREAM_GIT_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+        if history.returncode != 0:
+            return None
+        return ancestor in set(history.stdout.split())
+
+
+def action_pin_rotation_errors(
+    trusted_files: dict[str, str],
+    introduced_files: dict[str, str],
+    resolver: Any,
+) -> list[str]:
+    """Admit a changed external action pin only as a forward upstream release.
+
+    `trusted_files` is the raw YAML of the live trusted base; `introduced_files`
+    holds only the YAML lines the proposal adds (`added_yaml_lines`).
+    """
+
+    trusted_pins = collect_action_pins(trusted_files)
+    introduced_pins = collect_action_pins(introduced_files)
+    errors: list[str] = []
+    for repository, commits in sorted(introduced_pins.items()):
+        trusted_commits = trusted_pins.get(repository)
+        if not trusted_commits:
+            continue
+        rotated = sorted(set(commits) - set(trusted_commits))
+        if not rotated:
+            continue
+        owner, _, name = repository.partition("/")
+        if (
+            UPSTREAM_ACTION_OWNER.fullmatch(owner) is None
+            or UPSTREAM_ACTION_REPOSITORY.fullmatch(name) is None
+            or name in {".", ".."}
+        ):
+            errors.append(
+                f"action pin rotation for {repository!r} names an unsupported "
+                "upstream repository"
+            )
+            continue
+        tags = resolver.release_tags(repository)
+        if tags is None:
+            errors.append(
+                f"cannot list upstream release tags for {repository}; the pin "
+                "rotation stays refused until a re-run can resolve them"
+            )
+            continue
+        for commit in rotated:
+            sites = ", ".join(commits[commit][:3])
+            if len(commits[commit]) > 3:
+                sites += f", and {len(commits[commit]) - 3} more"
+            release_tags = tags.get(commit, ())
+            if not release_tags:
+                errors.append(
+                    f"{repository}@{commit} ({sites}) is not the commit of an "
+                    f"upstream release tag of https://github.com/{repository}"
+                )
+                continue
+            for trusted in sorted(trusted_commits):
+                verdict = resolver.descends_from(
+                    repository, trusted, release_tags[-1], commit
+                )
+                if verdict is None:
+                    errors.append(
+                        f"cannot verify that {repository}@{commit} "
+                        f"({release_tags[-1]}) descends from the trusted pin "
+                        f"{trusted}; re-run once upstream is reachable"
+                    )
+                elif not verdict:
+                    errors.append(
+                        f"{repository}@{commit} ({release_tags[-1]}, {sites}) "
+                        f"does not descend from the trusted pin {trusted}; a pin "
+                        "may only move forward along upstream release history"
+                    )
+    return errors
+
+
+def action_pin_rotation_self_test() -> list[str]:
+    failures: list[str] = []
+    old, new, side, untagged = ("1" * 40, "2" * 40, "3" * 40, "4" * 40)
+
+    class FakeResolver:
+        def __init__(self, tags: dict[str, tuple[str, ...]] | None) -> None:
+            self.tags = tags
+            self.calls: list[tuple[str, str]] = []
+
+        def release_tags(self, repository: str) -> dict[str, tuple[str, ...]] | None:
+            return self.tags
+
+        def descends_from(
+            self, repository: str, ancestor: str, tag: str, descendant: str
+        ) -> bool | None:
+            self.calls.append((ancestor, descendant))
+            if descendant == "5" * 40:
+                return None
+            return descendant == new and ancestor == old
+
+    def workflow(sha: str, comment: str = " # v7", action: str = "actions/checkout") -> str:
+        return (
+            "jobs:\n  build:\n    steps:\n"
+            f"      - uses: {action}@{sha}{comment}\n"
+            f"      - name: quoted\n        uses: '{action}/sub@{sha}'\n"
+        )
+
+    tags = {old: ("v7.0.1",), new: ("v7", "v7.0.2"), side: ("v6.9.9",)}
+    if normalize_action_pins(workflow(old)) != normalize_action_pins(workflow(new, " # v7.0.2")):
+        failures.append("pin normalization must ignore the commit and its version comment")
+    if normalize_action_pins(workflow(old)) == normalize_action_pins(
+        workflow(old, action="actions/cache")
+    ):
+        failures.append("pin normalization must keep the action path")
+    mutable = "      - uses: actions/checkout@v7\n"
+    if normalize_action_pins(mutable) != mutable:
+        failures.append("pin normalization must leave mutable refs for the freeze to refuse")
+    if "./.github/actions/x" not in normalize_action_pins("      - uses: ./.github/actions/x\n"):
+        failures.append("pin normalization must not touch local actions")
+
+    base = {"ci.yml": workflow(old)}
+    cases = (
+        ("unchanged pin", {"ci.yml": workflow(old)}, FakeResolver(tags), False),
+        ("forward release", {"ci.yml": workflow(new, " # v7.0.2")}, FakeResolver(tags), False),
+        ("untagged commit", {"ci.yml": workflow(untagged)}, FakeResolver(tags), True),
+        ("downgrade or side branch", {"ci.yml": workflow(side)}, FakeResolver(tags), True),
+        ("unreachable upstream", {"ci.yml": workflow(new)}, FakeResolver(None), True),
+        (
+            "unverifiable ancestry",
+            {"ci.yml": workflow("5" * 40)},
+            FakeResolver({**tags, "5" * 40: ("v8.0.0",)}),
+            True,
+        ),
+        (
+            "one rotated site among unchanged ones",
+            {"ci.yml": workflow(old), "release.yml": workflow(untagged)},
+            FakeResolver(tags),
+            True,
+        ),
+        (
+            "newly introduced action",
+            {"ci.yml": workflow(old) + workflow(untagged, action="evil/action")},
+            FakeResolver(tags),
+            False,
+        ),
+    )
+    for label, proposed, resolver, should_fail in cases:
+        errors = action_pin_rotation_errors(base, proposed, resolver)
+        if bool(errors) != should_fail:
+            failures.append(
+                f"action pin rotation self-test {label!r}: expected "
+                f"{'refusal' if should_fail else 'admission'}, got {errors!r}"
+            )
+    for unsupported in ("bad.owner/action", "owner/.."):
+        if not action_pin_rotation_errors(
+            {"ci.yml": workflow(old, action=unsupported)},
+            {"ci.yml": workflow(new, action=unsupported)},
+            FakeResolver(tags),
+        ):
+            failures.append(
+                f"action pin rotation must refuse unsupported repository {unsupported!r}"
+            )
+    two_trusted = {"ci.yml": workflow(old), "release.yml": workflow(side)}
+    if not action_pin_rotation_errors(
+        two_trusted, {"ci.yml": workflow(new), "release.yml": workflow(new)}, FakeResolver(tags)
+    ):
+        failures.append("a rotation must descend from every trusted pin of the action")
+    if not pin_normalized_equal(workflow(old), workflow(new, " # v7.0.2")):
+        failures.append("a pin-only rotation must compare pin-normalized equal")
+    if pin_normalized_equal(workflow(old), workflow(old) + "      - run: cross build\n"):
+        failures.append("a non-pin edit must not compare pin-normalized equal")
+    diff = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -4 +4 @@ jobs:\n"
+        f"-      - uses: actions/checkout@{old} # v7.0.1\n"
+        f"+      - uses: actions/checkout@{new} # v7.0.2\n"
+        "@@ -9,0 +10,2 @@\n"
+        "+++ a content line, not a header\n"
+        f"+        uses: 'actions/checkout/sub@{untagged}'\n"
+        "\\ No newline at end of file\n"
+        "diff --git a/src/lib.rs b/src/lib.rs\n"
+        "--- a/src/lib.rs\n"
+        "+++ b/src/lib.rs\n"
+        "@@ -1 +1 @@\n"
+        "-// old\n"
+        f"+//      - uses: actions/checkout@{untagged}\n"
+    )
+    introduced, diff_errors = added_yaml_lines(diff)
+    introduced_pins = collect_action_pins(introduced)
+    if diff_errors or introduced_pins != {
+        "actions/checkout": {
+            new: [".github/workflows/ci.yml:4"],
+            untagged: [".github/workflows/ci.yml:11"],
+        }
+    }:
+        failures.append(
+            f"added YAML line parsing lost or invented a pin: {introduced_pins!r} "
+            f"{diff_errors!r}"
+        )
+    if not added_yaml_lines("@@ -1 +1,2 @@\n+only one\n")[1]:
+        failures.append("a truncated YAML diff hunk must fail closed")
+    if not added_yaml_lines("@@ garbage @@\n")[1]:
+        failures.append("an unparseable YAML diff hunk must fail closed")
+    stale_branch = (
+        "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        "--- a/.github/workflows/ci.yml\n"
+        "+++ b/.github/workflows/ci.yml\n"
+        "@@ -2,0 +3 @@\n"
+        "+  # unrelated edit\n"
+    )
+    if action_pin_rotation_errors(
+        {"ci.yml": workflow(new)},
+        added_yaml_lines(stale_branch)[0],
+        FakeResolver(tags),
+    ):
+        failures.append(
+            "a branch cut before a rotation must not be judged on pins it never touched"
+        )
+    pins = collect_action_pins({"a.yml": workflow(old)})
+    if pins != {"actions/checkout": {old: ["a.yml:4", "a.yml:6"]}}:
+        failures.append(f"action pin collection lost a site or repository: {pins!r}")
+    return failures
+
+
 def load_workflow(path: Path, label: str) -> tuple[str | None, list[str]]:
     contents, failures = load_text(path)
     if failures:
@@ -31683,6 +32307,8 @@ def load_workflow(path: Path, label: str) -> tuple[str | None, list[str]]:
     assert contents is not None
     if "\x00" in contents:
         return None, [f"{label} contains a NUL byte"]
+    if path.suffix.lower() in PIN_NORMALIZED_SUFFIXES:
+        contents = normalize_action_pins(contents)
     return contents, []
 
 
@@ -31975,8 +32601,20 @@ def main() -> int:
     parser.add_argument("--merge-base-automation-dir", type=Path)
     parser.add_argument("--proposed-automation-dir", type=Path)
     parser.add_argument("--proposed-tree-listing", type=Path)
+    # `git diff --unified=0 <trusted base>...<proposal> -- '*.yml' '*.yaml'`:
+    # the pull request's own YAML lines, whose action pins it must justify.
+    parser.add_argument("--proposed-changes", type=Path)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--pin-normalized-equal",
+        nargs=2,
+        type=Path,
+        metavar=("MERGE_BASE", "PROPOSED"),
+    )
     args = parser.parse_args()
+
+    if args.pin_normalized_equal is not None:
+        return pin_normalized_equal_main(*args.pin_normalized_equal)
 
     failures = self_test() if args.self_test else []
 
@@ -32249,6 +32887,39 @@ def main() -> int:
                     "automation directory",
                 )
             )
+
+        # Every comparison above is pin-normalized; this is where the pinned
+        # commits themselves are governed, for the YAML lines this pull
+        # request adds.
+        trusted_pin_files, trusted_pin_failures = load_raw_pin_sources(
+            (
+                ("workflows", args.merge_base_workflows_dir),
+                ("actions", args.merge_base_actions_dir),
+                ("automation", args.merge_base_automation_dir),
+            )
+        )
+        failures.extend(trusted_pin_failures)
+        if args.proposed_changes is None:
+            failures.append(
+                "--proposed-changes is required when comparing a pull request "
+                "against the trusted base"
+            )
+        else:
+            changes, change_failures = load_text(args.proposed_changes)
+            failures.extend(change_failures)
+            introduced_pin_files: dict[str, str] = {}
+            if changes is not None:
+                introduced_pin_files, diff_failures = added_yaml_lines(changes)
+                failures.extend(diff_failures)
+                change_failures = change_failures + diff_failures
+            if not trusted_pin_failures and not change_failures:
+                failures.extend(
+                    action_pin_rotation_errors(
+                        trusted_pin_files,
+                        introduced_pin_files,
+                        GitUpstreamActionResolver(),
+                    )
+                )
 
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)

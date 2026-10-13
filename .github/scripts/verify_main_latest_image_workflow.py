@@ -1369,16 +1369,26 @@ def self_test() -> int:
             "the checked-in publisher must satisfy its own contract: " + "; ".join(baseline)
         )
 
-    build_push = "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc"
+    # Mutations anchor on the checked-in pin lines rather than literal commits,
+    # so an admitted upstream pin rotation (docs/dependency-policy.md →
+    # "Automated action pin rotation") keeps every mutation applicable.
+    def pinned_line(action: str) -> str:
+        match = re.search(
+            rf"(?m)^[ \t]*(?:-[ \t]+)?uses: {re.escape(action)}@[0-9a-f]{{40}}[^\n]*$",
+            workflow,
+        )
+        return match.group(0).split("uses: ", 1)[1] if match else f"{action}@<missing>"
+
+    build_push = pinned_line("docker/build-push-action").split(" ", 1)[0]
     checkout_step = (
-        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        f"      - uses: {pinned_line('actions/checkout')}\n"
         "        with:\n"
         "          ref: ${{ needs.resolve.outputs.sha }}\n"
         "          persist-credentials: false\n\n"
     )
     dockerhub_login = (
         "      - name: Log in to Docker Hub\n"
-        "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4\n"
+        f"        uses: {pinned_line('docker/login-action')}\n"
         "        with:\n"
         "          username: ${{ secrets.DOCKERHUB_USERNAME }}\n"
         "          password: ${{ secrets.DOCKERHUB_TOKEN }}\n\n"

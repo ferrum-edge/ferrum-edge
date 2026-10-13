@@ -61,7 +61,7 @@ adding, removing, or materially changing a workflow.
 | `main-latest-image.yml` | Main Latest Image | `workflow_run` of CI on `main` (successful `push` runs only) | Serialized: builds the newest waiting CI-validated `main` commit (intermediate commits may be skipped), pushes and signs `main-<sha>`, then moves `latest` forward to it while that commit is on main's history and newer than the commit `latest` names. Never touches version tags. See [Main latest image](#main-latest-image). |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
-| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
+| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. Frozen surfaces compare pin-normalized text, and the same run governs pin changes: a changed external action pin must be an upstream release-tag commit that descends from the trusted pin ([automated action pin rotation](dependency-policy.md#automated-action-pin-rotation)). `Trusted Cross Build Policy` is directly required. |
 | `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, push to `main`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. Issue #4302 added the unconditional `push: main` trigger so publication can bind exact-main-SHA evidence. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Every PR, `merge_group`, push to `main`, manual | Live eBPF datapath validation in kind plus the production-image smoke. Relevance is decided by a trusted-base classifier and `NodeWaypoint eBPF Live` reports on every run; it is **not** a required live-suite check. |
 | `istio-status-cas-live.yml` | Istio Status CAS Live | Every PR, `merge_group`, push to `main`, manual | Kind/apiserver competing-writer proof that Ferrum's Istio status CAS preserves foreign and Ferrum-owned conditions. Relevance is decided by a trusted-base classifier and `Istio Status CAS Live` reports on every run; **not** a required live-suite check. |
@@ -94,6 +94,7 @@ adding, removing, or materially changing a workflow.
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
 | `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
 | `base-image-digest-refresh.yml` | Base Image Digest Refresh | Weekly schedule, manual | Resolves the current `@sha256:` digest for each pinned Dockerfile `FROM`/`ARG` image tag and opens an ordinary PR with every non-workflow consumer of a drifted pin rotated, including the distroless runtime base. It uses only its own `GITHUB_TOKEN`, so its required CI does not start on its own; a maintainer reopens the PR to run every required check, then reviews and merges it (see `docs/dependency-policy.md`). |
+| `dependabot-auto-merge.yml` | Dependabot Auto-Merge | `pull_request_target` (opened, reopened, synchronize) for PRs to `main` | Queues merge-commit auto-merge on Dependabot's own non-major PRs using only `GITHUB_TOKEN`, and withdraws it after any non-Dependabot push. GitHub merges only once every required check passes. It checks out no PR content. See [automated dependency merges](dependency-policy.md#automated-dependency-merges). |
 | `trusted-policy-candidate.yml` | Trusted Policy Candidate | PRs and push to `main` on `.github/scripts/**` or `.github/workflows/**` | Read-only `Candidate policy self-test`: runs the candidate `verify_required_ci.py` and the candidate Cross verifier's `--self-test`; nothing consumes its output. Not a required check. |
 | `benchmark-harness-lockfile.yml` | Benchmark Harness Lockfile | PRs on the multi-protocol harness `Cargo.toml`/`Cargo.lock` | Fails on lockfile drift and retains the expected lockfile. Optional. |
 | `mesh-benchmark-lockfile.yml` | Mesh Benchmark Lockfile | PRs and push to `main` on the mesh benchmark manifests, manual | Checks the `tests/performance/mesh` locked dependency graph. Optional. |
@@ -245,6 +246,11 @@ skipped, stale, or ambiguous evidence blocks release. Tests is bound to the
 canonical CI check suite; trusted policy evidence is bound to the associated
 merged PR head. A policy override does not fabricate successful evidence: a
 commit landed with a failed trusted check is not a releasable commit.
+A Dependabot merge made by `dependabot-auto-merge.yml` passes every trusted
+check, but GitHub starts no `push` workflows for a merge queued through
+`GITHUB_TOKEN`. That merge commit therefore has no push-to-`main` evidence of
+its own. Release from the next maintainer merge on top of it, which carries the
+bump and its own evidence.
 
 Ordinary main validation has no publication-evidence polling job. The Gateway
 API workflow reports its own conformance result; it does not wait for unrelated
@@ -748,9 +754,13 @@ verifier modules are fatal rather than falling back to candidate code.
 
 CI Plan also performs a cheap diff against the pinned base to reject changes
 to the two already-frozen policy files (`verify_cross_build_policy.py` and
-`cross-build-policy.yml`) before allocating application builders. This is only
-an early rejection: it does not replace the full policy scan or admit policy
-migrations. Other invalid changes can still spend compilation minutes before
+`cross-build-policy.yml`) before allocating application builders. The one
+change it admits is a pin-only change of `cross-build-policy.yml`, which the
+trusted verifier decides (`--pin-normalized-equal`). `Trusted Cross Build
+Policy` then governs the pins themselves
+([automated action pin rotation](dependency-policy.md#automated-action-pin-rotation)).
+This is only an early rejection: it does not replace the full policy scan or
+admit policy migrations. Other invalid changes can still spend compilation minutes before
 the parallel policy verdict arrives. If the immutable-base guard rejects a
 legitimate workflow migration, resolve it through reviewed policy governance,
 never by suppressing checks or synthesizing successful release proof. See

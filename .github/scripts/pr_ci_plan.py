@@ -960,6 +960,9 @@ DEPENDENCY_AUDIT_PATTERNS = [
         r"^PRODUCTION_READINESS\.md$",
         r"^scripts/(?:check_advisory_expiry\.sh|check_vendored_patch_lifecycle\.py)$",
         r"^scripts/verify_dependency_security_chain\.py$",
+        # The lifecycle checker requires the cargo `ignore` list to cover every
+        # vendored `[patch.crates-io]` crate.
+        r"^\.github/dependabot\.yml$",
     )
 ]
 
