@@ -3997,6 +3997,7 @@ Response shape:
       "source": "spiffe://cluster.local/ns/staging/sa/web",
       "destination": "spiffe://cluster.local/ns/prod/sa/api",
       "reason": "namespace_mismatch",
+      "reevaluation": false,
       "count": 87,
       "first_at": "2026-05-18T19:32:11Z",
       "last_at":  "2026-05-18T19:36:48Z"
@@ -4176,6 +4177,9 @@ metadata:
   name: ferrum-edge-injector
 webhooks:
   - name: ferrum-inject.ferrum.io
+    admissionReviewVersions:
+      - v1
+    sideEffects: None
     failurePolicy: Fail
     namespaceSelector:
       matchExpressions:
@@ -4215,7 +4219,7 @@ The injector checks annotations and labels to decide whether to inject:
 | `ferrum.io/mesh: "false"` or `"disabled"` (label) | Skip injection |
 | `ferrum.io/injected` | Written by the injector as an observability marker only; not trusted as a skip signal. Re-invocation is rejected by reserved `ferrum-edge` / `ferrum-edge-init` name conflicts |
 
-When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"`, `sidecar.istio.io/inject: "true"` (Istio compat), or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
+When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"`, `sidecar.istio.io/inject: "true"` (Istio compat), or the `ferrum.io/mesh: "enabled"` label. When `false`, the positive opt-in requirement is removed for otherwise eligible pods, but a pod is still skipped when its inject annotations or `ferrum.io/mesh` label carry an explicit opt-out or an unrecognized value (for example `ferrum.io/inject: "maybe"`), and host-network pods are still never injected (see below).
 
 **Minimum Kubernetes version: 1.29.** Native sidecar containers (`initContainers` with `restartPolicy: Always`) are beta and enabled by default from 1.29, and GA in 1.33. There is **no ordinary-container fallback**: an ordinary sidecar cannot provide startup ordering or Job completion, so the injector always emits the native-sidecar shape. On Kubernetes 1.28 the `SidecarContainers` feature gate must be enabled; on 1.27 and earlier the apiserver rejects `spec.initContainers[].restartPolicy`. Do not install the injector on clusters older than 1.29 unless that feature gate is on. The `ferrum-mesh` chart enforces this at render time: with `injector.enabled=true`, `ferrum-mesh.validateInjectorKubeVersion` fails `helm template`/`helm install` below 1.29 and names the `SidecarContainers` gate and the reported cluster version. This is deliberately not a chart-wide `Chart.yaml: kubeVersion:` constraint, so the rest of the mesh chart still installs on an older cluster with `injector.enabled=false`. A client-side `helm template` with no `--kube-version` reports the 1.20 sentinel and is skipped rather than refused.
 
@@ -5575,10 +5579,17 @@ nodeAgent:
     limits:
       cpu: 250m
       memory: 256Mi
-  meshCapture:
-    includeCidrs: []       # empty = capture all
-    excludeCidrs: []
-    excludePorts: []
+  capture:
+    includeCidrs: "0.0.0.0/0"
+    excludeCidrs: ""
+    excludePorts: "15001,15006,15008,15020"
+
+# Required when nodeAgent.proxyMode is node_waypoint: the chart refuses to
+# render NodeWaypoint mode without ambient enabled in that topology.
+ambient:
+  enabled: true
+  env:
+    FERRUM_MESH_TOPOLOGY: node_waypoint
 ```
 
 Required Linux capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (kernel >= 5.8), `CAP_SYS_ADMIN` only for kernel-backcompat on 5.7.x (`nodeAgent.security.dropCapSysAdmin=false`; no proxy mode adds it, since veth resolution never enters pod network namespaces). Required volume mounts: `/sys/fs/bpf` (bpffs), `/sys/fs/cgroup` (cgroup v2, read-only). Required host access: `hostNetwork: true`; the node agent takes no `hostPID` (the NodeWaypoint ambient proxy keeps its own). See [`docs/node_agent_security.md`](node_agent_security.md) for the full security posture, including seccomp / AppArmor profiles and the kernel API each capability grants.
