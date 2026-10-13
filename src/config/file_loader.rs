@@ -679,7 +679,9 @@ pub async fn load_config_from_file_off_thread(
 }
 
 /// Reload config from file, returning the new config or an error.
-#[cfg(unix)]
+///
+/// Only the Unix SIGHUP handler calls this, but it is a plain file load, so it
+/// stays available on every target for the shared unit tests.
 pub fn reload_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
