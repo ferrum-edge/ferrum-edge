@@ -6,7 +6,8 @@
 #   --protocol <p>        udp | tcp | both  (default: both)
 #   --edns <n>            EDNS(0) udp_payload_size; 0 = off (default: 0)
 #   --skip-build          Reuse existing binaries (gateway + harness)
-#   --json                Emit JSON results, not a text table
+#   --json                Emit one JSON document {"gateway":…,"baseline":…}
+#                         on stdout; progress/cleanup go to stderr
 
 set -e
 
@@ -41,6 +42,22 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+# Progress helper: wrapper headings must never reach the captured stdout of
+# a loadgen run in --json mode.
+say() {
+    if [[ -n "$JSON_FLAG" ]]; then
+        echo -e "$@" >&2
+    else
+        echo -e "$@"
+    fi
+}
+
+# In --json mode stdout carries ONLY the final combined JSON document: park
+# the real stdout on fd 3 and send all wrapper progress/cleanup to stderr.
+if [[ -n "$JSON_FLAG" ]]; then
+    exec 3>&1 1>&2
+fi
 
 # Ports. Sidecar topology only binds inbound/outbound/HBONE; east-west /
 # egress addresses are still exported below so that a future topology swap
@@ -223,10 +240,10 @@ start_gateway() {
 }
 
 run_loadgen_via_gateway() {
-    echo -e "\n${CYAN}========================================${NC}"
-    echo -e "${CYAN}  Via gateway (127.0.0.1:${GATEWAY_DNS_PORT})${NC}"
-    echo -e "${CYAN}  ${DURATION}s, concurrency=${CONCURRENCY}, protocol=${PROTOCOL}${NC}"
-    echo -e "${CYAN}========================================${NC}\n"
+    say "\n${CYAN}========================================${NC}"
+    say "${CYAN}  Via gateway (127.0.0.1:${GATEWAY_DNS_PORT})${NC}"
+    say "${CYAN}  ${DURATION}s, concurrency=${CONCURRENCY}, protocol=${PROTOCOL}${NC}"
+    say "${CYAN}========================================${NC}\n"
     "$SCRIPT_DIR/target/release/dns_loadgen" \
         --target "127.0.0.1:${GATEWAY_DNS_PORT}" \
         --duration "$DURATION" \
@@ -237,10 +254,10 @@ run_loadgen_via_gateway() {
 }
 
 run_loadgen_baseline() {
-    echo -e "\n${CYAN}========================================${NC}"
-    echo -e "${CYAN}  Baseline direct to dns_upstream_stub (127.0.0.1:${UPSTREAM_STUB_PORT})${NC}"
-    echo -e "${CYAN}  Mesh-internal classes are skipped (no upstream equivalent)${NC}"
-    echo -e "${CYAN}========================================${NC}\n"
+    say "\n${CYAN}========================================${NC}"
+    say "${CYAN}  Baseline direct to dns_upstream_stub (127.0.0.1:${UPSTREAM_STUB_PORT})${NC}"
+    say "${CYAN}  Mesh-internal classes are skipped (no upstream equivalent)${NC}"
+    say "${CYAN}========================================${NC}\n"
     "$SCRIPT_DIR/target/release/dns_loadgen" \
         --target "127.0.0.1:${UPSTREAM_STUB_PORT}" \
         --duration "$DURATION" \
@@ -262,8 +279,26 @@ start_upstream_stub
 start_cp_stub
 start_gateway
 
-run_loadgen_via_gateway
-run_loadgen_baseline
+if [[ -n "$JSON_FLAG" ]]; then
+    # Capture each loadgen JSON report and emit ONE combined document on the
+    # real stdout (fd 3). A failing loadgen still prints its report, so emit
+    # the document first and then preserve the first nonzero exit status.
+    gateway_status=0
+    baseline_status=0
+    gateway_json=$(run_loadgen_via_gateway) || gateway_status=$?
+    baseline_json=$(run_loadgen_baseline) || baseline_status=$?
+    printf '{"gateway":%s,"baseline":%s}\n' \
+        "${gateway_json:-null}" "${baseline_json:-null}" >&3
+    if [[ $gateway_status -ne 0 ]]; then
+        exit "$gateway_status"
+    fi
+    if [[ $baseline_status -ne 0 ]]; then
+        exit "$baseline_status"
+    fi
+else
+    run_loadgen_via_gateway
+    run_loadgen_baseline
+fi
 
 echo -e "\n${GREEN}=======================================${NC}"
 echo -e "${GREEN}  Run completed successfully${NC}"
