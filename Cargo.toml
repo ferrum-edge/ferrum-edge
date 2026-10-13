@@ -253,7 +253,7 @@ pin-project-lite = "0.2"
 # load-bearing: `crypto-ring` / `fips`, not reqwest, selects the provider.
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "form", "rustls-no-provider", "stream", "http2", "charset"] }
 hickory-resolver = { version = "0.26.2", features = ["tokio", "system-config"] }
-base64 = "0.22"
+base64 = "0.23"
 # AWS event-stream prelude/message CRC32 (ITU-T V.42). Already transitive via
 # flate2; the explicit dependency makes the Bedrock integrity check intentional.
 crc32fast = "1"
