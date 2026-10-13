@@ -19052,10 +19052,16 @@ fn ai_embedding_plaintext_opt_in_matches_schema_and_runtime() {
         json!({ "provider": provider })
     };
 
-    let cases: [(&str, Option<bool>, bool); 7] = [
+    let cases: [(&str, Option<bool>, bool); 11] = [
         ("https://embeddings.example.com/v1", None, true),
         ("http://127.0.0.1:9/v1", None, true),
+        ("http://127.0.0.1", None, true),
         ("http://[::1]:9/v1", None, true),
+        // Loopback, but not the canonical literal spelling the schema names:
+        // both sides refuse it without the opt-in.
+        ("http://[0:0:0:0:0:0:0:1]:9/v1", None, false),
+        ("http://127.1:9/v1", None, false),
+        ("http://127.1:9/v1", Some(true), true),
         ("http://embeddings.example.com/v1", Some(true), true),
         ("http://embeddings.example.com/v1", None, false),
         ("http://embeddings.example.com/v1", Some(false), false),
