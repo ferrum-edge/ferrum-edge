@@ -693,7 +693,7 @@ async fn run_k8s_secret_watch(
     force_tx: mpsc::Sender<()>,
     mut shutdown_rx: Option<watch::Receiver<bool>>,
 ) {
-    let client = match kube::Client::try_default().await {
+    let client = match crate::k8s_controller::try_default_kube_client().await {
         Ok(client) => client,
         Err(error) => {
             warn!(
