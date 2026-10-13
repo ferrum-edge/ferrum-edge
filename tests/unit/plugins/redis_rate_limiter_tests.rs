@@ -9255,3 +9255,267 @@ fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
         );
     }
 }
+
+// ── Bounded record reads and exact claim replies (issue #6622) ──────────────
+
+/// Scripted RESP server holding ONE stored value that every key reports.
+///
+/// It answers the bounded read commands faithfully (`EXISTS`, `STRLEN`, and
+/// `GETRANGE` with Redis' inclusive end index), screens clean for both the
+/// topology and no-eviction probes, queues transaction commands, and answers
+/// `EXEC` with `exec_set_reply` for each queued `SET`. A standalone `SET … NX`
+/// answers `set_nx_reply`. Every received command is recorded, so a test can
+/// assert the exact range requested and that no `GET` was ever sent.
+struct ScriptedValueServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    commands: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+impl ScriptedValueServer {
+    fn commands_named(&self, name: &str) -> Vec<Vec<String>> {
+        self.commands
+            .lock()
+            .expect("command log")
+            .iter()
+            .filter(|args| {
+                args.first()
+                    .is_some_and(|first| first.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+async fn spawn_scripted_value_server(
+    stored: Vec<u8>,
+    exec_set_reply: &'static [u8],
+    set_nx_reply: &'static [u8],
+) -> ScriptedValueServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let commands_task = Arc::clone(&commands);
+    let stored = Arc::new(stored);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    let commands = Arc::clone(&commands_task);
+                    let stored = Arc::clone(&stored);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        let mut pending: Vec<u8> = Vec::new();
+                        let mut queued: Vec<String> = Vec::new();
+                        let mut in_transaction = false;
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            pending.extend_from_slice(&buf[..n]);
+                            let mut reply: Vec<u8> = Vec::new();
+                            while let Some(args) = take_resp_command(&mut pending) {
+                                let args: Vec<String> = args
+                                    .iter()
+                                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                                    .collect();
+                                commands.lock().expect("command log").push(args.clone());
+                                let name = args.first().cloned().unwrap_or_default().to_ascii_uppercase();
+                                if in_transaction && name != "EXEC" {
+                                    queued.push(name);
+                                    reply.extend_from_slice(b"+QUEUED\r\n");
+                                    continue;
+                                }
+                                match name.as_str() {
+                                    "TIME" => reply.extend_from_slice(&host_clock_time_reply()),
+                                    "INFO" => {
+                                        let text = "# Cluster\r\ncluster_enabled:0\r\n# Memory\r\nmaxmemory:0\r\nmaxmemory_policy:noeviction\r\n";
+                                        reply.extend_from_slice(format!("${}\r\n{text}\r\n", text.len()).as_bytes());
+                                    }
+                                    "EXISTS" => reply.extend_from_slice(b":1\r\n"),
+                                    "STRLEN" => reply.extend_from_slice(format!(":{}\r\n", stored.len()).as_bytes()),
+                                    "GETRANGE" | "GET" => {
+                                        let slice: &[u8] = if name == "GET" {
+                                            &stored
+                                        } else {
+                                            let start: usize = args[2].parse().expect("start");
+                                            let end: usize = args[3].parse().expect("non-negative end");
+                                            let end = end.min(stored.len().saturating_sub(1));
+                                            if stored.is_empty() || start > end { &[] } else { &stored[start..=end] }
+                                        };
+                                        reply.extend_from_slice(format!("${}\r\n", slice.len()).as_bytes());
+                                        reply.extend_from_slice(slice);
+                                        reply.extend_from_slice(b"\r\n");
+                                    }
+                                    "SET" if args.iter().any(|arg| arg.eq_ignore_ascii_case("NX")) => {
+                                        reply.extend_from_slice(set_nx_reply)
+                                    }
+                                    "MULTI" => {
+                                        in_transaction = true;
+                                        queued.clear();
+                                        reply.extend_from_slice(b"+OK\r\n");
+                                    }
+                                    "EXEC" => {
+                                        in_transaction = false;
+                                        reply.extend_from_slice(format!("*{}\r\n", queued.len()).as_bytes());
+                                        for command in queued.drain(..) {
+                                            match command.as_str() {
+                                                "SET" => reply.extend_from_slice(exec_set_reply),
+                                                "DEL" => reply.extend_from_slice(b":1\r\n"),
+                                                _ => reply.extend_from_slice(b"+OK\r\n"),
+                                            }
+                                        }
+                                    }
+                                    _ => reply.extend_from_slice(b"+OK\r\n"),
+                                }
+                            }
+                            if !reply.is_empty() && stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    ScriptedValueServer {
+        port,
+        shutdown: shutdown_tx,
+        commands,
+    }
+}
+
+fn scripted_client(port: u16) -> RedisRateLimitClient {
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    redis_rate_limit_client_for_test(config)
+}
+
+#[tokio::test]
+async fn ownership_compares_request_only_the_owner_length_and_never_get() {
+    let server = spawn_scripted_value_server(vec![b'x'; 1 << 20], b"+OK\r\n", b"+OK\r\n").await;
+    let client = scripted_client(server.port);
+    let owner = b"owner-record";
+
+    assert_eq!(
+        client.delete_if_value_matches("fence", owner).await,
+        Ok(false)
+    );
+    assert_eq!(
+        client
+            .set_bytes_with_expire_if_value_matches("fence", owner, b"done", 60)
+            .await,
+        Ok(false)
+    );
+
+    let ranges = server.commands_named("GETRANGE");
+    assert_eq!(ranges.len(), 2, "one bounded compare per primitive");
+    for range in &ranges {
+        assert_eq!(range[2], "0");
+        assert_eq!(
+            range[3],
+            owner.len().to_string(),
+            "the compare reads at most the owner length plus one byte"
+        );
+    }
+    assert!(server.commands_named("GET").is_empty(), "no unbounded GET");
+    assert!(
+        server.commands_named("MULTI").is_empty(),
+        "a mismatch never opens the write transaction"
+    );
+    assert!(client.is_available());
+    let _ = server.shutdown.send(());
+}
+
+#[tokio::test]
+async fn fenced_publication_requires_an_exact_ok_exec_reply() {
+    let owner = b"owner-record".to_vec();
+
+    let accepted = spawn_scripted_value_server(owner.clone(), b"+OK\r\n", b"+OK\r\n").await;
+    let client = scripted_client(accepted.port);
+    assert_eq!(
+        client
+            .set_bytes_with_expire_if_value_matches("fence", &owner, b"done", 60)
+            .await,
+        Ok(true)
+    );
+    let _ = accepted.shutdown.send(());
+
+    let malformed = spawn_scripted_value_server(owner.clone(), b"+NOT_OK\r\n", b"+OK\r\n").await;
+    let client = scripted_client(malformed.port);
+    assert_eq!(
+        client
+            .set_bytes_with_expire_if_value_matches("fence", &owner, b"done", 60)
+            .await,
+        Err(()),
+        "a SET reply other than OK must not count as a publication"
+    );
+    assert!(!client.is_available());
+    let _ = malformed.shutdown.send(());
+}
+
+#[tokio::test]
+async fn general_set_nx_claim_accepts_only_ok_or_nil() {
+    for (reply, expected) in [
+        (&b"+OK\r\n"[..], Ok(true)),
+        (&b"$-1\r\n"[..], Ok(false)),
+        (&b"+YES\r\n"[..], Err(())),
+    ] {
+        let reply: &'static [u8] = reply;
+        let server = spawn_scripted_value_server(Vec::new(), b"+OK\r\n", reply).await;
+        let client = scripted_client(server.port);
+        assert_eq!(
+            client
+                .set_bytes_nx_with_expire("claim", b"marker", 60)
+                .await,
+            expected,
+            "reply {:?}",
+            String::from_utf8_lossy(reply)
+        );
+        assert_eq!(client.is_available(), expected.is_ok());
+        let _ = server.shutdown.send(());
+    }
+}
+
+#[tokio::test]
+async fn deduplication_refuses_an_over_cap_record_without_downloading_it() {
+    use ferrum_edge::_test_support::{
+        request_deduplication_redis_record_state_for_test,
+        request_deduplication_with_instance_id_for_test,
+    };
+
+    let max_entry_size_bytes = 64usize;
+    let read_cap = max_entry_size_bytes + 4 * 1024;
+    let server = spawn_scripted_value_server(vec![b'{'; 16 * 1024], b"+OK\r\n", b"+OK\r\n").await;
+    let plugin = request_deduplication_with_instance_id_for_test(
+        &json!({
+            "header_name": "Idempotency-Key",
+            "sync_mode": "redis",
+            "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+            "redis_connect_timeout_seconds": 5,
+            "max_entry_size_bytes": max_entry_size_bytes,
+        }),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+        "dedup-bounded-read",
+    )
+    .expect("redis-mode deduplication");
+
+    assert_eq!(
+        request_deduplication_redis_record_state_for_test(&plugin, "v6:probe").await,
+        "unreadable",
+        "an over-cap record is a fail-closed conflict, not a miss"
+    );
+    let ranges = server.commands_named("GETRANGE");
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0][3], read_cap.to_string());
+    assert!(server.commands_named("GET").is_empty(), "no unbounded GET");
+    let _ = server.shutdown.send(());
+}

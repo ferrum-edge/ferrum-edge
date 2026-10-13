@@ -6575,9 +6575,24 @@ impl RedisRateLimitClient {
             .await;
 
         match result {
-            Ok(Some(_)) => {
+            Ok(Some((reply,))) if reply == "OK" => {
                 self.note_command_success()?;
                 Ok(true)
+            }
+            Ok(Some(_)) => {
+                // Only an exact `OK` proves the completion was stored. Any
+                // other string is protocol uncertainty: reporting it as a
+                // publication would let the caller treat an unwritten
+                // completion as authoritative.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare-and-set",
+                    phase = "EXEC",
+                    classification = "malformed_response",
+                    "Redis transaction SET returned a reply other than OK"
+                );
+                self.mark_unavailable();
+                Err(())
             }
             Ok(None) => {
                 self.note_command_success()?;

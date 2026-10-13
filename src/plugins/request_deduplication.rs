@@ -1922,6 +1922,24 @@ impl RequestDeduplication {
         }
     }
 
+    /// Classify the Redis record stored under logical `key`. Test support for
+    /// the bounded-read contract; production reads go through admission.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) async fn redis_record_state_for_test(&self, key: &str) -> &'static str {
+        let Some(redis) = self.redis_client.as_ref() else {
+            return "no_redis";
+        };
+        let redis_key = redis.make_key(&[key]);
+        match self.redis_read_record(redis, &redis_key).await {
+            RedisRecordState::Absent => "absent",
+            RedisRecordState::InFlight(_) => "inflight",
+            RedisRecordState::Completed(..) => "completed",
+            RedisRecordState::Unreadable => "unreadable",
+            RedisRecordState::Unprovable => "unprovable",
+            RedisRecordState::Unavailable => "unavailable",
+        }
+    }
+
     /// Largest Redis record this instance will read: an admitted replay
     /// payload (at most `max_entry_size_bytes`) plus the record envelope.
     fn redis_record_read_cap(&self) -> usize {

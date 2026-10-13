@@ -3191,7 +3191,7 @@ async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
             .get_bytes_bounded(&key, 1024)
             .await
             .expect("read record"),
-        BoundedRedisValue::Found(result_b)
+        BoundedRedisValue::Found(result_b.clone())
     );
 
     // A completely absent record cannot be resurrected by a stale owner.

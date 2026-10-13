@@ -3886,6 +3886,13 @@ pub mod _test_support {
         crate::plugins::request_deduplication::redis_record_payload_is_valid_for_test(data)
     }
 
+    pub async fn request_deduplication_redis_record_state_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        key: &str,
+    ) -> &'static str {
+        plugin.redis_record_state_for_test(key).await
+    }
+
     pub fn request_deduplication_completed_size_snapshot_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) -> (usize, usize) {
