@@ -14901,8 +14901,9 @@ mod inner {
 
                 // Guard collections are keyed purely by `_id` and need no
                 // secondary indexes. Some are written from inside transactions,
-                // and MongoDB < 4.4 cannot implicitly create a collection
-                // there, so create every guard collection explicitly.
+                // where a cross-shard write transaction cannot implicitly
+                // create a collection and concurrent first writes can
+                // conflict, so create every guard collection explicitly.
                 // NamespaceExists (code 48) is tolerated for idempotent
                 // multi-instance startup.
                 for lock_collection in REQUIRED_GUARD_COLLECTIONS {

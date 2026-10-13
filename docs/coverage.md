@@ -84,8 +84,9 @@ orchestration:
   the accepted sequence cursor when a full-load or incremental candidate is
   rejected. Unchanged valid database configs commit the sequence cursor and keep
   the gateway available.
-- MongoDB standalone behavior is covered by functional CI against the default
-  `mongo:7` service and intentionally forces database-mode pollers to full
+- MongoDB standalone behavior is covered by functional CI against the
+  `mongo:4.4.29` standalone fixture (the supported floor; the Coverage
+  workflow's standalone fixture is `mongo:7`) and intentionally forces database-mode pollers to full
   reloads instead of accepting non-transactional incremental cursors. MongoDB
   replica-set transaction/incremental behavior requires a replica-set topology
   and is tracked here as a backend-specific coverage boundary for remote CI

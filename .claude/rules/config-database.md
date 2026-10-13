@@ -64,6 +64,10 @@ paths:
 ## Database Backends
 
 - Supported stores are PostgreSQL, MySQL, SQLite through sqlx, and MongoDB.
+- MongoDB 4.4.2 is the server floor (the `mongodb` 3.9 driver's wire version 9,
+  plus the `hello` command Ferrum sends directly).
+  Do not add MongoDB queries that need a newer server without updating the
+  supported-version table in `docs/mongodb.md` and the CI 4.4 fixture.
 - SQLite must keep `PRAGMA journal_mode=WAL`, `busy_timeout=5000`, and `foreign_keys=ON` through `after_connect`.
 - `DatabaseBackend` in `src/config/db_backend.rs` is the shared trait. `DatabaseStore` and `MongoStore` both implement it. Admin and modes use `Arc<dyn DatabaseBackend>`.
 - SQL wraps multi-step CRUD in `sqlx::Transaction`.

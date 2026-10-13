@@ -49,8 +49,7 @@ unused-ignored-advisory = "deny"
 # exception register"):
 #   - RUSTSEC-2026-0118 / RUSTSEC-2026-0119 (hickory-proto 0.25.2): mongodb 3.7
 #     moved its SRV resolver to hickory 0.26; Cargo.toml now requires
-#     >=3.7, <3.9 (the lockfile resolves 3.8.2). The cap keeps MongoDB 4.2:
-#     3.9 raised the driver's minimum wire version to 9 (MongoDB 4.4).
+#     3.9.1 (the lockfile resolves 3.9.1).
 #   - RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and
 #     RUSTSEC-2026-0258 (h2 0.3.27): all came from the AWS SDK's legacy
 #     `rustls` feature (hyper 0.14 / rustls 0.21 connector), which

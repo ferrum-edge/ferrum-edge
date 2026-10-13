@@ -12,6 +12,47 @@ This guide covers deploying Ferrum Edge with MongoDB as the configuration databa
 | You're deploying on MongoDB Atlas | You're using managed RDS/Cloud SQL |
 | You want driver-managed topology discovery | You need SQL read-replica admin-read offload |
 
+## Supported Server Versions
+
+Ferrum Edge uses the Rust `mongodb` driver 3.9.1, which accepts servers that
+report wire versions 9 through 29: **MongoDB 4.4 through 9.0**. The driver
+rejects older servers during server selection with an incompatible wire version
+error, so the gateway cannot start against them. Ferrum also sends the `hello`
+command directly (server-time reads for leases), which MongoDB added in 4.4.2,
+so the practical floor is **4.4.2**.
+
+| Server | Status |
+|---|---|
+| MongoDB 9.0 | Supported and recommended. |
+| MongoDB 5.0 – 8.x | Supported. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 7.0 (see the kernel note below). |
+| MongoDB 4.4.2+ | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
+| MongoDB 4.4.0 – 4.4.1, 4.2 and older | Not supported (no `hello` command, or wire version 8 or lower). |
+| MongoDB Atlas | Supported on any Atlas-offered version. |
+| Azure Cosmos DB for MongoDB (RU) | Not supported. Accounts on server version 4.2 or older fail the driver's wire-version check. Accounts on 5.0+ pass it, but they cannot create Ferrum's baseline indexes (sparse, and non-unique partial). They also lack cross-collection transactions. See [Azure Cosmos DB](#azure-cosmos-db-mongodb-api). |
+| Azure Cosmos DB for MongoDB (vCore) / Azure DocumentDB | Wire-compatible (5.0 and later). Not tested by Ferrum. |
+| AWS DocumentDB | Engines 5.0 and 8.0 pass the driver's wire-version check. DocumentDB 3.6 and 4.0 report wire versions 6 and 7 and are rejected, so upgrade the cluster. Not tested by Ferrum; see [AWS DocumentDB](#aws-documentdb) for the known behavior differences. |
+
+**Linux kernel note.** Recent MongoDB releases refuse to start on some Linux
+kernels because of a tcmalloc/rseq safeguard. The upstream compatibility matrix
+is in [SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742).
+
+- 8.0.30+, 8.3.9+, and 9.0 exit on kernels 6.19 through 7.0.13 and run on
+  7.0.14+.
+- 8.0.21–8.0.29 and 8.3.0–8.3.8 exit on every kernel from 6.19 up, including
+  7.0.14+.
+- 8.0.0–8.0.20 start on 6.19+ but can crash shortly afterwards. Do not use them
+  there.
+- 7.0 is unaffected.
+
+The `mongo:9` image (9.0.2) also exits on hosts whose kernel reports 7.0.0, such
+as Ubuntu 26.04 kernels and the GitHub-hosted `ubuntu-26.04` runners
+([SERVER-136272](https://jira.mongodb.org/browse/SERVER-136272), fixed in
+9.0.4). Ferrum's CI uses 7.0 for this reason.
+
+Replica-set features (transactions, `POST /batch`, change streams) need a
+replica set on any version; see [Replica Sets and
+Transactions](#replica-sets-and-transactions).
+
 ## Quick Start
 
 ```bash
@@ -69,7 +110,7 @@ MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI
 | Max pool size | `maxPoolSize` URI option | MongoDB equivalent of pool capacity. Example: `?maxPoolSize=100` |
 | Minimum idle pool size | `minPoolSize` URI option | Keeps warm driver connections open. Example: `?minPoolSize=5` |
 | Idle connection age | `maxIdleTimeMS` URI option | Driver-side idle eviction. Example: `?maxIdleTimeMS=600000` |
-| Pool checkout wait | Not supported | The pinned `mongodb` 3.8.2 driver parses `waitQueueTimeoutMS` from the URI but does not implement it as a connection-checkout deadline; pooling waits on a connection request without a checkout timeout. Do not rely on it when tuning under pool pressure. |
+| Pool checkout wait | Not supported | The `mongodb` 3.9.1 driver parses `waitQueueTimeoutMS` from the URI but does not implement it as a connection-checkout deadline; pooling waits on a connection request without a checkout timeout. Do not rely on it when tuning under pool pressure. |
 | Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | Read preference | Ignored by Ferrum's config store | Runtime config reads are forced to primary for authoritative polling consistency. |
@@ -469,7 +510,7 @@ delayed commit can become visible later on another pooled connection. Ferrum
 therefore retains the owner-qualified fence and generation pin for manual
 recovery instead of admitting writes that the delayed clear could erase.
 
-Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time because MongoDB < 4.4 cannot implicitly create collections inside transactions.
+Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time: a cross-shard write transaction cannot create a collection implicitly, and concurrent first writes inside transactions can conflict.
 
 ## Managed Services
 
@@ -523,9 +564,25 @@ FERRUM_DB_TLS_CA_CERT_PATH=/certs/rds-combined-ca-bundle.pem
 
 ### Azure Cosmos DB (MongoDB API)
 
+The request-unit (RU) offering is **not supported**. Microsoft's compatibility
+pages list three gaps:
+
+- Sparse indexes are not supported, and partial indexes must be unique.
+  Ferrum's migration plan (`src/config/mongo_index_plan.rs`) needs both
+  kinds, so `migrate up` fails.
+- Multi-document transactions cannot span collections, and Ferrum's
+  replica-set batch and config-load paths use them.
+- Server versions 4.2 and older report a wire version below the `mongodb` 3.9
+  driver's floor of 9.
+
+The vCore offering (now Azure DocumentDB) is wire-compatible but untested. If
+you evaluate it, run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` against a
+scratch database first and confirm that every index is created. A vCore
+connection string looks like this:
+
 ```bash
 FERRUM_DB_TYPE=mongodb
-FERRUM_DB_URL="mongodb://ferrum-user:password@ferrum-cosmos.mongo.cosmos.azure.com:10255/ferrum?ssl=true&replicaSet=globaldb&retryWrites=false"
+FERRUM_DB_URL="mongodb+srv://ferrum-user:password@ferrum-cluster.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retryWrites=false"
 FERRUM_MONGO_DATABASE=ferrum
 ```
 
