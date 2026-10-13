@@ -4788,7 +4788,7 @@ udp_echo_backend_received() {
 # read or any identity field is missing, so callers must treat capture
 # failure as inconclusive rather than as continuity.
 ambient_restart_snapshot() {
-  kubectl -n "$MESH_NS" get pods -l app.kubernetes.io/component=ambient \
+  kubectl -n "$MESH_NS" get pods -l app.kubernetes.io/name=ferrum-mesh-ambient \
     -o json 2>/dev/null | python3 -c '
 import json
 import sys

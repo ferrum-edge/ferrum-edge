@@ -822,7 +822,15 @@ kubectl() {
         echo 'Error from server: connection refused' >&2
         return 1
       fi
-      printf '%s' "${AMBIENT_PODS_JSON:-}"
+      # Honor the label selector the chart actually applies to ambient pods
+      # (app.kubernetes.io/name=ferrum-mesh-ambient); any other selector sees
+      # no pods, exactly like a live cluster.
+      case " $* " in
+        *"app.kubernetes.io/name=ferrum-mesh-ambient"*)
+          printf '%s' "${AMBIENT_PODS_JSON:-}" ;;
+        *)
+          printf '%s' '{"items":[]}' ;;
+      esac
       ;;
     *" logs "*)
       if [[ "${LOGS_FAIL:-0}" == 1 ]]; then
