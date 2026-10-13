@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
-  makes authentication optional.** The flag used to double as Istio's
+  makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only
   applicable auth plugin, a request carrying no token was forwarded
   unauthenticated in every operating mode, while an invalid token was still
