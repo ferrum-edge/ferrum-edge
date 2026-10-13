@@ -107,13 +107,14 @@ jobs:
         run: cargo test --test unit_tests --no-run
 
       # A renamed module would otherwise match zero tests and pass. The module
-      # holds ten ordinary tests; require at least that many to pass.
+      # holds ten ordinary tests; require at least that many to pass. Run them
+      # serially: the handle-leak test counts every handle in the process.
       - name: Run Windows confinement tests
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/windows-confinement.log"
-          cargo test --test unit_tests unit::tls::scoped_material_reference_tests::windows_confined_files:: 2>&1 | tee "$log"
+          cargo test --test unit_tests unit::tls::scoped_material_reference_tests::windows_confined_files:: -- --test-threads=1 2>&1 | tee "$log"
           grep -Eq 'test result: ok\. ([1-9][0-9]+) passed' "$log"
 
       # The case-sensitive NTFS directory fixture needs an elevated process on
