@@ -13,14 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of resolving last-wins** (issue #6572). The SQL and MongoDB full
   loaders only warned when two consumers shared an API key, basicauth
   username, or mTLS identity, and the consumer index then authenticated that
-  credential as whichever consumer was indexed last. Full loads, config swaps
-  (including CP-to-DP snapshots), and incremental applies now strip the
-  colliding credential type from every later consumer (first-loaded by id
-  wins), matching the existing `hmac_auth` and identity quarantine. Case
-  variants of an mTLS identity count as collisions when a `san_dns` policy is
-  active. A namespace with an active quarantine keeps escalating consumer
-  changes to full reloads. File mode already rejected such configs and is
-  unchanged.
+  credential as whichever consumer was indexed last. Full loads and config
+  swaps (including CP-to-DP snapshots) now strip the colliding credential type
+  from every later consumer (first-loaded by id wins), matching the existing
+  `hmac_auth` and identity quarantine. An incremental delta that would
+  introduce such a collision is rejected, so the previous config stays live
+  until a full reload. Case variants of an mTLS identity count as collisions
+  when a `san_dns` policy is active. While a quarantine is active, consumer,
+  proxy, and plugin-config changes escalate to full reloads. File mode
+  already rejected such configs and is unchanged.
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is
