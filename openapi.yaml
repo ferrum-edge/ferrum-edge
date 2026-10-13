@@ -24801,7 +24801,7 @@ components:
           default: 64
           minimum: 1
           maximum: 1024
-          description: "Maximum concurrent uncached LDAP authentication flows per plugin instance; excess requests fail immediately"
+          description: "Maximum concurrent LDAP directory flows per plugin instance, shared by uncached authentications and due cached group re-checks; excess requests fail immediately"
         cache_ttl_seconds:
           type: integer
           format: uint64
