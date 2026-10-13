@@ -57,16 +57,6 @@ async fn start_echo_server_on(listener: TcpListener) {
 // Gateway helpers
 // ============================================================================
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
 /// Start the gateway in file mode with an explicit `FERRUM_ROUTER_CACHE_MAX_ENTRIES`.
 fn start_gateway_with_cache_cap(
     config_path: &str,
@@ -75,7 +65,7 @@ fn start_gateway_with_cache_cap(
     cache_cap: usize,
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> std::process::Child {
-    let binary_path = gateway_binary_path();
+    let binary_path = crate::common::gateway_binary_path();
     let mut cmd = std::process::Command::new(binary_path);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")

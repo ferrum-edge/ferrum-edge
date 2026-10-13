@@ -24,14 +24,6 @@ use crate::common::pin_gateway_command_rust_log;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 fn cert_paths() -> (PathBuf, PathBuf) {
     let crt = std::fs::canonicalize("tests/certs/server.crt")
         .expect("canonicalize tests/certs/server.crt");
@@ -145,7 +137,7 @@ where
         }
 
         let envs = build_envs(&ports, &extras);
-        let mut cmd = Command::new(gateway_binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run")
             .arg("--spec")
             .arg(spec_path)
@@ -361,7 +353,7 @@ async fn functional_tls_only_health_cli_auto_detects_tls() {
     // and log the outcome for visibility, but accept the explicit-flag path
     // (3b below) as the definitive assertion target — a failure there is
     // unambiguously a CLI bug because every TLS input is provided directly.
-    let auto = Command::new(gateway_binary_path())
+    let auto = Command::new(crate::common::gateway_binary_path())
         .arg("health")
         .env("FERRUM_ADMIN_HTTP_PORT", "0")
         .env("FERRUM_ADMIN_HTTPS_PORT", &admin_https)
@@ -378,7 +370,7 @@ async fn functional_tls_only_health_cli_auto_detects_tls() {
     );
 
     // 3b: Explicit `--tls --tls-no-verify` flags with explicit port.
-    let explicit = Command::new(gateway_binary_path())
+    let explicit = Command::new(crate::common::gateway_binary_path())
         .args(["health", "-p", &admin_https, "--tls", "--tls-no-verify"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -425,7 +417,7 @@ async fn functional_tls_only_warn_when_plaintext_disabled_and_no_tls() {
     for attempt in 1..=MAX_ATTEMPTS {
         let admin_http = alloc_port().await;
 
-        let mut cmd = Command::new(gateway_binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run")
             .arg("--spec")
             .arg(&spec)

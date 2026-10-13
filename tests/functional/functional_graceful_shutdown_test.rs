@@ -216,16 +216,6 @@ fn is_client_request(head: &[u8]) -> bool {
 // Gateway Subprocess Helpers
 // ============================================================================
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
 async fn ephemeral_port() -> u16 {
     crate::scaffolding::ports::unbound_port()
         .await
@@ -320,7 +310,7 @@ fn spawn_gateway(
     admin_port: u16,
     drain_seconds: u64,
 ) -> std::io::Result<GatewayChildGuard> {
-    let mut cmd = Command::new(gateway_binary_path());
+    let mut cmd = Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

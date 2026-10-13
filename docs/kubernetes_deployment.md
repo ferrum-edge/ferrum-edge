@@ -810,6 +810,11 @@ for environments that cannot use Helm.
 
 This example exposes proxy traffic publicly and keeps the admin API private.
 
+Generate your own admin JWT secret (at least 32 characters; for example
+`openssl rand -hex 32`) and substitute it for the
+`change-me-to-a-32-character-admin-secret` placeholder below before applying
+the manifest — startup rejects a shorter `FERRUM_ADMIN_JWT_SECRET`.
+
 ```yaml
 apiVersion: v1
 kind: Secret
@@ -818,7 +823,7 @@ metadata:
 type: Opaque
 stringData:
   db-url: postgres://ferrum:change-me@postgres.default.svc.cluster.local:5432/ferrum
-  admin-jwt-secret: change-me
+  admin-jwt-secret: change-me-to-a-32-character-admin-secret
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -990,7 +995,7 @@ type: Opaque
 stringData:
   # For Atlas: mongodb+srv://user:pass@cluster0.abc123.mongodb.net/ferrum
   db-url: mongodb://ferrum:change-me@mongodb.default.svc.cluster.local:27017/ferrum?replicaSet=rs0
-  admin-jwt-secret: change-me
+  admin-jwt-secret: change-me-to-a-32-character-admin-secret
 ```
 
 Key `env` changes in the Deployment:
@@ -1212,6 +1217,14 @@ env:
     value: "127.0.0.1/32,::1/128,10.0.0.0/8" # replace 10.0.0.0/8 with your scrape/CP-admin source ranges
   - name: FERRUM_CP_GRPC_LISTEN_ADDR
     value: 0.0.0.0:50051
+  # A non-loopback CP gRPC bind requires CP server TLS (or the development-only
+  # FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true on both sides). Mount the cert/key
+  # (for example from a TLS Secret) at these paths; see the paired TLS examples
+  # in cp_dp_mode.md#transport-security-tlsmtls.
+  - name: FERRUM_CP_GRPC_TLS_CERT_PATH
+    value: /certs/server.pem
+  - name: FERRUM_CP_GRPC_TLS_KEY_PATH
+    value: /certs/server-key.pem
   - name: FERRUM_CP_DP_GRPC_JWT_SECRET
     valueFrom:
       secretKeyRef:
@@ -1250,9 +1263,14 @@ spec:
 env:
   - name: FERRUM_MODE
     value: dp
-  # Single CP (simple):
+  # Single CP (simple): https with the CA that issued the CP server cert
+  # (mounted like the CP cert above). A non-loopback http:// URL is rejected
+  # unless both sides set FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true (development
+  # only). See cp_dp_mode.md#transport-security-tlsmtls.
   - name: FERRUM_DP_CP_GRPC_URLS
-    value: http://ferrum-edge-cp:50051
+    value: https://ferrum-edge-cp:50051
+  - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+    value: /certs/ca.pem
   # Multi-CP failover (recommended for HA):
   # - name: FERRUM_DP_CP_GRPC_URLS
   #   value: "https://cp-east:50051,https://cp-west:50051,https://cp-central:50051"

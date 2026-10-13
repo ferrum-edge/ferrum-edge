@@ -22,7 +22,13 @@ static_resources:
                     - name: backend
                       domains: ["*"]
                       routes:
-                        - match: { prefix: "/api/users" }
+                        # Route every path to the backend. Previously this was
+                        # pinned to /api/users, which never matched the native
+                        # benchmark target (/echo, mirroring Ferrum's
+                        # http1_perf.yaml listen_path), so a ready admin
+                        # listener concealed a route mismatch. A catch-all
+                        # prefix matches the TLS sibling (http1_tls.yaml).
+                        - match: { prefix: "/" }
                           route:
                             cluster: backend_http1
                             timeout: 10s

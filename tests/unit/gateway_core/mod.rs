@@ -174,6 +174,7 @@ mod overload_tests;
 mod owned_shell_tests;
 mod per_port_load_balancer_tests;
 mod policy_path_tests;
+mod pool_cleanup_recheck_tests;
 mod pool_create_failure_classification_tests;
 mod pool_create_failure_fanout_tests;
 mod pool_key_tests;

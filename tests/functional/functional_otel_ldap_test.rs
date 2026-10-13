@@ -129,15 +129,6 @@ impl Drop for RebindingDnsServer {
 // Gateway Helpers
 // ============================================================================
 
-/// Detect the gateway binary path (debug preferred, fallback to release).
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 fn otel_ldap_observability_token(proxy_port: u16, admin_port: u16, attempt: u32) -> String {
     format!(
         "ferrum-edge-otel-ldap-probe-{}-{}-{}-{}",
@@ -165,7 +156,7 @@ fn start_gateway_with_dns(
     dns_resolver: Option<SocketAddr>,
     observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let binary_path = gateway_binary_path();
+    let binary_path = crate::common::gateway_binary_path();
 
     let mut command = std::process::Command::new(binary_path);
     command.arg("run");

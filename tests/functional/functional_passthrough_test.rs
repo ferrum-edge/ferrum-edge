@@ -20,14 +20,6 @@ use tokio::time::sleep;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Plain TCP echo server — reads data, echoes it back, and closes.
 async fn start_tcp_echo_server(port: u16) {
     let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
@@ -279,7 +271,7 @@ where
         let stderr_log = std::fs::File::create(dir.path().join(GATEWAY_STDERR_LOG)).unwrap();
         let observability_token = mint_observability_token();
 
-        let mut cmd = std::process::Command::new(gateway_binary_path());
+        let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())

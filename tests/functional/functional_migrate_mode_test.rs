@@ -20,15 +20,6 @@ use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Locate the compiled `ferrum-edge` binary, preferring debug, then release.
-fn binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Query a SQLite database for the list of user table names.
 async fn list_tables(sqlite_path: &str) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let url = format!("sqlite:{}?mode=ro", sqlite_path);
@@ -47,7 +38,7 @@ async fn list_tables(sqlite_path: &str) -> Result<HashSet<String>, Box<dyn std::
 /// Returns the captured output. Panics if the binary cannot be spawned at all —
 /// that indicates a broken test setup rather than a migrate-time failure.
 fn run_migrate(action: &str, db_type: &str, db_url: &str) -> std::process::Output {
-    let bin = binary_path();
+    let bin = crate::common::gateway_binary_path();
     Command::new(bin)
         .arg("run")
         .env("FERRUM_MODE", "migrate")

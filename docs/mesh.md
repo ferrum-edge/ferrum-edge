@@ -5689,7 +5689,8 @@ handshake leaves socketless host jumps and fwmark routes behind.
 `ProxyHostUdpBackend` / host-netns TPROXY path with
 `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` on a privileged runner: two
 independent workload netns/veth pairs, IPv4 and IPv6 delivery, original-destination
-recovery, ingress-ifindex attribution, identical-tuple isolation by interface,
+recovery, ingress-ifindex attribution (including same-source-port /
+same-destination probes from distinct workload IPs kept distinct by interface),
 transparent replies, restart/reinstall, exact Ferrum-owned cleanup, and explicit
 negatives (source spoofing, missing/zero pktinfo, unenrolled/ambiguous interfaces,
 node-originated and inbound-to-pod traffic, fail-closed prerequisite/partial-install

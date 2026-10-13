@@ -55,7 +55,15 @@ scripts/coverage.sh --functional
 
 This opt-in path builds Cargo's instrumented `ferrum-edge` binary and exports
 its path through `FERRUM_EDGE_TEST_BIN` so subprocess-based functional tests
-contribute to the same coverage report. MongoDB functional tests are included
+contribute to the same coverage report. Every functional gateway spawner
+resolves the binary through `gateway_binary_path()` / `locate_binary()` in
+`tests/common/gateway_harness.rs`, which prefers `FERRUM_EDGE_TEST_BIN` over a
+`target/debug` or `target/release` build. The selected instrumented binary is
+therefore launched even when a stale ordinary debug build exists, and is found
+when it is the only build. A structural parity test in
+`tests/unit/gateway_core/shared_invariant_parity_tests.rs` rejects a fixed
+gateway path anywhere else under `tests/functional/` or `tests/common/`
+(#6379). MongoDB functional tests are included
 in the filter list and skip gracefully when local MongoDB is not available.
 
 ## Database/File Mode Regression Notes
@@ -281,10 +289,11 @@ them.
 Each functional shard first builds `functional_tests` under
 `cargo llvm-cov nextest` with a filter that selects no test, which also builds
 the instrumented `ferrum-edge` binary into `target/llvm-cov-target/debug/`. The
-step exports it as `FERRUM_EDGE_TEST_BIN` and hard-links it to the fixed
-`target/debug/ferrum-edge` path several suites still use. It is a hard link, not
-a symlink, because `functional_cli_test` hard-links that path into temp
-directories, and a relative symlink copied that way dangles. The test run
+step exports it as `FERRUM_EDGE_TEST_BIN`, which every functional spawner
+resolves first, and hard-links it to the fixed `target/debug/ferrum-edge`
+fallback path so no resolution path can launch an uninstrumented build. It is a
+hard link, not a symlink, because `functional_cli_test` hard-links the resolved
+binary into temp directories, and a relative symlink copied that way dangles. The test run
 reuses that binary: `--no-report` implies cargo-llvm-cov's `--no-clean` (the two
 flags conflict), so it does not run `cargo clean -p ferrum-edge` and rebuild the
 linked binary. The step sets `FERRUM_SKIP_GATEWAY_BUILD=1` so no test process

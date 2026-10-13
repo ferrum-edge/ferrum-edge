@@ -412,24 +412,20 @@ impl LoadTestHarness {
         }
 
         // Prefer release binary for production-realistic numbers
-        let binary_path = if std::path::Path::new("./target/release/ferrum-edge").exists() {
+        let binary_path =
+            crate::common::locate_binary(true).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+        if binary_path.starts_with("./target/release") {
             println!("Using release binary");
-            "./target/release/ferrum-edge"
-        } else if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            println!(
-                "WARNING: Using debug binary — run `cargo build --release --bin ferrum-edge` for accurate perf numbers"
-            );
-            "./target/debug/ferrum-edge"
         } else {
-            return Err(
-                "ferrum-edge binary not found. Run `cargo build --release --bin ferrum-edge` first."
-                    .into(),
+            println!(
+                "WARNING: Using {} — run `cargo build --release --bin ferrum-edge` for accurate perf numbers",
+                binary_path.display()
             );
-        };
+        }
 
         // Run migrations for postgres
         if db_type == "postgres" {
-            let migrate_status = Command::new(binary_path)
+            let migrate_status = Command::new(&binary_path)
                 .arg("run")
                 .env("FERRUM_MODE", "migrate")
                 .env("FERRUM_DB_TYPE", db_type)
@@ -441,7 +437,7 @@ impl LoadTestHarness {
             }
         }
 
-        let mut cmd = Command::new(binary_path);
+        let mut cmd = Command::new(&binary_path);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env(
