@@ -352,17 +352,24 @@ impl BodyValidator {
             .is_some_and(|pool| pool.files().any(|file| file.syntax() == Syntax::Proto2));
         let protobuf_reject_unknown_fields =
             optional_bool(config, "protobuf_reject_unknown_fields")?.unwrap_or(false);
-        let grpc_max_decompressed_size_bytes =
-            match optional_usize(config, "grpc_max_decompressed_size_bytes")? {
-                Some(0) => {
-                    return Err(
+        let grpc_max_decompressed_size_bytes = match optional_usize(
+            config,
+            "grpc_max_decompressed_size_bytes",
+        )? {
+            Some(0) => {
+                return Err(
                     "body_validator: `grpc_max_decompressed_size_bytes` must be greater than zero"
                         .to_string(),
                 );
-                }
-                Some(limit) => limit,
-                None => default_grpc_max_decompressed_size_bytes(),
-            };
+            }
+            Some(limit) if limit > MAX_GRPC_DECOMPRESSED_SIZE_CEILING => {
+                return Err(format!(
+                    "body_validator: `grpc_max_decompressed_size_bytes` must be at most {MAX_GRPC_DECOMPRESSED_SIZE_CEILING}"
+                ));
+            }
+            Some(limit) => limit,
+            None => default_grpc_max_decompressed_size_bytes(),
+        };
 
         let has_protobuf_request_validation = protobuf_targets.has_request();
         let has_protobuf_response_validation = protobuf_targets.has_response();
@@ -896,6 +903,13 @@ impl BodyValidator {
 /// the process.
 const DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 
+/// Hard ceiling on the resolved gRPC decompression limit. Compressed frames
+/// inflate into a growing buffer bounded only by this value, and the shared
+/// request-representation decode gate does not cover native gRPC, so an
+/// arbitrary 64-bit configuration (or environment-inherited default) would
+/// leave a small compressed frame effectively unbounded.
+const MAX_GRPC_DECOMPRESSED_SIZE_CEILING: usize = 64 * 1024 * 1024;
+
 fn parse_grpc_frame(
     body: &[u8],
     max_decompressed_size_bytes: usize,
@@ -951,6 +965,10 @@ fn default_grpc_max_decompressed_size_bytes() -> usize {
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE)
+        // A node-wide request-body setting above the ceiling is clamped rather
+        // than refused, so it cannot fail every body_validator config on that
+        // node, but it can never lift the decompression bound.
+        .min(MAX_GRPC_DECOMPRESSED_SIZE_CEILING)
 }
 
 /// Supported JSON Schema dialects. There is no "whatever the library guesses"

@@ -7471,6 +7471,20 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
         false,
     );
+    // Hard ceiling: component and constructor agree at and just above it.
+    for (limit, expected_valid) in [
+        (67_108_864_u64, true),
+        (67_108_865, false),
+        (u64::MAX, false),
+    ] {
+        let config = json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": limit});
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, expected_valid);
+        assert_eq!(
+            ferrum_edge::plugins::body_validator::BodyValidator::new(&config).is_ok(),
+            expected_valid,
+            "constructor must agree on grpc_max_decompressed_size_bytes={limit}"
+        );
+    }
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",

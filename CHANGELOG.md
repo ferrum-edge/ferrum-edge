@@ -145,6 +145,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ceiling while undoing `Content-Encoding` (amplification checks off), so an
   arbitrary 64-bit value let a small compressed body inflate without a
   meaningful bound. Values above 67108864 are now rejected at admission.
+- **BREAKING — `body_validator` caps `grpc_max_decompressed_size_bytes` at
+  64 MiB** (issue #6612 sibling audit). Compressed gRPC frames inflate into
+  a buffer bounded only by this value, so an explicit value above 67108864
+  is now rejected at admission. An environment-inherited
+  `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` above the ceiling is clamped to it.
 
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
