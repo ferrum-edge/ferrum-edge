@@ -2221,11 +2221,6 @@ fn spawn_discovery_task(
     })
 }
 
-/// Try to validate a JWT against a single provider's current trusted JWKS.
-///
-/// Key selection is the JWT header `kid` via [`verify_jwt_with_jwks`]: missing,
-/// empty, and unknown identifiers fail closed, and a matching `kid` binds
-/// verification to that one key.
 /// Admission bound on how many providers one token can be verified against.
 ///
 /// A token is a candidate for every provider pinning its exact `iss` plus
@@ -2270,6 +2265,11 @@ where
     None
 }
 
+/// Try to validate a JWT against a single provider's current trusted JWKS.
+///
+/// Key selection is the JWT header `kid` via [`verify_jwt_with_jwks`]: missing,
+/// empty, and unknown identifiers fail closed, and a matching `kid` binds
+/// verification to that one key.
 async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Option<Value> {
     let guard = provider.jwks_store.load();
     let store = guard.as_ref().as_ref()?;

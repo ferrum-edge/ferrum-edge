@@ -35857,8 +35857,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mesh_runtime_request_auth_union_dedupes_identical_rules() {
+    #[tokio::test]
+    async fn mesh_runtime_request_auth_union_dedupes_identical_rules() {
         let runtime = MeshRuntimeConfig {
             workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
             ..test_mesh_runtime_config()
@@ -35918,6 +35918,16 @@ mod tests {
         // 10 rules, the shared one installed once: 9 providers, all kept so
         // every extraction location and claim-output header stays owned.
         assert_eq!(providers.len(), 9);
+        // Nine providers for one issuer exceed the per-token bound, so the
+        // fail-closed plugin refuses the union and the last accepted
+        // configuration keeps serving.
+        let err = crate::plugins::jwks_auth::JwksAuth::new(
+            &jwks.config,
+            crate::plugins::PluginHttpClient::default(),
+        )
+        .err()
+        .expect("an over-bound union must fail construction");
+        assert!(err.contains("sharing one `issuer`"), "{err}");
     }
 
     #[test]
