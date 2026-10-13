@@ -700,19 +700,29 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   `check_distroless_digest_consistency()` still requires every distroless
   reference in the repository to match `Dockerfile`, so the refresh PR moves all
   consumers together or fails CI.
-  The workflow pushes and opens the PR with `BASE_IMAGE_REFRESH_TOKEN` (see
-  `docs/ci_cd.md` -> GitHub Actions Secrets) so required CI runs on it. Its
-  `merge` job then waits until every context in
-  `.github/required-publication-checks.json` passes on the exact head, with no
-  other check failing, and squash-merges that head with `--match-head-commit`.
-  A failing check or a moved head stops the merge and fails the run.
-  Only `SUCCESS` satisfies a required context; a skipped or neutral required
-  check never does. The trusted Cross policy freezes the workflow's `refresh`
-  and `merge` jobs by SHA-256 (`DIGEST_REFRESH_JOB_CONTRACTS`) and its read-only
-  top-level permissions, and refuses `BASE_IMAGE_REFRESH_TOKEN` in any other
-  job, so changing the rotation or the merge gate is a trusted-policy
-  migration. `verify_ci_runtime_cache.py` additionally fails if the workflow
-  stops rotating every consumer, uses another token, or weakens the merge gate.
+  The workflow has three jobs. `refresh` resolves, rewrites and runs the
+  repository's pin verifier on a runner that never holds a write credential.
+  `open` repeats the same rotation with its own frozen shell (no repository
+  code runs there), proceeds only if the result is identical to the verified
+  one, and pushes and opens the PR with `BASE_IMAGE_REFRESH_TOKEN` (see
+  `docs/ci_cd.md` -> GitHub Actions Secrets) so required CI runs on it.
+  `merge` waits until every context in
+  `.github/required-publication-checks.json` succeeds on the exact head, with
+  no other check failing or pending, and merges that head with a merge commit
+  (`--merge --match-head-commit`), which keeps the PR head as the second parent
+  the publication gate binds to. Only `SUCCESS` satisfies a required context; a
+  skipped or neutral required check never does. A failing check or a moved
+  head stops the merge and fails the run.
+  The trusted Cross policy freezes the whole workflow file by SHA-256
+  (`DIGEST_REFRESH_WORKFLOW_SHA256`), which closes its job set, top-level
+  `env`/`defaults`/permissions, and every step that can see the token, and it
+  refuses any other workflow that references `BASE_IMAGE_REFRESH_TOKEN` or uses
+  indexed (`secrets[...]`), bulk (`toJSON(secrets)`) or inherited
+  (`secrets: inherit`) secret access. Changing the rotation or the merge gate is
+  therefore a trusted-policy migration. `verify_ci_runtime_cache.py`
+  additionally fails if the workflow stops rotating every consumer, runs
+  repository code in the credentialed job, uses another token, or weakens the
+  merge gate.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
   default `BASE_IMAGE` matches the same source runtime pin; an

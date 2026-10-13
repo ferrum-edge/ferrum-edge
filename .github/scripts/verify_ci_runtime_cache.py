@@ -4206,7 +4206,9 @@ def check_distroless_digest_consistency(
 # must rewrite every Dockerfile/YAML consumer of a drifted reference together
 # (so `check_distroless_digest_consistency` holds), never rewrite the two trusted
 # policy files, open the PR with the refresh token so required CI runs, and
-# merge only the exact head after every required context passes.
+# merge only the exact head after every required context passes. Repository
+# code (this verifier) runs only in `refresh`; the credentialed `open` job
+# repeats the rotation itself and runs no repository step before the token.
 BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
     'for file in $(git grep -lF "${tagged}@${current}"); do',
     ".github/scripts/verify_cross_build_policy.py|.github/workflows/cross-build-policy.yml)",
@@ -4214,6 +4216,9 @@ BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
     "*Dockerfile*|*.yml|*.yaml)",
     'for file in ${consumers}; do',
     'sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"',
+)
+BASE_IMAGE_REFRESH_ROTATION_MATCH = (
+    """if [ "$(printf '%b' "${rotations}")" != "$(printf '%s' "${VERIFIED_ROTATIONS}")" ]; then"""
 )
 BASE_IMAGE_REFRESH_OPEN_TOKEN = (
     "          GH_TOKEN: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n"
@@ -4224,7 +4229,7 @@ BASE_IMAGE_REFRESH_MERGE_MARKERS = (
     'if [ -n "${failed}" ]; then',
     """if ! jq -e --arg c "${context}" 'any(.[]; .name == $c and .bucket == "pass")' <<<"${checks}" >/dev/null; then""",
     'if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then',
-    'gh pr merge "${PR}" --squash --match-head-commit "${HEAD_SHA}"',
+    'gh pr merge "${PR}" --merge --match-head-commit "${HEAD_SHA}"',
 )
 
 
@@ -4279,7 +4284,28 @@ def base_image_refresh_rotation_errors(workflow: str) -> list[str]:
                 break
         if any(command.startswith("for file in ${DOCKERFILES}") for command in commands):
             errors.append("the resolve loop must rewrite every consumer, not only the Dockerfiles")
-    opener = named_step(steps, "Open or update the refresh pull request")
+    if BASE_IMAGE_REFRESH_OPEN_TOKEN.split(":", 1)[1].strip() in job:
+        errors.append("the `refresh` job runs repository code and must never hold the refresh token")
+    open_job = extract_job(workflow, "open")
+    if not open_job:
+        return [*errors, "the `open` job is missing"]
+    open_steps = job_steps(open_job)
+    rotate = named_step(open_steps, "Repeat the verified rotation")
+    rotate_commands = step_run_block_commands(rotate) if rotate is not None else []
+    index = -1
+    for marker in (*BASE_IMAGE_REFRESH_RESOLVE_MARKERS, BASE_IMAGE_REFRESH_ROTATION_MATCH):
+        try:
+            index = rotate_commands.index(marker, index + 1)
+        except ValueError:
+            errors.append(f"the `open` rotation must contain, in order, `{marker}`")
+            break
+    if re.search(
+        r"(?m)^(?!\s*#).*(?:\bpython3?\b|\bnode\b|\bmake\b|\bnpm\b|\bcargo\b|"
+        r"uses:\s*\./|(?:^|\s)(?:bash|sh|source|\.)\s+\S|\s\./)",
+        open_job,
+    ):
+        errors.append("the credentialed `open` job must not run repository code")
+    opener = named_step(open_steps, "Open or update the refresh pull request")
     if opener is None or BASE_IMAGE_REFRESH_OPEN_TOKEN not in opener:
         errors.append(
             "the refresh pull request must be pushed and opened with "
@@ -4292,11 +4318,11 @@ def base_image_refresh_rotation_errors(workflow: str) -> list[str]:
     if not merge:
         errors.append("the `merge` job is missing")
     else:
-        if "    needs: refresh\n" not in merge:
-            errors.append("the `merge` job must need `refresh`")
+        if "    needs: open\n" not in merge:
+            errors.append("the `merge` job must need `open`")
         merge_steps = job_steps(merge)
         gate = named_step(
-            merge_steps, "Wait for required checks on the exact head, then squash-merge"
+            merge_steps, "Wait for required checks on the exact head, then merge"
         )
         gate_commands = step_run_block_commands(gate) if gate is not None else []
         index = -1
@@ -5486,19 +5512,30 @@ def self_test() -> int:
             """'any(.[]; .name == $c and (.bucket == "pass" or .bucket == "skipping"))'""",
         ),
         (
+            "that runs repository code in the credentialed job",
+            "      - name: Open or update the refresh pull request\n",
+            "      - name: Lint\n        run: python3 .github/scripts/verify_ci_runtime_cache.py\n\n"
+            "      - name: Open or update the refresh pull request\n",
+        ),
+        (
+            "that does not compare with the verified rotation",
+            """if [ "$(printf '%b' "${rotations}")" != "$(printf '%s' "${VERIFIED_ROTATIONS}")" ]; then""",
+            """if false; then""",
+        ),
+        (
             "that merges a moved head",
-            '          gh pr merge "${PR}" --squash --match-head-commit "${HEAD_SHA}"\n',
-            '          gh pr merge "${PR}" --squash\n',
+            '          gh pr merge "${PR}" --merge --match-head-commit "${HEAD_SHA}"\n',
+            '          gh pr merge "${PR}" --merge\n',
         ),
     ):
         require(
-            refresh_workflow.count(original) == 1,
-            f"self-test: the refresh mutation {label} must match the workflow once",
+            original in refresh_workflow,
+            f"self-test: the refresh mutation {label} must match the workflow",
             failures,
         )
         pin_failures = []
         check_base_image_refresh_rotates_all_pins(
-            refresh_workflow.replace(original, mutation), pin_failures
+            refresh_workflow.replace(original, mutation, 1), pin_failures
         )
         require(
             bool(pin_failures),

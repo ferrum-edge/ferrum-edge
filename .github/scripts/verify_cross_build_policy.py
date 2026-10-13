@@ -14001,52 +14001,50 @@ def cross_image_refresh_errors(workflows: dict[str, str], source: str) -> list[s
 
 
 # The scheduled digest refresh also rotates the distroless runtime base inside
-# the protected `main-linux-image` job and merges its own pull request, so its
-# rotation and merge gate are trusted automation: freeze both jobs and the
-# workflow's token permissions here, where an ordinary pull request cannot move
-# them, and keep the refresh token out of every other job.
-DIGEST_REFRESH_JOB_CONTRACTS = (
-    ("refresh", "3a7ffa2d28f3f44afc20f9fb657f98ea729092658c70f00fa9bc238878315542"),
-    ("merge", "672b4ac51e4377c861f2c05caf0183b3a4f6074e3ebcd1cb10f27cc849760a24"),
+# the protected `main-linux-image` job and merges its own pull request with a
+# write-capable token, so the whole workflow is trusted automation: freeze it
+# byte-for-byte here, where an ordinary pull request cannot move it. That
+# closes its job set, top-level `env`/`defaults`/permissions, and every step
+# that can see the token. Every other workflow is refused any reference to the
+# refresh token and any indexed, bulk or inherited secret access, so no other
+# job can obtain it.
+DIGEST_REFRESH_WORKFLOW_SHA256 = "982cbc7a18234b1a304696e1f41cc27dde35b2a1f216d36ff8cca357d62a3246"
+DIGEST_REFRESH_TOKEN_NAME = "BASE_IMAGE_REFRESH_TOKEN"
+INDIRECT_SECRET_ACCESS = re.compile(
+    r"\bsecrets\s*\[|\btojson\s*\(\s*secrets\s*\)|\bsecrets\s*:\s*inherit\b",
+    re.IGNORECASE,
 )
-DIGEST_REFRESH_PERMISSIONS = 'permissions:\n  # Every write uses BASE_IMAGE_REFRESH_TOKEN; GITHUB_TOKEN only reads.\n  contents: read\n'
-DIGEST_REFRESH_TOKEN_REFERENCE = "secrets.BASE_IMAGE_REFRESH_TOKEN"
 
 
 def digest_refresh_automation_errors(
     workflows: dict[str, str], source: str
 ) -> list[str]:
+    errors: list[str] = []
     contents = workflows.get(CROSS_IMAGE_REFRESH_WORKFLOW)
     if contents is None:
-        return [f"{source} is missing {CROSS_IMAGE_REFRESH_WORKFLOW}"]
-    located = f"{source}/{CROSS_IMAGE_REFRESH_WORKFLOW}"
-    errors: list[str] = []
-    frozen_token_uses = 0
-    for job_name, expected in DIGEST_REFRESH_JOB_CONTRACTS:
-        block, failures = extract_job_block(contents, located, job_name, required=True)
-        if failures:
-            errors.extend(failures)
-            continue
-        assert block is not None
-        frozen_token_uses += block.count(DIGEST_REFRESH_TOKEN_REFERENCE)
-        actual = hashlib.sha256(block.encode("utf-8")).hexdigest()
-        if actual != expected:
+        errors.append(f"{source} is missing {CROSS_IMAGE_REFRESH_WORKFLOW}")
+    else:
+        actual = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        if actual != DIGEST_REFRESH_WORKFLOW_SHA256:
             errors.append(
-                f"{located} job {job_name!r} differs from the trusted digest-refresh "
-                f"contract (expected SHA-256 {expected}, got {actual})"
+                f"{source}/{CROSS_IMAGE_REFRESH_WORKFLOW} differs from the trusted "
+                f"digest-refresh automation contract (expected SHA-256 "
+                f"{DIGEST_REFRESH_WORKFLOW_SHA256}, got {actual})"
             )
-    permissions, permission_failures = extract_top_level_block(
-        contents, located, "permissions"
-    )
-    errors.extend(permission_failures)
-    if not permission_failures and permissions != DIGEST_REFRESH_PERMISSIONS:
-        errors.append(f"{located} must keep its read-only top-level permissions")
-    if contents.count(DIGEST_REFRESH_TOKEN_REFERENCE) != frozen_token_uses:
-        errors.append(
-            f"{located} may use BASE_IMAGE_REFRESH_TOKEN only in its frozen jobs"
-        )
+    for name, text in sorted(workflows.items()):
+        if INDIRECT_SECRET_ACCESS.search(text):
+            errors.append(
+                f"{source}/{name} uses indexed, bulk or inherited secret access, "
+                "which could reach the digest-refresh token"
+            )
+        if name != CROSS_IMAGE_REFRESH_WORKFLOW and DIGEST_REFRESH_TOKEN_NAME.lower() in (
+            text.lower()
+        ):
+            errors.append(
+                f"{source}/{name} references {DIGEST_REFRESH_TOKEN_NAME}, which only "
+                f"{CROSS_IMAGE_REFRESH_WORKFLOW} may use"
+            )
     return errors
-
 
 def digest_refresh_automation_self_test() -> list[str]:
     path = Path(".github/workflows") / CROSS_IMAGE_REFRESH_WORKFLOW
@@ -14054,7 +14052,8 @@ def digest_refresh_automation_self_test() -> list[str]:
         return []
     real = path.read_text(encoding="utf-8")
     failures: list[str] = []
-    if digest_refresh_automation_errors({CROSS_IMAGE_REFRESH_WORKFLOW: real}, "self-test"):
+    workflows = {CROSS_IMAGE_REFRESH_WORKFLOW: real, "other.yml": "name: Other\n"}
+    if digest_refresh_automation_errors(workflows, "self-test"):
         failures.append("the real digest-refresh workflow was rejected")
     for label, original, replacement in (
         (
@@ -14079,23 +14078,39 @@ def digest_refresh_automation_self_test() -> list[str]:
             "  contents: write\n\nconcurrency:",
         ),
         (
-            "another job holding the refresh token",
+            "an inherited BASH_ENV",
+            "\nconcurrency:",
+            "\nenv:\n  BASH_ENV: .github/scripts/hook.sh\n\nconcurrency:",
+        ),
+        (
+            "inherited run defaults",
+            "\nconcurrency:",
+            "\ndefaults:\n  run:\n    shell: bash --rcfile hook.sh {0}\n\nconcurrency:",
+        ),
+        (
+            "an extra job",
             "  cross-image-drift:\n",
-            "  leak:\n    runs-on: ubuntu-26.04\n    steps:\n      - env:\n"
-            "          T: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n        run: true\n\n"
+            "  extra:\n    runs-on: ubuntu-26.04\n    steps:\n      - run: true\n\n"
             "  cross-image-drift:\n",
         ),
     ):
-        if real.count(original) != 1:
+        if original not in real:
             failures.append(f"the {label} digest-refresh mutation is stale")
             continue
-        mutated = real.replace(original, replacement)
-        if not digest_refresh_automation_errors(
-            {CROSS_IMAGE_REFRESH_WORKFLOW: mutated}, "self-test"
-        ):
+        mutated = {**workflows, CROSS_IMAGE_REFRESH_WORKFLOW: real.replace(original, replacement, 1)}
+        if not digest_refresh_automation_errors(mutated, "self-test"):
             failures.append(f"{label} was admitted")
+    for label, text in (
+        ("a named token reference", "x: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n"),
+        ("a case-varied token reference", "x: ${{ secrets.base_image_refresh_token }}\n"),
+        ("an indexed secret", "x: ${{ secrets['BASE_IMAGE_REFRESH_TOKEN'] }}\n"),
+        ("a computed index", "x: ${{ secrets[format('{0}_TOKEN', 'X')] }}\n"),
+        ("bulk secret serialization", "x: ${{ toJSON(secrets) }}\n"),
+        ("inherited reusable-workflow secrets", "    secrets: inherit\n"),
+    ):
+        if not digest_refresh_automation_errors({**workflows, "other.yml": text}, "self-test"):
+            failures.append(f"{label} in another workflow was admitted")
     return failures
-
 
 def cross_image_refresh_scan_contents(name: str, contents: str) -> str:
     """Withhold only the exact frozen registry-inspection job from Cross scans.
