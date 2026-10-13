@@ -16,8 +16,8 @@ status-check rulesets trust). So every workflow must state its own default:
   review sees it next to the steps that use it;
 * every `actions/checkout` step, in a workflow or a local composite action,
   states `persist-credentials: false`, so the token is not persisted for later
-  steps. `true` is admitted only in a workflow none of those events can start
-  (#6581).
+  steps. `true` is admitted only in a workflow started solely by `schedule`
+  or `workflow_dispatch` (#6581).
 
 Executed by verify_required_ci.py inside the `Tests` aggregate, so a pull
 request that adds or edits a workflow without explicit permissions fails CI.
@@ -211,6 +211,26 @@ def workflow_permission_errors(text: str, source: str) -> list[str]:
     return errors
 
 
+PERSIST_TRUE_TRIGGERS = frozenset({"schedule", "workflow_dispatch"})
+DOUBLE_QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
+ESCAPE = re.compile(r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)")
+
+
+def _decode_double_quoted(line: str) -> str:
+    """Resolve YAML double-quoted escapes, so `actions\\u002fcheckout` is seen."""
+
+    def unescape(match: re.Match[str]) -> str:
+        code = match.group(1)
+        if code[0] in "xuU" and len(code) > 1:
+            try:
+                return chr(int(code[1:], 16))
+            except ValueError:
+                return code
+        return code
+
+    return DOUBLE_QUOTED.sub(lambda m: '"' + ESCAPE.sub(unescape, m.group(1)) + '"', line)
+
+
 def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
@@ -226,19 +246,33 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
     credentials file under `$RUNNER_TEMP` that the checkout's `.git/config`
     includes, so every later step, build script, and test can read it or use
     it through git (#6581). A checkout must say `persist-credentials: false`. `true` is
-    admitted only in a workflow that no pull-request, push, merge-queue, or
-    `workflow_run` event can start, for jobs that push with the persisted
-    token. Any spelling this line-based reader cannot follow fails closed.
+    admitted only in a workflow started solely by `schedule` or
+    `workflow_dispatch` (not a reusable `workflow_call` callee), for jobs that
+    push with the persisted token. Only direct children of `with:` count as
+    inputs, YAML-escaped checkout references are refused, and any spelling this
+    line-based reader cannot follow fails closed.
     """
 
     lines = text.splitlines()
     triggers = workflow_triggers(text)
-    code_triggered = triggers is None or bool(triggers & CODE_TRIGGERED_EVENTS)
+    # `true` is only for scheduled or manual pushers. Anything else, including a
+    # reusable `workflow_call` callee that a pull-request workflow can invoke,
+    # or an unreadable trigger set, must say `false`.
+    true_admitted = triggers is not None and triggers <= PERSIST_TRUE_TRIGGERS
     errors: list[str] = []
     for index, line in enumerate(lines):
-        if "actions/checkout" not in line.lower() or line.lstrip().startswith("#"):
+        if line.lstrip().startswith("#"):
             continue
         located = f"{source}:{index + 1}"
+        decoded = _decode_double_quoted(line)
+        if decoded != line and "actions/checkout" in decoded.lower():
+            errors.append(
+                f"{located} spells an actions/checkout reference with YAML escapes; "
+                "write it literally so persist-credentials can be verified"
+            )
+            continue
+        if "actions/checkout" not in line.lower():
+            continue
         match = CHECKOUT_USES.match(line)
         if match is None:
             errors.append(
@@ -280,11 +314,19 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
             if _strip_comment(WITH_KEY.match(lines[number]).group("rest")):
                 unreadable = True  # flow mapping or scalar: not read here
                 continue
+            # Only direct children of `with:` are inputs. A deeper line is the
+            # body of another input's block scalar (`ssh-known-hosts: |`), whose
+            # text must not count as the key.
+            child_indent = None
             for body in lines[number + 1 : end]:
                 if not _is_content(body):
                     continue
                 if _indent(body) <= key_indent:
                     break
+                if child_indent is None:
+                    child_indent = _indent(body)
+                if _indent(body) != child_indent:
+                    continue
                 if "persist-credentials" not in body:
                     continue
                 persist = PERSIST_LINE.match(body)
@@ -313,11 +355,11 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
                 "job token is not persisted for later steps"
             )
         elif values[0] == "true":
-            if code_triggered:
+            if not true_admitted:
                 errors.append(
-                    f"{located} checkout persists credentials in a workflow that "
-                    "pull-request, push, merge-queue, or workflow_run events can "
-                    "start; use `persist-credentials: false`"
+                    f"{located} checkout persists credentials outside a workflow "
+                    "started only by schedule or workflow_dispatch; use "
+                    "`persist-credentials: false`"
                 )
         elif values[0] != "false":
             errors.append(
@@ -476,9 +518,31 @@ def run_self_test() -> list[str]:
             failures.append(f"checkout credential self-test {label!r} was accepted")
 
     mixed = pin.replace("actions/checkout", "Actions/Checkout")
+    sha = "0" * 40
+    persist_true = "        with:\n          persist-credentials: true\n"
+    scalar_body = (
+        "        with:\n          ssh-known-hosts: |\n            persist-credentials: false\n"
+    )
     for label, text in (
         ("mixed-case missing", pr + f"      - uses: {mixed}\n" + tail),
-        ("mixed-case true", pr + f"      - uses: {mixed}\n        with:\n          persist-credentials: true\n" + tail),
+        ("mixed-case true", pr + f"      - uses: {mixed}\n" + persist_true + tail),
+        ("escaped separator missing", pr + f'      - uses: "actions\\u002fcheckout@{sha}"\n' + tail),
+        ("escaped separator true", pr + f'      - uses: "actions\\x2fcheckout@{sha}"\n' + persist_true + tail),
+        ("escaped owner true", pr + f'      - uses: "\\u0061ctions/checkout@{sha}"\n' + persist_true + tail),
+        ("escaped slash missing", pr + f'      - uses: "actions\\/checkout@{sha}"\n' + tail),
+        ("escaped key missing", pr + f'      - "u\\u0073es": actions/checkout@{sha}\n' + tail),
+        ("block scalar impersonation", pr + f"      - uses: {pin}\n" + scalar_body + tail),
+        (
+            "reusable callee true",
+            "on:\n  workflow_call:\npermissions:\n  contents: read\njobs:\n  build:\n    steps:\n"
+            f"      - uses: {pin}\n" + persist_true + tail,
+        ),
+        (
+            "composite block scalar impersonation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        ssh-known-hosts: |\n"
+            "          persist-credentials: false\n    - run: true\n      shell: bash\n",
+        ),
     ):
         if not checkout_credential_errors(text, f"self-test checkout {label}"):
             failures.append(f"checkout credential self-test {label!r} was accepted")

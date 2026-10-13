@@ -3724,9 +3724,9 @@ scheduled or manual jobs that push with that token (`base-image-digest-refresh.y
 and the branch-pruning jobs in `prune-stale-prs.yml`).
 `.github/scripts/verify_workflow_permissions.py`, which runs in the `Tests`
 aggregate, rejects a checkout that omits the key, in workflows and in local
-composite actions under `.github/actions/`. It also rejects `true` in any
-workflow that pull-request, push, merge-queue, or `workflow_run` events can
-start.
+composite actions under `.github/actions/`. It admits `true` only in a
+workflow started solely by `schedule` or `workflow_dispatch`, and refuses
+YAML-escaped checkout references.
 
 One set of checkouts still uses the action default. The trusted Cross policy
 freezes the bytes of these jobs, so a pull request cannot add the key: the
