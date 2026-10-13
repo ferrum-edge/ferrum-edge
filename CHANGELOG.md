@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session secret. Shorter values are rejected at construction and by the
   OpenAPI `minLength`.
 - **Credential and diagnostic hygiene across plugins** (issues #6617, #6628).
-  `hmac_auth` spends one discarded MAC when a request names an unknown
-  username, so timing no longer separates unknown from known users. The
+  `hmac_auth` runs a fixed number of MAC rounds for every username (padding
+  missing or unrotated entries), so timing no longer separates unknown users
+  or reveals how many secrets a user is rotating. The
   `Debug` output of extracted credentials and of AWS SigV4 signing configs
   redacts tokens, passwords, API keys, secret keys and session tokens.
   `transaction_debugger` also redacts any header whose name the central
