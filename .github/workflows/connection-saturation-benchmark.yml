@@ -62,6 +62,9 @@ on:
         type: choice
         options: ["false", "true"]
 
+permissions:
+  contents: read
+
 jobs:
   saturation:
     name: Connection Saturation
