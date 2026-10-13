@@ -381,12 +381,25 @@ impl WsRateLimiting {
         let tracked_keys = self.limiter.tracked_keys_count();
         let over_capacity = tracked_keys > MAX_STATE_ENTRIES;
 
-        // Over-cap pressure immediately reclaims idle keys (no sample/cooldown
-        // gate). Live budgets are never force-evicted; previously unseen keys
-        // fail closed via atomic admission reservation.
+        // Over-cap pressure reclaims idle keys, single-flighted by the same
+        // once-per-cooldown CAS gate `udp_rate_limiting` uses, so concurrent
+        // frames cannot each run a full retain while the map is over the cap.
+        // Live budgets are never force-evicted; previously unseen keys fail
+        // closed via atomic admission reservation, so a frame that loses the
+        // gate still sees the capacity pressure.
         if over_capacity {
-            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
-            return self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
+            let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+            let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
+                && self
+                    .last_periodic_sweep_secs
+                    .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+                return self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
+            }
+            return true;
         }
 
         let periodic =

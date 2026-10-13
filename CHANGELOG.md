@@ -152,6 +152,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ws_logging` charges one back-off per failed attempt and none after the
+  last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
+  failure, including after the final attempt, and `send_batch` added
+  `retry_delay_ms` on top, so at the defaults a batch aimed at an
+  unreachable collector held the single delivery worker for about 44 s.
+  The retry ladder now owns the back-off. That is `reconnect_delay_ms` after
+  a failed connection and `retry_delay_ms` after a failed send, never both
+  and never after the final attempt, and per-attempt warnings are sampled.
+  The same change removes the unreachable empty-`endpoint_url` flush branch
+  and refuses a partially staged activation before consuming its config.
+  `ws_rate_limiting` single-flights its over-cap idle sweep behind the same
+  cooldown CAS gate `udp_rate_limiting` uses, as defense in depth.
+
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
   fuzz lane compiled the stock registry crate instead of the patched DB-TLS
