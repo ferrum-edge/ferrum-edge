@@ -773,7 +773,7 @@ jobs:
 
       - name: Preserve unit compile diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: unit-compile-diagnostics-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unit-ci/
@@ -874,7 +874,7 @@ jobs:
 
       - name: Preserve ACME compile diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: acme-compile-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unit-ci/
@@ -904,7 +904,7 @@ jobs:
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest
 
@@ -982,7 +982,7 @@ jobs:
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest
 
@@ -1140,7 +1140,7 @@ jobs:
           shared-key: "ci-debug"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest
 
@@ -1203,7 +1203,7 @@ jobs:
 
       - name: Upload gateway binary
         # Consumers use the target/debug path and OS/arch-keyed artifact name.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug/ferrum-edge
@@ -1211,7 +1211,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload integration tests archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: integration-tests-${{ runner.os }}-${{ runner.arch }}.tar.zst
@@ -1219,7 +1219,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload ferrum-cni binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug/ferrum-cni
@@ -1227,7 +1227,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload functional tests archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: functional-tests-${{ runner.os }}-${{ runner.arch }}.tar.zst
@@ -1447,18 +1447,18 @@ jobs:
         # Same prebuilt-binary install action as `test-functional`. Nextest
         # gives us per-test process isolation, OR'd substring filters via
         # positional args, and a much nicer progress UI than libtest.
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest
 
       - name: Download integration tests archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
 
       - name: Download prebuilt ferrum-cni binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug
@@ -1705,7 +1705,7 @@ jobs:
 
       - name: Upload mesh conformance artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: mesh-conformance-coverage
           path: target/conformance/
@@ -1747,7 +1747,7 @@ jobs:
 
       - name: Retain Hyper patch reconstruction evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hyper-patch-stack-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hyper-patch-stack
@@ -1780,7 +1780,7 @@ jobs:
 
       - name: Retain reqwest patch reconstruction evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: reqwest-patch-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/reqwest-patch
@@ -1800,7 +1800,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           # Pinned to the version the deny.toml schema was validated against, so
           # a future cargo-deny release can't silently change gate behavior.
@@ -1881,7 +1881,7 @@ jobs:
 
       - name: Upload third-party license inventory
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: third-party-licenses
           path: third-party-licenses.json
@@ -2004,7 +2004,7 @@ jobs:
           shared-key: "ci-vendor-patches"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest
 
@@ -2128,7 +2128,7 @@ jobs:
           cargo test --manifest-path vendor/h2-0.4.20-ferrum-patched/Cargo.toml --lib ferrum_assigned_capacity
 
       - name: Download integration tests archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
@@ -2381,12 +2381,12 @@ jobs:
         # Nextest's process-per-test model isolates port/process contention
         # and ships built-in slow-test + retry support, which fits this E2E
         # suite better than libtest's shared-process scheduler.
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest
 
       - name: Download prebuilt gateway binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug
@@ -2396,7 +2396,7 @@ jobs:
         run: chmod +x target/debug/ferrum-edge
 
       - name: Download functional tests archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
@@ -2992,12 +2992,12 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest
 
       - name: Download prebuilt gateway binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug
@@ -3006,7 +3006,7 @@ jobs:
         run: chmod +x target/debug/ferrum-edge
 
       - name: Download functional tests archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
           path: .
@@ -6273,14 +6273,14 @@ jobs:
 
       - name: Upload core gateway chart diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ferrum-gateway-helm-chart
           path: ${{ runner.temp }}/ferrum-gateway-helm-results
           retention-days: 7
 
       - name: Download prebuilt gateway binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
           path: target/debug
@@ -6604,7 +6604,7 @@ jobs:
 
       - name: Upload Helm chart diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ferrum-mesh-helm-chart
           path: ${{ runner.temp }}/ferrum-helm-results
@@ -7193,7 +7193,7 @@ jobs:
           fi
 
       - name: Upload BPF artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ebpf-programs
           path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
@@ -7795,13 +7795,13 @@ jobs:
           persist-credentials: false
 
       - name: Download tested gateway
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ferrum-edge-debug-Linux-X64
           path: image-bin
 
       - name: Download tested CNI
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ferrum-cni-debug-Linux-X64
           path: image-bin
@@ -7844,7 +7844,7 @@ jobs:
           docker save "$IMAGE" | gzip > ferrum-edge-linux-amd64.tar.gz
 
       - name: Upload Linux CI image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ferrum-edge-ci-linux-amd64-${{ github.sha }}
           path: ferrum-edge-linux-amd64.tar.gz

@@ -31,7 +31,7 @@ runs:
 
     - name: BoringCache Cargo
       if: steps.backend.outputs.enabled == 'true'
-      uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
+      uses: boringcache/one@f7b602f18a85f90c4771bb614589497676273fe2 # v1.41.0
       with:
         cli-version: v1.33.0
         mode: archive

@@ -128,7 +128,7 @@ jobs:
 
       - name: Upload comparison evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: h1-tls-post-comparison-${{ github.sha }}
           path: tests/performance/ci_results/h1-tls-post-comparison/
@@ -138,7 +138,7 @@ jobs:
       - name: Upload trends alias artifact
         # Only a contract-reference run on main may extend the rolling history.
         if: success() && github.event_name == 'schedule'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: h1-tls-post-trends-latest
           path: tests/performance/ci_results/h1-tls-post-comparison/h1_tls_post_trends.json

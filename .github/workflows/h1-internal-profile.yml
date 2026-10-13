@@ -156,7 +156,7 @@ jobs:
           done
       - name: Retain cadence identity and failures
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: h1-cadence-${{ matrix.observer }}-${{ github.sha }}
           path: h1-cadence-evidence/
@@ -212,7 +212,7 @@ jobs:
           fi
       - name: Retain failed and unsupported fixture evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: h1-trace-fixtures-${{ github.sha }}
           path: ${{ runner.temp }}/h1-trace/
@@ -408,7 +408,7 @@ jobs:
           exit "$status"
       - name: Upload raw evidence, including incomplete campaigns
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: h1-internal-profile-${{ github.sha }}-${{ inputs.payloads }}
           path: h1-profile-evidence/
