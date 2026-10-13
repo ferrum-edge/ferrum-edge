@@ -2412,17 +2412,26 @@ jobs:
         #
         # Four mongod instances on purpose:
         # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix,
-        #   plus the signal-first gateway-trust-bundle ordering proof (issue #3727)
+        #   plus the signal-first gateway-trust-bundle ordering proof (issue #3727).
+        #   Runs the oldest supported server (MongoDB 4.4, the `mongodb` 3.9
+        #   driver's wire-version floor) so the floor stays tested at no extra
+        #   job cost; 4.4 images ship the legacy `mongo` shell, not `mongosh`.
         # - replica set 27020: transactional `POST /batch` (issue #2401) and the
         #   transactional gateway-trust-bundle acceptance cell (issue #3727)
         # - TLS 27018: verify-full + require modes (issue #2399)
         # - mTLS 27019: client certificate authentication (issue #2399)
-        # Neither plaintext topology can substitute for the TLS fixtures.
+        # Neither plaintext topology can substitute for the TLS fixtures. The
+        # others stay on MongoDB 7.0: the official mongo:9 image (9.0.2) exits
+        # at startup on the ubuntu-26.04 runner kernel, which reports 7.0.0 and
+        # so falls inside the server's 6.19-7.0.13 tcmalloc/rseq startup gate
+        # (SERVER-125742; 8.0.21+ and 8.3 have the same gate). Move them to
+        # mongo:9 once an official image starts there (SERVER-136272, fixed in
+        # 9.0.4, targets the Ubuntu 26.04 kernel detection).
         run: |
           set -euo pipefail
 
           docker run -d --name ferrum-ci-redis -p 6379:6379 redis:7-alpine
-          docker run -d --name ferrum-ci-mongo -p 27017:27017 mongo:7
+          docker run -d --name ferrum-ci-mongo -p 27017:27017 mongo:4.4.29
           # `--network host` with a real port: a replica-set member advertises
           # its own host:port, and the driver reconnects to whatever is
           # advertised. Behind a `-p` mapping it would advertise the container
@@ -2707,7 +2716,8 @@ jobs:
 
           mongo_ok=""
           for _ in $(seq 1 30); do
-            if docker exec ferrum-ci-mongo mongosh --quiet \
+            # Legacy `mongo` shell: the 4.4 floor image predates `mongosh`.
+            if docker exec ferrum-ci-mongo mongo --quiet \
                 --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' 2>/dev/null; then
               mongo_ok=1; break
             fi

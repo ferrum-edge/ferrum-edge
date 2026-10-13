@@ -1191,6 +1191,11 @@ pub struct AcceptedClientTrust {
     /// Semantic client-CA / CRL identity of exactly the material `verifier` was
     /// built from.
     pub material: client_trust::ClientTrustMaterial,
+    /// Whether `verifier` enforces a nonempty CRL set. A second family that
+    /// adopts the verifier (the HTTP/3 endpoint) must then disable session
+    /// resumption too, so every handshake reaches the CRL expiry check
+    /// (issue #6538). Always `false` when `verifier` is `None`.
+    pub crls_enforced: bool,
 }
 
 impl std::fmt::Debug for AcceptedClientTrust {
@@ -1474,6 +1479,7 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
         *out = Some(AcceptedClientTrust {
             verifier: client_cert_verifier.clone(),
             material,
+            crls_enforced: client_auth_enforced && !crls.is_empty(),
         });
     }
 
@@ -1545,21 +1551,24 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
     // always set 0 here. Proxy-specific call sites apply early_data_max_size
     // via Arc::get_mut() after this returns — see modes/*.rs.
     config.max_early_data_size = 0;
-    if client_auth_enforced && handshake_scope.is_some() {
-        // TLS 1.3 session tickets and the stateful cache do not re-run client
-        // certificate verification. After a CRL or client-CA withdrawal the
-        // next handshake must meet the accepted verifier, not a ticket issued
-        // under the withdrawn generation.
-        //
-        // Gated on `handshake_scope` — i.e. on this listener participating in
-        // client-trust binding at all, which callers set only under
-        // `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`. Without live reload no
-        // generation can ever advance, there is no withdrawn generation a
-        // ticket could outlive, and disabling resumption would be a pure
-        // handshake-cost regression on every static mTLS listener. Keep the
-        // "cost when disabled is zero" contract this feature documents.
-        config.send_tls13_tickets = 0;
-        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    // Resumed TLS 1.2/1.3 handshakes do not re-run client-certificate
+    // verification, so resumption is disabled whenever a later handshake must
+    // reach the verifier:
+    //
+    // - the verifier enforces a nonempty CRL set (issue #6538). Its
+    //   `nextUpdate` check runs only on a full handshake, so without this a
+    //   client admitted before a CRL expired could keep resuming afterwards,
+    //   including on a static listener without live reload.
+    // - the listener is bound to a client-trust scope (`handshake_scope` is set
+    //   only under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`), so an accepted
+    //   client-CA or CRL withdrawal can land mid-life and the next handshake
+    //   must meet the accepted verifier, not a session from the withdrawn
+    //   generation.
+    //
+    // A static mTLS listener without CRLs keeps normal resumption: nothing it
+    // enforces can change or expire while the process runs.
+    if client_auth_enforced && (handshake_scope.is_some() || !crls.is_empty()) {
+        disable_server_session_resumption(&mut config);
     }
 
     Ok(Arc::new(config))
@@ -2058,6 +2067,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
         .with_protocol_versions(&tls_policy.protocol_versions)
         .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions: {}", e))?;
 
+    let mut spiffe_verifier_installed = false;
     let mut config = match client_auth {
         MeshClientAuth::Required | MeshClientAuth::Optional => {
             // When a SPIFFE verifier is supplied (gateway SVID bundle is
@@ -2071,6 +2081,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
             // operator-CA path below; the `crls` arg here applies only to that
             // operator-CA fallback for deployments without gateway SVID material.
             if let Some(verifier) = spiffe_client_verifier {
+                spiffe_verifier_installed = true;
                 info!(
                     mesh_client_auth = ?client_auth,
                     "Mesh TLS configuration loaded with SPIFFE trust-domain-validating \
@@ -2149,6 +2160,19 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
     config.session_storage =
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
     config.max_early_data_size = 0;
+
+    // Resumption skips the client-certificate verifier (issue #6538). Disable
+    // it whenever a later handshake must reach that verifier:
+    // - the SPIFFE verifier reads the enforced CRL records and the peer trust
+    //   bundles live on every handshake (issue #5574), so a published
+    //   revocation or trust withdrawal must apply to the peer's next
+    //   handshake, not only to its next full one;
+    // - the operator-CA verifier enforces a nonempty CRL set, whose
+    //   `nextUpdate` check runs only on a full handshake.
+    let operator_ca_crls_enforced = client_auth != MeshClientAuth::None && !crls.is_empty();
+    if spiffe_verifier_installed || operator_ca_crls_enforced {
+        disable_server_session_resumption(&mut config);
+    }
 
     Ok(Arc::new(config))
 }
@@ -2229,6 +2253,65 @@ pub fn apply_crl_enforced_client_resumption(
 ) {
     if !enforced_crls.is_empty() {
         config.resumption = rustls::client::Resumption::disabled();
+    }
+}
+
+/// A ticketer that never issues a ticket and never decrypts one.
+///
+/// rustls keeps its own equivalent private. Setting `send_tls13_tickets` to 0
+/// alone does not stop TLS 1.2 (RFC 5077) tickets: a TLS 1.2 client that
+/// offers the SessionTicket extension still receives one from an enabled
+/// ticketer and can resume with it.
+#[derive(Debug)]
+struct NoSessionTickets;
+
+impl rustls::server::ProducesTickets for NoSessionTickets {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    fn lifetime(&self) -> u32 {
+        0
+    }
+
+    fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// Disable every inbound session-resumption mechanism on `config`.
+///
+/// A resumed TLS 1.2 or TLS 1.3 handshake restores the client certificate
+/// chain from the session and never calls the client-certificate verifier.
+/// This turns off all three ways a client could skip it: TLS 1.3 tickets
+/// (stateless or stateful), TLS 1.2 RFC 5077 tickets, and the TLS 1.2
+/// session-ID cache. Established connections are unaffected.
+pub fn disable_server_session_resumption(config: &mut ServerConfig) {
+    config.send_tls13_tickets = 0;
+    config.ticketer = Arc::new(NoSessionTickets);
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+}
+
+/// Inbound twin of [`apply_crl_enforced_client_resumption`] (issue #6538).
+///
+/// When the installed client-certificate verifier enforces a nonempty CRL
+/// set, every new connection must reach the verifier, whose
+/// `enforce_revocation_expiration()` check refuses a chain once its
+/// authoritative CRL passes `nextUpdate`. A resumed session skips that check,
+/// so a client admitted before `nextUpdate` could otherwise keep reconnecting
+/// afterwards. This holds whether or not frontend live reload is enabled.
+/// Pass an empty slice when no verifier is installed or no CRL is enforced;
+/// the config's existing resumption settings are then left untouched.
+pub fn apply_crl_enforced_server_resumption(
+    config: &mut ServerConfig,
+    enforced_crls: &[CertificateRevocationListDer<'static>],
+) {
+    if !enforced_crls.is_empty() {
+        disable_server_session_resumption(config);
     }
 }
 
@@ -2385,6 +2468,8 @@ pub struct ClientCertVerifierCandidate {
     pub verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     /// Semantic identity of the same anchors and CRLs.
     pub material: client_trust::ClientTrustMaterial,
+    /// Whether the verifier enforces a nonempty CRL set (issue #6538).
+    pub crls_enforced: bool,
 }
 
 /// [`build_client_cert_verifier`] that also returns the trust identity of the
@@ -2422,7 +2507,11 @@ pub fn build_client_cert_verifier_candidate(
     let verifier = verifier_builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))?;
-    Ok(ClientCertVerifierCandidate { verifier, material })
+    Ok(ClientCertVerifierCandidate {
+        verifier,
+        material,
+        crls_enforced: !crls.is_empty(),
+    })
 }
 
 /// Check X.509 certificate expiration for a PEM certificate file.

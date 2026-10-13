@@ -15,9 +15,11 @@
 //! Session resumption is enabled by default (saves 1 RTT on reconnects).
 //! Ordinary listeners use stateless rotating tickets; non-mTLS listeners with
 //! early data enabled use the bounded stateful cache rustls requires for server
-//! 0-RTT. An mTLS listener whose client-trust scope can advance under frontend
-//! live reload disables tickets and the stateful cache so resumption cannot
-//! outlive an accepted client-CA or CRL withdrawal.
+//! 0-RTT. An mTLS listener disables tickets and the stateful cache when its
+//! client verifier enforces CRLs (so every handshake reaches the CRL
+//! `nextUpdate` check, issue #6538) or when its client-trust scope can advance
+//! under frontend live reload (so resumption cannot outlive an accepted
+//! client-CA or CRL withdrawal).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -936,6 +938,7 @@ fn load_configured_h3_client_trust(
             .map(|candidate| crate::tls::AcceptedClientTrust {
                 verifier: Some(candidate.verifier),
                 material: candidate.material,
+                crls_enforced: candidate.crls_enforced,
             })
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -951,6 +954,7 @@ fn load_configured_h3_client_trust(
         None => Ok(crate::tls::AcceptedClientTrust {
             verifier: None,
             material: crate::tls::ClientTrustMaterial::default(),
+            crls_enforced: false,
         }),
     }
 }
@@ -1188,15 +1192,15 @@ fn build_h3_rustls_server_config(
     }
     server_tls_config.session_storage =
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
-    if client_trust.verifier.is_some() && bind_live_verifier {
+    if client_trust.verifier.is_some() && (bind_live_verifier || client_trust.crls_enforced) {
         // A QUIC session ticket does not re-run client-certificate
-        // verification, so once this listener can publish a withdrawal a
-        // resumed connection must still meet the accepted verifier. A listener
-        // with no reload channel can never publish one, and suppressing
-        // resumption there would only cost every mTLS HTTP/3 client a full
-        // handshake.
-        server_tls_config.send_tls13_tickets = 0;
-        server_tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        // verification. Disable resumption when the verifier enforces CRLs, so
+        // a client admitted before a CRL's `nextUpdate` cannot resume after it
+        // (issue #6538), and when this listener can publish a withdrawal, so a
+        // resumed connection still meets the accepted verifier. A static mTLS
+        // listener without CRLs keeps resumption: nothing it enforces can
+        // change or expire while the process runs.
+        crate::tls::disable_server_session_resumption(&mut server_tls_config);
     }
 
     Ok(server_tls_config)
@@ -22332,6 +22336,249 @@ mod build_h3_quinn_server_config_mtls_tests {
         let accepted = super::load_configured_h3_client_trust(None, &crls)
             .expect("unenforced CRLs must not prevent non-mTLS H3 startup");
         assert!(accepted.verifier.is_none());
+    }
+}
+
+#[cfg(test)]
+mod h3_crl_resumption_tests {
+    //! Issue #6538: an mTLS HTTP/3 listener whose client verifier enforces CRLs
+    //! must not resume sessions, even without frontend live reload. A resumed
+    //! TLS 1.3 handshake skips the client-certificate verifier and so its CRL
+    //! `nextUpdate` check. `build_h3_rustls_server_config` is module-private,
+    //! so these tests live inline. QUIC only wraps the rustls config this
+    //! builder returns, so an in-memory TLS 1.3 exchange over it exercises the
+    //! same session-resumption state a QUIC reconnect would.
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use rustls::pki_types::{
+        CertificateDer, CertificateRevocationListDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+    };
+    use rustls::{CertificateError, ClientConnection, HandshakeKind, ServerConnection};
+    use time::{Duration as TimeDuration, OffsetDateTime};
+
+    use super::{build_h3_rustls_server_config, load_configured_h3_client_trust};
+    use crate::config::EnvConfig;
+    use crate::tls::{CrlList, TlsPolicy};
+
+    const HOST: &str = "h3.crl-resumption.test";
+    /// Bound on the in-memory exchange rounds, so a regression fails instead
+    /// of spinning.
+    const PUMP_ROUNDS: usize = 32;
+
+    #[derive(Debug)]
+    struct Clock(AtomicU64);
+
+    impl rustls::time_provider::TimeProvider for Clock {
+        fn current_time(&self) -> Option<UnixTime> {
+            Some(UnixTime::since_unix_epoch(Duration::from_secs(
+                self.0.load(Ordering::Relaxed),
+            )))
+        }
+    }
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+        issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+        ca_der: CertificateDer<'static>,
+        frontend: Arc<rustls::ServerConfig>,
+        client_chain: Vec<CertificateDer<'static>>,
+        client_key: Vec<u8>,
+        now: OffsetDateTime,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let _ = crate::fips::base_crypto_provider().install_default();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let ca_key =
+                rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+            let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+            ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca.distinguished_name
+                .push(rcgen::DnType::CommonName, "H3 CRL resumption CA");
+            ca.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+                rcgen::KeyUsagePurpose::DigitalSignature,
+            ];
+            let ca_cert = ca.self_signed(&ca_key).expect("CA cert");
+            std::fs::write(dir.path().join("client-ca.pem"), ca_cert.pem()).expect("write CA");
+            let issuer = rcgen::Issuer::new(ca, ca_key);
+
+            let server_key =
+                rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("server key");
+            let server_cert = rcgen::CertificateParams::new(vec![HOST.to_string()])
+                .expect("server params")
+                .signed_by(&server_key, &issuer)
+                .expect("server cert");
+            let frontend = Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(
+                        vec![server_cert.der().clone()],
+                        PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+                    )
+                    .expect("frontend config"),
+            );
+            let client_key =
+                rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
+            let client_cert = rcgen::CertificateParams::new(vec!["h3-client.test".to_string()])
+                .expect("client params")
+                .signed_by(&client_key, &issuer)
+                .expect("client cert");
+            Self {
+                dir,
+                issuer,
+                ca_der: ca_cert.der().clone(),
+                frontend,
+                client_chain: vec![client_cert.der().clone()],
+                client_key: client_key.serialize_der(),
+                now: OffsetDateTime::now_utc(),
+            }
+        }
+
+        /// One CRL from the client's issuer that revokes nothing and expires
+        /// in one minute: only its `nextUpdate` can refuse the client.
+        fn crls(&self) -> CrlList {
+            let params = rcgen::CertificateRevocationListParams {
+                this_update: self.now - TimeDuration::hours(1),
+                next_update: self.now + TimeDuration::minutes(1),
+                crl_number: rcgen::SerialNumber::from(1u64),
+                issuing_distribution_point: None,
+                revoked_certs: vec![],
+                key_identifier_method: rcgen::KeyIdMethod::Sha256,
+            };
+            let crl = params.signed_by(&self.issuer).expect("CRL");
+            Arc::new(vec![CertificateRevocationListDer::from(crl.der().to_vec())])
+        }
+
+        /// The production H3 rustls config for a static (no live reload)
+        /// mTLS listener, with a controllable clock.
+        fn h3_server(&self, crls: &CrlList) -> (Arc<rustls::ServerConfig>, Arc<Clock>) {
+            let tls_policy = TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy");
+            let ca_path = self.dir.path().join("client-ca.pem");
+            let client_trust =
+                load_configured_h3_client_trust(Some(ca_path.to_str().expect("utf8")), crls)
+                    .expect("client trust");
+            assert_eq!(client_trust.crls_enforced, !crls.is_empty());
+            let mut config = build_h3_rustls_server_config(
+                &self.frontend,
+                &tls_policy,
+                &client_trust,
+                true,
+                false,
+            )
+            .expect("H3 rustls config");
+            let clock = Arc::new(Clock(AtomicU64::new(self.now.unix_timestamp() as u64)));
+            config.time_provider = clock.clone();
+            (Arc::new(config), clock)
+        }
+
+        /// One TLS 1.3 client config, and so one session store, per test.
+        fn client(&self) -> Arc<rustls::ClientConfig> {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(self.ca_der.clone()).expect("root");
+            let mut config =
+                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(
+                        self.client_chain.clone(),
+                        PrivatePkcs8KeyDer::from(self.client_key.clone()).into(),
+                    )
+                    .expect("client auth cert");
+            config.alpn_protocols = vec![b"h3".to_vec()];
+            Arc::new(config)
+        }
+    }
+
+    fn connect(
+        client: &Arc<rustls::ClientConfig>,
+        server: &Arc<rustls::ServerConfig>,
+    ) -> Result<ClientConnection, rustls::Error> {
+        let mut client = ClientConnection::new(
+            Arc::clone(client),
+            ServerName::try_from(HOST).expect("server name"),
+        )?;
+        let mut server = ServerConnection::new(Arc::clone(server))?;
+        for _ in 0..PUMP_ROUNDS {
+            let mut progressed = false;
+            if client.wants_write() {
+                let mut wire = Vec::new();
+                client.write_tls(&mut wire).expect("client write");
+                server
+                    .read_tls(&mut Cursor::new(wire))
+                    .expect("server read");
+                server.process_new_packets()?;
+                progressed = true;
+            }
+            if server.wants_write() {
+                let mut wire = Vec::new();
+                server.write_tls(&mut wire).expect("server write");
+                client
+                    .read_tls(&mut Cursor::new(wire))
+                    .expect("client read");
+                client.process_new_packets()?;
+                progressed = true;
+            }
+            if !progressed {
+                assert!(!client.is_handshaking() && !server.is_handshaking());
+                return Ok(client);
+            }
+        }
+        panic!("in-memory TLS 1.3 exchange did not quiesce");
+    }
+
+    #[test]
+    fn crl_enforcing_static_h3_mtls_reconnect_after_next_update_is_refused() {
+        let fixture = Fixture::new();
+        let (server, clock) = fixture.h3_server(&fixture.crls());
+        assert_eq!(server.send_tls13_tickets, 0, "TLS 1.3 tickets");
+        assert!(!server.ticketer.enabled(), "stateless tickets");
+        assert!(
+            !server.session_storage.can_cache(),
+            "stateful session cache"
+        );
+
+        let client = fixture.client();
+        connect(&client, &server).expect("initial healthy handshake");
+        let second = connect(&client, &server).expect("healthy reconnect");
+        assert_eq!(
+            second.handshake_kind(),
+            Some(HandshakeKind::Full),
+            "a CRL-enforcing H3 listener must not resume sessions"
+        );
+
+        clock.0.store(
+            (fixture.now + TimeDuration::minutes(2)).unix_timestamp() as u64,
+            Ordering::Relaxed,
+        );
+        let error = connect(&client, &server).expect_err("expired CRL refuses the reconnect");
+        assert!(
+            matches!(
+                error,
+                rustls::Error::InvalidCertificate(
+                    CertificateError::ExpiredRevocationListContext { .. }
+                ) | rustls::Error::InvalidCertificate(CertificateError::ExpiredRevocationList)
+            ),
+            "the reconnect must fail the CRL expiry check, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn static_h3_mtls_without_crls_still_resumes() {
+        let fixture = Fixture::new();
+        let (server, _clock) = fixture.h3_server(&Arc::new(Vec::new()));
+        let client = fixture.client();
+        connect(&client, &server).expect("prime session");
+        let resumed = connect(&client, &server).expect("control reconnect");
+        assert_eq!(
+            resumed.handshake_kind(),
+            Some(HandshakeKind::Resumed),
+            "a static H3 mTLS listener without CRLs keeps session resumption"
+        );
     }
 }
 

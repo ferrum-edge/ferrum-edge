@@ -389,7 +389,7 @@ pub async fn run_cleanup_phase(config: &CleanupWaitConfig) -> Result<CleanupWait
     use k8s_openapi::api::apps::v1::DaemonSet;
     use kube::Api;
 
-    let client = kube::Client::try_default()
+    let client = crate::k8s_controller::try_default_kube_client()
         .await
         .map_err(|err| format!("could not build a Kubernetes client: {err}"))?;
     let api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);

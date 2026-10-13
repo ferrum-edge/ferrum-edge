@@ -210,6 +210,11 @@ pub fn build_spiffe_inbound_config(
     // SPIFFE inbound is currently used by HBONE listeners, which require
     // HTTP/2 over mTLS.
     cfg.alpn_protocols = vec![b"h2".to_vec()];
+    // The verifier reads the SVID bundle slot (trust bundles) on every
+    // handshake, and rustls enables a stateful session cache by default. A
+    // resumed peer would skip that live check and the CRL expiry check, so
+    // never resume (issue #6538).
+    crate::tls::disable_server_session_resumption(&mut cfg);
     Ok(Arc::new(cfg))
 }
 
@@ -1878,6 +1883,108 @@ mod tests {
         assert!(
             msg.contains("trust domain") || msg.contains("trust bundle"),
             "rejection should cite the missing trust domain, got: {msg}"
+        );
+    }
+
+    fn pump_handshake(
+        client_config: &Arc<ClientConfig>,
+        server_config: &Arc<ServerConfig>,
+    ) -> Result<rustls::ClientConnection, rustls::Error> {
+        let mut client = rustls::ClientConnection::new(
+            Arc::clone(client_config),
+            rustls::pki_types::ServerName::try_from("spiffe-peer.test").expect("server name"),
+        )?;
+        let mut server = rustls::ServerConnection::new(Arc::clone(server_config))?;
+        for _ in 0..HANDSHAKE_ROUNDS {
+            let mut progressed = false;
+            if client.wants_write() {
+                let mut wire = Vec::new();
+                client.write_tls(&mut wire).expect("client write");
+                server
+                    .read_tls(&mut std::io::Cursor::new(wire))
+                    .expect("server read");
+                server.process_new_packets()?;
+                progressed = true;
+            }
+            if server.wants_write() {
+                let mut wire = Vec::new();
+                server.write_tls(&mut wire).expect("server write");
+                client
+                    .read_tls(&mut std::io::Cursor::new(wire))
+                    .expect("client read");
+                client.process_new_packets()?;
+                progressed = true;
+            }
+            if !progressed {
+                return Ok(client);
+            }
+        }
+        panic!("in-memory handshake did not quiesce");
+    }
+
+    const HANDSHAKE_ROUNDS: usize = 32;
+
+    /// Issue #6538: `build_spiffe_inbound_config` reads the SVID bundle slot on
+    /// every handshake, so a trust-domain withdrawal must apply to the peer's
+    /// next connection. A resumed session would skip the verifier, so the
+    /// config never resumes, even without CRLs.
+    #[test]
+    fn inbound_config_never_resumes_so_trust_withdrawal_applies_to_the_next_handshake() {
+        let _ = crate::fips::base_crypto_provider().install_default();
+        let td = TrustDomain::new("td.inbound-resume").unwrap();
+        let server_id = SpiffeId::from_parts(&td, "ns/srv/sa/srv").unwrap();
+        let client_id = SpiffeId::from_parts(&td, "ns/cli/sa/cli").unwrap();
+        let (root_der, root_pem, key_pem) = synthetic_root(&td);
+        let (server_leaf, server_key) = issue_leaf_with_key(&server_id, &root_pem, &key_pem);
+        let (client_leaf, client_key) = issue_leaf_with_key(&client_id, &root_pem, &key_pem);
+        let server_slot = shared_bundle_slot(Some(svid_bundle_with_key(
+            server_id.clone(),
+            bundle_for(td.clone(), root_der.clone()),
+            server_leaf.clone(),
+            server_key.clone(),
+        )));
+        let client_slot = shared_bundle_slot(Some(svid_bundle_with_key(
+            client_id,
+            bundle_for(td, root_der),
+            client_leaf,
+            client_key,
+        )));
+
+        let server = build_spiffe_inbound_config(Arc::clone(&server_slot), true, empty_crls())
+            .expect("inbound config");
+        assert_eq!(server.send_tls13_tickets, 0, "TLS 1.3 tickets");
+        assert!(!server.ticketer.enabled(), "TLS 1.2 tickets");
+        assert!(!server.session_storage.can_cache(), "stateful cache");
+        let client = build_spiffe_outbound_config(
+            client_slot,
+            Some(server_id.clone()),
+            None,
+            vec![b"h2".to_vec()],
+            empty_crls(),
+        )
+        .expect("outbound config");
+
+        pump_handshake(&client, &server).expect("initial handshake");
+        let second = pump_handshake(&client, &server).expect("reconnect");
+        assert_eq!(
+            second.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "the inbound SPIFFE config must not resume sessions"
+        );
+
+        // Withdraw the client's trust domain: the server now trusts only a
+        // foreign root. The next reconnect must reach the verifier and fail.
+        let foreign_td = TrustDomain::new("td.inbound-resume-foreign").unwrap();
+        let (foreign_root_der, _, _) = synthetic_root(&foreign_td);
+        server_slot.store(Arc::new(Some(svid_bundle_with_key(
+            server_id,
+            bundle_for(foreign_td, foreign_root_der),
+            server_leaf,
+            server_key,
+        ))));
+        assert!(
+            pump_handshake(&client, &server).is_err(),
+            "a peer whose trust domain was withdrawn must not reconnect"
         );
     }
 

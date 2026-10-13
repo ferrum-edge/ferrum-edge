@@ -67,6 +67,20 @@ every node that admits or runs the plugin when you rely on one of these
 librdkafka features and trust your admin writers with code execution on the
 gateway host.
 
+### MongoDB 4.4.2 is the oldest supported server (#6592, PR #6571)
+
+The `mongodb` driver is now 3.9.1, which refuses servers that report a wire
+version below 9. Before you upgrade a gateway that uses `FERRUM_DB_TYPE=mongodb`,
+check the server version with `db.version()`.
+
+- **MongoDB 4.2 and older, and 4.4.0–4.4.1:** upgrade the server to 4.4.2 or
+  later first. The new binary cannot start against them.
+- **Azure Cosmos DB for MongoDB (RU):** not supported. Move to MongoDB, Atlas,
+  or another backend.
+
+See [docs/mongodb.md](mongodb.md#supported-server-versions) for the full table
+and the Linux kernel note for MongoDB 8.0.21+, 8.3 and 9.0.
+
 ## Upgrading to 0.9.17
 
 0.9.17 was published on 2026-10-10 UTC from commit

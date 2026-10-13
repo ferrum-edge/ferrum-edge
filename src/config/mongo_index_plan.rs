@@ -13,8 +13,10 @@ use mongodb::options::IndexOptions;
 /// `MongoStore` consumer encode paths.
 pub const HMAC_SECRET_HASHES_FIELD: &str = "_ferrum_hmac_secret_hashes";
 
-/// Empty shell collections that must exist before transactional writes (MongoDB
-/// < 4.4 cannot implicitly create collections inside a transaction).
+/// Empty shell collections that must exist before transactional writes. MongoDB
+/// 4.4+ can create a collection implicitly inside a transaction, but not in a
+/// cross-shard write transaction, and concurrent first writes can conflict, so
+/// migrations create them up front.
 pub const REQUIRED_GUARD_COLLECTIONS: &[&str] = &[
     "proxy_route_locks",
     "upstream_ref_guards",

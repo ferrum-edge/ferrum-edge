@@ -882,6 +882,7 @@ fn load_dp_operator_client_trust(
     Ok(AcceptedClientTrust {
         verifier: Some(candidate.verifier),
         material: candidate.material,
+        crls_enforced: candidate.crls_enforced,
     })
 }
 

@@ -3478,6 +3478,7 @@ mod tests {
             client_trust: crate::tls::AcceptedClientTrust {
                 verifier: None,
                 material: crate::tls::ClientTrustMaterial::from_test_digest([marker; 32]),
+                crls_enforced: false,
             },
         })
     }

@@ -1141,6 +1141,9 @@ fn algorithm_identity_label(algorithm: Algorithm) -> &'static [u8] {
         Algorithm::PS384 => b"PS384",
         Algorithm::PS512 => b"PS512",
         Algorithm::EdDSA => b"EdDSA",
+        // `Algorithm` is non-exhaustive since jsonwebtoken 11. Bundle loading
+        // refuses any other algorithm before an identity is derived.
+        _ => b"unsupported",
     }
 }
 
@@ -2159,6 +2162,14 @@ impl TrustBundleKeyDocument {
                     // Unreachable: `symmetric` covers these above.
                     return Err(format!(
                         "CP/DP trust bundle {origin:?}: key {kid:?} algorithm/material mismatch"
+                    ));
+                }
+                // `Algorithm` is non-exhaustive since jsonwebtoken 11: refuse an
+                // algorithm this loader does not know rather than guess its key type.
+                _ => {
+                    return Err(format!(
+                        "CP/DP trust bundle {origin:?}: key {kid:?} algorithm \"{algorithm:?}\" \
+                         is not supported"
                     ));
                 }
             };
