@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `jwks_auth` bounds per-token verification work.** A token
+- **BREAKING — `jwks_auth` bounds per-token verification work.** (issue n/a, PR #6644) A token
   is now verified only against providers whose `issuer` equals its
   unverified `iss`, then providers without an `issuer`, each at most once.
   Providers pinning a different issuer are no longer tried, since they

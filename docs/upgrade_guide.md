@@ -28,6 +28,10 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `jwks_auth` provider limits (PR #6644)
+
+A `jwks_auth` instance accepts at most 64 `providers`. For every `issuer`, the providers that share it plus the providers that set no `issuer` must total at most 8, and at most 8 providers may omit `issuer`. A config past these limits is refused at construction. A token is now verified only against providers whose `issuer` equals its `iss`, plus issuer-less providers. Merge duplicate providers, or split very large provider sets across routes. In mesh mode, identical RequestAuthentication rules are installed once. A combined set past the limits fails construction, so the data plane keeps its last accepted configuration.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
