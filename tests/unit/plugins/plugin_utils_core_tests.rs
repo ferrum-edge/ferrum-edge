@@ -419,6 +419,48 @@ fn canonical_query_ambiguity_reasons_are_stable_tokens() {
     assert_eq!(QueryAmbiguity::NonUtf8Name.reason(), "non_utf8_name");
     assert_eq!(QueryAmbiguity::NonUtf8Value.reason(), "non_utf8_value");
     assert_eq!(QueryAmbiguity::DuplicateName.reason(), "duplicate_name");
+    assert_eq!(
+        QueryAmbiguity::SemicolonSeparator.reason(),
+        "semicolon_separator"
+    );
+}
+
+#[test]
+fn canonical_query_flags_unencoded_semicolon_in_name_or_value() {
+    // Issue #6579: a backend that also splits on `;` (Rack < 3, Go < 1.17,
+    // Python < 3.9.2) sees `token=x` as its own parameter, while Ferrum sees
+    // one `a` whose value is `1;token=x`.
+    let query = CanonicalQuery::parse("a=1;token=x");
+    assert_eq!(query.ambiguities(), &[QueryAmbiguity::SemicolonSeparator]);
+    assert_eq!(query.len(), 1, "Ferrum still separates pairs only on '&'");
+    assert_eq!(
+        ambiguities("a;b=1"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+    assert_eq!(
+        ambiguities("flag;other"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+}
+
+#[test]
+fn canonical_query_flags_a_duplicate_smuggled_behind_a_semicolon() {
+    // To Ferrum `tenant` occurs once (`admin`); a `;`-splitting backend reads a
+    // second `tenant=victim` and, under last-value-wins, executes it. The
+    // duplicate-name pass cannot see it, so the semicolon class must.
+    assert_eq!(
+        ambiguities("tenant=admin&x=;tenant=victim"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+}
+
+#[test]
+fn canonical_query_accepts_percent_encoded_semicolon() {
+    // `%3B` is a literal `;` to every decoder, so it is not a separator.
+    let query = CanonicalQuery::parse("a=1%3Btoken%3Dx&b=%3b");
+    assert!(query.is_unambiguous());
+    assert_eq!(query.get("a"), Some("1;token=x"));
+    assert_eq!(query.get("b"), Some(";"));
 }
 
 #[test]

@@ -386,6 +386,27 @@ async fn opa_rejects_literal_plus_query_name() {
 }
 
 #[tokio::test]
+async fn opa_rejects_unencoded_semicolon_without_calling_opa() {
+    // Issue #6579: OPA would read one `a` while a `;`-splitting backend also
+    // executes `tenant=admin`.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a=1;tenant=admin".to_string());
+
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request history should be available");
+    assert!(
+        requests.is_empty(),
+        "OPA must not be called with an unencoded ';' in the query"
+    );
+}
+
+#[tokio::test]
 async fn opa_rejects_malformed_percent_encoding() {
     let server = MockServer::start().await;
     let plugin = plugin(&server, json!({}));

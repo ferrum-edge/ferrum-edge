@@ -4908,6 +4908,8 @@ async fn test_ambiguous_query_fails_before_external_egress() {
         ("role&role=admin", "duplicate_query_parameter"),
         ("name=alice+bob", "ambiguous_query_encoding"),
         ("a+b=1", "ambiguous_query_encoding"),
+        ("role=user;role=admin", "ambiguous_query_encoding"),
+        ("role;x=1", "ambiguous_query_encoding"),
         ("name=%FF", "invalid_query_encoding"),
         ("%FF=1", "invalid_query_encoding"),
         ("name=%ZZ", "invalid_query_encoding"),

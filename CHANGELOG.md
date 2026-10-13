@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **An unencoded `;` in the query is now an ambiguity that fail-closed query
+  consumers reject** (issue #6579; query counterpart of GHSA-fcqw-793q-wg5x /
+  GHSA-5mrg-vq2h-6j3w). The canonical query view split pairs only on `&`, so
+  `?tenant=admin&x=;tenant=victim` was one unambiguous `tenant=admin` to OPA,
+  `mesh_route_dispatch` query predicates, and `serverless_function` query
+  forwarding, while a backend that also splits on `;` (Rack before 3.0, Go
+  before 1.17, Python before 3.9.2) executed `tenant=victim`. A new
+  `semicolon_separator` classification records any unencoded `;` in a name
+  or value: OPA (`query_ambiguity_policy: reject`) denies before the policy
+  call, `mesh_route_dispatch` answers `400`, and `serverless_function` fails
+  with `ambiguous_query_encoding`. Under OPA `delegate` the token appears in
+  `input.query_ambiguity`. `%3B` stays an unambiguous literal semicolon.
+
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is

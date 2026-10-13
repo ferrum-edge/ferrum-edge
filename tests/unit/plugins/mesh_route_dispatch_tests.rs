@@ -2179,6 +2179,22 @@ async fn literal_plus_query_is_rejected() {
 }
 
 #[tokio::test]
+async fn duplicate_smuggled_behind_a_semicolon_is_rejected() {
+    // Issue #6579: Ferrum reads `tenant=admin` once and would select the
+    // privileged route, while a `;`-splitting, last-value-wins backend
+    // executes `tenant=victim`.
+    let mut ctx = ctx_with_query("tenant=admin&x=;tenant=victim");
+    match dispatch(&query_rule_plugin(), &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected a 400 reject, got {other:?}"),
+    }
+    assert!(
+        ctx.route_override_upstream_id.is_none(),
+        "no route override may be published for an ambiguous query"
+    );
+}
+
+#[tokio::test]
 async fn percent_encoded_space_and_plus_route_normally() {
     // `%20`/`%2B` are unambiguous, so the inverse policy stays routable.
     let plugin = MeshRouteDispatch::new(&json!({

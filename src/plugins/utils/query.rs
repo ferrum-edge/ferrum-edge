@@ -112,6 +112,14 @@ pub enum QueryAmbiguity {
     /// values, or reject, so no single value is the one the backend executes
     /// (advisory `GHSA-j2j6-f9c7-hh85`).
     DuplicateName,
+    /// An unencoded `;` in a name or value. Ferrum separates pairs only on
+    /// `&`, but HTML 4's recommendation, Rack before 3.0, Go before 1.17, and
+    /// Python before 3.9.2 also split on `;`, so `?a=1;tenant=admin` is one
+    /// parameter to Ferrum and two to such a backend. This is the query
+    /// counterpart of the `;` path-parameter differential
+    /// (`GHSA-fcqw-793q-wg5x`, `GHSA-5mrg-vq2h-6j3w`); `%3B` is an
+    /// unambiguous literal semicolon.
+    SemicolonSeparator,
 }
 
 impl QueryAmbiguity {
@@ -124,6 +132,7 @@ impl QueryAmbiguity {
             Self::NonUtf8Name => "non_utf8_name",
             Self::NonUtf8Value => "non_utf8_value",
             Self::DuplicateName => "duplicate_name",
+            Self::SemicolonSeparator => "semicolon_separator",
         }
     }
 }
@@ -218,6 +227,9 @@ impl CanonicalQuery {
             };
             if raw_name.contains('+') || raw_value.contains('+') {
                 record(&mut ambiguities, QueryAmbiguity::LiteralPlus);
+            }
+            if raw_name.contains(';') || raw_value.contains(';') {
+                record(&mut ambiguities, QueryAmbiguity::SemicolonSeparator);
             }
             if !has_valid_percent_triplets(raw_name) || !has_valid_percent_triplets(raw_value) {
                 record(&mut ambiguities, QueryAmbiguity::MalformedPercentEncoding);
