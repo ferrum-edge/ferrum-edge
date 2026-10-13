@@ -706,8 +706,13 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   `.github/required-publication-checks.json` passes on the exact head, with no
   other check failing, and squash-merges that head with `--match-head-commit`.
   A failing check or a moved head stops the merge and fails the run.
-  `verify_ci_runtime_cache.py` fails if the workflow stops rotating every
-  consumer, uses another token, or weakens the merge gate.
+  Only `SUCCESS` satisfies a required context; a skipped or neutral required
+  check never does. The trusted Cross policy freezes the workflow's `refresh`
+  and `merge` jobs by SHA-256 (`DIGEST_REFRESH_JOB_CONTRACTS`) and its read-only
+  top-level permissions, and refuses `BASE_IMAGE_REFRESH_TOKEN` in any other
+  job, so changing the rotation or the merge gate is a trusted-policy
+  migration. `verify_ci_runtime_cache.py` additionally fails if the workflow
+  stops rotating every consumer, uses another token, or weakens the merge gate.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
   default `BASE_IMAGE` matches the same source runtime pin; an

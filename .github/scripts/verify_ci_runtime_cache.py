@@ -4222,6 +4222,7 @@ BASE_IMAGE_REFRESH_MERGE_MARKERS = (
     "required=\"$(jq -r '.required_checks[].context' .github/required-publication-checks.json)\"",
     'if [ "${head}" != "OPEN ${HEAD_SHA}" ]; then',
     'if [ -n "${failed}" ]; then',
+    """if ! jq -e --arg c "${context}" 'any(.[]; .name == $c and .bucket == "pass")' <<<"${checks}" >/dev/null; then""",
     'if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then',
     'gh pr merge "${PR}" --squash --match-head-commit "${HEAD_SHA}"',
 )
@@ -5478,6 +5479,11 @@ def self_test() -> int:
             "that merges with failing checks",
             '            if [ -n "${failed}" ]; then\n',
             '            if false; then\n',
+        ),
+        (
+            "that accepts a skipped required check",
+            """'any(.[]; .name == $c and .bucket == "pass")'""",
+            """'any(.[]; .name == $c and (.bucket == "pass" or .bucket == "skipping"))'""",
         ),
         (
             "that merges a moved head",

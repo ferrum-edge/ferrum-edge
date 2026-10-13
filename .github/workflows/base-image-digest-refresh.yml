@@ -24,11 +24,15 @@
 # `verify_ci_runtime_cache.py` still requires every distroless reference to
 # match `Dockerfile`. The two trusted policy files are never rewritten.
 #
-# The pull request is pushed and opened with `BASE_IMAGE_REFRESH_TOKEN` so its
+# The pull request is pushed and opened with `BASE_IMAGE_REFRESH_TOKEN` (a
+# fine-grained personal access token; see docs/ci_cd.md) so its
 # CI runs (events from `GITHUB_TOKEN` start no workflows, and only a token with
 # workflow-write access may change `ci.yml`). The `merge` job then waits for
-# every context in `.github/required-publication-checks.json` to pass on the
-# exact head, with no other check failing, and squash-merges that head.
+# every context in `.github/required-publication-checks.json` to succeed on the
+# exact head, with no other check failing or pending, and squash-merges that
+# head. The trusted Cross policy freezes the `refresh` and `merge` jobs by
+# SHA-256, so neither the rotation nor this merge gate can change in an
+# ordinary pull request.
 name: Base Image Digest Refresh
 
 on:
@@ -228,7 +232,8 @@ jobs:
             pending="$(jq '[.[] | select(.bucket == "pending")] | length' <<<"${checks}")"
             missing=""
             while IFS= read -r context; do
-              if ! jq -e --arg c "${context}" 'any(.[]; .name == $c and (.bucket == "pass" or .bucket == "skipping"))' <<<"${checks}" >/dev/null; then
+              # Only SUCCESS satisfies a required context; skipped or neutral never does.
+              if ! jq -e --arg c "${context}" 'any(.[]; .name == $c and .bucket == "pass")' <<<"${checks}" >/dev/null; then
                 missing="${missing}[${context}]"
               fi
             done <<<"${required}"

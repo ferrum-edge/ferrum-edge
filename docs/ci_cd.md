@@ -3705,10 +3705,13 @@ those per-job grants to take effect.
 
 #### Base image digest refresh
 
-- `BASE_IMAGE_REFRESH_TOKEN` - a fine-grained personal access token (or GitHub
-  App installation token) scoped to `ferrum-edge/ferrum-edge` with **Contents:
-  read and write**, **Pull requests: read and write**, and **Workflows: read and
-  write**. `base-image-digest-refresh.yml` uses it to push
+- `BASE_IMAGE_REFRESH_TOKEN` - a fine-grained personal access token scoped to
+  `ferrum-edge/ferrum-edge` with **Contents: read and write**, **Pull requests:
+  read and write**, and **Workflows: read and write**. Choose the longest
+  expiration the organization allows; an expired token makes the refresh fail
+  with an authentication error until the secret is replaced. A GitHub App
+  installation token is not suitable: it expires after one hour, so a stored
+  one is invalid by the next weekly run. `base-image-digest-refresh.yml` uses it to push
   `deps/base-image-digests`, open the refresh PR, and merge it. `GITHUB_TOKEN`
   cannot substitute: pull requests it opens start no CI, and it can never change
   `.github/workflows/ci.yml`, which pins the distroless runtime base. Without the

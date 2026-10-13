@@ -13999,6 +13999,104 @@ def cross_image_refresh_errors(workflows: dict[str, str], source: str) -> list[s
     return errors
 
 
+
+# The scheduled digest refresh also rotates the distroless runtime base inside
+# the protected `main-linux-image` job and merges its own pull request, so its
+# rotation and merge gate are trusted automation: freeze both jobs and the
+# workflow's token permissions here, where an ordinary pull request cannot move
+# them, and keep the refresh token out of every other job.
+DIGEST_REFRESH_JOB_CONTRACTS = (
+    ("refresh", "3a7ffa2d28f3f44afc20f9fb657f98ea729092658c70f00fa9bc238878315542"),
+    ("merge", "672b4ac51e4377c861f2c05caf0183b3a4f6074e3ebcd1cb10f27cc849760a24"),
+)
+DIGEST_REFRESH_PERMISSIONS = 'permissions:\n  # Every write uses BASE_IMAGE_REFRESH_TOKEN; GITHUB_TOKEN only reads.\n  contents: read\n'
+DIGEST_REFRESH_TOKEN_REFERENCE = "secrets.BASE_IMAGE_REFRESH_TOKEN"
+
+
+def digest_refresh_automation_errors(
+    workflows: dict[str, str], source: str
+) -> list[str]:
+    contents = workflows.get(CROSS_IMAGE_REFRESH_WORKFLOW)
+    if contents is None:
+        return [f"{source} is missing {CROSS_IMAGE_REFRESH_WORKFLOW}"]
+    located = f"{source}/{CROSS_IMAGE_REFRESH_WORKFLOW}"
+    errors: list[str] = []
+    frozen_token_uses = 0
+    for job_name, expected in DIGEST_REFRESH_JOB_CONTRACTS:
+        block, failures = extract_job_block(contents, located, job_name, required=True)
+        if failures:
+            errors.extend(failures)
+            continue
+        assert block is not None
+        frozen_token_uses += block.count(DIGEST_REFRESH_TOKEN_REFERENCE)
+        actual = hashlib.sha256(block.encode("utf-8")).hexdigest()
+        if actual != expected:
+            errors.append(
+                f"{located} job {job_name!r} differs from the trusted digest-refresh "
+                f"contract (expected SHA-256 {expected}, got {actual})"
+            )
+    permissions, permission_failures = extract_top_level_block(
+        contents, located, "permissions"
+    )
+    errors.extend(permission_failures)
+    if not permission_failures and permissions != DIGEST_REFRESH_PERMISSIONS:
+        errors.append(f"{located} must keep its read-only top-level permissions")
+    if contents.count(DIGEST_REFRESH_TOKEN_REFERENCE) != frozen_token_uses:
+        errors.append(
+            f"{located} may use BASE_IMAGE_REFRESH_TOKEN only in its frozen jobs"
+        )
+    return errors
+
+
+def digest_refresh_automation_self_test() -> list[str]:
+    path = Path(".github/workflows") / CROSS_IMAGE_REFRESH_WORKFLOW
+    if not path.is_file():
+        return []
+    real = path.read_text(encoding="utf-8")
+    failures: list[str] = []
+    if digest_refresh_automation_errors({CROSS_IMAGE_REFRESH_WORKFLOW: real}, "self-test"):
+        failures.append("the real digest-refresh workflow was rejected")
+    for label, original, replacement in (
+        (
+            "a merge gate that ignores failing checks",
+            'not merging"\n              exit 1\n            fi\n            pending=',
+            'not merging"\n            fi\n            pending=',
+        ),
+        (
+            "a merge gate that overrides readiness",
+            '            if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then\n',
+            '            pending=0\n            missing=""\n'
+            '            if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then\n',
+        ),
+        (
+            "a rotation that may rewrite trusted policy files",
+            '                  exit 1\n                  ;;\n                *Dockerfile*',
+            '                  ;;\n                *Dockerfile*',
+        ),
+        (
+            "write permissions on GITHUB_TOKEN",
+            "  contents: read\n\nconcurrency:",
+            "  contents: write\n\nconcurrency:",
+        ),
+        (
+            "another job holding the refresh token",
+            "  cross-image-drift:\n",
+            "  leak:\n    runs-on: ubuntu-26.04\n    steps:\n      - env:\n"
+            "          T: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n        run: true\n\n"
+            "  cross-image-drift:\n",
+        ),
+    ):
+        if real.count(original) != 1:
+            failures.append(f"the {label} digest-refresh mutation is stale")
+            continue
+        mutated = real.replace(original, replacement)
+        if not digest_refresh_automation_errors(
+            {CROSS_IMAGE_REFRESH_WORKFLOW: mutated}, "self-test"
+        ):
+            failures.append(f"{label} was admitted")
+    return failures
+
+
 def cross_image_refresh_scan_contents(name: str, contents: str) -> str:
     """Withhold only the exact frozen registry-inspection job from Cross scans.
 
@@ -19843,6 +19941,7 @@ def compare_pr_workflow_job(
 
 def self_test() -> list[str]:
     failures: list[str] = distroless_rotation_self_test()
+    failures.extend(digest_refresh_automation_self_test())
 
     # Repeated scans must retain quoting, malformed-input and content-change
     # behavior. Cache only lexical data, never a decision from a scanner scope.
@@ -32270,6 +32369,7 @@ def main() -> int:
     failures.extend(workflow_directory_failures)
     if not workflow_directory_failures:
         failures.extend(validate_workflow_collection(workflows, "workflow directory"))
+        failures.extend(digest_refresh_automation_errors(workflows, "workflow directory"))
 
     actions, action_directory_failures = load_action_directory(
         args.actions_dir,
@@ -32386,6 +32486,11 @@ def main() -> int:
                     merge_base_workflows,
                     proposed_workflows,
                     "workflow directory",
+                )
+            )
+            failures.extend(
+                digest_refresh_automation_errors(
+                    proposed_workflows, "proposed workflow directory"
                 )
             )
 
