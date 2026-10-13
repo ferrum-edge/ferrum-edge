@@ -213,11 +213,20 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         return Some(AiProvider::Tgi);
     }
 
-    if json
-        .get("usage")
-        .and_then(|usage| usage.get("inputTokens"))
-        .is_some()
-    {
+    // Bedrock Converse `usage` uses camelCase counters no other supported
+    // provider shares; any one of them (a total-only or cache-only update
+    // included) identifies the format.
+    if json.get("usage").is_some_and(|usage| {
+        [
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "cacheReadInputTokens",
+            "cacheWriteInputTokens",
+        ]
+        .iter()
+        .any(|field| usage.get(field).is_some())
+    }) {
         return Some(AiProvider::Bedrock);
     }
 
@@ -587,15 +596,22 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     // `InvokeModelWithResponseStream` terminal chunk. AWS documents these as the
     // billed counts for the invocation, so they are authoritative for a native
     // Bedrock event stream that carries no `usage` block at all.
-    let metrics = json.get("amazon-bedrock-invocationMetrics");
-    let metrics_prompt = metrics
-        .and_then(|value| value.get("inputTokenCount"))
-        .and_then(|value| value.as_u64());
-    let metrics_completion = metrics
-        .and_then(|value| value.get("outputTokenCount"))
-        .and_then(|value| value.as_u64());
-    let prompt = titan_prompt.or(metrics_prompt);
-    let completion = titan_completion.or(metrics_completion);
+    // It may also carry `cacheReadInputTokenCount` / `cacheWriteInputTokenCount`
+    // beside an uncached `inputTokenCount`, the same layout as the Anthropic
+    // body the stream wraps, so it folds (and merges) as that layout.
+    if let Some(metrics) = json.get("amazon-bedrock-invocationMetrics")
+        && titan_prompt.is_none()
+        && titan_completion.is_none()
+    {
+        let mut invoke = AiTokenUsage {
+            provider: Some(AiProvider::Bedrock),
+            ..Default::default()
+        };
+        invoke.apply_categories(UsageCategories::bedrock_invocation_metrics(Some(metrics)));
+        return invoke;
+    }
+    let prompt = titan_prompt;
+    let completion = titan_completion;
     AiTokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
@@ -633,6 +649,18 @@ fn extract_tgi_usage(json: &Value) -> AiTokenUsage {
         provider: Some(AiProvider::Tgi),
         ..Default::default()
     }
+}
+
+/// The Anthropic `message_start` usage carrier with its `output_tokens`
+/// removed. That count is an initial placeholder (commonly 1); the cumulative
+/// output arrives on `message_delta`. Treating it as the completion count
+/// would make a stream interrupted before the terminal delta look complete.
+pub fn anthropic_message_start_usage(message: &Value) -> Value {
+    let mut usage = message.get("usage").cloned().unwrap_or(Value::Null);
+    if let Some(object) = usage.as_object_mut() {
+        object.remove("output_tokens");
+    }
+    serde_json::json!({ "usage": usage })
 }
 
 /// One raw provider counter. `Invalid` (present but not a non-negative
@@ -749,8 +777,29 @@ impl UsageCategories {
             completion_extra: Counter::Absent,
             reported_total: Counter::read(usage, "totalTokens"),
         };
-        (categories.prompt_base.is_reported() || categories.completion_base.is_reported())
-            .then_some(categories)
+        let reported = categories.prompt_base.is_reported()
+            || categories.prompt_extras.iter().any(|c| c.is_reported())
+            || categories.completion_base.is_reported()
+            || categories.reported_total.is_reported();
+        reported.then_some(categories)
+    }
+
+    /// `amazon-bedrock-invocationMetrics`, in the Anthropic layout (uncached
+    /// input + cache write + cache read; output), so terminal metrics merge
+    /// with the Anthropic events of the same InvokeModel stream instead of
+    /// replacing their cache categories.
+    fn bedrock_invocation_metrics(metrics: Option<&Value>) -> Self {
+        Self {
+            family: Some(CategoryFamily::Anthropic),
+            prompt_base: Counter::read(metrics, "inputTokenCount"),
+            prompt_extras: [
+                Counter::read(metrics, "cacheWriteInputTokenCount"),
+                Counter::read(metrics, "cacheReadInputTokenCount"),
+            ],
+            completion_base: Counter::read(metrics, "outputTokenCount"),
+            completion_extra: Counter::Absent,
+            reported_total: Counter::Absent,
+        }
     }
 
     fn zero_omitted_base(&self) -> bool {
@@ -801,7 +850,14 @@ impl UsageCategories {
     }
 
     /// `(prompt invalid, completion invalid)` for the merged state.
+    ///
+    /// A malformed provider TOTAL invalidates both: the components can then no
+    /// longer be trusted to rebuild a complete total, so the usage is
+    /// unmetered as a whole rather than resynthesized from them.
     pub(crate) fn invalid_sides(&self) -> (bool, bool) {
+        if self.reported_total == Counter::Invalid {
+            return (true, true);
+        }
         (
             self.side(self.prompt_base, &self.prompt_extras) == Counter::Invalid,
             self.side(self.completion_base, &[self.completion_extra]) == Counter::Invalid,
@@ -817,10 +873,10 @@ impl UsageCategories {
         };
         // A malformed or overflowing side also invalidates the total: the
         // whole usage is then unmetered rather than partially counted.
-        if prompt == Counter::Invalid
-            || completion == Counter::Invalid
-            || self.reported_total == Counter::Invalid
-        {
+        if self.reported_total == Counter::Invalid {
+            return (None, None, None);
+        }
+        if prompt == Counter::Invalid || completion == Counter::Invalid {
             return (value(prompt), value(completion), None);
         }
         let (prompt, completion) = (value(prompt), value(completion));

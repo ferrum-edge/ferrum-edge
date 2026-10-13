@@ -278,10 +278,24 @@ impl AiTokenMetrics {
             };
             detected_provider.get_or_insert(provider);
 
-            let mut extracted = extract_response_usage(payload, provider);
+            // `message_start` carries only the authoritative input side; its
+            // `output_tokens` is a placeholder the terminal delta supersedes.
+            let mut extracted =
+                if event_type == Some("message_start") && provider == AiProvider::Anthropic {
+                    let carrier =
+                        crate::plugins::utils::ai_providers::anthropic_message_start_usage(payload);
+                    extract_response_usage(&carrier, provider)
+                } else {
+                    extract_response_usage(payload, provider)
+                };
+            // A category-bearing snapshot is merged even when it folds to no
+            // counter: a malformed (or cache-only) update must still reach
+            // `merge_cumulative` to invalidate (or extend) the running state.
             if extracted.prompt_tokens.is_none()
                 && extracted.completion_tokens.is_none()
                 && extracted.total_tokens.is_none()
+                && extracted.categories
+                    == crate::plugins::utils::ai_providers::UsageCategories::default()
             {
                 continue;
             }

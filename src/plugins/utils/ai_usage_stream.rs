@@ -296,12 +296,8 @@ impl UsageAccumulator {
                 // and the cumulative output arrives on `message_delta`.
                 // Recording it would make an interrupted stream look complete
                 // at almost no output and release the reservation.
-                if let Some(Value::Object(usage)) =
-                    json.get("message").and_then(|message| message.get("usage"))
-                {
-                    let mut input_only = usage.clone();
-                    input_only.remove("output_tokens");
-                    let carrier = serde_json::json!({ "usage": Value::Object(input_only) });
+                if let Some(message) = json.get("message") {
+                    let carrier = super::ai_providers::anthropic_message_start_usage(message);
                     self.record(&extract_response_usage(&carrier, AiProvider::Anthropic));
                 }
             }

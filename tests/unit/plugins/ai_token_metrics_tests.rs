@@ -1692,3 +1692,62 @@ fn every_unknown_root_config_key_is_rejected_with_allowed_key_list() {
         assert!(err.contains("metadata_prefix"), "got: {err}");
     }
 }
+
+/// Issue #6623: the `message_start` `output_tokens` placeholder is not a
+/// completion count; a stream interrupted before `message_delta` keeps only
+/// its authoritative input (with prompt-cache categories).
+#[tokio::test]
+async fn anthropic_sse_interrupted_after_message_start_reports_input_only() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"cache_read_input_tokens\":100,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("125")
+    );
+    assert!(!ctx.metadata.contains_key("ai_completion_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+/// A category-only update reaches the cumulative merge: a valid one extends
+/// the prompt, a malformed one invalidates the stale count.
+#[tokio::test]
+async fn anthropic_sse_category_only_updates_reach_the_merge() {
+    let run = |delta: &'static str| async move {
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+        let mut ctx = create_test_context();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+        let body = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-test\",\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":5}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"usage\":{delta}}}\n\n"
+        );
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+            .await;
+        ctx
+    };
+
+    let ctx = run("{\"cache_read_input_tokens\":100}").await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("110")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("115")
+    );
+
+    let ctx = run("{\"cache_read_input_tokens\":\"bad\"}").await;
+    assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
