@@ -4874,7 +4874,8 @@ CI_FUZZ_SMOKE_PRE_PARSER_TARGETS_JOB = r"""  fuzz-smoke:
 """
 
 # The adopted generation (#6584): the pre-parser-targets shape plus the
-# `ocsp_response` / `jwt_svid` loop at the 64 KiB fuzz input budget.
+# `ocsp_response` / `jwt_svid` / `tls_material` loop at the 64 KiB fuzz input
+# budget.
 CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
@@ -4909,12 +4910,13 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # other is not actually scheduled. Every other bound is byte-identical to
     # the loop's.
     #
-    # Parser targets (#6584): `ocsp_response` and `jwt_svid` fuzz the
-    # hand-rolled stapled-OCSP DER grammar and the JWT-SVID strict-JSON and
-    # compact-token validator. They run in their own loop for the same reason:
-    # both parsers' size bounds (64 KiB OCSP, 8 KiB token) sit above the six-
-    # target loop's 4 KiB ceiling. They run before `datagram_client_address`
-    # so that invocation stays the one that saves the cache.
+    # Parser targets (#6584): `ocsp_response`, `jwt_svid` and `tls_material`
+    # fuzz the hand-rolled stapled-OCSP DER grammar, the JWT-SVID strict-JSON,
+    # token and JWKS validators, and PEM certificate/key/CRL admission. They
+    # run in their own loop for the same reason: their size bounds (64 KiB
+    # OCSP, 8 KiB token, larger PEM) sit above the six-target loop's 4 KiB
+    # ceiling. They run before `datagram_client_address` so that invocation
+    # stays the one that saves the cache.
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
@@ -5183,7 +5185,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
             fi
           done
 
-          for fuzz_target in ocsp_response jwt_svid; do
+          for fuzz_target in ocsp_response jwt_svid tls_material; do
             echo "Fuzz smoke target: ${fuzz_target}"
             if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
               boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
@@ -5226,7 +5228,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           set -euo pipefail
 
           if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Fuzz lane shape: property gate plus the nine-target sanitizer budget"
+            echo "Fuzz lane shape: property gate plus the ten-target sanitizer budget"
           else
             echo "Fuzz lane shape: deterministic property gate only"
           fi
@@ -5316,12 +5318,13 @@ CI_FUZZ_SMOKE_DATAGRAM_BUDGET = (
 )
 
 # The parser-target loop (#6584), verbatim in its native projection. It runs
-# `ocsp_response` and `jwt_svid` at the 64 KiB fuzz input budget, because the
-# OCSP size bound is 64 KiB and the JWT-SVID token bound is 8 KiB, both above
-# the six-target loop's 4 KiB ceiling. Every other bound matches the loop's.
+# `ocsp_response`, `jwt_svid` and `tls_material` at the 64 KiB fuzz input
+# budget, because the OCSP size bound is 64 KiB, the JWT-SVID token bound is
+# 8 KiB, and PEM material is larger still, all above the six-target loop's
+# 4 KiB ceiling. Every other bound matches the loop's.
 # The adopted generation must carry it exactly once.
 CI_FUZZ_SMOKE_PARSER_BUDGET = (
-    "          for fuzz_target in ocsp_response jwt_svid; do\n"
+    "          for fuzz_target in ocsp_response jwt_svid tls_material; do\n"
     '            echo "Fuzz smoke target: ${fuzz_target}"\n'
     '            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\\n'
     "              -runs=512 \\\n"
@@ -5439,6 +5442,7 @@ jobs:
           - datagram_client_address
           - ocsp_response
           - jwt_svid
+          - tls_material
     steps:
       - uses: actions/checkout@0000000000000000000000000000000000000000
         with:
@@ -5495,7 +5499,7 @@ jobs:
           # itself was tampered with; it costs nothing and keeps the command
           # line free of any value this shell has not literally approved.
           case "$FUZZ_TARGET" in
-            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config|datagram_client_address|ocsp_response|jwt_svid) ;;
+            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config|datagram_client_address|ocsp_response|jwt_svid|tls_material) ;;
             *)
               echo "::error::unknown fuzz target" >&2
               exit 1
@@ -31094,23 +31098,23 @@ pre_build = []
             )
     # The parser targets (#6584) run in their own loop at the 64 KiB fuzz input
     # budget, and only the adopted generation carries it. Freezing the loop is
-    # what stops a later revision from dropping `ocsp_response` or `jwt_svid`
+    # what stops a later revision from dropping a parser target
     # back out of the required smoke, or re-bounding them to the six-target
     # loop's 4 KiB ceiling, below both parsers' own size bounds.
     if fuzz_budget_commands(CI_FUZZ_SMOKE_JOB).count(CI_FUZZ_SMOKE_PARSER_BUDGET) != 1:
         failures.append(
             "the adopted fuzz-smoke generation does not carry the bounded "
-            "ocsp_response/jwt_svid loop exactly once"
+            "ocsp_response/jwt_svid/tls_material loop exactly once"
         )
     for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS[:-1]):
         if fuzz_budget_commands(admitted).count(CI_FUZZ_SMOKE_PARSER_BUDGET):
             failures.append(
                 f"fuzz-smoke generation {generation} predates the "
-                "ocsp_response/jwt_svid loop but carries it"
+                "ocsp_response/jwt_svid/tls_material loop but carries it"
             )
     if "-max_len=65536" not in CI_FUZZ_SMOKE_PARSER_BUDGET:
         failures.append(
-            "the ocsp_response/jwt_svid smoke loop no longer reaches the "
+            "the parser-target smoke loop no longer reaches the "
             "parsers' size bounds"
         )
     for shared_bound in (
@@ -31121,7 +31125,7 @@ pre_build = []
     ):
         if shared_bound not in CI_FUZZ_SMOKE_PARSER_BUDGET:
             failures.append(
-                "the ocsp_response/jwt_svid smoke loop relaxes "
+                "the parser-target smoke loop relaxes "
                 f"{shared_bound}, which the six-target loop still enforces"
             )
     # The scheduled lane installs no compiler cache at all, so it clears every
@@ -31433,8 +31437,8 @@ pre_build = []
         # from the smoke loop or re-bound the loop to the generic 4 KiB
         # ceiling, below the OCSP and JWT-SVID size bounds.
         "parser target dropped from the smoke budget": (
+            "          for fuzz_target in ocsp_response jwt_svid tls_material; do\n",
             "          for fuzz_target in ocsp_response jwt_svid; do\n",
-            "          for fuzz_target in ocsp_response; do\n",
         ),
         "parser targets re-bounded to the generic smoke ceiling": (
             "                -max_len=65536 \\\n",
@@ -31899,7 +31903,7 @@ pre_build = []
         "arbitrary target selection": (
             "            traceparent|config_decode|proxy_protocol|mesh_udp_frame"
             "|k8s_crd|plugin_config|datagram_client_address|ocsp_response"
-            "|jwt_svid) ;;\n",
+            "|jwt_svid|tls_material) ;;\n",
             "            *) ;;\n",
         ),
         # Issue #4442: the scheduled sanitizer lane is one of the two
@@ -31910,18 +31914,18 @@ pre_build = []
             "",
         ),
         "datagram target dropped from the shell allowlist": (
-            "|plugin_config|datagram_client_address|ocsp_response|jwt_svid) ;;\n",
-            "|plugin_config|ocsp_response|jwt_svid) ;;\n",
+            "|plugin_config|datagram_client_address|ocsp_response|jwt_svid|tls_material) ;;\n",
+            "|plugin_config|ocsp_response|jwt_svid|tls_material) ;;\n",
         ),
         # Issue #6584: the parser targets must reach the scheduled sanitizer
         # lane too, through both the matrix and the literal shell allowlist.
         "parser target dropped from the scheduled matrix": (
-            "          - jwt_svid\n",
+            "          - tls_material\n",
             "",
         ),
         "parser target dropped from the shell allowlist": (
+            "|datagram_client_address|ocsp_response|jwt_svid|tls_material) ;;\n",
             "|datagram_client_address|ocsp_response|jwt_svid) ;;\n",
-            "|datagram_client_address|ocsp_response) ;;\n",
         ),
     }
     for tamper_name, (original, replacement) in fuzz_workflow_tampering.items():

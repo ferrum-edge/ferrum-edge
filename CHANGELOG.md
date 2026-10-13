@@ -123,13 +123,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Fuzz targets for the hand-rolled OCSP and JWT-SVID parsers** (issue
-  #6584). `ocsp_response` fuzzes the stapled-OCSP DER grammar under both the
-  interoperable and FIPS-enforced profiles. `jwt_svid` fuzzes the strict
-  duplicate-key-refusing JSON parser, the compact-token validator through
-  signature verification, and authority PEM admission. Both run in the
-  scheduled sanitizer lane and the bounded `Fuzz Smoke` budget at the 64 KiB
-  fuzz input budget, with synthetic seeds and deterministic property tests.
+- **Fuzz targets for the hand-rolled OCSP, JWT-SVID, and TLS material
+  parsers** (issue #6584). `ocsp_response` fuzzes the stapled-OCSP DER grammar
+  under both the interoperable and FIPS-enforced profiles. `jwt_svid` fuzzes
+  the strict duplicate-key-refusing JSON parser, the compact-token validator
+  through signature verification, authority PEM admission, and external JWKS
+  admission. `tls_material` fuzzes PEM certificate/key admission and CRL window
+  classification. All three run in the scheduled sanitizer lane and the
+  bounded `Fuzz Smoke` budget at the 64 KiB fuzz input budget, with synthetic
+  seeds and deterministic property tests.
 
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its

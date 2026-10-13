@@ -105,6 +105,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "tls_material"
+path = "fuzz_targets/tls_material.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 

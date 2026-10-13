@@ -16,7 +16,8 @@ only under `fuzz/` — the production `ferrum-edge` binary does not depend on th
 | `k8s_crd` | Istio/Gateway API JSON → translation | 32 objects, depth 64 | Fail-closed translation errors |
 | `plugin_config` | Representative plugin JSON validation (one selector byte followed by JSON) | depth 64 | `validate_plugin_config` never panics |
 | `ocsp_response` | Hand-rolled stapled-OCSP DER grammar (`tls::ocsp::validate_structure_with_policy`), under both the interoperable and the FIPS-enforced profile | 64 KiB (`MAX_OCSP_RESPONSE_BYTES`, equal to the fuzz input budget) | No panic; an accepted response reports the input length and 1–64 `SingleResponse` entries; FIPS acceptance implies interoperable acceptance with the same structure |
-| `jwt_svid` | JWT-SVID strict duplicate-key-refusing JSON parser, compact-token validator, and authority PEM admission (one selector byte, then mode-specific bytes; see `fuzz_support::FUZZ_JWT_SVID_MODES`) | 8 KiB token, 4 KiB segment, 64 KiB fuzz input | No panic; no token validates against the fixed fuzz bundle without the authority's signature |
+| `jwt_svid` | JWT-SVID strict duplicate-key-refusing JSON parser, compact-token validator, authority PEM admission, and external JWKS bundle admission (one selector byte, then mode-specific bytes; see `fuzz_support::FUZZ_JWT_SVID_MODES`) | 8 KiB token, 4 KiB segment, 64 KiB fuzz input | No panic; no token validates against the fixed fuzz bundle without the authority's signature; an accepted JWKS republishes and re-admits to the same keys |
+| `tls_material` | PEM certificate-bundle and private-key admission (`parse_pem_certificate_bundle`, `parse_pem_private_key`) and CRL window classification (`classify_crl_window`) for PEM bundles and single DER records (selector byte; see `fuzz_support::FUZZ_TLS_MATERIAL_MODES`) | 64 KiB fuzz input, 64 CRL records per input | No panic; an accepted bundle holds 1–4096 records; a CRL admitted at the fixed instant reports a later `nextUpdate` |
 
 The `datagram_client_address` target parses attacker-controlled UDP bytes
 entirely **before** the MAC decision, so it is scheduled in **both** required
@@ -51,21 +52,22 @@ required a new admitted generation of that job rather than an edit, and the
 `fuzz.yml` whole-file freeze had to move with it. That is a direct-to-`main`
 trusted-policy change; no pull request can carry it.
 
-`ocsp_response` and `jwt_svid` (issue #6584) cover the two hand-rolled parsers
-of hostile ASN.1 and JSON input. Stapled OCSP responses arrive from files,
-provider URIs, Kubernetes Secrets, and the admin API. JWT-SVIDs arrive through
-the Workload API `ValidateJWTSVID` call. Both targets run in both lanes at the 64
-KiB fuzz input budget, as their own smoke loop, because the OCSP size bound (64
-KiB) and the token bound (8 KiB) sit above the six-target loop's 4 KiB ceiling.
+`ocsp_response`, `jwt_svid`, and `tls_material` (issue #6584) cover the
+hand-rolled parsers and admission rules for hostile ASN.1, PEM, and JSON input.
+Stapled OCSP responses and TLS material arrive from files, provider URIs,
+Kubernetes Secrets, and the admin API. JWT-SVIDs and federated JWKS bundles
+arrive through the Workload API. All three run in both lanes at the 64 KiB
+fuzz input budget, as their own smoke loop, because their size bounds (64 KiB
+OCSP, 8 KiB token, larger PEM) sit above the six-target loop's 4 KiB ceiling.
 `jwt_svid` validates against a fixed bundle holding the public half of the
 repository's synthetic `tests/fixtures/test_rsa_*.pem` test key. The deterministic
 smoke proves that bundle is admitted and verifies a correctly signed token, so
 fuzz inputs reach signature verification instead of stopping at authority
-admission. Seeds are synthetic DER and JSON under `fuzz/corpus/ocsp_response/`
-and `fuzz/corpus/jwt_svid/`, and every `valid_*` OCSP seed must be accepted.
-PEM and CRL parsing are delegated to `rustls-pki-types`/`x509-parser` and are
-not separate targets. The JWT authority PEM admission path is covered by
-`jwt_svid` mode 3.
+admission. Seeds are synthetic DER, PEM, and JSON under
+`fuzz/corpus/{ocsp_response,jwt_svid,tls_material}/`. Every `valid_*` OCSP seed
+must be accepted, every `jwks_valid_*` seed must be an accepted JWKS, and every
+`valid_crl*` seed must be inside its window at the fixed instant
+(`FUZZ_CRL_NOW_UNIX`).
 
 Shared budgets and helpers live in `src/fuzz_support.rs`.
 
@@ -85,7 +87,8 @@ rejects crash artifacts larger than 64 KiB before upload.
 - **Bounded libFuzzer budget** (same `Fuzz Smoke` job, `if: github.event_name ==
   'push' || github.event_name == 'workflow_dispatch'`): six targets at ~8 s each
   (`-runs=512`, `-max_total_time=8`, `-max_len=4096`, `-timeout=2`,
-  `-rss_limit_mb=1024`), then `ocsp_response` and `jwt_svid` (issue #6584) and
+  `-rss_limit_mb=1024`), then `ocsp_response`, `jwt_svid`, and `tls_material`
+  (issue #6584) and
   `datagram_client_address` (issue #4442) at the same bounds with
   `-max_len=65536`. It runs on the push to `main` and on manual
   `workflow_dispatch` of `ci.yml` only (#3902 moved it off `pull_request` for
@@ -94,7 +97,7 @@ rejects crash artifacts larger than 64 KiB before upload.
   the push to `main`, which is also the only event permitted to populate this
   lane's cache.
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
-  builds of all nine targets, 300 s per target at `-max_len=65536`, bounded
+  builds of all ten targets, 300 s per target at `-max_len=65536`, bounded
   crash artifacts uploaded after size/count checks, a 2048 MiB RSS cap, 7-day
   retention, and concurrency capped at two targets. Unchanged by #3902/#4238.
 

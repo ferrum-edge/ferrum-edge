@@ -2352,14 +2352,15 @@ admitted texts oldest first, and a generation retires once its successor is on
   `-rss_limit_mb=1024` — is byte-identical to the loop's, so the budget is
   widened by one target rather than relaxed.
 - `CI_FUZZ_SMOKE_JOB` — the adopted shape (#6584): identical, plus a bounded
-  loop over `ocsp_response` and `jwt_svid`, the hand-rolled stapled-OCSP DER
-  grammar and the JWT-SVID strict-JSON and token validator, at the same 64 KiB
+  loop over `ocsp_response`, `jwt_svid`, and `tls_material`: the hand-rolled
+  stapled-OCSP DER grammar, the JWT-SVID strict-JSON, token, and JWKS
+  validators, and PEM certificate/key/CRL admission, at the same 64 KiB
   `-max_len` and otherwise the six-target loop's bounds. The loop runs before
   `datagram_client_address`, so that invocation stays the one that saves the
   BoringCache entry. `CI_FUZZ_SMOKE_PARSER_BUDGET` freezes the loop in its
   native projection: it must appear exactly once in the adopted generation and
-  in no earlier one. Adopted-generation mutations reject dropping either target
-  and re-bounding the loop to 4 KiB, and the `fuzz.yml` freeze carries both
+  in no earlier one. Adopted-generation mutations reject dropping a target and
+  re-bounding the loop to 4 KiB, and the `fuzz.yml` freeze carries all three
   targets in its matrix and shell allowlist.
 
   Scheduling them edits the byte-frozen `fuzz-smoke` job and `fuzz.yml`

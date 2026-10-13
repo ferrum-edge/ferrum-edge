@@ -907,10 +907,10 @@ FUZZ_SMOKE_PATTERNS = [
         r"^src/config/file_loader\.rs$",
         r"^src/config_sources/k8s/",
         r"^src/identity/spiffe",
-        # `ocsp_response` / `jwt_svid` (issue #6584): the OCSP grammar, the
-        # JWT-SVID validator and its authority type, and the synthetic RSA key
-        # pair the fixed fuzz bundle embeds.
-        r"^src/tls/ocsp\.rs$",
+        # `ocsp_response` / `jwt_svid` / `tls_material` (issue #6584): the OCSP
+        # grammar, PEM/CRL admission, the JWT-SVID validator and its authority
+        # type, and the synthetic RSA key pair the fixed fuzz bundle embeds.
+        r"^src/tls/(?:mod|ocsp|crl_policy)\.rs$",
         r"^src/identity/jwt_svid/",
         r"^src/identity/ca/mod\.rs$",
         r"^tests/fixtures/test_rsa_(?:public|private)\.pem$",
@@ -999,7 +999,7 @@ STANDALONE_CARGO_PATTERNS = [
         r"^src/config/",
         r"^src/config_sources/k8s/",
         r"^src/identity/",
-        r"^src/tls/ocsp\.rs$",
+        r"^src/tls/(?:mod|ocsp|crl_policy)\.rs$",
         r"^tests/fixtures/test_rsa_(?:public|private)\.pem$",
         r"^src/load_balancer",
         r"^src/modes/mesh/",
