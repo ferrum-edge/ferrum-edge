@@ -142,3 +142,26 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .windows(needle.len())
         .position(|window| window == needle)
 }
+
+/// Unqualified attribute lookup for `roxmltree` nodes.
+///
+/// Since roxmltree 0.21, `Node::attribute("name")` (and `has_attribute` /
+/// `attribute_node`) match the local name in *any* namespace and return the
+/// first match, so `attribute("ID")` also returns a prefixed `x:ID` that
+/// precedes the unqualified `ID`. XML attributes never inherit a default
+/// namespace, and WS-Security, SAML, and XML-Signature define the attributes
+/// read here (`ID`, `URI`, `Algorithm`, ...) as unqualified, so a prefixed
+/// look-alike must not be read in their place. Use a `(namespace, local)`
+/// tuple with `attribute` for a namespaced attribute.
+pub trait UnqualifiedAttribute<'a> {
+    /// Value of the attribute named `local` that has no namespace.
+    fn unqualified_attribute(&self, local: &str) -> Option<&'a str>;
+}
+
+impl<'a, 'input: 'a> UnqualifiedAttribute<'a> for roxmltree::Node<'a, 'input> {
+    fn unqualified_attribute(&self, local: &str) -> Option<&'a str> {
+        self.attributes()
+            .find(|attribute| attribute.namespace().is_none() && attribute.name() == local)
+            .map(|attribute| attribute.value())
+    }
+}

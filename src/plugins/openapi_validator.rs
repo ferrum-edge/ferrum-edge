@@ -50,7 +50,7 @@ use super::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
     schema_violation_detail, xml_error_category,
 };
-use super::utils::xml_bounds::xml_nesting_depth_within_limit;
+use super::utils::xml_bounds::{UnqualifiedAttribute, xml_nesting_depth_within_limit};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -2675,6 +2675,8 @@ fn xml_body_to_value(
         roxmltree::ParsingOptions {
             allow_dtd: false,
             nodes_limit: XML_MAX_NODES,
+            // No resolver: an external entity is never fetched or inlined.
+            entity_resolver: None,
         },
     )
     .map_err(|error| format!("Invalid XML body: {}", xml_error_category(&error)))?;
@@ -5746,7 +5748,7 @@ fn xml_attribute_value<'a>(
     match namespace {
         Some(namespace) => node.attribute((namespace, local)),
         // Attributes do not inherit default namespaces; omit => unqualified only.
-        None => node.attribute(local),
+        None => node.unqualified_attribute(local),
     }
 }
 

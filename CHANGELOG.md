@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notification, session `DELETE` and discovery now use the redacted tracked
   HTTP helper, so a credential in the upstream URL path is not written to
   slow-call or egress-denial warnings.
+- **XML attribute lookups stay unqualified on roxmltree 0.21** (PR #6558).
+  roxmltree 0.21 makes `Node::attribute("ID")` return the first attribute
+  with that local name in any namespace. `soap_ws_security` (WS-Security,
+  SAML and XML-Signature `ID`, `URI`, `Algorithm`, validity and
+  confirmation attributes) and `openapi_validator` (attributes without
+  `xml.namespace`) now read only the unqualified attribute, so a prefixed
+  look-alike such as `x:ID` placed first cannot stand in for it. The XML
+  parsers pass no external-entity resolver.
 
 ### Fixed
 

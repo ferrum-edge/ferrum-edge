@@ -724,6 +724,8 @@ impl BodyValidator {
                 // external entity.
                 allow_dtd: true,
                 nodes_limit: XML_MAX_NODES,
+                // No resolver: an external entity is never fetched or inlined.
+                entity_resolver: None,
             },
         )
         .map_err(|e| format!("Invalid XML: {}", xml_error_category(&e)))?;

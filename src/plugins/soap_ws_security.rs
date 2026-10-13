@@ -355,7 +355,9 @@ use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
 use super::utils::validation_diagnostics::xml_error_category;
-use super::utils::xml_bounds::{XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit};
+use super::utils::xml_bounds::{
+    UnqualifiedAttribute, XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 // ── Namespace URIs ──────────────────────────────────────────────────────────
@@ -2661,7 +2663,7 @@ impl SoapWsSecurity {
         // (Nonce / Created / replay protection) to plain PasswordText by sending
         // `Type="...#PasswordText"`. If a recognized `Type` attribute is present
         // it must agree with the configured policy; a mismatch is rejected.
-        if let Some(type_attr) = password_element.attribute("Type") {
+        if let Some(type_attr) = password_element.unqualified_attribute("Type") {
             let wire_type =
                 if type_attr.contains("PasswordDigest") || type_attr == PASSWORD_DIGEST_TYPE {
                     Some(PasswordType::PasswordDigest)
@@ -3566,9 +3568,11 @@ impl SoapWsSecurity {
             "WS-Security",
         )?
         .ok_or_else(|| "WS-Security: SignedInfo missing SignatureMethod".to_string())?;
-        let sig_algorithm_uri = sig_method.attribute("Algorithm").ok_or_else(|| {
-            "WS-Security: SignatureMethod missing Algorithm attribute".to_string()
-        })?;
+        let sig_algorithm_uri = sig_method
+            .unqualified_attribute("Algorithm")
+            .ok_or_else(|| {
+                "WS-Security: SignatureMethod missing Algorithm attribute".to_string()
+            })?;
 
         let sig_algorithm = match sig_algorithm_uri {
             XMLDSIG_RSA_SHA256 => SignatureAlgorithm::RsaSha256,
@@ -3700,7 +3704,7 @@ impl SoapWsSecurity {
         let mut reference_ids: Vec<&str> = Vec::with_capacity(references.len());
         for reference in &references {
             let uri = reference
-                .attribute("URI")
+                .unqualified_attribute("URI")
                 .ok_or_else(|| "WS-Security: Reference missing URI attribute".to_string())?;
             let Some(ref_id) = uri.strip_prefix('#') else {
                 return Err("WS-Security: unsupported non-fragment Reference URI".to_string());
@@ -3733,7 +3737,7 @@ impl SoapWsSecurity {
             )?
             .ok_or_else(|| "WS-Security: Reference missing DigestMethod".to_string())?;
             let digest_alg_uri = digest_method
-                .attribute("Algorithm")
+                .unqualified_attribute("Algorithm")
                 .ok_or_else(|| "WS-Security: DigestMethod missing Algorithm".to_string())?;
 
             // Extract expected digest
@@ -4011,14 +4015,14 @@ impl SoapWsSecurity {
         })?;
 
         let not_before = conditions
-            .attribute("NotBefore")
+            .unqualified_attribute("NotBefore")
             .ok_or_else(|| "WS-Security: SAML Conditions missing NotBefore".to_string())
             .and_then(|raw| {
                 parse_ws_datetime(raw)
                     .ok_or_else(|| "WS-Security: invalid SAML NotBefore".to_string())
             })?;
         let not_on_or_after = conditions
-            .attribute("NotOnOrAfter")
+            .unqualified_attribute("NotOnOrAfter")
             .ok_or_else(|| "WS-Security: SAML Conditions missing NotOnOrAfter".to_string())
             .and_then(|raw| {
                 parse_ws_datetime(raw)
@@ -4121,8 +4125,8 @@ impl SoapWsSecurity {
         // burn a legitimate one's id, and before the identity is returned so no
         // caller can act on an assertion whose claim was refused.
         let assertion_id = assertion_node
-            .attribute("ID")
-            .or_else(|| assertion_node.attribute("AssertionID"))
+            .unqualified_attribute("ID")
+            .or_else(|| assertion_node.unqualified_attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         self.claim_saml_assertion(&issuer, assertion_id, &name_id)
             .await?;
@@ -4156,9 +4160,11 @@ impl SoapWsSecurity {
             .children()
             .filter(|node| node.has_tag_name((SAML2_ASSERTION_NS, "SubjectConfirmation")))
         {
-            let method = confirmation.attribute("Method").ok_or_else(|| {
-                "WS-Security: SAML SubjectConfirmation missing Method attribute".to_string()
-            })?;
+            let method = confirmation
+                .unqualified_attribute("Method")
+                .ok_or_else(|| {
+                    "WS-Security: SAML SubjectConfirmation missing Method attribute".to_string()
+                })?;
             if !self
                 .saml_allowed_confirmation_methods
                 .iter()
@@ -4176,14 +4182,14 @@ impl SoapWsSecurity {
                 "WS-Security: SAML SubjectConfirmation missing SubjectConfirmationData".to_string()
             })?;
 
-            if data.attribute("InResponseTo").is_some() {
+            if data.unqualified_attribute("InResponseTo").is_some() {
                 return Err(
                     "WS-Security: SAML SubjectConfirmationData carries an InResponseTo value that \
                      cannot be validated in a WS-Security bearer flow"
                         .to_string(),
                 );
             }
-            let recipient = data.attribute("Recipient").ok_or_else(|| {
+            let recipient = data.unqualified_attribute("Recipient").ok_or_else(|| {
                 "WS-Security: SAML SubjectConfirmationData missing Recipient".to_string()
             })?;
             if recipient.trim() != expected_recipient {
@@ -4194,7 +4200,7 @@ impl SoapWsSecurity {
                 );
             }
             let not_on_or_after = data
-                .attribute("NotOnOrAfter")
+                .unqualified_attribute("NotOnOrAfter")
                 .ok_or_else(|| {
                     "WS-Security: SAML SubjectConfirmationData missing NotOnOrAfter".to_string()
                 })
@@ -4211,7 +4217,7 @@ impl SoapWsSecurity {
             if now > expiry_with_skew {
                 return Err("WS-Security: SAML SubjectConfirmationData has expired".to_string());
             }
-            if let Some(raw) = data.attribute("NotBefore") {
+            if let Some(raw) = data.unqualified_attribute("NotBefore") {
                 let not_before = parse_ws_datetime(raw).ok_or_else(|| {
                     "WS-Security: invalid SAML SubjectConfirmationData NotBefore".to_string()
                 })?;
@@ -4286,9 +4292,11 @@ impl SoapWsSecurity {
             "WS-Security: SAML",
         )?
         .ok_or_else(|| "WS-Security: SAML SignedInfo missing SignatureMethod".to_string())?;
-        let sig_algorithm_uri = sig_method.attribute("Algorithm").ok_or_else(|| {
-            "WS-Security: SAML SignatureMethod missing Algorithm attribute".to_string()
-        })?;
+        let sig_algorithm_uri = sig_method
+            .unqualified_attribute("Algorithm")
+            .ok_or_else(|| {
+                "WS-Security: SAML SignatureMethod missing Algorithm attribute".to_string()
+            })?;
 
         let sig_algorithm = match sig_algorithm_uri {
             XMLDSIG_RSA_SHA256 => SignatureAlgorithm::RsaSha256,
@@ -4396,8 +4404,8 @@ impl SoapWsSecurity {
         budget: &mut WorkBudget,
     ) -> Result<(), String> {
         let assertion_id = assertion
-            .attribute("ID")
-            .or_else(|| assertion.attribute("AssertionID"))
+            .unqualified_attribute("ID")
+            .or_else(|| assertion.unqualified_attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         let expected_uri = format!("#{}", assertion_id);
 
@@ -4418,7 +4426,7 @@ impl SoapWsSecurity {
         let reference = references[0];
 
         let uri = reference
-            .attribute("URI")
+            .unqualified_attribute("URI")
             .ok_or_else(|| "WS-Security: SAML Reference missing URI attribute".to_string())?;
 
         // Only a Reference URI that targets this assertion is accepted — an
@@ -4438,9 +4446,11 @@ impl SoapWsSecurity {
             "WS-Security: SAML",
         )?
         .ok_or_else(|| "WS-Security: SAML Reference missing DigestMethod".to_string())?;
-        let digest_alg_uri = digest_method.attribute("Algorithm").ok_or_else(|| {
-            "WS-Security: SAML DigestMethod missing Algorithm attribute".to_string()
-        })?;
+        let digest_alg_uri = digest_method
+            .unqualified_attribute("Algorithm")
+            .ok_or_else(|| {
+                "WS-Security: SAML DigestMethod missing Algorithm attribute".to_string()
+            })?;
 
         let digest_value = unique_ns_child(
             reference,
@@ -5759,6 +5769,8 @@ fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>, St
         ParsingOptions {
             allow_dtd: false,
             nodes_limit: MAX_XML_NODES,
+            // No resolver: an external entity is never fetched or inlined.
+            entity_resolver: None,
         },
     )
     .map_err(|error| {
@@ -6293,7 +6305,7 @@ fn parse_signed_info_canonicalization(
         context,
     )?
     .ok_or_else(|| format!("{}: SignedInfo missing CanonicalizationMethod", context))?;
-    let algorithm = method.attribute("Algorithm").ok_or_else(|| {
+    let algorithm = method.unqualified_attribute("Algorithm").ok_or_else(|| {
         format!(
             "{}: CanonicalizationMethod missing Algorithm attribute",
             context
@@ -6348,7 +6360,7 @@ fn parse_reference_transforms(
             ));
         }
         let algorithm = transform
-            .attribute("Algorithm")
+            .unqualified_attribute("Algorithm")
             .ok_or_else(|| format!("{}: Transform missing Algorithm attribute", context))?;
         match algorithm {
             XMLDSIG_ENVELOPED_SIGNATURE => {
@@ -6427,7 +6439,7 @@ fn parse_inclusive_namespaces(
         return Ok(Vec::new());
     };
     let prefix_list = parameter
-        .attribute("PrefixList")
+        .unqualified_attribute("PrefixList")
         .ok_or_else(|| format!("{}: InclusiveNamespaces missing PrefixList", context))?;
     if prefix_list.len() > MAX_INCLUSIVE_PREFIX_LIST_BYTES {
         return Err(format!(
