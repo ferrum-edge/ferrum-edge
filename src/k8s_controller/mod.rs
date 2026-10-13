@@ -807,12 +807,59 @@ pub fn with_ferrum_client_defaults(mut config: kube::Config) -> kube::Config {
     config
 }
 
-/// `kube::Client::try_default()` with [`with_ferrum_client_defaults`] applied.
-pub async fn try_default_kube_client() -> Result<kube::Client, kube::Error> {
-    let config = kube::Config::infer()
-        .await
-        .map_err(kube::Error::InferConfig)?;
+/// `kube::Client::try_default()` with [`with_ferrum_client_defaults`] applied
+/// and the configuration loaded through [`infer_kube_config`].
+pub async fn try_default_kube_client() -> Result<kube::Client, String> {
+    let config = infer_kube_config().await?;
     kube::Client::try_from(with_ferrum_client_defaults(config))
+        .map_err(|error| format!("failed to build Kubernetes client: {error}"))
+}
+
+/// Fixed text that replaces a kubeconfig YAML parse error.
+pub const KUBECONFIG_PARSE_ERROR_REDACTED: &str =
+    "kubeconfig YAML could not be parsed (parser detail withheld: it quotes kubeconfig source)";
+
+/// Render a kubeconfig/inference error without kubeconfig source text.
+///
+/// kube 4 parses kubeconfigs with serde-saphyr, whose errors quote the source
+/// lines around the failure. A kubeconfig holds tokens, passwords and keys, so
+/// a malformed entry next to one would put that credential into a log line or
+/// a returned error. If any error in the chain is a YAML parse error, only
+/// [`KUBECONFIG_PARSE_ERROR_REDACTED`] is rendered.
+pub fn redacted_kube_config_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if matches!(
+            err.downcast_ref::<kube::config::KubeconfigError>(),
+            Some(kube::config::KubeconfigError::Parse(_))
+        ) {
+            return KUBECONFIG_PARSE_ERROR_REDACTED.to_string();
+        }
+        current = err.source();
+    }
+    error.to_string()
+}
+
+/// `kube::Config::infer()` without kubeconfig source text in its errors.
+///
+/// Same order as kube's `infer`: the kubeconfig (`KUBECONFIG` or
+/// `~/.kube/config`) first, then the in-cluster service account, then
+/// `apply_debug_overrides`. kube's own `infer` also writes the raw kubeconfig
+/// error to a trace event, so it is not called.
+pub async fn infer_kube_config() -> Result<kube::Config, String> {
+    let mut config =
+        match kube::Config::from_kubeconfig(&kube::config::KubeConfigOptions::default()).await {
+            Ok(config) => config,
+            Err(kubeconfig_err) => kube::Config::incluster().map_err(|in_cluster_err| {
+                format!(
+                    "failed to infer Kubernetes config: in-cluster: ({in_cluster_err}), \
+                     kubeconfig: ({})",
+                    redacted_kube_config_error(&kubeconfig_err)
+                )
+            })?,
+        };
+    config.apply_debug_overrides();
+    Ok(config)
 }
 
 async fn build_kube_client(
@@ -820,15 +867,18 @@ async fn build_kube_client(
 ) -> Result<kube::Client, anyhow::Error> {
     let config = if let Some(path) = kubeconfig_path {
         info!(path, "Loading kubeconfig from explicit path");
-        let kubeconfig = kube::config::Kubeconfig::read_from(path)?;
-        kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default()).await?
+        let kubeconfig = kube::config::Kubeconfig::read_from(path)
+            .map_err(|error| anyhow::anyhow!(redacted_kube_config_error(&error)))?;
+        kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
+            .await
+            .map_err(|error| anyhow::anyhow!(redacted_kube_config_error(&error)))?
     } else {
         match kube::Config::incluster() {
             Ok(c) => {
                 info!("Using in-cluster Kubernetes config");
                 c
             }
-            Err(in_cluster_err) => match kube::Config::infer().await {
+            Err(in_cluster_err) => match infer_kube_config().await {
                 Ok(c) => {
                     info!("Using inferred kubeconfig (not in-cluster)");
                     c

@@ -3900,7 +3900,7 @@ async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
 async fn build_node_agent_kube_client() -> Result<kube::Client, anyhow::Error> {
     let config = match kube::Config::incluster() {
         Ok(config) => config,
-        Err(in_cluster_err) => match kube::Config::infer().await {
+        Err(in_cluster_err) => match crate::k8s_controller::infer_kube_config().await {
             Ok(config) => config,
             Err(infer_err) => {
                 anyhow::bail!(
