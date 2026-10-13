@@ -971,8 +971,7 @@ fn default_grpc_max_decompressed_size_bytes() -> usize {
 /// so it cannot fail every body_validator config on that node, but it can never
 /// lift the decompression bound. Pure, so the clamp is testable without
 /// mutating process environment in a parallel test binary.
-#[doc(hidden)]
-pub fn inherited_grpc_max_decompressed_size_bytes(raw: Option<&str>) -> usize {
+pub(crate) fn inherited_grpc_max_decompressed_size_bytes(raw: Option<&str>) -> usize {
     raw.and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE)

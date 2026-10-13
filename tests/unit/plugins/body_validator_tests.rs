@@ -6500,7 +6500,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
 /// above the 64 MiB ceiling cannot lift the gRPC decompression bound.
 #[test]
 fn inherited_grpc_decompression_default_is_clamped_to_the_ceiling() {
-    use ferrum_edge::plugins::body_validator::inherited_grpc_max_decompressed_size_bytes;
+    use ferrum_edge::_test_support::inherited_grpc_max_decompressed_size_bytes_for_test as inherited_grpc_max_decompressed_size_bytes;
 
     let ceiling = 64 * 1024 * 1024;
     assert_eq!(
