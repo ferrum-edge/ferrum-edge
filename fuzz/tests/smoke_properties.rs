@@ -1,6 +1,7 @@
 use ferrum_edge::fuzz_support::{
-    MAX_FUZZ_INPUT_BYTES, fuzz_decode_config_document, fuzz_drain_mesh_udp_frames,
-    fuzz_jwt_svid_invariant, fuzz_parse_datagram_header, fuzz_parse_proxy_protocol,
+    MAX_FUZZ_INPUT_BYTES, fuzz_crl_window_accepts, fuzz_decode_config_document,
+    fuzz_drain_mesh_udp_frames, fuzz_jwks_accepts, fuzz_jwt_svid_invariant,
+    fuzz_parse_datagram_header, fuzz_parse_proxy_protocol, fuzz_tls_material_invariant,
     fuzz_translate_k8s_json, fuzz_validate_ocsp_structure, fuzz_validate_plugin_config,
     mesh_udp_frame_round_trip, ocsp_structure_invariant, smoke_invariants,
     traceparent_round_trip_invariant,
@@ -56,6 +57,11 @@ proptest! {
     fn jwt_svid_rejects_every_unsigned_input(data in prop::collection::vec(any::<u8>(), 0..=1024)) {
         prop_assert!(fuzz_jwt_svid_invariant(&data));
     }
+
+    #[test]
+    fn tls_material_invariants_hold(data in prop::collection::vec(any::<u8>(), 0..=1024)) {
+        prop_assert!(fuzz_tls_material_invariant(&data));
+    }
 }
 
 /// Every committed seed must keep its target's invariant, and the
@@ -87,6 +93,33 @@ fn jwt_svid_seeds_hold_the_forgery_invariant() {
         let path = entry.expect("corpus entry").path();
         let bytes = std::fs::read(&path).expect("seed bytes");
         assert!(fuzz_jwt_svid_invariant(&bytes), "{}", path.display());
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("jwks_valid_") {
+            assert!(
+                fuzz_jwks_accepts(&bytes[1..]),
+                "{name} must be an accepted JWKS so the round trip is exercised"
+            );
+        }
+        seeds += 1;
+    }
+    assert!(seeds > 0);
+}
+
+#[test]
+fn tls_material_seeds_hold_invariants_and_the_valid_crl_is_admitted() {
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/tls_material");
+    let mut seeds = 0;
+    for entry in std::fs::read_dir(&corpus).expect("tls_material corpus") {
+        let path = entry.expect("corpus entry").path();
+        let bytes = std::fs::read(&path).expect("seed bytes");
+        assert!(fuzz_tls_material_invariant(&bytes), "{}", path.display());
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("valid_crl") {
+            assert!(
+                fuzz_crl_window_accepts(&bytes[1..]),
+                "{name} must be inside its validity window"
+            );
+        }
         seeds += 1;
     }
     assert!(seeds > 0);
