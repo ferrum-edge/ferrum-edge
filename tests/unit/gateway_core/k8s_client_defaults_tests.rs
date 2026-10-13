@@ -3,7 +3,6 @@
 //! and kubeconfig errors never carry kubeconfig source text
 //! (`k8s_controller::redacted_kube_config_error`).
 
-use std::error::Error as _;
 use std::time::Duration;
 
 use ferrum_edge::k8s_controller::{
@@ -196,8 +195,9 @@ fn malformed_exec_plugin_output_is_redacted_when_the_client_is_built() {
         ..Default::default()
     });
 
-    let error = build_kube_client_from_config(config)
-        .expect_err("malformed exec plugin output must fail client construction");
+    let Err(error) = build_kube_client_from_config(config) else {
+        panic!("malformed exec plugin output must fail client construction");
+    };
 
     assert!(
         error.contains(KUBE_AUTH_EXEC_PARSE_ERROR_REDACTED),
