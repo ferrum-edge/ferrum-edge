@@ -28,6 +28,16 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### keyauth API keys need at least 16 non-whitespace characters (#6577)
+
+Consumer create, update, batch, restore, and the credential endpoints now
+reject a `keyauth` `key` with fewer than 16 non-whitespace characters (`400`),
+and a file-mode config that contains one fails to load. Keys already stored in
+a database keep authenticating, with a validation warning at each load, until
+you rotate them. Find short keys before upgrading a file-mode gateway, and
+rotate them through `POST /consumers/{id}/credentials/keyauth` (add the new
+key, move clients, then delete the old entry).
+
 ### Gateway material references from `ns`-claimed operator tokens (#6092, PR #6316)
 
 An `operator` admin token that carries an `ns` claim is now confined even when
