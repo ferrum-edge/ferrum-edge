@@ -15094,10 +15094,30 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         schema["properties"]["ttl_seconds"]["maximum"],
         json!(u64::MAX)
     );
+    // Issue #6612: `max_entries` sizes eviction bookkeeping, so it carries a
+    // hard admission ceiling instead of the whole u64 domain.
     assert_eq!(
         schema["properties"]["max_entries"]["maximum"],
-        json!(u64::MAX)
+        json!(10_000_000)
     );
+    for (max_entries, expected_valid) in [
+        (10_000_000_u64, true),
+        (10_000_001, false),
+        (u64::MAX, false),
+    ] {
+        let config = json!({"max_entries": max_entries});
+        assert_component_validity(&spec, "ResponseCachingConfig", &config, expected_valid);
+        assert_eq!(
+            ResponseCaching::new(&config).is_ok(),
+            expected_valid,
+            "component and constructor must agree on max_entries={max_entries}"
+        );
+        assert_eq!(
+            validate_plugin_config("response_caching", &config).is_ok(),
+            expected_valid,
+            "shared admission must agree on max_entries={max_entries}"
+        );
+    }
     assert_eq!(
         schema["properties"]["max_entry_size_bytes"]["maximum"],
         json!(u64::MAX)

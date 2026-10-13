@@ -33194,9 +33194,9 @@ components:
           type: [integer, "null"]
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 10000000
           default: 10000
-          description: Maximum number of cached entries. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — no full-map clone or sort is performed while the accounting mutex is held. Must be greater than zero.
+          description: Maximum number of cached entries, 1 to 10000000. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — no full-map clone or sort is performed while the accounting mutex is held. A value above the ceiling is rejected at admission.
         max_entry_size_bytes:
           type: [integer, "null"]
           format: uint64

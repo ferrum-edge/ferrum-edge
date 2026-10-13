@@ -134,6 +134,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `response_caching` caps `max_entries` at 10,000,000**
+  (issue #6612). The value sized an up-front capacity reservation, so one
+  huge integer in config could abort the process during a reload instead
+  of failing validation. Admission now rejects anything above the ceiling,
+  `openapi.yaml` publishes the same `maximum`, and the predictor's initial
+  reservation is capped at 1024 slots whatever `max_entries` is.
+
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
