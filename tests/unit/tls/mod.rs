@@ -10,6 +10,7 @@ mod crl_policy_tests;
 mod fips_key_admission_tests;
 mod fips_policy_tests;
 mod frontend_trust_binding_tests;
+mod inbound_crl_resumption_tests;
 mod inventory_public_metadata_tests;
 mod managed_store_ha_tests;
 mod material_size_cap_tests;

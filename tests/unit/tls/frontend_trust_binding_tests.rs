@@ -1128,33 +1128,74 @@ fn assert_source_order(source: &str, needles: &[&str], message: &str) {
     }
 }
 
-/// Suppressing TLS 1.3 resumption is required only where a withdrawal can
-/// actually land: a session ticket does not re-run client-certificate
-/// verification, so a listener bound to a client-trust scope must not issue
-/// one. A listener that is never bound can never publish a generation, so it
-/// has to keep the resumption it had before issue #3857 — otherwise every
-/// static mTLS deployment silently pays a full handshake per connection for a
-/// protection that cannot engage.
+/// Suppressing resumption is required wherever a later handshake must reach
+/// the client-certificate verifier, because a resumed session does not re-run
+/// it:
+///
+/// - a listener bound to a client-trust scope can publish a withdrawal;
+/// - a verifier that enforces CRLs must check each CRL's `nextUpdate` on every
+///   handshake, even on a static listener (issue #6538).
+///
+/// A static mTLS listener without CRLs can neither publish a generation nor
+/// see an enforced CRL expire, so it keeps the resumption it had before issue
+/// #3857. Suppression must cover TLS 1.2 RFC 5077 tickets too, not only TLS 1.3
+/// tickets and the stateful cache.
 #[test]
-fn resumption_is_suppressed_only_for_a_scope_bound_mtls_listener() {
+fn resumption_is_suppressed_for_scope_bound_or_crl_enforcing_mtls_listeners() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pki = build_pki();
     let crls = parse_crls(&pki.crl_pem(&[UNRELATED_SERIAL], 1));
+    let no_crls: CrlList = std::sync::Arc::new(Vec::new());
 
-    let unbound = load_accepted_frontend_parts(
+    let assert_resumption = |config: &rustls::ServerConfig, enabled: bool, why: &str| {
+        assert_eq!(
+            config.send_tls13_tickets > 0,
+            enabled,
+            "TLS 1.3 tickets: {why}"
+        );
+        assert_eq!(config.ticketer.enabled(), enabled, "TLS 1.2 tickets: {why}");
+        assert_eq!(
+            config.session_storage.can_cache(),
+            enabled,
+            "stateful session cache: {why}"
+        );
+    };
+
+    let unbound_static = load_accepted_frontend_parts(
         dir.path(),
-        "resumption-unbound",
+        "resumption-unbound-static",
+        &pki.server_cert_pem,
+        &pki.server_key_pem,
+        &pki.ca_pem,
+        &no_crls,
+        None,
+    )
+    .expect("unbound mTLS candidate without CRLs");
+    assert_resumption(
+        unbound_static.config.as_ref(),
+        true,
+        "a static mTLS listener without CRLs keeps resumption: nothing it enforces can change",
+    );
+    assert!(!unbound_static.client_trust.crls_enforced);
+
+    let unbound_crl = load_accepted_frontend_parts(
+        dir.path(),
+        "resumption-unbound-crl",
         &pki.server_cert_pem,
         &pki.server_key_pem,
         &pki.ca_pem,
         &crls,
         None,
     )
-    .expect("unbound mTLS candidate");
+    .expect("unbound mTLS candidate with CRLs");
+    assert_resumption(
+        unbound_crl.config.as_ref(),
+        false,
+        "a CRL-enforcing listener must not let a resumed session skip the CRL expiry check",
+    );
     assert!(
-        unbound.config.send_tls13_tickets > 0,
-        "a static mTLS listener must keep TLS 1.3 session tickets: no generation can advance, \
-         so no ticket can outlive a withdrawal"
+        unbound_crl.client_trust.crls_enforced,
+        "the adopting HTTP/3 family must learn that this verifier enforces CRLs"
     );
 
     let bound = load_accepted_frontend_parts(
@@ -1163,14 +1204,15 @@ fn resumption_is_suppressed_only_for_a_scope_bound_mtls_listener() {
         &pki.server_cert_pem,
         &pki.server_key_pem,
         &pki.ca_pem,
-        &crls,
+        &no_crls,
         Some(ClientTrustScope::ProxyFrontend),
     )
     .expect("scope-bound mTLS candidate");
-    assert_eq!(
-        bound.config.send_tls13_tickets, 0,
-        "a listener that can publish a withdrawal must not issue resumption tickets that skip \
-         client-certificate verification"
+    assert_resumption(
+        bound.config.as_ref(),
+        false,
+        "a listener that can publish a withdrawal must not resume sessions that skip \
+         client-certificate verification",
     );
 }
 
@@ -1924,6 +1966,7 @@ fn trust_only_candidate(ca_path: &str, crls: &CrlList) -> AcceptedClientTrust {
     AcceptedClientTrust {
         verifier: Some(candidate.verifier),
         material: candidate.material,
+        crls_enforced: candidate.crls_enforced,
     }
 }
 

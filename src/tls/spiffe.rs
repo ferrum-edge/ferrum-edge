@@ -200,7 +200,7 @@ pub fn build_spiffe_inbound_config(
     let verifier = SpiffeClientCertVerifier::new(
         bundle_slot.clone(),
         peer_required,
-        inbound_admission_artifact(crls),
+        inbound_admission_artifact(Arc::clone(&crls)),
     );
     let server_resolver = SpiffeServerCertResolver::new(bundle_slot);
 
@@ -210,6 +210,9 @@ pub fn build_spiffe_inbound_config(
     // SPIFFE inbound is currently used by HBONE listeners, which require
     // HTTP/2 over mTLS.
     cfg.alpn_protocols = vec![b"h2".to_vec()];
+    // rustls enables a stateful session cache by default. A resumed peer would
+    // skip the CRL expiry check (issue #6538).
+    crate::tls::apply_crl_enforced_server_resumption(&mut cfg, &crls);
     Ok(Arc::new(cfg))
 }
 
