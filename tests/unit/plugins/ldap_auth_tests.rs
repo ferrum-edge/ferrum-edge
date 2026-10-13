@@ -3682,3 +3682,199 @@ async fn search_bind_unknown_user_performs_an_equalizing_bind() {
     assert!(!ldap_message_contains(&bind, "client-password-123"));
     assert!(!ldap_message_contains(&bind, "nobody-here"));
 }
+
+/// One scripted LDAP connection for the group re-check tests.
+#[derive(Clone, Copy, Debug)]
+enum LdapStep {
+    /// Direct bind succeeds and the canonical identity search answers.
+    Bind,
+    /// Anonymous group search; `true` returns the required group.
+    Group(bool),
+    /// Anonymous group search fails with `operationsError`.
+    GroupError,
+    /// Anonymous group search never answers.
+    GroupStall,
+}
+
+/// Serve `steps` on successive connections and count every accepted
+/// connection, including any beyond the script.
+async fn spawn_scripted_ldap_server(steps: Vec<LdapStep>) -> (u16, Arc<AtomicUsize>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind scripted LDAP server");
+    let port = listener.local_addr().expect("local addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        let mut steps = steps.into_iter();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let Some(step) = steps.next() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                match step {
+                    LdapStep::Bind => {
+                        read_ldap_message(&mut stream).await;
+                        let _ = stream.write_all(&bind_response(1, 0)).await;
+                        answer_canonical_identity_search(&mut stream).await;
+                    }
+                    LdapStep::Group(member) => answer_group_search(&mut stream, member).await,
+                    LdapStep::GroupError => {
+                        read_ldap_message(&mut stream).await;
+                        let _ = stream.write_all(&search_result_done(1, 1)).await;
+                        let _ = stream.flush().await;
+                    }
+                    LdapStep::GroupStall => {
+                        read_ldap_message(&mut stream).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                }
+            });
+        }
+    });
+    (port, accepted)
+}
+
+fn group_window_plugin(
+    port: u16,
+    group_cache_ttl_seconds: u64,
+    extra: serde_json::Value,
+) -> LdapAuth {
+    let mut config = json!({
+        "ldap_url": format!("ldap://127.0.0.1:{port}"),
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+        "canonical_identity_attribute": "uid",
+        "group_base_dn": "ou=groups,dc=example,dc=com",
+        "required_groups": ["gateway-admins"],
+        "cache_ttl_seconds": 300,
+        "group_cache_ttl_seconds": group_cache_ttl_seconds
+    });
+    for (key, value) in extra.as_object().expect("extra object") {
+        config[key] = value.clone();
+    }
+    LdapAuth::new(&config, http_client()).expect("valid cached group config")
+}
+
+/// A nonzero group window really expires: inside it a hit makes no directory
+/// call, after it the hit re-checks and refreshes the window, and the next
+/// expiry after a removal refuses the user.
+#[tokio::test]
+async fn nonzero_group_window_expires_refreshes_and_then_refuses() {
+    let (port, accepted) = spawn_scripted_ldap_server(vec![
+        LdapStep::Bind,
+        LdapStep::Group(true),
+        LdapStep::Group(true),
+        LdapStep::Group(false),
+    ])
+    .await;
+    let plugin = group_window_plugin(port, 1, json!({}));
+
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "uncached bind + group check"
+    );
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "inside the window: no directory call"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        3,
+        "window expired: one group re-check"
+    );
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        3,
+        "re-check refreshed the window"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_reject(authenticate_alice(&plugin).await, Some(403));
+    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+}
+
+/// A directory error during a re-check fails closed and keeps the entry, so
+/// the next request re-checks again instead of being admitted.
+#[tokio::test]
+async fn group_recheck_error_fails_closed_and_retries() {
+    let (port, accepted) = spawn_scripted_ldap_server(vec![
+        LdapStep::Bind,
+        LdapStep::Group(true),
+        LdapStep::GroupError,
+        LdapStep::Group(true),
+    ])
+    .await;
+    let plugin = group_window_plugin(port, 0, json!({}));
+
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_reject(authenticate_alice(&plugin).await, Some(500));
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        4,
+        "the retry re-checked groups on the kept entry rather than binding again"
+    );
+}
+
+/// A stalled re-check is bounded by `request_timeout_seconds` and fails closed.
+#[tokio::test]
+async fn group_recheck_deadline_fails_closed() {
+    let (port, _accepted) = spawn_scripted_ldap_server(vec![
+        LdapStep::Bind,
+        LdapStep::Group(true),
+        LdapStep::GroupStall,
+    ])
+    .await;
+    let plugin = group_window_plugin(
+        port,
+        0,
+        json!({"connect_timeout_seconds": 5, "request_timeout_seconds": 1}),
+    );
+
+    assert_continue(authenticate_alice(&plugin).await);
+    let started = std::time::Instant::now();
+    assert_reject(authenticate_alice(&plugin).await, Some(500));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the re-check must stop at request_timeout_seconds"
+    );
+}
+
+/// A re-check needs a concurrency permit like an uncached flow; without one it
+/// fails closed immediately.
+#[tokio::test]
+async fn group_recheck_without_a_permit_fails_closed() {
+    let (port, _accepted) = spawn_scripted_ldap_server(vec![
+        LdapStep::Bind,
+        LdapStep::Group(true),
+        LdapStep::GroupStall,
+    ])
+    .await;
+    let plugin = Arc::new(group_window_plugin(
+        port,
+        0,
+        json!({"max_concurrent_requests": 1, "request_timeout_seconds": 5}),
+    ));
+
+    assert_continue(authenticate_alice(&plugin).await);
+    // The first re-check holds the only permit while its search stalls.
+    let holder = tokio::spawn({
+        let plugin = Arc::clone(&plugin);
+        async move { authenticate_alice(&plugin).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_reject(authenticate_alice(&plugin).await, Some(500));
+    holder.abort();
+}

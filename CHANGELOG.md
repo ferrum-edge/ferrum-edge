@@ -142,8 +142,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds; a user removed from every required group gets 403 and the entry is
   evicted. Password-change and disablement lag stays bounded by
   `cache_ttl_seconds`, now documented, and values above 900 seconds log a
-  warning. Search-then-bind also spends one equalizing bind on an unknown
-  username so response timing does not reveal which usernames exist.
+  warning. Search-then-bind also spends one connection and bind on an unknown
+  username, removing the extra round trips a known user's wrong password used
+  to cost; directory-side password-hash cost for existing entries can still
+  differ.
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
