@@ -2755,7 +2755,23 @@ impl DatabaseStore {
                 hmac_quarantined.len()
             );
         }
-        let consumer_quarantine_active = !quarantined.is_empty() || !hmac_quarantined.is_empty();
+        // Fail-closed keyauth/basicauth/mtls_auth collisions (issue #6572):
+        // `ConsumerIndex` resolves a shared credential last-wins, so strip it
+        // from every later claimant instead of publishing behind a warning.
+        // `consumer_credential_index` blocks new collisions at write time.
+        let credential_quarantined = config.quarantine_colliding_consumer_credentials();
+        if !credential_quarantined.is_empty() {
+            for message in &credential_quarantined {
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
+            }
+            error!(
+                "Quarantined {} colliding consumer credential(s) during full config load",
+                credential_quarantined.len()
+            );
+        }
+        let consumer_quarantine_active = !quarantined.is_empty()
+            || !hmac_quarantined.is_empty()
+            || !credential_quarantined.is_empty();
 
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()

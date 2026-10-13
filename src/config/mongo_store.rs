@@ -9666,8 +9666,18 @@ mod inner {
                     crate::startup::sanitize_startup_cause(message, &[])
                 );
             }
-            let consumer_quarantine_active =
-                !identity_quarantined.is_empty() || !hmac_quarantined.is_empty();
+            // Fail-closed keyauth/basicauth/mtls_auth collisions (issue
+            // #6572), parity with the SQL loader.
+            let credential_quarantined = config.quarantine_colliding_consumer_credentials();
+            for message in &credential_quarantined {
+                error!(
+                    "MongoDB config: {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
+            }
+            let consumer_quarantine_active = !identity_quarantined.is_empty()
+                || !hmac_quarantined.is_empty()
+                || !credential_quarantined.is_empty();
 
             // Serving-mode repairability (issue #4526), parity with the SQL
             // loader: quarantine stored plugin rows the shared construction

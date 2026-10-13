@@ -13873,6 +13873,11 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Config reload: {}", message);
         }
+        // Same boundary for keyauth/basicauth/mtls_auth credentials shared by
+        // two Consumers, which the index would otherwise resolve last-wins.
+        for message in new_config.quarantine_colliding_consumer_credentials() {
+            error!("Config reload: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -14715,6 +14720,9 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Incremental config: {}", message);
         }
+        for message in new_config.quarantine_colliding_consumer_credentials() {
+            error!("Incremental config: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -15111,6 +15119,7 @@ impl ProxyState {
         candidate.normalize_fields();
         candidate.resolve_upstream_tls();
         let _ = candidate.quarantine_invalid_hmac_credentials();
+        let _ = candidate.quarantine_colliding_consumer_credentials();
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
             &self.gateway_svid_bundle,

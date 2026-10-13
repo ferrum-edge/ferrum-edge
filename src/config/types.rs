@@ -4991,6 +4991,129 @@ impl GatewayConfig {
         messages
     }
 
+    /// Fail-closed handling of cross-Consumer keyauth, basicauth, and mtls_auth
+    /// credential collisions at full-load and swap time (issue #6572).
+    ///
+    /// `ConsumerIndex` maps each API key, basicauth username, and mTLS identity
+    /// to exactly one Consumer, last-inserted wins. A credential shared by two
+    /// Consumers would therefore authenticate as whichever was indexed last.
+    /// File mode rejects such a config outright; database snapshots, CP
+    /// payloads, and point-loaded deltas instead strip the colliding credential
+    /// type from every later Consumer that claims a value an earlier Consumer
+    /// already owns (first-loaded wins; the SQL and Mongo full loaders sort by
+    /// id), mirroring [`Self::quarantine_invalid_hmac_credentials`].
+    ///
+    /// - keyauth: any `key` already claimed by another Consumer.
+    /// - basicauth: the Consumer `username` (the index key) already claimed by
+    ///   another basicauth Consumer.
+    /// - mtls_auth: any exact `identity` already claimed by another Consumer,
+    ///   and, when an effective `san_dns` policy consumes the case-folded DNS
+    ///   index, any ASCII-case-insensitive match.
+    ///
+    /// Repeated values inside one Consumer (rotation entries) are allowed. A
+    /// stripped credential fails closed: its plugin returns 401 for that
+    /// Consumer. Persistence-level enforcement (`consumer_credential_index`,
+    /// `consumer_identity_index`) and admin write-time validation reject new
+    /// collisions; this guard covers pre-existing and out-of-band rows. Returns
+    /// one message per quarantined credential, never containing a key value.
+    pub fn quarantine_colliding_consumer_credentials(&mut self) -> Vec<String> {
+        let fold_dns = self.has_effective_mtls_dns_identity_policy();
+        let mut keyauth_owners: HashMap<String, String> = HashMap::new();
+        let mut basicauth_owners: HashMap<String, String> = HashMap::new();
+        let mut mtls_owners: HashMap<String, String> = HashMap::new();
+        let mut mtls_dns_owners: HashMap<String, String> = HashMap::new();
+        let mut messages = Vec::new();
+
+        fn string_values(consumer: &Consumer, cred_type: &str, field: &str) -> Vec<String> {
+            consumer
+                .credential_entries(cred_type)
+                .into_iter()
+                .filter_map(|entry| entry.get(field).and_then(|value| value.as_str()))
+                .map(str::to_owned)
+                .collect()
+        }
+        /// The first other Consumer that already owns one of `values`.
+        fn other_owner(
+            owners: &HashMap<String, String>,
+            values: &[String],
+            id: &str,
+        ) -> Option<String> {
+            values
+                .iter()
+                .find_map(|value| owners.get(value).filter(|owner| owner.as_str() != id))
+                .cloned()
+        }
+
+        for consumer in &mut self.consumers {
+            let id = consumer.id.clone();
+
+            let keys = string_values(consumer, "keyauth", "key");
+            if let Some(owner) = other_owner(&keyauth_owners, &keys, &id) {
+                consumer.credentials.remove("keyauth");
+                messages.push(format!(
+                    "Quarantined keyauth credential of consumer {:?}: an API key is also \
+                     claimed by consumer {:?} — the credential is excluded from this config \
+                     load so the key cannot authenticate as the wrong consumer. Rotate one of \
+                     the keys to restore it.",
+                    id, owner
+                ));
+            } else {
+                for key in keys {
+                    keyauth_owners.entry(key).or_insert_with(|| id.clone());
+                }
+            }
+
+            if consumer.has_credential("basicauth") {
+                let username = vec![consumer.username.clone()];
+                if let Some(owner) = other_owner(&basicauth_owners, &username, &id) {
+                    consumer.credentials.remove("basicauth");
+                    messages.push(format!(
+                        "Quarantined basicauth credential of consumer {:?}: its username {:?} \
+                         is also used by basicauth consumer {:?} — the credential is excluded \
+                         from this config load so it cannot authenticate as the wrong consumer.",
+                        id, consumer.username, owner
+                    ));
+                } else {
+                    basicauth_owners
+                        .entry(consumer.username.clone())
+                        .or_insert_with(|| id.clone());
+                }
+            }
+
+            let identities = string_values(consumer, "mtls_auth", "identity");
+            let folded: Vec<String> = if fold_dns {
+                identities
+                    .iter()
+                    .map(|identity| identity.to_ascii_lowercase())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let owner = other_owner(&mtls_owners, &identities, &id)
+                .or_else(|| other_owner(&mtls_dns_owners, &folded, &id));
+            if let Some(owner) = owner {
+                consumer.credentials.remove("mtls_auth");
+                messages.push(format!(
+                    "Quarantined mtls_auth credential of consumer {:?}: an identity is also \
+                     claimed by consumer {:?} — the credential is excluded from this config \
+                     load so a certificate cannot authenticate as the wrong consumer.",
+                    id, owner
+                ));
+            } else {
+                for identity in identities {
+                    mtls_owners.entry(identity).or_insert_with(|| id.clone());
+                }
+                for identity in folded {
+                    mtls_dns_owners
+                        .entry(identity)
+                        .or_insert_with(|| id.clone());
+                }
+            }
+        }
+
+        messages
+    }
+
     /// Validate only the exact and effective-DNS mTLS identity constraints.
     /// Admin candidate checks use this narrower surface so unrelated legacy
     /// keyauth/basicauth collisions do not block mTLS configuration repairs.
