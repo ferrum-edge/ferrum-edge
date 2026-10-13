@@ -134,6 +134,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
+  `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
+  clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging
+  sinks) verify servers through a rustls verifier that applies the shared CRL
+  policy, so a revoked certificate is refused there as on every other TLS
+  surface. They trust `FERRUM_TLS_CA_BUNDLE_PATH` exclusively or, without it,
+  the bundled webpki roots instead of the OS trust store, disable session
+  resumption, and follow the backend CRL generation that backend TLS live
+  reload publishes. A trust store or verifier that cannot be built fails
+  closed. `FERRUM_TLS_NO_VERIFY` still disables verification, and now logs a
+  warning when a CA bundle or CRL source is configured alongside it.
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB

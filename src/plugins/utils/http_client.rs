@@ -270,6 +270,9 @@ pub struct PluginHttpClient {
     /// separate from `tls_crl_file_path` so non-file sources fail closed for
     /// sinks such as Kafka that require a filesystem path.
     tls_crl_source_configured: bool,
+    /// Plugin-egress CRL verifier when gateway CRLs were configured at
+    /// construction; [`Self::with_live_crls`] points it at the live list.
+    live_crl_verifier: Option<Arc<LiveCrlServerVerifier>>,
     /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
     /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
     /// collisions when multiple gateway instances with different namespaces share
@@ -344,13 +347,191 @@ enum PluginTlsPosture {
     PlatformRoots,
     SkipVerification,
     CustomCaBundle(Vec<reqwest::Certificate>),
-    FailClosedCaBundle { source_id: String, reason: String },
+    FailClosedCaBundle {
+        source_id: String,
+        reason: String,
+    },
+    /// Gateway CRLs (`FERRUM_TLS_CRL_FILE_PATH`) are configured and
+    /// verification is on (issue #6621). reqwest's own verifier takes no CRLs,
+    /// so these clients get a preconfigured rustls config whose verifier
+    /// applies the shared CRL policy over the configured CA bundle
+    /// (exclusively) or, without one, the bundled webpki roots: the same
+    /// anchors the LDAP, health-probe and logging-sink CRL surfaces use.
+    CrlEnforced(Arc<LiveCrlServerVerifier>),
+}
+
+/// WebPKI verifier built for one CRL generation.
+#[derive(Debug)]
+struct CrlGenerationVerifier {
+    crls: CrlList,
+    verifier: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+/// Plugin-egress server verifier that follows the gateway's live CRL
+/// generation (issue #6621).
+///
+/// It starts on the startup CRL snapshot; [`PluginHttpClient::with_live_crls`]
+/// points it at the gateway's shared list, so a backend TLS live reload that
+/// refreshes `FERRUM_TLS_CRL_FILE_PATH` also refreshes plugin egress (and a
+/// CRL whose `nextUpdate` passes after a refresh does not strand it). The
+/// WebPKI verifier is rebuilt only when the generation changes; every other
+/// handshake reuses the cached one.
+#[derive(Debug)]
+pub(crate) struct LiveCrlServerVerifier {
+    roots: Arc<rustls::RootCertStore>,
+    source: arc_swap::ArcSwap<
+        arc_swap::ArcSwap<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>>,
+    >,
+    current: arc_swap::ArcSwap<CrlGenerationVerifier>,
+}
+
+impl LiveCrlServerVerifier {
+    fn new(roots: rustls::RootCertStore, crls: &CrlList) -> Result<Self, anyhow::Error> {
+        let verifier = crate::tls::build_server_verifier_with_crls(roots.clone(), crls)?;
+        Ok(Self {
+            roots: Arc::new(roots),
+            source: arc_swap::ArcSwap::new(crate::tls::shared_crl_list(Arc::clone(crls))),
+            current: arc_swap::ArcSwap::from_pointee(CrlGenerationVerifier {
+                crls: Arc::clone(crls),
+                verifier,
+            }),
+        })
+    }
+
+    /// Read CRL generations from the gateway's shared list from now on.
+    fn follow(&self, crls: crate::tls::SharedCrlList) {
+        self.source.store(crls);
+    }
+
+    /// The verifier for the current CRL generation, rebuilt when it changed.
+    fn current_verifier(&self) -> Result<Arc<rustls::client::WebPkiServerVerifier>, rustls::Error> {
+        let crls = self.source.load().load_full();
+        let cached = self.current.load();
+        if Arc::ptr_eq(&cached.crls, &crls) {
+            return Ok(Arc::clone(&cached.verifier));
+        }
+        let verifier = crate::tls::build_server_verifier_with_crls((*self.roots).clone(), &crls)
+            .map_err(|_| {
+                rustls::Error::General(
+                    "gateway CRLs could not be applied to the plugin HTTP verifier".to_string(),
+                )
+            })?;
+        self.current.store(Arc::new(CrlGenerationVerifier {
+            crls,
+            verifier: Arc::clone(&verifier),
+        }));
+        Ok(verifier)
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for LiveCrlServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.current_verifier()?.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.current
+            .load()
+            .verifier
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.current
+            .load()
+            .verifier
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.current.load().verifier.supported_verify_schemes()
+    }
+}
+
+/// ALPN a preconfigured rustls config must offer for one plugin client shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginAlpn {
+    /// The shared client: HTTP/2 or HTTP/1.1.
+    Negotiated,
+    /// The HTTP/2-prior-knowledge companion.
+    Http2Only,
+    /// The HTTP/1.1-pinned companion.
+    Http1Only,
+}
+
+impl PluginAlpn {
+    fn for_http2_prior_knowledge(http2_prior_knowledge: bool) -> Self {
+        if http2_prior_knowledge {
+            Self::Http2Only
+        } else {
+            Self::Negotiated
+        }
+    }
+
+    fn protocols(self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Negotiated => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            Self::Http2Only => vec![b"h2".to_vec()],
+            Self::Http1Only => vec![b"http/1.1".to_vec()],
+        }
+    }
+}
+
+/// rustls config for [`PluginTlsPosture::CrlEnforced`]. Resumption is
+/// disabled so every new connection reaches the verifier's CRL checks,
+/// including each CRL's `nextUpdate`.
+fn crl_enforced_rustls_config(
+    verifier: &Arc<LiveCrlServerVerifier>,
+    alpn: PluginAlpn,
+) -> Result<rustls::ClientConfig, anyhow::Error> {
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = verifier.clone();
+    let mut tls = crate::tls::backend_client_config_builder(None)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls.alpn_protocols = alpn.protocols();
+    tls.resumption = rustls::client::Resumption::disabled();
+    Ok(tls)
 }
 
 impl PluginTlsPosture {
-    fn from_config(tls_no_verify: bool, tls_ca_bundle_path: Option<&str>) -> Self {
+    fn from_config(tls_no_verify: bool, tls_ca_bundle_path: Option<&str>, crls: &CrlList) -> Self {
         if tls_no_verify {
+            if tls_ca_bundle_path.is_some() || !crls.is_empty() {
+                tracing::warn!(
+                    "FERRUM_TLS_NO_VERIFY disables plugin HTTP certificate verification; the \
+                     configured FERRUM_TLS_CA_BUNDLE_PATH / FERRUM_TLS_CRL_FILE_PATH are not \
+                     applied to plugin egress"
+                );
+            }
             return Self::SkipVerification;
+        }
+
+        if !crls.is_empty() {
+            return Self::crl_enforced(tls_ca_bundle_path, crls);
         }
 
         let Some(ca_path) = tls_ca_bundle_path else {
@@ -382,6 +563,54 @@ impl PluginTlsPosture {
             Err(_) => Self::fail_closed(
                 ca_material.display_source_id,
                 "`FERRUM_TLS_CA_BUNDLE_PATH`: malformed PEM CA bundle".to_string(),
+            ),
+        }
+    }
+
+    /// Build the CRL-enforcing posture. Any failure to assemble the trust
+    /// store or verifier fails closed with an empty trust store rather than
+    /// silently dropping revocation.
+    fn crl_enforced(tls_ca_bundle_path: Option<&str>, crls: &CrlList) -> Self {
+        let root_store = match tls_ca_bundle_path {
+            None => {
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+            }
+            Some(ca_path) => {
+                let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+                let source_id = source.redacted_source_id();
+                let ca_material = match load_material_blocking(&source, MaterialKind::CaBundle) {
+                    Ok(ca_material) => ca_material,
+                    Err(error) => {
+                        return Self::fail_closed(
+                            source_id,
+                            format!(
+                                "`FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle ({})",
+                                error.failure_class()
+                            ),
+                        );
+                    }
+                };
+                match crate::tls::root_cert_store_from_pem_bundle(
+                    ca_material.bytes.expose_secret(),
+                    "plugin HTTP CA bundle",
+                    &ca_material.display_source_id,
+                ) {
+                    Ok(root_store) => root_store,
+                    Err(_) => {
+                        return Self::fail_closed(
+                            ca_material.display_source_id,
+                            "`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        };
+        match LiveCrlServerVerifier::new(root_store, crls) {
+            Ok(verifier) => Self::CrlEnforced(Arc::new(verifier)),
+            Err(_) => Self::fail_closed(
+                "FERRUM_TLS_CRL_FILE_PATH".to_string(),
+                "gateway CRLs could not be applied to the plugin HTTP verifier".to_string(),
             ),
         }
     }
@@ -463,15 +692,16 @@ impl PluginTlsPosture {
         &self,
         builder: reqwest::ClientBuilder,
         inert: bool,
+        alpn: PluginAlpn,
     ) -> reqwest::ClientBuilder {
         if inert {
             Self::apply_inert_crypto_posture(builder)
         } else {
-            self.apply(builder)
+            self.apply(builder, alpn)
         }
     }
 
-    fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    fn apply(&self, builder: reqwest::ClientBuilder, alpn: PluginAlpn) -> reqwest::ClientBuilder {
         match self {
             Self::PlatformRoots => builder,
             Self::SkipVerification => builder.danger_accept_invalid_certs(true),
@@ -484,6 +714,19 @@ impl PluginTlsPosture {
                 );
                 Self::apply_fail_closed_empty_trust(builder)
             }
+            Self::CrlEnforced(verifier) => match crl_enforced_rustls_config(verifier, alpn) {
+                Ok(tls) => builder
+                    .use_preconfigured_tls(tls)
+                    .tls_danger_accept_invalid_certs(false),
+                Err(error) => {
+                    tracing::error!(
+                        error = %sanitize_startup_cause(&error, &[]),
+                        "Failed to build the CRL-enforcing plugin HTTP TLS config; \
+                         applying an empty trust store"
+                    );
+                    Self::apply_fail_closed_empty_trust(builder)
+                }
+            },
         }
     }
 }
@@ -695,7 +938,11 @@ fn build_dns_cached_fallback_client(
     }
 
     match try_build_plugin_client(dns_cache.as_ref(), http2_prior_knowledge, |builder| {
-        tls_posture.apply_or_inert(builder, provider_mismatch)
+        tls_posture.apply_or_inert(
+            builder,
+            provider_mismatch,
+            PluginAlpn::for_http2_prior_knowledge(http2_prior_knowledge),
+        )
     }) {
         Ok(client) => return Ok(client),
         Err(error) => tracing::error!(
@@ -791,7 +1038,11 @@ fn build_configured_plugin_client(
              unable to establish any connection."
         );
     }
-    builder = tls_posture.apply_or_inert(builder, crypto_provider.is_err());
+    builder = tls_posture.apply_or_inert(
+        builder,
+        crypto_provider.is_err(),
+        PluginAlpn::for_http2_prior_knowledge(http2_prior_knowledge),
+    );
 
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
@@ -862,7 +1113,7 @@ fn build_http1_only_plugin_client(
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds));
     builder = attach_plugin_client_dns(builder, dns_cache.as_ref());
-    builder = tls_posture.apply_or_inert(builder, crypto_provider.is_err());
+    builder = tls_posture.apply_or_inert(builder, crypto_provider.is_err(), PluginAlpn::Http1Only);
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
     }
@@ -905,7 +1156,8 @@ impl PluginHttpClient {
         pool_shard_amount: usize,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
-        let tls_posture = PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path);
+        let tls_posture =
+            PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path, &tls_crls);
 
         let client = accept_plugin_http_client(
             build_configured_plugin_client(
@@ -943,6 +1195,10 @@ impl PluginHttpClient {
             tls_crls,
             tls_crl_file_path: None,
             tls_crl_source_configured: false,
+            live_crl_verifier: match &tls_posture {
+                PluginTlsPosture::CrlEnforced(verifier) => Some(Arc::clone(verifier)),
+                _ => None,
+            },
             namespace: namespace.to_string(),
             real_ip_header: None,
             backend_allow_ips,
@@ -1010,6 +1266,7 @@ impl PluginHttpClient {
             tls_crls: Arc::new(Vec::new()),
             tls_crl_file_path: None,
             tls_crl_source_configured: false,
+            live_crl_verifier: None,
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             real_ip_header: None,
             backend_allow_ips: BackendEgressPolicy::unrestricted(),
@@ -1131,6 +1388,23 @@ impl PluginHttpClient {
         self.max_request_body_size_bytes
     }
 
+    /// Follow the gateway's live CRL list on plugin egress (issue #6621).
+    ///
+    /// When gateway CRLs were configured at construction, every reqwest client
+    /// this wrapper built verifies servers against the startup CRL snapshot
+    /// until this is called; afterwards each new handshake uses the CRL
+    /// generation currently published in `crls`, so a backend TLS live reload
+    /// of `FERRUM_TLS_CRL_FILE_PATH` reaches plugin egress too. Clones share
+    /// the verifier, so calling it on any clone applies to all of them. A
+    /// no-op when no CRL was configured at construction or verification is
+    /// disabled.
+    pub fn with_live_crls(self, crls: crate::tls::SharedCrlList) -> Self {
+        if let Some(verifier) = &self.live_crl_verifier {
+            verifier.follow(crls);
+        }
+        self
+    }
+
     /// Carry the configured gateway CRL source for non-rustls sinks. Only a
     /// plain path or `file://` URI has a librdkafka-compatible filesystem
     /// identity; other source kinds remain marked as configured so Kafka can
@@ -1202,8 +1476,8 @@ impl PluginHttpClient {
     /// `rustls::ClientConfig` (tcp_logging, ws_logging, udp_logging DTLS) so that
     /// revoked backend certificates are rejected on log-shipping paths, matching
     /// the policy applied to the proxy backend / DTLS / frontend mTLS surfaces.
-    /// reqwest-based outbound calls are unaffected — reqwest does not expose CRL
-    /// configuration.
+    /// The shared reqwest clients built by [`Self::new`] apply the same list
+    /// through a preconfigured rustls verifier (issue #6621).
     pub fn tls_crls(&self) -> &[rustls::pki_types::CertificateRevocationListDer<'static>] {
         &self.tls_crls
     }
@@ -2024,7 +2298,8 @@ mod fallback_tests {
     fn tls_posture_parses_configured_ca_bundle_once() {
         let cert_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server.crt");
-        let posture = PluginTlsPosture::from_config(false, cert_path.to_str());
+        let posture =
+            PluginTlsPosture::from_config(false, cert_path.to_str(), &Arc::new(Vec::new()));
 
         match posture {
             PluginTlsPosture::CustomCaBundle(certs) => assert_eq!(certs.len(), 1),
@@ -2038,7 +2313,7 @@ mod fallback_tests {
         let ca_path = tempdir.path().join("invalid-ca.pem");
         std::fs::write(&ca_path, "not a pem certificate").expect("write invalid CA");
 
-        let posture = PluginTlsPosture::from_config(false, ca_path.to_str());
+        let posture = PluginTlsPosture::from_config(false, ca_path.to_str(), &Arc::new(Vec::new()));
 
         match posture {
             PluginTlsPosture::FailClosedCaBundle { source_id, reason } => {
@@ -2051,7 +2326,8 @@ mod fallback_tests {
 
     #[test]
     fn tls_no_verify_takes_precedence_over_ca_bundle() {
-        let posture = PluginTlsPosture::from_config(true, Some("/does/not/exist.pem"));
+        let posture =
+            PluginTlsPosture::from_config(true, Some("/does/not/exist.pem"), &Arc::new(Vec::new()));
         assert!(matches!(posture, PluginTlsPosture::SkipVerification));
     }
 
@@ -2247,5 +2523,291 @@ mod redirect_tests {
             0,
         );
         assert_redirect_not_followed(&client).await;
+    }
+}
+
+#[cfg(test)]
+mod crl_tests {
+    //! Gateway CRLs on plugin egress (issue #6621). The posture is private, so
+    //! the revoked-certificate regression lives inline and drives the public
+    //! `PluginHttpClient` constructor exactly as the gateway does.
+    use super::*;
+    use crate::dns::DnsConfig;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
+    use std::io::Write;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const HOST: &str = "plugin-crl.invalid";
+    const REVOKED_SERIAL: u64 = 0x6621;
+    const OTHER_SERIAL: u64 = 0x6622;
+
+    struct TestCa {
+        cert_pem: String,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn test_ca() -> TestCa {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Plugin CRL Test CA");
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
+        let cert = params.self_signed(&key_pair).expect("self-sign CA");
+        TestCa {
+            cert_pem: cert.pem(),
+            issuer: Issuer::new(params, key_pair),
+        }
+    }
+
+    fn leaf(ca: &TestCa, serial: u64) -> (String, String) {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::new(vec![HOST.to_string()]).expect("leaf params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, HOST);
+        params.serial_number = Some(rcgen::SerialNumber::from(serial));
+        let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
+    fn crl_revoking(ca: &TestCa, serial: u64) -> CertificateRevocationListDer<'static> {
+        use rcgen::{
+            CertificateRevocationListParams, RevocationReason, RevokedCertParams, SerialNumber,
+        };
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let now = OffsetDateTime::now_utc();
+        let params = CertificateRevocationListParams {
+            this_update: now - TimeDuration::minutes(1),
+            next_update: now + TimeDuration::days(7),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(serial),
+                revocation_time: now - TimeDuration::minutes(1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        params
+            .signed_by(&ca.issuer)
+            .expect("sign CRL")
+            .der()
+            .clone()
+    }
+
+    /// HTTPS origin that answers every request on every connection with a
+    /// small JWKS-shaped body, standing in for a JWKS / discovery endpoint.
+    async fn spawn_https_origin(cert_pem: &str, key_pem: &str) -> u16 {
+        let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("leaf cert");
+        let key = crate::tls::first_pem_private_key(key_pem.as_bytes())
+            .expect("parse key")
+            .expect("key present");
+        let provider = Arc::new(crate::fips::base_crypto_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("server protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTPS origin");
+        let port = listener.local_addr().expect("origin address").port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buf[..read]),
+                        }
+                    }
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                              content-length: 11\r\nconnection: close\r\n\r\n{\"keys\":[]}",
+                        )
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn plugin_client(
+        ca_path: &str,
+        crls: Vec<CertificateRevocationListDer<'static>>,
+    ) -> PluginHttpClient {
+        let dns_cache = DnsCache::new(DnsConfig {
+            global_overrides: std::collections::HashMap::from([(
+                HOST.to_string(),
+                "127.0.0.1".to_string(),
+            )]),
+            ..DnsConfig::default()
+        });
+        PluginHttpClient::new(
+            &PoolConfig::default(),
+            dns_cache,
+            1_000,
+            0,
+            100,
+            false,
+            Some(ca_path),
+            Arc::new(crls),
+            "default",
+            BackendEgressPolicy::unrestricted(),
+            Arc::new(Vec::new()),
+            0,
+        )
+    }
+
+    async fn fetch(client: &reqwest::Client, port: u16) -> Result<u16, reqwest::Error> {
+        client
+            .get(format!("https://{HOST}:{port}/.well-known/jwks.json"))
+            .send()
+            .await
+            .map(|response| response.status().as_u16())
+    }
+
+    #[tokio::test]
+    async fn plugin_egress_rejects_a_certificate_revoked_by_the_gateway_crl() {
+        let ca = test_ca();
+        let mut ca_file = tempfile::NamedTempFile::new().expect("CA temp file");
+        ca_file
+            .write_all(ca.cert_pem.as_bytes())
+            .expect("write CA PEM");
+        let ca_path = ca_file.path().to_str().expect("CA path").to_string();
+        let (cert_pem, key_pem) = leaf(&ca, REVOKED_SERIAL);
+        let port = spawn_https_origin(&cert_pem, &key_pem).await;
+
+        // Baseline: the CA-signed certificate is trusted without a CRL.
+        let no_crl = plugin_client(&ca_path, Vec::new());
+        assert_eq!(
+            fetch(no_crl.get().expect("shared client"), port)
+                .await
+                .expect("baseline fetch"),
+            200
+        );
+
+        // A CRL for the same issuer that does not list this serial still
+        // admits it: the CRL posture keeps the configured trust anchors.
+        let other_crl = plugin_client(&ca_path, vec![crl_revoking(&ca, OTHER_SERIAL)]);
+        assert_eq!(
+            fetch(other_crl.get().expect("shared client"), port)
+                .await
+                .expect("fetch with an unrelated revocation"),
+            200
+        );
+        assert_eq!(
+            fetch(other_crl.get_http1().expect("HTTP/1.1 companion"), port)
+                .await
+                .expect("HTTP/1.1 companion fetch with an unrelated revocation"),
+            200
+        );
+
+        // The CRL revoking this serial refuses the handshake on the shared
+        // client and the HTTP/1.1 companion. (The HTTP/2 companion shares the
+        // same posture; this HTTP/1.1-only origin cannot prove it separately.)
+        let revoked = plugin_client(&ca_path, vec![crl_revoking(&ca, REVOKED_SERIAL)]);
+        for (shape, client) in [
+            ("shared", revoked.get().expect("shared client")),
+            ("http1", revoked.get_http1().expect("HTTP/1.1 companion")),
+        ] {
+            assert!(
+                fetch(client, port).await.is_err(),
+                "{shape} plugin client must refuse a certificate revoked by the gateway CRL"
+            );
+        }
+    }
+
+    /// A CRL refresh published on the gateway's shared list (backend TLS live
+    /// reload) reaches plugin egress without rebuilding the client, in both
+    /// directions.
+    #[tokio::test]
+    async fn plugin_egress_follows_live_crl_generations() {
+        let ca = test_ca();
+        let mut ca_file = tempfile::NamedTempFile::new().expect("CA temp file");
+        ca_file
+            .write_all(ca.cert_pem.as_bytes())
+            .expect("write CA PEM");
+        let ca_path = ca_file.path().to_str().expect("CA path").to_string();
+        let (cert_pem, key_pem) = leaf(&ca, REVOKED_SERIAL);
+        let port = spawn_https_origin(&cert_pem, &key_pem).await;
+
+        let startup: CrlList = Arc::new(vec![crl_revoking(&ca, OTHER_SERIAL)]);
+        let live = crate::tls::shared_crl_list(Arc::clone(&startup));
+        let client =
+            plugin_client(&ca_path, startup.as_ref().clone()).with_live_crls(Arc::clone(&live));
+        let shared = client.get().expect("shared client");
+        assert_eq!(fetch(shared, port).await.expect("startup generation"), 200);
+
+        live.store(Arc::new(vec![crl_revoking(&ca, REVOKED_SERIAL)]));
+        assert!(
+            fetch(shared, port).await.is_err(),
+            "a revocation published after startup must reach plugin egress"
+        );
+
+        live.store(Arc::new(vec![crl_revoking(&ca, OTHER_SERIAL)]));
+        assert_eq!(
+            fetch(shared, port).await.expect("revocation withdrawn"),
+            200
+        );
+    }
+
+    #[test]
+    fn crl_posture_fails_closed_for_an_unusable_ca_bundle() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let ca_path = tempdir.path().join("invalid-ca.pem");
+        std::fs::write(&ca_path, "not a pem certificate").expect("write invalid CA");
+        let ca = test_ca();
+        let posture = PluginTlsPosture::from_config(
+            false,
+            ca_path.to_str(),
+            &Arc::new(vec![crl_revoking(&ca, REVOKED_SERIAL)]),
+        );
+        assert!(matches!(
+            posture,
+            PluginTlsPosture::FailClosedCaBundle { .. }
+        ));
+    }
+
+    #[test]
+    fn crl_posture_alpn_matches_each_client_shape() {
+        assert_eq!(
+            PluginAlpn::Negotiated.protocols(),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(PluginAlpn::Http2Only.protocols(), vec![b"h2".to_vec()]);
+        assert_eq!(
+            PluginAlpn::Http1Only.protocols(),
+            vec![b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            PluginAlpn::for_http2_prior_knowledge(true),
+            PluginAlpn::Http2Only
+        );
+        assert_eq!(
+            PluginAlpn::for_http2_prior_knowledge(false),
+            PluginAlpn::Negotiated
+        );
     }
 }

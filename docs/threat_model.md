@@ -117,9 +117,9 @@ address; an on-path attacker between gateway and backend.
 
 - **Revocation coverage is partial.** CRLs are enforced on frontend and admin
   mTLS, frontend DTLS, mesh peer verifiers, rustls backend server verification,
-  verified HTTPS/gRPC health probes, and the rustls logging sinks — but **not** on
-  DP-to-CP gRPC and **not** on reqwest-based plugin egress; those stacks expose no
-  compatible CRL configuration. `kafka_logging` maps the CRL source to
+  verified HTTPS/gRPC health probes, the rustls logging sinks, and plugin HTTP
+  egress — but **not** on DP-to-CP gRPC; that stack exposes no compatible CRL
+  configuration. `kafka_logging` maps the CRL source to
   librdkafka's `ssl.crl.location` instead. See
   [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach).
 - **Unknown revocation status is accepted by design.** A chain that no configured
@@ -329,7 +329,6 @@ release, not an open defect awaiting a fix in this document's scope.
 | Residual | Boundary | Reference |
 |---|---|---|
 | CRLs are not applied to DP-to-CP gRPC | 4 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
-| CRLs are not applied to reqwest-based plugin egress | 6 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
 | A chain no configured CRL covers still verifies | 1, 2 | [What the verifier enforces](frontend_tls.md#what-the-verifier-enforces) |
 | `keyauth` / `jwt` / `hmac_auth` consumer secrets are recoverable at rest | 6 | [plugins.md](plugins.md) |
 | Frontend/admin TLS live reload is opt-in; inline PEM is static until config reload | 1 | [Configuration Reference](configuration.md#tls-material-sources) |

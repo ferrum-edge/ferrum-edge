@@ -450,7 +450,10 @@ outbound:
 - The same policy covers the rustls logging sinks (`tcp_logging` TLS,
   `ws_logging` wss, `udp_logging` DTLS) and `ldap_auth` over `ldaps://` /
   StartTLS. `kafka_logging` maps the source to librdkafka's `ssl.crl.location`
-  instead, and reqwest-based plugin egress does not apply CRLs at all.
+  instead. Plugin HTTP egress (JWKS, OIDC, introspection, webhooks, HTTP
+  logging sinks) applies the same policy through a preconfigured rustls
+  verifier that follows the live backend CRL generation; see
+  [CRL Policy](frontend_tls.md#surfaces-crls-do-not-reach).
 
 ### Operational Contract for Backend TLS Sources
 
