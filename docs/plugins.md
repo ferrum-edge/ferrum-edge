@@ -3570,9 +3570,9 @@ This applies to `NameID`, `Issuer`, `Audience`, `Username`, `Password`, `Nonce`,
 still accepted — only comments *inside* a value are refused. The rejection body
 names the reason and never echoes the element's content.
 
-Every instant (`wsu:Created`, `wsu:Expires`, the UsernameToken `Created`, and the
-SAML `NotBefore`, `NotOnOrAfter`, and `SubjectConfirmationData` bounds) must carry
-an explicit zone designator: `Z` or a numeric `±hh:mm` offset. An
+Every instant the gateway evaluates (the Timestamp `wsu:Created` and `wsu:Expires`,
+the PasswordDigest UsernameToken `Created`, and the SAML `Conditions` and
+`SubjectConfirmationData` bounds) must carry an explicit zone designator: `Z` or a numeric `±hh:mm` offset. An
 `xsd:dateTime` without one has no defined instant, and WS-Security and SAML 2.0
 both require UTC, so such a value is rejected as invalid rather than assumed to
 be UTC — a guess would shift every freshness and validity window by the
@@ -3820,7 +3820,7 @@ config:
 
 **Pinned certificates are trusted only inside their validity window.** A fingerprint match authenticates the key, not its lifetime, so every request also checks the matched certificate's `notBefore`/`notAfter` against the gateway clock and refuses a signature from a certificate that has expired or is not yet valid (`401`, "signing certificate is outside its validity period"). Admission still loads such a certificate, so a replacement can be staged ahead of its `notBefore` and a reload never fails just because an old entry has lapsed, but each out-of-window entry is logged as a warning when the plugin is built. Remove expired entries once their replacement is in service. No CA chain, revocation, or key-usage check is performed: trust is the pin itself.
 
-**SHA-1 is a legacy opt-in.** `rsa-sha1` and `sha1` exist only for partners that cannot sign with SHA-256. SHA-1 is not collision resistant, so a SHA-1 `DigestValue` binds the signed content far more weakly than SHA-256, and a SHA-1 `SignatureMethod` lets anyone who can get a chosen message signed by the pinned key attempt a collision. Enable them per route, for the specific signer that needs them, and remove them once that signer moves to SHA-256. FIPS builds refuse them regardless of this list.
+**SHA-1 is a legacy opt-in.** `rsa-sha1` and `sha1` exist only for partners that cannot sign with SHA-256. SHA-1 is not collision resistant, so a SHA-1 `DigestValue` binds the signed content far more weakly than SHA-256, and a SHA-1 `SignatureMethod` lets anyone who can get a chosen message signed by the pinned key attempt a collision. Enable them per route, for the specific signer that needs them, and remove them once that signer moves to SHA-256. FIPS enforcement (`FERRUM_FIPS_MODE=enforce`) refuses them at admission regardless of this list.
 
 #### SAML Assertion Validation
 

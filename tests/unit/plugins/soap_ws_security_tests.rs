@@ -1145,6 +1145,55 @@ async fn test_timestamp_without_zone_designator_rejected() {
             );
         }
     }
+
+    // Expires alone zoneless, with a valid zoned Created, fails on Expires.
+    let ts = format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1">
+            <wsu:Created>{}</wsu:Created>
+            <wsu:Expires>{}</wsu:Expires>
+        </wsu:Timestamp>"#,
+        now.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+        expires_at.format("%Y-%m-%dT%H:%M:%S%.3f")
+    );
+    let body = wrap_soap(&ts);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("invalid Expires timestamp"),
+        "got {}",
+        reject_body(&result)
+    );
+}
+
+/// A PasswordDigest token whose own `Created` is zoneless is refused even
+/// though its digest is correct over exactly those bytes and the outer
+/// Timestamp is valid.
+#[tokio::test]
+async fn test_password_digest_created_without_zone_designator_rejected() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let now = chrono::Utc::now();
+    let zoned = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let zoneless = now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+
+    let security = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"zoneless-nonce01",
+        &zoneless,
+        Some(&zoned),
+    );
+    let body = wrap_soap(&security);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("UsernameToken Created is not a valid dateTime"),
+        "got {}",
+        reject_body(&result)
+    );
 }
 
 #[tokio::test]
@@ -2169,6 +2218,44 @@ async fn test_saml_pinned_signing_cert_outside_validity_window_rejected() {
         assert!(
             reject_body(&result).contains("outside its validity period"),
             "{label}: got {}",
+            reject_body(&result)
+        );
+    }
+}
+
+/// A correctly signed assertion whose `Conditions` bound is zoneless is
+/// refused, one field at a time.
+#[tokio::test]
+async fn test_saml_conditions_without_zone_designator_rejected() {
+    let zoneless = |offset: chrono::Duration| {
+        (chrono::Utc::now() + offset)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string()
+    };
+    for (field, needle) in [
+        ("NotBefore", "invalid SAML NotBefore"),
+        ("NotOnOrAfter", "invalid SAML NotOnOrAfter"),
+    ] {
+        let bundle = saml_fixtures::IdpBundle::new();
+        let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+        let mut builder = saml_fixtures::AssertionBuilder::new(
+            "_assertion-zoneless",
+            "https://idp.example.com/metadata",
+            "alice@example.com",
+        );
+        if field == "NotBefore" {
+            builder.not_before = Some(zoneless(-chrono::Duration::seconds(60)));
+        } else {
+            builder.not_on_or_after = Some(zoneless(chrono::Duration::seconds(120)));
+        }
+        let body = wrap_saml_assertion(&builder.build());
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), 401, "{field}");
+        assert!(
+            reject_body(&result).contains(needle),
+            "{field}: got {}",
             reject_body(&result)
         );
     }
