@@ -115,9 +115,10 @@ def _gateway_labels(meta):
     tyk_ver = meta.get("tyk_version", "")
     krakend_ver = meta.get("krakend_version", "")
     envoy_ver = meta.get("envoy_version", "")
+    ferrum_where = "Docker" if meta.get("execution_mode") == "all-docker" else "native"
     return {
         "baseline": "Direct Backend",
-        "ferrum": "Ferrum Edge (native)",
+        "ferrum": f"Ferrum Edge ({ferrum_where})",
         "kong": f"Kong Gateway ({'native' if kong_native else 'Docker'})" if not kong_ver else f"Kong ({kong_ver})",
         "tyk": f"Tyk ({tyk_ver})" if tyk_ver else "Tyk Gateway (Docker)",
         "krakend": f"KrakenD ({krakend_ver})" if krakend_ver else "KrakenD (Docker)",
@@ -129,16 +130,23 @@ def _gateway_labels(meta):
 GATEWAY_LABELS = _gateway_labels({})
 
 
-def discover_results(results_dir):
+def discover_results(results_dir, allowed_files=None):
     """Scan results_dir for files matching the naming convention.
 
     Returns dict[gateway][protocol][endpoint] = metrics
 
     Filenames: {gateway}_{protocol}_{endpoint}_results.txt
     Handles multi-part protocol names like 'e2e_tls'.
+
+    When ``allowed_files`` is not None (the current run's ``result_files``
+    manifest from meta.json), only those basenames are considered, so
+    result files left behind by a previous run — for example for a
+    gateway the new run skipped — cannot leak into the new report.
     """
     data = {}
     for fname in sorted(os.listdir(results_dir)):
+        if allowed_files is not None and fname not in allowed_files:
+            continue
         if not fname.endswith("_results.txt"):
             continue
         stem = fname.replace("_results.txt", "")
@@ -162,13 +170,18 @@ def discover_results(results_dir):
     return data
 
 
-def discover_key_auth_results(results_dir):
+def discover_key_auth_results(results_dir, allowed_files=None):
     """Scan for key-auth result files: {gateway}_key_auth_api_echo_results.txt
 
     Returns dict[gateway] = metrics
+
+    Honors the same optional current-run manifest as
+    :func:`discover_results`.
     """
     data = {}
     for fname in sorted(os.listdir(results_dir)):
+        if allowed_files is not None and fname not in allowed_files:
+            continue
         if not fname.endswith("_key_auth_api_echo_results.txt"):
             continue
         gw = fname.replace("_key_auth_api_echo_results.txt", "")
@@ -409,8 +422,14 @@ def _build_tls_overhead_table(data):
 def generate_report(results_dir, output_path, meta=None):
     """Generate the full HTML comparison report."""
     global GATEWAY_LABELS
-    data = discover_results(results_dir)
-    key_auth_data = discover_key_auth_results(results_dir)
+    meta = meta or {}
+    # A current-run manifest (written by run_comparison.sh) restricts
+    # discovery to files this run produced; without one, fall back to
+    # scanning the whole directory for manually assembled inputs.
+    result_files = meta.get("result_files")
+    allowed_files = set(result_files) if isinstance(result_files, list) else None
+    data = discover_results(results_dir, allowed_files)
+    key_auth_data = discover_key_auth_results(results_dir, allowed_files)
     if not data:
         print(f"No result files found in {results_dir}", file=sys.stderr)
         sys.exit(1)
@@ -420,7 +439,6 @@ def generate_report(results_dir, output_path, meta=None):
     bl_https_echo = data.get("baseline", {}).get("https", {}).get("api_echo", {})
     bl_e2e_echo = data.get("baseline", {}).get("e2e_tls", {}).get("api_echo", {})
 
-    meta = meta or {}
     GATEWAY_LABELS = _gateway_labels(meta)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -539,11 +557,11 @@ def generate_report(results_dir, output_path, meta=None):
 <div class="section">
   <h2>Methodology &amp; Caveats</h2>
   <ul>
-    <li><strong>Ferrum Edge</strong> runs as a native binary on the host — zero container overhead.</li>
+    <li><strong>Ferrum Edge</strong> runs {"inside a Docker container (local build) — the same Docker overhead caveats as the other gateways apply." if meta.get("execution_mode") == "all-docker" else "as a native binary on the host — zero container overhead."}</li>
     <li><strong>Kong</strong> runs {"natively on the host (installed via package manager) — no container overhead." if meta.get("kong_native") else "inside a Docker container. On <strong>macOS</strong>, Docker Desktop runs containers in a Linux VM with userspace networking, which adds <strong>~0.1–0.5 ms per round-trip</strong> (port-mapped) plus higher CPU scheduling variance (~9.5x). On <strong>Linux</strong> with <code>--network host</code>, Docker overhead is negligible (&lt;5 &micro;s). To eliminate this overhead on Linux, install Kong natively via the official apt/yum packages."}</li>
     <li><strong>Tyk</strong> runs inside a Docker container (no official macOS binary; Linux-only native packages available via <a href="https://tyk.io/docs/apim/open-source/installation">packagecloud</a>). The same Docker overhead caveats as Kong apply. Additionally, Tyk requires Redis which also runs in a container.</li>
     <li><strong>KrakenD</strong> runs inside a Docker container (Go-based, stateless gateway). The same Docker overhead caveats apply. KrakenD is configured with <code>no-op</code> encoding for raw response pass-through, matching the minimal-overhead proxy behavior of other gateways. Key-auth benchmarks are excluded because API key authentication requires KrakenD Enterprise Edition.</li>
-    <li><strong>Envoy Proxy</strong> runs inside a Docker container (C++-based, high-performance proxy). The same Docker overhead caveats apply. Envoy is configured as a minimal HTTP reverse proxy with static route configuration, no access logging, and connection pooling defaults. Key-auth benchmarks are excluded as Envoy&rsquo;s ext_authz filter requires an external authorization service.</li>
+    <li><strong>Envoy Proxy</strong> runs inside a Docker container (C++-based, high-performance proxy). The same Docker overhead caveats apply. Envoy is configured as a minimal HTTP reverse proxy with static route configuration, no access logging, and connection pooling defaults. Key-auth benchmarks include Envoy when its key-auth arm runs: the fixture checks the <code>apikey</code> header with an in-process Lua filter, so no external authorization service is involved. That arm is absent only when Envoy is skipped (<code>SKIP_GATEWAYS</code>) or fails to start.</li>
     <li><strong>HTTPS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). <strong>E2E TLS tests</strong> measure full encryption (client &rarr; HTTPS &rarr; gateway &rarr; HTTPS &rarr; backend), the most secure pattern.</li>
     <li>All gateways run sequentially (one at a time) to avoid resource contention on the host.</li>
     <li>The <strong>/api/echo</strong> endpoint receives a POST with a ~10 KB JSON payload that the backend echoes back, measuring realistic request+response body proxying overhead.</li>
