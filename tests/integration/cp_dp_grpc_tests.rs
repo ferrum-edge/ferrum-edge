@@ -2488,9 +2488,13 @@ async fn test_dp_keeps_last_good_snapshot_after_short_keyauth_key() {
         }))
         .expect("consumer fixture"),
     );
-    CpGrpcServer::broadcast_update(&update_tx, &short_key_config);
+    assert!(
+        CpGrpcServer::broadcast_update(&update_tx, &short_key_config),
+        "the short-key snapshot must reach the DP"
+    );
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Give the DP ample time to process (and refuse) the snapshot.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     let live = proxy_state.config.load();
     assert_eq!(
         live.proxies.len(),

@@ -1354,7 +1354,7 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 # Append a credential for zero-downtime rotation (POST adds to array)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"key": "rotated-api-key"}' \
+  -d '{"key": "rotated-api-key-0123456789"}' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
 # Delete a specific credential by index (0-based)

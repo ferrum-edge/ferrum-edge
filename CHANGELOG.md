@@ -17,8 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stores a shorter key keeps serving it with a validation warning, but a data
   plane refuses a CP snapshot containing one and keeps its previous config, so
   rotate short keys before upgrading.
-  The OpenAPI `KeyAuthCredential` and `KeyAuthCredentialBackup` schemas carry
-  the same floor. The floor is lower than the 32-character HMAC/JWT secret
+  The OpenAPI `KeyAuthCredential` schema (create, update, and restore) carries
+  the same floor. `KeyAuthCredentialBackup` stays the stored-value shape, so a
+  legacy short key still exports in `GET /backup` but must be rotated before
+  that backup can be restored. The floor is lower than the 32-character HMAC/JWT secret
   minimum because an API key can only be guessed online, while those secrets
   can be attacked offline from one captured signature or token.
 - **BREAKING — gateway material references are default-deny for
