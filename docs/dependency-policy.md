@@ -705,20 +705,26 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   `open` repeats the same rotation with its own frozen shell (no repository
   code runs there), proceeds only if the result is identical to the verified
   one, and pushes and opens the PR with `BASE_IMAGE_REFRESH_TOKEN` (see
-  `docs/ci_cd.md` -> GitHub Actions Secrets) so required CI runs on it.
+  `docs/ci_cd.md` -> GitHub Actions Secrets) so required CI runs on it. The
+  token is a secret of the `main`-only `base-image-refresh` environment, which
+  only the `open` and `merge` jobs declare, so no pull-request run can read it.
   `merge` waits until every context in
   `.github/required-publication-checks.json` succeeds on the exact head, with
   no other check failing or pending, and merges that head with a merge commit
   (`--merge --match-head-commit`), which keeps the PR head as the second parent
-  the publication gate binds to. Only `SUCCESS` satisfies a required context; a
-  skipped or neutral required check never does. A failing check or a moved
+  the publication gate binds to. A required context counts only as a successful
+  check run from GitHub Actions (app 15368, the producer branch protection
+  binds) inside a run of that context's `workflow_path` from the inventory;
+  skipped, neutral, foreign-app and other-workflow results never count. A failing check or a moved
   head stops the merge and fails the run.
   The trusted Cross policy freezes the whole workflow file by SHA-256
   (`DIGEST_REFRESH_WORKFLOW_SHA256`), which closes its job set, top-level
   `env`/`defaults`/permissions, and every step that can see the token, and it
-  refuses any other workflow that references `BASE_IMAGE_REFRESH_TOKEN` or uses
-  indexed (`secrets[...]`), bulk (`toJSON(secrets)`) or inherited
-  (`secrets: inherit`) secret access. Changing the rotation or the merge gate is
+  refuses any other workflow that references `BASE_IMAGE_REFRESH_TOKEN` or the
+  environment, declares any deployment environment, uses indexed
+  (`secrets[...]`), wildcard (`secrets.*`), bulk (`toJSON(secrets...)`) or
+  inherited (`secrets: inherit`) secret access, or uses a YAML `\u`/`\U`/`\x`
+  escape that could spell one of those after decoding. Changing the rotation or the merge gate is
   therefore a trusted-policy migration. `verify_ci_runtime_cache.py`
   additionally fails if the workflow stops rotating every consumer, runs
   repository code in the credentialed job, uses another token, or weakens the

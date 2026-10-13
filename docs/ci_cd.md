@@ -3705,7 +3705,10 @@ those per-job grants to take effect.
 
 #### Base image digest refresh
 
-- `BASE_IMAGE_REFRESH_TOKEN` - a fine-grained personal access token scoped to
+- `BASE_IMAGE_REFRESH_TOKEN` - an **environment** secret of the
+  `base-image-refresh` environment (not a repository secret, which every
+  same-repository pull-request run could read). The environment must admit only
+  the `main` branch. The token is a fine-grained personal access token scoped to
   `ferrum-edge/ferrum-edge` with **Contents: read and write**, **Pull requests:
   read and write**, and **Workflows: read and write**. Choose the longest
   expiration the organization allows; an expired token makes the refresh fail
@@ -3718,7 +3721,12 @@ those per-job grants to take effect.
   secret the refresh still resolves digests but fails before opening a PR.
 
 ```bash
-gh secret set BASE_IMAGE_REFRESH_TOKEN -R ferrum-edge/ferrum-edge
+gh api -X PUT repos/ferrum-edge/ferrum-edge/environments/base-image-refresh \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/ferrum-edge/ferrum-edge/environments/base-image-refresh/deployment-branch-policies \
+  -f name=main -f type=branch
+gh secret set BASE_IMAGE_REFRESH_TOKEN -R ferrum-edge/ferrum-edge --env base-image-refresh
 ```
 
 ### Secret Usage in Workflows

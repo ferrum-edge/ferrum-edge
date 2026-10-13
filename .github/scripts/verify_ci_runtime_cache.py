@@ -4224,10 +4224,10 @@ BASE_IMAGE_REFRESH_OPEN_TOKEN = (
     "          GH_TOKEN: ${{ secrets.BASE_IMAGE_REFRESH_TOKEN }}\n"
 )
 BASE_IMAGE_REFRESH_MERGE_MARKERS = (
-    "required=\"$(jq -r '.required_checks[].context' .github/required-publication-checks.json)\"",
+    "inventory=.github/required-publication-checks.json",
     'if [ "${head}" != "OPEN ${HEAD_SHA}" ]; then',
     'if [ -n "${failed}" ]; then',
-    """if ! jq -e --arg c "${context}" 'any(.[]; .name == $c and .bucket == "pass")' <<<"${checks}" >/dev/null; then""",
+    'missing="$(jq -r --argjson checks "${checks}" --argjson runs "${runs}" \'[.required_checks[] as $r | select(([$runs[] | select(.path == $r.workflow_path and (.event == "pull_request" or .event == "pull_request_target")) | .suite]) as $suites | [$checks[] | select(.name == $r.context and .app == 15368 and .conclusion == "success" and (.suite as $s | $suites | index($s)))] | length == 0) | $r.context] | join(", ")\' "${inventory}")"',
     'if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then',
     'gh pr merge "${PR}" --merge --match-head-commit "${HEAD_SHA}"',
 )
@@ -5498,8 +5498,8 @@ def self_test() -> int:
         ),
         (
             "that merges without the required-check inventory",
-            "          required=\"$(jq -r '.required_checks[].context' .github/required-publication-checks.json)\"\n",
-            "          required=\"Tests\"\n",
+            "          inventory=.github/required-publication-checks.json\n",
+            "          inventory=/dev/null\n",
         ),
         (
             "that merges with failing checks",
@@ -5508,8 +5508,13 @@ def self_test() -> int:
         ),
         (
             "that accepts a skipped required check",
-            """'any(.[]; .name == $c and .bucket == "pass")'""",
-            """'any(.[]; .name == $c and (.bucket == "pass" or .bucket == "skipping"))'""",
+            '.conclusion == "success" and',
+            '(.conclusion == "success" or .conclusion == "skipped") and',
+        ),
+        (
+            "that accepts any check producer",
+            ".app == 15368 and",
+            "",
         ),
         (
             "that runs repository code in the credentialed job",

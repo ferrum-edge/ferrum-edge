@@ -55,6 +55,9 @@ concurrency:
 jobs:
   refresh:
     name: Resolve and verify current base image digests
+    # The credentialed jobs below depend on this one, so a dispatch from any
+    # other ref never reaches the refresh token.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
@@ -132,9 +135,12 @@ jobs:
   open:
     name: Open the refresh pull request
     needs: refresh
-    if: needs.refresh.outputs.rotations != ''
+    if: github.ref == 'refs/heads/main' && needs.refresh.outputs.rotations != ''
     runs-on: ubuntu-26.04
     timeout-minutes: 20
+    # The refresh token is an environment secret; the environment admits only
+    # `main`, so no pull-request or branch run can read it.
+    environment: base-image-refresh
     env:
       DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer Dockerfile.iproute2-layer"
     outputs:
@@ -265,9 +271,10 @@ jobs:
   merge:
     name: Merge the refresh pull request after required CI
     needs: open
-    if: needs.open.outputs.pr != ''
+    if: github.ref == 'refs/heads/main' && needs.open.outputs.pr != ''
     runs-on: ubuntu-26.04
     timeout-minutes: 300
+    environment: base-image-refresh
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -283,8 +290,11 @@ jobs:
           set -euo pipefail
           # The merging token may be able to bypass branch protection, so this
           # job enforces the gate itself instead of trusting a merge to be refused.
-          required="$(jq -r '.required_checks[].context' .github/required-publication-checks.json)"
-          if [ -z "${required}" ]; then
+          # Evidence is read for the exact head: only a successful check run
+          # from GitHub Actions (app 15368, the producer branch protection
+          # binds) in a run of the context's canonical workflow counts.
+          inventory=.github/required-publication-checks.json
+          if [ "$(jq '.required_checks | length' "${inventory}")" -eq 0 ]; then
             echo "::error::the required-check inventory is empty; refusing to merge"
             exit 1
           fi
@@ -294,24 +304,18 @@ jobs:
               echo "::error::refresh pull request #${PR} is no longer open at ${HEAD_SHA} (${head}); not merging"
               exit 1
             fi
-            checks="$(gh pr checks "${PR}" --json name,bucket || true)"
-            if [ -z "${checks}" ]; then
-              sleep 60
-              continue
-            fi
-            failed="$(jq -r '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(", ")' <<<"${checks}")"
+            runs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" \
+              --jq '.workflow_runs[] | {suite: .check_suite_id, path: .path, event: .event}' | jq -s .)"
+            checks="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+              --jq '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, app: .app.id, suite: .check_suite.id}' | jq -s .)"
+            failed="$(jq -r '[.[] | select(.status == "completed" and (.conclusion as $c | ["failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"] | index($c))) | .name] | unique | join(", ")' <<<"${checks}")"
             if [ -n "${failed}" ]; then
               echo "::error::refresh pull request #${PR} has failing checks: ${failed}; not merging"
               exit 1
             fi
-            pending="$(jq '[.[] | select(.bucket == "pending")] | length' <<<"${checks}")"
-            missing=""
-            while IFS= read -r context; do
-              # Only SUCCESS satisfies a required context; skipped or neutral never does.
-              if ! jq -e --arg c "${context}" 'any(.[]; .name == $c and .bucket == "pass")' <<<"${checks}" >/dev/null; then
-                missing="${missing}[${context}]"
-              fi
-            done <<<"${required}"
+            pending="$(jq '[.[] | select(.status != "completed")] | length' <<<"${checks}")"
+            # Only SUCCESS satisfies a required context; skipped or neutral never does.
+            missing="$(jq -r --argjson checks "${checks}" --argjson runs "${runs}" '[.required_checks[] as $r | select(([$runs[] | select(.path == $r.workflow_path and (.event == "pull_request" or .event == "pull_request_target")) | .suite]) as $suites | [$checks[] | select(.name == $r.context and .app == 15368 and .conclusion == "success" and (.suite as $s | $suites | index($s)))] | length == 0) | $r.context] | join(", ")' "${inventory}")"
             if [ "${pending}" -eq 0 ] && [ -z "${missing}" ]; then
               break
             fi

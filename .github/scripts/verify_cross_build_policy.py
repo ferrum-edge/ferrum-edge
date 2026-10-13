@@ -14005,15 +14005,25 @@ def cross_image_refresh_errors(workflows: dict[str, str], source: str) -> list[s
 # write-capable token, so the whole workflow is trusted automation: freeze it
 # byte-for-byte here, where an ordinary pull request cannot move it. That
 # closes its job set, top-level `env`/`defaults`/permissions, and every step
-# that can see the token. Every other workflow is refused any reference to the
-# refresh token and any indexed, bulk or inherited secret access, so no other
-# job can obtain it.
-DIGEST_REFRESH_WORKFLOW_SHA256 = "982cbc7a18234b1a304696e1f41cc27dde35b2a1f216d36ff8cca357d62a3246"
+# that can see the token. The token is a secret of the `main`-only
+# `base-image-refresh` environment, so pull-request runs never receive it, and
+# every other workflow is refused any environment, any mention of the token or
+# environment, any indexed, wildcard, bulk or inherited secret access, and any
+# YAML escape sequence that could spell one of those after decoding.
+DIGEST_REFRESH_WORKFLOW_SHA256 = "b0ed63455cbd1488c2a44183b66ca23603377070220191c513a43d046922a949"
 DIGEST_REFRESH_TOKEN_NAME = "BASE_IMAGE_REFRESH_TOKEN"
+DIGEST_REFRESH_ENVIRONMENT = "base-image-refresh"
 INDIRECT_SECRET_ACCESS = re.compile(
-    r"\bsecrets\s*\[|\btojson\s*\(\s*secrets\s*\)|\bsecrets\s*:\s*inherit\b",
+    r"\bsecrets\s*\[|\bsecrets\s*\.\s*\*|\btojson\s*\(\s*secrets\b"
+    r"|\bsecrets\s*:\s*inherit\b",
     re.IGNORECASE,
 )
+# YAML double-quoted escapes decode before expressions are evaluated, so they
+# could spell a forbidden secret or environment reference that a raw-text scan
+# never sees. Only the hex/Unicode escapes can spell an ASCII character other
+# than whitespace or punctuation, and no workflow needs them.
+YAML_DECODING_ESCAPE = re.compile(r"\\[uUx]")
+WORKFLOW_ENVIRONMENT_KEY = re.compile(r"(?im)(?:^|[\s{,\-])environment\s*:")
 
 
 def digest_refresh_automation_errors(
@@ -14037,12 +14047,28 @@ def digest_refresh_automation_errors(
                 f"{source}/{name} uses indexed, bulk or inherited secret access, "
                 "which could reach the digest-refresh token"
             )
-        if name != CROSS_IMAGE_REFRESH_WORKFLOW and DIGEST_REFRESH_TOKEN_NAME.lower() in (
-            text.lower()
+        if YAML_DECODING_ESCAPE.search(text):
+            errors.append(
+                f"{source}/{name} uses a YAML escape sequence that could hide a "
+                "secret or environment reference"
+            )
+        if name == CROSS_IMAGE_REFRESH_WORKFLOW:
+            continue
+        lowered = text.lower()
+        if (
+            DIGEST_REFRESH_TOKEN_NAME.lower() in lowered
+            or DIGEST_REFRESH_ENVIRONMENT in lowered
         ):
             errors.append(
-                f"{source}/{name} references {DIGEST_REFRESH_TOKEN_NAME}, which only "
+                f"{source}/{name} references {DIGEST_REFRESH_TOKEN_NAME} or the "
+                f"{DIGEST_REFRESH_ENVIRONMENT} environment, which only "
                 f"{CROSS_IMAGE_REFRESH_WORKFLOW} may use"
+            )
+        if WORKFLOW_ENVIRONMENT_KEY.search(text):
+            errors.append(
+                f"{source}/{name} declares a deployment environment; only "
+                f"{CROSS_IMAGE_REFRESH_WORKFLOW} may, so no other job can receive "
+                "an environment secret"
             )
     return errors
 
@@ -14107,6 +14133,16 @@ def digest_refresh_automation_self_test() -> list[str]:
         ("a computed index", "x: ${{ secrets[format('{0}_TOKEN', 'X')] }}\n"),
         ("bulk secret serialization", "x: ${{ toJSON(secrets) }}\n"),
         ("inherited reusable-workflow secrets", "    secrets: inherit\n"),
+        ("wildcard secret serialization", "x: ${{ toJSON(secrets.*) }}\n"),
+        ("a secret wildcard", "x: ${{ join(secrets.*, ',') }}\n"),
+        (
+            "a YAML-escaped token name",
+            'x: "${{ secrets.BASE\\u005fIMAGE_REFRESH_TOKEN }}"\n',
+        ),
+        ("a YAML-escaped expression", 'x: "\\x24{{ secrets.X }}"\n'),
+        ("the refresh environment", "    environment: base-image-refresh\n"),
+        ("another deployment environment", "    environment:\n      name: prod\n"),
+        ("a flow-mapped environment", "    with: {environment: prod}\n"),
     ):
         if not digest_refresh_automation_errors({**workflows, "other.yml": text}, "self-test"):
             failures.append(f"{label} in another workflow was admitted")
