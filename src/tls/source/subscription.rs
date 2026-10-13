@@ -1337,8 +1337,11 @@ async fn run_dynamic_material_set_reload_loop(
                 let source = std::slice::from_ref(&sources[*index]);
                 record_refresh_for_sources(surface, source, "load_error");
                 crate::tls::events::record_load_error(surface, source, &error.event_detail());
+                // A TCP+TLS stream listener whose material only rotated keeps
+                // its last admitted config (stream_listener keep-last-good);
+                // every other consumer fails closed for this destination.
                 warn!(surface, source_id = %sources[*index].source.redacted_source_id(), error = %error,
-                    "Tenant TLS file refused; destination remains fail-closed while unrelated source rotations continue");
+                    "Tenant TLS file refused; new backend TLS for its destinations fails closed (an unchanged TCP+TLS stream listener keeps its last admitted config) while unrelated source rotations continue");
             }
         }
         if let Some(last) = &last_fingerprint {

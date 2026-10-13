@@ -25,9 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it is projected onto upstreams. Every later load, cache rebuild and file
   watch re-resolves it under the configured roots and opens it one component
   at a time without following swapped symlinks (`openat` + `O_NOFOLLOW` on
-  Unix, handle-relative no-reparse opens on Windows). A refused tenant file
-  fails closed for its own destinations only and no longer stalls rotation
-  of unrelated backend TLS sources.
+  Unix, handle-relative no-reparse opens on Windows). Outside material is
+  never loaded. A tenant file refused after admission fails new backend TLS
+  closed for its own destinations only. The exception is an otherwise
+  unchanged TCP+TLS stream listener, which keeps serving with its last
+  admitted config under the existing keep-last-good rule until the file is
+  valid again. A refused tenant file no longer stalls rotation of unrelated
+  backend TLS sources.
 - **CRL-enforcing outbound TLS clients no longer resume sessions** (PR
   #6316, follow-up to #4297). TLS 1.2 tickets and TLS 1.3 PSK resumption
   skip certificate reverification, so a cached session could outlive a CRL's
