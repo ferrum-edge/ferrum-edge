@@ -113,6 +113,46 @@ fn test_verify_request_maps_header_failures_and_accepts_lowercase_bearer() {
     ));
 }
 
+/// Verification failures carry only a bounded category, never jsonwebtoken's
+/// serde text, which can quote attacker-chosen header or claim values.
+#[test]
+fn test_verify_request_failure_never_echoes_token_content() {
+    use base64::Engine;
+    let manager = JwtManager::new(test_jwt_config());
+    let b64 = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+    };
+    let sentinel = "sentinel-credential-material-7f3a";
+    let tokens = [
+        format!(
+            "{}.{}.c2ln",
+            b64(json!({"alg": sentinel, "typ": "JWT"})),
+            b64(json!({"sub": "x"}))
+        ),
+        format!(
+            "{}.{}.c2ln",
+            b64(json!({"alg": "HS256", "typ": "JWT"})),
+            b64(json!({"exp": sentinel}))
+        ),
+        format!("Bearer{sentinel}.{sentinel}.{sentinel}"),
+    ];
+    for token in tokens {
+        let Err(JwtError::VerificationFailed(message)) =
+            manager.verify_request(Some(&format!("Bearer {token}")))
+        else {
+            panic!("malformed token must fail verification");
+        };
+        assert!(
+            !message.contains(sentinel),
+            "verification failure leaked token content: {message}"
+        );
+        assert!(
+            message.chars().all(|c| c.is_ascii_alphanumeric()),
+            "verification failure must be a bare category: {message}"
+        );
+    }
+}
+
 #[test]
 fn test_jwt_required_claims_are_enforced() {
     let manager = JwtManager::new(test_jwt_config());
