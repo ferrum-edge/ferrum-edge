@@ -321,6 +321,15 @@ pub(crate) fn wildcard_suffix_is_effectively_universal(suffix: &str) -> bool {
     if domain.is_empty() || !domain.contains('.') {
         return true;
     }
+    // A numeric final label is an IP-literal fragment (`1.1` in `*.1.1`), not
+    // a DNS suffix with a registrable owner.
+    if domain
+        .rsplit('.')
+        .next()
+        .is_none_or(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
     if psl::suffix_str(&domain).is_none_or(|public_suffix| public_suffix == domain) {
         return true;
     }
@@ -543,6 +552,7 @@ fn origin_suffix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {
         && host
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && matches!(Host::parse(host), Ok(Host::Domain(_)))
         && !wildcard_suffix_is_effectively_universal(host)
 }
 

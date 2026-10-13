@@ -2464,6 +2464,9 @@ fn test_constructor_rejects_credentialed_public_suffix_regex() {
         // Provider apex subtrees.
         "^https://.*\\.amazonaws\\.com$",
         "https://[a-z0-9-]+\\.amazonaws\\.com\\.cn",
+        // A numeric suffix is an IP fragment, not a registrable domain.
+        "^https://[0-9.]+\\.1\\.1$",
+        "^https://[0-9.]+\\.1\\.1:[0-9]+$",
         // An IPv6 colon is not a port separator.
         "^https://\\[2001:[0-9a-f:]+\\]$",
     ] {

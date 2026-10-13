@@ -3194,6 +3194,7 @@ mod virtual_service_cors {
             "^https://[a-z]{2,}\\.com$",
             "^https://[a-z]+\\.com:8443$",
             "https://[a-z]+\\.biz",
+            "^https://[0-9.]+\\.1\\.1$",
         ] {
             let mut credentialed = policy(vec![MeshCorsOriginMatch::Regex(regex.into())]);
             credentialed.cors.allow_credentials = Some(true);

@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still work without credentials. A credentialed `regex` origin must now
   also prove that it pins the host: its literal suffixes must be complete
   origins, contain the literal authority, or end in a fixed non-public
-  domain (with an optional literal port). `https://[a-z]+\.com`,
+  domain (a trailing literal or variable numeric port is allowed;
+  numeric IP-fragment suffixes never count). `https://[a-z]+\.com`,
   `https://[a-z]+example\.com`, hosts not terminated before a variable part
   and patterns the analysis cannot bound are refused with credentials. A
   pattern whose every match starts with a literal `scheme://host:` still
