@@ -1,0 +1,153 @@
+name: Windows File Confinement
+
+# Windows is a shipped release target (`ferrum-edge-windows-x86_64.exe`), but
+# every unit-test shard runs on Linux, so the Windows tenant-file confinement
+# tests (`windows_confined_files` in
+# tests/unit/tls/scoped_material_reference_tests.rs, exercising
+# src/tls/source/windows_file.rs) compile out everywhere else. This workflow
+# runs them natively on the paths that can change them (issue #6540): the
+# confinement code and tests, the test-registration chain that could compile
+# them out, the shared crate root, and the build configuration.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/windows-confinement.yml
+      - src/tls/source/**
+      - src/lib.rs
+      - src/config/file_loader.rs
+      - tests/unit_tests.rs
+      - tests/unit/mod.rs
+      - tests/unit/tls/mod.rs
+      - tests/unit/tls/scoped_material_reference_tests.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - build.rs
+      - rust-toolchain.toml
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/windows-confinement.yml
+      - src/tls/source/**
+      - src/lib.rs
+      - src/config/file_loader.rs
+      - tests/unit_tests.rs
+      - tests/unit/mod.rs
+      - tests/unit/tls/mod.rs
+      - tests/unit/tls/scoped_material_reference_tests.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - build.rs
+      - rust-toolchain.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The repository Cargo config names sccache as the rustc wrapper; this
+  # workflow builds without a compiler cache.
+  RUSTC_WRAPPER: ""
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+
+# A newer push to the same pull request cancels the superseded run. Every
+# other event gets a unique group so it always runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows-confinement:
+    name: Windows confinement unit tests
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      # The aggregated unit_tests target is large; keep debug info small so the
+      # cold compile fits the hosted runner.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      RUST_BACKTRACE: "1"
+      # Git Bash puts its own msys perl first on PATH, which lacks the modules
+      # vendored OpenSSL's Configure needs. Use the image's Strawberry Perl.
+      OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      # Same checksum-pinned protoc and NASM the native release builds use.
+      # Vendored OpenSSL needs NASM on Windows.
+      - name: Install protoc and NASM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $protocVersion = "35.1"
+          $protocRoot = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion"
+          $protocZip = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion-win64.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip" `
+            -OutFile $protocZip
+          $expectedProtocSha256 = "5d3ff218d7d91eea95f7569bcb5a98f3030f8996d44151279d9772edcff76082"
+          $actualProtocSha256 = (Get-FileHash -Algorithm SHA256 $protocZip).Hash.ToLowerInvariant()
+          if ($actualProtocSha256 -ne $expectedProtocSha256) {
+            throw "protoc archive SHA-256 mismatch: expected $expectedProtocSha256, got $actualProtocSha256"
+          }
+          Expand-Archive -Path $protocZip -DestinationPath $protocRoot -Force
+          $protocExe = Join-Path (Join-Path $protocRoot "bin") "protoc.exe"
+          if (!(Test-Path $protocExe)) {
+            throw "protoc.exe was not found after extracting $protocZip"
+          }
+          "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+          $nasmVersion = "3.02"
+          $nasmZip = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
+          $nasmRoot = Join-Path $env:RUNNER_TEMP "nasm"
+          Invoke-WebRequest `
+            -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
+            -OutFile $nasmZip
+          $expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
+          $actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip).Hash.ToLowerInvariant()
+          if ($actualNasmSha256 -ne $expectedNasmSha256) {
+            throw "NASM archive SHA-256 mismatch: expected $expectedNasmSha256, got $actualNasmSha256"
+          }
+          Expand-Archive -Path $nasmZip -DestinationPath $nasmRoot -Force
+          $nasmBin = Join-Path $nasmRoot "nasm-$nasmVersion"
+          if (!(Test-Path (Join-Path $nasmBin "nasm.exe"))) {
+            throw "nasm.exe was not found after extracting $nasmZip"
+          }
+          $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Compile the unit test binary
+        shell: bash
+        run: cargo test --test unit_tests --no-run
+
+      # A renamed module would otherwise match zero tests and pass. The module
+      # holds ten ordinary tests; require at least that many to pass. Run them
+      # serially: the handle-leak test counts every handle in the process.
+      - name: Run Windows confinement tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/windows-confinement.log"
+          cargo test --test unit_tests unit::tls::scoped_material_reference_tests::windows_confined_files:: -- --test-threads=1 2>&1 | tee "$log"
+          grep -Eq 'test result: ok\. ([1-9][0-9]+) passed' "$log"
+
+      # The case-sensitive NTFS directory fixture needs an elevated process on
+      # a volume that supports per-directory case sensitivity. Hosted Windows
+      # runners are elevated, so run the ignored test explicitly. Its fixture
+      # setup asserts success, so an unsupported runner fails visibly here
+      # instead of skipping.
+      - name: Run the case-sensitive NTFS directory test
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/windows-case-sensitive.log"
+          cargo test --test unit_tests unit::tls::scoped_material_reference_tests::windows_confined_files::windows_case_sensitive_sibling_is_not_an_allowed_root_alias -- --ignored --exact 2>&1 | tee "$log"
+          grep -Eq 'test result: ok\. 1 passed' "$log"
