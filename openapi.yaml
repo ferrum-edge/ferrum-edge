@@ -34718,7 +34718,11 @@ components:
             endpoint:
               type: string
               format: uri
-              description: Embeddings endpoint URL. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time.
+              description: Embeddings endpoint URL. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time. A cleartext http:// URL is admitted only to a loopback host (localhost, 127.0.0.0/8, ::1) unless provider.allow_plaintext is true.
+            allow_plaintext:
+              type: [boolean, "null"]
+              default: false
+              description: Admit a cleartext http:// endpoint on a non-loopback host. The provider API key then crosses the network in clear. Omit or null means false.
             model:
               type: string
               description: Embedding model sent in the request body.
@@ -35146,7 +35150,7 @@ components:
         semantic_embedding_endpoint:
           type: string
           pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
-          description: Nonblank embedding endpoint. Required and validated as an HTTP(S) URL when semantic_similarity_enabled is true; disabled semantic mode only checks that the supplied string is nonblank. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
+          description: Nonblank embedding endpoint. Required and validated as an HTTP(S) URL when semantic_similarity_enabled is true; disabled semantic mode only checks that the supplied string is nonblank. A cleartext http:// URL is admitted only to a loopback host (localhost, 127.0.0.0/8, ::1) unless semantic_embedding_allow_plaintext is true. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
         semantic_embedding_model:
           type: string
           pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
@@ -35174,6 +35178,10 @@ components:
           not:
             pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss](?![\s\S])'
           description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key. Must not be the gateway-owned X-Ferrum-Hops proxy hop count (any case, `_` or `-`), which the embedding call carries itself.
+        semantic_embedding_allow_plaintext:
+          type: boolean
+          default: false
+          description: Admit a cleartext http:// semantic_embedding_endpoint on a non-loopback host. The embedding API key then crosses the network in clear.
         semantic_embedding_auth_scheme:
           type: string
           pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'

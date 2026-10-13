@@ -10232,3 +10232,30 @@ async fn embedding_calls_carry_the_proxy_hop_count() {
         }
     }
 }
+
+#[test]
+fn cleartext_provider_endpoint_requires_opt_in_off_loopback() {
+    let mut config = config_with_builtin("prompt_injection");
+    config["provider"] = provider("http://embeddings.example.com/v1/embeddings");
+    let err = AiSemanticFirewall::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("non-loopback http:// must be refused without the opt-in");
+    assert!(err.contains("provider.allow_plaintext"), "got: {err}");
+
+    config["provider"]["allow_plaintext"] = Value::Bool(true);
+    assert!(AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_ok());
+
+    for endpoint in [
+        "http://localhost:9/v1/embeddings",
+        "http://127.0.0.1:9/v1/embeddings",
+        "http://[::1]:9/v1/embeddings",
+        "https://embeddings.example.com/v1/embeddings",
+    ] {
+        let mut config = config_with_builtin("prompt_injection");
+        config["provider"] = provider(endpoint);
+        assert!(
+            AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_ok(),
+            "{endpoint} must be admitted without the opt-in"
+        );
+    }
+}

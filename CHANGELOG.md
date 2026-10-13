@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `ai_semantic_cache` and `ai_semantic_firewall` refuse a
+  cleartext embedding endpoint off loopback** (issue #6617). Both send an API
+  key with every embedding call. An `http://` endpoint is now admitted without
+  an opt-in only for `localhost`, `127.0.0.0/8` or `::1`. Any other host needs
+  `semantic_embedding_allow_plaintext: true` (cache) or
+  `provider.allow_plaintext: true` (firewall), matching the `allow_plaintext`
+  opt-in `ai_federation` and `ai_stream_router` already require.
+
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only

@@ -1093,7 +1093,7 @@ fn test_semantic_endpoint_allows_literal_ips_permitted_by_backend_policy() {
     let public_client = plugin_http_client_with_ip_policy(BackendAllowIps::Public);
     let public_endpoint = json!({
         "semantic_similarity_enabled": true,
-        "semantic_embedding_endpoint": "http://8.8.8.8/embeddings",
+        "semantic_embedding_endpoint": "https://8.8.8.8/embeddings",
     });
     assert!(AiSemanticCache::new(&public_endpoint, public_client).is_ok());
 
@@ -8490,5 +8490,34 @@ fn test_semantic_auth_header_cannot_name_the_proxy_hop_count() {
             Err(error) => error,
         };
         assert!(error.contains("X-Ferrum-Hops"), "{name:?}: {error}");
+    }
+}
+
+#[test]
+fn cleartext_embedding_endpoint_requires_opt_in_off_loopback() {
+    let mut config =
+        semantic_endpoint_config("http://embeddings.example.com/v1/embeddings".to_string());
+    let err = AiSemanticCache::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("non-loopback http:// must be refused without the opt-in");
+    assert!(
+        err.contains("semantic_embedding_allow_plaintext"),
+        "got: {err}"
+    );
+
+    config["semantic_embedding_allow_plaintext"] = serde_json::Value::Bool(true);
+    assert!(AiSemanticCache::new(&config, PluginHttpClient::default()).is_ok());
+
+    for endpoint in [
+        "http://localhost:9/embeddings",
+        "http://127.0.0.1:9/embeddings",
+        "http://[::1]:9/embeddings",
+        "https://embeddings.example.com/v1/embeddings",
+    ] {
+        let config = semantic_endpoint_config(endpoint.to_string());
+        assert!(
+            AiSemanticCache::new(&config, PluginHttpClient::default()).is_ok(),
+            "{endpoint} must be admitted without the opt-in"
+        );
     }
 }

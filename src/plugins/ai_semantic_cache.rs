@@ -84,6 +84,7 @@ use super::utils::redis_rate_limiter::{
 };
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::response_body::read_response_body_bounded;
+use super::utils::socket_host::is_loopback_url_host;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::fips::approved::{HmacSha256, Sha256};
 use crate::startup::sanitize_startup_scalar;
@@ -162,6 +163,7 @@ pub const AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS: &[&str] = &[
     "semantic_embedding_api_key",
     "semantic_embedding_auth_header",
     "semantic_embedding_auth_scheme",
+    "semantic_embedding_allow_plaintext",
     "semantic_similarity_threshold",
     "semantic_vector_max_candidates",
     "semantic_embedding_timeout_ms",
@@ -198,6 +200,7 @@ pub const AI_SEMANTIC_CACHE_CONFIG_KEYS: &[&str] = &[
     "semantic_embedding_api_key",
     "semantic_embedding_auth_header",
     "semantic_embedding_auth_scheme",
+    "semantic_embedding_allow_plaintext",
     "semantic_similarity_threshold",
     "semantic_vector_max_candidates",
     "semantic_embedding_timeout_ms",
@@ -5811,6 +5814,8 @@ fn parse_semantic_config(
     }
     let timeout_ms =
         optional_positive_u64(config, "semantic_embedding_timeout_ms")?.unwrap_or(5_000);
+    let allow_plaintext =
+        optional_bool(config, "semantic_embedding_allow_plaintext")?.unwrap_or(false);
 
     let auth_header =
         reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
@@ -5854,7 +5859,8 @@ fn parse_semantic_config(
         "ai_semantic_cache: `semantic_embedding_endpoint` is required when `semantic_similarity_enabled=true`"
             .to_string()
     })?;
-    let validated_endpoint = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
+    let validated_endpoint =
+        validate_semantic_embedding_endpoint(&endpoint, allow_plaintext, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
@@ -5879,6 +5885,7 @@ struct ValidatedSemanticEmbeddingEndpoint {
 
 fn validate_semantic_embedding_endpoint(
     endpoint: &str,
+    allow_plaintext: bool,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<ValidatedSemanticEmbeddingEndpoint, String> {
     let parsed_endpoint = Url::parse(endpoint)
@@ -5920,6 +5927,21 @@ fn validate_semantic_embedding_endpoint(
         return Err(format!(
             "ai_semantic_cache: `semantic_embedding_endpoint` IP \"{ip}\" denied by backend egress policy"
         ));
+    }
+
+    // The embedding call carries the configured API key. Cleartext is admitted
+    // without an opt-in only to a loopback host (a local sidecar); any other
+    // `http://` destination needs `semantic_embedding_allow_plaintext: true`.
+    if parsed_endpoint.scheme() == "http"
+        && !allow_plaintext
+        && !parsed_endpoint
+            .host()
+            .is_some_and(|host| is_loopback_url_host(&host))
+    {
+        return Err(
+            "ai_semantic_cache: `semantic_embedding_endpoint` uses `http://` to a non-loopback host, which is rejected by default; use `https://` or set `semantic_embedding_allow_plaintext: true`"
+                .to_string(),
+        );
     }
 
     Ok(ValidatedSemanticEmbeddingEndpoint {
