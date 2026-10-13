@@ -105,7 +105,11 @@ impl Serialize for OpaInputPayload<'_> {
 
 pub struct Opa {
     http_client: PluginHttpClient,
-    decision_url: String,
+    /// The admitted, already-normalized decision URL. Requests are built from
+    /// this parsed value rather than re-parsing a string, so the URL sent on
+    /// the wire is exactly the one whose path was proven to stay under the
+    /// `/v1/data/` Data API prefix at config admission.
+    decision_url: Url,
     /// Structural `scheme://host[:port]/redacted` rendering of `decision_url`,
     /// precomputed once so the shared client's slow-call and egress-denial
     /// diagnostics never print the configured base path. `opa_host` rejects
@@ -200,7 +204,7 @@ impl Opa {
 
         let (decision_url, redacted_decision_url, decision_hostname) =
             parse_decision_endpoint(object)?;
-        if decision_url.starts_with("https://") {
+        if decision_url.scheme() == "https" {
             info!(
                 plugin = "opa",
                 scheme = "https",
@@ -587,7 +591,7 @@ impl Plugin for Opa {
             );
         };
         let mut request = client
-            .post(&self.decision_url)
+            .post(self.decision_url.clone())
             .timeout(self.timeout)
             .json(&payload);
         for (name, value) in &self.custom_headers {
@@ -698,9 +702,7 @@ impl Plugin for Opa {
 
 /// Parse `opa_host` + `policy_path` into the wire decision URL, its
 /// diagnostic-safe rendering, and the hostname used for DNS warmup.
-fn parse_decision_endpoint(
-    object: &Map<String, Value>,
-) -> Result<(String, String, String), String> {
+fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(Url, String, String), String> {
     let opa_host = required_string(object, "opa_host")?;
     let parsed =
         Url::parse(opa_host).map_err(|error| format!("opa: invalid `opa_host`: {error}"))?;
@@ -736,20 +738,48 @@ fn parse_decision_endpoint(
     let policy_path = required_string(object, "policy_path")?;
     validate_policy_path(policy_path)?;
 
+    // Join onto the parsed (already normalized) base so the raw `opa_host`
+    // text can never contribute a separator or dot segment of its own.
     let decision_url = format!(
         "{}{}{}",
-        opa_host.trim_end_matches('/'),
+        parsed.as_str().trim_end_matches('/'),
         OPA_DATA_PREFIX,
         policy_path
     );
     let parsed_decision_url = Url::parse(&decision_url)
         .map_err(|error| format!("opa: invalid decision URL from opa_host/policy_path: {error}"))?;
+    let data_prefix = format!("{}{}", parsed.path().trim_end_matches('/'), OPA_DATA_PREFIX);
+    ensure_decision_path_under_data_prefix(&parsed_decision_url, &data_prefix, policy_path)?;
+    let redacted_decision_url = crate::plugins::utils::redacted_endpoint_url(&parsed_decision_url);
 
-    Ok((
-        decision_url,
-        crate::plugins::utils::redacted_endpoint_url(&parsed_decision_url),
-        hostname,
-    ))
+    Ok((parsed_decision_url, redacted_decision_url, hostname))
+}
+
+/// Prove the NORMALIZED decision URL still addresses `policy_path` beneath the
+/// Data API prefix (issue #6368).
+///
+/// The WHATWG URL parser rewrites paths: for `http`/`https` it treats `\` as a
+/// separator, strips tab/CR/LF, trims trailing spaces and C0 controls from the
+/// whole input, and then removes `.`/`..` segments. A raw string check alone
+/// cannot see any of that, so admission re-checks the parsed result: the path
+/// must begin with `{base}/v1/data/` and carry exactly as many segments after
+/// it as `policy_path` has. Anything the parser collapsed or redirected fails
+/// closed here instead of reaching OPA.
+fn ensure_decision_path_under_data_prefix(
+    decision_url: &Url,
+    data_prefix: &str,
+    policy_path: &str,
+) -> Result<(), String> {
+    let escapes = match decision_url.path().strip_prefix(data_prefix) {
+        Some(rest) => rest.split('/').count() != policy_path.split('/').count(),
+        None => true,
+    };
+    if escapes {
+        return Err(
+            "opa: `policy_path` must stay under `/v1/data/` after URL normalization".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_policy_path(policy_path: &str) -> Result<(), String> {
@@ -764,6 +794,18 @@ fn validate_policy_path(policy_path: &str) -> Result<(), String> {
     }
     if policy_path.contains('%') {
         return Err("opa: `policy_path` must not contain percent-encoding".to_string());
+    }
+    // `\` is a path separator for http/https URLs, and the URL parser strips
+    // tab/CR/LF and trailing spaces/controls, so any of these could turn an
+    // admitted segment into a separator or a dot segment after normalization.
+    if policy_path
+        .chars()
+        .any(|c| c == '\\' || c == ' ' || c.is_ascii_control())
+    {
+        return Err(
+            "opa: `policy_path` must not contain `\\`, spaces, or ASCII control characters"
+                .to_string(),
+        );
     }
     if policy_path
         .split('/')
