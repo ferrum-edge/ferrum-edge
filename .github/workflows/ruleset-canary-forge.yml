@@ -1,0 +1,22 @@
+name: Ruleset Canary Forge
+
+# Temporary canary: a DIFFERENT workflow file in the PR that reports a check
+# with the same name as the required probe job and always passes. No
+# checks: write, no API calls; it only shows that a same-named passing check
+# from GitHub Actions (app 15368) does not satisfy the ruleset workflows rule.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Ruleset Canary Probe
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Forged pass
+        run: |
+          echo "same-named forged check - always passes"
