@@ -30,8 +30,10 @@ proptest = "=1.6.0"
 # This is an isolated Cargo workspace, so it does not inherit the root
 # workspace's patched protocol and security dependencies. Keep these paths in
 # lockstep with the root `[patch.crates-io]` table or the fuzz lane would
-# compile and exercise different code from the production binary.
+# compile and exercise different code from the production binary
+# (tests/unit/gateway_core/fuzz_target_schedule_parity_tests.rs enforces it).
 [patch.crates-io]
+sqlx-core = { path = "../vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "../vendor/reqwest-0.13.4-ferrum-patched" }
 h3 = { path = "../vendor/h3-0.0.8-ferrum-patched" }
 h3-quinn = { path = "../vendor/h3-quinn-0.0.10-ferrum-patched" }

@@ -161,6 +161,14 @@ pub struct JwksAuth {
     dpop_authorization_scheme_providers: Vec<usize>,
     request_headers_to_redact: Vec<String>,
     emit_mesh_request_principal_metadata: bool,
+    /// Istio `RequestAuthentication` semantics: a request carrying no token
+    /// (no configured token location present) is passed through
+    /// unauthenticated when this plugin is the sole applicable auth plugin.
+    ///
+    /// Deliberately independent of `emit_mesh_request_principal_metadata`:
+    /// that flag only emits metadata, and enabling it must never relax
+    /// authentication. Defaults to `false` (fail closed).
+    allow_missing_token: bool,
     http_client: PluginHttpClient,
     refresh_interval: Duration,
     /// Minimum spacing between on-demand JWKS refetches triggered by a token
@@ -287,6 +295,7 @@ const CONFIG_FIELDS: &[&str] = &[
     "claim_headers",
     "claim_headers_separator",
     "emit_mesh_request_principal_metadata",
+    "allow_missing_token",
     "require_exp",
     "jwks_refresh_interval_secs",
     "jwks_max_stale_seconds",
@@ -525,6 +534,22 @@ impl JwksAuth {
             parse_separator(config_obj, "claim_headers_separator", "jwks_auth", ",")?;
         let emit_mesh_request_principal_metadata =
             optional_bool(config_obj, "emit_mesh_request_principal_metadata")?.unwrap_or(false);
+        let allow_missing_token =
+            optional_bool(config_obj, "allow_missing_token")?.unwrap_or(false);
+        // Only the mesh-managed RequestAuthentication instance (a reserved
+        // plugin-config id operators cannot create) is expected to carry this.
+        // Validation construction passes no id and stays quiet; a runtime
+        // instance under any other id is an operator opt-in to optional auth.
+        if allow_missing_token
+            && let Some(config_id) = plugin_config_id
+            && config_id != crate::modes::mesh::MESH_REQUEST_AUTH_PLUGIN_ID
+        {
+            warn!(
+                plugin_config_id = %config_id,
+                "jwks_auth: `allow_missing_token` is enabled; requests without a token are \
+                 forwarded unauthenticated when this is the only applicable auth plugin"
+            );
+        }
         let shard_amount = http_client.pool_shard_amount();
 
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
@@ -969,6 +994,7 @@ impl JwksAuth {
             dpop_authorization_scheme_providers,
             request_headers_to_redact,
             emit_mesh_request_principal_metadata,
+            allow_missing_token,
             http_client,
             refresh_interval,
             kid_miss_cooldown,
@@ -1395,7 +1421,10 @@ impl JwksAuth {
         match credential {
             JwksExtractedCredential::Missing => {
                 debug!("jwks_auth: no credential present");
-                if self.emit_mesh_request_principal_metadata {
+                // Only the explicit `allow_missing_token` opt-in may mark a
+                // missing token as permissive; the metadata-emission flag
+                // never does.
+                if self.allow_missing_token {
                     ctx.metadata.insert(
                         "mesh_request_auth.permissive_missing_token".to_string(),
                         "true".to_string(),

@@ -14180,9 +14180,11 @@ fn inject_mesh_request_auth_plugin(
         return;
     }
 
-    // jwks_auth already passes through requests with no token
-    // (ExtractedCredential::Missing -> PluginResult::Continue), which matches
-    // Istio's permissive RequestAuthentication semantics. No extra flag needed.
+    // Istio RequestAuthentication is permissive: a request with no token
+    // passes (only a forged/invalid token is rejected) and AuthorizationPolicy
+    // decides whether a principal is required. `jwks_auth` only grants that
+    // through the explicit `allow_missing_token` opt-in; the metadata flag
+    // alone never relaxes authentication.
     //
     // `require_exp` defaults to the secure posture (true): tokens that omit
     // `exp` are rejected so they cannot live forever, satisfying the
@@ -14194,6 +14196,7 @@ fn inject_mesh_request_auth_plugin(
         "providers": providers,
         "require_exp": runtime.request_auth_require_exp,
         "emit_mesh_request_principal_metadata": true,
+        "allow_missing_token": true,
     });
 
     ensure_global_plugin(
