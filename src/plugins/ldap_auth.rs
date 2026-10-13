@@ -111,9 +111,10 @@ const LDAP_AUTH_DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
 const LDAP_AUTH_MAX_CONCURRENT_REQUESTS: usize = 1_024;
 const LDAP_AUTH_USER_SEARCH_SIZE_LIMIT: i32 = 2;
 const LDAP_AUTH_GROUP_SEARCH_SIZE_LIMIT: i32 = 1_000;
-/// RDN bound by [`LdapAuth::equalize_unknown_user_bind`]. No real entry is
-/// expected to carry it.
-const LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN: &str = "cn=ferrum-edge-unknown-user";
+/// RDN prefix for [`LdapAuth::equalize_unknown_user_bind`]. Each bind appends
+/// 128 random bits, so no real entry can be targeted repeatedly (and locked
+/// out) by unknown-username traffic.
+const LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN_PREFIX: &str = "cn=ferrum-edge-unknown-";
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct CacheKey([u8; 32]);
@@ -1037,7 +1038,7 @@ impl LdapAuth {
             let result_entry = match rs.len() {
                 0 => {
                     let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
-                    self.equalize_unknown_user_bind(search_base).await;
+                    self.equalize_unknown_user_bind(search_base).await?;
                     return Err(AuthError::Credential(
                         "ldap_auth: user not found".to_string(),
                     ));
@@ -1093,32 +1094,44 @@ impl LdapAuth {
     /// exist (issue #6609). Directory-side cost can still differ: a directory
     /// may verify an expensive password hash only for an existing entry.
     ///
-    /// The bind targets a fixed RDN under `search_base_dn` with a random
+    /// The bind targets a fresh random RDN under `search_base_dn` with a random
     /// throwaway password: the client's password never leaves for a DN it did
-    /// not authenticate against. Every outcome is ignored; the caller always
-    /// answers "user not found".
-    async fn equalize_unknown_user_bind(&self, search_base: &str) {
-        let mut filler = [0u8; 24];
-        if crate::fips::backend::rand::SystemRandom::new()
-            .fill(&mut filler)
-            .is_err()
-        {
-            return;
-        }
-        let throwaway_password = base64::engine::general_purpose::STANDARD.encode(filler);
+    /// not authenticate against, and no real entry is targeted repeatedly.
+    ///
+    /// Infrastructure failures are classified exactly like the real user bind
+    /// (`AuthError::Backend`, 500), so an unreachable or unavailable directory
+    /// answers an unknown and a known username the same way. Only a credential
+    /// rejection (or an unexpected success) of the throwaway bind becomes the
+    /// ordinary "user not found" 401.
+    async fn equalize_unknown_user_bind(&self, search_base: &str) -> Result<(), AuthError> {
+        let mut random = [0u8; 40];
+        crate::fips::backend::rand::SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| {
+                AuthError::Backend("ldap_auth: failed to generate equalizer bind".to_string())
+            })?;
+        let (rdn_suffix, password_bytes) = random.split_at(16);
+        let rdn_suffix: String = rdn_suffix
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let throwaway_password = base64::engine::general_purpose::STANDARD.encode(password_bytes);
         let equalizer_dn = if search_base.is_empty() {
-            LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN.to_string()
+            format!("{LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN_PREFIX}{rdn_suffix}")
         } else {
-            format!("{LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN},{search_base}")
+            format!("{LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN_PREFIX}{rdn_suffix},{search_base}")
         };
-        let Ok(mut ldap) = self.connect().await else {
-            return;
-        };
-        let _ = ldap
+        let mut ldap = self.connect().await?;
+        let bind_result = ldap
             .with_timeout(self.connect_timeout)
             .simple_bind(&equalizer_dn, &throwaway_password)
-            .await;
+            .await
+            .map_err(|e| AuthError::Backend(format!("ldap_auth: user bind failed: {e}")));
         let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+        match classify_user_bind_result(bind_result?, "user bind") {
+            Ok(()) | Err(AuthError::Credential(_)) => Ok(()),
+            Err(backend) => Err(backend),
+        }
     }
 
     /// Read the configured canonical identity attribute off an already
@@ -2126,6 +2139,9 @@ impl AuthMechanism for LdapAuth {
             return VerifyOutcome::NotApplicable;
         };
         let password = Zeroizing::new(password);
+        // One wall-clock budget for the whole authentication: a group re-check
+        // and any uncached fallback after it share it.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
 
         // Check cache first
         if let Some(cached) = self.check_cache(&username, &password) {
@@ -2134,7 +2150,7 @@ impl AuthMechanism for LdapAuth {
                 return self.identity_outcome(&cached.canonical_identity, consumer_index);
             }
             match self
-                .revalidate_cached_groups(&username, &password, cached, consumer_index)
+                .revalidate_cached_groups(&username, &password, cached, consumer_index, deadline)
                 .await
             {
                 CachedGroupRevalidation::Decided(outcome) => return outcome,
@@ -2154,8 +2170,8 @@ impl AuthMechanism for LdapAuth {
             }
         };
 
-        match tokio::time::timeout(
-            self.request_timeout,
+        match tokio::time::timeout_at(
+            deadline,
             self.verify_uncached(&username, &password, consumer_index),
         )
         .await
@@ -2218,8 +2234,8 @@ auth_flow::impl_auth_plugin!(
 impl LdapAuth {
     /// Re-run the `required_groups` search for a cache hit whose last group
     /// check is older than `group_cache_ttl`, under the same concurrency and
-    /// wall-clock bounds as an uncached authentication, further capped by the
-    /// observed entry's remaining lifetime.
+    /// wall-clock bounds as an uncached authentication (the request's single
+    /// `deadline`), further capped by the observed entry's remaining lifetime.
     ///
     /// A user no longer in any required group is refused (403) and the
     /// observed entry is evicted. A directory failure or deadline fails closed
@@ -2233,11 +2249,15 @@ impl LdapAuth {
         password: &str,
         cached: CachedAuthentication,
         consumer_index: &ConsumerIndex,
+        deadline: tokio::time::Instant,
     ) -> CachedGroupRevalidation {
         let remaining = cached.expires_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return CachedGroupRevalidation::Stale;
         }
+        let budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(remaining);
         let _permit = match self.ldap_concurrency.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
@@ -2248,7 +2268,7 @@ impl LdapAuth {
             }
         };
         let membership = tokio::time::timeout(
-            self.request_timeout.min(remaining),
+            budget,
             self.check_group_membership(&cached.user_dn, &cached.canonical_identity),
         )
         .await;
