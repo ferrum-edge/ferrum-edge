@@ -4255,13 +4255,18 @@ fn query_has_alt_sse(query_or_path: &str) -> bool {
     })
 }
 
+/// Decoded names of an endpoint-owned query, under `&`-only splitting and,
+/// for a pair with a raw `;`, each `;` sub-pair name too (RFC and form
+/// decodings; issue #6579), so a provider that splits on `;` cannot have an
+/// endpoint parameter overridden through either reading. `%3B` stays content.
 fn decoded_query_names(query: &str) -> HashSet<String> {
-    query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name))
-        .map(|name| percent_decode_str(name).decode_utf8_lossy().into_owned())
-        .collect()
+    let mut names = HashSet::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        names.insert(percent_decode_str(name).decode_utf8_lossy().into_owned());
+        names.extend(super::utils::query::semicolon_sub_pair_names(pair));
+    }
+    names
 }
 
 fn query_after_strip_markers(
