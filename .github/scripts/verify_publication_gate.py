@@ -27,9 +27,11 @@ CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 GATEWAY_WORKFLOW_PATH = ".github/workflows/gateway-api-conformance.yml"
 RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
 RELEASE_GATE_JOB = "validate-release-sha"
-CHECKOUT_USES = (
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-)
+# Any full-commit pin of actions/checkout: which upstream release it is, is
+# governed by the trusted action pin rotation check in
+# verify_cross_build_policy.py (docs/dependency-policy.md → "Automated action
+# pin rotation"), not by this gate.
+CHECKOUT_USES = re.compile(r"actions/checkout@[0-9a-f]{40}")
 
 # Direct fields of the version-release SHA gate. Same closed-set rule: a
 # write permission, `continue-on-error`, or other control beside this list
@@ -645,10 +647,11 @@ def _checkout_step_errors(
             f"{located} pinned checkout step fields must be exactly "
             f"{expected_fields!r} in order, found {tuple(step)!r}"
         )
-    if _scalar(step, "uses") != CHECKOUT_USES:
+    uses = _scalar(step, "uses")
+    if uses is None or CHECKOUT_USES.fullmatch(uses) is None:
         errors.append(
-            f"{located} checkout must pin `{CHECKOUT_USES}` as an active "
-            "`uses:` value, not a comment or a different action"
+            f"{located} checkout must pin `actions/checkout` to a full commit "
+            "SHA as an active `uses:` value, not a comment or a different action"
         )
     if expected_with is None:
         return errors
@@ -2892,13 +2895,26 @@ def self_test() -> list[str]:
         _release_errors(release_missing_checkout) != [],
         "a missing release checkout must fail",
     )
-    release_wrong_pin = _CONFORMING_RELEASE_JOB.replace(
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/checkout@0000000000000000000000000000000000000000",
+    for label, replacement in (
+        ("a mutable release checkout ref must fail", "actions/checkout@v7"),
+        ("a short release checkout SHA must fail", "actions/checkout@3d3c42e5"),
+        (
+            "a different checkout action must fail",
+            "actions/checkouts@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        ),
+    ):
+        release_wrong_pin = _CONFORMING_RELEASE_JOB.replace(
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            replacement,
+        )
+        expect(_release_errors(release_wrong_pin) != [], label)
+    release_rotated_pin = _CONFORMING_RELEASE_JOB.replace(
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+        "actions/checkout@1111111111111111111111111111111111111111 # v7.0.9",
     )
     expect(
-        _release_errors(release_wrong_pin) != [],
-        "a wrong release checkout pin must fail",
+        _release_errors(release_rotated_pin) == [],
+        "a rotated full-commit release checkout pin must pass",
     )
     release_opaque_timeout = _CONFORMING_RELEASE_JOB.replace(
         "    timeout-minutes: 350\n",

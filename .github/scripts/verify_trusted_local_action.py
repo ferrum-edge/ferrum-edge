@@ -16,7 +16,8 @@ revision). Every governed constraint is then decided from that manifest:
 * every trusted member is a regular file (no symlink, device, or hard link),
 * every trusted path stays inside the action directory and contains no `..`,
 * the working-tree copy of each path is a regular, non-symlink file,
-* contents match byte for byte and the executable bit matches,
+* contents match byte for byte (a YAML file may also differ in nothing but
+  external action pins, see below) and the executable bit matches,
 * the action directory holds no extra file and no symlink of any kind,
 * every ancestor directory of the action is an ordinary directory.
 
@@ -39,6 +40,14 @@ unchanged destination bytes pass by ordinary identity and further unadmitted
 drift still fails. Retire the predecessor constants after that landing so the
 old tree cannot remain an admitted source.
 
+An external `uses: owner/repo@<40-hex sha>` pin inside a YAML file is not part
+of that identity: a file that differs from the trusted bytes only in such pins
+(commit and trailing comment) still matches. Which upstream release commit a
+pin names is decided by the trusted action pin rotation check in
+`verify_cross_build_policy.py`, the required `Trusted Cross Build Policy` gate
+(docs/dependency-policy.md → "Automated action pin rotation"); this gate keeps
+freezing what the action runs and how.
+
 Usage:
   python3 -I .github/scripts/verify_trusted_local_action.py --self-test
   python3 -I .github/scripts/verify_trusted_local_action.py \
@@ -52,6 +61,7 @@ import argparse
 import hashlib
 import io
 import os
+import re
 import stat
 import sys
 import tarfile
@@ -64,6 +74,41 @@ from pathlib import Path, PurePosixPath
 # parity with the checkout is still checked below. Anything else (including a
 # symlink 120000 or gitlink 160000) is not an input this verifier will execute.
 TRUSTED_FILE_MODES = frozenset((0o644, 0o664, 0o755, 0o775))
+# Same normalization as `verify_cross_build_policy.normalize_action_pins`; this
+# checker is extracted and run alone, so it cannot import it.
+PINNED_ACTION_SHA_PLACEHOLDER = "0" * 40
+EXTERNAL_ACTION_PIN = re.compile(
+    r"(?m)^(?P<lead>[ \t]*(?:-[ \t]+)?uses:[ \t]+)(?P<quote>['\"]?)"
+    r"(?P<action>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+"
+    r"(?:/[A-Za-z0-9_.-]+)*)@(?P<sha>[0-9a-f]{40})(?P=quote)"
+    r"(?P<comment>[ \t]+#[^\n]*)?[ \t]*$"
+)
+PIN_NORMALIZED_SUFFIXES = frozenset({".yml", ".yaml"})
+
+
+def pin_only_difference(relative: str, expected: bytes, actual: bytes) -> bool:
+    """True when a YAML input differs from the trusted bytes only in pins."""
+
+    if PurePosixPath(relative).suffix.lower() not in PIN_NORMALIZED_SUFFIXES:
+        return False
+    try:
+        trusted = expected.decode("utf-8")
+        local = actual.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+
+    def normalize(contents: str) -> str:
+        return EXTERNAL_ACTION_PIN.sub(
+            lambda match: (
+                f"{match['lead']}{match['quote']}{match['action']}"
+                f"@{PINNED_ACTION_SHA_PLACEHOLDER}{match['quote']}"
+            ),
+            contents,
+        )
+
+    return normalize(trusted) == normalize(local)
+
+
 # Bound a hostile archive so a crafted manifest cannot exhaust the runner.
 MAX_ARCHIVE_MEMBERS = 4096
 MAX_MEMBER_BYTES = 8 * 1024 * 1024
@@ -364,7 +409,7 @@ def verify_local_action(
         except (TrustedActionError, OSError) as exc:
             findings.append(f"{relative}: unreadable local action input ({exc})")
             continue
-        if actual != expected:
+        if actual != expected and not pin_only_difference(relative, expected, actual):
             findings.append(f"{relative}: differs from the trusted revision")
     return findings
 
@@ -601,6 +646,26 @@ def run_self_test() -> list[str]:
     """
 
     failures: list[str] = []
+    pinned = (
+        b"runs:\n  using: composite\n  steps:\n"
+        b"    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"
+    )
+    rotated = pinned.replace(
+        b"55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0",
+        b"1111111111111111111111111111111111111111 # v6.2.0",
+    )
+    if not pin_only_difference("action.yml", pinned, rotated):
+        failures.append("an action pin rotation must match the trusted YAML")
+    for label, relative, local in (
+        ("a step edit", "action.yml", rotated + b"    - run: curl x | sh\n"),
+        ("a mutable ref", "action.yml", pinned.replace(
+            b"55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0", b"v6"
+        )),
+        ("a different action", "action.yml", rotated.replace(b"actions/cache", b"evil/cache")),
+        ("a non-YAML file", "install.sh", rotated),
+    ):
+        if pin_only_difference(relative, pinned, local):
+            failures.append(f"{label} must not pass as a pin-only difference")
     action_dir = normalize_action_path(_ACTION_DIR)
     entries = [
         # `git archive`'s default tar modes for tracked 100644 / 100755 blobs.
