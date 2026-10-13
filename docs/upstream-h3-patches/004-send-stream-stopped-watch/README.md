@@ -25,9 +25,20 @@ This patch adds `quic::SendStreamStopped`: a `&self` method that returns a
 `'static` future via stable return-position `impl Future` (RPITIT). Quinn's
 `SendStream::stopped` already has that shape; h3 needs the trait so
 `server::RequestStream` can forward it through `FrameStream` / `BufRecvStream`
-without exclusive send-stream access or a per-call boxed trait object. An
+without exclusive send-stream access or a per-call boxed trait object. The
+implemented scope is server-side only: the trait is implemented on the shared
+inner `RequestStream` and the public server facade; the public client facade
+has no `stopped` forwarder, and adding one is optional additional work, not
+required by the Ferrum server cancellation use case. An
 associated-type `impl Trait` (`type Stopped = impl Future`) is intentionally
 avoided: that requires unstable `impl_trait_in_assoc_type`.
+
+Return-position `impl Trait` in traits was stabilized in Rust 1.75, so this
+trait syntax sets the vendored packages' compiler floor: both
+`vendor/h3-0.0.8-ferrum-patched/Cargo.toml` and
+`vendor/h3-quinn-0.0.10-ferrum-patched/Cargo.toml` declare
+`rust-version = "1.75"` (no other vendored h3/h3-quinn source or dependency
+requirement inspected needs a newer compiler; Ferrum itself builds on stable).
 
 ## Files
 
