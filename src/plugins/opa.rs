@@ -373,25 +373,15 @@ impl Opa {
     /// (issue #6579): `carrier=;api_key=secret` is one `carrier` pair here but
     /// an `api_key` credential to a backend that also splits on `;`, and under
     /// `query_ambiguity_policy: delegate` its value would otherwise reach the
-    /// policy service. The check runs on the decoded text, so an encoded name
-    /// (`;api%5Fkey=`) and a literal `%3B` are both treated as separators; the
-    /// latter only over-redacts.
+    /// policy service. Sub-pairs come from the still-encoded bytes, so an
+    /// encoded name (`;api%5Fkey=`, `;private%3Dkey=`) is matched decoded while
+    /// a `%3B` stays ordinary content and never hides a parameter.
     fn query_param_is_redacted(&self, ctx: &RequestContext, param: &CanonicalQueryParam) -> bool {
-        if self.query_key_is_redacted(ctx, &param.name) {
-            return true;
-        }
-        if !param.name.contains(';') && !param.value.contains(';') {
-            return false;
-        }
-        let segment = if param.bare {
-            param.name.clone()
-        } else {
-            format!("{}={}", param.name, param.value)
-        };
-        segment.split(';').any(|sub_pair| {
-            let name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
-            self.query_key_is_redacted(ctx, name)
-        })
+        self.query_key_is_redacted(ctx, &param.name)
+            || param
+                .semicolon_sub_names
+                .iter()
+                .any(|name| self.query_key_is_redacted(ctx, name))
     }
 
     fn query_key_is_redacted(&self, ctx: &RequestContext, key: &str) -> bool {

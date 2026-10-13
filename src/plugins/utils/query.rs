@@ -162,6 +162,12 @@ pub struct CanonicalQueryParam {
     /// value). Both decode to an empty `value`; this bit is what keeps the two
     /// distinguishable in a lossless representation.
     pub bare: bool,
+    /// Percent-decoded names of this pair's `;`-separated sub-pairs, split on
+    /// the still-encoded bytes (issue #6579). Empty unless the pair carries an
+    /// unencoded `;`. A backend that also splits on `;` reads each of these as
+    /// a parameter of its own, so credential redaction must consult them; a
+    /// `%3B` is content and never produces an entry.
+    pub semicolon_sub_names: Vec<String>,
 }
 
 /// Ordered, occurrence-complete, explicitly ambiguity-classified view of a
@@ -263,7 +269,22 @@ impl CanonicalQuery {
                         .into_owned()
                 }
             };
-            params.push(CanonicalQueryParam { name, value, bare });
+            let semicolon_sub_names = if pair.contains(';') {
+                pair.split(';')
+                    .map(|sub_pair| {
+                        let raw = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+                        percent_decode_str(raw).decode_utf8_lossy().into_owned()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            params.push(CanonicalQueryParam {
+                name,
+                value,
+                bare,
+                semicolon_sub_names,
+            });
         }
 
         // Duplicate detection runs on decoded names, so `a=1&%61=2` is one

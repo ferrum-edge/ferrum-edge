@@ -522,6 +522,60 @@ async fn opa_delegate_mode_redacts_credentials_behind_a_semicolon() {
 }
 
 #[tokio::test]
+async fn opa_delegate_mode_redacts_sub_pairs_by_their_encoded_names() {
+    // Sub-pairs are split on the still-encoded bytes, so a configured name
+    // containing `=` or `;` matches its encoded spelling behind a raw `;`.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({
+            "query_ambiguity_policy": "delegate",
+            "redact_query_keys": ["private=key", "a;b"]
+        }),
+    );
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(
+        "carrier=;private%3Dkey=first-secret&other=;a%3Bb=second-secret&page=1".to_string(),
+    );
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let rendered = serde_json::to_string(&payload).unwrap();
+    assert!(!rendered.contains("first-secret"), "{rendered}");
+    assert!(!rendered.contains("second-secret"), "{rendered}");
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([{"name": "page", "value": "1", "bare": false}])
+    );
+}
+
+#[tokio::test]
+async fn opa_keeps_a_value_with_an_encoded_semicolon() {
+    // `%3B` is content, not a separator: the query is unambiguous, and the
+    // whole `action` value must reach the policy so a denial on it holds.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete%3Btoken%3Dx".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(
+        payload["input"]["query"],
+        json!({"action": "delete;token=x"})
+    );
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([{"name": "action", "value": "delete;token=x", "bare": false}])
+    );
+    assert_eq!(payload["input"]["query_ambiguity"], json!([]));
+}
+
+#[tokio::test]
 async fn opa_delegate_mode_still_redacts_query_credentials() {
     // Opting into `delegate` must never widen what OPA is told. The ordered
     // occurrence view is redacted exactly like the flat map, so a duplicated
