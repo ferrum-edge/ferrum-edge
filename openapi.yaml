@@ -32549,8 +32549,10 @@ components:
         (so vendor variants like x-openai-api-key / x-amz-security-token are also
         caught), is credential-shaped (any separator-delimited segment is a
         credential-class word such as auth, jwt, session, sid, key, pass, pwd,
-        ticket, otp, or contains a credential stem such as session, token,
-        secret, auth, or ends in key; continuation cursors like
+        ticket, otp, or contains a credential stem such as session, sessid,
+        token, secret, auth, pwd, otp, verifier, or contains key or pass other
+        than ordinary words such as keyword or passenger; the whole name code
+        is denied too; continuation cursors like
         x-continuation-token, authorship/authority names, and Idempotency-Key
         are not), or matches a configured
         sensitive_header_patterns entry is stripped before the distinct mirror

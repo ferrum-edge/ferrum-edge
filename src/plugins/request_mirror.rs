@@ -563,9 +563,10 @@ const MIRROR_CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
 
 /// Credential-class stems matched inside a single segment, so concatenated
 /// and spelled-out forms (`sessionid`, `accesstoken`, `clientsecret`,
-/// `authorization`, `jwtassertion`, `privatekey`) fail closed too. A segment
-/// ending in `key`/`keys` (`accesskey`, `subscriptionkey`) is also treated as a
-/// credential; see [`segment_is_credential_shaped`].
+/// `authorization`, `jwtassertion`, `clientpwd`, `totpcode`, `codeverifier`)
+/// fail closed too. A segment containing `key` or `pass` (`accesskey`,
+/// `privatekeypem`, `clientpass`) is also treated as a credential unless it is
+/// a listed benign word; see [`segment_is_credential_shaped`].
 const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "auth",
     "token",
@@ -586,7 +587,40 @@ const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "ticket",
     "assertion",
     "hmac",
+    "pwd",
+    "otp",
+    "mfa",
+    "verifier",
 ];
+
+/// Whole segments that contain `key` or `pass` without naming a credential.
+/// Everything else containing either (`privatekeypem`, `keyid`, `clientpass`)
+/// fails closed.
+const MIRROR_BENIGN_KEY_PASS_SEGMENTS: &[&str] = &[
+    "keyword",
+    "keywords",
+    "keyboard",
+    "keystroke",
+    "keystrokes",
+    "keynote",
+    "monkey",
+    "donkey",
+    "turkey",
+    "hockey",
+    "jockey",
+    "whiskey",
+    "passenger",
+    "passengers",
+    "passage",
+    "passive",
+    "bypass",
+    "compass",
+];
+
+/// Whole names (not segments) that are credentials on their own. `code` is the
+/// OAuth authorization-code callback parameter; as a segment it is too common
+/// (`country_code`, `zip-code`) to treat as a credential.
+const MIRROR_CREDENTIAL_WHOLE_NAMES: &[&str] = &["code"];
 
 /// Whole segments that contain the `auth` stem but name authorship or a URI
 /// authority rather than a credential.
@@ -626,8 +660,8 @@ fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
         || MIRROR_CREDENTIAL_CLASS_STEMS
             .iter()
             .any(|stem| segment.contains(stem))
-        || segment.ends_with("key")
-        || segment.ends_with("keys")
+        || ((segment.contains("key") || segment.contains("pass"))
+            && !MIRROR_BENIGN_KEY_PASS_SEGMENTS.contains(&segment))
 }
 
 /// Fail-closed credential-class test shared by the header and query policies.
@@ -635,6 +669,9 @@ fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
 /// percent-decoded). Splitting on every non-alphanumeric byte means `-`, `_`,
 /// `.`, `+`, space and any other separator spelling yield the same segments.
 fn name_has_credential_class(name_lower: &str) -> bool {
+    if MIRROR_CREDENTIAL_WHOLE_NAMES.contains(&name_lower) {
+        return true;
+    }
     let mut previous = None;
     for segment in name_lower
         .split(|ch: char| !ch.is_ascii_alphanumeric())
