@@ -1,9 +1,11 @@
 //! Azure Key Vault functional tests against an in-process fake.
 //!
-//! The real `azure_security_keyvault_secrets::SecretClient` makes real HTTP
-//! calls to the fake; the only thing faked out is Entra ID — a dummy bearer
-//! token is injected via `AzureCredentials::from_static_token(..)`, so no real
-//! Azure AD round trip ever happens.
+//! The real `azure_security_keyvault_secrets::SecretClient` makes real HTTPS
+//! calls to the fake, which terminates TLS with a per-fake test CA that the
+//! client trusts through `FERRUM_TLS_CA_BUNDLE_PATH`
+//! ([`AzureKeyVaultFake::trust_ca`]). The only thing faked out is Entra ID — a
+//! dummy bearer token is injected via `AzureCredentials::from_static_token(..)`,
+//! so no real Azure AD round trip ever happens.
 
 // `.err().expect(..)` is used deliberately on the secret-returning fetch path:
 // the `Ok` value is the resolved secret, and `.expect_err()` (clippy's
@@ -28,11 +30,13 @@ const KEY: &str = "FERRUM_ADMIN_JWT_SECRET";
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn azure_secret_url_success() {
-    let _guard = EnvGuard::new();
+    let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret("admin-jwt", "azure-admin-jwt").await;
 
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let secret = creds
         .fetch_secret(&fake.secret_url("admin-jwt"), KEY)
         .await
@@ -60,20 +64,22 @@ async fn azure_secret_url_success() {
 async fn azure_port_is_preserved_regression() {
     // (a) Direct parser assertion — the explicit port survives.
     let (vault_url, name, version) =
-        azure_parse_keyvault_reference("http://127.0.0.1:12345/secrets/admin-jwt", KEY)
+        azure_parse_keyvault_reference("https://127.0.0.1:12345/secrets/admin-jwt", KEY)
             .expect("valid URL should parse");
-    assert_eq!(vault_url, "http://127.0.0.1:12345");
+    assert_eq!(vault_url, "https://127.0.0.1:12345");
     assert_eq!(name, "admin-jwt");
     assert_eq!(version, None);
 
     // (b) End-to-end: a successful fetch via the fake (which listens on an
     // ephemeral non-standard port) can only happen if the port was preserved —
-    // dropping it would target :80 and fail to connect.
-    let _guard = EnvGuard::new();
+    // dropping it would target :443 and fail to connect.
+    let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret("admin-jwt", "azure-admin-jwt").await;
 
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let secret = creds
         .fetch_secret(&fake.secret_url("admin-jwt"), KEY)
         .await
@@ -91,7 +97,8 @@ async fn azure_port_is_preserved_regression() {
 #[serial]
 async fn azure_invalid_url_errors() {
     let _guard = EnvGuard::new();
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let err = creds
         .fetch_secret("not-a-url", KEY)
         .await
@@ -107,10 +114,11 @@ async fn azure_invalid_url_errors() {
 #[serial]
 async fn azure_invalid_path_errors() {
     let _guard = EnvGuard::new();
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     // `/keys/...` is the wrong resource path; only `/secrets/<name>` is valid.
     let err = creds
-        .fetch_secret("http://127.0.0.1:12345/keys/admin-jwt", KEY)
+        .fetch_secret("https://127.0.0.1:12345/keys/admin-jwt", KEY)
         .await
         .err()
         .expect("a non-/secrets path must fail");
@@ -141,11 +149,13 @@ async fn azure_missing_env_credentials_errors() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn azure_secret_not_found_errors() {
-    let _guard = EnvGuard::new();
+    let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret_status("admin-jwt", 404).await;
 
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let err = creds
         .fetch_secret(&fake.secret_url("admin-jwt"), KEY)
         .await
@@ -160,11 +170,13 @@ async fn azure_secret_not_found_errors() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn azure_secret_has_no_value_errors() {
-    let _guard = EnvGuard::new();
+    let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret_no_value("admin-jwt").await;
 
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let err = creds
         .fetch_secret(&fake.secret_url("admin-jwt"), KEY)
         .await
@@ -179,11 +191,13 @@ async fn azure_secret_has_no_value_errors() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn azure_malformed_response_errors() {
-    let _guard = EnvGuard::new();
+    let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret_malformed("admin-jwt").await;
 
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let err = creds
         .fetch_secret(&fake.secret_url("admin-jwt"), KEY)
         .await
@@ -205,6 +219,7 @@ async fn azure_malformed_response_errors() {
 async fn azure_timeout_errors() {
     let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret_delayed("slow", "value", Duration::from_secs(5))
         .await;
 
@@ -244,14 +259,16 @@ async fn azure_versioned_url_fetches_exact_version() {
     assert_eq!(name, "admin-jwt");
     assert_eq!(version.as_deref(), Some("abc123version"));
 
-    let _guard = EnvGuard::new();
+    let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     // Latest-only mock must not satisfy a versioned request.
     fake.mock_secret("admin-jwt", "latest-value").await;
     fake.mock_secret_version("admin-jwt", "abc123version", "pinned-value")
         .await;
 
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let secret = creds
         .fetch_secret(&fake.secret_version_url("admin-jwt", "abc123version"), KEY)
         .await
@@ -283,11 +300,13 @@ async fn azure_versioned_url_fetches_exact_version() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn azure_versioned_url_does_not_use_latest_mock() {
-    let _guard = EnvGuard::new();
+    let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret("admin-jwt", "latest-only").await;
 
-    let creds = AzureCredentials::from_static_token("dummy-token");
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
     let err = creds
         .fetch_secret(
             &fake.secret_version_url("admin-jwt", "missing-version"),
@@ -336,6 +355,7 @@ async fn azure_tls_version_option_conflict_is_rejected() {
 async fn azure_tls_inventory_reports_fetched_version() {
     let guard = EnvGuard::new();
     let fake = AzureKeyVaultFake::start().await;
+    fake.trust_ca(&guard);
     fake.mock_secret_version("edge-cert", "v1", "not-a-pem-body")
         .await;
 
@@ -391,4 +411,119 @@ async fn azure_tls_inventory_reports_fetched_version() {
     assert_eq!(entry.source.kind, "azure");
     assert_eq!(entry.source.version.as_deref(), Some("v1"));
     assert_eq!(entry.source.identifier, format!("azure://{reference}"));
+}
+
+/// Plain-`http://` vault URLs are refused at parse time with an explicit
+/// error, before any client or network call — the 1.x SDK would otherwise
+/// fail obscurely inside its bearer-token policy.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn azure_http_vault_url_is_refused() {
+    let _guard = EnvGuard::new();
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
+    let err = creds
+        .fetch_secret("http://127.0.0.1:12345/secrets/admin-jwt", KEY)
+        .await
+        .err()
+        .expect("an http:// vault URL must be refused");
+    assert!(
+        err.contains("must use https://"),
+        "expected an https-required error, got: {err}"
+    );
+    assert!(
+        !err.contains("127.0.0.1") && !err.contains("admin-jwt"),
+        "the refusal must not echo the source reference: {err}"
+    );
+
+    let err = azure_parse_keyvault_reference("http://myvault.vault.azure.net/secrets/x", KEY)
+        .expect_err("the parser itself must refuse http://");
+    assert!(err.contains("must use https://"), "got: {err}");
+}
+
+/// The same refusal surfaces through the startup resolver (and therefore
+/// `ferrum-edge validate`) as a config error, not an SDK transport failure.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn azure_http_reference_fails_startup_resolution() {
+    let guard = EnvGuard::new();
+    guard.set("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000");
+    guard.set("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001");
+    guard.set("AZURE_CLIENT_SECRET", "placeholder-not-used");
+    guard.set(
+        "FERRUM_ADMIN_JWT_SECRET_AZURE",
+        "http://127.0.0.1:12345/secrets/admin-jwt",
+    );
+
+    let err = resolve_all_env_secrets()
+        .await
+        .err()
+        .expect("an http:// _AZURE reference must fail startup resolution");
+    assert!(
+        err.contains("must use https://"),
+        "expected an https-required error, got: {err}"
+    );
+    assert!(
+        !err.contains("127.0.0.1:12345"),
+        "the refusal must not echo the source reference: {err}"
+    );
+}
+
+/// Without the fake's CA in `FERRUM_TLS_CA_BUNDLE_PATH`, the TLS handshake
+/// fails: certificate verification stays on and the bundle is the only way to
+/// add trust.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn azure_untrusted_certificate_fails_closed() {
+    let _guard = EnvGuard::new();
+    let fake = AzureKeyVaultFake::start().await;
+    fake.mock_secret("admin-jwt", "azure-admin-jwt").await;
+
+    let creds =
+        AzureCredentials::from_static_token("dummy-token").expect("static-token credentials");
+    let err = creds
+        .fetch_secret(&fake.secret_url("admin-jwt"), KEY)
+        .await
+        .err()
+        .expect("an untrusted certificate must fail the fetch");
+    assert!(
+        err.contains("Failed to get Azure secret"),
+        "expected an Azure fetch failure, got: {err}"
+    );
+    let hits = fake.server.received_requests().await.unwrap_or_default();
+    assert!(
+        hits.is_empty(),
+        "no HTTP request may reach the vault over an unverified TLS session"
+    );
+}
+
+/// An unusable `FERRUM_TLS_CA_BUNDLE_PATH` is an explicit error at credential
+/// construction, never a silent fallback to platform roots only, and the error
+/// names the variable but not the path.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn azure_invalid_ca_bundle_is_refused() {
+    let guard = EnvGuard::new();
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("missing-ca-sentinel.pem");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", missing.to_string_lossy());
+    let err = AzureCredentials::from_static_token("dummy-token")
+        .err()
+        .expect("a missing CA bundle must fail");
+    assert!(
+        err.contains("FERRUM_TLS_CA_BUNDLE_PATH") && !err.contains("missing-ca-sentinel"),
+        "expected a variable-level read error, got: {err}"
+    );
+
+    let not_pem = dir.path().join("not-pem-sentinel.pem");
+    std::fs::write(&not_pem, "this is not a certificate").expect("write bundle");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", not_pem.to_string_lossy());
+    let err = AzureCredentials::from_static_token("dummy-token")
+        .err()
+        .expect("a bundle with no certificates must fail");
+    assert!(
+        err.contains("FERRUM_TLS_CA_BUNDLE_PATH") && !err.contains("not-pem-sentinel"),
+        "expected a variable-level bundle error, got: {err}"
+    );
 }

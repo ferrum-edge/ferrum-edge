@@ -411,7 +411,7 @@ Uses service principal authentication via `ClientSecretCredential`.
 | `AZURE_CLIENT_ID` | Yes | Application (client) ID of the service principal |
 | `AZURE_CLIENT_SECRET` | Yes | Client secret for the service principal |
 
-The service principal must have the **Key Vault Secrets User** role (or equivalent `get` secret permission) on the referenced vault. The `_AZURE` reference format is `https://<vault-name>.vault.azure.net/secrets/<secret-name>`.
+The service principal must have the **Key Vault Secrets User** role (or equivalent `get` secret permission) on the referenced vault. The `_AZURE` reference format is `https://<vault-name>.vault.azure.net/secrets/<secret-name>` (append `/<version>` to pin a version). The URL must use `https://`; `http://` references are refused at validation and startup because the Azure SDK only sends the bearer token over TLS.
 
 ### Usage Examples
 
@@ -504,6 +504,13 @@ cargo build --release --features secrets-vault,secrets-aws
 **Cloud backends (AWS, GCP, Azure)** use **rustls** (pure-Rust TLS) with the compile-time Mozilla CA bundle (`webpki-roots`) and the OS certificate store (`rustls-native-certs`). No OpenSSL or system-specific TLS libraries are required. These SDKs connect to public cloud API endpoints whose certificates are already trusted by the Mozilla CA bundle — no additional TLS configuration is needed.
 
 **HashiCorp Vault** also uses rustls, but since Vault is often deployed on-premises with a private CA, the gateway respects `FERRUM_TLS_CA_BUNDLE_PATH`. If this variable points to a PEM-encoded CA bundle, the Vault client will trust certificates signed by those CAs in addition to the default trust store. This is the same CA bundle variable used by the gateway's backend proxy connections.
+
+**Azure Key Vault** requires `https://` vault URLs, with no loopback exception. To point the backend at a Key Vault emulator, sidecar, or private endpoint, serve it over TLS (a self-signed CA is fine) and set `FERRUM_TLS_CA_BUNDLE_PATH` to that CA's PEM bundle in the process environment. Key Vault data-plane calls then trust it in addition to the platform roots, so public vaults keep working. An unreadable bundle, or one with no certificates, fails resolution instead of falling back. Certificate verification is never disabled; `FERRUM_TLS_NO_VERIFY` does not apply. For example:
+
+```bash
+export FERRUM_TLS_CA_BUNDLE_PATH=/etc/ferrum/kv-emulator-ca.pem
+export FERRUM_ADMIN_JWT_SECRET_AZURE=https://127.0.0.1:8443/secrets/ferrum-jwt
+```
 
 ### Timeouts and Resilience
 

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — Azure Key Vault references must use `https://`** (issue #6570).
+  The Azure Key Vault backend moves to the 1.x Azure SDK (`azure_core` 1.1,
+  `azure_identity` 1.0, `azure_security_keyvault_secrets` 1.0.1; Dependabot
+  #6559 bumped only `azure_core` and did not compile). The 1.x SDK refuses to
+  send the Entra bearer token over plain HTTP, so `_AZURE` values and
+  `azure://` TLS sources with an `http://` (or other non-`https`) vault URL now
+  fail `ferrum-edge validate` and startup with an explicit error that does not
+  echo the reference. Before this change an `http://` reference to a
+  non-loopback host sent the token and the fetched secret in cleartext. To use
+  an emulator, sidecar, or private endpoint, serve it over TLS and set
+  `FERRUM_TLS_CA_BUNDLE_PATH`: Key Vault calls trust that bundle in addition to
+  the platform roots, and an unreadable or empty bundle is an error.
+  `AzureCredentials::from_static_token` now returns a `Result`. Secret
+  redaction also covers the bare vault host and `host:port`, which the SDK's
+  challenge check can echo. The `Secret Backends` Azure fake now serves TLS
+  with a per-test CA. Dependabot groups the Azure SDK crates so they move
+  together.
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is
