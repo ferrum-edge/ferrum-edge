@@ -558,7 +558,7 @@ testcontainers = "0.27"
 # `tests/unit/plugins/serverless_function_tests.rs`: a test that publishes a
 # provider credential fixture is `#[serial(serverless_env)]` and every test that
 # constructs the plugin — an environment READ — is `#[parallel(serverless_env)]`.
-serial_test = "3"
+serial_test = "4"
 # Functional testing dependencies
 rand = "0.10"
 futures = "0.3"
