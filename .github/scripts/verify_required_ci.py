@@ -323,8 +323,11 @@ DEDICATED_REQUIRED_CHECKS = {
 # download and no toolchain step. Pin those properties structurally rather than
 # by substring alone.
 ARTIFACT_GATE_WORKFLOW = ".github/workflows/multicluster-federation-live.yml"
-ARTIFACT_GATE_DOWNLOAD_ACTION = (
-    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+# Any full-commit pin: the trusted action pin rotation check governs which
+# upstream release it is (docs/dependency-policy.md → "Automated action pin
+# rotation").
+ARTIFACT_GATE_DOWNLOAD_ACTION = re.compile(
+    r"(?m)^\s*(?:-\s+)?uses:\s+actions/download-artifact@[0-9a-f]{40}(?:\s+#.*)?$"
 )
 # The release-blocking `multicluster.*` ids, mirrored from the enforced,
 # non-deferred `multicluster-federation` rows of tests/conformance/ga_contract.yaml.
@@ -1555,10 +1558,10 @@ def validate_artifact_gate_wiring() -> list[str]:
     workflow_yml = Path(ARTIFACT_GATE_WORKFLOW).read_text(encoding="utf-8")
     gate_body = extract_job_body(workflow_yml, "gate")
 
-    if ARTIFACT_GATE_DOWNLOAD_ACTION not in gate_body:
+    if ARTIFACT_GATE_DOWNLOAD_ACTION.search(gate_body) is None:
         errors.append(
             f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must download the published live "
-            f"artifact with the pinned `{ARTIFACT_GATE_DOWNLOAD_ACTION}`"
+            "artifact with a full-commit-pinned `actions/download-artifact`"
         )
 
     # The gate must stay free of any build/toolchain step so the trusted build
