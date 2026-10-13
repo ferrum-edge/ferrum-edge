@@ -82,10 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     session-ID cache, with or without live reload: frontend HTTPS/H2 and
     TCP+TLS, HTTP/3, admin HTTPS, CP gRPC and the mesh operator-CA listener.
     New connections pay a full handshake; established connections are
-    unaffected, and mTLS listeners without a CRL keep resumption.
-  - The mesh inbound listener that installs the SPIFFE peer verifier always
-    disables resumption, because that verifier reads the enforced CRLs and
-    peer trust bundles live on every handshake.
+    unaffected. Static frontend and operator-CA mTLS listeners without a
+    CRL keep resumption.
+  - The mesh inbound listener that installs the SPIFFE peer verifier, and
+    the standalone `build_spiffe_inbound_config`, always disable resumption,
+    because that verifier reads the enforced CRLs and peer trust bundles live
+    on every handshake.
   - The existing live-reload suppression now also disables TLS 1.2 session
     tickets. Before, it stopped only TLS 1.3 tickets and the stateful cache.
 - **`mcp_gateway` upstream calls log a redacted endpoint** (PR #6316,

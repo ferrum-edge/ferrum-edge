@@ -495,7 +495,11 @@ are listed at the end of this section.
   `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`, so a client admitted before a CRL
   expired cannot keep reconnecting after it (issue #6538). Every new connection
   to such a listener pays a full handshake; established connections are not
-  affected. An mTLS listener without a CRL keeps normal resumption.
+  affected. A frontend, admin, CP gRPC or mesh operator-CA mTLS listener
+  without a CRL and without live reload keeps normal resumption. A
+  live-reload (scope-bound) listener disables it, and so does any listener
+  that installs the live SPIFFE peer verifier: that verifier reads CRLs and
+  trust bundles on every handshake.
 - **CRL refresh is a restart-blocking dependency.** The same refusal applies at
   **startup**, not only at reload: `FERRUM_TLS_CRL_FILE_PATH` /
   `FERRUM_TLS_CRL_SOURCE` is loaded during startup in every serving mode
