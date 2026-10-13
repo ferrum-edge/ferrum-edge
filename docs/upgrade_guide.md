@@ -81,6 +81,24 @@ check the server version with `db.version()`.
 See [docs/mongodb.md](mongodb.md#supported-server-versions) for the full table
 and the Linux kernel note for MongoDB 8.0.21+, 8.3 and 9.0.
 
+### Azure Key Vault references must use `https://` (#6570, PR #6603)
+
+The Azure Key Vault backend now uses the 1.x Azure SDK. That SDK sends the
+Entra bearer token only over TLS, and Ferrum now refuses any vault URL that is
+not `https://`. This applies to `_AZURE` values and to `azure://` TLS sources.
+Such a URL fails `ferrum-edge validate` and startup.
+
+- **Public or private-link vaults (`https://<vault>.vault.azure.net/...`):** no
+  change.
+- **`http://` emulators, fakes, sidecars, or proxies:** serve them over TLS. If
+  their certificate is not publicly trusted, set `FERRUM_TLS_CA_BUNDLE_PATH` in
+  the process environment to the issuing CA. Key Vault calls trust it in
+  addition to the platform roots. An unreadable bundle, or one with no
+  certificates, now fails resolution.
+- **Embedding code:** `AzureCredentials::from_static_token` returns a `Result`.
+
+See [FEATURES.md](../FEATURES.md#tls-and-trust) for an emulator example.
+
 ## Upgrading to 0.9.17
 
 0.9.17 was published on 2026-10-10 UTC from commit
