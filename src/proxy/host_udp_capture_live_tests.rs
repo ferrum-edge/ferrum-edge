@@ -920,8 +920,10 @@ fn host_udp_live_kernel_multi_pod_dual_stack_attribution_and_replies() {
     assert_eq!(got.0, b"reply-b6");
     assert_eq!(got.1.ip(), IpAddr::V6(REMOTE_V6));
 
-    // Identical 4-tuple isolation by ingress interface: both pods use the same
-    // source port and destination, remaining distinct by ifindex.
+    // Same-source-port / same-destination isolation by ingress interface:
+    // both pods use source port 41000 and the same destination, but distinct
+    // workload source IPs (POD_A_V4 / POD_B_V4), so their transport
+    // four-tuples differ in source IP; attribution stays distinct by ifindex.
     send_from_pod(
         topo.pod_a_pid,
         SocketAddr::new(IpAddr::V4(POD_A_V4), 41000),

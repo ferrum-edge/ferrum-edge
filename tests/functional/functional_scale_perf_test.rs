@@ -1341,11 +1341,17 @@ const RELOAD_STEADY_SECS: u64 = 10;
 /// Measured after the new wave is live, still under the same load.
 const RELOAD_POST_SECS: u64 = 10;
 /// Proxies in each small change applied after every wave. A 12,000-resource
-/// wave exceeds the poller's 10,000-row change-log limit and forces a full
-/// rebuild. Small changes come in two kinds: with new `key_auth` consumers and
-/// proxies-only (new proxies whose plugins admit existing consumers). Both take
-/// the incremental path: consumer changes escalate to a full reload only while
-/// load-time quarantine is active or a changed consumer carries `hmac_auth`
+/// wave stays incremental: the poller pages the change log 10,000 rows at a
+/// time (`CHANGE_LOG_PAGE_ROWS`) under a separate 100,000-row total cap
+/// (`CHANGE_LOG_MAX_ROWS`), and only a backlog reaching that cap
+/// (`changes.len() >= max_rows`) falls back to an authoritative full reload
+/// (issue #6058). Small changes come in two kinds: with new `key_auth`
+/// consumers and proxies-only (new proxies whose plugins admit existing
+/// consumers). Both take the incremental path in this fixture: consumer
+/// changes escalate to a full reload unless the namespace has successfully
+/// recorded clean state (a successful authoritative full load that
+/// quarantined nothing) — unknown or poisoned state also escalates — and a
+/// changed consumer carrying `hmac_auth` is a separate escalation condition
 /// (issue #6060).
 const RELOAD_SMALL_CHANGE_PROXIES: usize = 100;
 /// Index bases for small-change proxies, clear of every wave's range.

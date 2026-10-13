@@ -1029,11 +1029,11 @@ Both gateways run natively (no Docker), bind the same ports (sequentially), and 
 | Protocol | Envoy Config | Notes |
 |----------|-------------|-------|
 | HTTP/1.1 | `configs/envoy/http1.yaml` | `http_connection_manager` with `codec_type: HTTP1` |
-| HTTP/1.1+TLS | `configs/envoy/http1_tls.yaml` | Downstream TLS termination, plain HTTP to backend |
+| HTTP/1.1+TLS | `configs/envoy/http1_tls.yaml` | End-to-end TLS: downstream TLS termination and TLS origination to the backend on 3447; the Ferrum leg uses `configs/http1_tls_e2e_perf.yaml` and the direct baseline hits `https://127.0.0.1:3447/echo`, so every leg does TLS upstream work |
 | WebSocket | `configs/envoy/ws.yaml` | `upgrade_configs: websocket` on HCM |
 | gRPC | `configs/envoy/grpc.yaml` | h2c (cleartext HTTP/2) on both sides |
 | TCP | `configs/envoy/tcp.yaml` | `tcp_proxy` network filter |
-| TCP+TLS | `configs/envoy/tcp_tls.yaml` | Downstream TLS + `tcp_proxy` |
+| TCP+TLS | `configs/envoy/tcp_tls.yaml` | End-to-end TLS: downstream TLS + `tcp_proxy` with TLS origination to the backend on 3444; the Ferrum leg uses `configs/tcp_tls_e2e_perf.yaml` (`tcps`) and the direct baseline hits 3444 with `--tls` |
 | UDP | `configs/envoy/udp.yaml` | `udp_proxy` listener filter with matcher-based routing |
 
 **Skipped protocols:**
@@ -1048,7 +1048,7 @@ Envoy configs are tuned to match Ferrum Edge where applicable:
 - HTTP/2 flow control: 8 MiB stream window, 32 MiB connection window, 1000 max concurrent streams
 - Access logging disabled (`access_log: []`)
 - Log level: `error` (`-l error`)
-- Worker threads: auto (`--concurrency auto`, matches CPU cores)
+- Worker threads: numeric detected CPU count (`--concurrency "$num_cpus"` in `start_envoy`, discovered via `sysctl -n hw.ncpu`, then `nproc`, with fallback 4 when neither succeeds; the fallback need not equal the host's CPU count)
 - Admin interface on port 15000 (not benchmarked)
 
 ### Sample Comparison Output
@@ -1143,10 +1143,11 @@ This means Ferrum provides more predictable latency under load — critical for 
 - **Rust toolchain** (cargo, rustc)
 - **protoc** (protobuf compiler) for gRPC support
 - **Envoy** (optional, for `--envoy` comparison mode)
-- The following ports must be free: 3001-3006, 3010, 3443-3447, 5000-5001,
+- The following ports must be free: 3001-3006, 3010, 3443-3447, 5001,
   5003-5004, 5010, 8000, 8443, 15000 (Envoy admin), 50052-50053.
-  `run_protocol_test.sh` checks all of them except 3446, 3447 and 50053 before
-  starting (including 15000 even without `--envoy`).
+  `run_protocol_test.sh` checks every port in its shared `BENCH_PORTS` list
+  before starting (including 3446, 3447, 50053, and 15000 even without
+  `--envoy`); port 5000 is not used or claimed by the runner.
 
 Install dependencies:
 ```bash
