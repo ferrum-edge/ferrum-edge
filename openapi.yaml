@@ -34710,6 +34710,19 @@ components:
           type: object
           additionalProperties: false
           required: [type, endpoint]
+          # Cleartext to anything but a loopback IP literal needs the opt-in.
+          if:
+            required: [endpoint]
+            properties:
+              endpoint:
+                pattern: '^[hH][tT][tT][pP]://'
+                not:
+                  pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+          then:
+            required: [allow_plaintext]
+            properties:
+              allow_plaintext:
+                const: true
           properties:
             type:
               type: string
@@ -35069,6 +35082,21 @@ components:
             properties:
               semantic_embedding_endpoint:
                 pattern: '^[hH][tT][tT][pP][sS]?://[^/?#@\s]+(?:[/?#][\s\S]*)?(?![\s\S])'
+        # Cleartext to anything but a loopback IP literal needs the opt-in.
+        - if:
+            required: [semantic_similarity_enabled, semantic_embedding_endpoint]
+            properties:
+              semantic_similarity_enabled:
+                const: true
+              semantic_embedding_endpoint:
+                pattern: '^[hH][tT][tT][pP]://'
+                not:
+                  pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+          then:
+            required: [semantic_embedding_allow_plaintext]
+            properties:
+              semantic_embedding_allow_plaintext:
+                const: true
         - if:
             required: [sync_mode]
             properties:
