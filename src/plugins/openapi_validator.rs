@@ -41,6 +41,7 @@ use crate::util::json_dup_keys::{self, JsonScanMemo};
 use crate::util::media_type::is_concrete_http_media_type;
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::utils::auth_flow::constant_time_eq;
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::synthetic_response::{
@@ -166,6 +167,10 @@ const OPERATION_KEYS: &[&str] = &[
     "responses",
 ];
 const BYPASS_KEYS: &[&str] = &["paths", "methods", "consumers", "header_present"];
+/// Minimum byte length of a `bypass.header_present` secret value.
+const MIN_BYPASS_HEADER_SECRET_BYTES: usize = 16;
+/// Maximum byte length of a `bypass.header_present` secret value.
+const MAX_BYPASS_HEADER_SECRET_BYTES: usize = 4096;
 const ERROR_RESPONSE_KEYS: &[&str] = &[
     "request_status_code",
     "response_status_code",
@@ -617,7 +622,11 @@ pub struct OpenapiValidator {
     bypass_paths: Option<RegexSet>,
     bypass_methods: HashSet<String>,
     bypass_consumers: HashSet<String>,
-    bypass_header_present: HashMap<String, Option<String>>,
+    /// Lowercased header name -> required secret value. A request bypasses
+    /// validation only when the header carries exactly this value (compared in
+    /// constant time). Presence alone never bypasses: clients can send any
+    /// header name.
+    bypass_header_present: HashMap<String, String>,
     request_error_status: u16,
     response_error_status: u16,
     /// Status for a nonempty client representation that no declared media entry
@@ -942,11 +951,8 @@ impl OpenapiValidator {
             return Some("bypass_consumer");
         }
         if self.bypass_header_present.iter().any(|(name, expected)| {
-            header_value(headers, name).is_some_and(|actual| {
-                expected
-                    .as_deref()
-                    .is_none_or(|expected| actual == expected)
-            })
+            header_value(headers, name)
+                .is_some_and(|actual| constant_time_eq(actual.as_bytes(), expected.as_bytes()))
         }) {
             return Some("bypass_header");
         }
@@ -5913,12 +5919,14 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
     })
 }
 
-fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<String>>, String> {
+fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, String>, String> {
     match value {
         None => Ok(HashMap::new()),
         Some(Value::Object(map)) => {
-            let mut parsed = HashMap::new();
-            for (key, value) in map {
+            // Names first, so a duplicate is reported as a duplicate whatever
+            // the map order and whatever the values look like.
+            let mut seen = HashSet::new();
+            for key in map.keys() {
                 if key.is_empty() {
                     return Err(
                         "openapi_validator: `bypass.header_present` keys must not be empty"
@@ -5930,21 +5938,37 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<
                         "openapi_validator: `bypass.header_present` contains invalid header name {key:?}"
                     ));
                 }
-                let expected = if value.is_null() {
-                    None
-                } else {
-                    Some(value.as_str().ok_or_else(|| {
-                        "openapi_validator: `bypass.header_present` values must be strings or null"
-                            .to_string()
-                    })?)
-                };
                 let normalized = key.to_ascii_lowercase();
-                if parsed.contains_key(&normalized) {
+                if !seen.insert(normalized.clone()) {
                     return Err(format!(
                         "openapi_validator: `bypass.header_present` contains duplicate header name {normalized:?}"
                     ));
                 }
-                parsed.insert(normalized, expected.map(str::to_string));
+            }
+            let mut parsed = HashMap::new();
+            for (key, value) in map {
+                let normalized = key.to_ascii_lowercase();
+                let Some(secret) = value.as_str() else {
+                    return Err(format!(
+                        "openapi_validator: `bypass.header_present` value for {normalized:?} must be a secret string; a client can send any header, so presence alone cannot bypass validation"
+                    ));
+                };
+                if secret.len() < MIN_BYPASS_HEADER_SECRET_BYTES {
+                    return Err(format!(
+                        "openapi_validator: `bypass.header_present` value for {normalized:?} must be at least {MIN_BYPASS_HEADER_SECRET_BYTES} bytes"
+                    ));
+                }
+                if secret.len() > MAX_BYPASS_HEADER_SECRET_BYTES {
+                    return Err(format!(
+                        "openapi_validator: `bypass.header_present` value for {normalized:?} must be at most {MAX_BYPASS_HEADER_SECRET_BYTES} bytes"
+                    ));
+                }
+                if http::header::HeaderValue::from_str(secret).is_err() || secret.trim() != secret {
+                    return Err(format!(
+                        "openapi_validator: `bypass.header_present` value for {normalized:?} must be a valid header value without leading or trailing whitespace"
+                    ));
+                }
+                parsed.insert(normalized, secret.to_string());
             }
             Ok(parsed)
         }

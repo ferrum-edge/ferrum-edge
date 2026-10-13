@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `openapi_validator` `bypass.header_present` requires a
+  shared secret.** Each entry now maps a header name to a secret string of
+  16–4096 bytes, and a request skips validation only when that header
+  carries exactly the secret, compared in constant time. Presence-only
+  entries (`null`) and short, padded or invalid values are rejected at
+  construction, because a client can send any header name. Inject the
+  header from a trusted hop or gateway plugin.
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only

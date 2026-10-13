@@ -126,7 +126,7 @@ x-ferrum-validate:
     methods: [OPTIONS]
     consumers: [emergency-bypass]
     header_present:
-      x-bypass-validator: null
+      x-bypass-validator: replace-with-a-long-random-secret
 ```
 
 `mode` maps to plugin `enforcement_mode`. Supported modes are `block`, `log_only`, and `disabled`.
@@ -173,7 +173,7 @@ The generated plugin config has this shape:
     "paths": ["^/health$"],
     "methods": ["OPTIONS"],
     "consumers": ["emergency-bypass"],
-    "header_present": { "x-bypass-validator": null }
+    "header_present": { "x-bypass-validator": "replace-with-a-long-random-secret" }
   },
   "error_response": {
     "request_status_code": 400,
@@ -199,7 +199,7 @@ The generated plugin config has this shape:
 | `bypass.paths` | `[]` | Regexes that skip validation when the full inbound request path matches. No listen prefix is added to these patterns. |
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |
-| `bypass.header_present` | `{}` | Header-name map. `null` means any value; a string requires an exact value match. Case-equivalent duplicate keys are rejected at construction. |
+| `bypass.header_present` | `{}` | Header name to shared secret. A request skips validation only when the header carries exactly that secret, compared in constant time. Presence alone never skips validation, because a client can send any header, so `null` is rejected at construction. The secret must be 16–4096 bytes, a valid header value, with no leading or trailing whitespace. Have a trusted hop or a gateway plugin inject it, and keep it secret from clients. Case-equivalent duplicate keys are rejected at construction. |
 | `error_response.request_status_code` | `400` | Status for blocked request validation errors, including a missing or empty `request_required` body. |
 | `error_response.response_status_code` | `502` | Status for blocked response validation errors. |
 | `error_response.unsupported_media_type_status_code` | `415` | Status for a nonempty request body that no media entry declared for the matched operation covers, including a body sent with no `Content-Type`. Separate from `request_status_code` so remapping schema failures does not also remap media-type refusals. |
@@ -208,7 +208,7 @@ The generated plugin config has this shape:
 
 ### Strict config admission
 
-Every fixed-field object in the plugin config is closed. Unknown keys at the root and in `bypass`, `error_response`, each `operations[]` entry, `request_body`, and multipart Encoding Header Objects are rejected at construction with a path-qualified error and a spelling suggestion. Presence is also distinct from omission: an explicit `null` for a published non-null field is a type error rather than a request to select that field's default (the `null` values in `bypass.header_present` remain intentional and mean “match any value”). The `x-ferrum-validate.bypass` importer object is closed by the same key set. Because the plugin is registered `FailClosed`, a rejected config never becomes the running policy: direct Admin writes return HTTP 400, file mode fails startup, and a DP keeps its last known-good generation.
+Every fixed-field object in the plugin config is closed. Unknown keys at the root and in `bypass`, `error_response`, each `operations[]` entry, `request_body`, and multipart Encoding Header Objects are rejected at construction with a path-qualified error and a spelling suggestion. Presence is also distinct from omission: an explicit `null` for a published non-null field is a type error rather than a request to select that field's default (`bypass.header_present` values must be secret strings; `null` is rejected). The `x-ferrum-validate.bypass` importer object is closed by the same key set. Because the plugin is registered `FailClosed`, a rejected config never becomes the running policy: direct Admin writes return HTTP 400, file mode fails startup, and a DP keeps its last known-good generation.
 
 Intentionally free-form maps stay open but are shape-validated instead of key-enumerated:
 
