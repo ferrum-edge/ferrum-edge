@@ -104,13 +104,32 @@ EARLY_STEP = r"""      - name: Reject edits to frozen policy files early
           # This cheap rejection mirrors the protected-policy workflow. The
           # complete semantic scan runs independently in CI Policy.
           if ! git diff --no-ext-diff --quiet "${TRUSTED_BASE_SHA}...HEAD" -- \
-            .github/scripts/verify_cross_build_policy.py \
-            .github/workflows/cross-build-policy.yml; then
+            .github/scripts/verify_cross_build_policy.py; then
             echo "::error::frozen policy files changed; a reviewed policy migration is required" >&2
             exit 1
+          fi
+          # The policy workflow admits one ordinary change, mirroring its own
+          # guard: an action pin rotation of its steps. The trusted verifier
+          # decides "pins only"; Trusted Cross Build Policy governs the pins.
+          policy_workflow=.github/workflows/cross-build-policy.yml
+          if ! git diff --no-ext-diff --quiet "${TRUSTED_BASE_SHA}...HEAD" -- \
+            "$policy_workflow"; then
+            pin_check="$RUNNER_TEMP/frozen-policy-pin-check"
+            mkdir -p "$pin_check"
+            git show "${TRUSTED_BASE_SHA}:.github/scripts/verify_cross_build_policy.py" \
+              > "$pin_check/verify_cross_build_policy.py"
+            git show "${TRUSTED_BASE_SHA}:${policy_workflow}" > "$pin_check/trusted.yml"
+            git show "HEAD:${policy_workflow}" > "$pin_check/proposed.yml"
+            if ! python3 -I "$pin_check/verify_cross_build_policy.py" \
+              --pin-normalized-equal "$pin_check/trusted.yml" "$pin_check/proposed.yml"; then
+              echo "::error::frozen policy files changed; a reviewed policy migration is required" >&2
+              exit 1
+            fi
           fi"""
 
-CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+# Any upstream release commit: Trusted Cross Build Policy governs the pin
+# itself (docs/dependency-policy.md → "Automated action pin rotation").
+CHECKOUT_PIN = re.compile(r"actions/checkout@[0-9a-f]{40}")
 AGGREGATE_IF = (
     "always() && (github.event_name == 'pull_request' || github.event_name == "
     "'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))"
@@ -154,10 +173,13 @@ def policy_contract_errors(workflow):
             errors.append("CI Policy must pin, extract and run the complete isolated trusted verifier")
         for name, job in (("ci-plan", plan), ("ci-policy", policy)):
             checkout = _sequence(job, "steps")[0]
-            if checkout != {
-                "uses": ("scalar", CHECKOUT),
-                "with": ("mapping", {"fetch-depth": ("scalar", "0"), "persist-credentials": ("scalar", "false")}),
-            }:
+            uses = checkout.get("uses", (None, ""))
+            if (
+                set(checkout) != {"uses", "with"}
+                or uses[0] != "scalar"
+                or CHECKOUT_PIN.fullmatch(uses[1]) is None
+                or checkout["with"] != ("mapping", {"fetch-depth": ("scalar", "0"), "persist-credentials": ("scalar", "false")})
+            ):
                 errors.append(f"{name} checkout must preserve triggering SHA and fork-safe credentials")
         plan_body = _protected_job_body(workflow, "ci-plan")
         plan_steps = job_steps(plan_body)
