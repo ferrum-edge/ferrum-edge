@@ -123,7 +123,7 @@ paths:
 
 ## Proto And gRPC Config Sync
 
-- `proto/ferrum.proto` compiles through `build.rs` and `tonic_build`.
+- `proto/ferrum.proto` compiles through `build.rs` and `tonic_prost_build`.
 - `ConfigSync` exposes streaming `Subscribe` and unary `GetFullConfig`.
 - `FERRUM_REAL_IP_HEADER` is an enforced CP/DP cluster ownership setting. DPs
   advertise an explicitly present effective value (empty means unset) on both
