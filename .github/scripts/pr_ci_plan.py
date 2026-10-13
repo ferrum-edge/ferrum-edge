@@ -907,6 +907,13 @@ FUZZ_SMOKE_PATTERNS = [
         r"^src/config/file_loader\.rs$",
         r"^src/config_sources/k8s/",
         r"^src/identity/spiffe",
+        # `ocsp_response` / `jwt_svid` (issue #6584): the OCSP grammar, the
+        # JWT-SVID validator and its authority type, and the synthetic RSA key
+        # pair the fixed fuzz bundle embeds.
+        r"^src/tls/ocsp\.rs$",
+        r"^src/identity/jwt_svid/",
+        r"^src/identity/ca/mod\.rs$",
+        r"^tests/fixtures/test_rsa_(?:public|private)\.pem$",
         r"^src/plugins/otel_tracing\.rs$",
         r"^src/plugins/mod\.rs$",
         r"^src/proxy/(?:datagram_client_address|mesh_udp_frame|proxy_protocol)\.rs$",
@@ -992,6 +999,8 @@ STANDALONE_CARGO_PATTERNS = [
         r"^src/config/",
         r"^src/config_sources/k8s/",
         r"^src/identity/",
+        r"^src/tls/ocsp\.rs$",
+        r"^tests/fixtures/test_rsa_(?:public|private)\.pem$",
         r"^src/load_balancer",
         r"^src/modes/mesh/",
         r"^src/xds/",
@@ -1716,6 +1725,16 @@ def self_test() -> int:
             "pull_request",
             ["src/proxy/proxy_protocol.rs"],
             src_only | {"run_fuzz_smoke": True, "run_standalone_cargo": True},
+        ),
+        (
+            "pull_request",
+            ["src/tls/ocsp.rs"],
+            {"run_fuzz_smoke": True, "run_standalone_cargo": True},
+        ),
+        (
+            "pull_request",
+            ["src/identity/jwt_svid/strict_json.rs"],
+            {"run_fuzz_smoke": True, "run_standalone_cargo": True},
         ),
         (
             "pull_request",

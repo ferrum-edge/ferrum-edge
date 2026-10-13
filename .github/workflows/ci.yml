@@ -6833,6 +6833,13 @@ jobs:
     # whose length boundaries are reachable in one required lane and not the
     # other is not actually scheduled. Every other bound is byte-identical to
     # the loop's.
+    #
+    # Parser targets (#6584): `ocsp_response` and `jwt_svid` fuzz the
+    # hand-rolled stapled-OCSP DER grammar and the JWT-SVID strict-JSON and
+    # compact-token validator. They run in their own loop for the same reason:
+    # both parsers' size bounds (64 KiB OCSP, 8 KiB token) sit above the six-
+    # target loop's 4 KiB ceiling. They run before `datagram_client_address`
+    # so that invocation stays the one that saves the cache.
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
@@ -7101,6 +7108,25 @@ jobs:
             fi
           done
 
+          for fuzz_target in ocsp_response jwt_svid; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
+              boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
+                -runs=512 \
+                -max_total_time=8 \
+                -max_len=65536 \
+                -timeout=2 \
+                -rss_limit_mb=1024
+            else
+              cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+                -runs=512 \
+                -max_total_time=8 \
+                -max_len=65536 \
+                -timeout=2 \
+                -rss_limit_mb=1024
+            fi
+          done
+
           echo "Fuzz smoke target: datagram_client_address"
           if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
             boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore fuzz run --codegen-units 16 datagram_client_address -- \
@@ -7125,7 +7151,7 @@ jobs:
           set -euo pipefail
 
           if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Fuzz lane shape: property gate plus the seven-target sanitizer budget"
+            echo "Fuzz lane shape: property gate plus the nine-target sanitizer budget"
           else
             echo "Fuzz lane shape: deterministic property gate only"
           fi

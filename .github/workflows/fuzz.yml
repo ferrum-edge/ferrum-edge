@@ -65,6 +65,8 @@ jobs:
           - k8s_crd
           - plugin_config
           - datagram_client_address
+          - ocsp_response
+          - jwt_svid
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -121,7 +123,7 @@ jobs:
           # itself was tampered with; it costs nothing and keeps the command
           # line free of any value this shell has not literally approved.
           case "$FUZZ_TARGET" in
-            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config|datagram_client_address) ;;
+            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config|datagram_client_address|ocsp_response|jwt_svid) ;;
             *)
               echo "::error::unknown fuzz target" >&2
               exit 1

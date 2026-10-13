@@ -91,6 +91,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ocsp_response"
+path = "fuzz_targets/ocsp_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_svid"
+path = "fuzz_targets/jwt_svid.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
 

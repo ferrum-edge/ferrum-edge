@@ -2332,8 +2332,9 @@ admitted texts oldest first, and a generation retires once its successor is on
   deterministic property smoke is the required `pull_request` and `merge_group`
   gate, and the six-target bounded budget runs on the push to `main` and on
   `workflow_dispatch` only.
-- `CI_FUZZ_SMOKE_JOB` — the adopted shape (#4442): identical, plus a seventh
-  bounded libFuzzer invocation for `datagram_client_address`.
+- `CI_FUZZ_SMOKE_PRE_PARSER_TARGETS_JOB` — the #4442 shape (with the BoringCache
+  rollout): identical, plus a seventh bounded libFuzzer invocation for
+  `datagram_client_address`.
 
   That target parses the Datagram PROXY v2 envelope — address block, the `0xE0`
   authentication-tag and `0xE1` freshness TLVs, and the freshness value — on
@@ -2350,8 +2351,22 @@ admitted texts oldest first, and a generation retires once its successor is on
   Every other bound — `-runs=512`, `-max_total_time=8`, `-timeout=2`,
   `-rss_limit_mb=1024` — is byte-identical to the loop's, so the budget is
   widened by one target rather than relaxed.
+- `CI_FUZZ_SMOKE_JOB` — the adopted shape (#6584): identical, plus a bounded
+  loop over `ocsp_response` and `jwt_svid`, the hand-rolled stapled-OCSP DER
+  grammar and the JWT-SVID strict-JSON and token validator, at the same 64 KiB
+  `-max_len` and otherwise the six-target loop's bounds. The loop runs before
+  `datagram_client_address`, so that invocation stays the one that saves the
+  BoringCache entry. `CI_FUZZ_SMOKE_PARSER_BUDGET` freezes the loop in its
+  native projection: it must appear exactly once in the adopted generation and
+  in no earlier one. Adopted-generation mutations reject dropping either target
+  and re-bounding the loop to 4 KiB, and the `fuzz.yml` freeze carries both
+  targets in its matrix and shell allowlist.
 
-What is invariant across both generations:
+  Scheduling them edits the byte-frozen `fuzz-smoke` job and `fuzz.yml`
+  together with the policy that admits them. The trusted base's policy
+  therefore rejects that pull request, so it needs the owner's admin merge.
+
+What is invariant across every generation:
 
 - the property smoke runs the same `cargo test --locked` and is the required
   full-mode `pull_request` and `merge_group` gate;
