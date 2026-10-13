@@ -48,6 +48,7 @@ SCOPE_LINE = re.compile(
     r"^\s+" + QUOTED.format("scope") + r"\s*:\s*" + QUOTED.format("level") + r"\s*(?:#.*)?$"
 )
 FLOW_ENTRY = re.compile(r"^\s*" + QUOTED.format("scope") + r"\s*:\s*" + QUOTED.format("level") + r"\s*$")
+EVENT_NAME = re.compile(r"^\s*" + QUOTED.format("event") + r"\s*$")
 EVENT_LINE = re.compile(r"^  " + QUOTED.format("event") + r"\s*:(?:\s.*)?$")
 
 
@@ -84,11 +85,18 @@ def workflow_triggers(text: str) -> set[str] | None:
         if key not in {"on", "true"}:
             continue
         if inline:
+            items = [inline]
             if inline.startswith("[") and inline.endswith("]"):
-                return {item.strip().strip("\"'") for item in inline[1:-1].split(",") if item.strip()}
-            if re.fullmatch(r"[a-z_]+", inline):
-                return {inline}
-            return None
+                items = inline[1:-1].split(",")
+            events = set()
+            for item in items:
+                # Only plain or plainly quoted names are read; escapes or any
+                # other spelling make the trigger set unreadable, never empty.
+                match = EVENT_NAME.match(item)
+                if match is None:
+                    return None
+                events.add(match.group("event"))
+            return events or None
         events: set[str] = set()
         for line in body:
             if line.lstrip().startswith("#"):
@@ -230,6 +238,16 @@ def run_self_test() -> list[str]:
             "on:\n  workflow_dispatch:\n  ? push\npermissions:\n  contents: write\n" + jobs,
             False,
         ),
+        ("escaped push", 'on: ["pu\\u0073h"]\npermissions: {checks: write}\n' + jobs, False),
+        ("escaped target", 'on: ["pull_request_\\x74arget"]\npermissions:\n  checks: write\n' + jobs, False),
+        (
+            "escaped workflow_run key",
+            'on:\n  "workflow_\\u0072un":\n    workflows: [CI]\npermissions:\n  checks: write\n' + jobs,
+            False,
+        ),
+        ("escaped flow scope", 'on: workflow_dispatch\npermissions: {"che\\u0063ks": write}\n' + jobs, False),
+        ("empty list trigger", "on: []\npermissions: {}\n" + jobs, False),
+        ("quoted list triggers", "on: ['push', \"pull_request\"]\npermissions: {}\n" + jobs, True),
         ("quoted read flow", "on: push\npermissions: {\"contents\": 'read'}\n" + jobs, True),
     )
     for label, text, accepted in cases:
