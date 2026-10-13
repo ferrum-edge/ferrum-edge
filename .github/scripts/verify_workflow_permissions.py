@@ -269,9 +269,33 @@ def _single_line_input(line: str, mapping_keys: frozenset[str] = frozenset()) ->
     if value.startswith('"'):
         return DOUBLE_QUOTED_VALUE.match(value) is not None
     if value.startswith(("[", "{")):
+        # Only simple flow collections: a quote inside could hold the closing
+        # bracket and carry the value onto later lines.
         closing = "]" if value[0] == "[" else "}"
-        return _strip_comment(value).endswith(closing)
+        return "'" not in value and '"' not in value and _strip_comment(value).endswith(closing)
+    if value.startswith(("&", "*", "!")):
+        return False  # anchors, aliases, and tags are not read here
     return True
+
+
+BLOCK_SCALAR_HEADER = re.compile(r"(?:^|[ :-]) *[|>][1-9+-]{0,2} *(?:#.*)?$")
+EXPLICIT_KEY = re.compile(r"^ *(?:- +)?[?:](?: |$)")
+
+
+def _block_scalar_body_lines(lines: list[str]) -> set[int]:
+    """Indices of lines inside `|` / `>` block scalar bodies (e.g. `run: |`)."""
+
+    body: set[int] = set()
+    header_indent: int | None = None
+    for number, line in enumerate(lines):
+        if header_indent is not None:
+            if not line.strip() or _indent(line) > header_indent:
+                body.add(number)
+                continue
+            header_indent = None
+        if _is_content(line) and BLOCK_SCALAR_HEADER.search(line.rstrip()):
+            header_indent = _indent(line)
+    return body
 
 
 def _indent(line: str) -> int:
@@ -307,10 +331,17 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
         not composite and triggers is not None and triggers <= PERSIST_TRUE_TRIGGERS
     )
     errors: list[str] = []
+    block_bodies = _block_scalar_body_lines(lines)
     for index, line in enumerate(lines):
         if line.lstrip().startswith("#"):
             continue
         located = f"{source}:{index + 1}"
+        if index not in block_bodies and EXPLICIT_KEY.match(line):
+            errors.append(
+                f"{located} uses an explicit YAML key (`?` / `:` line); write plain "
+                "`key: value` mappings so checkout steps can be verified"
+            )
+            continue
         decoded = _decode_escapes(line)
         if FLOW_USES_KEY.search(decoded):
             errors.append(
@@ -699,6 +730,30 @@ def run_self_test() -> list[str]:
             "name: a\nruns:\n  using: composite\n  steps:\n"
             f"    - uses: {pin}\n      name:\n        'ignored\n      with:\n"
             "        persist-credentials: false\n        '\n",
+        ),
+        (
+            "flow value with quote hides with",
+            pr + f"      - uses: {pin}\n        env: {{ X: 'ignored}}\n        with:\n"
+            "          persist-credentials: false\n            '}}\n" + tail,
+        ),
+        (
+            "composite flow value with quote hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      env: {{ X: 'ignored}}\n      with:\n"
+            "        persist-credentials: false\n          '}}\n",
+        ),
+        (
+            "explicit key escaped continuation",
+            pr + '      - ? uses\n        : "actions/che\\\n            ckout@' + sha + '"\n' + tail,
+        ),
+        (
+            "composite explicit key escaped continuation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            '    - ? uses\n      : "actions/che\\\n          ckout@' + sha + '"\n',
+        ),
+        (
+            "tagged input",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: !!str false\n" + tail,
         ),
         (
             "composite block scalar impersonation",
