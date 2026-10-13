@@ -17,7 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token are not echoed). `localhost`, `127.0.0.0/8`, `::1`, and IPv4-mapped
   loopback stay accepted for a local Vault agent or dev server. Set
   `FERRUM_VAULT_ALLOW_PLAINTEXT=true` in the environment to accept remote
-  plaintext explicitly; Ferrum then logs a warning once.
+  plaintext explicitly; Ferrum then logs a warning once, deferred until logging
+  starts when the address is first used during startup. The rule also covers
+  redirects, since `X-Vault-Token` survives them: a redirect to plaintext
+  `http` is refused unless the opt-in is set or both ends are loopback. A
+  loopback `http` Vault is contacted directly, never through `HTTP_PROXY`.
 
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of

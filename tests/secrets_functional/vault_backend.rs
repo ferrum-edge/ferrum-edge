@@ -522,3 +522,296 @@ async fn vault_database_tls_snapshots_follow_pool_lifetime() {
         assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "foreign owner");
     }
 }
+
+// --- Plaintext transport policy (issue #6582) -------------------------------
+//
+// `VAULT_ADDR` must use https unless the host is loopback or
+// `FERRUM_VAULT_ALLOW_PLAINTEXT=true`, and the same rule follows redirects and
+// keeps loopback traffic off any configured proxy.
+
+/// Stop resolution right after client construction: "Invalid Vault KV v2
+/// reference" proves `VAULT_ADDR` was admitted, any other error is the
+/// construction refusal itself.
+async fn vault_construction_outcome(guard: &EnvGuard, address: &str, allow: &str) -> String {
+    guard.set("VAULT_ADDR", address);
+    guard.set("VAULT_TOKEN", "plaintext-token-sentinel");
+    guard.set("FERRUM_VAULT_ALLOW_PLAINTEXT", allow);
+    resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+        .await
+        .err()
+        .expect("a malformed reference never resolves")
+}
+
+fn kv2_body(field: &str) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": "plaintext-policy",
+        "lease_id": "",
+        "lease_duration": 0,
+        "renewable": false,
+        "data": {
+            "data": { "field": field },
+            "metadata": {
+                "created_time": "2026-01-01T00:00:00Z",
+                "deletion_time": "",
+                "destroyed": false,
+                "version": 1
+            }
+        }
+    })
+}
+
+/// A non-loopback address of this host, or `None` when it has no route. A
+/// server bound on `0.0.0.0` is reachable there, which lets a test stand up a
+/// "remote" plaintext destination and observe whether it was contacted.
+fn non_loopback_local_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+async fn mock_server_on_all_interfaces() -> MockServer {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind 0.0.0.0");
+    MockServer::builder().listener(listener).start().await
+}
+
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_http_to_remote_host_is_refused() {
+    let guard = EnvGuard::new();
+    for address in [
+        "http://vault.example.com:8200",
+        "http://10.0.0.5:8200",
+        "http://[2001:db8::1]:8200",
+        "http://localhost.example.com:8200",
+    ] {
+        let error = vault_construction_outcome(&guard, address, "").await;
+        assert!(
+            error.contains("VAULT_ADDR must use https")
+                && error.contains("FERRUM_VAULT_ALLOW_PLAINTEXT"),
+            "{address}: {error}"
+        );
+        assert!(!error.contains("example.com") && !error.contains("10.0.0.5"));
+        assert!(!error.contains("plaintext-token-sentinel"));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn vault_loopback_http_and_remote_https_are_admitted() {
+    let guard = EnvGuard::new();
+    for address in [
+        "http://127.0.0.1:8200",
+        "http://127.8.9.10:8200",
+        "http://localhost:8200",
+        "http://LOCALHOST:8200",
+        "http://[::1]:8200",
+        "http://[::ffff:127.0.0.1]:8200",
+        "https://vault.example.com:8200",
+    ] {
+        let error = vault_construction_outcome(&guard, address, "").await;
+        assert!(
+            error.contains("Invalid Vault KV v2 reference"),
+            "{address} must construct a client: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_opt_in_is_explicit_and_strict() {
+    let guard = EnvGuard::new();
+    let remote = "http://vault.example.com:8200";
+    for allow in ["true", "TRUE", "1", "yes"] {
+        let error = vault_construction_outcome(&guard, remote, allow).await;
+        assert!(
+            error.contains("Invalid Vault KV v2 reference"),
+            "FERRUM_VAULT_ALLOW_PLAINTEXT={allow} must admit remote http: {error}"
+        );
+    }
+    for deny in ["false", "0", "no"] {
+        let error = vault_construction_outcome(&guard, remote, deny).await;
+        assert!(
+            error.contains("VAULT_ADDR must use https"),
+            "{deny}: {error}"
+        );
+    }
+    // A typo must not read as either answer, even for an https address.
+    for address in [remote, "https://vault.example.com:8200"] {
+        let error = vault_construction_outcome(&guard, address, "maybe").await;
+        assert!(
+            error.contains("FERRUM_VAULT_ALLOW_PLAINTEXT must be true or false"),
+            "{address}: {error}"
+        );
+    }
+}
+
+/// reqwest strips `Authorization` on a cross-origin redirect but not
+/// `X-Vault-Token`, so an admitted loopback address must not be able to bounce
+/// the token to a plaintext remote host.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_redirect_to_remote_plaintext_is_refused_before_any_request() {
+    let guard = EnvGuard::new();
+    let Some(lan_ip) = non_loopback_local_ip() else {
+        eprintln!("skipping: this host has no non-loopback address to stand in for a remote host");
+        return;
+    };
+    let remote = mock_server_on_all_interfaces().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("leaked")))
+        .mount(&remote)
+        .await;
+    let remote_port = remote.address().port();
+
+    let local = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(307).insert_header(
+            "Location",
+            format!("http://{lan_ip}:{remote_port}/v1/secret/data/app").as_str(),
+        ))
+        .mount(&local)
+        .await;
+
+    guard.set("VAULT_ADDR", local.uri());
+    guard.set("VAULT_TOKEN", "redirect-token-sentinel");
+    let outcome = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST").await;
+    assert!(
+        outcome.is_err(),
+        "a redirect to remote plaintext must not resolve the secret"
+    );
+    assert!(
+        remote
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the plaintext redirect target must never receive the token"
+    );
+
+    // The explicit opt-in follows the same redirect.
+    guard.set("FERRUM_VAULT_ALLOW_PLAINTEXT", "true");
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("the opt-in admits plaintext redirects");
+    assert_eq!(resolved.value, "leaked");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_loopback_redirect_is_followed() {
+    let guard = EnvGuard::new();
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .and(header("X-Vault-Token", "loopback-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("followed")))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(307).insert_header(
+            "Location",
+            format!("{}/v1/secret/data/app", target.uri()).as_str(),
+        ))
+        .mount(&origin)
+        .await;
+
+    guard.set("VAULT_ADDR", origin.uri());
+    guard.set("VAULT_TOKEN", "loopback-token");
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("a loopback-to-loopback redirect is followed");
+    assert_eq!(resolved.value, "followed");
+    target.verify().await;
+}
+
+/// A loopback `http` Vault never goes through `HTTP_PROXY`: the proxy may be
+/// remote, and the request would carry the token to it in plaintext.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_loopback_http_bypasses_http_proxy() {
+    let guard = EnvGuard::new();
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&proxy)
+        .await;
+    let vault = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("direct")))
+        .expect(1)
+        .mount(&vault)
+        .await;
+
+    for key in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        guard.set_other(key, proxy.uri());
+    }
+    for key in ["NO_PROXY", "no_proxy"] {
+        guard.set_other(key, "");
+    }
+    guard.set("VAULT_ADDR", vault.uri());
+    guard.set("VAULT_TOKEN", "proxy-token-sentinel");
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("loopback Vault resolves directly");
+    assert_eq!(resolved.value, "direct");
+    assert!(
+        proxy
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the proxy must never see the loopback Vault request"
+    );
+    vault.verify().await;
+}
+
+/// Startup resolution runs before logging exists, so the opt-in warning is
+/// deferred and must still appear exactly once.
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_opt_in_warning_survives_startup_resolution() {
+    let Some(lan_ip) = non_loopback_local_ip() else {
+        eprintln!("skipping: this host has no non-loopback address to stand in for a remote host");
+        return;
+    };
+    let temp = tempfile::TempDir::new().unwrap();
+    let vault = mock_server_on_all_interfaces().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(kv2_body("valid-vault-admin-secret-0123456789abcdef")),
+        )
+        .mount(&vault)
+        .await;
+    let address = format!("http://{lan_ip}:{}", vault.address().port());
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        vault_cli_command(&temp, "validate")
+            .env("VAULT_ADDR", &address)
+            .env("FERRUM_VAULT_ALLOW_PLAINTEXT", "true")
+            .output(),
+    )
+    .await
+    .expect("validate must exit promptly")
+    .expect("spawn the feature-enabled Ferrum binary");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{diagnostic}");
+    assert_eq!(
+        diagnostic
+            .matches("VAULT_ADDR uses plaintext http to a non-loopback host")
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+}

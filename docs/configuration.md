@@ -55,7 +55,13 @@ only for a loopback host (`localhost`, `127.0.0.0/8`, `::1`, or an IPv4-mapped
 loopback such as a local Vault agent or dev server), because every Vault
 request carries `VAULT_TOKEN` and every response carries a secret. To accept
 plaintext Vault traffic to another host, set `FERRUM_VAULT_ALLOW_PLAINTEXT=true`
-in the environment; Ferrum then logs a warning once. Malformed URLs,
+in the environment; Ferrum then logs a warning once (after logging starts, when
+the address was first used during startup secret resolution). The same rule
+applies to every redirect a Vault server returns, because `X-Vault-Token` is
+carried across redirects: a redirect to a plaintext `http` address is refused
+unless the opt-in is set or both the configured address and the target are
+loopback. A loopback `http` address is always contacted directly, never through
+`HTTP_PROXY`/`ALL_PROXY`, so the token cannot reach a proxy in plaintext. Malformed URLs,
 unsupported schemes, and refused plaintext addresses fail secret resolution
 with a diagnostic naming `VAULT_ADDR`; `validate` and startup exit non-zero
 without a dependency panic. The diagnostic does not echo the address or token.

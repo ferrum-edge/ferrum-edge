@@ -1,6 +1,7 @@
 //! HashiCorp Vault secret resolution (requires `secrets-vault` feature).
 
 use std::env;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Check if the `{key}_VAULT` env var is set and non-empty.
 /// Returns the Vault path reference (e.g. `secret/data/gateway#field`) if so.
@@ -16,6 +17,22 @@ pub fn resolve_ref(key: &str) -> Option<String> {
 /// before `ferrum.conf` is loaded.
 const ALLOW_PLAINTEXT_ENV: &str = "FERRUM_VAULT_ALLOW_PLAINTEXT";
 
+/// Redirect hops a Vault request may follow, the same as reqwest's default.
+const MAX_VAULT_REDIRECTS: usize = 10;
+
+/// Parse [`ALLOW_PLAINTEXT_ENV`]. Unset or blank is `false`; a value that is
+/// not a recognised boolean fails closed so a typo cannot read as either answer.
+fn parse_allow_plaintext(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(format!("{ALLOW_PLAINTEXT_ENV} must be true or false")),
+        },
+    }
+}
+
 /// Refuse plaintext Vault traffic that leaves the host (issue #6582).
 ///
 /// Every Vault request carries `VAULT_TOKEN` in `X-Vault-Token` and every
@@ -23,37 +40,24 @@ const ALLOW_PLAINTEXT_ENV: &str = "FERRUM_VAULT_ALLOW_PLAINTEXT";
 /// on-path observer. `https` is always accepted. `http` is accepted for a
 /// loopback host (`localhost`, `127.0.0.0/8`, `::1`, or an IPv4-mapped
 /// loopback), where a local agent or dev server never puts the token on the
-/// network, and otherwise only when [`ALLOW_PLAINTEXT_ENV`] is `true`.
+/// network, and otherwise only when [`ALLOW_PLAINTEXT_ENV`] is `true`. The
+/// same rule follows every redirect, and a loopback `http` address bypasses
+/// proxies (see [`vault_transport`]).
 ///
 /// Diagnostics name the variables and the failure class only, never the
 /// address, so userinfo or a sensitive host name cannot leak through them.
-fn check_plaintext_policy(addr: &url::Url, allow_plaintext: Option<&str>) -> Result<(), String> {
-    let allow = match allow_plaintext.map(str::trim) {
-        None | Some("") => false,
-        Some(raw) => match raw.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => true,
-            "false" | "0" | "no" => false,
-            _ => return Err(format!("{ALLOW_PLAINTEXT_ENV} must be true or false")),
-        },
-    };
+fn check_plaintext_policy(addr: &url::Url, allow_plaintext: bool) -> Result<(), String> {
     if addr.scheme() != "http" || host_is_loopback(addr) {
         return Ok(());
     }
-    if !allow {
+    if !allow_plaintext {
         return Err(format!(
             "VAULT_ADDR must use https for a non-loopback Vault host: plaintext http would \
              send VAULT_TOKEN and every fetched secret unencrypted. Use https, or set \
              {ALLOW_PLAINTEXT_ENV}=true to accept plaintext Vault traffic"
         ));
     }
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        tracing::warn!(
-            "VAULT_ADDR uses plaintext http to a non-loopback host because \
-             {ALLOW_PLAINTEXT_ENV}=true; VAULT_TOKEN and fetched secrets cross the network \
-             unencrypted"
-        );
-    });
+    note_plaintext_opt_in();
     Ok(())
 }
 
@@ -66,6 +70,133 @@ fn host_is_loopback(addr: &url::Url) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether a Vault redirect may be followed with the token attached.
+///
+/// reqwest strips `Authorization` and `Cookie` on a cross-origin redirect but
+/// not `X-Vault-Token`, so the plaintext rule has to hold for every hop, not
+/// just `VAULT_ADDR`. An `https` target is always fine. A plaintext target is
+/// fine with the opt-in, or when both the address and the target are loopback
+/// `http` (a client that may use a proxy never sends plaintext to one).
+fn redirect_permitted(target: &url::Url, from_loopback_http: bool, allow_plaintext: bool) -> bool {
+    match target.scheme() {
+        "https" => true,
+        "http" => allow_plaintext || (from_loopback_http && host_is_loopback(target)),
+        _ => false,
+    }
+}
+
+/// The plaintext opt-in warning: not yet needed, recorded before a logging
+/// subscriber existed, or emitted.
+const PLAINTEXT_WARNING_NONE: u8 = 0;
+const PLAINTEXT_WARNING_PENDING: u8 = 1;
+const PLAINTEXT_WARNING_EMITTED: u8 = 2;
+static PLAINTEXT_WARNING: AtomicU8 = AtomicU8::new(PLAINTEXT_WARNING_NONE);
+
+/// Warn once that the opt-in admitted a plaintext address. Startup secret
+/// resolution runs before logging is initialized, so the warning is held until
+/// [`emit_deferred_plaintext_warning`] runs rather than dropped.
+fn note_plaintext_opt_in() {
+    if tracing::dispatcher::has_been_set() {
+        if PLAINTEXT_WARNING.swap(PLAINTEXT_WARNING_EMITTED, Ordering::AcqRel)
+            != PLAINTEXT_WARNING_EMITTED
+        {
+            warn_plaintext_opt_in();
+        }
+    } else {
+        let _ = PLAINTEXT_WARNING.compare_exchange(
+            PLAINTEXT_WARNING_NONE,
+            PLAINTEXT_WARNING_PENDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// Emit the plaintext opt-in warning recorded before logging started.
+pub(crate) fn emit_deferred_plaintext_warning() {
+    if PLAINTEXT_WARNING
+        .compare_exchange(
+            PLAINTEXT_WARNING_PENDING,
+            PLAINTEXT_WARNING_EMITTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        warn_plaintext_opt_in();
+    }
+}
+
+fn warn_plaintext_opt_in() {
+    tracing::warn!(
+        "VAULT_ADDR uses plaintext http to a non-loopback host because \
+         {ALLOW_PLAINTEXT_ENV}=true; VAULT_TOKEN and fetched secrets cross the network \
+         unencrypted"
+    );
+}
+
+/// Build the Vault HTTP transport with the plaintext policy applied past the
+/// first hop.
+///
+/// This mirrors `vaultrs::client::VaultClient::new` (vaultrs 0.8, rustls
+/// backend) setting for setting: timeout, certificate verification, CA bundle
+/// (only for `https`), client identity, and explicit proxy. It adds the two
+/// things vaultrs leaves at reqwest's defaults:
+///
+/// - a redirect policy that applies [`redirect_permitted`] to every hop;
+/// - no proxy for a loopback `http` address, because reqwest honours
+///   `HTTP_PROXY` and would otherwise carry a loopback request, token
+///   included, to a remote proxy in plaintext.
+fn vault_transport(
+    settings: &vaultrs::client::VaultClientSettings,
+    allow_plaintext: bool,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::ClientBuilder::new().tls_backend_rustls();
+    if let Some(timeout) = settings.timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder = builder.tls_danger_accept_invalid_certs(!settings.verify);
+    if settings.address.scheme() == "http" {
+        builder = builder.tls_certs_only(Vec::new());
+    } else {
+        for path in &settings.ca_certs {
+            let pem = std::fs::read(path)
+                .map_err(|e| format!("Failed to read the Vault CA certificate bundle: {e}"))?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem)
+                .map_err(|e| format!("Failed to parse the Vault CA certificate bundle: {e}"))?;
+            builder = builder.tls_certs_merge(certs);
+        }
+    }
+    if let Some(identity) = &settings.identity {
+        builder = builder.identity(identity.clone());
+    }
+    let loopback_http = settings.address.scheme() == "http" && host_is_loopback(&settings.address);
+    if let Some(proxy) = &settings.proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy.as_str())
+                .map_err(|e| format!("Failed to configure the Vault proxy: {e}"))?,
+        );
+    } else if loopback_http {
+        builder = builder.no_proxy();
+    }
+    builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_VAULT_REDIRECTS {
+            return attempt.error("too many Vault redirects");
+        }
+        if redirect_permitted(attempt.url(), loopback_http, allow_plaintext) {
+            attempt.follow()
+        } else {
+            attempt.error(
+                "refused a Vault redirect to a plaintext http address that would carry \
+                 VAULT_TOKEN unencrypted",
+            )
+        }
+    }));
+    builder
+        .build()
+        .map_err(|e| format!("Failed to create Vault client: {e}"))
 }
 
 /// Reusable Vault client for batch secret resolution.
@@ -87,7 +218,8 @@ impl VaultClientWrapper {
         if !matches!(parsed_addr.scheme(), "http" | "https") {
             return Err("VAULT_ADDR must use http or https".to_string());
         }
-        check_plaintext_policy(&parsed_addr, env::var(ALLOW_PLAINTEXT_ENV).ok().as_deref())?;
+        let allow_plaintext = parse_allow_plaintext(env::var(ALLOW_PLAINTEXT_ENV).ok().as_deref())?;
+        check_plaintext_policy(&parsed_addr, allow_plaintext)?;
 
         let mut settings_builder = vaultrs::client::VaultClientSettingsBuilder::default();
         // vaultrs 0.8's address setter panics on parse failure. A serialized
@@ -107,8 +239,12 @@ impl VaultClientWrapper {
             .build()
             .map_err(|e| format!("Failed to build Vault client settings: {}", e))?;
 
-        let client = vaultrs::client::VaultClient::new(settings)
+        let mut client = vaultrs::client::VaultClient::new(settings)
             .map_err(|e| format!("Failed to create Vault client: {}", e))?;
+        // Replace the transport vaultrs built with one that carries the
+        // plaintext policy past the first hop. Endpoint middleware (token,
+        // API version, namespace) and the base address are untouched.
+        client.http.http = vault_transport(&client.settings, allow_plaintext)?;
 
         Ok(Self { client })
     }
