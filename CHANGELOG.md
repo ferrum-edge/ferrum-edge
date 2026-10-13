@@ -134,6 +134,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `claim_headers` follows the `output_claim_headers` bounds**
+  (issue #6620). On `jwks_auth`, `oauth2_introspection` and
+  `oidc_relying_party`, a resolved claim value that is not a valid header value
+  (CR, LF or other control bytes) or exceeds 8192 bytes, including a joined
+  array claim, now leaves the destination absent instead of reaching the
+  outbound header conversion, which dropped it with an unsampled warning. The
+  object form also takes the list form's admission rules: at most 16 mappings,
+  bounded claim paths and header names, no duplicate destination, and the
+  strict reserved-destination list (`cookie`, `content-length`,
+  `x-forwarded-*`, `x-ferrum-*` and the other framing and provenance names).
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
@@ -151,6 +161,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   official `mongo:9` image starts on the `ubuntu-26.04` runner kernel.
 
 ### Fixed
+
+- **`oauth2_introspection` reads a JSON `null` `exp`, `active_until` or
+  `expires_in` as omitted** (issue #6611), matching its `nbf` handling.
+  Authorization servers that serialize unset members as `null` used to fail
+  every authentication with a 503. A null member never hides a present sibling
+  bound, and other non-integer values are still a 503.
 
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
