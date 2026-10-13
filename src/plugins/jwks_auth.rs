@@ -2242,15 +2242,13 @@ fn spawn_discovery_task(
 /// Key selection is the JWT header `kid` via [`verify_jwt_with_jwks`]: missing,
 /// empty, and unknown identifiers fail closed, and a matching `kid` binds
 /// verification to that one key.
-/// Shared admission bound on how many providers one token can be verified
-/// against, used by plugin construction and by mesh RequestAuthentication
-/// admission so the two cannot disagree.
+/// Admission bound on how many providers one token can be verified against.
 ///
 /// A token is a candidate for every provider pinning its exact `iss` plus
 /// every provider pinning none, so each issuer realm's count plus the
 /// issuer-less count must stay within [`MAX_JWKS_CANDIDATE_PROVIDERS`], and
 /// the total within [`MAX_JWKS_PROVIDERS`]. Returns the refusal reason.
-pub fn jwks_provider_bound_error<'a, I>(issuers: I) -> Option<String>
+pub(crate) fn jwks_provider_bound_error<'a, I>(issuers: I) -> Option<String>
 where
     I: IntoIterator<Item = Option<&'a str>>,
 {

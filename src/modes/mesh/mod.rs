@@ -14167,42 +14167,21 @@ fn inject_mesh_request_auth_plugin(
     }
 
     // Several applicable RequestAuthentications are combined into one
-    // `jwks_auth` instance. Each resource is admitted within the per-token
-    // verification bound, but their union can exceed it. Identical providers
-    // are dropped first (verifying one twice is pointless). Any provider still
-    // past the bound is left out with a warning rather than failing plugin
-    // construction for the whole slice. Every rule pins an issuer, so a token
-    // for a left-out provider fails verification (401) instead of passing
-    // unauthenticated: the overflow fails closed for that issuer only.
+    // `jwks_auth` instance. Identical rules are installed once: verifying the
+    // same provider twice is pointless and would count twice against the
+    // per-token verification bound. Nothing else is dropped, so every
+    // extraction location and claim-output header stays owned. A union that
+    // still exceeds the bound fails plugin construction, and the data plane
+    // keeps its last accepted configuration (fail closed).
     let mut providers: Vec<serde_json::Value> = Vec::new();
-    let mut per_issuer: HashMap<String, usize> = HashMap::new();
-    let mut dropped = 0usize;
     for ra in &applicable {
         for rule in &ra.jwt_rules {
-            let Some(provider) = build_jwks_provider_config(rule) else {
-                continue;
-            };
-            if providers.contains(&provider) {
-                continue;
-            }
-            let count = per_issuer.entry(rule.issuer.clone()).or_insert(0);
-            if *count >= crate::plugins::jwks_auth::MAX_JWKS_CANDIDATE_PROVIDERS
-                || providers.len() >= crate::plugins::jwks_auth::MAX_JWKS_PROVIDERS
+            if let Some(provider) = build_jwks_provider_config(rule)
+                && !providers.contains(&provider)
             {
-                dropped += 1;
-                continue;
+                providers.push(provider);
             }
-            *count += 1;
-            providers.push(provider);
         }
-    }
-    if dropped > 0 {
-        warn!(
-            dropped,
-            "mesh RequestAuthentication: applicable JWT rules exceed the jwks_auth per-token \
-             verification bound; extra rules were not installed and tokens for them are \
-             rejected"
-        );
     }
 
     if providers.is_empty() {
@@ -35874,7 +35853,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_runtime_request_auth_union_stays_within_jwks_verification_bound() {
+    fn mesh_runtime_request_auth_union_dedupes_identical_rules() {
         let runtime = MeshRuntimeConfig {
             workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
             ..test_mesh_runtime_config()
@@ -35885,10 +35864,10 @@ mod tests {
                 namespace: Some("default".to_string()),
             },
         };
-        // Two resources, each within the bound, share one issuer: six rules
-        // each, with one rule identical across both.
+        // Two resources share one issuer: five rules each, with one rule
+        // identical across both.
         let rules = |prefix: &str| -> Vec<MeshJwtRule> {
-            (0..6)
+            (0..5)
                 .map(|i| {
                     let source = if i == 0 {
                         "shared".to_string()
@@ -35931,19 +35910,9 @@ mod tests {
             .get("providers")
             .and_then(|v| v.as_array())
             .expect("providers array");
-        // 12 rules, 1 duplicate, capped at the per-issuer bound.
-        assert_eq!(
-            providers.len(),
-            crate::plugins::jwks_auth::MAX_JWKS_CANDIDATE_PROVIDERS
-        );
-        assert!(
-            crate::plugins::jwks_auth::JwksAuth::new(
-                &jwks.config,
-                crate::plugins::PluginHttpClient::default()
-            )
-            .is_ok(),
-            "the injected config must construct"
-        );
+        // 10 rules, the shared one installed once: 9 providers, all kept so
+        // every extraction location and claim-output header stays owned.
+        assert_eq!(providers.len(), 9);
     }
 
     #[test]

@@ -7504,17 +7504,6 @@ fn validate_mesh_config_internal(
             &ra.scope,
             &mut errors,
         );
-        // Same per-token verification bound `jwks_auth` enforces at
-        // construction, so an over-bound resource is refused here instead of
-        // failing plugin construction on the data plane.
-        if let Some(reason) = crate::plugins::jwks_auth::jwks_provider_bound_error(
-            ra.jwt_rules.iter().map(|rule| Some(rule.issuer.as_str())),
-        ) {
-            errors.push(format!(
-                "MeshRequestAuthentication {:?} jwt_rules: {reason}",
-                ra.name
-            ));
-        }
         for (i, rule) in ra.jwt_rules.iter().enumerate() {
             if rule.issuer.trim().is_empty() {
                 errors.push(format!(

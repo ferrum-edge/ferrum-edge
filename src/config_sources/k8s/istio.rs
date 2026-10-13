@@ -1363,14 +1363,6 @@ fn request_authentication(
         .flatten()
         .map(|rule| translate_jwt_rule(object, rule))
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(reason) = crate::plugins::jwks_auth::jwks_provider_bound_error(
-        jwt_rules.iter().map(|rule| Some(rule.issuer.as_str())),
-    ) {
-        return Err(invalid_resource(
-            object,
-            format!("RequestAuthentication jwtRules: {reason}"),
-        ));
-    }
 
     Ok(MeshRequestAuthentication {
         name: object.metadata.name.clone(),

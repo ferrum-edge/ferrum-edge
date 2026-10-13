@@ -1368,7 +1368,7 @@ Per-workload mTLS mode with optional per-port overrides.
 
 Declares valid JWTs for a workload scope. Permissive by default (see [RequestAuthentication](#requestauthentication)).
 
-Each resource may declare at most 8 `jwt_rules` for one issuer and 64 in total, matching the `jwks_auth` per-token verification bound (a token is verified only against the providers pinning its `iss`). An over-bound resource is refused at translation (`FerrumAccepted=False`) and by mesh config validation. All applicable resources for a workload are combined into one `jwks_auth` instance: identical rules are installed once, and rules past the bound in the union are left out with a warning. Tokens for a left-out rule are rejected with 401, never admitted unauthenticated.
+All applicable resources for a workload are combined into one `jwks_auth` instance, and identical rules are installed once. That instance is subject to the `jwks_auth` per-token verification bound: at most 64 rules in total, and at most 8 rules sharing one issuer. A combination past the bound fails plugin construction, so the data plane keeps its last accepted configuration rather than dropping any rule or its extraction locations.
 
 ### MeshTelemetryResource
 
