@@ -644,8 +644,8 @@ async fn respond(
 }
 
 #[tokio::test]
-async fn response_default_allow_streams_and_records_unlisted_bodies() {
-    let plugin = response_waf("enforce", None);
+async fn response_allow_streams_and_records_unlisted_bodies() {
+    let plugin = response_waf("enforce", Some("allow"));
     let (buffers, result, ctx) =
         respond(&plugin, Some("application/octet-stream"), b"leak-marker").await;
     assert!(!buffers, "allow keeps the streaming path");
@@ -656,6 +656,24 @@ async fn response_default_allow_streams_and_records_unlisted_bodies() {
         Some("response_body")
     );
     assert_eq!(meta(&ctx, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn response_default_is_fail_closed_under_an_enforcing_rule() {
+    let plugin = response_waf("enforce", None);
+    let (buffers, result, ctx) = respond(
+        &plugin,
+        Some("application/octet-stream"),
+        b"<?php echo 1; ?>",
+    )
+    .await;
+    assert!(buffers);
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+    // The refusing disposition is part of the pre-content-type capability, so
+    // gateway-header provenance is retained for the rejection.
+    let ctx = request("GET", "/api/items", None);
+    assert!(plugin.may_enforce_response_body_policy(&ctx));
 }
 
 #[tokio::test]
@@ -700,7 +718,14 @@ async fn response_fail_closed_needs_an_enforcing_response_rule_but_block_does_no
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(meta(&ctx, "waf.block_reason"), None);
 
+    let ctx = request("GET", "/api/items", None);
+    assert!(!fail_closed.may_enforce_response_body_policy(&ctx));
+
     let block = response_waf("monitor", Some("block"));
+    assert!(
+        block.may_enforce_response_body_policy(&ctx),
+        "a refusing unlisted disposition must be reported as a capability"
+    );
     let (buffers, result, ctx) =
         respond(&block, Some("application/octet-stream"), b"anything").await;
     assert!(buffers);
@@ -767,4 +792,85 @@ fn invalid_response_values_are_rejected() {
         error.contains("`on_unlisted_response_content_type` must be allow, fail_closed, or block"),
         "{error}"
     );
+}
+
+// ── Zero-contribution scoring does not make a body policy enforcing ────────
+
+#[tokio::test]
+async fn a_zero_score_monitor_body_rule_does_not_make_unlisted_bodies_refusable() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "custom_rules": [
+            {
+                "id": "QUERY", "category": "custom", "target": "query_values",
+                "match_kind": "contains", "pattern": "query-marker", "action": "enforce"
+            },
+            {
+                "id": "BODY-ZERO", "category": "custom", "target": "body_text",
+                "match_kind": "contains", "pattern": "noted", "action": "monitor", "score": 0
+            },
+            {
+                "id": "RESP-ZERO", "category": "custom", "target": "response_body",
+                "match_kind": "contains", "pattern": "noted", "action": "monitor", "score": 0
+            }
+        ]
+    }))
+    .unwrap();
+
+    let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), b"x").await;
+    assert!(!buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+
+    let (buffers, result, ctx) = respond(&plugin, Some("application/octet-stream"), b"x").await;
+    assert!(!buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn a_scoring_body_rule_with_a_positive_score_still_makes_them_refusable() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "custom_rules": [{
+            "id": "BODY-SCORED", "category": "custom", "target": "body_text",
+            "match_kind": "contains", "pattern": "noted", "action": "monitor", "score": 5
+        }]
+    }))
+    .unwrap();
+    let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), b"x").await;
+    assert!(buffers);
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+}
+
+// ── header_present secrets stay out of diagnostics ─────────────────────────
+
+#[test]
+fn header_present_names_are_redacted_from_diagnostics() {
+    let plugin = waf(json!({
+        "mode": "monitor",
+        "global_exemptions": {
+            "header_present": {
+                "X-Waf-Bypass": "trusted-hop-shared-secret",
+                "x-scanner": "another-shared-secret-value"
+            }
+        }
+    }))
+    .unwrap();
+    let mut names = plugin.request_headers_to_redact().to_vec();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["x-scanner".to_string(), "x-waf-bypass".to_string()]
+    );
+
+    let plain = waf(json!({ "mode": "monitor" })).unwrap();
+    assert!(plain.request_headers_to_redact().is_empty());
 }

@@ -589,7 +589,9 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
             b"file=%252e%252e%252fetc",
         )
         .await;
-    assert!(matches!(result, PluginResult::Continue));
+    // Not scanned: the enforcing special makes the unlisted response refusable
+    // under the default `on_unlisted_response_content_type: fail_closed`.
+    assert!(refused_as_unlisted(&result, &binary_resp_ctx));
 }
 
 #[tokio::test]
@@ -8097,6 +8099,7 @@ fn wide_parity_waf() -> Waf {
     // so unlisted bodies are forwarded rather than refused.
     waf(json!({
         "on_unlisted_content_type": "allow",
+        "on_unlisted_response_content_type": "allow",
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,

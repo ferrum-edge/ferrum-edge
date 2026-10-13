@@ -21,10 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     an enforcing request-body policy applies; monitor-only deployments are
     unaffected. Set `allow` to keep the previous behavior.
   - New `on_unlisted_response_content_type` (`allow` / `fail_closed` /
-    `block`, default `allow`) gives response bodies the same control. An
-    enforce-mode instance with enforcing response-body rules logs a warning
-    while it is unset. Unlisted bodies now record
+    `block`, default `fail_closed`) gives response bodies the same control,
+    so an origin cannot stream a disclosure past an enforcing response-body
+    rule by labelling it with an unscanned type. Unlisted bodies now record
     `waf.body_uninspected_target`.
+  - A body rule that neither enforces nor adds to the anomaly score (for
+    example `score: 0`) no longer makes a body policy "enforcing" for the
+    fail-closed size, timeout, and content-type decisions.
+  - `global_exemptions.header_present` values are redacted from non-admin
+    config reads, audit records, and exports, and the named headers are
+    redacted from transaction debugging and policy inputs.
   - `body_methods` now defaults to `POST`, `PUT`, `PATCH`, and `DELETE`.
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's

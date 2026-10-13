@@ -795,17 +795,21 @@ takes the same three values:
 
 | Value | Non-empty unlisted response body |
 | --- | --- |
-| `allow` (default) | forwarded uninspected; recorded as `waf.body_uninspected=content_type` with `waf.body_uninspected_target=response_body` when the body was buffered anyway |
-| `fail_closed` | rejected when an enforcing response-body policy applies to the request |
+| `allow` | forwarded uninspected; recorded as `waf.body_uninspected=content_type` with `waf.body_uninspected_target=response_body` when the body was buffered anyway |
+| `fail_closed` (default) | rejected when an enforcing response-body policy applies to the request (an applicable `action: enforce` response-body rule, or anomaly scoring over one) |
 | `block` | rejected while `mode: enforce` |
 
 Refusing values buffer the unlisted body and decide over the exact bytes, so an
 empty body passes. `text/event-stream` responses, bodiless responses (`HEAD`,
-1xx, 204, 304), and exempt requests are never governed. The response default
-stays `allow` because the origin, not the client, chooses the response type,
-and images, archives, and protobuf are routine; an enforce-mode instance with
-enforcing response-body rules logs a warning at construction while the option
-is unset. Neither value satisfies `mode: enforce` admission on its own.
+1xx, 204, 304), and exempt requests are never governed. `fail_closed` is the
+default for the same reason as on requests: response-body rules exist to catch
+disclosures an origin did not intend, and an origin serving source code or a
+stack trace as `application/octet-stream` must not stream it past an enforcing
+rule. Monitor-only response policy never starts blocking. A route that
+legitimately serves images, archives, or protobuf under enforcing
+response-body rules lists those types, exempts the route, turns on
+`inspect_binary_body`, or sets `allow`. Neither value satisfies `mode: enforce`
+admission on its own.
 
 Because a refusing configuration reads the whole body before it rejects, a
 large or long-running upload receives the rejection (`reject_status_code`,

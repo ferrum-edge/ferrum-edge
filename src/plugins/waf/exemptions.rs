@@ -174,6 +174,13 @@ impl CompiledExemptions {
         }
     }
 
+    /// Lowercase `header_present` header names, whose values are secrets.
+    pub fn header_present_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.header_present.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Whether a `header_present` entry suppresses every rule for this
     /// request. Each entry requires the exact configured secret value,
     /// compared in constant time; header presence alone never matches.

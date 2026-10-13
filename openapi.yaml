@@ -30376,24 +30376,24 @@ components:
         on_unlisted_response_content_type:
           type: [string, "null"]
           enum: [allow, fail_closed, block, null]
-          default: allow
+          default: fail_closed
           description: >-
             Response-side counterpart of on_unlisted_content_type, for a
             non-empty response body whose Content-Type is outside the same
             scan scope while this instance inspects response bodies. allow
-            (default) forwards it uninspected and records
+            forwards it uninspected and records
             waf.body_uninspected=content_type with
             waf.body_uninspected_target=response_body when the body was
-            buffered; fail_closed rejects it when an enforcing response-body
-            policy applies to the request; block rejects every such body while
+            buffered; fail_closed (default) rejects it when an enforcing
+            response-body policy applies to the request, so monitor-only
+            response policy never blocks; block rejects every such body while
             mode is enforce. Refusing values buffer the unlisted body and decide
             over the exact bytes, so an empty body passes. text/event-stream
             responses, bodiless responses (HEAD, 1xx, 204, 304), and exempt
-            requests are never governed. The default is allow because the
-            origin chooses the response type and binary media is routine; an
-            enforce-mode instance with enforcing response-body rules logs a
-            warning at construction while this is left unset. Neither value
-            satisfies mode enforce admission on its own.
+            requests are never governed. Routes that serve opaque media under
+            enforcing response-body rules list or exempt it, enable
+            inspect_binary_body, or set allow. Neither value satisfies mode
+            enforce admission on its own.
         include_default_rules:
           type: [boolean, "null"]
           default: true

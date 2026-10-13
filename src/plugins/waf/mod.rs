@@ -272,6 +272,9 @@ pub struct Waf {
     identity: Arc<str>,
     /// Precomputed `waf.instances.<identity>.score` metadata key (cold path).
     score_metadata_key: Arc<str>,
+    /// `global_exemptions.header_present` names. Their values are shared
+    /// secrets, so diagnostics and policy calls must never see them.
+    request_headers_to_redact: Vec<String>,
 }
 
 static NEXT_WAF_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -307,7 +310,7 @@ impl Waf {
         {
             return false;
         }
-        let scoring_enabled = self.config.scoring.is_some();
+        let scoring = self.config.scoring.as_ref();
         let encoding = self.specials.encoding;
         let overlong_utf8 = self.specials.overlong_utf8;
         self.compiled.rules.iter().enumerate().any(|(index, rule)| {
@@ -325,9 +328,13 @@ impl Waf {
             };
             let reads_direction =
                 reads_body || encoding == Some(index) || overlong_utf8 == Some(index);
+            // A rule that neither enforces nor adds to the anomaly score can
+            // never refuse this body, so it does not make the body policy
+            // enforcing even when scoring is on.
             reads_direction
                 && !rule.detection_only
-                && (scoring_enabled || rule.action == RuleAction::Enforce)
+                && (rule.action == RuleAction::Enforce
+                    || scoring.is_some_and(|scoring| scoring.contribution(rule) > 0))
         })
     }
 
@@ -451,17 +458,15 @@ impl Waf {
                 .as_deref()
                 .unwrap_or("fail_closed"),
         )?;
-        // The response Content-Type is chosen by the origin and binary media
-        // is the norm, so responses default to `allow`; a configuration that
-        // leaves enforcing response-body rules blind to unlisted types is
-        // warned about below.
-        let on_unlisted_response_content_type_configured =
-            optional_string(object, "on_unlisted_response_content_type")?;
+        // Responses fail closed the same way: the origin choosing an unlisted
+        // type (or none) must not let a disclosure stream past an enforcing
+        // response-body rule. Routes that serve opaque media under such rules
+        // list or exempt it, or set `allow` explicitly.
         let on_unlisted_response_content_type = parse_unlisted_content_type_action(
             "on_unlisted_response_content_type",
-            on_unlisted_response_content_type_configured
+            optional_string(object, "on_unlisted_response_content_type")?
                 .as_deref()
-                .unwrap_or("allow"),
+                .unwrap_or("fail_closed"),
         )?;
         let include_default_rules = optional_bool(object, "include_default_rules")?.unwrap_or(true);
         let disabled_default_rules = optional_string_vec(object, "disabled_default_rules")?
@@ -542,24 +547,6 @@ impl Waf {
             on_body_too_large,
             on_unlisted_content_type,
         )?;
-        if on_unlisted_response_content_type_configured.is_none()
-            && !inspect_binary_body
-            && response_body_rules_enforce(
-                mode,
-                &compiled,
-                scoring.as_ref(),
-                response_inspection && response_body_inspection,
-            )
-        {
-            tracing::warn!(
-                plugin = "waf",
-                "waf: enforcing response-body rules do not inspect responses whose \
-                 Content-Type is outside the scan scope, and \
-                 `on_unlisted_response_content_type` defaults to `allow`; set it to \
-                 `fail_closed` or `block` to refuse such responses, or to `allow` to \
-                 silence this warning"
-            );
-        }
 
         let config = WafConfig {
             mode,
@@ -631,6 +618,7 @@ impl Waf {
             None => Arc::from(format!("standalone-{instance_id}")),
         };
         let score_metadata_key: Arc<str> = Arc::from(format!("waf.instances.{identity}.score"));
+        let request_headers_to_redact = exemptions.header_present_names();
         Ok(Self {
             config,
             compiled,
@@ -642,6 +630,7 @@ impl Waf {
             instance_id,
             identity,
             score_metadata_key,
+            request_headers_to_redact,
         })
     }
 
@@ -1596,6 +1585,13 @@ impl Plugin for Waf {
         "waf"
     }
 
+    /// `global_exemptions.header_present` values are shared secrets that
+    /// suppress every rule, so transaction debugging and policy inputs must
+    /// never carry them.
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
+    }
+
     fn priority(&self) -> u16 {
         super::priority::WAF
     }
@@ -2227,8 +2223,13 @@ impl Plugin for Waf {
     /// Depends only on configuration and request state, as the contract requires
     /// — including the enforcing-disposition term, which is itself decided from
     /// configuration and the request alone.
+    ///
+    /// `on_unlisted_response_content_type` can refuse a response this instance
+    /// never scans, so its refusing disposition is part of the capability too.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.should_buffer_response_body(ctx) && self.response_body_disposition_can_refuse(ctx)
+        self.should_buffer_response_body(ctx)
+            && (self.response_body_disposition_can_refuse(ctx)
+                || self.unlisted_response_content_type_refuses(ctx))
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
@@ -2448,27 +2449,6 @@ fn parse_unlisted_content_type_action(
             "waf: `{field}` must be allow, fail_closed, or block; got {other:?}"
         )),
     }
-}
-
-/// Whether some response-body rule can refuse a response under this
-/// configuration: globally enforcing, response-body inspection reachable, and
-/// an applicable-in-principle `ResponseBody` rule that enforces or feeds
-/// anomaly scoring. Conditions are request-scoped and are deliberately not
-/// evaluated: this only drives an admission-time warning.
-fn response_body_rules_enforce(
-    mode: GlobalMode,
-    compiled: &CompiledRules,
-    scoring: Option<&ScoringConfig>,
-    response_body_surface: bool,
-) -> bool {
-    mode == GlobalMode::Enforce
-        && response_body_surface
-        && compiled.rules.iter().any(|rule| {
-            matches!(rule.target, RuleTarget::ResponseBody)
-                && !rule.detection_only
-                && (rule.action == RuleAction::Enforce
-                    || scoring.is_some_and(|scoring| scoring.contribution(rule) > 0))
-        })
 }
 
 fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {

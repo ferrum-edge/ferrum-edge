@@ -233,6 +233,28 @@ fn http_logging_endpoint_and_every_custom_header_value_are_projected() {
 }
 
 #[test]
+fn waf_header_present_secret_values_are_projected() {
+    let projected = project(
+        "waf",
+        json!({
+            "mode": "enforce",
+            "global_exemptions": {
+                "paths": ["/health"],
+                "header_present": { "x-skip-waf": "waf-exemption-secret-canary" }
+            }
+        }),
+    );
+    assert_eq!(
+        projected["global_exemptions"]["header_present"]["x-skip-waf"],
+        REDACTED
+    );
+    // Header names and unrelated exemption fields stay visible.
+    assert_eq!(projected["global_exemptions"]["paths"], json!(["/health"]));
+    assert_eq!(projected["mode"], "enforce");
+    assert_no_canaries(&projected, &["waf-exemption-secret-canary"]);
+}
+
+#[test]
 fn otel_header_values_are_secret_by_default_regardless_of_name() {
     let projected = project(
         "otel_tracing",
