@@ -2755,23 +2755,7 @@ impl DatabaseStore {
                 hmac_quarantined.len()
             );
         }
-        // Fail-closed keyauth/basicauth/mtls_auth collisions (issue #6572):
-        // `ConsumerIndex` resolves a shared credential last-wins, so strip it
-        // from every later claimant instead of publishing behind a warning.
-        // `consumer_credential_index` blocks new collisions at write time.
-        let credential_quarantined = config.quarantine_colliding_consumer_credentials();
-        if !credential_quarantined.is_empty() {
-            for message in &credential_quarantined {
-                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
-            }
-            error!(
-                "Quarantined {} colliding consumer credential(s) during full config load",
-                credential_quarantined.len()
-            );
-        }
-        let consumer_quarantine_active = !quarantined.is_empty()
-            || !hmac_quarantined.is_empty()
-            || !credential_quarantined.is_empty();
+        let consumer_quarantine_active = !quarantined.is_empty() || !hmac_quarantined.is_empty();
 
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
@@ -6760,14 +6744,8 @@ impl DatabaseStore {
 
         // Consumer changes ride the delta only while the published consumer
         // set has nothing quarantined; otherwise a delete or update may have
-        // to rehydrate a stripped credential (issue #6060). Proxy and plugin
-        // changes escalate too while anything is quarantined: they can change
-        // the effective mTLS DNS identity policy, and only a full load can
-        // restore a credential that policy no longer collides (issue #6572).
-        if (!consumer_ops.is_empty() && !self.consumer_quarantine.allows_consumer_deltas(namespace))
-            || ((!proxy_ops.is_empty() || !plugin_config_ops.is_empty())
-                && self.consumer_quarantine.has_active_quarantine(namespace))
-        {
+        // to rehydrate a stripped credential (issue #6060).
+        if !consumer_ops.is_empty() && !self.consumer_quarantine.allows_consumer_deltas(namespace) {
             return Err(anyhow::Error::new(
                 crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
                     namespace,

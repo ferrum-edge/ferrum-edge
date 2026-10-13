@@ -241,13 +241,12 @@ async fn sqlite_consumer_delta_quarantine_contract() {
 }
 
 /// A stored API key shared by two consumers (a pre-existing row or direct DB
-/// edit that bypassed `consumer_credential_index`) must not resolve last-wins
-/// (issue #6572): the later consumer loses its keyauth credential at full
-/// load, and the namespace stays on full reloads while quarantine is active.
+/// edit that bypassed `consumer_credential_index`) makes the full load refuse
+/// the snapshot instead of resolving the key last-wins (issue #6572).
 #[tokio::test(flavor = "multi_thread")]
-async fn sqlite_full_load_quarantines_shared_keyauth_key() {
+async fn sqlite_full_load_refuses_shared_keyauth_key() {
     let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("consumer-keyauth-quarantine.db");
+    let path = dir.path().join("consumer-keyauth-collision.db");
     let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
     let store = DatabaseStore::connect_with_pool_config("sqlite", &url, DbPoolConfig::default())
         .await
@@ -262,6 +261,8 @@ async fn sqlite_full_load_quarantines_shared_keyauth_key() {
         .create_consumer(&consumer(ns, "c-b", keyauth("key-b-0123456789")))
         .await
         .unwrap();
+    store.load_full_config(ns).await.expect("unique keys load");
+
     let result = sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
         .bind(keyauth("shared-key-0123456789").to_string())
         .bind(ns)
@@ -271,57 +272,13 @@ async fn sqlite_full_load_quarantines_shared_keyauth_key() {
         .expect("out-of-band consumer update");
     assert_eq!(result.rows_affected(), 1);
 
-    let full = store.load_full_config(ns).await.unwrap();
-    let keyauth_of = |id: &str| {
-        full.consumers
-            .iter()
-            .find(|consumer| consumer.id == id)
-            .expect("consumer present")
-            .credentials
-            .get("keyauth")
-            .cloned()
-    };
-    assert_eq!(
-        keyauth_of("c-a"),
-        Some(json!([{"key": "shared-key-0123456789"}]))
-    );
-    assert_eq!(
-        keyauth_of("c-b"),
-        None,
-        "the shared key must be stripped from the later consumer"
-    );
-    assert!(full.validate_unique_consumer_credentials().is_ok());
-
-    let after = store.latest_change_sequence(ns).await.unwrap();
-    store
-        .create_consumer(&consumer(ns, "c-c", keyauth("key-c-0123456789")))
+    let error = store
+        .load_full_config(ns)
         .await
-        .unwrap();
-    expect_escalation(
-        &store,
-        ns,
-        after,
-        "keyauth create while quarantine is active",
-    )
-    .await;
-
-    // A plugin-only change can alter the effective mTLS identity policy, so it
-    // escalates too while quarantine is active.
-    let plugin: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
-        "id": "global-key-auth",
-        "plugin_name": "key_auth",
-        "namespace": ns,
-        "scope": "global",
-        "config": {}
-    }))
-    .expect("plugin config fixture");
-    let after = store.latest_change_sequence(ns).await.unwrap();
-    store.create_plugin_config(&plugin).await.unwrap();
-    expect_escalation(
-        &store,
-        ns,
-        after,
-        "plugin change while quarantine is active",
-    )
-    .await;
+        .expect_err("a shared API key must reject the snapshot");
+    let message = format!("{error:#}");
+    assert!(
+        !message.contains("shared-key-0123456789"),
+        "the rejection must not leak the key: {message}"
+    );
 }

@@ -300,15 +300,8 @@ full-reload path. Consumer creates, updates, and deletes ride the incremental
 delta unless load-time quarantine could change their outcome: they escalate to
 a full reload (which rehydrates quarantined credentials from storage) while
 the namespace's last published full load quarantined a colliding consumer
-identity, an `hmac_auth` credential, or a `keyauth`/`basicauth`/`mtls_auth`
-credential shared by two consumers, before any full load has been published,
-and whenever a changed consumer carries `hmac_auth`. While such a quarantine is
-active, proxy and plugin-config changes escalate as well, because they can
-change the effective mTLS DNS identity policy that decided it. An incremental
-delta that would make two consumers share a `keyauth` key, `basicauth`
-username, or mTLS identity is rejected rather than quarantined in arrival
-order; the previous config stays live and the rejected-delta escalation
-recovers through a full reload. The
+identity or an `hmac_auth` credential, before any full load has been published,
+and whenever a changed consumer carries `hmac_auth`. The
 reload records the change-log watermark it read before loading as its accepted
 cursor, so rows committed while it ran are picked up by the next incremental
 poll, and its validation cost is linear in cheap per-row work: the plugin

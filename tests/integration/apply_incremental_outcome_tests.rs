@@ -3129,10 +3129,9 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
     assert!(live_winner(&state).is_some_and(|id| id != winner));
 }
 
-/// A delta that would make two consumers share an API key is rejected rather
-/// than quarantined in arrival order (issue #6572): the last-known-good config
-/// stays live, and the rejected-delta escalation recovers through a full
-/// snapshot that quarantines deterministically by consumer id.
+/// A delta that would make two consumers share an API key is rejected (issue
+/// #6572): `ConsumerIndex` would otherwise resolve the key last-wins. The
+/// last-known-good config stays live.
 #[tokio::test]
 async fn consumer_delta_introducing_shared_api_key_is_rejected() {
     let keyed = |id: &str, key: &str| {
@@ -3155,8 +3154,7 @@ async fn consumer_delta_introducing_shared_api_key_is_rejected() {
             .map(|consumer| consumer.id.clone())
     };
 
-    // `c-a` sorts before the existing owner, so arrival-order quarantine would
-    // disagree with a fresh full load. The delta must not publish at all.
+    // The delta must not publish at all, whichever id sorts first.
     let mut delta = empty_delta_at(Utc::now());
     delta.added_or_modified_consumers = vec![keyed("c-a", "zulu-api-key-0123456789")];
     let outcome = state.apply_incremental(delta).await;

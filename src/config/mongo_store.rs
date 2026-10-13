@@ -9666,18 +9666,8 @@ mod inner {
                     crate::startup::sanitize_startup_cause(message, &[])
                 );
             }
-            // Fail-closed keyauth/basicauth/mtls_auth collisions (issue
-            // #6572), parity with the SQL loader.
-            let credential_quarantined = config.quarantine_colliding_consumer_credentials();
-            for message in &credential_quarantined {
-                error!(
-                    "MongoDB config: {}",
-                    crate::startup::sanitize_startup_cause(message, &[])
-                );
-            }
-            let consumer_quarantine_active = !identity_quarantined.is_empty()
-                || !hmac_quarantined.is_empty()
-                || !credential_quarantined.is_empty();
+            let consumer_quarantine_active =
+                !identity_quarantined.is_empty() || !hmac_quarantined.is_empty();
 
             // Serving-mode repairability (issue #4526), parity with the SQL
             // loader: quarantine stored plugin rows the shared construction
@@ -10142,13 +10132,8 @@ mod inner {
             // Consumer changes ride the delta only while the published
             // consumer set has nothing quarantined; otherwise a delete or
             // update may have to rehydrate a stripped credential (issue #6060).
-            // Proxy and plugin changes escalate too while anything is
-            // quarantined: they can change the effective mTLS DNS identity
-            // policy, which only a full load re-judges (issue #6572).
-            if (!consumer_ops.is_empty()
-                && !self.consumer_quarantine.allows_consumer_deltas(namespace))
-                || ((!proxy_ops.is_empty() || !plugin_config_ops.is_empty())
-                    && self.consumer_quarantine.has_active_quarantine(namespace))
+            if !consumer_ops.is_empty()
+                && !self.consumer_quarantine.allows_consumer_deltas(namespace)
             {
                 return Err(anyhow::Error::new(
                     crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(

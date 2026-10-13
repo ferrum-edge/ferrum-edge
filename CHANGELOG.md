@@ -9,19 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Shared keyauth, basicauth, and mtls_auth credentials are quarantined
-  instead of resolving last-wins** (issue #6572). The SQL and MongoDB full
-  loaders only warned when two consumers shared an API key, basicauth
-  username, or mTLS identity, and the consumer index then authenticated that
-  credential as whichever consumer was indexed last. Full loads and config
-  swaps (including CP-to-DP snapshots) now strip the colliding credential type
-  from every later consumer (first-loaded by id wins), matching the existing
-  `hmac_auth` and identity quarantine. An incremental delta that would
-  introduce such a collision is rejected, so the previous config stays live
-  until a full reload. Case variants of an mTLS identity count as collisions
-  when a `san_dns` policy is active. While a quarantine is active, consumer,
-  proxy, and plugin-config changes escalate to full reloads. File mode
-  already rejected such configs and is unchanged.
+- **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
+  refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB full loaders only
+  warned when two consumers in one namespace shared an API key, basicauth
+  username, or exact mTLS identity, and the consumer index then authenticated
+  that credential as whichever consumer was indexed last. Database full loads,
+  CP snapshots and deltas, and every runtime swap (including DP snapshots and
+  incremental applies) now refuse such a config and keep the previous one,
+  the same way case-variant mTLS DNS identities were already refused and file
+  mode already failed. Admin writes were already blocked from creating these
+  collisions; repair a pre-existing one by rotating or removing one of the
+  credentials through the Admin API, which stays available while the snapshot
+  is rejected.
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is

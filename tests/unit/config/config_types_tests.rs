@@ -2009,10 +2009,10 @@ fn test_unique_consumer_credentials_scopes_case_folding_to_san_dns() {
     assert!(errors[0].contains("ASCII case-insensitive"));
 }
 
-// ── Cross-consumer credential collision quarantine (issue #6572) ──────────
+// ── Runtime refusal of shared auth credentials (issue #6572) ─────────────
 
 #[test]
-fn test_quarantine_colliding_keyauth_keeps_first_consumer() {
+fn test_unique_consumer_auth_credentials_rejects_shared_keyauth_key() {
     let key = "shared-api-key-value-0123456789abcdef";
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials
@@ -2020,127 +2020,75 @@ fn test_quarantine_colliding_keyauth_keeps_first_consumer() {
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "bob-own-key"}, {"key": key}]),
+        serde_json::json!([{"key": "bob-own-key-0123456789"}, {"key": key}]),
     );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
 
-    let messages = config.quarantine_colliding_consumer_credentials();
-    assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("consumer \"c2\""));
-    assert!(!messages[0].contains(key), "the key must never be logged");
-    assert!(config.consumers[0].has_credential("keyauth"));
-    assert!(!config.consumers[1].has_credential("keyauth"));
-    assert!(config.validate_unique_consumer_credentials().is_ok());
-
-    // The index can no longer resolve the shared key to the later consumer.
-    let index = ferrum_edge::ConsumerIndex::new(&config.consumers);
-    assert_eq!(
-        index
-            .find_by_api_key(key)
-            .map(|consumer| consumer.id.clone()),
-        Some("c1".to_string())
-    );
-    assert!(index.find_by_api_key("bob-own-key").is_none());
+    let errors = config
+        .validate_unique_consumer_auth_credentials()
+        .unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("\"c2\"") && errors[0].contains("\"c1\""));
+    assert!(!errors[0].contains(key), "the key must never be reported");
 }
 
 #[test]
-fn test_quarantine_colliding_credentials_allows_rotation_duplicates_and_unique_values() {
+fn test_unique_consumer_auth_credentials_allows_rotation_and_other_namespaces() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "alice-key"}, {"key": "alice-key"}]),
+        serde_json::json!([{"key": "alice-key-0123456789"}, {"key": "alice-key-0123456789"}]),
     );
     c1.credentials.insert(
         "mtls_auth".into(),
-        serde_json::json!([{"identity": "alice.example.com"}]),
+        serde_json::json!([{"identity": "client.example.com"}]),
     );
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "bob-key"}]));
+    c2.namespace = "tenant-b".to_string();
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "alice-key-0123456789"}]),
+    );
     c2.credentials.insert(
         "mtls_auth".into(),
-        serde_json::json!([{"identity": "bob.example.com"}]),
+        serde_json::json!([{"identity": "client.example.com"}]),
     );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
 
-    assert!(
-        config
-            .quarantine_colliding_consumer_credentials()
-            .is_empty()
-    );
-    for consumer in &config.consumers {
-        assert!(consumer.has_credential("keyauth"));
-        assert!(consumer.has_credential("mtls_auth"));
-    }
+    assert!(config.validate_unique_consumer_auth_credentials().is_ok());
 }
 
 #[test]
-fn test_quarantine_colliding_basicauth_username() {
+fn test_unique_consumer_auth_credentials_rejects_basicauth_and_mtls_collisions() {
     let mut c1 = make_consumer("c1", "shared-user");
     c1.credentials.insert(
         "basicauth".into(),
         serde_json::json!([{"password_hash": "hash-one"}]),
+    );
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client.example.com"}]),
     );
     let mut c2 = make_consumer("c2", "shared-user");
     c2.credentials.insert(
         "basicauth".into(),
         serde_json::json!([{"password_hash": "hash-two"}]),
     );
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client.example.com"}]),
+    );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
 
-    let messages = config.quarantine_colliding_consumer_credentials();
-    assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("basicauth"));
-    assert!(config.consumers[0].has_credential("basicauth"));
-    assert!(!config.consumers[1].has_credential("basicauth"));
-}
-
-#[test]
-fn test_quarantine_colliding_mtls_exact_and_effective_dns_identity() {
-    let mut c1 = make_consumer("c1", "alice");
-    c1.credentials.insert(
-        "mtls_auth".into(),
-        serde_json::json!([{"identity": "API.Example.COM"}]),
-    );
-    let mut c2 = make_consumer("c2", "bob");
-    c2.credentials.insert(
-        "mtls_auth".into(),
-        serde_json::json!([{"identity": "api.example.com"}]),
-    );
-    let mut c3 = make_consumer("c3", "carol");
-    c3.credentials.insert(
-        "mtls_auth".into(),
-        serde_json::json!([{"identity": "API.Example.COM"}]),
-    );
-    let mut config = empty_config();
-    config.consumers = vec![c1, c2, c3];
-
-    // Exact-match policy: only the exact duplicate is ambiguous.
-    let mut exact = config.clone();
-    let messages = exact.quarantine_colliding_consumer_credentials();
-    assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("consumer \"c3\""));
-    assert!(exact.consumers[0].has_credential("mtls_auth"));
-    assert!(exact.consumers[1].has_credential("mtls_auth"));
-    assert!(!exact.consumers[2].has_credential("mtls_auth"));
-
-    // An effective san_dns policy consumes the case-folded index, so the
-    // case variant is ambiguous too.
-    config.plugin_configs.push(mtls_plugin(
-        "dns-mtls",
-        PluginScope::Global,
-        None,
-        serde_json::json!({"cert_field": "san_dns"}),
-    ));
-    let messages = config.quarantine_colliding_consumer_credentials();
-    assert_eq!(messages.len(), 2);
-    assert!(config.consumers[0].has_credential("mtls_auth"));
-    assert!(!config.consumers[1].has_credential("mtls_auth"));
-    assert!(!config.consumers[2].has_credential("mtls_auth"));
-    assert!(config.validate_unique_consumer_credentials().is_ok());
+    let errors = config
+        .validate_unique_consumer_auth_credentials()
+        .unwrap_err();
+    assert_eq!(errors.len(), 2);
+    assert!(errors.iter().any(|error| error.contains("basicauth")));
+    assert!(errors.iter().any(|error| error.contains("mtls_auth")));
 }
 
 #[test]

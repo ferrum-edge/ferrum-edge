@@ -12981,6 +12981,12 @@ impl ProxyState {
         if let Err(errs) = config.validate_unique_mtls_dns_identities() {
             errors.extend(errs);
         }
+        // `ConsumerIndex` resolves a shared keyauth key, basicauth username,
+        // or exact mTLS identity last-wins; refuse the snapshot or delta
+        // instead of authenticating it as the wrong Consumer (issue #6572).
+        if let Err(errs) = config.validate_unique_consumer_auth_credentials() {
+            errors.extend(errs);
+        }
         if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
             errors.extend(errs);
         }
@@ -13873,11 +13879,6 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Config reload: {}", message);
         }
-        // Same boundary for keyauth/basicauth/mtls_auth credentials shared by
-        // two Consumers, which the index would otherwise resolve last-wins.
-        for message in new_config.quarantine_colliding_consumer_credentials() {
-            error!("Config reload: {}", message);
-        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -14720,22 +14721,6 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Incremental config: {}", message);
         }
-        // A delta must never introduce a keyauth/basicauth/mtls_auth
-        // credential shared by two Consumers (issue #6572). Quarantining here
-        // would follow delta arrival order rather than the full-load id order
-        // and could leave a stripped credential unrecoverable by later deltas,
-        // so reject the delta instead: the last-known-good config stays live
-        // and the rejected-delta escalation recovers through an authoritative
-        // full snapshot, which quarantines deterministically.
-        let credential_collisions = new_config.consumer_credential_collisions();
-        if !credential_collisions.is_empty() {
-            for message in &credential_collisions {
-                error!("Incremental config rejected: {}", message);
-            }
-            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected(
-                credential_collisions,
-            ));
-        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -15132,7 +15117,6 @@ impl ProxyState {
         candidate.normalize_fields();
         candidate.resolve_upstream_tls();
         let _ = candidate.quarantine_invalid_hmac_credentials();
-        let _ = candidate.quarantine_colliding_consumer_credentials();
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
             &self.gateway_svid_bundle,
