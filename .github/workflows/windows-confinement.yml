@@ -5,20 +5,42 @@ name: Windows File Confinement
 # tests (`windows_confined_files` in
 # tests/unit/tls/scoped_material_reference_tests.rs, exercising
 # src/tls/source/windows_file.rs) compile out everywhere else. This workflow
-# runs them natively on the paths that can change them (issue #6540).
+# runs them natively on the paths that can change them (issue #6540): the
+# confinement code and tests, the test-registration chain that could compile
+# them out, the shared crate root, and the build configuration.
 
 on:
   pull_request:
     paths:
       - .github/workflows/windows-confinement.yml
       - src/tls/source/**
+      - src/lib.rs
+      - src/config/file_loader.rs
+      - tests/unit_tests.rs
+      - tests/unit/mod.rs
+      - tests/unit/tls/mod.rs
       - tests/unit/tls/scoped_material_reference_tests.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - build.rs
+      - rust-toolchain.toml
   push:
     branches: [main]
     paths:
       - .github/workflows/windows-confinement.yml
       - src/tls/source/**
+      - src/lib.rs
+      - src/config/file_loader.rs
+      - tests/unit_tests.rs
+      - tests/unit/mod.rs
+      - tests/unit/tls/mod.rs
       - tests/unit/tls/scoped_material_reference_tests.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - build.rs
+      - rust-toolchain.toml
   workflow_dispatch:
 
 permissions:
