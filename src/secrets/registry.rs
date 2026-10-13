@@ -434,7 +434,11 @@ fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
 /// Deterministic and reference-free: client/credential discovery can stall on
 /// ADC or instance-metadata without ever touching a source reference, so the
 /// message names only the backend and the configured bound.
-#[cfg(any(feature = "secrets-aws", feature = "secrets-gcp"))]
+#[cfg(any(
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
 fn client_init_timeout_error(backend_name: &str, timeout: Duration) -> String {
     format!(
         "Timeout initializing {} client after {}s",
@@ -1261,7 +1265,11 @@ impl SecretBackend for AzureBackend {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
-        let creds = azure::AzureCredentials::new()?;
+        // Credential construction reads `FERRUM_TLS_CA_BUNDLE_PATH`; bound it
+        // with the same timeout as the fetches (once per provider batch).
+        let creds = tokio::time::timeout(timeout, azure::AzureCredentials::new())
+            .await
+            .map_err(|_| client_init_timeout_error(self.display_name(), timeout))??;
         resolve_many_concurrent(
             secrets,
             timeout,

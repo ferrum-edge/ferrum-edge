@@ -84,8 +84,9 @@ impl AzureCredentials {
     ///
     /// Also loads `FERRUM_TLS_CA_BUNDLE_PATH` (when set) for the Key Vault
     /// transport; an unreadable or invalid bundle is an error rather than a
-    /// silent fallback to platform roots only.
-    pub fn new() -> Result<Self, String> {
+    /// silent fallback to platform roots only. The bundle is read on a detached
+    /// thread, so callers bound construction with the secret fetch timeout.
+    pub async fn new() -> Result<Self, String> {
         let tenant_id = env::var("AZURE_TENANT_ID").map_err(|_| {
             "AZURE_TENANT_ID must be set to resolve secrets from Azure Key Vault".to_string()
         })?;
@@ -106,7 +107,7 @@ impl AzureCredentials {
 
         Ok(Self {
             credential,
-            transport: keyvault_transport()?,
+            transport: keyvault_transport().await?,
         })
     }
 
@@ -122,10 +123,11 @@ impl AzureCredentials {
     ///
     /// Like [`AzureCredentials::new`], this loads `FERRUM_TLS_CA_BUNDLE_PATH`
     /// for the Key Vault transport and fails if the bundle is unusable.
-    pub fn from_static_token(token: impl Into<String>) -> Result<Self, String> {
+    pub async fn from_static_token(token: impl Into<String>) -> Result<Self, String> {
+        let credential: Arc<dyn TokenCredential> = Arc::new(StaticTokenCredential::new(token));
         Ok(Self {
-            credential: Arc::new(StaticTokenCredential::new(token)),
-            transport: keyvault_transport()?,
+            credential,
+            transport: keyvault_transport().await?,
         })
     }
 
@@ -138,7 +140,7 @@ impl AzureCredentials {
 /// Fetch a single secret from Azure Key Vault (creates new credentials).
 /// For batch resolution, use `AzureCredentials`.
 pub async fn fetch_secret(reference: &str, key: &str) -> Result<AzureSecret, String> {
-    let creds = AzureCredentials::new()?;
+    let creds = AzureCredentials::new().await?;
     creds.fetch_secret(reference, key).await
 }
 
@@ -172,16 +174,11 @@ impl KeyVaultReference {
 /// whose trust store is the platform roots **plus** the bundle's roots. The
 /// client is `https_only`, matching the vault-URL rule enforced at parse time.
 /// Errors name the variable and the failure class, never the path or bytes.
-fn keyvault_transport() -> Result<Option<Transport>, String> {
+async fn keyvault_transport() -> Result<Option<Transport>, String> {
     let Some(path) = env::var_os(CA_BUNDLE_PATH_ENV).filter(|path| !path.is_empty()) else {
         return Ok(None);
     };
-    let pem = std::fs::read(&path).map_err(|e| {
-        format!(
-            "Failed to read {CA_BUNDLE_PATH_ENV} for Azure Key Vault TLS: {}",
-            e.kind()
-        )
-    })?;
+    let pem = read_ca_bundle_detached(path).await?;
     let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
         format!("{CA_BUNDLE_PATH_ENV} is not a valid PEM CA bundle (Azure Key Vault TLS)")
     })?;
@@ -201,6 +198,85 @@ fn keyvault_transport() -> Result<Option<Transport>, String> {
             format!("Failed to build the Azure Key Vault TLS client from {CA_BUNDLE_PATH_ENV}")
         })?;
     Ok(Some(Transport::new(Arc::new(client))))
+}
+
+/// Upper bound on the CA bundle, matching the default TLS material ceiling
+/// (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`).
+const CA_BUNDLE_MAX_BYTES: usize = crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES;
+
+/// Read the CA bundle on a detached OS thread.
+///
+/// The open is non-blocking and the opened descriptor must be a regular file,
+/// so a FIFO, socket, or device fails at once instead of blocking. The read is
+/// capped at [`CA_BUNDLE_MAX_BYTES`]. A stalled mount can still hold the
+/// detached thread, but not a Tokio worker; the registry's fetch timeout
+/// bounds the caller (the same model as `credential_file`'s detached reader).
+async fn read_ca_bundle_detached(path: std::ffi::OsString) -> Result<Vec<u8>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ferrum-azure-ca-read".to_string())
+        .spawn(move || {
+            let _ = tx.send(read_ca_bundle(std::path::Path::new(&path)));
+        })
+        .map_err(|_| {
+            format!("Failed to start the {CA_BUNDLE_PATH_ENV} reader for Azure Key Vault TLS")
+        })?;
+    rx.await.map_err(|_| {
+        format!("The {CA_BUNDLE_PATH_ENV} reader for Azure Key Vault TLS exited unexpectedly")
+    })?
+}
+
+fn read_ca_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let io_error = |e: std::io::Error| {
+        format!(
+            "Failed to read {CA_BUNDLE_PATH_ENV} for Azure Key Vault TLS: {}",
+            e.kind()
+        )
+    };
+    let not_regular =
+        || format!("{CA_BUNDLE_PATH_ENV} must name a regular file (Azure Key Vault TLS)");
+    let oversized = || {
+        format!(
+            "{CA_BUNDLE_PATH_ENV} exceeds the {CA_BUNDLE_MAX_BYTES}-byte limit (Azure Key Vault TLS)"
+        )
+    };
+
+    // Fast-reject a non-regular, non-symlink path before `open(2)`; a symlink
+    // (e.g. a projected Kubernetes secret) is typed after open instead.
+    let link_meta = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if !link_meta.file_type().is_symlink() && !link_meta.is_file() {
+        return Err(not_regular());
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(io_error)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).map_err(io_error)?;
+
+    let meta = file.metadata().map_err(io_error)?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    if meta.len() > CA_BUNDLE_MAX_BYTES as u64 {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    file.take(CA_BUNDLE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() > CA_BUNDLE_MAX_BYTES {
+        return Err(oversized());
+    }
+    Ok(bytes)
 }
 
 /// Parse a Key Vault secret reference URL into vault URL, secret name, and

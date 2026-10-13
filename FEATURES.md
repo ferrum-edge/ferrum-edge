@@ -505,11 +505,14 @@ cargo build --release --features secrets-vault,secrets-aws
 
 **HashiCorp Vault** also uses rustls, but since Vault is often deployed on-premises with a private CA, the gateway respects `FERRUM_TLS_CA_BUNDLE_PATH`. If this variable points to a PEM-encoded CA bundle, the Vault client will trust certificates signed by those CAs in addition to the default trust store. This is the same CA bundle variable used by the gateway's backend proxy connections.
 
-**Azure Key Vault** requires `https://` vault URLs, with no loopback exception. To point the backend at a Key Vault emulator, sidecar, or private endpoint, serve it over TLS (a self-signed CA is fine) and set `FERRUM_TLS_CA_BUNDLE_PATH` to that CA's PEM bundle in the process environment. Key Vault data-plane calls then trust it in addition to the platform roots, so public vaults keep working. An unreadable bundle, or one with no certificates, fails resolution instead of falling back. Certificate verification is never disabled; `FERRUM_TLS_NO_VERIFY` does not apply. For example:
+**Azure Key Vault** requires `https://` vault URLs, with no loopback exception. To point the backend at a Key Vault emulator, sidecar, or private endpoint, serve it over TLS (a self-signed CA is fine) and set `FERRUM_TLS_CA_BUNDLE_PATH` to that CA's PEM bundle in the process environment. Key Vault data-plane calls then trust it in addition to the platform roots, so public vaults keep working. An unreadable bundle, a non-regular file, a bundle over 4 MiB, or one with no certificates fails resolution instead of falling back. Certificate verification is never disabled; `FERRUM_TLS_NO_VERIFY` does not apply.
+
+The SDK also keeps Key Vault's challenge-resource check: on the first request the endpoint answers `401` with a `WWW-Authenticate` challenge, and the SDK only sends the token if the challenge's `resource` domain is a suffix of the request host. A sidecar or proxy that relays Azure's normal `resource="https://vault.azure.net"` challenge must therefore be reached under the vault's own name (`<vault>.vault.azure.net`). Route that name to it with DNS, `/etc/hosts`, or an `HTTPS_PROXY` that tunnels it, and give it a certificate for that name. A bare `https://127.0.0.1:<port>` reference works only when the endpoint does not send a challenge. For example:
 
 ```bash
-export FERRUM_TLS_CA_BUNDLE_PATH=/etc/ferrum/kv-emulator-ca.pem
-export FERRUM_ADMIN_JWT_SECRET_AZURE=https://127.0.0.1:8443/secrets/ferrum-jwt
+# /etc/hosts: 127.0.0.1 my-vault.vault.azure.net  (the sidecar listens on 8443)
+export FERRUM_TLS_CA_BUNDLE_PATH=/etc/ferrum/kv-sidecar-ca.pem
+export FERRUM_ADMIN_JWT_SECRET_AZURE=https://my-vault.vault.azure.net:8443/secrets/ferrum-jwt
 ```
 
 ### Timeouts and Resilience

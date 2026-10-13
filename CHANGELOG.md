@@ -20,8 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-loopback host sent the token and the fetched secret in cleartext. To use
   an emulator, sidecar, or private endpoint, serve it over TLS and set
   `FERRUM_TLS_CA_BUNDLE_PATH`: Key Vault calls trust that bundle in addition to
-  the platform roots, and an unreadable or empty bundle is an error.
-  `AzureCredentials::from_static_token` now returns a `Result`. Secret
+  the platform roots. The bundle is read without blocking, and an unreadable,
+  non-regular, over-4 MiB or certificate-free bundle is an error. The SDK's
+  challenge-resource check stays on, so a sidecar that relays Azure's
+  challenge must be addressed as `<vault>.vault.azure.net`.
+  `AzureCredentials::new` and `AzureCredentials::from_static_token` are now
+  `async` and return a `Result`. Secret
   redaction also covers the bare vault host and `host:port`, which the SDK's
   challenge check can echo. The `Secret Backends` Azure fake now serves TLS
   with a per-test CA. Dependabot groups the Azure SDK crates so they move

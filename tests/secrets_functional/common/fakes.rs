@@ -181,12 +181,19 @@ mod azure {
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsAcceptor;
-    use wiremock::matchers::{method, path_regex};
+    use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::common::env::EnvGuard;
+
+    /// Key Vault-shaped hostname the fake's certificate also covers. Requests
+    /// to it are routed to the fake through an in-process `CONNECT` proxy
+    /// (`HTTPS_PROXY`), so the SDK's challenge-resource check sees a real
+    /// `*.vault.azure.net` request host without any DNS setup.
+    pub const VAULT_HOST: &str = "ferrum-kv.vault.azure.net";
 
     /// A fake Azure Key Vault secrets data plane. `wiremock` serves the wire
     /// shape on plain HTTP; an in-process TLS terminator in front of it is the
@@ -202,11 +209,16 @@ mod azure {
         /// PEM file holding this fake's CA certificate.
         ca_bundle: tempfile::NamedTempFile,
         terminator: tokio::task::JoinHandle<()>,
+        /// `http://127.0.0.1:<port>` of the `CONNECT` proxy in front of the
+        /// TLS terminator.
+        proxy_url: String,
+        proxy: tokio::task::JoinHandle<()>,
     }
 
     impl Drop for AzureKeyVaultFake {
         fn drop(&mut self) {
             self.terminator.abort();
+            self.proxy.abort();
         }
     }
 
@@ -229,9 +241,12 @@ mod azure {
             let leaf_key =
                 KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("fake leaf key");
             // `CertificateParams::new` maps `127.0.0.1` to an IP-address SAN.
-            let mut leaf_params =
-                CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
-                    .expect("fake leaf params");
+            let mut leaf_params = CertificateParams::new(vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                VAULT_HOST.to_string(),
+            ])
+            .expect("fake leaf params");
             leaf_params
                 .distinguished_name
                 .push(DnType::CommonName, "127.0.0.1");
@@ -286,12 +301,84 @@ mod azure {
                 }
             });
 
+            // Minimal HTTP `CONNECT` proxy: every tunnel goes to the TLS
+            // terminator whatever host it names.
+            let proxy_listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake CONNECT proxy");
+            let proxy_port = proxy_listener
+                .local_addr()
+                .expect("fake CONNECT proxy addr")
+                .port();
+            let tls_addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let proxy = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = proxy_listener.accept().await else {
+                        continue;
+                    };
+                    tokio::spawn(serve_connect(stream, tls_addr));
+                }
+            });
+
             Self {
                 server,
                 https_base: format!("https://127.0.0.1:{port}"),
                 ca_bundle,
                 terminator,
+                proxy_url: format!("http://127.0.0.1:{proxy_port}"),
+                proxy,
             }
+        }
+
+        /// Route `https://` requests through this fake's `CONNECT` proxy for
+        /// the guard's lifetime, so [`Self::vault_host_secret_url`] reaches the
+        /// fake. Call before constructing `AzureCredentials`: the client reads
+        /// the proxy environment when it is built.
+        pub fn route_through_proxy(&self, guard: &EnvGuard) {
+            guard.set_other("HTTPS_PROXY", &self.proxy_url);
+            guard.set_other("https_proxy", &self.proxy_url);
+        }
+
+        /// `https://ferrum-kv.vault.azure.net/secrets/<name>`; reaches the fake
+        /// only after [`Self::route_through_proxy`].
+        pub fn vault_host_secret_url(&self, name: &str) -> String {
+            format!("https://{VAULT_HOST}/secrets/{name}")
+        }
+
+        /// Key Vault challenge flow: an unauthenticated request gets `401` with
+        /// a `WWW-Authenticate` challenge naming `resource`; only a request
+        /// carrying `Authorization: Bearer <token>` gets the secret.
+        pub async fn mock_secret_challenge(
+            &self,
+            name: &str,
+            value: &str,
+            resource: &str,
+            token: &str,
+        ) {
+            Mock::given(method("GET"))
+                .and(path_regex(Self::secret_path_regex(name)))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(self.secret_body(name, value)),
+                )
+                .with_priority(1)
+                .mount(&self.server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(Self::secret_path_regex(name)))
+                .respond_with(
+                    ResponseTemplate::new(401).insert_header(
+                        "WWW-Authenticate",
+                        format!(
+                            "Bearer authorization=\"https://login.microsoftonline.com/\
+                         00000000-0000-0000-0000-000000000000\", resource=\"{resource}\""
+                        )
+                        .as_str(),
+                    ),
+                )
+                .with_priority(2)
+                .mount(&self.server)
+                .await;
         }
 
         /// Trust this fake's CA for Key Vault TLS by pointing
@@ -426,5 +513,34 @@ mod azure {
                 "attributes": { "enabled": true },
             })
         }
+    }
+
+    /// Answer one `CONNECT` request and splice the tunnel to `target`.
+    async fn serve_connect(mut client: TcpStream, target: SocketAddr) {
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+            }
+            if head.len() > 16 * 1024 {
+                return;
+            }
+        }
+        if !head.starts_with(b"CONNECT ") {
+            return;
+        }
+        let Ok(mut upstream) = TcpStream::connect(target).await else {
+            return;
+        };
+        if client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
     }
 }

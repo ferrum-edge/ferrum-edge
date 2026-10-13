@@ -93,9 +93,13 @@ Such a URL fails `ferrum-edge validate` and startup.
 - **`http://` emulators, fakes, sidecars, or proxies:** serve them over TLS. If
   their certificate is not publicly trusted, set `FERRUM_TLS_CA_BUNDLE_PATH` in
   the process environment to the issuing CA. Key Vault calls trust it in
-  addition to the platform roots. An unreadable bundle, or one with no
-  certificates, now fails resolution.
-- **Embedding code:** `AzureCredentials::from_static_token` returns a `Result`.
+  addition to the platform roots. An unreadable, non-regular, or oversized
+  bundle, or one with no certificates, now fails resolution. A sidecar that
+  relays Azure's `resource="https://vault.azure.net"` challenge must be
+  addressed as `<vault>.vault.azure.net`, because the SDK checks the challenge
+  domain against the request host.
+- **Embedding code:** `AzureCredentials::new` and
+  `AzureCredentials::from_static_token` are `async` and return a `Result`.
 
 See [FEATURES.md](../FEATURES.md#tls-and-trust) for an emulator example.
 
