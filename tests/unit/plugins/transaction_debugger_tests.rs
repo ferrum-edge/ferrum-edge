@@ -2264,3 +2264,21 @@ fn startup_diagnostics_withhold_debugger_keys_and_capture_budgets() {
         assert!(!rendered.contains(hidden), "{rendered}");
     }
 }
+
+/// Issue #6619: camelCase credential-class field names redact in captured
+/// bodies, so the classifier must see the original spelling, not a lowercased
+/// copy that has lost its segment boundaries.
+#[test]
+fn test_camel_case_credential_class_body_fields_are_redacted() {
+    let plugin = capture_plugin();
+    let json_body = br#"{"hsmPin":"735102","userSessionId":"sess-748215","keep":"visible"}"#;
+    let json = plugin.render_captured_body(json_body, BodyKind::Json, 512);
+    assert!(!json.rendered.contains("735102"), "{}", json.rendered);
+    assert!(!json.rendered.contains("sess-748215"), "{}", json.rendered);
+    assert!(json.rendered.contains("visible"), "{}", json.rendered);
+
+    let form_body = b"totpSeed=482913&note=fine";
+    let form = plugin.render_captured_body(form_body, BodyKind::Form, 512);
+    assert!(!form.rendered.contains("482913"), "{}", form.rendered);
+    assert!(form.rendered.contains("note=fine"), "{}", form.rendered);
+}

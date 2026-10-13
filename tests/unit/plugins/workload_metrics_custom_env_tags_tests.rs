@@ -190,6 +190,9 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "WEBHOOK_SIGNATURE",
         "CLIENT_ASSERTION",
         "ID_JWT",
+        "ASSERTION_VALUE",
+        "PRIVATEKEY",
+        "ENCRYPTIONKEY",
     ];
 
     for env_var in cases {
@@ -298,4 +301,28 @@ fn custom_env_tags_credential_shaped_invalid_syntax_prefers_credential_diagnosti
     );
     assert!(!error.contains("AWS_SECRET-KEY"));
     assert!(!error.contains("invalid environment variable name"));
+}
+
+#[test]
+fn custom_header_tags_reject_credential_class_header_names() {
+    for header in [
+        "x-session-id",
+        "x-csrf",
+        "x-privatekey",
+        "x-client-assertion",
+        "x-hsm-pin",
+    ] {
+        let error = workload_metrics_new_with_env_lookup_for_test(
+            &json!({
+                "custom_header_tags": {"dimension": header}
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected sensitive-header rejection for {header}"));
+        assert!(
+            error.contains("cannot copy sensitive header"),
+            "expected sensitive-header rejection for {header}, got {error}"
+        );
+    }
 }

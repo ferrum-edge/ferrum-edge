@@ -578,6 +578,15 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "x-csrf",
     "xsrf",
     "accesstoken",
+    "privatekey",
+    "x-privatekey",
+    "clientkey",
+    "encryptionKey",
+    "masterkey",
+    "awsaccesskeyid",
+    "assertion_value",
+    "assertion_xml",
+    "ASSERTION_VALUE",
 ];
 
 /// Ordinary dimensions that share a word or stem with a credential class.

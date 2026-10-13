@@ -734,6 +734,9 @@ impl TransactionDebugger {
             || SENSITIVE_HEADERS.iter().any(|name| lowered == *name)
             || self.extra_redacted_headers.contains(&lowered)
             || self.redacted_body_fields.contains(&lowered)
+            // Also the original spelling: lowercasing first erases the
+            // camelCase boundaries the classifier segments on (`hsmPin`).
+            || is_sensitive_metadata_key(key)
             || is_sensitive_metadata_key(&lowered)
     }
 

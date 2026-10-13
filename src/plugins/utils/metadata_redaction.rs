@@ -286,9 +286,9 @@ const CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
     "xsrf",
 ];
 
-/// Credential stems that stay credential-shaped when concatenated into a
-/// longer segment (`usersession`, `dbpassword`, `gpgpassphrase`, `idjwt`,
-/// `requestsignature`, `awsaccesskey`, `rsaprivatekey`).
+/// Credential stems that stay credential-shaped anywhere inside a segment
+/// (`usersession`, `dbpassword`, `gpgpassphrase`, `idjwt`,
+/// `requestsignature`, `clientassertion`).
 const CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "session",
     "sessid",
@@ -298,17 +298,14 @@ const CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "credential",
     "jwt",
     "signature",
-    "privatekey",
-    "accesskey",
-    "secretkey",
-    "signingkey",
-    "sessionkey",
-    "masterkey",
+    "assertion",
 ];
 
-/// Qualifiers that make a following `key` / `keys` segment a credential
-/// (`private_key`, `access-key`, `signingKey`). A bare `key` stays visible so
-/// `cache_key` and `routing_key` remain observable.
+/// Key-material qualifiers. A `key` / `keys` segment after one of these
+/// (`private_key`, `access-key`, `signingKey`), or a segment containing one
+/// concatenated with `key` (`privatekey`, `x-clientkey`, `awsaccesskeyid`),
+/// is a credential. A bare `key` stays visible so `cache_key` and
+/// `routing_key` remain observable.
 const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "private",
     "access",
@@ -326,73 +323,94 @@ const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "jwt",
 ];
 
-/// Qualifiers that make a following `assertion` a bearer credential
-/// (`client_assertion`, `saml.assertion`, `jwtAssertion`).
-const CREDENTIAL_ASSERTION_QUALIFIERS: &[&str] =
-    &["client", "saml", "jwt", "oidc", "id", "bearer", "user"];
+/// Complete metadata keys that name a policy OUTCOME about an assertion, not
+/// the assertion itself. Matched case-insensitively as a key suffix.
+/// `mesh_authz.ignored_baggage.assertion_out_of_scope` is a documented
+/// transaction-log signal.
+const NON_SECRET_ASSERTION_SIGNAL_SUFFIXES: &[&str] = &["assertion_out_of_scope"];
+
+/// Longest segment lowercased on the stack; longer segments (rare) allocate.
+const CLASSIFIER_STACK_SEGMENT_BYTES: usize = 64;
+
+fn ends_with_ascii_case_insensitive(haystack: &str, suffix: &str) -> bool {
+    haystack.len() >= suffix.len()
+        && haystack.as_bytes()[haystack.len() - suffix.len()..]
+            .eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+/// Judge one lowercased segment given whether the previous segment was a
+/// key-material qualifier.
+fn lowered_segment_is_credential(lower: &str, previous_is_key_qualifier: bool) -> bool {
+    if CREDENTIAL_CLASS_SEGMENTS.contains(&lower)
+        || (lower.len() > "token".len() && lower.ends_with("token"))
+        || CREDENTIAL_CLASS_STEMS
+            .iter()
+            .any(|stem| lower.contains(stem))
+        || (matches!(lower, "key" | "keys") && previous_is_key_qualifier)
+    {
+        return true;
+    }
+    CREDENTIAL_KEY_QUALIFIERS.iter().any(|qualifier| {
+        lower
+            .match_indices(qualifier)
+            .any(|(offset, _)| lower[offset + qualifier.len()..].starts_with("key"))
+    })
+}
 
 /// Credential-class classifier for metadata keys (issue #6619).
 ///
 /// The key is split into segments exactly like the token classifier
-/// (delimiters, camelCase, acronyms, non-ASCII boundaries), lowercased, and
-/// judged per segment and per adjacent pair. A key is credential-shaped when:
+/// (delimiters, camelCase, acronyms, non-ASCII boundaries) and each segment is
+/// judged case-insensitively. A key is credential-shaped when:
 ///
 /// * a segment is a credential-class word (`session`, `sid`, `jwt`, `pwd`,
 ///   `passphrase`, `pin`, `otp`, `credential`, `signature`, `csrf`, …);
-/// * a segment embeds a long credential stem (`usersession`,
-///   `gpgpassphrase`, `awsaccesskey`), or ends in `token` after a qualifier
-///   (`accesstoken`, `csrftoken`) — `tokens` stays visible for usage counts;
+/// * a segment contains a credential stem (`usersession`, `gpgpassphrase`,
+///   `clientassertion`, `assertion_value`'s `assertion`), or ends in `token`
+///   after a qualifier (`accesstoken`, `csrftoken`); plural `tokens` stays
+///   visible for usage counts;
 /// * a `key` / `keys` segment follows a key-material qualifier (`private`,
-///   `access`, `signing`, `client`, …);
-/// * an `assertion` segment ends the key or follows a bearer qualifier
-///   (`client_assertion`, `samlAssertion`). A trailing qualifier such as
-///   `assertion_out_of_scope` names a policy outcome, not the assertion.
+///   `access`, `signing`, `client`, …), or a segment concatenates a qualifier
+///   with `key` (`privatekey`, `x-clientkey`, `awsaccesskeyid`).
 ///
-/// Unlisted spellings of these classes therefore redact. The rule is deliberately
+/// The only exemption is an explicitly listed non-secret outcome signal
+/// ([`NON_SECRET_ASSERTION_SIGNAL_SUFFIXES`]). The rule is deliberately
 /// narrower than outbound header stripping: ordinary dimensions such as
-/// `cache_key`, `routing_key`, `request_id`, and `ai_total_tokens` stay visible.
+/// `cache_key`, `routing_key`, `request_id`, and `ai_total_tokens` stay
+/// visible. Allocation-free for segments up to 64 bytes.
 pub fn is_credential_class_metadata_key(key: &str) -> bool {
+    if NON_SECRET_ASSERTION_SIGNAL_SUFFIXES
+        .iter()
+        .any(|suffix| ends_with_ascii_case_insensitive(key, suffix))
+    {
+        return false;
+    }
     let mut sensitive = false;
-    let mut previous = String::new();
-    let mut last_was_assertion = false;
+    let mut previous_is_key_qualifier = false;
     for_each_metadata_key_segment(key, |segment| {
         if sensitive {
             return;
         }
-        let lower = segment.to_ascii_lowercase();
-        last_was_assertion = false;
-        if CREDENTIAL_CLASS_SEGMENTS.contains(&lower.as_str())
-            || (lower.len() > "token".len() && lower.ends_with("token"))
-            || CREDENTIAL_CLASS_STEMS
-                .iter()
-                .any(|stem| lower.len() > stem.len() && lower.contains(stem))
-            || (matches!(lower.as_str(), "key" | "keys")
-                && CREDENTIAL_KEY_QUALIFIERS.contains(&previous.as_str()))
-        {
-            sensitive = true;
-            return;
-        }
-        if lower.ends_with("assertion") || lower.ends_with("assertions") {
-            let stem_len = if lower.ends_with('s') {
-                "assertions".len()
-            } else {
-                "assertion".len()
-            };
-            let qualifier = &lower[..lower.len() - stem_len];
-            if !qualifier.is_empty() {
-                // `clientassertion` / `samlassertion`: concatenated bearer.
-                sensitive = true;
-                return;
+        let mut stack = [0u8; CLASSIFIER_STACK_SEGMENT_BYTES];
+        let heap;
+        let lower: &str = if segment.len() <= CLASSIFIER_STACK_SEGMENT_BYTES {
+            let buffer = &mut stack[..segment.len()];
+            buffer.copy_from_slice(segment.as_bytes());
+            buffer.make_ascii_lowercase();
+            // Segments are ASCII alphanumeric runs (see the segmenter), so the
+            // lowercased bytes are valid UTF-8.
+            match std::str::from_utf8(buffer) {
+                Ok(lower) => lower,
+                Err(_) => return,
             }
-            if CREDENTIAL_ASSERTION_QUALIFIERS.contains(&previous.as_str()) {
-                sensitive = true;
-                return;
-            }
-            last_was_assertion = true;
-        }
-        previous = lower;
+        } else {
+            heap = segment.to_ascii_lowercase();
+            heap.as_str()
+        };
+        sensitive = lowered_segment_is_credential(lower, previous_is_key_qualifier);
+        previous_is_key_qualifier = CREDENTIAL_KEY_QUALIFIERS.contains(&lower);
     });
-    sensitive || last_was_assertion
+    sensitive
 }
 
 /// `api` + `key` / concatenated `apikey` credential spellings.
