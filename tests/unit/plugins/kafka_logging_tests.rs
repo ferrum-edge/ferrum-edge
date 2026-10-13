@@ -2100,6 +2100,9 @@ fn native_producer_keys_are_refused_for_every_token_by_default() {
     // librdkafka matches names exactly; the refusal must not depend on case.
     keys.push("Plugin.Library.Paths".to_string());
     keys.push("SASL.KERBEROS.KINIT.CMD".to_string());
+    // librdkafka strips a `topic.` prefix from global-level topic properties.
+    keys.push("topic.offset.store.path".to_string());
+    keys.push("Topic.plugin.library.paths".to_string());
     for key in keys {
         let error = kafka_logging_validate_producer_admission_for_test(
             &native_key_config(&key),

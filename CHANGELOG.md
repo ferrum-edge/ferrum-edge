@@ -55,8 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a producer until the key is removed or the node opts in.
   - The list lives in the central plugin material registry
     (`src/admin/crud/scoped_references.rs`) beside the tenant-safe list, so
-    namespace-claimed `operator` tokens stay refused these keys even on an
-    opted-in node.
+    namespace-claimed `operator` tokens still cannot introduce or change
+    these keys on an opted-in node (a value already stored at the same path
+    is left alone, as for every registry-classified field).
 - **Tenant DestinationRule TLS files stay confined after admission** (PR
   #6316).
   - A file that a non-root-namespace DestinationRule names under

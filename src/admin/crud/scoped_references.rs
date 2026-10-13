@@ -375,9 +375,16 @@ pub(crate) fn plugin_scoped_fields(plugin: &str) -> Option<&'static PluginScoped
 /// do, or `None` when `key` is not a registered native key (issue #6539).
 ///
 /// The plugin's admission refuses such a key for every token unless its
-/// operator opt-in is set. A namespace-bounded operator is refused regardless,
-/// because no native key is tenant-safe.
+/// operator opt-in is set. A namespace-bounded operator cannot introduce or
+/// change one even then, because no native key is tenant-safe.
 pub(crate) fn open_map_native_key(plugin: &str, map_path: &str, key: &str) -> Option<&'static str> {
+    // librdkafka also accepts a topic property at the global level under a
+    // `topic.` prefix, which it strips (`rd_kafka_conf_set`). Match both
+    // spellings so the prefix cannot bypass the gate.
+    let key = match key.get(..6) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("topic.") => &key[6..],
+        _ => key,
+    };
     plugin_scoped_fields(plugin)?
         .open_maps
         .iter()
