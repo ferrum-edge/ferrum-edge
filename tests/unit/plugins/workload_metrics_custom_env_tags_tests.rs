@@ -193,6 +193,10 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "ASSERTION_VALUE",
         "PRIVATEKEY",
         "ENCRYPTIONKEY",
+        "HSMPIN",
+        "TOTPSEED",
+        "PRIVATE_RSA_KEY",
+        "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
     ];
 
     for env_var in cases {
@@ -311,6 +315,10 @@ fn custom_header_tags_reject_credential_class_header_names() {
         "x-privatekey",
         "x-client-assertion",
         "x-hsm-pin",
+        // Header names are normalized to lowercase before classification.
+        "x-hsmPin",
+        "x-totpSeed",
+        "x-private-rsa-key",
     ] {
         let error = workload_metrics_new_with_env_lookup_for_test(
             &json!({
@@ -325,4 +333,17 @@ fn custom_header_tags_reject_credential_class_header_names() {
             "expected sensitive-header rejection for {header}, got {error}"
         );
     }
+}
+
+#[test]
+fn credential_class_tag_destinations_are_rejected_separately_from_sources() {
+    let error = workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_env_tags": {"session_id": "ISTIO_META_ZONE"}
+        }),
+        |_| Err(std::env::VarError::NotPresent),
+    )
+    .err()
+    .expect("a credential-class tag name must be refused");
+    assert!(error.contains("reserved or sensitive"), "{error}");
 }

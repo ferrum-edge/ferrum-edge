@@ -332,16 +332,21 @@ credential-class word (`session`, `sessions`, `sess`, `sessid`, `sessionid`,
 `sid`, `jwt`, `jws`, `jwe`, `passwd`, `pwd`, `passphrase`, `passcode`, `pin`,
 `otp`, `totp`, `hotp`, `credential(s)`, `cred(s)`, `signature(s)`, `sig`,
 `csrf`, `xsrf`). It is also credential-shaped when a segment contains a
-credential stem (`usersession`, `dbpassword`, `gpgpassphrase`, `idjwt`,
-`requestsignature`, `assertion`, `clientassertion`) or ends in `token` after
-a qualifier (`accesstoken`). Key material counts in two forms: a `key`
-segment after a key-material qualifier (`private`, `access`, `secret`,
-`signing`, `session`, `client`, `master`, `encryption`, `decryption`, `ssh`,
-`pgp`, `gpg`, `hmac`, `jwt`), or a segment that joins such a qualifier
-directly to `key` (`privatekey`, `x-clientkey`, `awsaccesskeyid`). The only
-exemption is the documented outcome signal
-`mesh_authz.ignored_baggage.assertion_out_of_scope`, which names a policy
-result rather than an assertion. Ordinary dimensions such as `cache_key`, `routing_key` and
+credential stem or a qualified compound (`usersession`, `dbpassword`,
+`dbpwd`, `gpgpassphrase`, `idjwt`, `requestsignature`, `assertion`,
+`clientassertion`, `totpseed`, `hsmpin`, `otpcode`, `mfasecret`), or ends in
+`token` after a qualifier (`accesstoken`). Key material counts when a
+key-material qualifier (`private`, `access`, `secret`, `signing`, `session`,
+`client`, `master`, `encryption`, `decryption`, `ssh`, `pgp`, `gpg`, `hmac`,
+`jwt`) reaches `key`/`keys`. Algorithm or encoding words such as `rsa`,
+`ec`, `ed25519`, `pem` or `pkcs8` may sit in between, either across segments
+(`private_key`, `private_rsa_key`, `privateRsaKey`) or inside one segment
+(`privatekey`, `x-clientkey`, `awsaccesskeyid`). Lowercase compounds are
+recognized as well as camelCase ones, so a name normalized before
+classification (an HTTP header name such as `x-hsmpin`) is still caught. The
+only exemption is the complete documented outcome key
+`mesh_authz.ignored_baggage.assertion_out_of_scope`. Any other key, including
+one that merely ends the same way, is classified normally. Ordinary dimensions such as `cache_key`, `routing_key` and
 `ai_total_tokens` stay visible. Values under such keys are redacted on every
 sink, `mesh.*` trace attributes with such names are not exported, and the
 transaction debugger redacts captured body fields with such names. Schema `static_fields`, `derived_fields` names, and `rename` targets

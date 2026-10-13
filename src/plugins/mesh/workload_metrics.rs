@@ -2922,7 +2922,7 @@ mod tests {
         ] {
             let sensitive = WorkloadMetrics::new_with_env_lookup_for_test(
                 &json!({
-                    "custom_env_tags": {"credential": env_var}
+                    "custom_env_tags": {"dimension": env_var}
                 }),
                 |_| Err(std::env::VarError::NotPresent),
             );

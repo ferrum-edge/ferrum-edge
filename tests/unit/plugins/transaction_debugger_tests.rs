@@ -2282,3 +2282,56 @@ fn test_camel_case_credential_class_body_fields_are_redacted() {
     assert!(!form.rendered.contains("482913"), "{}", form.rendered);
     assert!(form.rendered.contains("note=fine"), "{}", form.rendered);
 }
+
+/// Issue #6619: credential-class header names are redacted in the request and
+/// response trace records, not only names on the exact built-in list.
+#[tokio::test(flavor = "current_thread")]
+async fn test_transaction_debugger_redacts_credential_class_headers_in_both_directions() {
+    let (writer, _guard) = capture_debug_logs();
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "x-session-id".to_string(),
+        "request-session-519".to_string(),
+    );
+    ctx.headers
+        .insert("x-csrf".to_string(), "request-csrf-519".to_string());
+    ctx.headers.insert(
+        "x-safe-header".to_string(),
+        "safe-request-value".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let mut response_headers = HashMap::from([
+        ("x-private-key".to_string(), "response-key-519".to_string()),
+        (
+            "x-session-id".to_string(),
+            "response-session-519".to_string(),
+        ),
+        (
+            "x-safe-response".to_string(),
+            "safe-response-value".to_string(),
+        ),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let logs = writer.contents();
+    for secret in [
+        "request-session-519",
+        "request-csrf-519",
+        "response-key-519",
+        "response-session-519",
+    ] {
+        assert!(!logs.contains(secret), "debugger leaked {secret}: {logs}");
+    }
+    assert!(logs.contains("safe-request-value"), "{logs}");
+    assert!(logs.contains("safe-response-value"), "{logs}");
+}

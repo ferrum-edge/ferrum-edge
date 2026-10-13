@@ -287,25 +287,46 @@ const CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
 ];
 
 /// Credential stems that stay credential-shaped anywhere inside a segment
-/// (`usersession`, `dbpassword`, `gpgpassphrase`, `idjwt`,
-/// `requestsignature`, `clientassertion`).
+/// (`usersession`, `dbpassword`, `gpgpassphrase`, `idjwt`, `dbpwd`,
+/// `requestsignature`, `clientassertion`, `totpseed`), plus qualified
+/// compounds whose bare parts are too common to match alone (`hsmpin`,
+/// `otpseed`, `mfacode`).
 const CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "session",
     "sessid",
     "passw",
     "passphrase",
     "passcode",
+    "pwd",
     "credential",
     "jwt",
     "signature",
     "assertion",
+    "totp",
+    "hotp",
+    "otpseed",
+    "otpsecret",
+    "otpcode",
+    "otpkey",
+    "mfacode",
+    "mfasecret",
+    "mfaseed",
+    "pincode",
+    "pinblock",
+    "hsmpin",
+    "simpin",
+    "cardpin",
+    "userpin",
+    "adminpin",
+    "devicepin",
+    "sopin",
 ];
 
 /// Key-material qualifiers. A `key` / `keys` segment after one of these
-/// (`private_key`, `access-key`, `signingKey`), or a segment containing one
-/// concatenated with `key` (`privatekey`, `x-clientkey`, `awsaccesskeyid`),
-/// is a credential. A bare `key` stays visible so `cache_key` and
-/// `routing_key` remain observable.
+/// (`private_key`, `access-key`, `signingKey`), or a segment joining one to
+/// `key` (`privatekey`, `x-clientkey`, `awsaccesskeyid`), is a credential.
+/// A bare `key` stays visible so `cache_key` and `routing_key` remain
+/// observable.
 const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "private",
     "access",
@@ -323,37 +344,58 @@ const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "jwt",
 ];
 
+/// Algorithm / encoding words that may sit between a key-material qualifier
+/// and `key` without ending the key-material context (`private_rsa_key`,
+/// `privateRsaPemKey`, `signing-ed25519-key`).
+const KEY_MATERIAL_INTERVENING_WORDS: &[&str] = &[
+    "rsa", "ec", "ecdsa", "ecc", "dsa", "ed25519", "ed448", "x25519", "aes", "des", "pem", "der",
+    "pkcs1", "pkcs8", "pkcs12", "p12", "pfx", "jwk", "x509", "tls", "ssl", "raw", "b64", "base64",
+    "hex",
+];
+
 /// Complete metadata keys that name a policy OUTCOME about an assertion, not
-/// the assertion itself. Matched case-insensitively as a key suffix.
+/// the assertion itself, compared case-insensitively against the WHOLE key.
 /// `mesh_authz.ignored_baggage.assertion_out_of_scope` is a documented
 /// transaction-log signal.
-const NON_SECRET_ASSERTION_SIGNAL_SUFFIXES: &[&str] = &["assertion_out_of_scope"];
+const NON_SECRET_ASSERTION_SIGNAL_KEYS: &[&str] =
+    &["mesh_authz.ignored_baggage.assertion_out_of_scope"];
 
 /// Longest segment lowercased on the stack; longer segments (rare) allocate.
 const CLASSIFIER_STACK_SEGMENT_BYTES: usize = 64;
 
-fn ends_with_ascii_case_insensitive(haystack: &str, suffix: &str) -> bool {
-    haystack.len() >= suffix.len()
-        && haystack.as_bytes()[haystack.len() - suffix.len()..]
-            .eq_ignore_ascii_case(suffix.as_bytes())
+/// Whether `rest` (what follows a qualifier inside one segment) reaches `key`
+/// after skipping algorithm / encoding words (`rsakey`, `rsapemkey`, `key`).
+fn reaches_key_after_intervening_words(mut rest: &str) -> bool {
+    loop {
+        if rest.starts_with("key") {
+            return true;
+        }
+        let Some(word) = KEY_MATERIAL_INTERVENING_WORDS
+            .iter()
+            .find(|word| rest.starts_with(**word))
+        else {
+            return false;
+        };
+        rest = &rest[word.len()..];
+    }
 }
 
-/// Judge one lowercased segment given whether the previous segment was a
-/// key-material qualifier.
-fn lowered_segment_is_credential(lower: &str, previous_is_key_qualifier: bool) -> bool {
+/// Judge one lowercased segment given whether the preceding segments left a
+/// key-material context open.
+fn lowered_segment_is_credential(lower: &str, in_key_context: bool) -> bool {
     if CREDENTIAL_CLASS_SEGMENTS.contains(&lower)
         || (lower.len() > "token".len() && lower.ends_with("token"))
         || CREDENTIAL_CLASS_STEMS
             .iter()
             .any(|stem| lower.contains(stem))
-        || (matches!(lower, "key" | "keys") && previous_is_key_qualifier)
+        || (in_key_context && reaches_key_after_intervening_words(lower))
     {
         return true;
     }
     CREDENTIAL_KEY_QUALIFIERS.iter().any(|qualifier| {
-        lower
-            .match_indices(qualifier)
-            .any(|(offset, _)| lower[offset + qualifier.len()..].starts_with("key"))
+        lower.match_indices(qualifier).any(|(offset, _)| {
+            reaches_key_after_intervening_words(&lower[offset + qualifier.len()..])
+        })
     })
 }
 
@@ -365,28 +407,32 @@ fn lowered_segment_is_credential(lower: &str, previous_is_key_qualifier: bool) -
 ///
 /// * a segment is a credential-class word (`session`, `sid`, `jwt`, `pwd`,
 ///   `passphrase`, `pin`, `otp`, `credential`, `signature`, `csrf`, …);
-/// * a segment contains a credential stem (`usersession`, `gpgpassphrase`,
-///   `clientassertion`, `assertion_value`'s `assertion`), or ends in `token`
-///   after a qualifier (`accesstoken`, `csrftoken`); plural `tokens` stays
-///   visible for usage counts;
-/// * a `key` / `keys` segment follows a key-material qualifier (`private`,
-///   `access`, `signing`, `client`, …), or a segment concatenates a qualifier
-///   with `key` (`privatekey`, `x-clientkey`, `awsaccesskeyid`).
+/// * a segment contains a credential stem or qualified compound
+///   (`usersession`, `gpgpassphrase`, `clientassertion`, `hsmpin`,
+///   `totpseed`), or ends in `token` after a qualifier (`accesstoken`);
+///   plural `tokens` stays visible for usage counts;
+/// * key material: a key-material qualifier (`private`, `access`, `signing`,
+///   `client`, …) reaches `key` / `keys`, optionally through algorithm or
+///   encoding words (`rsa`, `pem`, `ed25519`, …), within one segment
+///   (`privatekey`, `awsaccesskeyid`) or across segments (`private_key`,
+///   `private_rsa_key`, `privateRsaKey`).
 ///
-/// The only exemption is an explicitly listed non-secret outcome signal
-/// ([`NON_SECRET_ASSERTION_SIGNAL_SUFFIXES`]). The rule is deliberately
-/// narrower than outbound header stripping: ordinary dimensions such as
-/// `cache_key`, `routing_key`, `request_id`, and `ai_total_tokens` stay
-/// visible. Allocation-free for segments up to 64 bytes.
+/// Lowercased compounds are recognized as well as camelCase ones, so a name
+/// normalized before classification (an HTTP header name) cannot slip past.
+/// The only exemption is an explicitly listed complete non-secret outcome key
+/// ([`NON_SECRET_ASSERTION_SIGNAL_KEYS`]). The rule is deliberately narrower
+/// than outbound header stripping: ordinary dimensions such as `cache_key`,
+/// `routing_key`, `request_id`, and `ai_total_tokens` stay visible.
+/// Allocation-free for segments up to 64 bytes.
 pub fn is_credential_class_metadata_key(key: &str) -> bool {
-    if NON_SECRET_ASSERTION_SIGNAL_SUFFIXES
+    if NON_SECRET_ASSERTION_SIGNAL_KEYS
         .iter()
-        .any(|suffix| ends_with_ascii_case_insensitive(key, suffix))
+        .any(|exempt| key.eq_ignore_ascii_case(exempt))
     {
         return false;
     }
     let mut sensitive = false;
-    let mut previous_is_key_qualifier = false;
+    let mut in_key_context = false;
     for_each_metadata_key_segment(key, |segment| {
         if sensitive {
             return;
@@ -407,8 +453,11 @@ pub fn is_credential_class_metadata_key(key: &str) -> bool {
             heap = segment.to_ascii_lowercase();
             heap.as_str()
         };
-        sensitive = lowered_segment_is_credential(lower, previous_is_key_qualifier);
-        previous_is_key_qualifier = CREDENTIAL_KEY_QUALIFIERS.contains(&lower);
+        sensitive = lowered_segment_is_credential(lower, in_key_context);
+        // A qualifier opens the key-material context; algorithm / encoding
+        // words keep it open; anything else closes it.
+        in_key_context = CREDENTIAL_KEY_QUALIFIERS.contains(&lower)
+            || (in_key_context && KEY_MATERIAL_INTERVENING_WORDS.contains(&lower));
     });
     sensitive
 }

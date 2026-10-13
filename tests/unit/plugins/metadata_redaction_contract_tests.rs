@@ -587,6 +587,17 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "assertion_value",
     "assertion_xml",
     "ASSERTION_VALUE",
+    "private_rsa_key",
+    "privateRsaKey",
+    "x-private-rsa-key",
+    "signing-ed25519-key",
+    "hsmpin",
+    "x-hsmpin",
+    "totpseed",
+    "dbpwd",
+    // The outcome-signal exemption covers only its complete key.
+    "session_id.assertion_out_of_scope",
+    "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
 ];
 
 /// Ordinary dimensions that share a word or stem with a credential class.
@@ -646,7 +657,12 @@ fn credential_classes_redact_unlisted_spellings_and_keep_ordinary_dimensions() {
 
 #[test]
 fn credential_class_names_are_rejected_as_log_schema_field_names() {
-    for name in ["session_id", "client_assertion", "gpg_passphrase"] {
+    for name in [
+        "session_id",
+        "client_assertion",
+        "gpg_passphrase",
+        "session_id.assertion_out_of_scope",
+    ] {
         let compiled = SummarySchema::compile(
             &json!({
                 "summary_type": "http",

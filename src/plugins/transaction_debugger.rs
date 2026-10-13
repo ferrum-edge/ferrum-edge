@@ -561,6 +561,10 @@ impl TransactionDebugger {
                 .iter()
                 .any(|h| header_name.eq_ignore_ascii_case(h))
             || ctx.request_header_requires_redaction(header_name)
+            // The shared metadata decision (issue #6619): credential-class
+            // names such as `x-session-id`, `x-csrf` or `x-private-key` are
+            // redacted in request and response trace records too.
+            || is_sensitive_metadata_key(header_name)
     }
 
     /// Create a redacted copy of headers for safe logging.
