@@ -1389,6 +1389,23 @@ probe_vs_cors() {
   out="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/client -c curl -- \
     sh -c '
       host="$1"; good="$2"; evil="$3"; marker="$4"
+      tab="$(printf "\t")"
+      acao_exact() {
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="$(printf "%s" "$line" | tr -d "\r")"
+          case "$line" in
+            *:*)
+              name="${line%%:*}"
+              value="${line#*:}"
+              while :; do case "$value" in " "*) value="${value#?}";; "$tab"*) value="${value#?}";; *) break;; esac; done
+              while :; do case "$value" in *" ") value="${value%?}";; *"$tab") value="${value%?}";; *) break;; esac; done
+              lname="$(printf "%s" "$name" | tr "[:upper:]" "[:lower:]")"
+              if [ "$lname" = "access-control-allow-origin" ] && [ "$value" = "$2" ]; then return 0; fi
+              ;;
+          esac
+        done < "$1"
+        return 1
+      }
       a_status=000
       a_acao=no
       a_body=""
@@ -1400,7 +1417,7 @@ probe_vs_cors() {
         [ -n "$a_status" ] || a_status=000
         a_body="$(tr -d "\r\n" </tmp/b 2>/dev/null || true)"
         if [ "$a_status" = "200" ] \
-          && grep -qi "^access-control-allow-origin: $good" /tmp/h \
+          && acao_exact /tmp/h "$good" \
           && printf "%s" "$a_body" | grep -q "$marker"; then
           a_acao=yes
           break

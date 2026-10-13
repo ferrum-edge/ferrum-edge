@@ -58,8 +58,16 @@ enough to be worth compressing.
 With `request_family: auto` (the default), the parsed shape must agree with a
 standard operation path ending in `/chat/completions` or `/completions`.
 Image-generation paths, arbitrary JSON carrying a `prompt`, provider-native
-markers, mixed `messages`+`prompt` bodies, malformed content parts, and other
-ambiguous shapes pass through unchanged. A fixed request family is the explicit
+markers, mixed `messages`+`prompt` bodies, malformed JSON, and other shapes
+rejected by coarse family classification pass through unchanged. That
+unchanged promise does not extend to every malformed inner field: coarse
+classification accepts a `messages` array before `role`/`content` validation,
+so valid JSON with an admitted coarse shape but malformed inner `role` or
+`content` fields (for example a non-string `role`) skips statistical
+compression yet, when `preserve_tag` is configured, still goes through the
+marker-only fallback that strips configured markers from JSON string values.
+Without a configured `preserve_tag`, that fallback is a no-op and the body
+passes through unchanged. A fixed request family is the explicit
 opt-in for a compatible custom endpoint path; shape validation still applies.
 For example, `request_family: chat_completions` admits a compatible `/custom`
 endpoint whose body would pass through unchanged under `auto`.
@@ -238,7 +246,11 @@ transforms cannot write request metadata and therefore emit no counters.
 - **Only admitted request families are touched.** `auto` requires a standard
   Chat/Text Completions path and matching shape. Fixed-family mode is an
   operator assertion for custom compatible endpoints; unsupported, ambiguous,
-  or malformed shapes still pass through unchanged.
+  or malformed shapes rejected by coarse classification still pass through
+  unchanged. Valid JSON admitted at the coarse level but with malformed inner
+  `role`/`content` fields skips statistical compression; with `preserve_tag`
+  configured it can still receive marker-only string-value cleanup (see
+  above), and without one it passes through unchanged.
 - **Encoded bytes are never parsed as JSON.** A non-`identity`
   `Content-Encoding` stays untouched unless an earlier configured decompression
   transform produces plaintext on the standard wire path.

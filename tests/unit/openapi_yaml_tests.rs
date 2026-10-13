@@ -17933,7 +17933,7 @@ fn mesh_authz_public_guide_documents_its_configuration_contract() {
         "FailClosed",
         "implicit-deny",
         "**Strict configuration admission.**",
-        "**Trusted identity is required.**",
+        "**Trusted identity is required for identity-constrained rules.**",
     ] {
         assert!(
             section.contains(contract),
