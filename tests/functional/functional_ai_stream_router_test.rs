@@ -13,21 +13,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 fn start_gateway(
     config_path: &str,
     proxy_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> std::process::Child {
-    let mut cmd = std::process::Command::new(gateway_binary_path());
+    let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

@@ -305,8 +305,9 @@ their upstream licenses (MIT, Apache-2.0, and similar permissive terms for the
 current patches) must fall within the allowlist or carry an explicit exception.
 
 Every `[licenses.exceptions]` entry must document an **owner**, a **rationale**,
-and an `[expires:YYYY-MM-DD]` token, and this is **enforced**:
-`scripts/check_advisory_expiry.sh` walks the `exceptions` array in
+and an `[expires:YYYY-MM-DD]` token. The owner and rationale are a review
+requirement; the automated checker enforces only the expiry token and its
+date: `scripts/check_advisory_expiry.sh` walks the `exceptions` array in
 `deny.toml` and fails on a missing token or a passed date, on the per-PR
 `dependency-audit` job in `.github/workflows/ci.yml` **and** on the weekly
 `.github/workflows/dependency-audit.yml`, so a license exception cannot become
@@ -636,9 +637,12 @@ To refresh a base:
 
 `tests/unit/gateway_core/container_base_pinning_tests.rs` enforces digest pins
 and rejects an unpinned floating Rust channel (`latest`, `stable`, `nightly`,
-`beta`) on those Dockerfiles. It reads each line the way the Dockerfile parser
-does, so a note appended after an instruction is a failure rather than a
-silently accepted comment.
+`beta`) on those Dockerfiles. A pin is a reference ending in
+`@sha256:<64 lowercase hex>`. Both pin gates read only the complete shapes
+`FROM [--flag ...] <image> [AS <alias>]` and `ARG <NAME>[=<value>]`. Any other
+`FROM` or `ARG` instruction in a governed Dockerfile, including one with a note
+appended after it, fails as an unsupported instruction instead of being read by
+its first token or skipped.
 
 ### Container build inputs (enforcement and refresh)
 
@@ -661,8 +665,9 @@ Two independent gates enforce it, because each covers a hole the other leaves:
   reference from all five Dockerfiles, requires a digest on each, and separately
   rejects a bare `:latest`. It needs no Rust build, so it fails fast, and it
   binds an `ARG` image default even when no `FROM` consumes it. Its `--self-test`
-  cases cover the pinned, unpinned-`FROM`, unpinned-`ARG`, stage-alias, and
-  `scratch` shapes.
+  cases cover the pinned, unpinned-`FROM`, unpinned-`ARG`, stage-alias,
+  `scratch`, and trailing-text (`FROM` tail, image and version `ARG` tail,
+  extra `FROM` token) shapes.
 - `tests/unit/gateway_core/container_base_pinning_tests.rs`, which additionally
   rejects an unpinned floating Rust channel on the builder image.
 
@@ -683,6 +688,19 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   one, never changes an image or tag. Required CI (multi-arch build, FIPS, eBPF,
   GNU ABI scan, chart smoke) and `Trusted Cross Build Policy` must qualify the
   latest reviewed PR head before merge.
+  It never rewrites the `gcr.io/distroless/cc-debian13` runtime base. That
+  digest is also pinned by the `main-linux-image` job in
+  `.github/workflows/ci.yml`, which `verify_cross_build_policy.py` freezes by
+  whole-job SHA-256 (`WORKFLOW_CONTRACTS`), and
+  `check_distroless_digest_consistency()` requires every distroless reference
+  in the repository to match `Dockerfile`. A pull request can neither move that
+  frozen pin nor leave it stale, so on distroless drift the workflow lists every tracked
+  file that pins the old digest in a warning, the step summary, and the refresh
+  PR body (when other inputs changed), still proposes the other refreshed
+  inputs, and then fails. A maintainer rotates the distroless digest in every
+  listed file, including the `main-linux-image` job and its `WORKFLOW_CONTRACTS`
+  digest, in one reviewed direct-to-`main` commit. `verify_ci_runtime_cache.py`
+  fails if the workflow stops holding distroless drift.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
   default `BASE_IMAGE` matches the same source runtime pin; an

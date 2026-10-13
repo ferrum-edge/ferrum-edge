@@ -417,15 +417,6 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-/// Find the gateway binary path.
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Mint a per-spawn-attempt observability credential.
 ///
 /// Nothing here is a real secret — it exists only so two gateways started by two
@@ -463,7 +454,7 @@ fn start_gateway_with_extra_env(
     let stderr_path =
         std::path::Path::new(config_path).with_extension(format!("gateway-{http_port}.stderr.log"));
     let stderr_file = std::fs::File::create(&stderr_path)?;
-    let mut cmd = std::process::Command::new(gateway_binary_path());
+    let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

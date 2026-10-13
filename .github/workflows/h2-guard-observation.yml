@@ -55,9 +55,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: h2-guard-observation-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  # Only superseded PR runs are cancelled. Main pushes and manual campaigns
-  # run to completion (see docs/ci_cd.md "Main-push concurrency").
+  group: h2-guard-observation-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && format('run-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
+  # Only superseded PR runs are cancelled. Manual dispatches get a unique
+  # per-run group so a queued campaign cannot be replaced by a later dispatch
+  # on the same ref; main pushes keep the ref group and its intentional
+  # coalescing (see docs/ci_cd.md "Main-push concurrency").
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

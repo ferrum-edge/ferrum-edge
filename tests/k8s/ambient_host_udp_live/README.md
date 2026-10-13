@@ -8,7 +8,9 @@ placement (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` →
 
 - Two independent workload netns / veth pairs
 - IPv4 and IPv6 TPROXY delivery with original-destination recovery
-- Kernel ingress-ifindex attribution and identical-tuple isolation by interface
+- Kernel ingress-ifindex attribution, including same-source-port /
+  same-destination probes from distinct workload IPs kept distinct by
+  ingress interface
 - Transparent replies sourced from the captured destination
 - Restart / reinstall and exact Ferrum-owned cleanup (table `33135`, priority
   `101`, chains `FERRUM_MESH_UDP_HOST` / `_GUARD_A` / `_GUARD_B`)

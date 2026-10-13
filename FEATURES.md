@@ -514,4 +514,4 @@ Every backend fetch is wrapped in the same per-fetch timeout envelope — the cl
 - Single binary, mode selected via environment variable
 - Docker multi-stage build with a distroless (`gcr.io/distroless/cc`) nonroot runtime image
 - Docker Compose setups for SQLite (default), PostgreSQL, MongoDB, and CP/DP topologies
-- CI pipeline: unit, integration, and functional tests plus lint on every PR; performance regression suites on a schedule
+- CI pipeline: validation selected by the PR diff (unit, integration, and functional tests plus lint in the selected Rust lane; light CI for ordinary documentation-only PRs), with the full checks on every push to `main`; performance regression suites on a schedule

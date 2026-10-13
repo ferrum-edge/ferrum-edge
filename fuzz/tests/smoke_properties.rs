@@ -16,7 +16,10 @@ proptest! {
     #[test]
     fn traceparent_round_trip_never_panics(input in prop::string::string_regex(".{0,256}").unwrap()) {
         let _ = ferrum_edge::fuzz_support::parse_traceparent_header(&input);
-        let _ = traceparent_round_trip_invariant(&input);
+        prop_assert!(
+            traceparent_round_trip_invariant(&input),
+            "accepted traceparent must round-trip"
+        );
     }
 
     #[test]

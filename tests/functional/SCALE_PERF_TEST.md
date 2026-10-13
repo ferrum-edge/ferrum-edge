@@ -87,8 +87,8 @@ apply cursor, proves the new routes are live, and measures 10 s more. Three kind
 
 | Kind | Change | Reload path |
 |---|---|---|
-| `full` | 3,000 proxies with new consumers (12,000 resources) | Incremental since issue #6058: the poller pages through the change log up to 100,000 rows (it was a full rebuild past the old 10,000-row limit) |
-| `small+consumers` | 100 proxies with new `key_auth` consumers (400 resources) | Incremental: consumer changes escalate to a full reload only while load-time quarantine is active or a changed consumer carries `hmac_auth` (issue #6060) |
+| `full` | 3,000 proxies with new consumers (12,000 resources) | Incremental since issue #6058: the poller pages the change log 10,000 rows at a time (`CHANGE_LOG_PAGE_ROWS`) under a separate 100,000-row total cap (`CHANGE_LOG_MAX_ROWS`); a backlog reaching that cap (`changes.len() >= max_rows`) falls back to an authoritative full reload (it was a full rebuild past the old single-query 10,000-row limit) |
+| `small+consumers` | 100 proxies with new `key_auth` consumers (400 resources) | Incremental: consumer changes escalate to a full reload unless the namespace has successfully recorded clean state (a successful authoritative full load that quarantined nothing; unknown or poisoned state also escalates), and a changed consumer carrying `hmac_auth` is a separate escalation condition (issue #6060) |
 | `small-proxies` | 100 proxies whose plugins admit existing consumers (300 resources) | Incremental |
 
 The two small changes run after the initial wave and after every full wave.

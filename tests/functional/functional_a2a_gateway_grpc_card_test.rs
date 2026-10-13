@@ -368,14 +368,6 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Upper bound on the child output surfaced in a failure message.
 ///
 /// The child runs at `ferrum_edge=debug`, so its log can be large; only the
@@ -506,7 +498,7 @@ fn start_gateway(
     let http_port = gateway.port;
     let admin_port = admin.port;
     let (stdout, stderr) = logs.stdio()?;
-    let mut command = std::process::Command::new(gateway_binary_path());
+    let mut command = std::process::Command::new(crate::common::gateway_binary_path());
     command.arg("run");
     command
         .env("FERRUM_MODE", "file")
@@ -657,7 +649,7 @@ async fn start_gateway_with_retry(
         let (mut child, gateway_port, admin_port) = match started {
             Ok(started) => started,
             Err(error) => {
-                let binary = gateway_binary_path();
+                let binary = crate::common::gateway_binary_path().display().to_string();
                 panic!(
                     "Gateway spawn failed deterministically on attempt \
                      {attempt}/{MAX_ATTEMPTS} ({binary}): {error}"

@@ -91,9 +91,9 @@ pub use gateway_harness::{
     DbType, GatewayChildGuard, GatewayMode, GatewaySpawnFailure, HARNESS_GATEWAY_RUST_LOG_OPT_IN,
     SpawnedGatewayIdentity, TestGateway, TestGatewayBuilder,
     captured_output_reports_listener_addr_in_use, configure_coverage_gateway_command,
-    ensure_gateway_built, ephemeral_port, explicit_test_binary, pin_gateway_command_rust_log,
-    probe_gateway_identity, scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
-    wait_for_owned_gateway_identity,
+    ensure_gateway_built, ephemeral_port, explicit_test_binary, gateway_binary_path, locate_binary,
+    pin_gateway_command_rust_log, probe_gateway_identity, scrub_gateway_capture_for_diagnostics,
+    shutdown_gateway_child, wait_for_owned_gateway_identity,
 };
 pub use hmac_helpers::{
     HmacV2Request, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,

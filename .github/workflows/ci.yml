@@ -585,7 +585,7 @@ jobs:
           else
             /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test $UNIT_PRECOMPILE_TARGETS --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
           fi
-          kill "$unit_sampler_pid"
+          kill "$unit_sampler_pid" 2>/dev/null || true
           wait "$unit_sampler_pid"
           trap - EXIT
           cp target/cargo-timings/cargo-timing.html "$RUNNER_TEMP/unit-ci/default-build.cargo-timing.html"
@@ -813,7 +813,7 @@ jobs:
           else
             /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
           fi
-          kill "$unit_sampler_pid"
+          kill "$unit_sampler_pid" 2>/dev/null || true
           wait "$unit_sampler_pid"
           trap - EXIT
           cp target/cargo-timings/cargo-timing.html "$RUNNER_TEMP/unit-ci/acme-build.cargo-timing.html"

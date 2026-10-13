@@ -129,14 +129,6 @@ async fn start_raw_ws_first_frame_backend(
     })
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 fn write_ws_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
@@ -259,7 +251,7 @@ async fn start_gateway_with_retry(
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
-        let mut cmd = std::process::Command::new(gateway_binary_path());
+        let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path)

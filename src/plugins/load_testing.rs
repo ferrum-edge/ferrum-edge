@@ -29,10 +29,12 @@
 //! When `gateway_addresses` is configured, the originating controller fans out
 //! once with `X-Loadtesting-Fanout: 1`. Peer nodes that accept a fan-out
 //! trigger start a local cohort only — they never re-fanout — and terminate
-//! the control request with `204` before backend dispatch. Fan-out stays
-//! fire-and-forget for the application request, but any other parsed HTTP
-//! outcome (a rejection status, or an unfollowed redirect) means no remote
-//! cohort started and is reported with a bounded, sanitized warning.
+//! the control request with `204` before backend dispatch. A receiver that
+//! refuses the trigger because a process-wide resource budget is exhausted
+//! answers `503` instead, still before backend dispatch. Fan-out stays
+//! fire-and-forget for the application request, but any parsed HTTP outcome
+//! other than `204` (a rejection status, or an unfollowed redirect) means no
+//! remote cohort started and is reported with a bounded, sanitized warning.
 //!
 //! ## HTTPS loopback
 //!
@@ -121,6 +123,10 @@ const FANOUT_MARKER: &str = "1";
 /// The only response a peer returns when it admits a fan-out trigger. Every
 /// other parsed HTTP outcome means no remote cohort started.
 const FANOUT_ACK_STATUS: u16 = 204;
+/// The terminal response a peer returns when it refuses a fan-out trigger
+/// because the process-wide active-client or retained-body budget is
+/// exhausted. No cohort started, so this must never be the `204` ack.
+const FANOUT_RESOURCE_REFUSAL_STATUS: u16 = 503;
 const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 
 static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
@@ -650,6 +656,23 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
             .unwrap_or(false)
     }
 
+    /// Record a terminal `Failed` run for a trigger refused by a process-wide
+    /// resource budget. A fan-out control request still terminates before
+    /// backend dispatch, but with a refusal status the sender reports instead
+    /// of the `204` admission acknowledgment; the initiating application
+    /// request keeps flowing.
+    fn refuse_for_resource_budget(&self, is_fanout: bool) -> PluginResult {
+        self.state.end_run(RunResult {
+            outcome: RunOutcome::Failed,
+            ..RunResult::default()
+        });
+        if is_fanout {
+            fanout_resource_refusal_result()
+        } else {
+            PluginResult::Continue
+        }
+    }
+
     fn is_fanout_control_request(headers: &HashMap<String, String>) -> bool {
         headers
             .get(HEADER_FANOUT)
@@ -984,15 +1007,7 @@ impl Plugin for LoadTesting {
                 requested = self.concurrent_clients,
                 "load_testing: process-wide active client budget exhausted; ignoring trigger"
             );
-            self.state.end_run(RunResult {
-                outcome: RunOutcome::Failed,
-                ..RunResult::default()
-            });
-            return if is_fanout {
-                fanout_ack_result()
-            } else {
-                PluginResult::Continue
-            };
+            return self.refuse_for_resource_budget(is_fanout);
         }
         let client_budget = ProcessClientBudget::new(u64::from(self.concurrent_clients));
         let Some(request_body) = RetainedRequestBody::try_new(ctx.request_body_bytes.clone())
@@ -1001,15 +1016,7 @@ impl Plugin for LoadTesting {
                 requested_bytes = ctx.request_body_bytes.as_ref().map_or(0, Bytes::len),
                 "load_testing: process-wide retained request-body budget exhausted; ignoring trigger"
             );
-            self.state.end_run(RunResult {
-                outcome: RunOutcome::Failed,
-                ..RunResult::default()
-            });
-            return if is_fanout {
-                fanout_ack_result()
-            } else {
-                PluginResult::Continue
-            };
+            return self.refuse_for_resource_budget(is_fanout);
         };
 
         let proxy_name = ctx
@@ -1102,7 +1109,8 @@ impl Plugin for LoadTesting {
                     }
                     // A parsed HTTP response is not an accepted trigger. Only
                     // `fanout_ack_result()`'s 204 means the peer admitted a
-                    // cohort; a 4xx/5xx refusal, an unfollowed redirect, or any
+                    // cohort; a 4xx/5xx refusal (including a peer's 503
+                    // resource-budget refusal), an unfollowed redirect, or any
                     // other status is a silent peer failure unless it is
                     // reported (issue #5158). Log the status alone — never the
                     // key, raw path/query, or response body — and keep the
@@ -1476,6 +1484,14 @@ impl Drop for ProcessClientBudget {
 fn fanout_ack_result() -> PluginResult {
     PluginResult::Reject {
         status_code: FANOUT_ACK_STATUS,
+        body: String::new(),
+        headers: HashMap::new(),
+    }
+}
+
+fn fanout_resource_refusal_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: FANOUT_RESOURCE_REFUSAL_STATUS,
         body: String::new(),
         headers: HashMap::new(),
     }

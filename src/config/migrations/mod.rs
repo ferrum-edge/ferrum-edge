@@ -11,7 +11,9 @@ pub use mysql_collation_probe::{
     inspect_mysql_identity_collations, merge_stale_collation_findings,
     remediation_alter_statements, warn_stale_mysql_identity_collations,
 };
-pub use sql_statements::split_plugin_migration_statements;
+pub use sql_statements::{
+    split_plugin_migration_statements, statements_require_non_transactional_postgres,
+};
 
 use chrono::Utc;
 use sqlx::any::AnyRow;
@@ -1358,7 +1360,9 @@ impl MigrationRunner {
 
                 // Fail-closed: parse the full migration body into statement
                 // boundaries before executing statement one. Classification and
-                // execution share this exact split.
+                // execution share this exact split, and transaction-control
+                // statements that could end the runner-owned transaction (and
+                // the SQLite migration lock) before tracking are rejected here.
                 let statements =
                     split_plugin_migration_statements(sql, &self.db_type).map_err(|err| {
                         anyhow::anyhow!(
@@ -1370,10 +1374,7 @@ impl MigrationRunner {
                         )
                     })?;
                 let non_transactional =
-                    sql_statements::statements_require_non_transactional_postgres(
-                        &self.db_type,
-                        &statements,
-                    );
+                    statements_require_non_transactional_postgres(&self.db_type, &statements);
                 let now;
                 if non_transactional {
                     // PostgreSQL online DDL such as CREATE INDEX CONCURRENTLY
