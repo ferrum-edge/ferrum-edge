@@ -14166,13 +14166,43 @@ fn inject_mesh_request_auth_plugin(
         return;
     }
 
-    let mut providers = Vec::new();
+    // Several applicable RequestAuthentications are combined into one
+    // `jwks_auth` instance. Each resource is admitted within the per-token
+    // verification bound, but their union can exceed it. Identical providers
+    // are dropped first (verifying one twice is pointless). Any provider still
+    // past the bound is left out with a warning rather than failing plugin
+    // construction for the whole slice. Every rule pins an issuer, so a token
+    // for a left-out provider fails verification (401) instead of passing
+    // unauthenticated: the overflow fails closed for that issuer only.
+    let mut providers: Vec<serde_json::Value> = Vec::new();
+    let mut per_issuer: HashMap<String, usize> = HashMap::new();
+    let mut dropped = 0usize;
     for ra in &applicable {
         for rule in &ra.jwt_rules {
-            if let Some(provider) = build_jwks_provider_config(rule) {
-                providers.push(provider);
+            let Some(provider) = build_jwks_provider_config(rule) else {
+                continue;
+            };
+            if providers.contains(&provider) {
+                continue;
             }
+            let count = per_issuer.entry(rule.issuer.clone()).or_insert(0);
+            if *count >= crate::plugins::jwks_auth::MAX_JWKS_CANDIDATE_PROVIDERS
+                || providers.len() >= crate::plugins::jwks_auth::MAX_JWKS_PROVIDERS
+            {
+                dropped += 1;
+                continue;
+            }
+            *count += 1;
+            providers.push(provider);
         }
+    }
+    if dropped > 0 {
+        warn!(
+            dropped,
+            "mesh RequestAuthentication: applicable JWT rules exceed the jwks_auth per-token \
+             verification bound; extra rules were not installed and tokens for them are \
+             rejected"
+        );
     }
 
     if providers.is_empty() {
@@ -35840,6 +35870,79 @@ mod tests {
         assert_eq!(
             providers[0].get("issuer").and_then(|v| v.as_str()),
             Some("https://api-jwt.example.com")
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_union_stays_within_jwks_verification_bound() {
+        let runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let scope = || PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+        };
+        // Two resources, each within the bound, share one issuer: six rules
+        // each, with one rule identical across both.
+        let rules = |prefix: &str| -> Vec<MeshJwtRule> {
+            (0..6)
+                .map(|i| {
+                    let source = if i == 0 {
+                        "shared".to_string()
+                    } else {
+                        format!("{prefix}{i}")
+                    };
+                    MeshJwtRule {
+                        issuer: "https://idp.example.com".to_string(),
+                        audiences: vec!["test-app".to_string()],
+                        jwks_uri: Some(format!("https://idp.example.com/{source}/jwks")),
+                        jwks: None,
+                        from_headers: Vec::new(),
+                        from_params: Vec::new(),
+                        forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
+                    }
+                })
+                .collect()
+        };
+        let mut first = test_request_authentication("ra-a", scope());
+        first.jwt_rules = rules("a");
+        let mut second = test_request_authentication("ra-b", scope());
+        second.jwt_rules = rules("b");
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![first, second],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin injected");
+        let providers = jwks
+            .config
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+        // 12 rules, 1 duplicate, capped at the per-issuer bound.
+        assert_eq!(
+            providers.len(),
+            crate::plugins::jwks_auth::MAX_JWKS_CANDIDATE_PROVIDERS
+        );
+        assert!(
+            crate::plugins::jwks_auth::JwksAuth::new(
+                &jwks.config,
+                crate::plugins::PluginHttpClient::default()
+            )
+            .is_ok(),
+            "the injected config must construct"
         );
     }
 

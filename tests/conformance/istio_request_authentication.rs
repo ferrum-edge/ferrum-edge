@@ -200,6 +200,51 @@ fn request_auth_missing_issuer_fails_closed() {
     );
 }
 
+/// More JWT rules for one issuer than `jwks_auth` verifies a token against
+/// is refused at translation, not left to fail plugin construction later.
+#[test]
+fn request_auth_over_verification_bound_fails_closed() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "jwtRules[] per-issuer verification bound",
+        status = Status::Supported,
+        notes = "At most 8 rules may share one issuer (and 64 in total), matching the \
+                 jwks_auth per-token verification bound; an over-bound resource is rejected \
+                 (K8sTranslateError -> FerrumAccepted=False).",
+    );
+    let rules: Vec<Value> = (0..9)
+        .map(|i| {
+            json!({
+                "issuer": "https://issuer.example",
+                "jwksUri": format!("https://issuer.example/{i}/jwks.json")
+            })
+        })
+        .collect();
+    let result = translate_k8s_objects(
+        &[request_auth(
+            "ra-over-bound",
+            "default",
+            json!({ "jwtRules": rules }),
+        )],
+        options(),
+    );
+    assert!(
+        result.is_err(),
+        "nine rules for one issuer must fail translation"
+    );
+
+    let within: Vec<Value> = (0..8)
+        .map(|i| {
+            json!({
+                "issuer": "https://issuer.example",
+                "jwksUri": format!("https://issuer.example/{i}/jwks.json")
+            })
+        })
+        .collect();
+    let ra = translate_one(json!({ "jwtRules": within }));
+    assert_eq!(ra.jwt_rules.len(), 8);
+}
+
 /// `selector.matchLabels` scopes the policy to a workload selector; no
 /// selector means namespace scope.
 #[test]

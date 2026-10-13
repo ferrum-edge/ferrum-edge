@@ -3628,6 +3628,18 @@ pub mod _test_support {
         plugin.candidate_provider_indices_for_test(token)
     }
 
+    /// Start recording which providers `jwks_auth` verifies tokens against.
+    pub fn jwks_auth_observe_verifications_for_test(plugin: &crate::plugins::jwks_auth::JwksAuth) {
+        plugin.observe_verifications_for_test();
+    }
+
+    /// Providers `jwks_auth` verified tokens against since the last call.
+    pub fn jwks_auth_take_verification_attempts_for_test(
+        plugin: &crate::plugins::jwks_auth::JwksAuth,
+    ) -> Vec<usize> {
+        plugin.take_verification_attempts_for_test()
+    }
+
     pub fn request_mirror_retained_request_body_bytes_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> u64 {
