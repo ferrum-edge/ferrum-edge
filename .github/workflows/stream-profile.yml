@@ -65,10 +65,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-      # `.cargo/config.toml` hardcodes `rustc-wrapper = "sccache"`, so a lane
-      # that skips this action fails immediately with "could not execute
-      # process `sccache`". The action also clears the wrapper itself if the
-      # install fails, so the build degrades rather than breaking.
+      # `.cargo/config.toml` names no rustc-wrapper; this action selects
+      # sccache by exporting RUSTC_WRAPPER / CARGO_BUILD_RUSTC_WRAPPER as the
+      # verified binary. It clears both if the install fails, so the build
+      # degrades to an uncached compile rather than breaking.
       - uses: ./.github/actions/setup-sccache
       - uses: ./.github/actions/setup-fast-linker
       - name: Cache Rust dependencies

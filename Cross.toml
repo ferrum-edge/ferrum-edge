@@ -24,10 +24,13 @@ pre-build = [
 [target.aarch64-unknown-linux-gnu.env]
 # The cross-rs container lacks sccache, mold, standalone `clang`, and a
 # gcc new enough to understand `-fuse-ld=`. We use three forms of override
-# (one per kind of cargo setting) to make `.cargo/config.toml` agnostic:
+# (one per kind of cargo setting) so neither `.cargo/config.toml` nor the
+# host environment can select a tool the container lacks:
 #
-# 1. `RUSTC_WRAPPER=` (empty) — cargo reliably treats empty as "no wrapper",
-#    cleanly clearing `[build] rustc-wrapper`. Same for CARGO_BUILD_RUSTC_WRAPPER.
+# 1. `RUSTC_WRAPPER=` (empty) — cargo reliably treats empty as "no wrapper".
+#    The repository config names no rustc-wrapper, but an empty value still
+#    overrides a host-exported sccache wrapper or a `[build] rustc-wrapper`
+#    from a user-level cargo config. Same for CARGO_BUILD_RUSTC_WRAPPER.
 #
 # 2. `RUSTFLAGS=` (empty) — per cargo docs, when RUSTFLAGS is set (even to
 #    empty), cargo skips `[target.<triple>] rustflags` entirely. This is
