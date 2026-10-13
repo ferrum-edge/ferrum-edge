@@ -33,10 +33,25 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 A configuration in which two consumers of one namespace share a `keyauth` key,
 a `basicauth` username, or an exact `mtls_auth` identity is now refused by
 database full loads, control planes, data planes, and incremental applies; the
-previous configuration stays live. The Admin API already refused to create such
-collisions, so only rows written out of band or before that check can trigger
-it. Before upgrading, look for `Credential collision` warnings in the gateway
-log and rotate or remove one side of each collision through the Admin API.
+previous configuration stays live on a running gateway. The Admin API already
+refused to create such collisions, so only rows written out of band or before
+that check can trigger it.
+
+At **startup** there is no previous configuration: a database-mode gateway
+whose initial load is refused falls back to a valid backup if one is configured,
+and otherwise exits before its Admin API binds. **Before upgrading**, look for
+`Credential collision` warnings in the gateway log and rotate or remove one
+side of each collision, either through the Admin API of a still-running
+(pre-upgrade) instance or directly in storage.
+### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
+
+`emit_mesh_request_principal_metadata: true` used to let a request without a
+token through unauthenticated when that `jwks_auth` was the only applicable
+auth plugin. It now only emits metadata, and such a request gets `401`. Mesh
+mode is unaffected: its generated RequestAuthentication plugin sets the new
+`allow_missing_token: true` option. If a standalone gateway relied on the old
+pass-through for optional authentication, set `allow_missing_token: true` on
+that `jwks_auth` explicitly. The gateway logs a warning for it.
 
 ### Gateway material references from `ns`-claimed operator tokens (#6092, PR #6316)
 

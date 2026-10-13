@@ -18,9 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incremental applies) now refuse such a config and keep the previous one,
   the same way case-variant mTLS DNS identities were already refused and file
   mode already failed. Admin writes were already blocked from creating these
-  collisions; repair a pre-existing one by rotating or removing one of the
-  credentials through the Admin API, which stays available while the snapshot
-  is rejected.
+  collisions. On a running gateway, repair a pre-existing one through the Admin
+  API while the previous config stays live. An initial database load that is
+  refused has no previous config and needs a valid backup, so repair
+  collisions before upgrading.
+- **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
+  makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
+  permissive `RequestAuthentication` mode: when that `jwks_auth` was the only
+  applicable auth plugin, a request carrying no token was forwarded
+  unauthenticated in every operating mode, while an invalid token was still
+  rejected. The flag now only emits metadata. Permissive missing-token
+  handling needs the new, explicit `allow_missing_token: true` option, which
+  mesh mode sets on its generated RequestAuthentication instance; a runtime
+  instance under any other plugin-config id logs a warning when it enables
+  it. A standalone `jwks_auth` that set only the metadata flag now returns
+  401 for credential-less requests.
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is
