@@ -7181,3 +7181,65 @@ async fn test_sse_other_providers_are_unaffected_by_tgi_reassembly() {
         );
     }
 }
+
+/// Issue #6624: provider-chosen choice/output indexes cannot grow the guard's
+/// SSE accumulators without bound. Past the per-family ceiling the excess is
+/// folded, and an enforcing guard treats the stream as uninspectable instead
+/// of allowing on merged text.
+#[tokio::test]
+async fn sse_index_families_past_the_ceiling_fail_closed() {
+    let plugin = make_plugin(json!({
+        "blocked_phrases": ["never-present-phrase"],
+        "action": "reject"
+    }));
+    let frame_sets: Vec<(&str, Box<dyn Fn(usize) -> serde_json::Value>)> = vec![
+        (
+            "chat content (shared reassembler)",
+            Box::new(|i| json!({"choices": [{"index": i, "delta": {"content": "c"}}]})),
+        ),
+        (
+            "chat refusal (guard side accumulator)",
+            Box::new(|i| json!({"choices": [{"index": i, "delta": {"refusal": "r"}}]})),
+        ),
+        (
+            "legacy function_call name (guard side accumulator)",
+            Box::new(
+                |i| json!({"choices": [{"index": i, "delta": {"function_call": {"name": "n"}}}]}),
+            ),
+        ),
+        (
+            "Responses refusal (guard side accumulator)",
+            Box::new(
+                |i| json!({"type": "response.refusal.delta", "output_index": i, "delta": "r"}),
+            ),
+        ),
+    ];
+    for (label, frame) in frame_sets {
+        let build = |count: usize| -> Vec<u8> {
+            let mut body = String::new();
+            for i in 0..count {
+                body.push_str(&format!("data: {}\n\n", frame(i)));
+            }
+            body.into_bytes()
+        };
+
+        // Control: within the ceiling, a clean stream passes.
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &build(8))
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label}: a small clean stream must pass: {result:?}"
+        );
+
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &build(300))
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{label}: folded index families must fail closed: {result:?}"
+        );
+    }
+}

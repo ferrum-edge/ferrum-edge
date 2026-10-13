@@ -2753,10 +2753,21 @@ data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"baz\"}}]}\n\n";
             }));
         }
 
+        // Issue #6624: distinct choice keys are capped; the excess folds into
+        // one overflow accumulator whose bytes are kept, and the stream is
+        // flagged so enforcing callers fail closed.
+        assert!(reassembler.provider_stream_uninspectable());
         let texts = reassembler.into_texts();
-        assert_eq!(texts.len(), 4096);
+        assert_eq!(texts.len(), MAX_OPENAI_STREAM_ACCUMULATORS + 1);
         assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
-        assert_eq!(texts[4095].json_path, "$.choices[4095].delta.content");
+        let overflow = texts.last().expect("overflow accumulator");
+        assert_eq!(
+            overflow.json_path,
+            format!("$.choices[{}].delta.content", usize::MAX)
+        );
+        assert_eq!(overflow.text.len(), 4096 - MAX_OPENAI_STREAM_ACCUMULATORS);
+        let retained: usize = texts.iter().map(|text| text.text.len()).sum();
+        assert_eq!(retained, 4096);
     }
 
     #[test]
