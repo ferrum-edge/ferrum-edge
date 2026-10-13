@@ -6584,7 +6584,12 @@ jobs:
 
   test:
     name: Tests
-    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    # `Tests` is a required status check, and GitHub counts a skipped required
+    # check as passing. It therefore never skips: on any trigger other than a
+    # pull request, the merge queue, or main itself it runs and fails (see the
+    # trigger guard in the summary step), so dispatching this workflow on a
+    # branch cannot attach a passing `Tests` check run to that branch's head.
+    if: always()
     needs:
       - ci-plan
       - ci-policy
@@ -6623,6 +6628,24 @@ jobs:
           set -euo pipefail
 
           failures=0
+
+          # Only these triggers verify against a trusted base (pull request
+          # and merge queue) or are main itself. A dispatch on any other ref
+          # validates the branch against its own policy, so its result must
+          # never satisfy the required check.
+          case "$EVENT_NAME" in
+            pull_request|merge_group) ;;
+            push|workflow_dispatch)
+              if [ "$EVENT_REF" != "refs/heads/main" ]; then
+                echo "::error title=Untrusted CI trigger::Tests only reports for pull requests, the merge queue, and main; ${EVENT_NAME} on ${EVENT_REF} cannot satisfy it"
+                failures=1
+              fi
+              ;;
+            *)
+              echo "::error title=Untrusted CI trigger::Tests only reports for pull requests, the merge queue, and main; event '${EVENT_NAME}' cannot satisfy it"
+              failures=1
+              ;;
+          esac
 
           add_row() {
             echo "| $1 | $2 |" >> "$GITHUB_STEP_SUMMARY"
@@ -6720,6 +6743,7 @@ jobs:
         env:
           CI_MODE: ${{ needs.ci-plan.outputs.mode }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
           PLAN_RESULT: ${{ needs.ci-plan.result }}
           POLICY_RESULT: ${{ needs.ci-policy.result }}
           POLICY_VERIFIED: ${{ needs.ci-policy.outputs.verified }}

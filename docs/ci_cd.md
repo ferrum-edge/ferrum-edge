@@ -1222,7 +1222,11 @@ cross-platform build matrix. When the planner marks `run_secrets_backends` or
 `run_pkcs11` false, the aggregate accepts a skipped Secret Backends or PKCS#11
 job; when the planner marks either true, that job must succeed. In light mode
 it requires successful planning and CI Policy with `verified=true`, and accepts
-the planned heavy jobs as skipped. Pushes to `main` validate the
+the planned heavy jobs as skipped. The aggregate never skips, because GitHub
+counts a skipped required check as passing: it reports only for pull requests,
+the merge queue, and pushes or manual runs on `main`. A manual run on any other
+ref validates that branch against its own policy, so the aggregate fails there.
+Pushes to `main` validate the
 commit and may produce a CI image artifact; they do not publish production
 binaries, GitHub Releases, or registry tags. Production publication belongs to
 `release-dispatch.yml` and the version-tag `release.yml` workflow.

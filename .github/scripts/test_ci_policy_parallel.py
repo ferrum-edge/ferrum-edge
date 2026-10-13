@@ -111,10 +111,9 @@ EARLY_STEP = r"""      - name: Reject edits to frozen policy files early
           fi"""
 
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-AGGREGATE_IF = (
-    "always() && (github.event_name == 'pull_request' || github.event_name == "
-    "'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))"
-)
+# A skipped required check counts as passing, so the aggregate never skips;
+# its summary step rejects untrusted triggers instead.
+AGGREGATE_IF = "always()"
 REQUIRED_POLICY_GUARD = '''if [ "$PLAN_RESULT" != "success" ] || [ "$POLICY_RESULT" != "success" ] || [ "$POLICY_VERIFIED" != "true" ]; then
   echo "::error::CI planning and complete trusted policy verification must succeed"
   failures=1
@@ -204,6 +203,8 @@ def policy_contract_errors(workflow):
                 ("PLAN_RESULT", "${{ needs.ci-plan.result }}"),
                 ("POLICY_RESULT", "${{ needs.ci-policy.result }}"),
                 ("POLICY_VERIFIED", "${{ needs.ci-policy.outputs.verified }}"),
+                ("EVENT_NAME", "${{ github.event_name }}"),
+                ("EVENT_REF", "${{ github.ref }}"),
             ):
                 if _scalar(env, key) != expression:
                     errors.append(f"Tests must bind {key} to its actual dependency")
@@ -237,6 +238,8 @@ class PolicyParallelTests(unittest.TestCase):
             ("      - ci-policy\n", ""),
             ("POLICY_RESULT: ${{ needs.ci-policy.result }}", "POLICY_RESULT: success"),
             ("POLICY_VERIFIED: ${{ needs.ci-policy.outputs.verified }}", "POLICY_VERIFIED: 'true'"),
+            ("EVENT_REF: ${{ github.ref }}", "EVENT_REF: refs/heads/main"),
+            ("          EVENT_NAME: ${{ github.event_name }}\n          EVENT_REF:", "          EVENT_NAME: pull_request\n          EVENT_REF:"),
             ('verified: ${{ steps.verify.outputs.verified }}', "verified: 'true'"),
             ('python3 -I "$trusted_policy"', 'python3 "$policy"'),
             ('            --config Cross.toml \\\n', '            --self-test \\\n            --config Cross.toml \\\n'),
@@ -277,6 +280,7 @@ class PolicyParallelTests(unittest.TestCase):
                         with self.subTest(mode=mode, result=result, verified=verified):
                             env = {**os.environ, "CI_MODE": mode, "PLAN_RESULT": "success",
                                    "POLICY_RESULT": result, "POLICY_VERIFIED": verified,
+                                   "EVENT_NAME": "pull_request", "EVENT_REF": "refs/pull/1/merge",
                                    "GITHUB_STEP_SUMMARY": f"{directory}/summary"}
                             completed = subprocess.run(["bash", "-c", replaced], env=env, capture_output=True, text=True)
                             self.assertEqual(completed.returncode == 0, result == "success" and verified == "true", completed.stderr)
@@ -285,6 +289,27 @@ class PolicyParallelTests(unittest.TestCase):
                            "POLICY_RESULT": "success", "POLICY_VERIFIED": "true",
                            "GITHUB_STEP_SUMMARY": f"{directory}/summary"}
                     self.assertNotEqual(subprocess.run(["bash", "-c", replaced], env=env, capture_output=True).returncode, 0)
+                # Every dependency green, so only the trigger decides. A dispatch
+                # on a branch validated that branch against its own policy and
+                # must not produce a passing required check on its head.
+                for event, ref, accepted in (
+                    ("pull_request", "refs/pull/1/merge", True),
+                    ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1-" + "a" * 40, True),
+                    ("push", "refs/heads/main", True),
+                    ("workflow_dispatch", "refs/heads/main", True),
+                    ("workflow_dispatch", "refs/heads/feature", False),
+                    ("workflow_dispatch", "refs/tags/v1.0.0", False),
+                    ("push", "refs/heads/feature", False),
+                    ("schedule", "refs/heads/main", False),
+                    ("", "refs/heads/main", False),
+                ):
+                    with self.subTest(mode=mode, event=event, ref=ref):
+                        env = {**os.environ, "CI_MODE": mode, "PLAN_RESULT": "success",
+                               "POLICY_RESULT": "success", "POLICY_VERIFIED": "true",
+                               "EVENT_NAME": event, "EVENT_REF": ref,
+                               "GITHUB_STEP_SUMMARY": f"{directory}/summary"}
+                        completed = subprocess.run(["bash", "-c", replaced], env=env, capture_output=True, text=True)
+                        self.assertEqual(completed.returncode == 0, accepted, completed.stderr)
 
     def test_actual_pin_uses_authenticated_event_identity(self):
         # Fake only git transport; execute the literal workflow pin script.
