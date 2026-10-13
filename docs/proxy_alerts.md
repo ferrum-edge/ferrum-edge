@@ -97,7 +97,7 @@ The constructor is the admission source of truth. `ProxyAlertsConfig` in `openap
 ]
 ```
 
-- `from` / `to` are `HH:MM` (UTC). `from > to` wraps past midnight.
+- `from` / `to` are `HH:MM` (UTC). `from > to` wraps past midnight. `from == to` is a zero-length window that suppresses nothing; it is not a 24-hour window. For an all-day quiet window, use `"00:00"` to `"23:59"`.
 - `weekdays` is `0..=6` with `0 = Sunday` … `6 = Saturday`. Empty/omitted = every day. For wrapped windows (`from > to`), the after-midnight segment belongs to the weekday on which the window started.
 
 ### Rule types
