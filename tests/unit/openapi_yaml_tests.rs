@@ -19062,6 +19062,13 @@ fn ai_embedding_plaintext_opt_in_matches_schema_and_runtime() {
         ("http:/embeddings.example.com/v1", None, false),
         ("http:/embeddings.example.com/v1", Some(false), false),
         ("http:/embeddings.example.com/v1", Some(true), true),
+        // Whitespace and control characters are refused outright, never
+        // trimmed or stripped into a different URL.
+        (" http://embeddings.example.com/v1", None, false),
+        (" http://embeddings.example.com/v1", Some(true), false),
+        ("ht\ttp://embeddings.example.com/v1", Some(true), false),
+        ("https://embeddings.example.com/v1\n", None, false),
+        (" https://embeddings.example.com/v1", None, false),
     ] {
         let config = firewall(endpoint, opt_in);
         assert_component_validity(&spec, "AiSemanticFirewallConfig", &config, valid);

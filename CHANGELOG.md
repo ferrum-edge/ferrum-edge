@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `localhost` included, needs
   `semantic_embedding_allow_plaintext: true` (cache) or
   `provider.allow_plaintext: true` (firewall), matching the `allow_plaintext`
-  opt-in `ai_federation` and `ai_stream_router` already require.
+  opt-in `ai_federation` and `ai_stream_router` already require. `ai_semantic_firewall`
+  also refuses whitespace or control characters in `provider.endpoint`.
 - **BREAKING — HTTP/3 always percent-decodes `ctx.query_params`** (issue
   #6580). HTTP/3 used to materialize the raw form (`%2Fadmin`) unless an
   active plugin opted in through `requires_decoded_query_params()`, while

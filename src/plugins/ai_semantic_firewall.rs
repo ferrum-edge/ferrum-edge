@@ -3225,6 +3225,22 @@ fn parse_provider_config(
     }
 
     let endpoint = required_non_empty_string(provider.get("endpoint"), "provider.endpoint")?;
+    // Refuse whitespace and control characters anywhere in the configured
+    // value instead of trimming or letting URL parsing strip them, so the
+    // admitted spelling is the one the published schema pattern judges.
+    if provider
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .is_some_and(|raw| {
+            raw.chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '\u{feff}')
+        })
+    {
+        return Err(
+            "ai_semantic_firewall: `provider.endpoint` must not contain whitespace or control characters"
+                .to_string(),
+        );
+    }
     let allow_plaintext = match provider.get("allow_plaintext") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(value)) => *value,

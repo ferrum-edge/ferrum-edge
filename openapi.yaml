@@ -34731,7 +34731,8 @@ components:
             endpoint:
               type: string
               format: uri
-              description: Embeddings endpoint URL. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time. A cleartext http:// URL is admitted only to a loopback IP literal written as a dotted-quad 127.d.d.d or [::1] (other spellings and the name localhost do not qualify) unless provider.allow_plaintext is true.
+              pattern: '^[^\s\u0000-\u001f\u007f-\u009f\ufeff]+$'
+              description: Embeddings endpoint URL, with no whitespace or control characters anywhere. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time. A cleartext http:// URL is admitted only to a loopback IP literal written as a dotted-quad 127.d.d.d or [::1] (other spellings and the name localhost do not qualify) unless provider.allow_plaintext is true.
             allow_plaintext:
               type: [boolean, "null"]
               default: false

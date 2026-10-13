@@ -7584,7 +7584,7 @@ config:
   on_error: reject
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
     api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
     request_timeout_ms: 5000
@@ -7599,7 +7599,7 @@ config:
   on_error: warn
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
     api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
 ```
@@ -7614,7 +7614,7 @@ config:
     response: false
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   builtins:
     prompt_injection: false
@@ -7644,7 +7644,7 @@ config:
     response: false
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   builtins:
     indirect_prompt_injection: true
@@ -7657,7 +7657,7 @@ plugin_name: ai_semantic_firewall
 config:
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   builtins:
     prompt_injection:
@@ -7675,7 +7675,7 @@ plugin_name: ai_semantic_firewall
 config:
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   custom_rules:
     - id: block-project-falcon
@@ -8345,7 +8345,7 @@ plugins:
     config:
       provider:
         type: openai_compatible_embeddings
-        endpoint: http://localhost:8081/v1/embeddings
+        endpoint: http://127.0.0.1:8081/v1/embeddings
         model: text-embedding-3-small
   - plugin_name: ai_request_guard
     config:
