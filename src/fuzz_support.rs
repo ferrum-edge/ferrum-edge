@@ -390,12 +390,23 @@ pub fn smoke_invariants() -> Result<(), String> {
     if fuzz_jwt_svid_invariant(&token_mode) {
         return Err("JWT-SVID forgery invariant did not fire for an accepted token".to_string());
     }
-    let mut tampered = signed.into_bytes();
-    if let Some(last) = tampered.last_mut() {
-        *last = if *last == b'A' { b'B' } else { b'A' };
-    }
+    // Flip a byte of the decoded signature and re-encode it canonically, so
+    // the token is refused by RSA verification rather than by the strict
+    // base64url decoder (editing only the last character can change nothing
+    // but unused trailing bits).
+    let (signing_input, signature) = signed
+        .rsplit_once('.')
+        .ok_or_else(|| "signed JWT-SVID has no signature segment".to_string())?;
+    let mut signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|error| error.to_string())?;
+    let Some(first) = signature.first_mut() else {
+        return Err("signed JWT-SVID has an empty signature".to_string());
+    };
+    *first ^= 0x01;
+    let tampered = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(&signature));
     let mut tampered_mode = vec![1_u8];
-    tampered_mode.extend_from_slice(&tampered);
+    tampered_mode.extend_from_slice(tampered.as_bytes());
     if !fuzz_jwt_svid_invariant(&tampered_mode) {
         return Err("a tampered JWT-SVID signature validated".to_string());
     }
