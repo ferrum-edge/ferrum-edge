@@ -196,36 +196,47 @@ pub fn generate_payload(content_type: ContentType, target_size: usize) -> Vec<u8
     }
 }
 
+/// Measure the exact serialized length of `count` empty-padding records.
+///
+/// Record IDs widen as they grow (1, 2, … digits), so a fixed per-record
+/// estimate based on record 0 drifts and previously forced a final
+/// `truncate` that cut closing syntax. Measuring the real empty records
+/// lets the caller distribute the remaining bytes as in-field padding and
+/// hit the target size exactly without truncating serialized syntax.
+fn empty_records_len(count: usize, mut format_record: impl FnMut(usize, &str) -> String) -> usize {
+    (0..count).map(|i| format_record(i, "").len()).sum()
+}
+
 /// Generate a realistic JSON payload.
-/// Uses a metadata wrapper + padding data field sized to hit the exact target.
+/// Uses a metadata wrapper + padding data fields sized to hit the exact target.
 fn generate_json(target_size: usize) -> Vec<u8> {
-    // Template: {"metadata":{"type":"benchmark","version":"1.0","records":10},"data":"<PADDING>"}
-    // The overhead of the wrapper is fixed; we fill the "data" field to hit target_size.
+    // Template: {"metadata":{...},"records":[<RECORD>,...]}
+    // The overhead of the wrapper is fixed; we fill the "data" fields to hit target_size.
     let prefix = r#"{"metadata":{"type":"benchmark","version":"1.0","timestamp":"2024-01-01T00:00:00Z","tags":["perf","test","payload-size"]},"records":["#;
     let suffix = "]}";
-    let record_base = r#"{"id":0,"name":"user_0","email":"user0@bench.example.com","role":"senior_engineer","active":true,"score":98.5,"department":"platform","data":""}"#;
-    let record_base_len = record_base.len(); // ~150 bytes
+    let format_record = |i: usize, padding: &str| {
+        format!(
+            r#"{{"id":{i},"name":"user_{i}","email":"user{i}@bench.example.com","role":"senior_engineer","active":true,"score":98.5,"department":"platform","data":"{padding}"}}"#
+        )
+    };
 
     let fixed_overhead = prefix.len() + suffix.len();
     let available = target_size.saturating_sub(fixed_overhead);
-
-    // For small payloads, use a single record with a large data field
-    if available < record_base_len * 3 {
-        let data_size = target_size.saturating_sub(fixed_overhead + record_base_len);
-        let padding = "A".repeat(data_size);
-        let result = format!(
-            r#"{prefix}{{"id":0,"name":"user_0","email":"user0@bench.example.com","role":"senior_engineer","active":true,"score":98.5,"department":"platform","data":"{padding}"}}{suffix}"#
-        );
-        return result.into_bytes();
+    let mut num_records = (available / 512).clamp(1, 5000);
+    // Shrink the record count until the empty records (plus commas) fit.
+    let mut base_len = fixed_overhead
+        + empty_records_len(num_records, &format_record)
+        + num_records.saturating_sub(1);
+    while base_len > target_size && num_records > 1 {
+        num_records -= 1;
+        base_len = fixed_overhead
+            + empty_records_len(num_records, &format_record)
+            + num_records.saturating_sub(1);
     }
 
-    // For larger payloads, use multiple records each with padding
-    let num_records = (available / 512).clamp(1, 5000);
-    // Estimate: each record is record_base_len + data + comma
-    let per_record_overhead = record_base_len + 1; // +1 for comma
-    let total_data = available.saturating_sub(num_records * per_record_overhead);
-    let data_per_record = total_data / num_records;
-    let padding_chunk = "A".repeat(data_per_record);
+    let total_padding = target_size.saturating_sub(base_len);
+    let padding_per_record = total_padding / num_records;
+    let padding_remainder = total_padding % num_records;
 
     let mut buf = String::with_capacity(target_size + 512);
     buf.push_str(prefix);
@@ -233,21 +244,11 @@ fn generate_json(target_size: usize) -> Vec<u8> {
         if i > 0 {
             buf.push(',');
         }
-        buf.push_str(&format!(
-            r#"{{"id":{i},"name":"user_{i}","email":"user{i}@bench.example.com","role":"senior_engineer","active":true,"score":98.5,"department":"platform","data":"{padding_chunk}"}}"#
-        ));
+        let extra = usize::from(i < padding_remainder);
+        buf.push_str(&format_record(i, &"A".repeat(padding_per_record + extra)));
     }
     buf.push_str(suffix);
-
-    let mut bytes = buf.into_bytes();
-    // Pad if slightly short
-    while bytes.len() < target_size {
-        // Insert padding before the closing ]}
-        let insert_pos = bytes.len() - suffix.len();
-        bytes.insert(insert_pos, b'A');
-    }
-    bytes.truncate(target_size);
-    bytes
+    buf.into_bytes()
 }
 
 /// Generate a realistic XML payload.
@@ -256,31 +257,30 @@ fn generate_xml(target_size: usize) -> Vec<u8> {
     let footer = "</root>";
     let overhead = header.len() + footer.len();
     let available = target_size.saturating_sub(overhead);
+    let format_record = |i: usize, padding: &str| {
+        format!(
+            r#"<record id="{i}"><name>user_{i}</name><email>user{i}@example.com</email><role>engineer</role><active>true</active><score>98.5</score><data>{padding}</data></record>"#
+        )
+    };
 
-    let record_base = r#"<record id="0"><name>user_0</name><email>user0@example.com</email><role>engineer</role><active>true</active><score>98.5</score><data></data></record>"#;
-    let record_base_len = record_base.len();
-    let records_count = (available / 512).clamp(1, 10000);
-    let total_data = available.saturating_sub(records_count * record_base_len);
-    let data_per_record = total_data / records_count;
-    let padding_chunk = "A".repeat(data_per_record);
+    let mut records_count = (available / 512).clamp(1, 10000);
+    let mut base_len = overhead + empty_records_len(records_count, &format_record);
+    while base_len > target_size && records_count > 1 {
+        records_count -= 1;
+        base_len = overhead + empty_records_len(records_count, &format_record);
+    }
+    let total_padding = target_size.saturating_sub(base_len);
+    let padding_per_record = total_padding / records_count;
+    let padding_remainder = total_padding % records_count;
 
     let mut buf = String::with_capacity(target_size + 1024);
     buf.push_str(header);
     for i in 0..records_count {
-        buf.push_str(&format!(
-            r#"<record id="{i}"><name>user_{i}</name><email>user{i}@example.com</email><role>engineer</role><active>true</active><score>98.5</score><data>{padding_chunk}</data></record>"#
-        ));
+        let extra = usize::from(i < padding_remainder);
+        buf.push_str(&format_record(i, &"A".repeat(padding_per_record + extra)));
     }
     buf.push_str(footer);
-
-    let mut bytes = buf.into_bytes();
-    // Pad if slightly short
-    while bytes.len() < target_size {
-        let insert_pos = bytes.len() - footer.len();
-        bytes.insert(insert_pos, b'A');
-    }
-    bytes.truncate(target_size);
-    bytes
+    buf.into_bytes()
 }
 
 /// Generate a form-urlencoded payload.
@@ -302,7 +302,8 @@ fn generate_form_urlencoded(target_size: usize) -> Vec<u8> {
         buf.push_str(&chunk[..remainder]);
     }
 
-    buf.truncate(target_size);
+    // Exact by construction for targets above the fixed prefix; never
+    // truncate, which could cut a %XX escape in the fixed pairs.
     buf.into_bytes()
 }
 
@@ -331,7 +332,9 @@ fn generate_multipart(target_size: usize) -> Vec<u8> {
     buf.extend_from_slice(&file_data);
 
     buf.extend_from_slice(footer.as_bytes());
-    buf.truncate(target_size);
+    // Exact by construction when target_size >= overhead; for smaller
+    // targets return the smallest valid multipart body rather than
+    // truncating the closing boundary.
     buf
 }
 
@@ -344,40 +347,58 @@ fn generate_binary(target_size: usize) -> Vec<u8> {
 }
 
 /// Generate SSE-formatted events.
+///
+/// Only whole events are emitted: the final event's `payload` padding is
+/// sized to fill the remaining budget, and generation stops short of the
+/// target when fewer bytes remain than one empty event needs. The result
+/// is therefore approximate in size (the module contract) but never cuts
+/// an event or its terminating blank line.
 fn generate_sse(target_size: usize) -> Vec<u8> {
     let mut buf = String::with_capacity(target_size + 1024);
     let mut id = 0u64;
-    while buf.len() < target_size {
+    loop {
+        let empty_event =
+            format!("id: {id}\nevent: message\ndata: {{\"seq\":{id},\"payload\":\"\"}}\n\n");
         let remaining = target_size.saturating_sub(buf.len());
-        // Each event: "id: N\nevent: message\ndata: {...}\n\n" ~= overhead + data
-        let event_overhead = 50;
-        let data_size = remaining.min(4096).saturating_sub(event_overhead);
-        let padding = "A".repeat(data_size);
+        if remaining < empty_event.len() {
+            break;
+        }
+        let padding_len = remaining.min(4096).saturating_sub(empty_event.len());
+        let padding = "A".repeat(padding_len);
         buf.push_str(&format!(
             "id: {id}\nevent: message\ndata: {{\"seq\":{id},\"payload\":\"{padding}\"}}\n\n"
         ));
         id += 1;
     }
-    buf.truncate(target_size);
     buf.into_bytes()
 }
 
 /// Generate newline-delimited JSON.
+///
+/// Only whole records are emitted, each terminated by `\n`: the final
+/// record's `data` padding is sized to fill the remaining budget, and
+/// generation stops short of the target when fewer bytes remain than one
+/// empty record (plus its newline) needs.
 fn generate_ndjson(target_size: usize) -> Vec<u8> {
     let mut buf = String::with_capacity(target_size + 1024);
     let mut id = 0u64;
-    while buf.len() < target_size {
+    loop {
+        let empty_record = format!(
+            r#"{{"id":{id},"timestamp":"2024-01-01T00:00:00Z","event":"benchmark","data":""}}"#
+        );
+        let min_record_len = empty_record.len() + 1; // + '\n'
         let remaining = target_size.saturating_sub(buf.len());
-        let record_overhead = 80;
-        let data_size = remaining.min(1024).saturating_sub(record_overhead);
-        let padding = "A".repeat(data_size);
+        if remaining < min_record_len {
+            break;
+        }
+        let padding_len = remaining.min(1024).saturating_sub(min_record_len);
+        let padding = "A".repeat(padding_len);
         buf.push_str(&format!(
             r#"{{"id":{id},"timestamp":"2024-01-01T00:00:00Z","event":"benchmark","data":"{padding}"}}"#
         ));
         buf.push('\n');
         id += 1;
     }
-    buf.truncate(target_size);
     buf.into_bytes()
 }
 
@@ -398,48 +419,57 @@ fn generate_soap_xml(target_size: usize) -> Vec<u8> {
 
     let overhead = header.len() + footer.len();
     let available = target_size.saturating_sub(overhead);
+    let format_record = |i: usize, padding: &str| {
+        format!(r#"<ws:DataItem id="{i}"><ws:Value>{padding}</ws:Value></ws:DataItem>"#)
+    };
 
-    let record_base = r#"<ws:DataItem id="0"><ws:Value></ws:Value></ws:DataItem>"#;
-    let record_base_len = record_base.len();
-    let records_count = (available / 256).clamp(1, 10000);
-    let total_data = available.saturating_sub(records_count * record_base_len);
-    let data_per_record = total_data / records_count;
-    let padding_chunk = "A".repeat(data_per_record);
+    let mut records_count = (available / 256).clamp(1, 10000);
+    let mut base_len = overhead + empty_records_len(records_count, &format_record);
+    while base_len > target_size && records_count > 1 {
+        records_count -= 1;
+        base_len = overhead + empty_records_len(records_count, &format_record);
+    }
+    let total_padding = target_size.saturating_sub(base_len);
+    let padding_per_record = total_padding / records_count;
+    let padding_remainder = total_padding % records_count;
 
     let mut buf = String::with_capacity(target_size + 1024);
     buf.push_str(header);
     for i in 0..records_count {
-        buf.push_str(&format!(
-            r#"<ws:DataItem id="{i}"><ws:Value>{padding_chunk}</ws:Value></ws:DataItem>"#
-        ));
+        let extra = usize::from(i < padding_remainder);
+        buf.push_str(&format_record(i, &"A".repeat(padding_per_record + extra)));
     }
     buf.push_str(footer);
-
-    let mut bytes = buf.into_bytes();
-    while bytes.len() < target_size {
-        let insert_pos = bytes.len() - footer.len();
-        bytes.insert(insert_pos, b'A');
-    }
-    bytes.truncate(target_size);
-    bytes
+    buf.into_bytes()
 }
 
 /// Generate a GraphQL request payload (JSON-encoded).
 fn generate_graphql(target_size: usize) -> Vec<u8> {
     let query = r#"mutation ProcessBatchData($input: BatchDataInput!) { processBatchData(input: $input) { success processedCount errors { code message } } }"#;
     let escaped_query = query.replace('"', r#"\""#);
-    // Build the wrapper to measure exact overhead
+    // Build the wrapper to measure exact overhead. The prefix opens three
+    // objects (root, "variables", "input") and one array ("items"), so the
+    // suffix closes the array and exactly those three objects.
     let prefix = format!(r#"{{"query":"{escaped_query}","variables":{{"input":{{"items":["#);
-    let suffix = "]}}}}";
+    let suffix = "]}}}";
     let overhead = prefix.len() + suffix.len();
     let available = target_size.saturating_sub(overhead);
+    let format_record =
+        |i: usize, padding: &str| format!(r#"{{"id":{i},"type":"benchmark","data":"{padding}"}}"#);
 
-    let record_base = r#"{"id":0,"type":"benchmark","data":""}"#;
-    let record_base_len = record_base.len() + 1; // +1 for comma
-    let records_count = (available / 256).clamp(1, 10000);
-    let total_data = available.saturating_sub(records_count * record_base_len);
-    let data_per_record = total_data / records_count;
-    let padding_chunk = "A".repeat(data_per_record);
+    let mut records_count = (available / 256).clamp(1, 10000);
+    let mut base_len = overhead
+        + empty_records_len(records_count, &format_record)
+        + records_count.saturating_sub(1);
+    while base_len > target_size && records_count > 1 {
+        records_count -= 1;
+        base_len = overhead
+            + empty_records_len(records_count, &format_record)
+            + records_count.saturating_sub(1);
+    }
+    let total_padding = target_size.saturating_sub(base_len);
+    let padding_per_record = total_padding / records_count;
+    let padding_remainder = total_padding % records_count;
 
     let mut buf = String::with_capacity(target_size + 512);
     buf.push_str(&prefix);
@@ -447,20 +477,11 @@ fn generate_graphql(target_size: usize) -> Vec<u8> {
         if i > 0 {
             buf.push(',');
         }
-        buf.push_str(&format!(
-            r#"{{"id":{i},"type":"benchmark","data":"{padding_chunk}"}}"#
-        ));
+        let extra = usize::from(i < padding_remainder);
+        buf.push_str(&format_record(i, &"A".repeat(padding_per_record + extra)));
     }
     buf.push_str(suffix);
-
-    let mut bytes = buf.into_bytes();
-    // Pad if slightly short
-    while bytes.len() < target_size {
-        let insert_pos = bytes.len() - suffix.len();
-        bytes.insert(insert_pos, b'A');
-    }
-    bytes.truncate(target_size);
-    bytes
+    buf.into_bytes()
 }
 
 #[cfg(test)]

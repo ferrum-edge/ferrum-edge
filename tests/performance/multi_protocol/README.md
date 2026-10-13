@@ -173,7 +173,7 @@ Options:
                           grpc only: a new connection (TCP, TLS, HTTP/2) per call
 ```
 
-An option a protocol would ignore is refused rather than silently dropped.
+The two measurement controls above are refused rather than silently dropped when set for a protocol that would ignore them: a non-default `--h2-stream-window` is rejected outside HTTP/2/gRPC, and `--connection-per-request` is rejected outside gRPC. Other shared options are not all validated this way — for example `--ca-cert` is documented in `--help` as ignored by HTTP/1, HTTP/3, and WebSocket runs — so check each option's help text before assuming it took effect.
 
 ## Configuration
 

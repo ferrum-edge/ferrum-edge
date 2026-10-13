@@ -59,8 +59,14 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
             -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
           sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev
-      - name: Verify admission and shutdown races without timing sleeps
-        run: cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_admission_tests -- --nocapture
+      - name: Verify TCP echo shutdown diagnostics without timing sleeps
+        run: |
+          set -euo pipefail
+          # Fail loudly if the selector ever goes stale again and matches
+          # nothing: the focused contract must be listed before it runs.
+          cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_echo_tests -- --list \
+            | grep -q "tcp_and_tls_shutdown_timeouts_remain_diagnostic_after_measured_echoes"
+          cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_echo_tests -- --nocapture
 
   benchmark:
     name: Paired native Linux release profiles
