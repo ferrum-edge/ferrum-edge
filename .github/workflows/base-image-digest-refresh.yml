@@ -24,9 +24,10 @@
 # cannot change workflow files: a drifted reference pinned in a workflow fails
 # the run instead. A pull request opened by `GITHUB_TOKEN` does not start its
 # required CI on its own: `pull_request` runs, if created, wait for maintainer
-# approval, and the `pull_request_target` trusted policy never starts. A
-# maintainer approves those runs or closes and reopens the refresh PR (or merges
-# `main` into it) to run every required check, reviews it, and merges it.
+# approval, and the `pull_request_target` trusted policy never starts, so
+# approving them is not enough. A maintainer closes and reopens the refresh PR
+# (or pushes a commit to it, for example by merging `main`) to run every
+# required check, reviews it, and merges it.
 name: Base Image Digest Refresh
 
 on:
