@@ -80,6 +80,21 @@ while IFS= read -r artifact_name; do
   # Drain any tar end padding so unzip always reaches its CRC check.
   # pipefail propagates corrupt ZIPs AND tar extraction failures.
   unzip -p "$archive" "$member" | { tar -xpf - && cat > /dev/null; }
+  # Raw-profile names can coincide across runners: cargo-llvm-cov's
+  # default `%p-%Nm` name reuses pids, and the functional shards'
+  # pooled `%4m` name carries only the binary signature (#6378). Tag
+  # every profile this shard just extracted with its shard name before
+  # the next shard can overwrite it. The report merges every
+  # top-level `*.profraw`, whatever its name.
+  shard="${artifact_name#coverage-data-}"
+  while IFS= read -r -d '' profile; do
+    tagged="${profile%.profraw}.fanin-${shard}.profraw"
+    if [ -e "$tagged" ]; then
+      echo "::error::coverage profile ${tagged} already exists"
+      exit 1
+    fi
+    mv -- "$profile" "$tagged"
+  done < <(find target/llvm-cov-target -name '*.profraw' ! -name '*.fanin-*.profraw' -print0)
   extract_seconds=$((SECONDS - extract_started))
   echo "| ${artifact_name} | ${zip_bytes} | ${tar_bytes} | ${download_seconds} | ${extract_seconds} |" >> "$GITHUB_STEP_SUMMARY"
   rm -rf coverage-data

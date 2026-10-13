@@ -18,6 +18,8 @@ ADMIN_CONFIG_SHARD = "admin-config"
 MESH_ROUTING_SHARD = "mesh-routing"
 MESH_PLATFORM_SHARD = "mesh-platform"
 PROTOCOLS_SHARD = "protocols-data-plane"
+INTEGRATION_REMAINDER_1_SHARD = "integration-remainder-1"
+INTEGRATION_REMAINDER_2_SHARD = "integration-remainder-2"
 FUNCTIONAL_1_SHARD = "functional-1"
 FUNCTIONAL_2_SHARD = "functional-2"
 FUNCTIONAL_DATA_SHARD = "functional-data"
@@ -28,6 +30,15 @@ INTEGRATION_SHARD_ORDER = (
     MESH_ROUTING_SHARD,
     MESH_PLATFORM_SHARD,
     PROTOCOLS_SHARD,
+)
+# The remainder shards run every registered `integration_tests` module that no
+# scoped integration shard filter selects (#6377), split by nextest hash
+# partition. Like the functional shards they belong to full plans only, so a
+# module added to `tests/integration/mod.rs` reaches full coverage without a
+# filter-list edit.
+INTEGRATION_REMAINDER_SHARDS = (
+    INTEGRATION_REMAINDER_1_SHARD,
+    INTEGRATION_REMAINDER_2_SHARD,
 )
 # Functional coverage shards run the subprocess `functional_tests` suite against
 # the instrumented `ferrum-edge` binary. They belong to full plans only: the
@@ -41,15 +52,18 @@ FUNCTIONAL_SHARD_ORDER = (*FUNCTIONAL_PARTITION_SHARDS, FUNCTIONAL_DATA_SHARD)
 CANONICAL_SHARD_ORDER = (
     LIB_UNIT_SHARD,
     *INTEGRATION_SHARD_ORDER,
+    *INTEGRATION_REMAINDER_SHARDS,
     *FUNCTIONAL_SHARD_ORDER,
 )
 
 ADMIN_SHARDS = frozenset({ADMIN_API_SHARD, ADMIN_CONFIG_SHARD})
 MESH_SHARDS = frozenset({MESH_ROUTING_SHARD, MESH_PLATFORM_SHARD})
 ALL_INTEGRATION_SHARDS = frozenset(INTEGRATION_SHARD_ORDER)
+ALL_INTEGRATION_REMAINDER_SHARDS = frozenset(INTEGRATION_REMAINDER_SHARDS)
 ALL_FUNCTIONAL_SHARDS = frozenset(FUNCTIONAL_SHARD_ORDER)
 # Every shard a path-scoped plan can select. Selecting all of them promotes the
-# plan to the full matrix, which adds the functional shards.
+# plan to the full matrix, which adds the integration remainder and functional
+# shards.
 SCOPED_SHARDS = frozenset({LIB_UNIT_SHARD, *INTEGRATION_SHARD_ORDER})
 ALL_SHARDS = frozenset(CANONICAL_SHARD_ORDER)
 # Serving modes that start admin + proxy (and optionally DB/CP), but are not mesh.
@@ -314,6 +328,41 @@ SHARD_DEFINITIONS: dict[str, dict[str, str]] = {
         "data_services": "true",
     },
 }
+
+INTEGRATION_FILTER_RE = re.compile(r"^integration::[a-z0-9_]+$")
+# Every positional filter of the scoped integration shards, in shard order.
+SCOPED_INTEGRATION_FILTERS = tuple(
+    line.strip()
+    for shard in INTEGRATION_SHARD_ORDER
+    for line in SHARD_DEFINITIONS[shard]["filters"].splitlines()
+    if line.strip()
+)
+# nextest positional filters are substring matches on the full test name, and
+# an unanchored `test(/regex/)` alternation is the same substring match, so the
+# remainder is exactly the complement of the scoped shards.
+INTEGRATION_REMAINDER_FILTERSET = (
+    "not test(/integration::("
+    + "|".join(name.removeprefix("integration::") for name in SCOPED_INTEGRATION_FILTERS)
+    + ")/)"
+)
+
+
+def integration_remainder_definition(shard: str, index: int) -> dict[str, str]:
+    return {
+        "shard": shard,
+        "kind": "integration",
+        "filters": "",
+        "filterset": INTEGRATION_REMAINDER_FILTERSET,
+        "partition": f"hash:{index}/{len(INTEGRATION_REMAINDER_SHARDS)}",
+    }
+
+
+SHARD_DEFINITIONS.update(
+    {
+        shard: integration_remainder_definition(shard, index)
+        for index, shard in enumerate(INTEGRATION_REMAINDER_SHARDS, start=1)
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -838,7 +887,8 @@ def self_test() -> int:
         plan = select_scoped_plan("pull_request", [path])
         if LIB_UNIT_SHARD not in plan.shards:
             failures.append(f"{path}: non-skip ownership plan omitted lib-unit")
-        if set(plan.shards) - {LIB_UNIT_SHARD} - ALL_FUNCTIONAL_SHARDS != set(expected):
+        full_only = ALL_INTEGRATION_REMAINDER_SHARDS | ALL_FUNCTIONAL_SHARDS
+        if set(plan.shards) - {LIB_UNIT_SHARD} - full_only != set(expected):
             failures.append(
                 f"{path}: plan shards {plan.shards} drifted from ownership lock"
             )
@@ -981,6 +1031,27 @@ def self_test() -> int:
             failures.append(f"{name} shard kind must remain integration")
         if "integration::" not in SHARD_DEFINITIONS[name]["filters"]:
             failures.append(f"{name} shard is missing integration filters")
+    for filter_name in SCOPED_INTEGRATION_FILTERS:
+        if not INTEGRATION_FILTER_RE.fullmatch(filter_name):
+            failures.append(f"scoped integration filter {filter_name!r} is not a module filter")
+    if len(set(SCOPED_INTEGRATION_FILTERS)) != len(SCOPED_INTEGRATION_FILTERS):
+        failures.append("scoped integration filters must not repeat a module")
+    remainder_partitions = []
+    for name in ALL_INTEGRATION_REMAINDER_SHARDS:
+        definition = SHARD_DEFINITIONS[name]
+        if definition["kind"] != "integration" or definition["filters"]:
+            failures.append(f"{name} must be a filter-free integration shard")
+        if definition["filterset"] != INTEGRATION_REMAINDER_FILTERSET:
+            failures.append(f"{name} must exclude exactly the scoped integration filters")
+        remainder_partitions.append(definition["partition"])
+    count = len(INTEGRATION_REMAINDER_SHARDS)
+    if sorted(remainder_partitions) != [f"hash:{index}/{count}" for index in range(1, count + 1)]:
+        failures.append("integration remainder shards must cover every hash partition once")
+    for name in ALL_INTEGRATION_REMAINDER_SHARDS:
+        for scoped_path in ("src/admin/mod.rs", "src/proxy/mod.rs", "src/http3/server.rs"):
+            scoped = select_scoped_plan("pull_request", [scoped_path])
+            if scoped.mode == "shards" and name in scoped.shards:
+                failures.append(f"path-scoped plans must not select {name}")
     partitions = []
     for name in ALL_FUNCTIONAL_SHARDS:
         definition = SHARD_DEFINITIONS[name]

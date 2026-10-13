@@ -7743,7 +7743,16 @@ jobs:
       - name: Report compiler cache statistics
         if: always()
         shell: bash
-        run: '"${FERRUM_SCCACHE_BIN}" --show-stats'
+        # Best-effort telemetry (#6282): setup-sccache may fail before it
+        # publishes a verified executable, leaving FERRUM_SCCACHE_BIN empty
+        # while Cargo builds uncached. That must not fail the job; real Cargo
+        # failures still fail their own steps above.
+        run: |
+          if [ -n "${FERRUM_SCCACHE_BIN:-}" ]; then
+            "${FERRUM_SCCACHE_BIN}" --show-stats || echo "::warning::sccache statistics were unavailable"
+          else
+            echo "::warning::sccache was unavailable; this build compiled without a compiler cache"
+          fi
 
   main-linux-image:
     name: Build Linux CI image

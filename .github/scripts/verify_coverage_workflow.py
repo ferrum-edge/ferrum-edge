@@ -21,14 +21,17 @@ from coverage_plan import (
     ADMIN_API_SHARD,
     ADMIN_CONFIG_SHARD,
     ALL_FUNCTIONAL_SHARDS,
+    ALL_INTEGRATION_REMAINDER_SHARDS,
     ALL_SHARDS,
     CANONICAL_SHARD_ORDER,
     CONTROLLER_PATHS,
     FUNCTIONAL_DATA_SHARD,
+    INTEGRATION_REMAINDER_FILTERSET,
     LIB_UNIT_SHARD,
     MESH_PLATFORM_SHARD,
     MESH_ROUTING_SHARD,
     PROTOCOLS_SHARD,
+    SCOPED_INTEGRATION_FILTERS,
     SHARD_DEFINITIONS,
     VALID_MODES,
     parse_planned_shards,
@@ -44,6 +47,8 @@ WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 PLANNER_PATH = REPO_ROOT / ".github" / "scripts" / "coverage_plan.py"
 DOCS_COVERAGE_PATH = REPO_ROOT / "docs" / "coverage.md"
 DOCS_CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
+INTEGRATION_REGISTRY_PATH = REPO_ROOT / "tests" / "integration" / "mod.rs"
+INTEGRATION_MODULE_RE = re.compile(r"(?m)^\s*(?:pub\s+)?mod\s+([a-z0-9_]+)\s*;")
 
 FROZEN_FILTER_MODULES = {
     ADMIN_API_SHARD: {
@@ -151,6 +156,16 @@ FUNCTIONAL_STEP_TOKENS = (
     "FUNCTIONAL_PARTITION: ${{ matrix.partition }}",
     "if: matrix.kind == 'functional' && matrix.data_services == 'true'",
 )
+# The integration step must apply the remainder shards' filterset and hash
+# partition, or those rows would run the whole suite (or nothing) (#6377).
+INTEGRATION_STEP_TOKENS = (
+    "if: matrix.kind == 'integration'",
+    'nextest_args+=(-E "$INTEGRATION_FILTERSET")',
+    'nextest_args+=(--partition "$INTEGRATION_PARTITION")',
+    "INTEGRATION_FILTERS: ${{ matrix.filters }}",
+    "INTEGRATION_FILTERSET: ${{ matrix.filterset }}",
+    "INTEGRATION_PARTITION: ${{ matrix.partition }}",
+)
 
 
 def extract_job_body(workflow_yml: str, job: str) -> str:
@@ -170,6 +185,48 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
 
 def filter_modules(filters: str) -> set[str]:
     return {line.strip() for line in filters.splitlines() if line.strip()}
+
+
+def integration_registry_modules(registry: str) -> list[str]:
+    return INTEGRATION_MODULE_RE.findall(registry)
+
+
+def remainder_regex(filterset: str) -> re.Pattern[str] | None:
+    match = re.fullmatch(r"not test\(/(?P<regex>[A-Za-z0-9_:|()]+)/\)", filterset)
+    return re.compile(match.group("regex")) if match else None
+
+
+def integration_selection_failures(
+    modules: list[str],
+    scoped_filters: tuple[str, ...] | list[str],
+    filterset: str,
+) -> list[str]:
+    """Every registered module must reach exactly one integration shard family.
+
+    nextest positional filters and an unanchored `test(/regex/)` both match a
+    substring of `integration::<module>::<test>`, so the check models each
+    module by one representative test name.
+    """
+
+    failures: list[str] = []
+    if not modules:
+        return ["tests/integration/mod.rs declares no integration modules"]
+    pattern = remainder_regex(filterset)
+    if pattern is None:
+        return ["integration remainder filterset must be `not test(/<alternation>/)`"]
+    for module in modules:
+        name = f"integration::{module}::coverage_probe"
+        scoped = [shard_filter for shard_filter in scoped_filters if shard_filter in name]
+        remainder = pattern.search(name) is None
+        if len(scoped) + int(remainder) != 1:
+            failures.append(
+                f"integration module {module} reaches {len(scoped)} scoped filter(s) "
+                f"and {'the' if remainder else 'no'} remainder shard; it must reach exactly one"
+            )
+    for shard_filter in scoped_filters:
+        if not any(f"integration::{module}::".startswith(shard_filter) for module in modules):
+            failures.append(f"scoped integration filter {shard_filter} matches no registered module")
+    return failures
 
 
 def validate_planner_contract(failures: list[str]) -> None:
@@ -196,6 +253,25 @@ def validate_planner_contract(failures: list[str]) -> None:
             f"{shard} integration filters drifted from the frozen coverage matrix",
             failures,
         )
+    require(
+        bool(ALL_INTEGRATION_REMAINDER_SHARDS)
+        and ALL_INTEGRATION_REMAINDER_SHARDS <= set(CANONICAL_SHARD_ORDER)
+        and all(
+            SHARD_DEFINITIONS[shard]["filterset"] == INTEGRATION_REMAINDER_FILTERSET
+            for shard in ALL_INTEGRATION_REMAINDER_SHARDS
+        ),
+        "full coverage must include the integration remainder shards",
+        failures,
+    )
+    failures.extend(
+        integration_selection_failures(
+            integration_registry_modules(
+                INTEGRATION_REGISTRY_PATH.read_text(encoding="utf-8")
+            ),
+            SCOPED_INTEGRATION_FILTERS,
+            INTEGRATION_REMAINDER_FILTERSET,
+        )
+    )
     require(
         bool(ALL_FUNCTIONAL_SHARDS)
         and all(
@@ -340,6 +416,12 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         require(
             token in shard_body,
             f"coverage-shard functional coverage must retain {token}",
+            failures,
+        )
+    for token in INTEGRATION_STEP_TOKENS:
+        require(
+            token in shard_body,
+            f"coverage-shard integration coverage must retain {token}",
             failures,
         )
 
@@ -503,6 +585,10 @@ def validate_artifact_transport(workflow: str, failures: list[str]) -> None:
         'member="coverage-${artifact_name#coverage-data-}.tar"',
         'if [ "$(unzip -Z1 "$archive")" != "$member" ]; then',
         'unzip -p "$archive" "$member" | { tar -xpf - && cat > /dev/null; }',
+        'shard="${artifact_name#coverage-data-}"',
+        'tagged="${profile%.profraw}.fanin-${shard}.profraw"',
+        'mv -- "$profile" "$tagged"',
+        "find target/llvm-cov-target -name '*.profraw' ! -name '*.fanin-*.profraw' -print0",
         'done <<< "$artifact_names"',
     ):
         require(token in script, f"coverage transport must retain {token}", failures)
@@ -523,6 +609,7 @@ def self_test_artifact_transport(failures: list[str]) -> None:
         ("length == 1 and .[0].expired == false", "length >= 1"),
         ('if [ "$downloaded" != "true" ]; then', 'if false; then'),
         ('tar -xpf - && cat > /dev/null', 'tar -xpf - || true'),
+        ('mv -- "$profile" "$tagged"', ':'),
     ):
         # Mutate the transport step, not another job's shell prologue.
         merge_start = workflow.index("  coverage-merge:")
@@ -538,7 +625,7 @@ def self_test_artifact_transport(failures: list[str]) -> None:
             "coverage transport fixture must exactly match the hosted shell", failures)
     cases = (
         "valid", "zip64", "retry", "download-failure", "missing", "expired", "duplicate", "wrong-member",
-        "extra-member", "corrupt-zip", "invalid-tar", "no-profiles",
+        "extra-member", "corrupt-zip", "invalid-tar", "no-profiles", "same-profile-path",
     )
     for case in cases:
         with tempfile.TemporaryDirectory(prefix="coverage-transport-") as directory:
@@ -555,8 +642,14 @@ def self_test_artifact_transport(failures: list[str]) -> None:
                 contents = io.BytesIO()
                 with tarfile.open(fileobj=contents, mode="w") as archive:
                     entries = [("debug/deps/shared-object", f"object-{shard}".encode(), 0o755)]
+                    # Two runners can write one raw-profile name (#6378).
+                    profile = (
+                        "ferrum-edge-functional-pool_0.profraw"
+                        if case == "same-profile-path"
+                        else f"{shard}.profraw"
+                    )
                     if case != "no-profiles":
-                        entries.append((f"{shard}.profraw", f"profile-{shard}".encode(), 0o644))
+                        entries.append((profile, f"profile-{shard}".encode(), 0o644))
                     for path, data, mode in entries:
                         entry = tarfile.TarInfo(f"target/llvm-cov-target/{path}")
                         entry.size, entry.mode = len(data), mode
@@ -625,7 +718,7 @@ esac
                      "PLANNED_SHARDS": json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD])},
                 capture_output=True, text=True, timeout=30,
             )
-            should_succeed = case in {"valid", "zip64", "retry"}
+            should_succeed = case in {"valid", "zip64", "retry", "same-profile-path"}
             require(
                 (result.returncode == 0) == should_succeed,
                 f"transport {case}: exit {result.returncode}; {result.stderr}", failures,
@@ -636,8 +729,14 @@ esac
                 require((root / "downloads").read_text().splitlines() == ["11", "11"], "transport must stop after two failed downloads", failures)
             if should_succeed and result.returncode == 0:
                 target = root / "target/llvm-cov-target"
+                expected_profiles = {}
                 for shard in (LIB_UNIT_SHARD, ADMIN_API_SHARD):
-                    require((target / f"{shard}.profraw").read_bytes() == f"profile-{shard}".encode(), "profile bytes changed", failures)
+                    stem = "ferrum-edge-functional-pool_0" if case == "same-profile-path" else shard
+                    expected_profiles[f"{stem}.fanin-{shard}.profraw"] = f"profile-{shard}".encode()
+                # The report reads every top-level *.profraw: each shard's
+                # profile must survive there under its own shard tag.
+                reported = {path.name: path.read_bytes() for path in target.glob("*.profraw")}
+                require(reported == expected_profiles, f"transport {case}: shard profiles lost or changed: {sorted(reported)}", failures)
                 obj = target / "debug/deps/shared-object"
                 require(obj.read_bytes() == b"object-admin-api" and (obj.stat().st_mode & 0o777) == 0o755, "shared object overwrite order or executable mode changed", failures)
                 expected_downloads = ["11", "11", "12"] if case == "retry" else ["11", "12"]
@@ -666,6 +765,57 @@ def self_test() -> int:
     self_test_artifact_transport(failures)
     if planner_self_test() != 0:
         failures.append("planner self-test failed during verifier self-test")
+
+    registry = (
+        '#[path = "nested/a.rs"]\nmod a_tests_nested;\nmod b_tests;\n'
+        "// mod commented_tests;\npub mod c_support;\nmod inline {}\n"
+    )
+    require(
+        integration_registry_modules(registry) == ["a_tests_nested", "b_tests", "c_support"],
+        "integration registry parser must read every declared module and nothing else",
+        failures,
+    )
+    modules = ["alpha_tests", "beta_tests", "beta_tests_extra", "gamma_tests"]
+    scoped = ["integration::alpha_tests", "integration::beta_tests"]
+    remainder = "not test(/integration::(alpha_tests|beta_tests)/)"
+    require(
+        not integration_selection_failures(modules, scoped, remainder),
+        "integration registry selection fixture was rejected",
+        failures,
+    )
+    for label, case_modules, case_scoped, case_remainder in (
+        (
+            "remainder also excludes an unscoped module",
+            modules,
+            scoped,
+            "not test(/integration::(alpha_tests|beta_tests|gamma_tests)/)",
+        ),
+        (
+            "remainder re-runs a scoped module",
+            modules,
+            scoped,
+            "not test(/integration::(alpha_tests)/)",
+        ),
+        (
+            "module reached by two scoped filters",
+            modules,
+            [*scoped, "integration::beta_tests_extra"],
+            remainder,
+        ),
+        (
+            "stale scoped filter",
+            modules,
+            [*scoped, "integration::removed_tests"],
+            "not test(/integration::(alpha_tests|beta_tests|removed_tests)/)",
+        ),
+        ("malformed remainder filterset", modules, scoped, "all()"),
+        ("empty registry", [], scoped, remainder),
+    ):
+        require(
+            bool(integration_selection_failures(case_modules, case_scoped, case_remainder)),
+            f"integration registry mutation not caught: {label}",
+            failures,
+        )
 
     good = """
 name: Coverage
@@ -696,6 +846,15 @@ jobs:
     steps:
       - run: echo "${{ matrix.shard }}"
       - run: cargo llvm-cov --no-report --lib --test unit_tests
+      - if: matrix.kind == 'integration'
+        run: |
+          nextest_args+=(-E "$INTEGRATION_FILTERSET")
+          nextest_args+=(--partition "$INTEGRATION_PARTITION")
+          cargo llvm-cov --no-report nextest --test integration_tests "${nextest_args[@]}" "${filters[@]}"
+        env:
+          INTEGRATION_FILTERS: ${{ matrix.filters }}
+          INTEGRATION_FILTERSET: ${{ matrix.filterset }}
+          INTEGRATION_PARTITION: ${{ matrix.partition }}
       - if: matrix.kind == 'functional' && matrix.data_services == 'true'
         run: docker run -d mongo:7
       - if: matrix.kind == 'functional'
@@ -824,6 +983,16 @@ jobs:
             "--run-ignored all",
             "--no-fail-fast",
             "ignored functional tests skipped",
+        ),
+        (
+            'nextest_args+=(-E "$INTEGRATION_FILTERSET")',
+            "true",
+            "integration remainder filterset dropped",
+        ),
+        (
+            "INTEGRATION_PARTITION: ${{ matrix.partition }}",
+            'INTEGRATION_PARTITION: ""',
+            "integration remainder partition dropped",
         ),
     ]
     for old, new, label in mutations:
