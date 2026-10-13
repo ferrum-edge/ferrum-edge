@@ -231,6 +231,32 @@ def _decode_double_quoted(line: str) -> str:
     return DOUBLE_QUOTED.sub(lambda m: '"' + ESCAPE.sub(unescape, m.group(1)) + '"', line)
 
 
+CHILD_INPUT = re.compile(r"^ *[A-Za-z0-9_-]+ *:(?: +(?P<value>.*))?$")
+SINGLE_QUOTED_VALUE = re.compile(r"^'(?:[^']|'')*' *(?:#.*)?$")
+DOUBLE_QUOTED_VALUE = re.compile(r'^"(?:[^"\\]|\\.)*" *(?:#.*)?$')
+
+
+def _single_line_input(line: str) -> bool:
+    """Whether a `with:` child is a key whose value cannot continue onto later lines.
+
+    Block scalars (`|`, `>`) are fine: their bodies are indented deeper than
+    the key and are skipped. Quoted and flow values must close on this line.
+    """
+
+    match = CHILD_INPUT.match(line)
+    if match is None:
+        return False
+    value = (match.group("value") or "").strip()
+    if value.startswith("'"):
+        return SINGLE_QUOTED_VALUE.match(value) is not None
+    if value.startswith('"'):
+        return DOUBLE_QUOTED_VALUE.match(value) is not None
+    if value.startswith(("[", "{")):
+        closing = "]" if value[0] == "[" else "}"
+        return _strip_comment(value).endswith(closing)
+    return True
+
+
 def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
@@ -239,7 +265,7 @@ def _is_content(line: str) -> bool:
     return bool(line.strip()) and not line.lstrip().startswith("#")
 
 
-def checkout_credential_errors(text: str, source: str) -> list[str]:
+def checkout_credential_errors(text: str, source: str, *, composite: bool = False) -> list[str]:
     """Every `actions/checkout` step states `persist-credentials` explicitly.
 
     The action's default (`true`) writes the job's `GITHUB_TOKEN` to a
@@ -258,7 +284,11 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
     # `true` is only for scheduled or manual pushers. Anything else, including a
     # reusable `workflow_call` callee that a pull-request workflow can invoke,
     # or an unreadable trigger set, must say `false`.
-    true_admitted = triggers is not None and triggers <= PERSIST_TRUE_TRIGGERS
+    # A composite action runs inside whatever workflow calls it; an `on:` key in
+    # its metadata is ignored by the runner and restricts nothing.
+    true_admitted = (
+        not composite and triggers is not None and triggers <= PERSIST_TRUE_TRIGGERS
+    )
     errors: list[str] = []
     for index, line in enumerate(lines):
         if line.lstrip().startswith("#"):
@@ -327,6 +357,12 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
                     child_indent = _indent(body)
                 if _indent(body) != child_indent:
                     continue
+                # Every direct child must be one complete `key: value` line. A
+                # quoted or flow value left open here continues onto later lines
+                # at this same indent, which would then only look like keys.
+                if not _single_line_input(body):
+                    unreadable = True
+                    continue
                 if "persist-credentials" not in body:
                     continue
                 persist = PERSIST_LINE.match(body)
@@ -388,7 +424,9 @@ def check_repository(root: Path = Path(".")) -> list[str]:
     )
     for path in sorted(action_paths):
         errors.extend(
-            checkout_credential_errors(path.read_text(encoding="utf-8"), path.as_posix())
+            checkout_credential_errors(
+                path.read_text(encoding="utf-8"), path.as_posix(), composite=True
+            )
         )
     return errors
 
@@ -523,6 +561,10 @@ def run_self_test() -> list[str]:
     scalar_body = (
         "        with:\n          ssh-known-hosts: |\n            persist-credentials: false\n"
     )
+    quoted_ok = pr + f"      - uses: {pin}\n        with:\n          ref: 'main' # base\n" \
+        "          path: \"src\"\n          persist-credentials: false\n" + tail
+    if checkout_credential_errors(quoted_ok, "self-test checkout quoted single-line inputs"):
+        failures.append("checkout credential self-test: single-line quoted inputs were rejected")
     for label, text in (
         ("mixed-case missing", pr + f"      - uses: {mixed}\n" + tail),
         ("mixed-case true", pr + f"      - uses: {mixed}\n" + persist_true + tail),
@@ -536,6 +578,27 @@ def run_self_test() -> list[str]:
             "reusable callee true",
             "on:\n  workflow_call:\npermissions:\n  contents: read\njobs:\n  build:\n    steps:\n"
             f"      - uses: {pin}\n" + persist_true + tail,
+        ),
+        (
+            "single-quoted scalar impersonation",
+            pr + f"      - uses: {pin}\n        with:\n          ssh-known-hosts: 'ignored\n"
+            "          persist-credentials: false\n          '\n" + tail,
+        ),
+        (
+            "double-quoted scalar impersonation",
+            pr + f"      - uses: {pin}\n        with:\n          ssh-known-hosts: \"ignored\n"
+            "          persist-credentials: false\n          \"\n" + tail,
+        ),
+        (
+            "composite quoted scalar impersonation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        ssh-known-hosts: 'ignored\n"
+            "        persist-credentials: false\n        '\n    - run: true\n      shell: bash\n",
+        ),
+        (
+            "composite true",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        persist-credentials: true\n",
         ),
         (
             "composite block scalar impersonation",
@@ -567,6 +630,15 @@ def run_self_test() -> list[str]:
         )
         if not check_repository(root):
             failures.append("checkout credential self-test: composite-action checkout was accepted")
+        (root / ACTIONS_DIR / "hidden" / "action.yml").write_text(
+            "name: hidden\non:\n  workflow_dispatch:\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        persist-credentials: true\n",
+            encoding="utf-8",
+        )
+        if not check_repository(root):
+            failures.append(
+                "checkout credential self-test: composite with a fake trigger persisted credentials"
+            )
 
     frozen = pr.replace("  build:\n", "  docker:\n") + f"      - uses: {pin}\n" + tail
     if checkout_credential_errors(frozen, ".github/workflows/release.yml"):
