@@ -23729,7 +23729,20 @@ components:
         emit_mesh_request_principal_metadata:
           type: boolean
           default: false
-          description: Emits mesh.request_principal plus mesh JWT claim/audience metadata for direct mesh_authz request-principal and when-condition evaluation
+          description: >-
+            Emits mesh.request_principal plus mesh JWT claim/audience metadata
+            for direct mesh_authz request-principal and when-condition
+            evaluation. Metadata only; it never relaxes authentication.
+        allow_missing_token:
+          type: boolean
+          default: false
+          description: >-
+            Istio RequestAuthentication semantics. When true and this is the
+            only applicable auth plugin, a request carrying no token is
+            forwarded UNAUTHENTICATED (an invalid token is still rejected).
+            Mesh mode sets this on its generated RequestAuthentication
+            instance; leave it false on a standalone gateway unless optional
+            authentication is intended.
         require_exp:
           type: boolean
           default: true
