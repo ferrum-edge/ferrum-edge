@@ -2397,6 +2397,9 @@ fn test_constructor_rejects_credentialed_public_suffix_wildcards() {
         // Parents of PSL wildcard rules (`*.run.app`, `*.compute.amazonaws.com`).
         "*.run.app",
         "*.compute.amazonaws.com",
+        // Provider apexes with named PSL suffixes beneath them.
+        "*.amazonaws.com",
+        "*.amazonaws.com.cn",
     ] {
         let err = CorsPlugin::new(&json!({
             "allowed_origins": [origin],
@@ -2458,6 +2461,11 @@ fn test_constructor_rejects_credentialed_public_suffix_regex() {
         "https://[a-z]+example\\.com",
         // A host that is not terminated before the variable part.
         "https://app\\.example\\.com[a-z.]*",
+        // Provider apex subtrees.
+        "^https://.*\\.amazonaws\\.com$",
+        "https://[a-z0-9-]+\\.amazonaws\\.com\\.cn",
+        // An IPv6 colon is not a port separator.
+        "^https://\\[2001:[0-9a-f:]+\\]$",
     ] {
         let err = CorsPlugin::new(&json!({
             "allowed_origins": [{"regex": regex}],
@@ -2478,6 +2486,9 @@ fn test_constructor_rejects_credentialed_public_suffix_regex() {
         "^https://pr-[0-9]+\\.preview\\.example\\.com$",
         // A pinned host followed by a variable port.
         "^https://app\\.example\\.com:[0-9]+$",
+        "^https://[a-z]+\\.example\\.com:[0-9]+$",
+        "^https://[a-z]+\\.example\\.com(?::[0-9]+)?$",
+        "^https://\\[2001:db8::1\\]:[0-9]+$",
         "https://[a-z]+app\\.example\\.com",
         // A finite host alternation is a set of exact origins.
         "^https://(?:a|zq|probe)\\.github\\.io$",
