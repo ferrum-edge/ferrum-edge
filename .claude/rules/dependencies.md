@@ -218,6 +218,25 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   holds on `main` — read them there, never from this file. Background:
   `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
 
+## Cargo Dependabot And The Rustc Wrapper
+
+- The committed `.cargo/config.toml` must not set `[build] rustc-wrapper`. Every
+  cargo process under the root reads it, including Dependabot's cargo updater,
+  which runs `rustc -vV` through the wrapper and has no sccache. From #821 until
+  the wrapper was removed, every cargo version and security update failed with
+  `dependency_file_not_resolvable`. `verify_cross_build_policy.py`
+  (`EXPECTED_CARGO_BUILD`) allowlists exactly `incremental = false` and rejects
+  a committed wrapper; changing it is a direct-to-`main` / admin-merge change.
+- sccache is selected by environment: `setup-sccache` exports `RUSTC_WRAPPER` /
+  `CARGO_BUILD_RUSTC_WRAPPER` as the verified binary (or clears them), Cross and
+  the GNU sysroot build pass them empty, and `scripts/install-build-deps.sh`
+  writes the user-level `$CARGO_HOME/config.toml` wrapper locally.
+- Dependabot `cargo` version updates cover `/` and `/tests/performance/mesh`,
+  with minor/patch grouped. Every `[patch.crates-io]` crate plus `sqlx*` is in
+  `ignore`: a bump past the vendored version silently drops the patch (Cargo
+  only warns "patch was not used"). Keep that list equal to the patch table.
+  See `docs/dependency-policy.md` → "Cargo dependency updates".
+
 ## Drift Guard
 
 - `tests/integration/vendor_integrity_tests.rs` hashes every governed `vendor/`
