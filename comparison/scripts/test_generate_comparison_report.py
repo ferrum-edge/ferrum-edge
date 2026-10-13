@@ -14,6 +14,7 @@ Run directly: python3 comparison/scripts/test_generate_comparison_report.py
 """
 
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +103,28 @@ class ComparisonReportContractTests(unittest.TestCase):
         write_result(self.dir, "kong_http_api_echo_results.txt", 424242)
         html = render(self.dir, {"execution_mode": "all-docker"})
         self.assertIn(STALE_KONG_RPS, html)
+
+
+class RunComparisonManifestContractTests(unittest.TestCase):
+    """Every wrk result the driver writes must land in the run manifest.
+
+    Otherwise a successful arm would be filtered out of its own report
+    once ``result_files`` is present (for example Tyk's key-auth path,
+    which runs wrk directly rather than through ``run_wrk_key_auth``).
+    """
+
+    def test_each_result_writer_appends_to_the_manifest(self):
+        driver = SCRIPT.parents[1] / "run_comparison.sh"
+        text = driver.read_text()
+        writers = [m.start() for m in re.finditer(r'> "\$result_file" 2>&1', text)]
+        self.assertGreaterEqual(len(writers), 3, "expected the POST, key-auth and Tyk writers")
+        for start in writers:
+            window = text[start : start + 1200]
+            self.assertIn(
+                'basename "$result_file" >> "$CURRENT_RUN_MANIFEST"',
+                window,
+                f"result writer at offset {start} does not record its file in the manifest",
+            )
 
 
 if __name__ == "__main__":

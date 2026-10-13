@@ -1279,6 +1279,7 @@ test_tyk_key_auth() {
         --latency -s "$tyk_lua" "$url" > "$result_file" 2>&1; then
         log_warn "wrk failed for ${label} — see ${result_file}"
     else
+        basename "$result_file" >> "$CURRENT_RUN_MANIFEST"
         local rps
         rps=$(grep "Requests/sec:" "$result_file" | awk '{print $2}' || echo "N/A")
         local latency

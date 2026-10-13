@@ -64,8 +64,10 @@ jobs:
           set -euo pipefail
           # Fail loudly if the selector ever goes stale again and matches
           # nothing: the focused contract must be listed before it runs.
-          cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_echo_tests -- --list \
-            | grep -q "tcp_and_tls_shutdown_timeouts_remain_diagnostic_after_measured_echoes"
+          # Capture the listing first: piping into `grep -q` under pipefail
+          # can fail the step when grep exits before the listing is written.
+          listing=$(cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_echo_tests -- --list)
+          grep -F "tcp_and_tls_shutdown_timeouts_remain_diagnostic_after_measured_echoes: test" <<<"$listing"
           cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_echo_tests -- --nocapture
 
   benchmark:
