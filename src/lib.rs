@@ -124,6 +124,12 @@ pub mod _test_support {
         rows
     }
 
+    /// `kafka_logging` `producer_config` keys refused without
+    /// `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`, as `(key, effect)` (issue #6539).
+    pub fn kafka_native_producer_keys_for_test() -> &'static [(&'static str, &'static str)] {
+        crate::admin::crud::scoped_references::KAFKA_NATIVE_PRODUCER_KEYS
+    }
+
     /// Reviewed path-shaped plugin fields that name no gateway material.
     pub fn reviewed_non_material_plugin_fields_for_test() -> &'static [(&'static str, &'static str)]
     {

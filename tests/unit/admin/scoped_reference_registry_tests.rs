@@ -302,3 +302,26 @@ fn registry_extracts_concrete_field_paths_and_unsafe_open_map_keys() {
         .is_empty()
     );
 }
+
+/// No native `producer_config` key (issue #6539) may be on the tenant-safe
+/// list: a namespace-bounded operator stays refused even on a node that sets
+/// `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG=true`.
+#[test]
+fn kafka_native_producer_keys_are_never_tenant_safe() {
+    for (key, effect) in ferrum_edge::_test_support::kafka_native_producer_keys_for_test() {
+        assert!(!effect.is_empty(), "{key}: the refusal must say why");
+        let references = ferrum_edge::_test_support::plugin_scoped_references_for_test(
+            "kafka_logging",
+            &json!({"producer_config": {*key: "x"}}),
+        );
+        assert_eq!(
+            references,
+            vec![(
+                format!("config.producer_config.{key}"),
+                "x".to_string(),
+                "gateway_only"
+            )],
+            "{key} must stay refused for namespace-bounded operators"
+        );
+    }
+}

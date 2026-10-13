@@ -2057,3 +2057,119 @@ fn startup_diagnostics_withhold_kafka_enums_and_producer_keys() {
     assert!(rendered.contains("unsupported protocol"), "{rendered}");
     assert!(!rendered.contains("diagnostic-secret-5594"), "{rendered}");
 }
+
+// ---------------------------------------------------------------------------
+// librdkafka native-loader, command and gateway-file keys (issue #6539).
+// ---------------------------------------------------------------------------
+
+/// Every `producer_config` key the plugin material registry lists as native:
+/// it loads native code, runs a host command, or reads a gateway file.
+const NATIVE_PRODUCER_KEYS: &[&str] = &[
+    "plugin.library.paths",
+    "ssl.engine.location",
+    "ssl.engine.id",
+    "ssl.providers",
+    "sasl.kerberos.kinit.cmd",
+    "sasl.kerberos.keytab",
+    "sasl.oauthbearer.assertion.private.key.file",
+    "sasl.oauthbearer.assertion.file",
+    "sasl.oauthbearer.assertion.jwt.template.file",
+    "https.ca.location",
+    "offset.store.path",
+];
+
+/// `sasl_ssl` satisfies both the `ssl.*` and the `sasl.*`/`https.*` transport
+/// requirements, so only the native-key rule can refuse these configs.
+fn native_key_config(key: &str) -> serde_json::Value {
+    json!({
+        "broker_list": "localhost:9093",
+        "topic": "test",
+        "security_protocol": "sasl_ssl",
+        "sasl_mechanism": "PLAIN",
+        "sasl_username": "alice",
+        "sasl_password": "alice-secret",
+        "ssl_no_verify": true,
+        "producer_config": { key: "/opt/attacker/payload" }
+    })
+}
+
+#[test]
+fn native_producer_keys_are_refused_for_every_token_by_default() {
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let mut keys: Vec<String> = NATIVE_PRODUCER_KEYS.iter().map(|k| k.to_string()).collect();
+    // librdkafka matches names exactly; the refusal must not depend on case.
+    keys.push("Plugin.Library.Paths".to_string());
+    keys.push("SASL.KERBEROS.KINIT.CMD".to_string());
+    for key in keys {
+        let error = kafka_logging_validate_producer_admission_for_test(
+            &native_key_config(&key),
+            &default_http_client(),
+        )
+        .expect_err("a native producer_config key must be refused without the opt-in");
+        assert!(
+            error.contains(&format!("{key:?}"))
+                && error.contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
+            "{key}: the refusal must name the key and the opt-in: {error}"
+        );
+        assert!(
+            !error.contains("/opt/attacker/payload"),
+            "{key}: the refusal must not echo the configured value: {error}"
+        );
+        // Construction applies the same admission, so a stored config with a
+        // native key cannot start a producer either.
+        assert!(
+            KafkaLogging::new(&native_key_config(&key), &default_http_client()).is_err(),
+            "{key}: plugin construction must refuse a native key"
+        );
+    }
+}
+
+#[test]
+fn native_producer_keys_are_admitted_only_with_the_operator_opt_in() {
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    for value in ["true", "TRUE", "1", "yes"] {
+        env.set("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG", value);
+        for key in NATIVE_PRODUCER_KEYS {
+            kafka_logging_validate_producer_admission_for_test(
+                &native_key_config(key),
+                &default_http_client(),
+            )
+            .unwrap_or_else(|error| panic!("{key} with opt-in {value:?}: {error}"));
+        }
+    }
+    for value in ["false", "0", "no", "", "maybe"] {
+        env.set("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG", value);
+        assert!(
+            kafka_logging_validate_producer_admission_for_test(
+                &native_key_config("plugin.library.paths"),
+                &default_http_client(),
+            )
+            .is_err(),
+            "opt-in value {value:?} must not allow native keys"
+        );
+    }
+}
+
+#[test]
+fn native_producer_key_list_matches_the_plugin_material_registry() {
+    let registered = ferrum_edge::_test_support::kafka_native_producer_keys_for_test();
+    let mut registered: Vec<&str> = registered.iter().map(|(key, _)| *key).collect();
+    registered.sort_unstable();
+    let mut expected = NATIVE_PRODUCER_KEYS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(registered, expected);
+}
+
+#[test]
+fn ordinary_tuning_keys_do_not_need_the_opt_in() {
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    kafka_logging_validate_producer_admission_for_test(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "producer_config": {"linger.ms": "5", "compression.type": "lz4", "client.id": "edge"}
+        }),
+        &default_http_client(),
+    )
+    .expect("tuning keys stay admitted without the opt-in");
+}

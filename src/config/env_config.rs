@@ -335,6 +335,43 @@ pub fn parse_mesh_tenant_tls_file_roots(
     Ok(roots)
 }
 
+/// Settings key for the operator opt-in that re-allows `kafka_logging`
+/// `producer_config` keys which load native code, run a host command, or read
+/// a gateway file (issue #6539).
+pub const KAFKA_ALLOW_NATIVE_CONFIG_KEY: &str = "FERRUM_KAFKA_ALLOW_NATIVE_CONFIG";
+
+/// Pure parse/validation for `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`.
+///
+/// Unset or blank is `false`. Only `true`/`false` (and `1`/`0`, `yes`/`no`,
+/// case-insensitive) are accepted; anything else is an error so a typo cannot
+/// read as either answer.
+pub fn parse_kafka_allow_native_config(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(format!(
+                "{KAFKA_ALLOW_NATIVE_CONFIG_KEY} must be true or false"
+            )),
+        },
+    }
+}
+
+/// Whether this process allows `kafka_logging` native `producer_config` keys.
+///
+/// Resolved with the same env-over-`ferrum.conf` precedence `EnvConfig` uses,
+/// at each plugin admission, so every admission path in the process (admin
+/// writes, file and database loads, data-plane updates) gives one answer.
+/// `EnvConfig` refuses startup on a malformed value; if one is seen here
+/// anyway, the answer is `false`.
+pub fn kafka_native_config_allowed() -> bool {
+    parse_kafka_allow_native_config(
+        crate::config::conf_file::resolve_ferrum_var(KAFKA_ALLOW_NATIVE_CONFIG_KEY).as_deref(),
+    )
+    .unwrap_or(false)
+}
+
 /// Settings key for the shared TLS state document byte ceiling.
 pub const TLS_STORE_MAX_DOCUMENT_BYTES_KEY: &str = "FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES";
 /// Default shared TLS state document byte ceiling (16 MiB).
@@ -5155,6 +5192,12 @@ impl EnvConfig {
             resolve_var(conf, MESH_TENANT_TLS_FILE_ROOTS_KEY).as_deref(),
         )?;
         crate::tls::source::install_mesh_tenant_tls_file_roots(mesh_tenant_tls_file_roots)?;
+
+        // `kafka_logging` reads the opt-in at admission; validate it here so a
+        // malformed value refuses startup instead of reading as `false`.
+        parse_kafka_allow_native_config(
+            resolve_var(conf, KAFKA_ALLOW_NATIVE_CONFIG_KEY).as_deref(),
+        )?;
 
         let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
             parse_tls_source_execution_policy(

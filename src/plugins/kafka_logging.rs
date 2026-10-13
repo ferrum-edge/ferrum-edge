@@ -2526,6 +2526,23 @@ fn admit_producer_config(
                 "kafka_logging: `producer_config` key {key:?} is not allowed"
             ));
         }
+        // librdkafka properties that load native code, run a host command, or
+        // read a gateway file are refused for every token unless the operator
+        // opted the whole process in (issue #6539). The list lives in the
+        // central plugin material registry, which also refuses these keys to
+        // namespace-bounded operators regardless of the opt-in.
+        if let Some(effect) = crate::admin::crud::scoped_references::open_map_native_key(
+            "kafka_logging",
+            "producer_config",
+            &normalized,
+        ) && !crate::config::env_config::kafka_native_config_allowed()
+        {
+            return Err(format!(
+                "kafka_logging: `producer_config` key {key:?} is not allowed because it {effect}; \
+                 set {}=true on every node that admits or runs this plugin to allow it",
+                crate::config::env_config::KAFKA_ALLOW_NATIVE_CONFIG_KEY
+            ));
+        }
         if let Some((_, rationale)) = UNSUPPORTED_PRODUCER_KEYS
             .iter()
             .find(|(unsupported, _)| normalized.as_str() == *unsupported)
