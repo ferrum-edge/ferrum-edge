@@ -1238,6 +1238,10 @@ async fn run_dynamic_material_set_reload_loop(
     let rebuild: SharedMaterialSetRebuildFn = Arc::from(rebuild);
 
     let mut last_fingerprint: Option<DynamicMaterialFingerprint> = None;
+    // A tenant refusal (or recovery) transition whose rebuild failed has not
+    // invalidated cached configs yet. Retry it on every poll, even when the
+    // fingerprint is unchanged, until a rebuild succeeds.
+    let mut refusal_rebuild_pending = false;
     let mut load_failures = LoadFailureTransitionTracker::default();
     let mut last_source_signature: Option<Vec<(MaterialKind, String)>> = None;
     let mut k8s_targets = Vec::new();
@@ -1368,7 +1372,8 @@ async fn run_dynamic_material_set_reload_loop(
             continue;
         }
 
-        if last_fingerprint.as_ref() == Some(&next_fingerprint) {
+        let unchanged = last_fingerprint.as_ref() == Some(&next_fingerprint);
+        if unchanged && !refusal_rebuild_pending {
             record_refresh_for_entries(surface, &next_fingerprint.material.entries, "unchanged");
             if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
                 cleanup_dynamic_reload(surface, &mut k8s_handles);
@@ -1377,8 +1382,12 @@ async fn run_dynamic_material_set_reload_loop(
             continue;
         }
 
+        let refusal_changed = last_fingerprint
+            .as_ref()
+            .is_none_or(|last| last.refused != next_fingerprint.refused);
         match run_material_set_rebuild(&rebuild).await {
             Ok(()) => {
+                refusal_rebuild_pending = false;
                 let event_entries = next_fingerprint.material.entries.clone();
                 record_refresh_for_entries(surface, &next_fingerprint.material.entries, "rotated");
                 last_fingerprint = Some(next_fingerprint);
@@ -1397,17 +1406,21 @@ async fn run_dynamic_material_set_reload_loop(
                     &next_fingerprint.material.entries,
                     "rebuild_error",
                 );
-                crate::tls::events::record_rebuild_error(
-                    surface,
-                    &next_fingerprint.material.entries,
-                    &error,
-                );
+                refusal_rebuild_pending |= refusal_changed;
+                // A retry of an unchanged candidate is already reported.
+                if !unchanged {
+                    crate::tls::events::record_rebuild_error(
+                        surface,
+                        &next_fingerprint.material.entries,
+                        &error,
+                    );
+                    warn!(
+                        surface,
+                        error = %error,
+                        "TLS material sources changed but rebuild failed; keeping previous material"
+                    );
+                }
                 last_fingerprint = Some(next_fingerprint);
-                warn!(
-                    surface,
-                    error = %error,
-                    "TLS material sources changed but rebuild failed; keeping previous material"
-                );
             }
         }
 

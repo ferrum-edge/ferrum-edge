@@ -37,8 +37,9 @@ PEM, `system://`, or a `k8s://` Secret in the addressed namespace for
 `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`. The same rule now covers the
 route-local `client_cert_path`, `client_key_path` and `server_ca_cert_path`
 under `rules[].destination.backend_tls` in `mesh_route_dispatch` plugin
-configs and the `udp_logging` `dtls_cert_path`, `dtls_key_path` and
-`dtls_ca_cert_path` fields. Anything else is refused with `400` before it is
+configs, the `udp_logging` `dtls_cert_path`, `dtls_key_path` and
+`dtls_ca_cert_path` fields, and the `kafka_logging` `ssl_certificate_location`,
+`ssl_key_location` and `ssl_ca_location` fields. Anything else is refused with `400` before it is
 loaded.
 
 Values already stored in the same field (for `mesh_route_dispatch`, the same

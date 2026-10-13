@@ -4250,17 +4250,26 @@ pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
     fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
-        if self.plugin_name == "udp_logging" {
-            // DTLS sink identity and trust are loaded with the gateway's own
-            // credentials, exactly like backend TLS material.
-            let mut references = Vec::new();
-            for (field, kind) in [
+        // Logging sinks whose TLS identity and trust are loaded with the
+        // gateway's own credentials, exactly like backend TLS material.
+        let sink_fields: &[(&str, MaterialKind)] = match self.plugin_name.as_str() {
+            "udp_logging" => &[
                 ("dtls_cert_path", MaterialKind::Cert),
                 ("dtls_key_path", MaterialKind::Key),
                 ("dtls_ca_cert_path", MaterialKind::CaBundle),
-            ] {
-                if let Some(value) = self.config.get(field).and_then(Value::as_str) {
-                    references.push((format!("config.{field}"), value, kind));
+            ],
+            "kafka_logging" => &[
+                ("ssl_certificate_location", MaterialKind::Cert),
+                ("ssl_key_location", MaterialKind::Key),
+                ("ssl_ca_location", MaterialKind::CaBundle),
+            ],
+            _ => &[],
+        };
+        if !sink_fields.is_empty() {
+            let mut references = Vec::new();
+            for (field, kind) in sink_fields {
+                if let Some(value) = self.config.get(*field).and_then(Value::as_str) {
+                    references.push((format!("config.{field}"), value, *kind));
                 }
             }
             return references;

@@ -21430,7 +21430,8 @@ components:
           type: string
           minLength: 1
           pattern: '\S'
-          description: Path to CA certificate for broker TLS verification. Falls back to FERRUM_TLS_CA_BUNDLE_PATH
+          description: >-
+            Path to CA certificate for broker TLS verification. Falls back to FERRUM_TLS_CA_BUNDLE_PATH. Where admin namespace-claim enforcement is on, or the token carries an `ns` claim even with enforcement off, an `operator` may set only inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace; any other reference it introduces is refused with `400` before it is loaded. A value already stored in this field is exempt, and `admin`-role tokens are not restricted.
         ssl_no_verify:
           type: boolean
           description: Skip broker TLS certificate verification. Falls back to FERRUM_TLS_NO_VERIFY
@@ -21438,12 +21439,14 @@ components:
           type: string
           minLength: 1
           pattern: '\S'
-          description: Path to client certificate for mTLS
+          description: >-
+            Path to client certificate for mTLS. Where admin namespace-claim enforcement is on, or the token carries an `ns` claim even with enforcement off, an `operator` may set only inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace; any other reference it introduces is refused with `400` before it is loaded. A value already stored in this field is exempt, and `admin`-role tokens are not restricted.
         ssl_key_location:
           type: string
           minLength: 1
           pattern: '\S'
-          description: Path to client private key for mTLS
+          description: >-
+            Path to client private key for mTLS. Where admin namespace-claim enforcement is on, or the token carries an `ns` claim even with enforcement off, an `operator` may set only inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace; any other reference it introduces is refused with `400` before it is loaded. A value already stored in this field is exempt, and `admin`-role tokens are not restricted.
         producer_config:
           type: object
           propertyNames:

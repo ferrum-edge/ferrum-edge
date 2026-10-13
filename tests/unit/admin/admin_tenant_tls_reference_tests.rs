@@ -419,8 +419,8 @@ fn udp_logging_plugin_with(id: &str, field: &str, value: &str) -> Value {
     body
 }
 
-/// `udp_logging` DTLS identity and trust are resolved with the gateway's own
-/// credentials, so a namespace-claimed operator is confined there exactly as
+/// `udp_logging` DTLS and `kafka_logging` SSL identity and trust are resolved
+/// with the gateway's own credentials, so a namespace-claimed operator is confined there exactly as
 /// for backend TLS, whether or not the claim is required.
 #[tokio::test]
 async fn namespace_claim_confines_udp_logging_dtls_material_on_create_and_put() {
@@ -468,6 +468,31 @@ async fn namespace_claim_confines_udp_logging_dtls_material_on_create_and_put() 
                 let (status, response) =
                     put(&base, "/plugins/config/udp-base", &operator, &replacement).await;
                 assert_eq!(status, 400, "{require} PUT {field}: {response}");
+                assert!(is_scope_refusal(&response), "{response}");
+                assert!(!response.to_string().contains(value), "{response}");
+            }
+        }
+        // `kafka_logging` shares the same sink admission table and write path
+        // (the PUT arm is exercised above through `udp_logging`).
+        for field in [
+            "ssl_certificate_location",
+            "ssl_key_location",
+            "ssl_ca_location",
+        ] {
+            for value in ["k8s://tenant-b/material", "/absent/platform/material.pem"] {
+                let mut forbidden = json!({
+                    "id": format!("kafka-{field}"), "plugin_name": "kafka_logging",
+                    "scope": "proxy", "proxy_id": "p-partner", "enabled": true,
+                    "config": {
+                        "bootstrap_servers": "127.0.0.1:9093",
+                        "topic": "audit",
+                        "security_protocol": "ssl"
+                    }
+                });
+                forbidden["config"][field] = json!(value);
+                let (status, response) =
+                    post(&base, "/plugins/config", &operator, &forbidden).await;
+                assert_eq!(status, 400, "{require} kafka {field}: {response}");
                 assert!(is_scope_refusal(&response), "{response}");
                 assert!(!response.to_string().contains(value), "{response}");
             }

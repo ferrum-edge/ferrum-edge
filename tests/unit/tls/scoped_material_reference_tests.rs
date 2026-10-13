@@ -438,6 +438,95 @@ async fn refused_tenant_file_does_not_freeze_other_backend_rotations_or_rebuild_
         .unwrap();
 }
 
+/// A tenant refusal whose first rebuild fails (for example a gateway CRL that
+/// is briefly unreadable during the rebuild) must not be consumed: cached
+/// configs are still valid for the refused destination, so the watcher retries
+/// the unchanged candidate until a rebuild succeeds, then stops churning.
+#[tokio::test]
+async fn failed_rebuild_keeps_tenant_refusal_invalidation_pending_until_it_succeeds() {
+    use ferrum_edge::tls::source::{
+        CertSource,
+        subscription::{
+            DynamicMaterialSetReloadConfig, WatchedMaterialSource, request_material_set_reload,
+        },
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    const SURFACE: &str = "test_confined_backend_reload_retry";
+    let dir = tempfile::tempdir().unwrap();
+    let trusted = dir.path().join("other-ca.pem");
+    std::fs::write(&trusted, b"accepted bytes").unwrap();
+    let denied = CertSource::parse(
+        bound_file("/absent/tenant/retry.pem", MaterialKind::CaBundle),
+        MaterialKind::CaBundle,
+    );
+    let sources = vec![
+        WatchedMaterialSource::new("backend_ca", denied, MaterialKind::CaBundle),
+        WatchedMaterialSource::new(
+            "global_ca",
+            CertSource::from_path(&trusted),
+            MaterialKind::CaBundle,
+        ),
+    ];
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let rebuild_attempts = attempts.clone();
+    let (revision_tx, mut revision_rx) = tokio::sync::watch::channel(0u64);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = ferrum_edge::_test_support::spawn_backend_material_reload_for_test(
+        DynamicMaterialSetReloadConfig {
+            surface: SURFACE,
+            collect_sources: Box::new(move || sources.clone()),
+            file_default_interval: Duration::from_secs(3600),
+            provider_default_interval: Duration::from_secs(3600),
+            revision_tx,
+            max_material_bytes: 4096,
+            rebuild: Box::new(move || {
+                if rebuild_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("transient gateway source failure during rebuild");
+                }
+                Ok(())
+            }),
+        },
+        Some(shutdown_rx),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while attempts.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial refusal must attempt a rebuild"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *revision_rx.borrow_and_update(),
+        0,
+        "the failed rebuild published nothing"
+    );
+
+    assert!(request_material_set_reload(SURFACE));
+    tokio::time::timeout(Duration::from_secs(5), revision_rx.changed())
+        .await
+        .expect("an unchanged candidate with a pending refusal is retried")
+        .unwrap();
+    assert_eq!(*revision_rx.borrow_and_update(), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    assert!(request_material_set_reload(SURFACE));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), revision_rx.changed())
+            .await
+            .is_err(),
+        "once applied, an unchanged refusal must not rebuild again"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[test]
 fn constrained_file_uri_roundtrip_keeps_path_options_identity_and_refreshability() {
     use ferrum_edge::tls::source::{
