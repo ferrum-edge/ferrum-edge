@@ -456,6 +456,15 @@ pub fn fuzz_tls_material_accepts(data: &[u8]) -> bool {
     }
 }
 
+/// Record count of an admitted PEM certificate bundle, or `None` when the
+/// bundle parser refuses it. Lets the smoke tests pin the record limit, which
+/// no fuzz input can reach inside the 64 KiB budget.
+pub fn fuzz_pem_certificate_record_count(pem: &[u8]) -> Option<usize> {
+    parse_pem_certificate_bundle(pem, "fuzz", "fuzz")
+        .ok()
+        .map(|certificates| certificates.len())
+}
+
 /// Whether one DER CRL is inside its validity window at [`FUZZ_CRL_NOW_UNIX`].
 pub fn fuzz_crl_window_accepts(der: &[u8]) -> bool {
     classify_crl_window(&CertificateRevocationListDer::from(der), FUZZ_CRL_NOW_UNIX).is_ok()

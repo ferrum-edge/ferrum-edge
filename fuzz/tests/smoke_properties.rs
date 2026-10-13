@@ -1,10 +1,10 @@
 use ferrum_edge::fuzz_support::{
     MAX_FUZZ_INPUT_BYTES, fuzz_decode_config_document, fuzz_drain_mesh_udp_frames,
     fuzz_jwks_accepts, fuzz_jwt_svid_invariant, fuzz_parse_datagram_header,
-    fuzz_parse_proxy_protocol, fuzz_tls_material_accepts, fuzz_tls_material_invariant,
-    fuzz_translate_k8s_json, fuzz_validate_ocsp_structure, fuzz_validate_plugin_config,
-    mesh_udp_frame_round_trip, ocsp_structure_invariant, smoke_invariants,
-    traceparent_round_trip_invariant,
+    fuzz_parse_proxy_protocol, fuzz_pem_certificate_record_count, fuzz_tls_material_accepts,
+    fuzz_tls_material_invariant, fuzz_translate_k8s_json, fuzz_validate_ocsp_structure,
+    fuzz_validate_plugin_config, mesh_udp_frame_round_trip, ocsp_structure_invariant,
+    smoke_invariants, traceparent_round_trip_invariant,
 };
 use ferrum_edge::proxy::mesh_udp_frame::MAX_FRAME_PAYLOAD;
 use proptest::prelude::*;
@@ -180,4 +180,15 @@ fn plugin_config_cors_minimal() {
 #[test]
 fn input_budget_is_documented() {
     assert_eq!(MAX_FUZZ_INPUT_BYTES, 64 * 1024);
+}
+
+/// The certificate record limit (4096) sits far outside the fuzz input budget,
+/// so it is pinned here with minimal PEM records on both sides of the bound.
+#[test]
+fn pem_certificate_bundle_record_limit_is_exact() {
+    let record = b"-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n";
+    let at_limit = record.repeat(4096);
+    assert_eq!(fuzz_pem_certificate_record_count(&at_limit), Some(4096));
+    let over_limit = record.repeat(4097);
+    assert_eq!(fuzz_pem_certificate_record_count(&over_limit), None);
 }
