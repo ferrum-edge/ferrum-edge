@@ -337,7 +337,7 @@ opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = t
 aws-smithy-json = { version = "=0.62.7", optional = true }
 azure_security_keyvault_secrets = { version = "0.14", optional = true }
 azure_identity = { version = "0.35", optional = true }
-azure_core = { version = "0.35", optional = true }
+azure_core = { version = "1.1", optional = true }
 
 # GeoIP (geo_restriction plugin)
 maxminddb = "0.28"
