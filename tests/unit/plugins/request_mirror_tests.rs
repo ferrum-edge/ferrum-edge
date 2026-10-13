@@ -6698,6 +6698,7 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         "pin=q32&user_pin=q33&pincode=q34&%70in=q35&",
         "x-vercel-protection-bypass=q36&x-vercel-protection-%62ypass=q37&",
         "x-vercel-protection-%2562ypass=q38&",
+        "%20code=q39&+code=q40&%2520code=q41&",
         "continuation_token=c3&continuation%5Ftoken=c4&continuation%255Ftoken=c5&",
         "author=a1&signal=1&page=2&keyword=shoes&country_code=us&spin_count=3"
     );
@@ -6711,7 +6712,7 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         )),
         "benign pairs must be retained in order: {request_line}"
     );
-    for idx in 1..=38 {
+    for idx in 1..=41 {
         let value = format!("=q{idx}&");
         let tail = format!("=q{idx} ");
         assert!(

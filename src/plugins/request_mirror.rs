@@ -631,9 +631,10 @@ const MIRROR_BENIGN_KEY_PASS_SEGMENTS: &[&str] = &[
     "spins",
 ];
 
-/// Whole names (not segments) that are credentials on their own. `code` is the
-/// OAuth authorization-code callback parameter; as a segment it is too common
-/// (`country_code`, `zip-code`) to treat as a credential.
+/// Names that are credentials when they are the name's only alphanumeric
+/// segment. `code` is the OAuth authorization-code callback parameter; next to
+/// other segments it is too common (`country_code`, `zip-code`) to treat as a
+/// credential.
 const MIRROR_CREDENTIAL_WHOLE_NAMES: &[&str] = &["code"];
 
 /// Whole segments that contain the `auth` stem but name authorship or a URI
@@ -687,7 +688,14 @@ fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
 /// percent-decoded). Splitting on every non-alphanumeric byte means `-`, `_`,
 /// `.`, `+`, space and any other separator spelling yield the same segments.
 fn name_has_credential_class(name_lower: &str) -> bool {
-    if MIRROR_CREDENTIAL_WHOLE_NAMES.contains(&name_lower) {
+    // A whole-name credential also matches when separators surround it
+    // (` code`, `+code`, `code[]`): form decoders strip or normalise those.
+    let mut segments = name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty());
+    if let (Some(only), None) = (segments.next(), segments.next())
+        && MIRROR_CREDENTIAL_WHOLE_NAMES.contains(&only)
+    {
         return true;
     }
     let mut previous = None;
