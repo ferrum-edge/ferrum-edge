@@ -4912,7 +4912,8 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_BEFORE_PROXY: u32 = 1 << 3;
     pub const NEEDS_REQUEST_BODY_BYTES: u32 = 1 << 4;
     pub const HAS_BODY_BEFORE_AUTHENTICATE: u32 = 1 << 5;
-    pub const NEEDS_DECODED_QUERY_PARAMS: u32 = 1 << 6;
+    // `1 << 6` was `NEEDS_DECODED_QUERY_PARAMS`; HTTP/3 now always decodes
+    // query params (#6580), so no frontend reads that bit.
     pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u32 = 1 << 7;
     pub const HAS_RESPONSE_COMMITTED_HOOK: u32 = 1 << 8;
     pub const HAS_RESPONSE_STREAM_HOOKS: u32 = 1 << 9;
@@ -5220,9 +5221,6 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.needs_request_body_bytes() {
             caps |= PluginCapabilities::NEEDS_REQUEST_BODY_BYTES;
-        }
-        if p.requires_decoded_query_params() {
-            caps |= PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS;
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
