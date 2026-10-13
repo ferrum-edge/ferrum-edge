@@ -537,15 +537,89 @@ fn service_qualified_host_aliases(
     aliases
 }
 
+/// Insertion-ordered set of destination policy scopes.
+///
+/// Replicas of one Deployment share a SPIFFE identity, namespace and labels,
+/// so every backing workload of a service usually yields the SAME destination
+/// scope. Each listed scope costs one full policy evaluation per request
+/// (`evaluate_destination_policy_scopes`), so collapsing equal scopes at index
+/// build time turns an endpoints × policies authorize cost into
+/// distinct-scopes × policies (issue #6625).
+///
+/// Collapsing is behaviour-preserving: a scope's evaluation depends only on
+/// the scope's own fields, and the cross-scope fold keeps the FIRST deny,
+/// the FIRST audit and coalesces same-provider delegations, so a repeated
+/// scope never changes the decision, the reported policy, or the delegation.
+/// First-occurrence order is kept so the reported deny/audit policy stays the
+/// one the uncollapsed list would have reported.
+#[derive(Default)]
+struct DestinationScopeSet {
+    scopes: Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
+    by_fingerprint: HashMap<u64, Vec<usize>>,
+}
+
+impl DestinationScopeSet {
+    fn insert(&mut self, scope: &crate::modes::mesh::runtime::PolicyScopeCache) {
+        let bucket = self
+            .by_fingerprint
+            .entry(destination_scope_fingerprint(scope))
+            .or_default();
+        if bucket.iter().any(|&index| self.scopes[index] == *scope) {
+            return;
+        }
+        bucket.push(self.scopes.len());
+        self.scopes.push(scope.clone());
+    }
+
+    fn extend(&mut self, scopes: &[crate::modes::mesh::runtime::PolicyScopeCache]) {
+        for scope in scopes {
+            self.insert(scope);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.scopes.is_empty()
+    }
+
+    fn into_vec(self) -> Vec<crate::modes::mesh::runtime::PolicyScopeCache> {
+        self.scopes
+    }
+}
+
+/// Hash every field `PolicyScopeCache` equality compares, so equal scopes
+/// always share a bucket. Labels fold order-independently (a wrapping sum of
+/// per-pair hashes) because they live in a `HashMap`. Only a fingerprint
+/// collision falls back to a full equality check, which keeps index build
+/// linear even for a StatefulSet whose pods each carry a unique label.
+fn destination_scope_fingerprint(scope: &crate::modes::mesh::runtime::PolicyScopeCache) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut labels = 0u64;
+    for (key, value) in &scope.labels {
+        let mut pair = DefaultHasher::new();
+        key.hash(&mut pair);
+        value.hash(&mut pair);
+        labels = labels.wrapping_add(pair.finish());
+    }
+    let mut hasher = DefaultHasher::new();
+    scope.spiffe_id.as_str().hash(&mut hasher);
+    scope.namespace.hash(&mut hasher);
+    scope.service_namespace.hash(&mut hasher);
+    scope.service_name.hash(&mut hasher);
+    scope.labels.len().hash(&mut hasher);
+    labels.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn destination_policy_scopes_for_service_port(
     service: &crate::modes::mesh::config::MeshService,
     service_port: &crate::modes::mesh::config::ServicePort,
     workloads: &[crate::modes::mesh::config::Workload],
     multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> ServicePortDestinationScopes {
-    let mut scopes = Vec::new();
+    let mut scopes = DestinationScopeSet::default();
     let mut endpoint_backends = HashSet::new();
-    let mut endpoint_scopes: HashMap<_, Vec<_>> = HashMap::new();
+    let mut endpoint_scopes: HashMap<_, Vec<crate::modes::mesh::runtime::PolicyScopeCache>> =
+        HashMap::new();
     for workload in
         crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
     {
@@ -572,19 +646,21 @@ fn destination_policy_scopes_for_service_port(
             &service.namespace,
             &service.name,
         );
-        scopes.push(workload_scope.clone());
+        scopes.insert(&workload_scope);
         for address in &workload.addresses {
             if let Some(key) = DestinationBackendKey::new(address, app_port) {
                 endpoint_backends.insert(key.clone());
-                endpoint_scopes
-                    .entry(key)
-                    .or_default()
-                    .push(workload_scope.clone());
+                // One address normally backs one workload, so this list stays
+                // tiny; a linear check keeps it duplicate-free as well.
+                let endpoint = endpoint_scopes.entry(key).or_default();
+                if !endpoint.contains(&workload_scope) {
+                    endpoint.push(workload_scope.clone());
+                }
             }
         }
     }
     ServicePortDestinationScopes {
-        scopes,
+        scopes: scopes.into_vec(),
         endpoint_backends,
         endpoint_scopes,
     }
@@ -819,7 +895,8 @@ fn destination_policy_scope_index(
         }
     }
     for upstream in route_upstreams {
-        let mut route_scopes = Vec::new();
+        // Two ports of one Service carry the same scopes; collapse them too.
+        let mut route_scopes = DestinationScopeSet::default();
         let mut requires_destination_scope = false;
         let mut unscoped_target_seen = false;
         let mut external_target_seen = false;
@@ -860,7 +937,7 @@ fn destination_policy_scope_index(
             }
             if seen_service_ports.insert(service_key.clone()) {
                 if let Some(scopes) = service_port_scopes.get(&service_key) {
-                    route_scopes.extend(scopes.clone());
+                    route_scopes.extend(scopes);
                 } else {
                     unscoped_target_seen = true;
                 }
@@ -876,7 +953,9 @@ fn destination_policy_scope_index(
             && !external_target_seen
             && !route_scopes.is_empty()
         {
-            index.by_upstream.insert(upstream.id.clone(), route_scopes);
+            index
+                .by_upstream
+                .insert(upstream.id.clone(), route_scopes.into_vec());
         }
     }
     index
@@ -4943,5 +5022,106 @@ mod tests {
         let canonical =
             mesh_authz_authorization_path("/%61dmin").expect("pchar escape is decodable");
         assert_eq!(canonical, "/admin");
+    }
+
+    // ── Destination scope collapsing (issue #6625) ──────────────────────────
+
+    fn reviews_replica(index: usize, version: &str) -> crate::modes::mesh::config::Workload {
+        serde_json::from_value(serde_json::json!({
+            "spiffe_id": "spiffe://cluster.local/ns/shop/sa/reviews",
+            "selector": {"labels": {"app": "reviews", "version": version}},
+            "service_name": "reviews",
+            "addresses": [format!("10.1.{}.{}", index / 200, index % 200 + 1)],
+            "trust_domain": "cluster.local",
+            "namespace": "shop"
+        }))
+        .expect("workload")
+    }
+
+    fn reviews_slice(
+        workloads: Vec<crate::modes::mesh::config::Workload>,
+    ) -> crate::modes::mesh::slice::MeshSlice {
+        let refs: Vec<_> = workloads
+            .iter()
+            .map(|_| serde_json::json!({"spiffe_id": "spiffe://cluster.local/ns/shop/sa/reviews"}))
+            .collect();
+        let service: crate::modes::mesh::config::MeshService =
+            serde_json::from_value(serde_json::json!({
+                "name": "reviews",
+                "namespace": "shop",
+                "ports": [{"port": 9080}],
+                "workloads": refs
+            }))
+            .expect("service");
+        crate::modes::mesh::slice::MeshSlice {
+            namespace: "shop".to_string(),
+            services: vec![service],
+            workloads,
+            ..crate::modes::mesh::slice::MeshSlice::default()
+        }
+    }
+
+    #[test]
+    fn replicas_sharing_one_identity_index_a_single_destination_scope() {
+        use super::{DestinationBackendKey, destination_policy_scope_index};
+
+        let replicas = (0..300).map(|index| reviews_replica(index, "v1")).collect();
+        let index = destination_policy_scope_index(&reviews_slice(replicas), &[], &[]);
+
+        let upstream = crate::modes::mesh::mesh_outbound_upstream_id("shop", "reviews", 9080);
+        assert_eq!(
+            index.by_upstream[&upstream].len(),
+            1,
+            "300 identical replicas must cost one policy evaluation, not 300"
+        );
+        let alias = DestinationBackendKey::new("reviews.shop", 9080).expect("alias key");
+        assert_eq!(index.by_backend[&alias].len(), 1);
+        let endpoint = DestinationBackendKey::new("10.1.0.1", 9080).expect("endpoint key");
+        assert_eq!(index.by_backend[&endpoint].len(), 1);
+    }
+
+    #[test]
+    fn replicas_with_distinct_labels_keep_distinct_destination_scopes_in_order() {
+        use super::destination_policy_scope_index;
+
+        let mut replicas: Vec<_> = (0..50).map(|index| reviews_replica(index, "v1")).collect();
+        replicas.extend((50..100).map(|index| reviews_replica(index, "v2")));
+        replicas.push(reviews_replica(100, "v1"));
+        let index = destination_policy_scope_index(&reviews_slice(replicas), &[], &[]);
+
+        let upstream = crate::modes::mesh::mesh_outbound_upstream_id("shop", "reviews", 9080);
+        let versions: Vec<_> = index.by_upstream[&upstream]
+            .iter()
+            .map(|scope| scope.labels["version"].as_str())
+            .collect();
+        assert_eq!(versions, vec!["v1", "v2"], "first-occurrence order is kept");
+    }
+
+    #[test]
+    fn collapsing_repeated_scopes_never_changes_the_evaluation() {
+        let policies = vec![
+            scoped_policy("audit-alpha", "alpha", PolicyAction::Audit),
+            scoped_policy("deny-beta", "beta", PolicyAction::Deny),
+            scoped_policy(
+                "delegate-alpha",
+                "alpha",
+                PolicyAction::Custom {
+                    provider: "sample-ext-authz".to_string(),
+                },
+            ),
+        ];
+        let alpha = destination_scope("alpha", "reviews");
+        let beta = destination_scope("beta", "ratings");
+        let repeated = vec![
+            alpha.clone(),
+            beta.clone(),
+            alpha.clone(),
+            beta.clone(),
+            alpha.clone(),
+        ];
+        assert_eq!(
+            evaluate(&policies, &repeated),
+            evaluate(&policies, &[alpha, beta])
+        );
     }
 }

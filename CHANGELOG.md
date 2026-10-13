@@ -152,6 +152,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`mesh_authz` evaluates each distinct destination scope once** (issue
+  #6625). The destination index listed one scope per backing workload, so
+  authorizing a request to a Service with N identical replicas ran the full
+  policy evaluation N times. Equal scopes are now collapsed when the index is
+  built, keeping first-occurrence order. Decisions, reported policies and
+  delegations are unchanged.
+- **The mesh service graph is bounded and built on demand** (issue #6626).
+  Each data plane tracks at most 10,000 live edges, and new edges past the cap
+  are dropped with a sampled warning until idle edges expire. The
+  every-second worker that cloned and sorted every edge now only evicts idle
+  edges every 30 seconds. `GET /mesh/service-graph` rebuilds the snapshot when
+  the published one is at least a second old. Existing edges are updated
+  under a shard read lock instead of a write lock.
+
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
   fuzz lane compiled the stock registry crate instead of the patched DB-TLS
