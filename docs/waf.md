@@ -788,7 +788,9 @@ list or exempt.
 #### Responses: `on_unlisted_response_content_type`
 
 The same scan scope applies to response bodies when `response_inspection` and
-`response_body_inspection` are on. A non-empty response whose `Content-Type`
+`response_body_inspection` are on, with one difference: on responses
+`inspect_binary_body: true` brings **every** type into scope, multipart
+included, so nothing is unlisted and every body is scanned. A non-empty response whose `Content-Type`
 falls outside it used to stream past every response-body rule (stack-trace,
 source and data-leak detection) with no record. `on_unlisted_response_content_type`
 takes the same three values:
@@ -1306,7 +1308,7 @@ fire, then switch to `enforce`.
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
 | `on_unlisted_content_type` | enum | `fail_closed` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
-| `on_unlisted_response_content_type` | enum | `allow` | `allow` / `fail_closed` / `block`; the same for response bodies (see [Responses](#responses-on_unlisted_response_content_type)) |
+| `on_unlisted_response_content_type` | enum | `fail_closed` | `allow` / `fail_closed` / `block`; the same for response bodies (see [Responses](#responses-on_unlisted_response_content_type)) |
 | `body_methods` | string[] | `[POST,PUT,PATCH,DELETE]` | methods whose HTTP request bodies are scanned and governed by `on_unlisted_content_type`; WebSocket messages ignore it |
 | `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |

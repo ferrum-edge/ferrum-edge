@@ -158,13 +158,12 @@ enum TooLargeAction {
 /// rule is skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnlistedContentTypeAction {
-    /// Forward the body uninspected. Default for responses, whose type is
-    /// chosen by the origin and is routinely binary media.
+    /// Forward the body uninspected.
     Allow,
     /// Reject a non-empty unlisted body when an enforcing body policy for its
     /// direction applies to this request, so an enforcing rule cannot be
     /// sidestepped by relabelling the payload. Monitor-only policy never
-    /// starts blocking. Default for requests.
+    /// starts blocking. Default in both directions.
     FailClosed,
     /// Strict allowlist: reject every non-empty unlisted body while globally
     /// enforcing.

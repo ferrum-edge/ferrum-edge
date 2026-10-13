@@ -10,7 +10,7 @@
 //! `block` refuses every non-empty unlisted body while globally enforcing.
 //!
 //! `on_unlisted_response_content_type` is the response-side counterpart
-//! (default `allow`).
+//! (default `fail_closed`).
 
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -873,4 +873,32 @@ fn header_present_names_are_redacted_from_diagnostics() {
 
     let plain = waf(json!({ "mode": "monitor" })).unwrap();
     assert!(plain.request_headers_to_redact().is_empty());
+}
+
+/// On responses `inspect_binary_body` brings every type, multipart included,
+/// into the scan scope, so such a body is scanned by the rules rather than
+/// being unlisted: a hit still blocks for the rule.
+#[tokio::test]
+async fn binary_response_inspection_scans_multipart_instead_of_refusing_it() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "inspect_binary_body": true,
+        "on_unlisted_response_content_type": "block",
+        "custom_rules": [{
+            "id": "LEAK", "category": "custom", "target": "response_body",
+            "match_kind": "contains", "pattern": "leak-marker", "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let multipart = Some("multipart/mixed; boundary=b");
+    let (buffers, result, ctx) = respond(&plugin, multipart, b"--b\r\nclean\r\n--b--").await;
+    assert!(buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.body_uninspected"), None);
+    let (_, result, ctx) = respond(&plugin, multipart, b"--b\r\nleak-marker\r\n--b--").await;
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"));
 }
