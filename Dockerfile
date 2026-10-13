@@ -41,7 +41,7 @@ ARG BPF_LINKER_ARM64_SHA256=d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d8
 # is honored (and install rust-src on that pinned toolchain). core-only
 # build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 # Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:6ff07edce8775d0f64be7aba9197229407301bddf2054d62c27b541a6238a181 AS ebpf-builder
+FROM rust:latest@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
 ARG BPF_LINKER_AMD64_SHA256
@@ -91,7 +91,7 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 # Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:6ff07edce8775d0f64be7aba9197229407301bddf2054d62c27b541a6238a181 AS builder
+FROM rust:latest@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS builder
 
 # Install build dependencies
 # clang/libclang-dev: required by bindgen (used by zstd-sys)
