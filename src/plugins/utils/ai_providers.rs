@@ -59,7 +59,22 @@ impl AiTokenUsage {
         if self.provider.is_some() && newer.provider.is_some() && self.provider != newer.provider {
             return;
         }
+        let has_categories = newer.categories.family.is_some();
         let newer = self.categories.absorb(newer);
+        if has_categories {
+            // A malformed or overflowing side invalidates the stale count and
+            // the total that depended on it, instead of keeping them complete.
+            let (prompt_invalid, completion_invalid) = self.categories.invalid_sides();
+            if prompt_invalid {
+                self.prompt_tokens = None;
+            }
+            if completion_invalid {
+                self.completion_tokens = None;
+            }
+            if prompt_invalid || completion_invalid {
+                self.total_tokens = None;
+            }
+        }
 
         let component_updated = newer.prompt_tokens.is_some() || newer.completion_tokens.is_some();
         if newer.prompt_tokens.is_some() {
@@ -479,6 +494,7 @@ fn extract_openai_usage(json: &Value, provider: AiProvider) -> AiTokenUsage {
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(provider),
+        ..Default::default()
     }
 }
 
@@ -540,6 +556,7 @@ fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(AiProvider::Cohere),
+        ..Default::default()
     }
 }
 
@@ -614,6 +631,7 @@ fn extract_tgi_usage(json: &Value) -> AiTokenUsage {
         total_tokens: sum_pair(prompt, completion),
         model: None,
         provider: Some(AiProvider::Tgi),
+        ..Default::default()
     }
 }
 
@@ -753,13 +771,13 @@ impl UsageCategories {
         self.reported_total.merge(newer.reported_total);
     }
 
-    /// Fold one side. `None` when the side was not reported, when any of its
-    /// counters is malformed (never publish a partial count as complete), or
-    /// when only a category was reported for a provider that always sends
-    /// the base.
-    fn side(&self, base: Counter, extras: &[Counter]) -> Option<u64> {
+    /// Fold one side. `Absent` when the side was not reported (or only a
+    /// category was reported for a provider that always sends the base);
+    /// `Invalid` when any of its counters is malformed or their sum overflows
+    /// — never publish a partial or wrapped count as complete.
+    fn side(&self, base: Counter, extras: &[Counter]) -> Counter {
         if base == Counter::Invalid || extras.contains(&Counter::Invalid) {
-            return None;
+            return Counter::Invalid;
         }
         let base = match base {
             Counter::Value(base) => base,
@@ -768,32 +786,60 @@ impl UsageCategories {
             {
                 0
             }
-            _ => return None,
+            _ => return Counter::Absent,
         };
-        // Saturate: a provider-controlled overflow charges the maximum rather
-        // than wrapping to a small number.
-        Some(extras.iter().fold(base, |sum, counter| match counter {
-            Counter::Value(value) => sum.saturating_add(*value),
-            _ => sum,
-        }))
+        let mut sum = base;
+        for counter in extras {
+            if let Counter::Value(value) = counter {
+                match sum.checked_add(*value) {
+                    Some(next) => sum = next,
+                    None => return Counter::Invalid,
+                }
+            }
+        }
+        Counter::Value(sum)
+    }
+
+    /// `(prompt invalid, completion invalid)` for the merged state.
+    pub(crate) fn invalid_sides(&self) -> (bool, bool) {
+        (
+            self.side(self.prompt_base, &self.prompt_extras) == Counter::Invalid,
+            self.side(self.completion_base, &[self.completion_extra]) == Counter::Invalid,
+        )
     }
 
     fn fold(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         let prompt = self.side(self.prompt_base, &self.prompt_extras);
         let completion = self.side(self.completion_base, &[self.completion_extra]);
-        let reported = match self.reported_total {
-            Counter::Value(total) => Some(total),
+        let value = |side: Counter| match side {
+            Counter::Value(value) => Some(value),
             _ => None,
         };
-        // The provider total stays authoritative (it may cover a category
-        // this parser does not model) but never below its own components.
-        let derived = match (prompt, completion) {
-            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
-            _ => None,
-        };
-        let total = match (reported, derived) {
-            (Some(reported), Some(derived)) => Some(reported.max(derived)),
-            (reported, derived) => reported.or(derived),
+        // A malformed or overflowing side also invalidates the total: the
+        // whole usage is then unmetered rather than partially counted.
+        if prompt == Counter::Invalid
+            || completion == Counter::Invalid
+            || self.reported_total == Counter::Invalid
+        {
+            return (value(prompt), value(completion), None);
+        }
+        let (prompt, completion) = (value(prompt), value(completion));
+        let total = match self.reported_total {
+            // The provider total stays authoritative (it may cover a category
+            // this parser does not model) but never below the components the
+            // same usage reports, even when only one side is present.
+            Counter::Value(reported) => {
+                let known = match (prompt, completion) {
+                    (None, None) => Some(0),
+                    (p, c) => p.unwrap_or(0).checked_add(c.unwrap_or(0)),
+                };
+                known.map(|known| reported.max(known))
+            }
+            // Without a provider total, only both sides make a complete one.
+            _ => match (prompt, completion) {
+                (Some(p), Some(c)) => p.checked_add(c),
+                _ => None,
+            },
         };
         (prompt, completion, total)
     }

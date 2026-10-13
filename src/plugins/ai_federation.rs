@@ -4656,6 +4656,24 @@ fn fold_native_usage_categories(
     Ok(folded)
 }
 
+/// A reported provider total, never below the sum of whichever components the
+/// same response reports; without one, only both components make a total.
+fn clamped_reported_total(
+    reported: Option<u64>,
+    input: Option<u64>,
+    output: Option<u64>,
+    provider: &str,
+) -> Result<Option<u64>, String> {
+    let Some(reported) = reported else {
+        return summed_usage(input, output, provider);
+    };
+    let known = input
+        .unwrap_or(0)
+        .checked_add(output.unwrap_or(0))
+        .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed"))?;
+    Ok(Some(reported.max(known)))
+}
+
 fn summed_usage(
     input: Option<u64>,
     output: Option<u64>,
@@ -5021,12 +5039,14 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
         true,
         "Gemini",
     )?;
-    // The provider total stays authoritative but never below the components.
-    let derived = summed_usage(prompt_tokens, completion_tokens, "Gemini")?;
-    let total = match (resp["usageMetadata"]["totalTokenCount"].as_u64(), derived) {
-        (Some(reported), Some(derived)) => Some(reported.max(derived)),
-        (reported, derived) => reported.or(derived),
-    };
+    // The provider total stays authoritative but never below the components
+    // it reports, even when only one side is present.
+    let total = clamped_reported_total(
+        resp["usageMetadata"]["totalTokenCount"].as_u64(),
+        prompt_tokens,
+        completion_tokens,
+        "Gemini",
+    )?;
 
     if resp
         .get("usageMetadata")
@@ -5152,11 +5172,12 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
         false,
         "Bedrock",
     )?;
-    let derived = summed_usage(input_tokens, output_tokens, "Bedrock")?;
-    let total = match (resp["usage"]["totalTokens"].as_u64(), derived) {
-        (Some(reported), Some(derived)) => Some(reported.max(derived)),
-        (reported, derived) => reported.or(derived),
-    };
+    let total = clamped_reported_total(
+        resp["usage"]["totalTokens"].as_u64(),
+        input_tokens,
+        output_tokens,
+        "Bedrock",
+    )?;
 
     if resp
         .get("usage")

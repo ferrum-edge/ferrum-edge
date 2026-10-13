@@ -9687,3 +9687,27 @@ fn test_normalized_usage_nullable_cache_and_zero_omitted_gemini_base() {
     .unwrap();
     assert_eq!((prompt, completion, total), (10, 40, 50));
 }
+
+#[test]
+fn test_normalized_usage_clamps_one_sided_low_totals() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "toolUsePromptTokenCount": 1000,
+            "totalTokenCount": 1
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, _, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    assert_eq!((prompt, total), (1010, 1010));
+}

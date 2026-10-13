@@ -145,7 +145,24 @@ impl UsageAccumulator {
     }
 
     fn record(&mut self, usage: &AiTokenUsage) {
+        let has_categories = usage.categories != UsageCategories::default();
         let folded = self.categories.absorb(usage.clone());
+        if has_categories {
+            // A malformed or overflowing side (even in an event that carries
+            // nothing else) invalidates the stale count and its dependent
+            // total instead of leaving them complete.
+            let (prompt_invalid, completion_invalid) = self.categories.invalid_sides();
+            if prompt_invalid || completion_invalid {
+                if prompt_invalid {
+                    self.prompt_tokens = None;
+                }
+                if completion_invalid {
+                    self.completion_tokens = None;
+                }
+                self.total_tokens = None;
+                self.observed = true;
+            }
+        }
         let usage = &folded;
         if usage.prompt_tokens.is_none()
             && usage.completion_tokens.is_none()
@@ -274,8 +291,18 @@ impl UsageAccumulator {
             // sometimes restating cumulative input categories — on the terminal
             // delta. Categories merge field by field in `record`.
             Some("message_start") => {
-                if let Some(message) = json.get("message") {
-                    self.record(&extract_response_usage(message, AiProvider::Anthropic));
+                // Only the input side is authoritative here: `output_tokens`
+                // on `message_start` is an initial placeholder (commonly 1),
+                // and the cumulative output arrives on `message_delta`.
+                // Recording it would make an interrupted stream look complete
+                // at almost no output and release the reservation.
+                if let Some(Value::Object(usage)) =
+                    json.get("message").and_then(|message| message.get("usage"))
+                {
+                    let mut input_only = usage.clone();
+                    input_only.remove("output_tokens");
+                    let carrier = serde_json::json!({ "usage": Value::Object(input_only) });
+                    self.record(&extract_response_usage(&carrier, AiProvider::Anthropic));
                 }
             }
             Some("message_delta") => {

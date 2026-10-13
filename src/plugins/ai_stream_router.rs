@@ -4596,19 +4596,27 @@ impl AnthropicSseNormalizer {
     /// `message_delta` event) into the running counters. The billed input
     /// includes prompt-cache writes and reads, which Anthropic reports beside
     /// `input_tokens` rather than in it.
-    fn absorb_anthropic_usage(&mut self, carrier: &Value) {
-        let folded =
-            self.usage_categories
-                .absorb(super::utils::ai_providers::extract_response_usage(
-                    carrier,
-                    super::utils::ai_providers::AiProvider::Anthropic,
-                ));
+    ///
+    /// Returns `false` when a usage counter is malformed or its category sum
+    /// overflows; the caller fails the stream closed, exactly as the Gemini
+    /// normalizer does for a malformed `usageMetadata`.
+    fn absorb_anthropic_usage(&mut self, carrier: &Value) -> bool {
+        let usage = super::utils::ai_providers::extract_response_usage(
+            carrier,
+            super::utils::ai_providers::AiProvider::Anthropic,
+        );
+        let folded = self.usage_categories.absorb(usage);
+        let (prompt_invalid, completion_invalid) = self.usage_categories.invalid_sides();
+        if prompt_invalid || completion_invalid {
+            return false;
+        }
         if folded.prompt_tokens.is_some() {
             self.prompt_tokens = folded.prompt_tokens;
         }
         if folded.completion_tokens.is_some() {
             self.completion_tokens = folded.completion_tokens;
         }
+        true
     }
 
     fn unread_len(&self) -> usize {
@@ -4746,7 +4754,13 @@ impl AnthropicSseNormalizer {
                 if let Some(m) = message.get("model").and_then(Value::as_str) {
                     self.model = m.to_string();
                 }
-                self.absorb_anthropic_usage(message);
+                if !self.absorb_anthropic_usage(message) {
+                    self.fail_bound(
+                        "upstream provider sent malformed Anthropic usage; stream terminated",
+                        out,
+                    );
+                    return true;
+                }
                 if !self.role_emitted {
                     self.role_emitted = true;
                     self.write_chunk_line(json!({ "role": "assistant" }), None, out);
@@ -4871,7 +4885,13 @@ impl AnthropicSseNormalizer {
                 if !self.require_message_start("message_delta", out) {
                     return true;
                 }
-                self.absorb_anthropic_usage(event);
+                if !self.absorb_anthropic_usage(event) {
+                    self.fail_bound(
+                        "upstream provider sent malformed Anthropic usage; stream terminated",
+                        out,
+                    );
+                    return true;
+                }
                 let stop_reason = event["delta"]["stop_reason"].as_str();
                 if self.tools_forbidden && stop_reason == Some("tool_use") {
                     self.emit_upstream_error(

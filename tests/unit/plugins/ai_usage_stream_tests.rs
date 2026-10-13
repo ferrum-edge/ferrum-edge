@@ -1022,7 +1022,7 @@ fn malformed_counters_are_unmetered_not_partial() {
 }
 
 #[test]
-fn gemini_zero_omitted_candidates_and_saturating_overflow() {
+fn gemini_zero_omitted_candidates_overflow_and_one_sided_total() {
     use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
 
     // proto3 omits a zero `candidatesTokenCount`; thoughts are still output.
@@ -1037,7 +1037,8 @@ fn gemini_zero_omitted_candidates_and_saturating_overflow() {
     assert_eq!(filtered.completion_tokens, Some(40));
     assert_eq!(filtered.total_tokens, Some(50));
 
-    // An overflowing category saturates; a tiny reported total cannot win.
+    // An overflowing category sum is unmetered (the documented policy for
+    // overflowing usage), so a tiny reported total cannot stand in for it.
     let overflow = extract_response_usage(
         &json!({"usageMetadata": {
             "promptTokenCount": 1,
@@ -1047,6 +1048,85 @@ fn gemini_zero_omitted_candidates_and_saturating_overflow() {
         }}),
         AiProvider::Google,
     );
-    assert_eq!(overflow.prompt_tokens, Some(u64::MAX));
-    assert_eq!(overflow.total_tokens, Some(u64::MAX));
+    assert_eq!(overflow.prompt_tokens, None);
+    assert_eq!(overflow.total_tokens, None);
+    assert!(!overflow.is_complete_for_mode("total_tokens"));
+
+    // A one-sided usage still clamps an explicit low total.
+    let one_sided = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "toolUsePromptTokenCount": 1000,
+            "totalTokenCount": 1
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(one_sided.prompt_tokens, Some(1010));
+    assert_eq!(one_sided.total_tokens, Some(1010));
+}
+
+#[test]
+fn anthropic_start_output_placeholder_is_not_a_complete_count() {
+    // `message_start` carries an initial `output_tokens` placeholder; a stream
+    // interrupted before `message_delta` must stay incomplete for completion
+    // and total modes so the reservation is kept.
+    let body = sse(&[
+        &json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 25, "output_tokens": 1}}
+        })
+        .to_string(),
+        &json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "partial"}})
+            .to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    let usage = extractor.usage();
+    assert_eq!(usage.total_for_mode("prompt_tokens"), Some(25));
+    assert!(usage.is_complete_for_mode("prompt_tokens"));
+    assert!(!usage.is_complete_for_mode("completion_tokens"));
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn valid_then_malformed_update_invalidates_the_stale_count() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let start = json!({
+        "type": "message_start",
+        "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 100}}
+    });
+    let malformed_delta = json!({
+        "type": "message_delta",
+        "usage": {"input_tokens": 20, "cache_read_input_tokens": "bad", "output_tokens": 5}
+    });
+    // Streaming accumulator.
+    let body = sse(&[&start.to_string(), &malformed_delta.to_string()]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("prompt_tokens"));
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+
+    // A malformed-only event still reaches invalidation.
+    let body = sse(&[
+        &start.to_string(),
+        &json!({"type": "message_delta", "usage": {"cache_read_input_tokens": "bad"}}).to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("prompt_tokens"));
+
+    // Cumulative merge (buffered SSE metrics path).
+    let mut merged = extract_response_usage(&start["message"], AiProvider::Anthropic);
+    assert_eq!(merged.prompt_tokens, Some(110));
+    merged.merge_cumulative(extract_response_usage(
+        &malformed_delta,
+        AiProvider::Anthropic,
+    ));
+    assert_eq!(merged.prompt_tokens, None);
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
 }
