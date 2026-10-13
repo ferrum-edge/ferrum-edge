@@ -4212,6 +4212,7 @@ BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
     'echo "::error::${file} pins ${tagged}@${current}; the refresh cannot rewrite workflow or trusted policy files, so move that pin into a Dockerfile it reads"',
     "exit 1",
     "*Dockerfile*|*.yml|*.yaml)",
+    'consumers="${consumers}${file} "',
     "for file in ${consumers}; do",
     'sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"',
 )
@@ -5429,6 +5430,11 @@ def self_test() -> int:
             "that skips a refused consumer instead of failing",
             "move that pin into a Dockerfile it reads\"\n                  exit 1\n",
             "move that pin into a Dockerfile it reads\"\n",
+        ),
+        (
+            "that never collects a consumer",
+            '                  consumers="${consumers}${file} "\n',
+            "                  true\n",
         ),
         (
             "that stages only the Dockerfiles",
