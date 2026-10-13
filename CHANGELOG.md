@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `VAULT_ADDR` must use `https` unless the Vault host is
+  loopback** (issue #6582). `_VAULT` and `vault://` resolution accepted
+  `http` for any host, so a remote plaintext address sent `VAULT_TOKEN` and
+  every fetched secret unencrypted. Plaintext `http` is now refused for a
+  non-loopback host with a diagnostic naming `VAULT_ADDR` (the address and
+  token are not echoed). `localhost`, `127.0.0.0/8`, `::1`, and IPv4-mapped
+  loopback stay accepted for a local Vault agent or dev server. Set
+  `FERRUM_VAULT_ALLOW_PLAINTEXT=true` in the environment to accept remote
+  plaintext explicitly; Ferrum then logs a warning once.
+
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is

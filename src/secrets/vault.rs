@@ -9,6 +9,68 @@ pub fn resolve_ref(key: &str) -> Option<String> {
     env::var(&vault_key).ok().filter(|s| !s.is_empty())
 }
 
+/// Opt-in that lets `VAULT_ADDR` use plaintext `http` for a non-loopback host.
+///
+/// Read from the process environment only, like `VAULT_ADDR` and `VAULT_TOKEN`
+/// themselves: Vault client construction runs during startup secret resolution,
+/// before `ferrum.conf` is loaded.
+const ALLOW_PLAINTEXT_ENV: &str = "FERRUM_VAULT_ALLOW_PLAINTEXT";
+
+/// Refuse plaintext Vault traffic that leaves the host (issue #6582).
+///
+/// Every Vault request carries `VAULT_TOKEN` in `X-Vault-Token` and every
+/// response carries a secret, so `http` to a remote host hands both to any
+/// on-path observer. `https` is always accepted. `http` is accepted for a
+/// loopback host (`localhost`, `127.0.0.0/8`, `::1`, or an IPv4-mapped
+/// loopback), where a local agent or dev server never puts the token on the
+/// network, and otherwise only when [`ALLOW_PLAINTEXT_ENV`] is `true`.
+///
+/// Diagnostics name the variables and the failure class only, never the
+/// address, so userinfo or a sensitive host name cannot leak through them.
+fn check_plaintext_policy(
+    addr: &url::Url,
+    allow_plaintext: Option<&str>,
+) -> Result<(), String> {
+    let allow = match allow_plaintext.map(str::trim) {
+        None | Some("") => false,
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => return Err(format!("{ALLOW_PLAINTEXT_ENV} must be true or false")),
+        },
+    };
+    if addr.scheme() != "http" || host_is_loopback(addr) {
+        return Ok(());
+    }
+    if !allow {
+        return Err(format!(
+            "VAULT_ADDR must use https for a non-loopback Vault host: plaintext http would \
+             send VAULT_TOKEN and every fetched secret unencrypted. Use https, or set \
+             {ALLOW_PLAINTEXT_ENV}=true to accept plaintext Vault traffic"
+        ));
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "VAULT_ADDR uses plaintext http to a non-loopback host because \
+             {ALLOW_PLAINTEXT_ENV}=true; VAULT_TOKEN and fetched secrets cross the network \
+             unencrypted"
+        );
+    });
+    Ok(())
+}
+
+fn host_is_loopback(addr: &url::Url) -> bool {
+    match addr.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        None => false,
+    }
+}
+
 /// Reusable Vault client for batch secret resolution.
 /// Created once and shared across multiple Vault secret fetches.
 pub struct VaultClientWrapper {
@@ -28,6 +90,7 @@ impl VaultClientWrapper {
         if !matches!(parsed_addr.scheme(), "http" | "https") {
             return Err("VAULT_ADDR must use http or https".to_string());
         }
+        check_plaintext_policy(&parsed_addr, env::var(ALLOW_PLAINTEXT_ENV).ok().as_deref())?;
 
         let mut settings_builder = vaultrs::client::VaultClientSettingsBuilder::default();
         // vaultrs 0.8's address setter panics on parse failure. A serialized

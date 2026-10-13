@@ -370,7 +370,7 @@ Each cloud backend uses its SDK's standard credential chain. The required enviro
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `VAULT_ADDR` | Yes | Vault server URL (e.g. `https://vault.example.com:8200`) |
+| `VAULT_ADDR` | Yes | Vault server URL (e.g. `https://vault.example.com:8200`). Plaintext `http` is refused unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`) or `FERRUM_VAULT_ALLOW_PLAINTEXT=true` is set |
 | `VAULT_TOKEN` | Yes | Authentication token with read access to the referenced secret paths |
 
 Uses KV v2 engine. The `_VAULT` reference format is `<mount>/data/<path>#<json_key>` (e.g. `secret/data/ferrum#admin_jwt`). The `#<json_key>` suffix is required if the Vault secret contains multiple keys; if omitted, the secret must contain exactly one key or startup fails with an error.
