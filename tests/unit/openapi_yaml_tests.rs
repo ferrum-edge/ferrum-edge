@@ -19022,3 +19022,52 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
     ));
     assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
 }
+
+/// Issue #6620: every `claim_headers` schema encodes the representable object
+/// bounds the runtime enforces (16 mappings, 256-byte claim paths).
+#[test]
+fn claim_headers_schemas_encode_runtime_object_bounds() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for pointer in [
+        "/components/schemas/JwksAuthConfig/properties/claim_headers",
+        "/components/schemas/JwksAuthConfig/properties/providers/items/properties/claim_headers",
+        "/components/schemas/Oauth2IntrospectionConfig/properties/providers/items/properties/claim_headers",
+        "/components/schemas/OidcRelyingPartyConfig/properties/providers/items/properties/claim_headers",
+    ] {
+        let schema = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("missing {pointer}"));
+        let validator = jsonschema::draft202012::options()
+            .build(schema)
+            .unwrap_or_else(|error| panic!("{pointer} compiles: {error}"));
+
+        let at_cap: serde_json::Map<String, serde_json::Value> = (0..16)
+            .map(|index| (format!("claim{index}"), json!(format!("x-claim-{index}"))))
+            .collect();
+        assert!(
+            validator.validate(&json!(at_cap)).is_ok(),
+            "{pointer}: 16 mappings"
+        );
+        let over_cap: serde_json::Map<String, serde_json::Value> = (0..17)
+            .map(|index| (format!("claim{index}"), json!(format!("x-claim-{index}"))))
+            .collect();
+        assert!(
+            validator.validate(&json!(over_cap)).is_err(),
+            "{pointer}: 17 mappings"
+        );
+
+        let mut long_path = serde_json::Map::new();
+        long_path.insert("a".repeat(257), json!("x-claim"));
+        assert!(
+            validator.validate(&json!(long_path)).is_err(),
+            "{pointer}: 257-byte claim path"
+        );
+        let mut path_at_cap = serde_json::Map::new();
+        path_at_cap.insert("a".repeat(256), json!("x-claim"));
+        assert!(
+            validator.validate(&json!(path_at_cap)).is_ok(),
+            "{pointer}: 256-byte claim path"
+        );
+    }
+}

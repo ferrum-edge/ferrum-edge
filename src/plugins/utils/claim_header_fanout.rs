@@ -39,6 +39,10 @@ pub struct ClaimHeaderDestinations {
     /// metadata key is precomputed so the request path can look a destination's
     /// staged value up directly, with no per-request formatting.
     entries: Vec<(String, String)>,
+    /// Per entry, the destination as a CGI-style backend reads it (`_` folded
+    /// to `-`). The once-per-request sanitization marker is keyed on this, so
+    /// instances owning `x-tenant-id` and `x_tenant_id` claim one destination.
+    sanitization_keys: Vec<String>,
 }
 
 impl ClaimHeaderDestinations {
@@ -62,7 +66,14 @@ impl ClaimHeaderDestinations {
             .collect();
         entries.sort_unstable();
         entries.dedup();
-        Self { entries }
+        let sanitization_keys = entries
+            .iter()
+            .map(|(_, destination)| backend_equivalence_key(destination))
+            .collect();
+        Self {
+            entries,
+            sanitization_keys,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -409,23 +420,27 @@ fn sanitize_owned_claim_header_destinations(
     }
     let sanitized = ctx.plugin_state_mut();
     headers.retain(|name, _| {
-        !destinations.names().any(|destination| {
-            !sanitized
-                .sanitized_claim_header_destinations
-                .contains(destination)
-                && crate::proxy::headers::field_names_equivalent_for_backends(name, destination)
-        })
+        !destinations
+            .names()
+            .zip(destinations.sanitization_keys.iter())
+            .any(|(destination, key)| {
+                !sanitized.sanitized_claim_header_destinations.contains(key)
+                    && crate::proxy::headers::field_names_equivalent_for_backends(name, destination)
+            })
     });
-    for destination in destinations.names() {
-        if !sanitized
-            .sanitized_claim_header_destinations
-            .contains(destination)
-        {
+    for key in &destinations.sanitization_keys {
+        if !sanitized.sanitized_claim_header_destinations.contains(key) {
             sanitized
                 .sanitized_claim_header_destinations
-                .insert(destination.to_string());
+                .insert(key.clone());
         }
     }
+}
+
+/// A destination name as a CGI-style backend reads it: ASCII-lowercased with
+/// `_` folded to `-` (see `field_names_equivalent_for_backends`).
+fn backend_equivalence_key(name: &str) -> String {
+    name.to_ascii_lowercase().replace('_', "-")
 }
 
 pub fn parse_separator(
