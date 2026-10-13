@@ -1357,6 +1357,8 @@ mod windows_confined_files {
         // between native lookup instructions; the earlier swaps are deterministic.
     }
 
+    // Ignored in ordinary runs; `.github/workflows/windows-confinement.yml`
+    // runs it explicitly on an elevated hosted Windows runner.
     #[test]
     #[ignore = "requires elevated NTFS case-sensitive-directory security gate"]
     fn windows_case_sensitive_sibling_is_not_an_allowed_root_alias() {
