@@ -186,6 +186,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Authorization servers that serialize unset members as `null` used to fail
   every authentication with a 503. A null member never hides a present sibling
   bound, and other non-integer values are still a 503.
+- **Plugin instances with a `priority_override` or trigger keep every
+  capability declaration** (issue #6606). The cache wrapper did not forward
+  `admits_authenticated_stream_principal`, `cors_uses_strict_origin_policy`
+  or `rejects_with_origin_response`, so a wrapped `mtls_auth` or
+  `spiffe_identity` instance on a kTLS TCP listener was refused at relay time
+  instead of staying on the buffered path, a wrapped strict `cors` instance
+  skipped the WebSocket-origin warning, and a wrapped cache plugin's origin
+  responses were tagged as gateway rejections. A unit test now fails when any
+  `Plugin` trait method lacks a wrapper forward.
 
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
