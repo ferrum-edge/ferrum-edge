@@ -29,6 +29,8 @@ const EDGE_PRUNE_INTERVAL_MS: u64 = 30_000;
 /// edges are dropped (with a sampled warning) until retention frees a slot;
 /// edges already tracked keep counting.
 const MAX_SERVICE_GRAPH_EDGES: usize = 10_000;
+/// Sentinel for "no snapshot built yet", so the first read always rebuilds.
+const SNAPSHOT_NEVER_PUBLISHED: u64 = u64::MAX;
 
 static GLOBAL_SERVICE_GRAPH: LazyLock<Arc<ServiceGraphRegistry>> =
     LazyLock::new(|| Arc::new(ServiceGraphRegistry::default()));
@@ -129,7 +131,11 @@ pub struct ServiceGraphRegistry {
     edge_count: AtomicUsize,
     dropped_edge_transactions: AtomicU64,
     snapshot: ArcSwap<ServiceGraphSnapshot>,
-    last_snapshot_unix_ms: AtomicU64,
+    /// Monotonic publication instant (`socket_opts::monotonic_now_ms`), or
+    /// [`SNAPSHOT_NEVER_PUBLISHED`]. Refresh throttling must not use wall
+    /// time: a backward clock step would make an old snapshot look fresh and
+    /// freeze the graph until the wall clock caught up.
+    last_snapshot_monotonic_ms: AtomicU64,
     snapshot_rebuilding: AtomicBool,
     snapshot_worker_started: AtomicBool,
 }
@@ -141,7 +147,7 @@ impl Default for ServiceGraphRegistry {
             edge_count: AtomicUsize::new(0),
             dropped_edge_transactions: AtomicU64::new(0),
             snapshot: ArcSwap::from_pointee(ServiceGraphSnapshot::default()),
-            last_snapshot_unix_ms: AtomicU64::new(0),
+            last_snapshot_monotonic_ms: AtomicU64::new(SNAPSHOT_NEVER_PUBLISHED),
             snapshot_rebuilding: AtomicBool::new(false),
             snapshot_worker_started: AtomicBool::new(false),
         }
@@ -193,34 +199,37 @@ impl ServiceGraphRegistry {
             counters.observe(summary.latency_total_ms, is_error, now_unix_ms);
             return;
         }
-        // A new edge must reserve a slot under the cap before it is inserted.
-        if self
-            .edge_count
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < MAX_SERVICE_GRAPH_EDGES).then_some(count + 1)
-            })
-            .is_err()
-        {
-            let dropped = self
-                .dropped_edge_transactions
-                .fetch_add(1, Ordering::Relaxed)
-                .saturating_add(1);
-            warn_sampled!(
-                max_edges = MAX_SERVICE_GRAPH_EDGES,
-                dropped_transactions_total = dropped,
-                "mesh service graph is at its edge cap; dropping transactions for new edges until idle edges expire"
-            );
-            return;
-        }
+        // A miss takes the shard write lock and only a genuinely new edge
+        // reserves capacity. A request that lost the insert race to another
+        // request for the same edge lands in `Occupied` and is always counted,
+        // even when that insert took the last slot.
         match self.edges.entry(key) {
             Entry::Occupied(entry) => {
-                // Another request inserted it first: release the reservation.
-                self.edge_count.fetch_sub(1, Ordering::Relaxed);
                 entry
                     .get()
                     .observe(summary.latency_total_ms, is_error, now_unix_ms);
             }
             Entry::Vacant(entry) => {
+                if self
+                    .edge_count
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                        (count < MAX_SERVICE_GRAPH_EDGES).then_some(count + 1)
+                    })
+                    .is_err()
+                {
+                    // Release the shard before logging.
+                    drop(entry);
+                    let dropped = self
+                        .dropped_edge_transactions
+                        .fetch_add(1, Ordering::Relaxed)
+                        .saturating_add(1);
+                    warn_sampled!(
+                        max_edges = MAX_SERVICE_GRAPH_EDGES,
+                        dropped_transactions_total = dropped,
+                        "mesh service graph is at its edge cap; dropping transactions for new edges until idle edges expire"
+                    );
+                    return;
+                }
                 entry
                     .insert(ServiceGraphCounters::new(now_unix_ms))
                     .observe(summary.latency_total_ms, is_error, now_unix_ms);
@@ -235,13 +244,18 @@ impl ServiceGraphRegistry {
     /// most once per refresh interval however often they poll: concurrent
     /// readers that lose the rebuild race return the published snapshot.
     pub fn snapshot(&self) -> Arc<ServiceGraphSnapshot> {
-        self.refresh_snapshot_if_stale(now_unix_ms());
+        self.refresh_snapshot_if_stale(crate::socket_opts::monotonic_now_ms(), now_unix_ms());
         self.snapshot.load_full()
     }
 
-    fn refresh_snapshot_if_stale(&self, now_unix_ms: u64) {
-        let is_stale = |last: u64| now_unix_ms.saturating_sub(last) >= SNAPSHOT_REFRESH_MIN_MS;
-        if !is_stale(self.last_snapshot_unix_ms.load(Ordering::Acquire)) {
+    /// Throttled on the monotonic clock; `now_unix_ms` only stamps the
+    /// published snapshot and judges edge retention.
+    fn refresh_snapshot_if_stale(&self, now_monotonic_ms: u64, now_unix_ms: u64) {
+        let is_stale = |last: u64| {
+            last == SNAPSHOT_NEVER_PUBLISHED
+                || now_monotonic_ms.saturating_sub(last) >= SNAPSHOT_REFRESH_MIN_MS
+        };
+        if !is_stale(self.last_snapshot_monotonic_ms.load(Ordering::Acquire)) {
             return;
         }
         if self
@@ -252,8 +266,8 @@ impl ServiceGraphRegistry {
             return;
         }
         // Another reader may have published while this one raced for the flag.
-        if is_stale(self.last_snapshot_unix_ms.load(Ordering::Acquire)) {
-            self.rebuild_snapshot(now_unix_ms);
+        if is_stale(self.last_snapshot_monotonic_ms.load(Ordering::Acquire)) {
+            self.rebuild_snapshot_at(now_monotonic_ms, now_unix_ms);
         }
         self.snapshot_rebuilding.store(false, Ordering::Release);
     }
@@ -310,11 +324,16 @@ impl ServiceGraphRegistry {
         }
     }
 
-    fn rebuild_snapshot(&self, generated_at_unix_ms: u64) {
+    fn rebuild_snapshot_at(&self, now_monotonic_ms: u64, generated_at_unix_ms: u64) {
         self.prune_stale_edges(generated_at_unix_ms);
+        // `iter_mut` holds each shard's WRITE lock while its edges are read.
+        // Updates hold the read (or write) lock across all of an edge's
+        // counter increments, so every edge is captured between observations:
+        // `errors_total <= requests_total` and the duration total describe the
+        // same request count.
         let mut edges: Vec<ServiceGraphEdge> = self
             .edges
-            .iter()
+            .iter_mut()
             .map(|entry| entry.value().snapshot(entry.key()))
             .collect();
         edges.sort_by(compare_service_graph_edges);
@@ -324,8 +343,8 @@ impl ServiceGraphRegistry {
             edge_count: edges.len(),
             edges,
         }));
-        self.last_snapshot_unix_ms
-            .store(generated_at_unix_ms, Ordering::Release);
+        self.last_snapshot_monotonic_ms
+            .store(now_monotonic_ms, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -335,7 +354,7 @@ impl ServiceGraphRegistry {
 
     #[cfg(test)]
     fn force_rebuild_snapshot_at(&self, generated_at_unix_ms: u64) {
-        self.rebuild_snapshot(generated_at_unix_ms);
+        self.rebuild_snapshot_at(crate::socket_opts::monotonic_now_ms(), generated_at_unix_ms);
     }
 
     #[cfg(test)]
@@ -343,7 +362,8 @@ impl ServiceGraphRegistry {
         self.edges.clear();
         self.edge_count.store(0, Ordering::Relaxed);
         self.dropped_edge_transactions.store(0, Ordering::Relaxed);
-        self.last_snapshot_unix_ms.store(0, Ordering::Relaxed);
+        self.last_snapshot_monotonic_ms
+            .store(SNAPSHOT_NEVER_PUBLISHED, Ordering::Relaxed);
         self.snapshot
             .store(Arc::new(ServiceGraphSnapshot::default()));
     }
@@ -726,11 +746,120 @@ mod tests {
         assert_eq!(registry.snapshot().edge_count, 1);
 
         // Once the interval has passed, the next read sees both edges.
-        registry.last_snapshot_unix_ms.store(
-            now_unix_ms().saturating_sub(SNAPSHOT_REFRESH_MIN_MS),
-            Ordering::Release,
-        );
+        let published = registry.last_snapshot_monotonic_ms.load(Ordering::Acquire);
+        registry.refresh_snapshot_if_stale(published + SNAPSHOT_REFRESH_MIN_MS, now_unix_ms());
         assert_eq!(registry.snapshot().edge_count, 2);
+    }
+
+    #[test]
+    fn a_backward_wall_clock_step_does_not_freeze_snapshot_refresh() {
+        let registry = ServiceGraphRegistry::default();
+        let unix_now = now_unix_ms();
+        registry.refresh_snapshot_if_stale(1_000, unix_now);
+        assert_eq!(registry.snapshot.load().generated_at_unix_ms, unix_now);
+
+        // The wall clock steps back ten minutes while monotonic time advances
+        // past the refresh interval: the snapshot must still be rebuilt.
+        let rolled_back = unix_now - 10 * 60 * 1_000;
+        registry.refresh_snapshot_if_stale(1_000 + SNAPSHOT_REFRESH_MIN_MS, rolled_back);
+        assert_eq!(registry.snapshot.load().generated_at_unix_ms, rolled_back);
+
+        // Inside the interval nothing is rebuilt, whatever the wall clock says.
+        registry.refresh_snapshot_if_stale(1_000 + SNAPSHOT_REFRESH_MIN_MS + 1, unix_now + 60_000);
+        assert_eq!(registry.snapshot.load().generated_at_unix_ms, rolled_back);
+    }
+
+    #[test]
+    fn concurrent_requests_for_the_last_slot_are_all_counted() {
+        let registry = Arc::new(ServiceGraphRegistry::default());
+        let summary = summary(
+            "spiffe://cluster.local/ns/default/sa/frontend",
+            "spiffe://cluster.local/ns/default/sa/reviews",
+            200,
+            1.0,
+        );
+        let base = mesh_request_key(&summary).expect("mesh key");
+        // Occupy every slot but one with unrelated edges.
+        registry
+            .edge_count
+            .store(MAX_SERVICE_GRAPH_EDGES - 1, Ordering::Relaxed);
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 500;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                let summary = summary.clone();
+                let key = base.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..PER_THREAD {
+                        registry.record_transaction_with_mesh_key(&summary, Some(&key));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+
+        assert_eq!(
+            registry.dropped_edge_transactions.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            registry.edge_count.load(Ordering::Relaxed),
+            MAX_SERVICE_GRAPH_EDGES
+        );
+        let requests: u64 = registry
+            .edges
+            .iter()
+            .map(|entry| entry.value().requests_total.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(requests, (THREADS * PER_THREAD) as u64);
+    }
+
+    #[test]
+    fn snapshots_never_mix_counter_states_under_concurrent_updates() {
+        let registry = Arc::new(ServiceGraphRegistry::default());
+        let failing = summary(
+            "spiffe://cluster.local/ns/default/sa/frontend",
+            "spiffe://cluster.local/ns/default/sa/reviews",
+            503,
+            1.0,
+        );
+        let key = mesh_request_key(&failing).expect("mesh key");
+        registry.record_transaction_with_mesh_key(&failing, Some(&key));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let stop = Arc::clone(&stop);
+                let failing = failing.clone();
+                let key = key.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        registry.record_transaction_with_mesh_key(&failing, Some(&key));
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..200 {
+            registry.force_rebuild_snapshot();
+            let snapshot = registry.snapshot.load_full();
+            let edge = &snapshot.edges[0];
+            // Every observation is one failed 1 ms request, so a coherent
+            // capture has all three totals equal.
+            assert_eq!(edge.errors_total, edge.requests_total);
+            assert_eq!(edge.duration_ms_total, edge.requests_total as f64);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for writer in writers {
+            writer.join().expect("writer");
+        }
     }
 
     fn summary(
