@@ -7658,3 +7658,122 @@ async fn structured_redaction_budget_respects_the_covering_window() {
         PluginResult::Reject { .. }
     ));
 }
+
+/// A refused SSE rewrite (growth allowance or a runtime zero-width match) must
+/// fail closed. Before, the refusal looked like "no frame modified": the
+/// residual pre-check then scanned the ORIGINAL bytes with placeholders
+/// stripped, and content equal to a placeholder made it look clean.
+#[tokio::test]
+async fn refused_sse_rewrites_fail_closed_at_inspection() {
+    let budget_plugin = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "x"}],
+        "redaction_placeholder": "{type}"
+    }));
+    // 640 `x` = five placeholders' worth; rewriting needs ~81 KB of growth.
+    let body = openai_sse_body(&[&"x".repeat(640)]);
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        budget_plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert!(
+        budget_plugin
+            .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
+            .await
+            .is_none()
+    );
+
+    let zero_width = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [
+            {"name": "boundary", "regex": "\\b"},
+            {"name": "word", "regex": "\\w+"}
+        ],
+        "redaction_placeholder": "!"
+    }));
+    let body = openai_sse_body(&["hello world"]);
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        zero_width
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+/// Growth is charged on the JSON-escaped form for every rewritten string, not
+/// only tool arguments: a control-character placeholder escapes six-fold.
+#[tokio::test]
+async fn escaped_placeholder_growth_is_charged_for_completion_strings() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512),
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // 10 matches: ~30 KB escaped growth fits the 64 KiB floor.
+    assert!(
+        plugin
+            .transform_response_body(
+                &chat_body(&["7".repeat(10)]),
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_some()
+    );
+    // 30 matches: 15 KB decoded growth, but ~92 KB once escaped.
+    assert!(
+        plugin
+            .transform_response_body(
+                &chat_body(&["7".repeat(30)]),
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none()
+    );
+    let sse = |count: usize| openai_sse_body(&[&"7".repeat(count)]);
+    assert!(
+        plugin
+            .transform_response_body(&sse(10), Some("text/event-stream"), &sse_headers())
+            .await
+            .is_some()
+    );
+    assert!(
+        plugin
+            .transform_response_body(&sse(30), Some("text/event-stream"), &sse_headers())
+            .await
+            .is_none()
+    );
+}
+
+/// The live-capacity bound still admits a grow-then-shrink rewrite whose
+/// intermediate nearly fills a 64 KiB window: the shrinking pass reserves only
+/// the room the resident intermediate leaves.
+#[tokio::test]
+async fn grow_then_shrink_fits_a_tight_window() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "8".repeat(128), "regex": "7"},
+            {"name": "x", "regex": "8+"}
+        ],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let body = chat_body(&["7".repeat(480)]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    let redacted = plugin
+        .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &headers)
+        .await
+        .expect("intermediate plus result fit the window");
+    let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
+    assert_eq!(value["choices"][0]["message"]["content"], "x");
+}

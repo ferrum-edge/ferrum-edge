@@ -146,7 +146,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at 64 MiB and custom regex lists at 256 entries (`blocked_phrases` at 1024).
   Both refuse a repeated built-in pattern name. Re-serialized tool-argument
   documents are charged against the same allowance, including JSON escaping
-  growth.
+  growth. Growth is charged on the JSON-escaped form of every rewritten
+  string, live intermediate buffers are bounded by the allowance, the
+  allowance never exceeds the room the response's retained-body window leaves,
+  and a refused SSE rewrite fails closed instead of being treated as a no-op.
 
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its

@@ -242,28 +242,99 @@ impl RedactionBudget {
     }
 }
 
-/// Append `value` to `output` only while the result stays within `ceiling`.
-fn push_within_ceiling(output: &mut String, value: &str, ceiling: usize) -> bool {
-    match output.len().checked_add(value.len()) {
-        Some(next) if next <= ceiling => {
-            output.push_str(value);
-            true
-        }
-        _ => false,
+/// Append `value` to `output` while the buffer's CAPACITY stays within `room`.
+///
+/// Growth is reserved explicitly (doubling, capped at `room`) rather than left
+/// to `push_str`, whose geometric growth could allocate past the bound before
+/// any length check sees it.
+fn push_within_capacity(output: &mut String, value: &str, room: usize) -> bool {
+    let Some(needed) = output.len().checked_add(value.len()) else {
+        return false;
+    };
+    if needed > room {
+        return false;
     }
+    if needed > output.capacity() {
+        let target = output.capacity().saturating_mul(2).max(needed).min(room);
+        if output.try_reserve_exact(target - output.len()).is_err() || output.capacity() > room {
+            return false;
+        }
+    }
+    output.push_str(value);
+    true
+}
+
+/// Sequential literal replacement under a live-capacity bound.
+///
+/// Every pass reads the previous pass's output while writing the next one, so
+/// two buffers are live at once: the new buffer may only use `limit` minus the
+/// capacity of the still-resident intermediate (the borrowed input text is
+/// already charged by its owner). Replacement is literal (the
+/// `regex::NoExpand` contract). A zero-width match is refused: admission
+/// rejects patterns that match the empty string, but a contextual assertion
+/// (`\b`) can still produce an empty span beside non-empty input. `None` is a
+/// refusal; the returned string is compacted to its length so no amplified
+/// intermediate capacity is retained. Shared with `ai_prompt_shield`.
+pub(crate) fn replace_sequentially_bounded<'p>(
+    text: &str,
+    passes: impl Iterator<Item = (&'p Regex, &'p str)>,
+    limit: usize,
+) -> Option<String> {
+    let mut current: Option<String> = None;
+    for (regex, placeholder) in passes {
+        let replaced = {
+            let input: &str = current.as_deref().unwrap_or(text);
+            let mut matches = regex.find_iter(input);
+            let Some(first_match) = matches.next() else {
+                continue;
+            };
+            let room = limit.checked_sub(current.as_ref().map_or(0, String::capacity))?;
+            let mut replaced = String::new();
+            replaced.try_reserve_exact(input.len().min(room)).ok()?;
+            let mut cursor = 0usize;
+            for matched in std::iter::once(first_match).chain(matches) {
+                if matched.start() == matched.end() {
+                    return None;
+                }
+                if !push_within_capacity(&mut replaced, &input[cursor..matched.start()], room)
+                    || !push_within_capacity(&mut replaced, placeholder, room)
+                {
+                    return None;
+                }
+                cursor = matched.end();
+            }
+            if !push_within_capacity(&mut replaced, &input[cursor..], room) {
+                return None;
+            }
+            replaced
+        };
+        current = Some(replaced);
+    }
+    let mut result = current.unwrap_or_else(|| text.to_string());
+    result.shrink_to_fit();
+    Some(result)
+}
+
+/// Bytes `text` occupies once JSON-escaped inside a string literal (quotes
+/// excluded). Redaction output is serialized into JSON documents and SSE
+/// frames, where a placeholder of control characters can grow six-fold, so the
+/// growth allowance is charged on this measure rather than on decoded length.
+fn json_escaped_len(text: &str) -> usize {
+    text.bytes().fold(0usize, |len, byte| {
+        len.saturating_add(match byte {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+    })
 }
 
 /// Sequentially replace every pattern's matches in ONE string scalar with that
 /// pattern's pre-rendered placeholder, under `budget`.
 ///
-/// Replacement is literal (the `regex::NoExpand` contract): `$`-sequences in a
-/// placeholder are never expanded as capture references. Every intermediate
-/// pass is bounded by what the shared allowance can still pay for, and only net
-/// growth is charged, so a non-expanding redaction spends nothing. A zero-width
-/// match is refused: admission rejects patterns that match the empty string,
-/// but a contextual assertion (`\b`) can still produce an empty span beside
-/// non-empty input.
-///
+/// Live allocations are bounded by what the shared allowance can still pay for
+/// (see [`replace_sequentially_bounded`]), and only net growth of the
+/// JSON-escaped form is charged, so a non-expanding redaction spends nothing.
 /// On refusal the ORIGINAL text is returned and the budget is marked failed.
 /// Every caller re-verifies its candidate (or checks the budget) and fails
 /// closed, so an unrewritten match can never be delivered as "redacted".
@@ -275,48 +346,19 @@ fn redact_scalar_bounded<'p>(
     if budget.is_exhausted() {
         return text.to_string();
     }
-    let ceiling = text.len().saturating_add(budget.remaining.get());
-    let mut result: Cow<'_, str> = Cow::Borrowed(text);
-    for pattern in patterns {
-        let replaced = {
-            let current: &str = result.as_ref();
-            let mut matches = pattern.regex.find_iter(current);
-            let Some(first_match) = matches.next() else {
-                continue;
-            };
-            let mut replaced = String::with_capacity(current.len());
-            let mut cursor = 0usize;
-            for matched in std::iter::once(first_match).chain(matches) {
-                if matched.start() == matched.end() {
-                    budget.fail();
-                    return text.to_string();
-                }
-                if !push_within_ceiling(&mut replaced, &current[cursor..matched.start()], ceiling)
-                    || !push_within_ceiling(&mut replaced, &pattern.placeholder, ceiling)
-                {
-                    budget.fail();
-                    return text.to_string();
-                }
-                cursor = matched.end();
-            }
-            if !push_within_ceiling(&mut replaced, &current[cursor..], ceiling) {
-                budget.fail();
-                return text.to_string();
-            }
-            replaced
-        };
-        result = Cow::Owned(replaced);
-    }
-    let growth = result.len().saturating_sub(text.len());
+    let limit = text.len().saturating_add(budget.remaining.get());
+    let Some(result) = replace_sequentially_bounded(
+        text,
+        patterns.map(|pattern| (&pattern.regex, pattern.placeholder.as_str())),
+        limit,
+    ) else {
+        budget.fail();
+        return text.to_string();
+    };
+    let growth = json_escaped_len(&result).saturating_sub(json_escaped_len(text));
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }
-    // Only net growth is charged, so the retained string must not keep the
-    // spare capacity of an amplified intermediate pass: a grow-then-shrink
-    // policy would otherwise leave an uncharged large allocation behind every
-    // rewritten scalar.
-    let mut result = result.into_owned();
-    result.shrink_to_fit();
     result
 }
 
@@ -335,29 +377,6 @@ pub(crate) fn reject_duplicate_names(
         }
     }
     Ok(())
-}
-
-/// `io::Write` sink that refuses to grow past `cap` bytes, so a serialization
-/// is bounded while it is produced rather than measured afterwards.
-struct CappedWriter {
-    buf: Vec<u8>,
-    cap: usize,
-}
-
-impl std::io::Write for CappedWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.buf.len().saturating_add(bytes.len()) > self.cap {
-            return Err(std::io::Error::other(
-                "serialization exceeds redaction budget",
-            ));
-        }
-        self.buf.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Render one pattern's redaction placeholder and bound the RESULT (a template
@@ -380,6 +399,16 @@ fn check_custom_pattern_name(list_field: &str, idx: usize, name: &str) -> Result
         ));
     }
     Ok(())
+}
+
+/// Outcome of rewriting a buffered SSE body.
+enum SseRewrite {
+    Rewritten(Vec<u8>),
+    /// Nothing detectable, or nothing the rewriter addresses.
+    Unchanged,
+    /// The rewrite was refused (ceiling, growth allowance, zero-width match,
+    /// non-UTF-8). Never discharge this as a no-op.
+    Refused,
 }
 
 /// How to scan the response body.
@@ -1335,7 +1364,7 @@ impl AiResponseGuard {
     /// leave residual detectable content, so the caller can fail closed instead
     /// of forwarding the original bytes while reporting them `redacted`.
     ///
-    /// The SSE transform (`redact_sse_body`) only rewrites `data:` payloads that
+    /// The SSE transform (`rewrite_sse_body`) only rewrites `data:` payloads that
     /// parse as JSON. A plaintext or malformed `data:` frame (e.g.
     /// `data: contact user@example.com`) is matched by the raw-body union in
     /// detection but cannot be rewritten. This mirrors the JSON
@@ -1371,14 +1400,19 @@ impl AiResponseGuard {
         // The residual pass masks only preserved top-level structural scalar
         // spans, so duplicate keys and formatting remain visible and matches in
         // cross-event, key, numeric, or non-data content still fail closed.
-        let redacted = self.redact_sse_body(body, window.window_bytes());
+        let redacted = match self.rewrite_sse_body(body, window.window_bytes()) {
+            SseRewrite::Rewritten(output) => Some(output),
+            SseRewrite::Unchanged => None,
+            // A refused rewrite delivers nothing redacted: fail closed.
+            SseRewrite::Refused => return Some(true),
+        };
         let residual = self.sse_body_has_residual(redacted.as_deref().unwrap_or(body));
         drop(redacted);
         drop(window);
         Some(residual)
     }
 
-    /// Re-scan an SSE body produced by [`Self::redact_sse_body`]. Scan-all
+    /// Re-scan an SSE body produced by [`Self::rewrite_sse_body`]. Scan-all
     /// redaction deliberately preserves top-level structural scalar values in
     /// each JSON event, matching the buffered JSON path. Blank those values in
     /// both decoded and raw/contextual passes so an IP-shaped `id` does not
@@ -1516,25 +1550,30 @@ impl AiResponseGuard {
         // control character becomes `\u00XX`). Serialize under the allowance
         // this string had before its leaves were charged, then charge whatever
         // net growth the serialized form adds on top of the leaf charges.
-        let mut writer = CappedWriter {
-            buf: Vec::with_capacity(text.len()),
-            cap: text.len().saturating_add(allowance_before),
-        };
+        let mut writer =
+            crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(
+                text.len().saturating_add(allowance_before),
+            );
         if serde_json::to_writer(&mut writer, &decoded).is_err() {
             budget.fail();
             return;
         }
-        let Ok(rewritten) = String::from_utf8(writer.buf) else {
+        let Some(rewritten) = writer.finish() else {
             budget.fail();
             return;
         };
+        let Ok(mut rewritten) = String::from_utf8(rewritten) else {
+            budget.fail();
+            return;
+        };
+        // The rewritten document is itself embedded as a JSON string, so its
+        // growth is measured escaped; the leaf charges already paid part of it.
         let charged = allowance_before.saturating_sub(budget.remaining.get());
-        let growth = rewritten.len().saturating_sub(text.len());
+        let growth = json_escaped_len(&rewritten).saturating_sub(json_escaped_len(text));
         let extra = growth.saturating_sub(charged);
         if extra > 0 && !budget.charge_growth(extra) {
             return;
         }
-        let mut rewritten = rewritten;
         rewritten.shrink_to_fit();
         *value = Value::String(rewritten);
     }
@@ -2209,8 +2248,15 @@ impl AiResponseGuard {
     /// `serde_json::to_writer` into the bounded sink, which may alter
     /// whitespace within a frame — clients consuming SSE byte-for-byte should
     /// not depend on inner-frame formatting.
-    fn redact_sse_body(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
-        let body_str = std::str::from_utf8(body).ok()?;
+    ///
+    /// The outcome distinguishes "nothing to rewrite" from a refused rewrite (ceiling, growth allowance, or a zero-width match). A
+    /// refusal must never be discharged as a structural-only no-op: the
+    /// placeholder exemption the residual scan applies to rewritten output does
+    /// not apply to the ORIGINAL bytes a refused rewrite leaves behind.
+    fn rewrite_sse_body(&self, body: &[u8], ceiling: usize) -> SseRewrite {
+        let Ok(body_str) = std::str::from_utf8(body) else {
+            return SseRewrite::Refused;
+        };
 
         // Fast-skip the common "redact mode but no PII in the stream" case.
         // Scan-all mode unions decoded frame strings (so JSON escapes cannot hide
@@ -2229,7 +2275,7 @@ impl AiResponseGuard {
             !self.detect_matches(&refs).is_empty()
         };
         if !has_match {
-            return None;
+            return SseRewrite::Unchanged;
         }
 
         // Assembled eventwise through the ceiling-bounded sink, so the rewritten
@@ -2237,17 +2283,24 @@ impl AiResponseGuard {
         // (GHSA-pwcm-6rh8-f2gh). Each event is framed/serialized directly into
         // that sink — never as a complete would-be event `String` beside it.
         let budget = RedactionBudget::for_response(body.len(), ceiling);
-        let (output, modified) = rewrite_sse_events_bounded(body_str, ceiling, |output, lines| {
-            self.redact_sse_event(output, lines, &budget)
-        })?;
+        let Some((output, modified)) =
+            rewrite_sse_events_bounded(body_str, ceiling, |output, lines| {
+                self.redact_sse_event(output, lines, &budget)
+            })
+        else {
+            return SseRewrite::Refused;
+        };
         // A refused scalar rewrite leaves that match in place; discard the
-        // partial stream so the caller's residual verification sees the
-        // original bytes and fails closed.
+        // partial stream and report the refusal so no caller discharges it.
         if budget.is_exhausted() {
-            return None;
+            return SseRewrite::Refused;
         }
 
-        if modified { Some(output) } else { None }
+        if modified {
+            SseRewrite::Rewritten(output)
+        } else {
+            SseRewrite::Unchanged
+        }
     }
 
     // ───────────────────────── native gRPC inspection ─────────────────────────
@@ -4218,14 +4271,22 @@ impl Plugin for AiResponseGuard {
             return None;
         }
         let mut detected = Vec::new();
-        let replacement = self.redacted_response_body(body, content_type, ceiling, &mut detected);
+        let mut sse_refused = false;
+        let replacement = self.redacted_response_body(
+            body,
+            content_type,
+            ceiling,
+            &mut detected,
+            &mut sse_refused,
+        );
         if let Some(redacted) = replacement.as_deref() {
             self.record_verified_redaction(ctx, redacted, content_type);
             if !detected.is_empty() {
                 ctx.metadata
                     .insert("ai_response_guard_redacted".to_string(), detected.join(","));
             }
-        } else if content_type.is_some_and(is_text_event_stream_media_type)
+        } else if !sse_refused
+            && content_type.is_some_and(is_text_event_stream_media_type)
             && body.len() <= self.max_scan_bytes
             && ctx.plugin_state().is_some_and(|state| {
                 state
@@ -4262,6 +4323,7 @@ impl Plugin for AiResponseGuard {
             content_type,
             crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
             &mut Vec::new(),
+            &mut false,
         )
     }
 
@@ -4548,6 +4610,7 @@ impl AiResponseGuard {
         content_type: Option<&str>,
         ceiling: usize,
         detected: &mut Vec<String>,
+        sse_refused: &mut bool,
     ) -> Option<Vec<u8>> {
         if !self.needs_body_transform {
             return None;
@@ -4569,7 +4632,14 @@ impl AiResponseGuard {
 
         if let Some(ct) = content_type {
             if is_text_event_stream_media_type(ct) {
-                let redacted = self.redact_sse_body(body, ceiling)?;
+                let redacted = match self.rewrite_sse_body(body, ceiling) {
+                    SseRewrite::Rewritten(output) => output,
+                    SseRewrite::Unchanged => return None,
+                    SseRewrite::Refused => {
+                        *sse_refused = true;
+                        return None;
+                    }
+                };
                 return (!self.sse_body_has_residual(&redacted)).then_some(redacted);
             }
             if !is_json_content_type(ct) {

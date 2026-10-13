@@ -397,18 +397,6 @@ impl RedactionBudget {
     }
 }
 
-/// Append `value` to `output` only while the result stays within `ceiling`,
-/// so an expanding rewrite is refused BEFORE it allocates rather than after.
-fn push_within_ceiling(output: &mut String, value: &str, ceiling: usize) -> bool {
-    match output.len().checked_add(value.len()) {
-        Some(next) if next <= ceiling => {
-            output.push_str(value);
-            true
-        }
-        _ => false,
-    }
-}
-
 /// Replace every configured pattern's matches in `text` with that pattern's
 /// pre-rendered placeholder, under `budget`.
 ///
@@ -426,48 +414,24 @@ fn redact_text_bounded(text: &str, patterns: &[PiiPattern], budget: &RedactionBu
     if budget.is_exhausted() {
         return text.to_string();
     }
-    // Every intermediate pass over this one string is bounded by what the
-    // aggregate allowance can still pay for.
-    let ceiling = text.len().saturating_add(budget.remaining());
-    let mut result = text.to_string();
-    for pattern in patterns {
-        let mut matches = pattern.regex.find_iter(&result);
-        let Some(first_match) = matches.next() else {
-            continue;
-        };
-        let mut replaced = String::with_capacity(result.len());
-        let mut cursor = 0usize;
-        for matched in std::iter::once(first_match).chain(matches) {
-            // A zero-width match inserts the placeholder at every position and
-            // amplifies a bounded body without bound. Config admission already
-            // refuses patterns that match the empty string; a contextual
-            // assertion can still produce an empty span beside non-empty input,
-            // so refuse those here too.
-            if matched.start() == matched.end() {
-                budget.fail();
-                return text.to_string();
-            }
-            if !push_within_ceiling(&mut replaced, &result[cursor..matched.start()], ceiling)
-                || !push_within_ceiling(&mut replaced, &pattern.placeholder, ceiling)
-            {
-                budget.fail();
-                return text.to_string();
-            }
-            cursor = matched.end();
-        }
-        if !push_within_ceiling(&mut replaced, &result[cursor..], ceiling) {
-            budget.fail();
-            return text.to_string();
-        }
-        result = replaced;
-    }
+    // Live allocations (the still-resident intermediate plus the buffer being
+    // written) are bounded by what the aggregate allowance can still pay for,
+    // and the retained result is compacted to its length.
+    let limit = text.len().saturating_add(budget.remaining());
+    let Some(result) = super::ai_response_guard::replace_sequentially_bounded(
+        text,
+        patterns
+            .iter()
+            .map(|pattern| (&pattern.regex, pattern.placeholder.as_str())),
+        limit,
+    ) else {
+        budget.fail();
+        return text.to_string();
+    };
     let growth = result.len().saturating_sub(text.len());
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }
-    // Only net growth is charged, so do not retain the spare capacity of an
-    // amplified intermediate pass behind a shrinking rewrite.
-    result.shrink_to_fit();
     result
 }
 
