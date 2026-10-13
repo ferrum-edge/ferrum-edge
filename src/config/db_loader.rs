@@ -6760,8 +6760,14 @@ impl DatabaseStore {
 
         // Consumer changes ride the delta only while the published consumer
         // set has nothing quarantined; otherwise a delete or update may have
-        // to rehydrate a stripped credential (issue #6060).
-        if !consumer_ops.is_empty() && !self.consumer_quarantine.allows_consumer_deltas(namespace) {
+        // to rehydrate a stripped credential (issue #6060). Proxy and plugin
+        // changes escalate too while anything is quarantined: they can change
+        // the effective mTLS DNS identity policy, and only a full load can
+        // restore a credential that policy no longer collides (issue #6572).
+        if (!consumer_ops.is_empty() && !self.consumer_quarantine.allows_consumer_deltas(namespace))
+            || ((!proxy_ops.is_empty() || !plugin_config_ops.is_empty())
+                && self.consumer_quarantine.has_active_quarantine(namespace))
+        {
             return Err(anyhow::Error::new(
                 crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
                     namespace,

@@ -304,4 +304,24 @@ async fn sqlite_full_load_quarantines_shared_keyauth_key() {
         "keyauth create while quarantine is active",
     )
     .await;
+
+    // A plugin-only change can alter the effective mTLS identity policy, so it
+    // escalates too while quarantine is active.
+    let plugin: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "global-key-auth",
+        "plugin_name": "key_auth",
+        "namespace": ns,
+        "scope": "global",
+        "config": {}
+    }))
+    .expect("plugin config fixture");
+    let after = store.latest_change_sequence(ns).await.unwrap();
+    store.create_plugin_config(&plugin).await.unwrap();
+    expect_escalation(
+        &store,
+        ns,
+        after,
+        "plugin change while quarantine is active",
+    )
+    .await;
 }

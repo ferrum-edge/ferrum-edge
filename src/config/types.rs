@@ -5017,12 +5017,31 @@ impl GatewayConfig {
     /// collisions; this guard covers pre-existing and out-of-band rows. Returns
     /// one message per quarantined credential, never containing a key value.
     pub fn quarantine_colliding_consumer_credentials(&mut self) -> Vec<String> {
+        let (removals, messages) = self.consumer_credential_collision_plan();
+        for (index, cred_type) in removals {
+            self.consumers[index].credentials.remove(cred_type);
+        }
+        messages
+    }
+
+    /// Messages describing every credential
+    /// [`Self::quarantine_colliding_consumer_credentials`] would strip, without
+    /// mutating the config. Empty when no two Consumers share a keyauth key,
+    /// basicauth username, or (effective) mTLS identity.
+    pub fn consumer_credential_collisions(&self) -> Vec<String> {
+        self.consumer_credential_collision_plan().1
+    }
+
+    /// First-loaded-wins collision plan: `(consumer index, credential type)`
+    /// pairs to strip, plus one message per pair.
+    fn consumer_credential_collision_plan(&self) -> (Vec<(usize, &'static str)>, Vec<String>) {
         let fold_dns = self.has_effective_mtls_dns_identity_policy();
         let mut keyauth_owners: HashMap<String, String> = HashMap::new();
         let mut basicauth_owners: HashMap<String, String> = HashMap::new();
         let mut mtls_owners: HashMap<String, String> = HashMap::new();
         let mut mtls_dns_owners: HashMap<String, String> = HashMap::new();
         let mut messages = Vec::new();
+        let mut removals: Vec<(usize, &'static str)> = Vec::new();
 
         fn string_values(consumer: &Consumer, cred_type: &str, field: &str) -> Vec<String> {
             consumer
@@ -5044,12 +5063,12 @@ impl GatewayConfig {
                 .cloned()
         }
 
-        for consumer in &mut self.consumers {
+        for (index, consumer) in self.consumers.iter().enumerate() {
             let id = consumer.id.clone();
 
             let keys = string_values(consumer, "keyauth", "key");
             if let Some(owner) = other_owner(&keyauth_owners, &keys, &id) {
-                consumer.credentials.remove("keyauth");
+                removals.push((index, "keyauth"));
                 messages.push(format!(
                     "Quarantined keyauth credential of consumer {:?}: an API key is also \
                      claimed by consumer {:?} — the credential is excluded from this config \
@@ -5066,7 +5085,7 @@ impl GatewayConfig {
             if consumer.has_credential("basicauth") {
                 let username = vec![consumer.username.clone()];
                 if let Some(owner) = other_owner(&basicauth_owners, &username, &id) {
-                    consumer.credentials.remove("basicauth");
+                    removals.push((index, "basicauth"));
                     messages.push(format!(
                         "Quarantined basicauth credential of consumer {:?}: its username {:?} \
                          is also used by basicauth consumer {:?} — the credential is excluded \
@@ -5092,7 +5111,7 @@ impl GatewayConfig {
             let owner = other_owner(&mtls_owners, &identities, &id)
                 .or_else(|| other_owner(&mtls_dns_owners, &folded, &id));
             if let Some(owner) = owner {
-                consumer.credentials.remove("mtls_auth");
+                removals.push((index, "mtls_auth"));
                 messages.push(format!(
                     "Quarantined mtls_auth credential of consumer {:?}: an identity is also \
                      claimed by consumer {:?} — the credential is excluded from this config \
@@ -5111,7 +5130,7 @@ impl GatewayConfig {
             }
         }
 
-        messages
+        (removals, messages)
     }
 
     /// Validate only the exact and effective-DNS mTLS identity constraints.

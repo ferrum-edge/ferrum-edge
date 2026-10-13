@@ -1781,17 +1781,40 @@ impl std::error::Error for IncrementalFullReloadRequired {}
 #[derive(Debug, Default)]
 pub struct ConsumerQuarantineTracker {
     clean_namespaces: std::sync::Mutex<HashSet<String>>,
+    /// Namespaces whose latest recorded full load quarantined something.
+    /// Unlike the clean set, [`Self::forget`] keeps this marker, so policy
+    /// changes keep escalating until a full load records a clean result.
+    quarantined_namespaces: std::sync::Mutex<HashSet<String>>,
 }
 
 impl ConsumerQuarantineTracker {
     /// Record the result of a successful authoritative full load.
     pub fn record_full_load(&self, namespace: &str, quarantined_anything: bool) {
+        if let Ok(mut quarantined) = self.quarantined_namespaces.lock() {
+            if quarantined_anything {
+                quarantined.insert(namespace.to_string());
+            } else {
+                quarantined.remove(namespace);
+            }
+        }
         if quarantined_anything {
             self.forget(namespace);
             return;
         }
         if let Ok(mut clean) = self.clean_namespaces.lock() {
             clean.insert(namespace.to_string());
+        }
+    }
+
+    /// Whether the latest recorded full load for `namespace` quarantined
+    /// something. Proxy and plugin changes then escalate to a full reload,
+    /// because they can change the effective mTLS DNS identity policy that
+    /// decided a credential quarantine (issue #6572). A poisoned lock answers
+    /// `true` (escalate).
+    pub fn has_active_quarantine(&self, namespace: &str) -> bool {
+        match self.quarantined_namespaces.lock() {
+            Ok(quarantined) => quarantined.contains(namespace),
+            Err(_) => true,
         }
     }
 
