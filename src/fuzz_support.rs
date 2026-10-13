@@ -389,6 +389,16 @@ pub fn fuzz_tls_material_invariant(data: &[u8]) -> bool {
     match selector % FUZZ_TLS_MATERIAL_MODES {
         0 => match parse_pem_certificate_bundle(payload, "fuzz", "fuzz") {
             Ok(certificates) => {
+                // The fuzz lane never enables FIPS mode, so the bundle parser's
+                // own key-form gate returns early. Drive the enforced check
+                // directly so the X.509 parse and key-strength policy behind it
+                // are reached on every admitted record.
+                for certificate in &certificates {
+                    let _ = crate::fips::keys::check_certificate_public_key_enforced(
+                        certificate.as_ref(),
+                        "fuzz",
+                    );
+                }
                 !certificates.is_empty() && certificates.len() <= MAX_PEM_CERTIFICATE_RECORDS
             }
             Err(_) => true,
@@ -410,6 +420,40 @@ pub fn fuzz_tls_material_invariant(data: &[u8]) -> bool {
 pub fn fuzz_jwks_accepts(document: &[u8]) -> bool {
     fuzz_jwt_trust_domain()
         .is_some_and(|trust_domain| authorities_from_jwks(&trust_domain, document).is_ok())
+}
+
+/// Whether the parser `tls_material` selects accepts the input. Used by the
+/// seed tests to pin acceptance and rejection, so a bypassed admission check
+/// fails them: mode `0` also requires every record to pass the enforced FIPS
+/// key-form check, mode `2` requires at least one CRL with every record inside
+/// its window.
+pub fn fuzz_tls_material_accepts(data: &[u8]) -> bool {
+    let Some((&selector, payload)) = data.split_first() else {
+        return false;
+    };
+    match selector % FUZZ_TLS_MATERIAL_MODES {
+        0 => parse_pem_certificate_bundle(payload, "fuzz", "fuzz").is_ok_and(|certificates| {
+            certificates.iter().all(|certificate| {
+                crate::fips::keys::check_certificate_public_key_enforced(
+                    certificate.as_ref(),
+                    "fuzz",
+                )
+                .is_ok()
+            })
+        }),
+        1 => parse_pem_private_key(payload, "fuzz", "fuzz").is_ok(),
+        2 => {
+            let records: Result<Vec<_>, _> =
+                CertificateRevocationListDer::pem_slice_iter(payload).collect();
+            records.is_ok_and(|records| {
+                !records.is_empty()
+                    && records
+                        .iter()
+                        .all(|crl| classify_crl_window(crl, FUZZ_CRL_NOW_UNIX).is_ok())
+            })
+        }
+        _ => fuzz_crl_window_accepts(payload),
+    }
 }
 
 /// Whether one DER CRL is inside its validity window at [`FUZZ_CRL_NOW_UNIX`].
