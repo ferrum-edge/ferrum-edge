@@ -14,18 +14,30 @@
 
 ## Why this exists
 
-The reader API (`WebSocket::read`, `WebSocketStream::poll_next`) only ever
-yields **fully reassembled** messages. The initial non-final Text/Binary frame
-and every Continuation frame before the final one are consumed inside the codec
-and are invisible to the caller.
+This section describes the **stock, message-only codec** that motivated the
+patch; the applied local controls are described separately below.
 
-That makes every per-message admission policy layered on top of the codec —
-Ferrum's `ws_rate_limiting` among them — bypassable by fragmentation: a peer
-sends one non-final frame followed by an unbounded stream of Continuation
-frames and pays for at most one logical message. Zero-length continuations make
-it worse: they accumulate no bytes, so `max_message_size` never fires either,
-and nothing in the stock codec bounds how many frames or how long a message may
-stay incomplete.
+In the stock reader API (`WebSocket::read`, `WebSocketStream::poll_next`),
+non-final **data** frames are hidden until a logical data message is fully
+reassembled. The initial non-final Text/Binary frame and every Continuation
+frame before the final one are consumed inside the codec and are invisible
+to the caller. Interleaved control frames are not hidden that way: the read
+APIs can still return Ping/Pong or Close while a data message remains
+incomplete.
+
+That makes a per-message admission policy that charges **only returned
+logical message counts**, with no physical-fragment accounting — Ferrum's
+historical `ws_rate_limiting` among them — bypassable by fragmentation: a
+peer sends one non-final frame followed by an unbounded stream of
+Continuation frames and pays for at most one logical message. (A policy
+that also accounts for physical fragments is not bypassable this way; the
+bypass is a property of message-count-only charging, not of every possible
+per-message policy.) Zero-length continuations make it worse: they
+accumulate no bytes, so `max_message_size` never fires either, and nothing
+in the stock codec bounds how many frames or how long a message may stay
+incomplete. That historical Ferrum bypass is tracked by #3404 /
+GHSA-qq94-2gv2-phh6; the controls below are the applied local extension,
+described on their own terms rather than as that advisory.
 
 This patch adds the missing visibility and the missing bounds, without changing
 any default:
@@ -37,7 +49,16 @@ any default:
   `WebSocketConfig::max_incomplete_message_duration` — two **independent**
   ceilings on the in-flight reassembly (count and wall-clock), neither of which
   is expressible with the existing byte ceilings. Both default to `None`
-  (upstream behavior).
+  (upstream behavior). The duration ceiling is an observation-point check,
+  not an autonomous timer: elapsed time is compared only after the codec
+  decodes a subsequent non-Close frame while a data message is still
+  incomplete — including the final continuation and interleaved Ping/Pong —
+  and a peer Close is exempt. A silent peer, or one that has not yet
+  completed its next physical frame, does not trigger the check merely
+  because time passes; callers still need their own idle, session, or
+  physical-frame deadlines for those conditions. The count ceiling is
+  unaffected by this qualification and is enforced on each consumed
+  non-final data frame.
 - `WebSocketContext::set_fragment_accounting()` /
   `WebSocket::set_fragment_accounting()` /
   `WebSocketStream::set_fragment_accounting()` — one setter that installs the
@@ -46,11 +67,25 @@ any default:
   `ProtocolError::IncompleteMessageTimeout` — distinct failure origins so a
   caller can map them to a policy Close rather than a size Close.
 
-Accounting is deliberately per **message**: it resets at every message
-boundary, so a long-lived connection of legitimately fragmented messages is
-unaffected. The completing frame is *not* metered — it becomes the returned
-message, which the caller already charges once — so a caller that charges both
-the batch and the message counts each wire frame exactly once.
+Two different lifetimes are involved, and only one of them resets at a
+message boundary:
+
+- The codec's **per-message bounds state** — the incomplete-message frame
+  counter and its start time — resets at every message boundary, so a
+  long-lived connection of legitimately fragmented messages is unaffected
+  by the ceilings above.
+- The public **`FragmentMeter`** is a shared pending count that message
+  completion does **not** drain. It keeps accumulating across messages
+  until a caller invokes `FragmentMeter::take_reassembly_frames()`, which
+  atomically swaps the pending count to zero.
+
+The completing frame is *not* metered — it becomes the returned message.
+Exactly-once wire-frame accounting therefore holds only conditionally: a
+caller must drain the meter (charging the consumed non-final data-frame
+count) **and** charge the returned completing data message once. A read
+that returns an interleaved control frame (Ping/Pong) during reassembly is
+also a drain opportunity. Error and peer-Close teardown paths need not
+perform admission charges for the abandoned incomplete message.
 
 ## Files
 

@@ -60,6 +60,35 @@ cryptographic provider (`aws-lc-rs` or RustCrypto); their internal scalar
 storage follows that provider's secret-memory lifecycle and is not observable
 through the deterministic byte-owner hook.
 
+Two ownership boundaries sit outside that guarantee:
+
+- **Protocol close is not destruction.** `Dtls::close()` changes protocol
+  state while retaining the endpoint/engine in the `Dtls` value; managed
+  DER is cleared when that value is dropped. The shutdown zeroization
+  regression below therefore exercises `drop(endpoint)`: its guarantee is
+  destruction-time erasure, not immediate erasure on a retained endpoint
+  after protocol close. Replacing a whole protected `DtlsPrivateKey` owner
+  keeps the guarantee, because the displaced owner is itself dropped.
+- **The compatibility raw field is caller-owned once mutated.**
+  `DtlsCertificate.private_key` is a public `Vec<u8>`; replacing or
+  extracting it releases or moves the previous allocation independently of
+  the enclosing value's `Drop`. Callers mutating that raw field must clear
+  the displaced bytes themselves, or use the protected `DtlsPrivateKey`
+  owner through `DtlsCertificateChain`.
+
+`DtlsCertificateChain::new` performs **structural** validation only
+(non-empty chain/certificates/private key, wire-length bounds); it does not
+parse the private key with the selected crypto provider. An `Ok` chain
+therefore does not by itself establish that endpoint construction succeeds:
+certificate-authenticated `Dtls::new_12` / `new_13` / `new_auto` parse the
+key through the configured provider's key loader and panic if that parse
+fails (the PSK-only `new_auto` delegation does not parse the key). The
+vendored rustdoc states this prevalidated-key prerequisite on the chain
+constructor and in each constructor's "Panics" section. Ferrum's loader
+(`src/dtls/mod.rs`) satisfies the prerequisite: it parses the key with the
+build-selected signing provider and with dimpl's key provider before
+returning a chain, so no Ferrum loader path reaches the constructor panic.
+
 ## Provenance and audit artifacts
 
 `vendor/dimpl-0.6.1-ferrum-patched/` is the complete crates.io 0.6.1 package,
@@ -102,7 +131,10 @@ MIT/Apache-2.0 license is already allowed.
 - `vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs`
   exercises full-chain wire output on explicit DTLS 1.2 and 1.3, plus clone,
   failed-construction, auto/fallback, shutdown zeroization, and valid leaf
-  certificates larger than the caller's poll buffer.
+  certificates larger than the caller's poll buffer. The shutdown case
+  (`dtls13_shutdown_zeroizes_retained_private_key_owner`) calls
+  `drop(endpoint)`, so it pins the destruction-time guarantee above; it
+  does not claim erasure while a closed endpoint is still retained.
 - The `test-hooks` feature invokes a post-zeroization observer while the
   allocation is still live. Tests never inspect freed memory.
 - `tests/integration/dtls_integration_tests.rs` configures
@@ -120,7 +152,9 @@ Retire the vendor copy only after a compatible upstream release:
 2. exposes the peer chain without changing existing leaf fingerprint
    semantics;
 3. clears every dependency-retained private-key byte copy on failed
-   construction, clone drop, fallback, replacement, and shutdown; and
+   construction, clone drop, fallback, replacement of a protected owner,
+   and drop of the endpoint (protocol `close()` alone, which retains the
+   endpoint, is not required to erase it); and
 4. preserves Ferrum's supported ECDSA P-256/P-384 and constructor APIs.
 
 Then remove the `[patch.crates-io]` rows (root `Cargo.toml` and
