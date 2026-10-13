@@ -175,3 +175,33 @@ fn production_kube_clients_use_the_shared_constructor() {
         offenders.join("\n")
     );
 }
+
+/// kube runs the exec credential plugin while the client is built, so a
+/// malformed plugin response surfaces from `build_kube_client_from_config`.
+#[cfg(unix)]
+#[test]
+fn malformed_exec_plugin_output_is_redacted_when_the_client_is_built() {
+    use ferrum_edge::k8s_controller::build_kube_client_from_config;
+
+    // `expirationTimestamp` must be a string, so serde-saphyr rejects the
+    // document and its error would quote the token next to it.
+    let output = format!(
+        r#"{{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{{"token":"{SENTINEL_TOKEN}","expirationTimestamp":["not-a-time"]}}}}"#
+    );
+    let mut config = kube::Config::new("https://127.0.0.1:6443".parse().expect("valid URI"));
+    config.auth_info.exec = Some(kube::config::ExecConfig {
+        api_version: Some("client.authentication.k8s.io/v1".to_string()),
+        command: Some("sh".to_string()),
+        args: Some(vec!["-c".to_string(), format!("printf '%s' '{output}'")]),
+        ..Default::default()
+    });
+
+    let error = build_kube_client_from_config(config)
+        .expect_err("malformed exec plugin output must fail client construction");
+
+    assert!(
+        error.contains(KUBE_AUTH_EXEC_PARSE_ERROR_REDACTED),
+        "expected the redacted exec parse error, got: {error}"
+    );
+    assert!(!error.contains(SENTINEL_TOKEN), "{error}");
+}
