@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  # Jobs without their own `permissions:` (version validation and the binary
+  # builds) only read the repository; publishing jobs grant scopes per job.
+  contents: read
+
 concurrency:
   group: production-release
   cancel-in-progress: false

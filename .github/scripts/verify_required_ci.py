@@ -78,6 +78,10 @@ from verify_release_image_attestations import (
 from verify_release_image_attestations import (
     validate_release_workflow,
 )
+from verify_workflow_permissions import (
+    check_repository as workflow_permission_errors,
+    run_self_test as workflow_permissions_self_test,
+)
 from verify_ci_runtime_cache import (
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
@@ -2296,6 +2300,10 @@ def main() -> int:
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     planner_errors.extend(validate_release_workflow(release_yml))
     planner_errors.extend(release_attestation_self_test(release_yml))
+    # Every workflow states its own GITHUB_TOKEN default instead of inheriting
+    # the repository setting, and code-triggered workflows keep it read-only.
+    planner_errors.extend(workflow_permissions_self_test())
+    planner_errors.extend(workflow_permission_errors())
 
     # None of the governed live workflows carries a top-level `paths:` block any
     # more: `ambient-host-udp-live.yml` never did, and issue #3908 retired the

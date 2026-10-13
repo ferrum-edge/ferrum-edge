@@ -19,6 +19,9 @@ on:
         default: '20'
         type: string
 
+# GITHUB_TOKEN is unused: every API call authenticates with REVIEW_TOKEN.
+permissions: {}
+
 # Note: REVIEW_TOKEN secret (a PAT from a named environment reviewer) is
 # required because GITHUB_TOKEN cannot approve/reject deployment reviews.
 # The PAT needs repo scope (classic) or actions:write (fine-grained).

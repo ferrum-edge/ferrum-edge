@@ -43,6 +43,9 @@ on:
           - postgres
           - mongodb
 
+permissions:
+  contents: read
+
 jobs:
   scale-benchmark:
     name: Scale Benchmark (${{ inputs.db_type }})

@@ -59,6 +59,9 @@ on:
           - ci-release
           - dev
 
+permissions:
+  contents: read
+
 jobs:
   benchmark:
     name: Payload Size Benchmark
