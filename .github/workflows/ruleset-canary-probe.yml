@@ -36,4 +36,5 @@ jobs:
           echo "event_name=$EVENT_NAME sha=$SHA ref=$REF head=$HEAD_SHA run=$RUN_ID"
           sleep 90
       - name: Forged pass
-        run: echo "forged probe: always passes"
+        run: |
+          echo "forged probe - always passes"
