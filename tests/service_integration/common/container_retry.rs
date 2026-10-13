@@ -1,14 +1,17 @@
-//! Bounded retry for transient container image-pull/registry failures,
-//! shared by every Docker-backed test fixture.
+//! Bounded retry for selected transient container-start error text, shared
+//! by every Docker-backed test fixture.
 //!
 //! A registry pull can fail for reasons that have nothing to do with the
 //! fixture: Docker Hub cutting a layer short (`bytes remaining on stream`,
 //! main CI run 36370971003), a reset connection, a TLS handshake timeout, rate
-//! limiting, or a registry 5xx. [`start_within_deadline`] retries only those,
-//! a bounded number of times inside one phase deadline; every other start
-//! failure (wait conditions, a wrong image reference, a host-port collision)
-//! is returned after the first attempt so a broken fixture still hard-fails in
-//! CI.
+//! limiting, or a registry 5xx. [`start_within_deadline`] retries errors whose
+//! text matches that bounded heuristic, a bounded number of times inside one
+//! phase deadline; every other start failure (wait conditions, a wrong image
+//! reference, a host-port collision) is returned after the first attempt so a
+//! broken fixture still hard-fails in CI. The classifier is a text heuristic
+//! over the whole start operation's error, intended to recover
+//! image-pull/registry flakes: its generic transport markers do not by
+//! themselves establish that the failure happened in the pull/registry phase.
 //!
 //! Compiled into both container suites: `tests/service_integration/` owns it
 //! next to [`super::host_ports`], and the Vault/LocalStack fixtures in
@@ -76,9 +79,11 @@ const NON_TRANSIENT_START_MARKERS: &[&str] = &[
     "healthcheck is not configured",
 ];
 
-/// Error text of a transient image-pull or registry fault: testcontainers'
+/// Error text selected as transient by the heuristic: testcontainers'
 /// `failed to pull the image` wrapper, a truncated or reset transfer, a
-/// network timeout, registry rate limiting, or a registry 5xx.
+/// network timeout, registry rate limiting, or a registry 5xx. The generic
+/// transport markers (`timeout`, `connection reset`, `unexpected eof`, …)
+/// match without any pull/registry context.
 const TRANSIENT_START_MARKERS: &[&str] = &[
     "failed to pull",
     "bytes remaining on stream",
@@ -97,9 +102,11 @@ const TRANSIENT_START_MARKERS: &[&str] = &[
     "504 gateway timeout",
 ];
 
-/// True when a container-start error is a transient image-pull or registry
-/// failure worth another attempt (e.g. Docker Hub cutting a `postgres:17` layer
-/// short with `bytes remaining on stream`, main CI run 36370971003).
+/// True when a container-start error's text matches the bounded transient
+/// heuristic and is worth another attempt (e.g. Docker Hub cutting a
+/// `postgres:17` layer short with `bytes remaining on stream`, main CI run
+/// 36370971003). A match does not prove the failure phase: generic transport
+/// text from elsewhere in the start operation can also match.
 ///
 /// Deliberately conservative. Host-port bind collisions are excluded so they
 /// reach [`super::host_ports::retry_on_host_port_collision`] and get a fresh
@@ -123,8 +130,9 @@ pub fn is_transient_image_pull_error(error: &str) -> bool {
 }
 
 /// Bound one container `start()` (image pull + create + start) by
-/// [`CONTAINER_START_TIMEOUT`], retrying transient image-pull/registry errors
-/// up to [`CONTAINER_START_ATTEMPTS`] times inside that same deadline.
+/// [`CONTAINER_START_TIMEOUT`], retrying errors whose text matches the
+/// bounded transient heuristic up to [`CONTAINER_START_ATTEMPTS`] times
+/// inside that same deadline.
 ///
 /// `start` builds and starts a fresh request on every call (a
 /// `ContainerRequest` is consumed by `start()` and is not `Clone`). Every

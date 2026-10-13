@@ -187,11 +187,18 @@ shares.
   preserve the bound socket and extend the lease until test-process exit.
   `drop_and_take_port` / `unbound_port` / `unbound_tcp_port` release only the
   socket for a consumer that binds itself; the lease survives the handoff.
-  These reservations and bare-port helpers exclude the host's ephemeral source
-  range (Linux `/proc/sys/net/ipv4/ip_local_port_range`, default 32768–60999 when
-  absent) from candidates 10240–65535. The generic harness uses the same policy.
-  Keep `reserve_refused_tcp_port` held for refused-connect fixtures; use
-  `reserve_future_tcp_port` for a future subprocess listener that starts refused.
+  Released subprocess handoffs and the screened reservation helpers exclude
+  the host's ephemeral source range (Linux
+  `/proc/sys/net/ipv4/ip_local_port_range`, default 32768–60999 when absent)
+  from candidates 10240–65535; the generic harness uses the same
+  outside-source-range candidate policy. `reserve_refused_tcp_port` is the
+  held exception: it binds `127.0.0.1:0` and leases the kernel-assigned port
+  (`PortRegistry::lease_with` rejects zero/occupied ports but applies no
+  source-range filter to that returned number), so a genuine refused-backend
+  reservation may sit inside the source range and must stay bound. Keep
+  `reserve_refused_tcp_port` held for refused-connect fixtures; use
+  `reserve_future_tcp_port` (the screened constructor, via `handoff_ports()`)
+  for a future subprocess listener that starts refused.
   Native fixture sockets use `TestSocket::bind_test` with `127.0.0.1:0` (or the
   required wildcard/IPv6 address) and stay bound until their consumer finishes.
   Nonzero `bind_test` ports must already belong to the calling process.
@@ -218,7 +225,7 @@ shares.
   client closes an idle connection once its last `SendRequest` drops; keep the
   sender alive when asserting that the server closed it.
 - Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
-- `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN`, and its spawn barrier requires the authenticated detail tier of `/health` plus `ready: true`; that combination is also the proof the child owns its proxy port, because `ready` flips only after every listener bind. Do not weaken it to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
+- `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN` (effective caller overrides win; explicitly shared credentials are only as unique as the value chosen). On the standard spawn path with admin-auth verification, its barrier is a conjunction: ready `/health`, HTTP 200 from JWT-only `GET /proxies` under the effective attempt identity (`wait_for_owned_gateway_identity`), and `Child::try_wait` liveness around the waits and before success; that combination, not health detail alone, proves the child owns its proxy port, because `ready` flips only after every listener bind and `/health` detail is also granted by a matching metrics token or an allowed source IP. When admin-auth verification is not enabled the caller takes an explicit health-only alternative instead — do not imply every builder/mode takes the JWT path. Do not weaken the authenticated path to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
 - Use a struct harness with `try_new()` retry wrapper or a `start_gateway_with_retry()` helper.
 - Every retry needs fresh ports and fresh temp dirs/DBs. Reusing killed SQLite can corrupt WAL.
 - Backend/echo server should hold its listener. Do not drop+rebind; pass pre-bound `TcpListener` to `start_echo_server_on()`.
@@ -236,8 +243,13 @@ shares.
   structurally over both fixture modules. Every container `start()` in both
   suites goes through `tests/service_integration/common/container_retry.rs`
   (`start_within_deadline`, also `#[path]`-included by the secrets fixtures),
-  which retries only transient image-pull/registry errors within one bounded
-  deadline; the same parity file asserts that too.
+  which retries selected transient container-start error text within one
+  bounded deadline — a bounded text heuristic (host-port collisions and
+  deterministic/wait-condition markers excluded first) intended to recover
+  image-pull/registry flakes, whose generic transport markers (`timeout`,
+  `timed out`, `connection reset`, `unexpected eof`) do not by themselves
+  establish that the failure happened in the pull/registry phase; the same
+  parity file asserts that too.
 - **A fixture must prove its PUBLISHED mapping before a test asserts through
   it** (issue #5488). A `WaitFor` log match and a `docker exec` seed both
   observe the container from the inside; neither shows that the host port
