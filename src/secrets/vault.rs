@@ -194,7 +194,9 @@ fn vault_transport(
         builder = builder.no_proxy();
     }
     builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_VAULT_REDIRECTS {
+        // `previous()` includes the original request, so `>` (reqwest's own
+        // test) allows exactly `MAX_VAULT_REDIRECTS` hops.
+        if attempt.previous().len() > MAX_VAULT_REDIRECTS {
             return attempt.error("too many Vault redirects");
         }
         if redirect_permitted(attempt.url(), loopback_http, allow_plaintext) {

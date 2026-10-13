@@ -899,3 +899,53 @@ async fn vault_opted_in_plaintext_redirect_warns_once() {
         "{diagnostic}"
     );
 }
+
+/// The redirect policy keeps reqwest's own ten-hop limit: ten loopback hops
+/// resolve, an eleventh fails.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_redirect_limit_matches_reqwest_default() {
+    let guard = EnvGuard::new();
+    let vault = MockServer::start().await;
+    for hop in 0..11 {
+        Mock::given(method("GET"))
+            .and(path(format!("/hop/{hop}")))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("/hop/{}", hop + 1).as_str()),
+            )
+            .mount(&vault)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/ten"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/1"))
+        .mount(&vault)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/eleven"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/0"))
+        .mount(&vault)
+        .await;
+    // `/hop/10` redirects to `/hop/11`, which serves the secret.
+    Mock::given(method("GET"))
+        .and(path("/hop/11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("ten-hops")))
+        .mount(&vault)
+        .await;
+
+    guard.set("VAULT_ADDR", vault.uri());
+    guard.set("VAULT_TOKEN", "redirect-limit-token");
+    // `ten` -> /hop/1 .. /hop/11: ten redirects in all.
+    let resolved = resolve_external_reference("vault", "secret/data/ten#field", "FERRUM_TEST")
+        .await
+        .expect("ten redirects are within the limit");
+    assert_eq!(resolved.value, "ten-hops");
+    // `eleven` -> /hop/0 .. /hop/11: eleven redirects.
+    assert!(
+        resolve_external_reference("vault", "secret/data/eleven#field", "FERRUM_TEST")
+            .await
+            .is_err(),
+        "an eleventh redirect must be refused"
+    );
+}
