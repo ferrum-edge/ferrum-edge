@@ -4896,9 +4896,7 @@ async fn test_ambiguous_query_fails_before_external_egress() {
         default_client(),
     )
     .unwrap();
-    // A query-forwarding function opts the proxy's shared map into the decoded
-    // representation, so H3 no longer differs from H1/H2 for its plugin chain
-    // (advisory GHSA-gr4p-3qw3-87r5).
+    // A query-forwarding function declares that it decides on the query.
     assert!(plugin.requires_decoded_query_params());
 
     for (raw_query, expected_code) in [

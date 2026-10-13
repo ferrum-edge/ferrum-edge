@@ -3309,12 +3309,9 @@ impl Plugin for ServerlessFunction {
         self.requires_body
     }
 
-    /// The invocation payload itself is built from the canonical decoding of
-    /// the forwarded query, so it is already identical on H1/H2/H3. This opts
-    /// the proxy's shared `ctx.query_params` map into the decoded form as well,
-    /// so a query-forwarding function and the rest of its plugin chain never
-    /// see one representation on H1/H2 and a raw percent-escaped one on H3
-    /// (advisory GHSA-gr4p-3qw3-87r5).
+    /// The invocation payload is built from the canonical decoding of the
+    /// forwarded query, so it is identical on H1/H2/H3 (advisory
+    /// GHSA-gr4p-3qw3-87r5). Declared when the query is forwarded.
     fn requires_decoded_query_params(&self) -> bool {
         self.forward_query_params
     }

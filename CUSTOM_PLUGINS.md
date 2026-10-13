@@ -1170,6 +1170,16 @@ pub struct RequestContext {
 }
 ```
 
+**Query parameters.** `query_params` holds percent-decoded names and values,
+materialized the same way on HTTP/1.1, HTTP/2, and HTTP/3 (issue #6580), so a
+custom plugin needs no opt-in to see `/admin` rather than `%2Fadmin` on any
+frontend. The map is single-valued (a repeated name keeps its last value) and
+does not reflect what the backend will parse from `+` or `;`. A plugin that
+makes an authentication, authorization, or routing decision on the query should
+use `crate::plugins::utils::query::canonical_query_for_policy(ctx)` and reject
+when `first_ambiguity()` is `Some`, as the built-in OPA and
+`mesh_route_dispatch` plugins do.
+
 **Helper methods:**
 - `effective_identity()` — returns the stable identity (Consumer username preferred over external identity)
 - `backend_consumer_username()` — returns the identity for the `X-Consumer-Username` backend header
