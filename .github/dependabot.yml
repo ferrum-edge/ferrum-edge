@@ -1,36 +1,78 @@
 version: 2
 updates:
+  # The root workspace, plus the mesh benchmark crate, which path-depends on
+  # the root crate and carries the same vendored patch table. Other standalone
+  # lockfiles still get security updates; see
+  # docs/dependency-policy.md#cargo-dependency-updates for why they are not here.
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/tests/performance/mesh"
     schedule:
       interval: "weekly"
       day: "monday"
+    # Crates replaced by a vendored `[patch.crates-io]` copy, plus sqlx, whose
+    # crates pin `sqlx-core` exactly. Moving any of them past its vendored
+    # version silently drops the Ferrum patch from the build. They move only by
+    # re-vendoring (docs/dependency-policy.md).
+    ignore:
+      - dependency-name: "sqlx*"
+      - dependency-name: "reqwest"
+      - dependency-name: "h3"
+      - dependency-name: "h3-quinn"
+      - dependency-name: "tungstenite"
+      - dependency-name: "tokio-tungstenite"
+      - dependency-name: "dimpl"
+      - dependency-name: "hyper"
+      - dependency-name: "hyper-util"
+      - dependency-name: "h2"
+      # `Cargo.toml` caps mongodb below 3.9: 3.9 raised the driver's minimum
+      # wire version to 9 (MongoDB 4.4), dropping MongoDB 4.2 / Cosmos DB
+      # server-version-4.2 support. Without this entry the grouped update
+      # widens the cap to `<3.10`.
+      - dependency-name: "mongodb"
+        versions:
+          - ">= 3.9"
+    groups:
+      # One weekly PR per directory for every compatible update; a
+      # semver-major update gets its own PR and a maintainer.
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     commit-message:
       prefix: "deps"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
 
+  # Every external action, including those inside frozen trusted-policy
+  # surfaces, rotates through ordinary Dependabot PRs: the trusted policy
+  # compares pin-normalized text and admits a changed pin only as a forward
+  # upstream release, and green PRs auto-merge. See
+  # docs/dependency-policy.md#automated-action-pin-rotation.
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
       day: "monday"
-    # Frozen action pins rotate with their trusted contracts; see
-    # docs/dependency-policy.md#rotating-frozen-actions.
     ignore:
-      - dependency-name: "actions/cache/restore"
-      - dependency-name: "actions/cache/save"
-      - dependency-name: "actions/checkout"
-      - dependency-name: "actions/download-artifact"
-      - dependency-name: "actions/setup-python"
-      - dependency-name: "actions/upload-artifact"
-      - dependency-name: "docker/build-push-action"
-      - dependency-name: "docker/login-action"
-      - dependency-name: "docker/setup-buildx-action"
+      # Publishes no release tags (one branch per toolchain), so no new pin
+      # could pass the release-tag rule; rotate it by hand.
       - dependency-name: "dtolnay/rust-toolchain"
-      - dependency-name: "Swatinem/rust-cache"
-      - dependency-name: "taiki-e/install-action"
+    groups:
+      # One weekly PR (one CI run) for every compatible action update;
+      # a semver-major update gets its own PR and a maintainer.
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     commit-message:
       prefix: "ci"
     labels:

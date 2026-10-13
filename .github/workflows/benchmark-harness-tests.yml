@@ -54,8 +54,9 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
-      # `.cargo/config.toml` points every cargo invocation at sccache and mold.
-      # Neither is installed here, so clear both, exactly as the sibling harness
+      # `.cargo/config.toml` points every cargo invocation at mold, and a
+      # runner- or user-level rustc-wrapper may select sccache. Neither is
+      # installed here, so clear both, exactly as the sibling harness
       # job in `release-profile-study.yml` does. This lane does not pay for them
       # on purpose: the package's whole `test` profile compiles cold in about a
       # minute, which is less than installing the tools and carrying a separate

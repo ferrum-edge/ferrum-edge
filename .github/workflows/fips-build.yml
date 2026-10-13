@@ -147,8 +147,9 @@ jobs:
   feature-policy:
     name: FIPS Feature Policy
     runs-on: ubuntu-26.04
-    # This job does not install sccache, so clear the checked-in rustc wrapper
-    # from `.cargo/config.toml` rather than exec'ing a missing tool.
+    # This job does not install sccache. `.cargo/config.toml` names no rustc
+    # wrapper, but clear any runner- or user-level one rather than exec'ing a
+    # missing tool.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""

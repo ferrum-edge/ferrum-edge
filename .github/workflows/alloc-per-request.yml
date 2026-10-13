@@ -54,8 +54,9 @@ on:
 permissions:
   contents: read
 
-# `.cargo/config.toml` points cargo at sccache and mold; this lane installs
-# neither, exactly like h1-internal-profile.yml.
+# `.cargo/config.toml` points cargo at mold, and a runner- or user-level
+# rustc-wrapper may select sccache; this lane installs neither, so clear both,
+# exactly like h1-internal-profile.yml.
 env:
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""

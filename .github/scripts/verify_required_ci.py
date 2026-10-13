@@ -78,6 +78,10 @@ from verify_release_image_attestations import (
 from verify_release_image_attestations import (
     validate_release_workflow,
 )
+from verify_workflow_permissions import (
+    check_repository as workflow_permission_errors,
+    run_self_test as workflow_permissions_self_test,
+)
 from verify_ci_runtime_cache import (
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
@@ -319,8 +323,11 @@ DEDICATED_REQUIRED_CHECKS = {
 # download and no toolchain step. Pin those properties structurally rather than
 # by substring alone.
 ARTIFACT_GATE_WORKFLOW = ".github/workflows/multicluster-federation-live.yml"
-ARTIFACT_GATE_DOWNLOAD_ACTION = (
-    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+# Any full-commit pin: the trusted action pin rotation check governs which
+# upstream release it is (docs/dependency-policy.md → "Automated action pin
+# rotation").
+ARTIFACT_GATE_DOWNLOAD_ACTION = re.compile(
+    r"(?m)^\s*(?:-\s+)?uses:\s+actions/download-artifact@[0-9a-f]{40}(?:\s+#.*)?$"
 )
 # The release-blocking `multicluster.*` ids, mirrored from the enforced,
 # non-deferred `multicluster-federation` rows of tests/conformance/ga_contract.yaml.
@@ -1551,10 +1558,10 @@ def validate_artifact_gate_wiring() -> list[str]:
     workflow_yml = Path(ARTIFACT_GATE_WORKFLOW).read_text(encoding="utf-8")
     gate_body = extract_job_body(workflow_yml, "gate")
 
-    if ARTIFACT_GATE_DOWNLOAD_ACTION not in gate_body:
+    if ARTIFACT_GATE_DOWNLOAD_ACTION.search(gate_body) is None:
         errors.append(
             f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must download the published live "
-            f"artifact with the pinned `{ARTIFACT_GATE_DOWNLOAD_ACTION}`"
+            "artifact with a full-commit-pinned `actions/download-artifact`"
         )
 
     # The gate must stay free of any build/toolchain step so the trusted build
@@ -2296,6 +2303,10 @@ def main() -> int:
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     planner_errors.extend(validate_release_workflow(release_yml))
     planner_errors.extend(release_attestation_self_test(release_yml))
+    # Every workflow states its own GITHUB_TOKEN default instead of inheriting
+    # the repository setting, and code-triggered workflows keep it read-only.
+    planner_errors.extend(workflow_permissions_self_test())
+    planner_errors.extend(workflow_permission_errors())
 
     # None of the governed live workflows carries a top-level `paths:` block any
     # more: `ambient-host-udp-live.yml` never did, and issue #3908 retired the

@@ -13,8 +13,9 @@
 # The rewrite is digest-preserving by construction: it resolves the digest the
 # reference's own tag points at today and substitutes it. It never removes a
 # digest, never changes an image or tag, and opens an ordinary pull request that
-# the full required CI (multi-arch build, FIPS, eBPF, ABI scan, chart smoke)
-# gates like any other change.
+# the required PR checks gate like any other change. It also moves the
+# `# Digest resolved YYYY-MM-DD` comment governing each rewritten pin to the
+# run's UTC date.
 #
 # Every tracked non-workflow file that pins a drifted reference is rewritten
 # together, so the distroless runtime base also moves in
@@ -107,6 +108,27 @@ jobs:
             for file in ${consumers}; do
               sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"
             done
+            # The resolution date lives on the comment above a block of pins:
+            # for each rewritten line, walk up over adjacent FROM/ARG pin lines
+            # and move a `# Digest resolved YYYY-MM-DD` comment to today.
+            for file in ${consumers}; do
+              awk -v ref="${tagged}@${resolved}" -v today="$(date -u +%F)" '
+                { line[NR] = $0 }
+                END {
+                  date = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
+                  for (i = 1; i <= NR; i++) {
+                    if (index(line[i], ref) == 0) continue
+                    j = i - 1
+                    while (j >= 1 && line[j] ~ /^[[:space:]]*(FROM|ARG)[[:space:]]/) j--
+                    if (j >= 1 && line[j] ~ ("^[[:space:]]*# Digest resolved " date)) {
+                      sub(date, today, line[j])
+                    }
+                  }
+                  for (i = 1; i <= NR; i++) print line[i]
+                }' "${file}" > "${file}.resolved"
+              cat "${file}.resolved" > "${file}"
+              rm -f "${file}.resolved"
+            done
             changed="${changed}- \`${tagged}\`: \`${current}\` -> \`${resolved}\` (${consumers% })\n"
           done
           if [ -z "${changed}" ]; then
@@ -128,8 +150,12 @@ jobs:
             echo
             echo "## Test plan"
             echo
-            echo "Normal required CI on this pull request: multi-arch image build, FIPS,"
-            echo "eBPF, the GNU ABI scan, and the Helm chart smoke."
+            echo "The ordinary required PR checks, selected by the changed paths. For"
+            echo "Dockerfile changes that includes the amd64 production Dockerfile smoke"
+            echo "build. Multi-architecture image builds, FIPS and the GNU ABI scan are"
+            echo "not guaranteed to run on this pull request: check which checks actually"
+            echo "ran before merging, and rely on main and release qualification for the"
+            echo "rest."
             echo
             echo "This pull request was opened with the workflow's GITHUB_TOKEN, so its"
             echo "required CI does not start on its own: any pull_request runs wait for"

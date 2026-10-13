@@ -1,0 +1,101 @@
+name: Dependabot Auto-Merge
+
+# Queues GitHub auto-merge on Dependabot's own pull requests so a green
+# dependency bump lands without a maintainer click. Queuing is not merging:
+# GitHub merges only after every required check passes on the PR head,
+# including `Trusted Cross Build Policy`, whose action pin rotation check admits
+# a changed action pin only as a forward upstream release
+# (docs/dependency-policy.md → "Automated dependency merges").
+#
+# - `pull_request_target` runs this file from `main`, never from the PR, and no
+#   step checks out or executes PR content. The job holds only the built-in
+#   `GITHUB_TOKEN`; no stored credential exists.
+# - Only a PR Dependabot opened, on a branch of this repository, whose latest
+#   push was Dependabot's, is queued. Any other push to that branch withdraws
+#   the queued merge, so a human-edited bump goes back to human review.
+# - semver-major updates are left for a maintainer.
+# - The merge method is a merge commit: the publication gate binds Trusted Cross
+#   Build Policy evidence to the merge commit's second parent.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  queue:
+    name: Queue Dependabot auto-merge
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: metadata
+        name: Read Dependabot update metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Queue a merge-commit auto-merge
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPENDENCIES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+          queued="$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$queued" = "true" ]; then
+            echo "Auto-merge is already queued for #${PR_NUMBER}"
+            exit 0
+          fi
+          echo "Queuing auto-merge for #${PR_NUMBER} (${UPDATE_TYPE:-digest}): ${DEPENDENCIES}"
+          gh pr merge "$PR_NUMBER" --auto --merge
+
+      - name: Leave a semver-major update for a maintainer
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          DEPENDENCIES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          echo "::notice::semver-major update (${DEPENDENCIES}) is left for maintainer review"
+
+  withdraw:
+    name: Withdraw auto-merge after a non-Dependabot push
+    if: >-
+      github.event.action == 'synchronize'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Withdraw the queued merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          queued="$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          if [ "$queued" != "true" ]; then
+            echo "No auto-merge is queued for #${PR_NUMBER}"
+            exit 0
+          fi
+          echo "::notice::${ACTOR} pushed to Dependabot PR #${PR_NUMBER}; withdrawing auto-merge"
+          gh pr merge "$PR_NUMBER" --disable-auto
