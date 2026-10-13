@@ -1721,9 +1721,9 @@ jobs:
       contents: read
       id-token: write
     # cargo-deny only runs `cargo metadata` (no compilation), so this job does
-    # not install sccache. Clear the checked-in sccache rustc-wrapper
-    # (.cargo/config.toml `[build] rustc-wrapper = "sccache"`) — same fallback
-    # the setup-sccache action uses — so `cargo metadata` doesn't try to exec a
+    # not install sccache. `.cargo/config.toml` names no rustc-wrapper, but
+    # clear any runner- or user-level one anyway — same fallback the
+    # setup-sccache action uses — so `cargo metadata` doesn't try to exec a
     # binary that isn't on PATH.
     env:
       RUSTC_WRAPPER: ""
