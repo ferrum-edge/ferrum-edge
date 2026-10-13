@@ -404,6 +404,90 @@ async fn namespace_claim_confines_route_plugin_tls_on_create_and_put() {
     }
 }
 
+fn udp_logging_plugin_with(id: &str, field: &str, value: &str) -> Value {
+    let mut body = json!({
+        "id": id, "plugin_name": "udp_logging", "scope": "proxy",
+        "proxy_id": "p-partner", "enabled": true,
+        "config": {"host": "127.0.0.1", "port": 5514, "dtls": true}
+    });
+    body["config"][field] = json!(value);
+    if field == "dtls_cert_path" {
+        body["config"]["dtls_key_path"] = json!("k8s://tenant-a/material#tls.key");
+    } else if field == "dtls_key_path" {
+        body["config"]["dtls_cert_path"] = json!("k8s://tenant-a/material#tls.crt");
+    }
+    body
+}
+
+/// `udp_logging` DTLS identity and trust are resolved with the gateway's own
+/// credentials, so a namespace-claimed operator is confined there exactly as
+/// for backend TLS, whether or not the claim is required.
+#[tokio::test]
+async fn namespace_claim_confines_udp_logging_dtls_material_on_create_and_put() {
+    let temp = TempDir::new().unwrap();
+    for require in [false, true] {
+        let db = sqlite_store(&temp, &format!("udp-logging-scope-{require}.db")).await;
+        let mut state = tenant_control_plane_state(db);
+        state.admin_require_namespace_claim = require;
+        let (base, _shutdown) = start_admin(state).await;
+        let operator = operator_token(&["tenant-a"]);
+        let (status, response) = post(
+            &base,
+            "/proxies",
+            &operator,
+            &proxy_with("backend_tls_server_ca_cert_path", "system://"),
+        )
+        .await;
+        assert!((200..300).contains(&status), "{response}");
+        let mut base_plugin = udp_logging_plugin_with("udp-base", "dtls_no_verify", "unused");
+        base_plugin["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dtls_no_verify");
+        let (status, response) = post(&base, "/plugins/config", &operator, &base_plugin).await;
+        assert!(
+            (200..300).contains(&status),
+            "DTLS with an ephemeral identity needs no material: {response}"
+        );
+        for field in ["dtls_cert_path", "dtls_key_path", "dtls_ca_cert_path"] {
+            for value in [
+                "k8s://tenant-b/material",
+                "vault://secret/tenant-b",
+                "managed://material/foreign",
+                "/absent/platform/material.pem",
+            ] {
+                let id = format!("udp-{field}");
+                let forbidden = udp_logging_plugin_with(&id, field, value);
+                let (status, response) =
+                    post(&base, "/plugins/config", &operator, &forbidden).await;
+                assert_eq!(status, 400, "{require} {field}: {response}");
+                assert!(is_scope_refusal(&response), "{response}");
+                assert!(!response.to_string().contains(value), "{response}");
+                let mut replacement = udp_logging_plugin_with("udp-base", field, value);
+                replacement["id"] = json!("udp-base");
+                let (status, response) =
+                    put(&base, "/plugins/config/udp-base", &operator, &replacement).await;
+                assert_eq!(status, 400, "{require} PUT {field}: {response}");
+                assert!(is_scope_refusal(&response), "{response}");
+                assert!(!response.to_string().contains(value), "{response}");
+            }
+        }
+        if !require {
+            let (_, response) = post(
+                &base,
+                "/plugins/config",
+                &token_with_claim("operator", None),
+                &udp_logging_plugin_with("claimless-udp", "dtls_ca_cert_path", "/admin/ca.pem"),
+            )
+            .await;
+            assert!(
+                !is_scope_refusal(&response),
+                "claimless global authority is not namespace-confined: {response}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn namespace_scoped_operator_keeps_material_it_may_reference() {
     let temp_dir = TempDir::new().unwrap();

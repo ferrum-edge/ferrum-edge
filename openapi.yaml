@@ -21141,6 +21141,12 @@ components:
             consuming node's dependency/construction phase when dtls is true; must
             be paired with dtls_key_path. Rejected unless dtls is true.
             Whitespace-only values are rejected.
+            Where admin namespace-claim enforcement is on, or the token carries an
+            `ns` claim even with enforcement off, an `operator` may set only inline
+            PEM, `system://`, or a `k8s://` Secret in the addressed namespace; any
+            other reference it introduces is refused with `400` before the material
+            is loaded. A value already stored in this field is exempt, and
+            `admin`-role tokens are not restricted.
         dtls_key_path:
           type: string
           minLength: 1
@@ -21149,6 +21155,12 @@ components:
             PEM private key for DTLS mutual TLS (ECDSA P-256 or P-384). Must be
             paired with dtls_cert_path. Rejected unless dtls is true.
             Whitespace-only values are rejected.
+            Where admin namespace-claim enforcement is on, or the token carries an
+            `ns` claim even with enforcement off, an `operator` may set only inline
+            PEM, `system://`, or a `k8s://` Secret in the addressed namespace; any
+            other reference it introduces is refused with `400` before the material
+            is loaded. A value already stored in this field is exempt, and
+            `admin`-role tokens are not restricted.
         dtls_ca_cert_path:
           type: string
           minLength: 1
@@ -21159,6 +21171,12 @@ components:
             is true (the source must still be valid even though verification is
             disabled). Rejected unless dtls is true. Whitespace-only values are
             rejected.
+            Where admin namespace-claim enforcement is on, or the token carries an
+            `ns` claim even with enforcement off, an `operator` may set only inline
+            PEM, `system://`, or a `k8s://` Secret in the addressed namespace; any
+            other reference it introduces is refused with `400` before the material
+            is loaded. A value already stored in this field is exempt, and
+            `admin`-role tokens are not restricted.
         dtls_no_verify:
           type: boolean
           default: false

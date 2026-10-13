@@ -17,8 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bound #6093 applies to every other route. The same admission now covers the
   route-local `client_cert_path`, `client_key_path` and `server_ca_cert_path`
   under `rules[].destination.backend_tls` in `mesh_route_dispatch` plugin
-  configs. A value already stored in the same field (same rule index for
-  `mesh_route_dispatch`) stays admitted, and `admin` tokens are unaffected.
+  configs, and the `udp_logging` DTLS identity and trust fields
+  (`dtls_cert_path`, `dtls_key_path`, `dtls_ca_cert_path`), which the gateway
+  also loads with its own credentials. A value already stored in the same
+  field (same rule index for `mesh_route_dispatch`) stays admitted, and
+  `admin` tokens are unaffected.
 - **Tenant DestinationRule TLS files stay confined after admission** (PR
   #6316). A file that a non-root-namespace DestinationRule names under
   `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` is bound to a confined reference when
@@ -30,8 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed for its own destinations only. The exception is an otherwise
   unchanged TCP+TLS stream listener, which keeps serving with its last
   admitted config under the existing keep-last-good rule until the file is
-  valid again. A refused tenant file no longer stalls rotation of unrelated
-  backend TLS sources.
+  valid again. While a gateway-owned (non-tenant) backend TLS source is
+  itself unreadable, the whole backend TLS surface stays on its last-good
+  generation, and a tenant refusal is applied on the first poll after that
+  source recovers. A refused tenant file no longer stalls rotation of
+  unrelated backend TLS sources. Files named only in per-port
+  (`portLevelSettings`) or per-subset TLS overrides are now watched for
+  rotation too.
 - **CRL-enforcing outbound TLS clients no longer resume sessions** (PR
   #6316, follow-up to #4297). TLS 1.2 tickets and TLS 1.3 PSK resumption
   skip certificate reverification, so a cached session could outlive a CRL's

@@ -4250,6 +4250,21 @@ pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
     fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
+        if self.plugin_name == "udp_logging" {
+            // DTLS sink identity and trust are loaded with the gateway's own
+            // credentials, exactly like backend TLS material.
+            let mut references = Vec::new();
+            for (field, kind) in [
+                ("dtls_cert_path", MaterialKind::Cert),
+                ("dtls_key_path", MaterialKind::Key),
+                ("dtls_ca_cert_path", MaterialKind::CaBundle),
+            ] {
+                if let Some(value) = self.config.get(field).and_then(Value::as_str) {
+                    references.push((format!("config.{field}"), value, kind));
+                }
+            }
+            return references;
+        }
         if self.plugin_name != "mesh_route_dispatch" {
             return Vec::new();
         }
