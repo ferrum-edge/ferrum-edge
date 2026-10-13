@@ -49,6 +49,27 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 - External GitHub Actions must be pinned to a full commit SHA (see
   `docs/dependency-policy.md` → "CI Actions and Kubernetes tooling").
+- Action pins rotate without a policy edit or override
+  (`docs/dependency-policy.md` → "Automated action pin rotation"). Every frozen
+  surface in `verify_cross_build_policy.py` compares pin-normalized text
+  (`normalize_action_pins`: `owner/repo@<sha> # comment` →
+  `owner/repo@<placeholder>`). `action_pin_rotation_errors` in `Trusted Cross
+  Build Policy` judges the pins on YAML lines the PR adds (its three-dot diff,
+  `--proposed-changes`). It admits a new commit only when it is an upstream
+  release-tag commit (from `git ls-remote` of `github.com/<owner>/<repo>`) that
+  descends from every trusted pin of that repository. Never re-freeze a literal action
+  commit in a template, digest, PR-tier verifier, or test. Match the action
+  path plus `[0-9a-f]{40}`, or normalize first; the trusted rotation check is
+  the only place a commit is judged. A new template must be written in
+  normalized form, and a job digest is taken over normalized text.
+  `cross-build-policy.yml` and the `CI Plan` early guard admit a pin-only change
+  of `cross-build-policy.yml` through `--pin-normalized-equal`;
+  `verify_cross_build_policy.py` stays byte-protected.
+- Dependabot covers every action (`/` and `/.github/actions/*`) except
+  `dtolnay/rust-toolchain`, which has no release tags.
+  `dependabot-auto-merge.yml` queues merge-commit auto-merge on Dependabot's
+  own non-major PRs with only `GITHUB_TOKEN`. Its merges start no push
+  workflows, so a Dependabot merge commit is never itself a release candidate.
 - `docker://` action refs and local-action Dockerfile bases must use full
   SHA-256 image digests; `scratch` is the only unpinned Dockerfile base.
 - kind / kubectl / Helm install only via

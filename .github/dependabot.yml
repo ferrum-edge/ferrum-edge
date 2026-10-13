@@ -41,26 +41,31 @@ updates:
     labels:
       - "dependencies"
 
+  # Every external action, including those inside frozen trusted-policy
+  # surfaces, rotates through ordinary Dependabot PRs: the trusted policy
+  # compares pin-normalized text and admits a changed pin only as a forward
+  # upstream release, and green PRs auto-merge. See
+  # docs/dependency-policy.md#automated-action-pin-rotation.
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
       day: "monday"
-    # Frozen action pins rotate with their trusted contracts; see
-    # docs/dependency-policy.md#rotating-frozen-actions.
     ignore:
-      - dependency-name: "actions/cache/restore"
-      - dependency-name: "actions/cache/save"
-      - dependency-name: "actions/checkout"
-      - dependency-name: "actions/download-artifact"
-      - dependency-name: "actions/setup-python"
-      - dependency-name: "actions/upload-artifact"
-      - dependency-name: "docker/build-push-action"
-      - dependency-name: "docker/login-action"
-      - dependency-name: "docker/setup-buildx-action"
+      # Publishes no release tags (one branch per toolchain), so no new pin
+      # could pass the release-tag rule; rotate it by hand.
       - dependency-name: "dtolnay/rust-toolchain"
-      - dependency-name: "Swatinem/rust-cache"
-      - dependency-name: "taiki-e/install-action"
+    groups:
+      # One weekly PR (one CI run) for every compatible action update;
+      # a semver-major update gets its own PR and a maintainer.
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     commit-message:
       prefix: "ci"
     labels:
