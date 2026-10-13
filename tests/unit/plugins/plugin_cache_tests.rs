@@ -4418,6 +4418,35 @@ fn test_request_view_precomputes_key_auth_header_redaction() {
 }
 
 #[test]
+fn test_request_view_redacts_openapi_validator_bypass_header() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["oav"])],
+        vec![make_plugin_config_with_json(
+            "oav",
+            "openapi_validator",
+            json!({
+                "bypass": {"header_present": {"X-Bypass-Validator": "bypass-secret-0123456789"}},
+                "operations": [{
+                    "method": "GET",
+                    "path_template": "/items",
+                    "path_regex": "^/items$",
+                    "responses": {"200": {"application/json": {"type": "object"}}}
+                }]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(
+        view.request_headers_to_redact().as_ref(),
+        &["x-bypass-validator"]
+    );
+}
+
+#[test]
 fn test_authorize_plugin_default_preserves_legacy_custom_plugins() {
     let plugin: Arc<dyn Plugin> = Arc::new(LegacyAuthorizePlugin);
 

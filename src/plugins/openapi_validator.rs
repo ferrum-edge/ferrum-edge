@@ -627,6 +627,9 @@ pub struct OpenapiValidator {
     /// constant time). Presence alone never bypasses: clients can send any
     /// header name.
     bypass_header_present: HashMap<String, String>,
+    /// Sorted names of `bypass_header_present`, reported for redaction so the
+    /// secret never reaches diagnostics or policy calls.
+    bypass_header_names: Vec<String>,
     request_error_status: u16,
     response_error_status: u16,
     /// Status for a nonempty client representation that no declared media entry
@@ -760,6 +763,8 @@ impl OpenapiValidator {
             .collect();
         let bypass_header_present =
             parse_header_present(bypass.and_then(|b| b.get("header_present")))?;
+        let mut bypass_header_names: Vec<String> = bypass_header_present.keys().cloned().collect();
+        bypass_header_names.sort_unstable();
 
         let error_response = optional_object(object, "error_response")?;
         if let Some(error_response) = error_response {
@@ -809,6 +814,7 @@ impl OpenapiValidator {
             bypass_paths,
             bypass_methods,
             bypass_consumers,
+            bypass_header_names,
             bypass_header_present,
             request_error_status,
             response_error_status,
@@ -1263,6 +1269,12 @@ impl OpenapiValidator {
 impl Plugin for OpenapiValidator {
     fn name(&self) -> &str {
         "openapi_validator"
+    }
+
+    /// `bypass.header_present` values are shared secrets that skip
+    /// validation; keep them out of diagnostics and policy calls.
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.bypass_header_names
     }
 
     fn priority(&self) -> u16 {
@@ -5963,9 +5975,9 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, String>
                         "openapi_validator: `bypass.header_present` value for {normalized:?} must be at most {MAX_BYPASS_HEADER_SECRET_BYTES} bytes"
                     ));
                 }
-                if http::header::HeaderValue::from_str(secret).is_err() || secret.trim() != secret {
+                if !secret.bytes().all(|byte| byte.is_ascii_graphic()) {
                     return Err(format!(
-                        "openapi_validator: `bypass.header_present` value for {normalized:?} must be a valid header value without leading or trailing whitespace"
+                        "openapi_validator: `bypass.header_present` value for {normalized:?} must contain only visible ASCII characters (no spaces or control characters)"
                     ));
                 }
                 parsed.insert(normalized, secret.to_string());

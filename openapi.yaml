@@ -31588,15 +31588,17 @@ components:
                 type: string
                 minLength: 16
                 maxLength: 4096
+                pattern: "^[!-~]+$"
               default: {}
               description: >-
                 Header name to shared secret. A request skips validation only
                 when that header carries exactly the configured secret
                 (compared in constant time). Presence alone never skips
                 validation, because clients can send any header, so null is
-                rejected. The secret must be 16 to 4096 bytes (measured in
-                UTF-8 bytes at construction), a valid header value, and have
-                no leading or trailing whitespace. Inject it from a trusted
+                rejected. The secret must be 16 to 4096 visible ASCII
+                characters (0x21-0x7E: no spaces, controls or non-ASCII), so
+                characters and bytes coincide. Bypass header names are
+                redacted from diagnostics and policy calls. Inject it from a trusted
                 hop or gateway plugin and keep it out of client hands. Keys
                 are matched case-insensitively at runtime; case-equivalent
                 duplicate keys are rejected at construction.

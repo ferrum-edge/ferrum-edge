@@ -7992,11 +7992,18 @@ fn bypass_header_requires_a_secret_value() {
         error.contains("at least 16 bytes"),
         "a short bypass secret must be rejected: {error}"
     );
-    let error = config_error(bypass_header_config(json!(" bypass-secret-0123456789")));
-    assert!(
-        error.contains("whitespace"),
-        "a padded bypass secret must be rejected: {error}"
-    );
+    for invalid in [
+        " bypass-secret-0123456789",
+        "bypass-secret 0123456789",
+        "bypass-secret-0123456789\r\n",
+        "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+    ] {
+        let error = config_error(bypass_header_config(json!(invalid)));
+        assert!(
+            error.contains("visible ASCII"),
+            "bypass secret {invalid:?} must be rejected: {error}"
+        );
+    }
     let error = config_error(bypass_header_config(json!("x".repeat(4097))));
     assert!(
         error.contains("at most 4096 bytes"),
@@ -8006,8 +8013,13 @@ fn bypass_header_requires_a_secret_value() {
 
 #[tokio::test]
 async fn bypass_header_with_wrong_value_does_not_skip_validation() {
-    let plugin =
-        OpenapiValidator::new(&bypass_header_config(json!("bypass-secret-0123456789"))).unwrap();
+    const SECRET: &str = "bypass-secret-0123456789";
+    let mut config = attestation_config("block");
+    config["bypass"] = json!({"header_present": {"x-bypass-validator": SECRET}});
+    let plugin = OpenapiValidator::new(&config).unwrap();
+    // Missing `client_attestation`: violates the contract.
+    let invalid_body: &[u8] = br#"{"id":"a"}"#;
+
     for presented in [
         "1",
         "",
@@ -8016,21 +8028,74 @@ async fn bypass_header_with_wrong_value_does_not_skip_validation() {
         "bypass-secret-01234567890",
         "BYPASS-SECRET-0123456789",
     ] {
-        let mut ctx = post_ctx("/items");
-        ctx.headers
-            .insert("x-bypass-validator".to_string(), presented.to_string());
-        let mut headers = ctx.headers.clone();
+        let mut headers = json_headers();
+        headers.insert("x-bypass-validator".to_string(), presented.to_string());
+
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
         assert!(
             plugin.should_buffer_request_body(&ctx),
             "value {presented:?} must not skip request buffering"
         );
-        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-        assert_ne!(
-            skip_reason(&ctx),
-            Some("bypass_header"),
-            "value {presented:?} must not bypass validation"
+        assert_reject(
+            plugin
+                .validate_client_request_body_contract(&mut ctx, &headers, invalid_body)
+                .await,
+            Some(400),
         );
+        assert_ne!(skip_reason(&ctx), Some("bypass_header"));
+
+        // The backend-final phase does not bypass on a wrong value either.
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, invalid_body)
+                .await,
+            None,
+        );
+        assert_ne!(skip_reason(&ctx), Some("bypass_header"));
     }
+
+    // The configured secret skips both phases.
+    let mut headers = json_headers();
+    headers.insert("x-bypass-validator".to_string(), SECRET.to_string());
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, invalid_body)
+            .await,
+    );
+    assert_eq!(skip_reason(&ctx), Some("bypass_header"));
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, invalid_body)
+            .await,
+    );
+}
+
+#[test]
+fn bypass_header_names_are_redacted() {
+    let plugin = OpenapiValidator::new(&json!({
+        "bypass": {"header_present": {
+            "X-Bypass-Validator": "bypass-secret-0123456789",
+            "x-alt-bypass": "another-secret-0123456789"
+        }},
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }))
+    .unwrap();
+    assert_eq!(
+        plugin.request_headers_to_redact(),
+        &["x-alt-bypass", "x-bypass-validator"]
+    );
 }
 
 #[test]

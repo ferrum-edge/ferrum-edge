@@ -5971,7 +5971,7 @@ Validates request and response bodies against operation schemas generated from a
 | `bypass.paths` | String[] | `[]` | Regex paths that skip validation |
 | `bypass.methods` | String[] | `[]` | HTTP methods that skip validation |
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
-| `bypass.header_present` | object | `{}` | Header name to shared secret (16–4096 bytes). Validation is skipped only when the header carries exactly that secret, compared in constant time; presence alone never skips it, and `null` is rejected. Case-equivalent duplicate keys are rejected at construction. |
+| `bypass.header_present` | object | `{}` | Header name to shared secret (16–4096 visible ASCII characters; the header is redacted from diagnostics). Validation is skipped only when the header carries exactly that secret, compared in constant time; presence alone never skips it, and `null` is rejected. Case-equivalent duplicate keys are rejected at construction. |
 | `error_response.request_status_code` | integer | `400` | Status for blocked request validation errors, including a missing or empty required body |
 | `error_response.response_status_code` | integer | `502` | Status for blocked response validation errors |
 | `error_response.unsupported_media_type_status_code` | integer | `415` | Status for a nonempty request body that no declared media entry of the matched operation covers, including a body sent with no `Content-Type` |
