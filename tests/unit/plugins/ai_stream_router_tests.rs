@@ -2125,6 +2125,31 @@ async fn test_endpoint_query_omits_previously_stripped_client_credentials() {
 }
 
 #[tokio::test]
+async fn test_endpoint_query_drops_semicolon_hidden_credentials_and_provider_params() {
+    // Issue #6579: a provider that also splits on `;` reads `carrier=;api_key=`
+    // as an `api_key` parameter and `x=;api-version=` as a second
+    // `api-version`. Neither may be folded into the provider path.
+    let plugin = build(azure_style_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string(
+        "api_key=secret&carrier=;api_key=secret&x=;api-version=evil&foo=bar".to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let path = ctx.route_override_path.as_deref().expect("override path");
+    assert_eq!(
+        path,
+        "/openai/deployments/gpt/chat/completions?api-version=2024-02-01&foo=bar"
+    );
+    assert!(!path.contains("secret") && !path.contains("evil"), "{path}");
+}
+
+#[tokio::test]
 async fn test_endpoint_query_drops_client_duplicate_provider_params() {
     let plugin = build(azure_style_config());
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});

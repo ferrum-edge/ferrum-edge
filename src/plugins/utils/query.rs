@@ -162,11 +162,12 @@ pub struct CanonicalQueryParam {
     /// value). Both decode to an empty `value`; this bit is what keeps the two
     /// distinguishable in a lossless representation.
     pub bare: bool,
-    /// Percent-decoded names of this pair's `;`-separated sub-pairs, split on
-    /// the still-encoded bytes (issue #6579). Empty unless the pair carries an
-    /// unencoded `;`. A backend that also splits on `;` reads each of these as
-    /// a parameter of its own, so credential redaction must consult them; a
-    /// `%3B` is content and never produces an entry.
+    /// Decoded names of this pair's `;`-separated sub-pairs, split on the
+    /// still-encoded bytes (issue #6579; see [`semicolon_sub_pair_names`]).
+    /// Empty unless the pair carries an unencoded `;`. A backend that also
+    /// splits on `;` reads each of these as a parameter of its own, so
+    /// credential redaction must consult them; a `%3B` is content and never
+    /// produces an entry.
     pub semicolon_sub_names: Vec<String>,
 }
 
@@ -269,16 +270,7 @@ impl CanonicalQuery {
                         .into_owned()
                 }
             };
-            let semicolon_sub_names = if pair.contains(';') {
-                pair.split(';')
-                    .map(|sub_pair| {
-                        let raw = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
-                        percent_decode_str(raw).decode_utf8_lossy().into_owned()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let semicolon_sub_names = semicolon_sub_pair_names(pair);
             params.push(CanonicalQueryParam {
                 name,
                 value,
@@ -364,22 +356,53 @@ pub fn canonical_query_for_policy(ctx: &crate::plugins::RequestContext) -> Canon
     CanonicalQuery::parse(&crate::proxy::effective_backend_query_string(ctx))
 }
 
+/// Decoded names of a still-encoded `&`-separated pair's `;`-separated
+/// sub-pairs (issue #6579), or nothing when the pair carries no raw `;`.
+///
+/// The split happens on the encoded bytes, so a `%3B` is content and never
+/// creates a sub-pair, and each name is decoded only afterwards. A name is
+/// reported under RFC 3986 percent-decoding and, when it holds a raw `+`,
+/// under form decoding too (`+` as space, converted before percent-decoding
+/// so `%2B` stays a literal plus), because the backend that splits on `;`
+/// may be a form decoder.
+pub fn semicolon_sub_pair_names(segment: &str) -> Vec<String> {
+    if !segment.contains(';') {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for sub_pair in segment.split(';') {
+        let raw = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+        let rfc = percent_decode_str(raw).decode_utf8_lossy().into_owned();
+        if raw.contains('+') {
+            let form = percent_decode_str(&raw.replace('+', " "))
+                .decode_utf8_lossy()
+                .into_owned();
+            if form != rfc {
+                names.push(form);
+            }
+        }
+        names.push(rfc);
+    }
+    names
+}
+
 /// Whether a still-encoded `&`-separated query pair carries a parameter in
 /// `names` once a backend also splits it on `;` (issue #6579).
 ///
 /// `carrier=;api_key=secret` is one `carrier` pair to Ferrum but also an
 /// `api_key` parameter to a `;`-splitting backend, so credential stripping must
-/// drop the whole `&` segment. Matches each `;` sub-pair by raw or decoded
-/// name, the same contract as [`crate::proxy::query_string_after_plugin_strips`].
-/// A segment without `;` never matches here; callers check the pair's own name
+/// drop the whole `&` segment. Each `;` sub-pair matches by its raw name or by
+/// any decoding [`semicolon_sub_pair_names`] reports, the same raw-or-decoded
+/// contract as [`crate::proxy::query_string_after_plugin_strips`]. A segment
+/// without `;` never matches here; callers check the pair's own name
 /// separately.
 pub fn semicolon_sub_pair_names_any(segment: &str, names: &HashSet<&str>) -> bool {
     segment.contains(';')
-        && segment.split(';').any(|sub_pair| {
-            let raw_name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
-            names.contains(raw_name)
-                || names.contains(percent_decode_str(raw_name).decode_utf8_lossy().as_ref())
-        })
+        && (segment.split(';').any(|sub_pair| {
+            names.contains(sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
+        }) || semicolon_sub_pair_names(segment)
+            .iter()
+            .any(|name| names.contains(name.as_str())))
 }
 
 /// Whether every `%` in `value` begins a complete `%HH` triplet.

@@ -4284,9 +4284,16 @@ fn query_after_strip_markers(
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
         let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
+        // A `;` sub-pair is a parameter of its own to a provider that also
+        // splits on `;` (issue #6579): it must neither carry a stripped
+        // credential through nor override an endpoint-owned parameter.
         if strip_names.contains(raw_name)
             || strip_names.contains(decoded_name.as_ref())
             || endpoint_query_names.contains(decoded_name.as_ref())
+            || super::utils::query::semicolon_sub_pair_names_any(pair, &strip_names)
+            || super::utils::query::semicolon_sub_pair_names(pair)
+                .iter()
+                .any(|name| endpoint_query_names.contains(name))
         {
             continue;
         }

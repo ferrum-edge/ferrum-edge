@@ -12,7 +12,7 @@ use ferrum_edge::plugins::utils::jwt_verifier::{
 };
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
-    has_conflicting_duplicate_query_key,
+    has_conflicting_duplicate_query_key, semicolon_sub_pair_names,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
@@ -496,6 +496,33 @@ fn credential_strip_drops_a_credential_smuggled_behind_a_semicolon() {
         assert_eq!(query.len(), 1, "{raw}");
         assert_eq!(query.get("page"), Some("1"), "{raw}");
     }
+}
+
+#[test]
+fn semicolon_sub_pair_names_cover_form_decoding_and_keep_encoded_semicolons() {
+    let names = semicolon_sub_pair_names("carrier=;private+key=x;a%2Bb=1");
+    assert!(names.contains(&"private key".to_string()), "{names:?}");
+    assert!(names.contains(&"private+key".to_string()), "{names:?}");
+    // `%2B` is a literal plus under either decoding.
+    assert!(names.contains(&"a+b".to_string()), "{names:?}");
+    assert!(!names.contains(&"a b".to_string()), "{names:?}");
+    // `%3B` is content, not a separator.
+    assert!(semicolon_sub_pair_names("a=1%3Bapi_key%3Dx").is_empty());
+}
+
+#[test]
+fn credential_strip_matches_a_form_decoded_semicolon_name() {
+    // A JWKS `from_params: ["private key"]` credential consumed at
+    // `private%20key` must not survive as a hidden `;private+key=` copy that a
+    // form-decoding backend reads under the same name.
+    let mut ctx = ctx_for("private%20key=token&carrier=;private+key=token&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.private key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert_eq!(query.len(), 1, "{:?}", query.params());
+    assert_eq!(query.get("page"), Some("1"));
 }
 
 #[test]
