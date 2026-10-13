@@ -28,6 +28,15 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ai_transcript_audit` `redaction.hash_secret` needs 32 characters (issue #6617)
+
+The minimum length of `redaction.hash_secret` rose from 16 to 32 characters
+(Unicode code points). A config with a shorter secret is refused at load time.
+Before upgrading, replace the secret with a random value of at least 32
+characters. Placeholder digests and body hashes keyed with the old secret will
+no longer match the new ones, so collectors that correlate across the upgrade
+see a one-time break.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
