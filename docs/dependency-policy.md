@@ -623,7 +623,10 @@ by a vendored `[patch.crates-io]` copy, and the `sqlx*` crates (which pin
 version would make Cargo pick the crates.io release and drop the Ferrum patch
 without failing the build. Cargo only warns that the patch was unused. These
 crates move only through "Refreshing a vendored patch", "Retiring a vendored
-patch", or the emergency procedure above.
+patch", or the emergency procedure above. `mongodb` is ignored from 3.9 on:
+`Cargo.toml` caps it below 3.9 to keep MongoDB 4.2 / Cosmos DB
+server-version-4.2 support, and the grouped update would otherwise widen that
+cap.
 
 The other standalone lockfiles get no version updates: `ebpf/` and `fuzz/` pin
 nightly toolchains, `tests/performance/multi_protocol/` must keep `# SYNC:`
