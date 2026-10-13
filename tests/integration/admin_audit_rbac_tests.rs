@@ -1756,7 +1756,9 @@ async fn kafka_producer_config_properties_are_projected_by_allow_list() {
     let operator = token("mesh-operator", Some("operator"));
 
     let keypw_secret = "kafka-keypw-canary";
-    let oauth_secret = "kafka-keytab-canary";
+    // `sasl.kerberos.keytab` is a native key refused at admission (#6539);
+    // `sasl.kerberos.principal` likewise matches no redaction name heuristic.
+    let oauth_secret = "kafka-principal-canary";
     let plugin = json!({
         "id": "kafka-producer-redaction",
         "plugin_name": "kafka_logging",
@@ -1771,7 +1773,7 @@ async fn kafka_producer_config_properties_are_projected_by_allow_list() {
             "security_protocol": "sasl_ssl",
             "producer_config": {
                 "ssl.key.password": keypw_secret,
-                "sasl.kerberos.keytab": oauth_secret,
+                "sasl.kerberos.principal": oauth_secret,
                 "linger.ms": "20",
                 "compression.type": "lz4"
             }
@@ -1804,7 +1806,7 @@ async fn kafka_producer_config_properties_are_projected_by_allow_list() {
     let (status, raw) = get_json(&base, "/plugins/config/kafka-producer-redaction", &admin).await;
     assert_eq!(status, 200, "admin read failed: {raw:?}");
     assert_eq!(
-        raw["config"]["producer_config"]["sasl.kerberos.keytab"],
+        raw["config"]["producer_config"]["sasl.kerberos.principal"],
         oauth_secret
     );
 
@@ -1823,7 +1825,7 @@ fn assert_kafka_projection_redacted(config: &Value) {
     let props = &config["producer_config"];
     assert_eq!(props["ssl.key.password"], "[REDACTED]");
     // No name heuristic matches this property; only the allow-list saves it.
-    assert_eq!(props["sasl.kerberos.keytab"], "[REDACTED]");
+    assert_eq!(props["sasl.kerberos.principal"], "[REDACTED]");
     // Safe-value controls: allow-listed tuning knobs stay visible.
     assert_eq!(props["linger.ms"], "20");
     assert_eq!(props["compression.type"], "lz4");

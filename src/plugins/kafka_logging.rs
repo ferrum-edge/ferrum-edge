@@ -2470,6 +2470,47 @@ pub(crate) fn contains_inline_private_key(value: &str) -> bool {
     })
 }
 
+/// Refusal for a `producer_config` key that loads native code, runs a host
+/// command, or makes librdkafka read or write a gateway file (issue #6539).
+///
+/// Refused for every token unless the operator opted the whole process in.
+/// The list lives in the central plugin material registry, which also keeps
+/// namespace-bounded operators from introducing these keys at all.
+fn native_producer_key_error(key: &str) -> Option<String> {
+    let effect = crate::admin::crud::scoped_references::open_map_native_key(
+        "kafka_logging",
+        "producer_config",
+        key,
+    )?;
+    if crate::config::env_config::kafka_native_config_allowed() {
+        return None;
+    }
+    Some(format!(
+        "kafka_logging: `producer_config` key {key:?} is not allowed because it {effect}; \
+         set {}=true on every node that admits or runs this plugin to allow it",
+        crate::config::env_config::KAFKA_ALLOW_NATIVE_CONFIG_KEY
+    ))
+}
+
+/// The native-key refusal for a plugin config, whether or not it is enabled.
+///
+/// Admission of a disabled row skips plugin construction, so the admin API and
+/// the config load/admission sweeps call this before that skip. A disabled
+/// `kafka_logging` row therefore cannot store a native key either.
+pub(crate) fn disabled_config_native_key_refusal(
+    plugin_name: &str,
+    config: &Value,
+) -> Option<String> {
+    if plugin_name != "kafka_logging" {
+        return None;
+    }
+    config
+        .get("producer_config")?
+        .as_object()?
+        .keys()
+        .find_map(|key| native_producer_key_error(key))
+}
+
 /// Admit `producer_config` overrides (budgets, forbidden keys, CRL conflict)
 /// without constructing a Kafka producer.
 fn admit_producer_config(
@@ -2526,22 +2567,8 @@ fn admit_producer_config(
                 "kafka_logging: `producer_config` key {key:?} is not allowed"
             ));
         }
-        // librdkafka properties that load native code, run a host command, or
-        // read a gateway file are refused for every token unless the operator
-        // opted the whole process in (issue #6539). The list lives in the
-        // central plugin material registry, which also refuses these keys to
-        // namespace-bounded operators regardless of the opt-in.
-        if let Some(effect) = crate::admin::crud::scoped_references::open_map_native_key(
-            "kafka_logging",
-            "producer_config",
-            &normalized,
-        ) && !crate::config::env_config::kafka_native_config_allowed()
-        {
-            return Err(format!(
-                "kafka_logging: `producer_config` key {key:?} is not allowed because it {effect}; \
-                 set {}=true on every node that admits or runs this plugin to allow it",
-                crate::config::env_config::KAFKA_ALLOW_NATIVE_CONFIG_KEY
-            ));
+        if let Some(error) = native_producer_key_error(key) {
+            return Err(error);
         }
         if let Some((_, rationale)) = UNSUPPORTED_PRODUCER_KEYS
             .iter()
