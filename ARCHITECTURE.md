@@ -529,20 +529,24 @@ In-flight requests continue using the previous config snapshot via Arc reference
 
 ### **WebSocket Request Processing**
 
-All WebSocket connections go through the full plugin authentication pipeline — there is no unauthenticated bypass path. The upgrade is performed only after all plugins (auth, authz, rate limiting, logging) have executed successfully.
+All WebSocket connections go through the configured, protocol-applicable request admission phases — there is no unauthenticated bypass path. Rate limiting is phase-dependent: IP limits charge in `on_request_received` (before authentication), while consumer/SPIFFE limits charge in authorization. The backend upgrade is performed only after those admission phases have executed successfully, and the successful handshake summary is logged only after the backend is verified and its status recorded.
 
 ```
 1. WebSocket Upgrade Request
    ↓
 2. Route Matching
    ↓
-3. Full Plugin Pipeline (auth → authz → rate limit → logging)
+3. Configured, protocol-applicable request admission phases
+   (on_request_received, incl. IP rate limit → auth → authz,
+    incl. consumer/SPIFFE rate limit)
    ↓
 4. Connection Pool (with mTLS)
    ↓
-5. Backend WebSocket Upgrade
+5. Backend WebSocket Upgrade and verification (status recorded)
    ↓
-6. Bidirectional Proxying
+6. Successful handshake logging
+   ↓
+7. Bidirectional Proxying
 ```
 
 ## Configuration Hierarchy
