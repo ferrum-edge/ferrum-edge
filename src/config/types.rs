@@ -7542,11 +7542,11 @@ fn load_validated_country_mmdb_inner(
         ))
     })?;
 
-    if !is_supported_country_mmdb_type(&reader.metadata.database_type) {
+    if !is_supported_country_mmdb_type(&reader.metadata().database_type) {
         return Err(CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file {path:?} has unsupported database type {:?}; expected a \
              GeoIP2/GeoLite2 Country or City database, or GeoIP2 Enterprise",
-            reader.metadata.database_type
+            reader.metadata().database_type
         )));
     }
 
