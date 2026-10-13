@@ -222,6 +222,43 @@ fn reject_body(result: &PluginResult) -> &str {
     }
 }
 
+/// Validity window for an rcgen-minted signer certificate, as
+/// `(notBefore, notAfter)` calendar dates `(year, month, day)`.
+type CertValidityDates = ((i32, u8, u8), (i32, u8, u8));
+
+/// A validity window that ended long ago.
+const EXPIRED_CERT_VALIDITY: CertValidityDates = ((2000, 1, 1), (2001, 1, 1));
+/// A validity window that has not started yet.
+const NOT_YET_VALID_CERT_VALIDITY: CertValidityDates = ((2090, 1, 1), (2091, 1, 1));
+
+/// Mint a self-signed RSA certificate with rcgen and return
+/// `(PKCS#8 DER key, certificate PEM, certificate DER)`. `validity` overrides
+/// rcgen's default window (which is valid now).
+fn mint_rsa_signer(
+    common_name: &str,
+    validity: Option<CertValidityDates>,
+) -> (Vec<u8>, String, Vec<u8>) {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .expect("rcgen RSA keypair (requires aws_lc_rs feature on rcgen)");
+    let mut params =
+        rcgen::CertificateParams::new(vec![common_name.to_string()]).expect("rcgen params");
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, common_name);
+    params.distinguished_name = dn;
+    if let Some(((by, bm, bd), (ay, am, ad))) = validity {
+        params.not_before = rcgen::date_time_ymd(by, bm, bd);
+        params.not_after = rcgen::date_time_ymd(ay, am, ad);
+    }
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("rcgen self-sign RSA cert");
+    (
+        key_pair.serialize_der(),
+        cert.pem(),
+        cert.der().as_ref().to_vec(),
+    )
+}
+
 fn reject_headers(result: &PluginResult) -> &HashMap<String, String> {
     match result {
         PluginResult::Reject { headers, .. } => headers,
@@ -1066,6 +1103,50 @@ async fn test_timestamp_expires_past_rejects() {
     assert!(reject_body(&result).contains("expired"));
 }
 
+/// An `xsd:dateTime` without a zone designator has no defined instant, so it
+/// is refused instead of being guessed as UTC. The same instant with `Z` or an
+/// explicit offset is accepted.
+#[tokio::test]
+async fn test_timestamp_without_zone_designator_rejected() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let now = chrono::Utc::now();
+    let expires_at = now + chrono::Duration::minutes(5);
+
+    let cases = [
+        ("%Y-%m-%dT%H:%M:%S%.3f", false),
+        ("%Y-%m-%dT%H:%M:%S", false),
+        ("%Y-%m-%dT%H:%M:%S%.3fZ", true),
+        ("%Y-%m-%dT%H:%M:%S%:z", true),
+    ];
+    for (format, accepted) in cases {
+        let ts = format!(
+            r#"<wsu:Timestamp wsu:Id="TS-1">
+            <wsu:Created>{}</wsu:Created>
+            <wsu:Expires>{}</wsu:Expires>
+        </wsu:Timestamp>"#,
+            now.format(format),
+            expires_at.format(format)
+        );
+        let body = wrap_soap(&ts);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        if accepted {
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "{format}: expected Continue, got {result:?}"
+            );
+        } else {
+            assert_eq!(reject_status(&result), 401, "{format}");
+            assert!(
+                reject_body(&result).contains("invalid Created timestamp"),
+                "{format}: got {}",
+                reject_body(&result)
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_timestamp_require_expires_missing_rejects() {
     let config = json!({
@@ -1779,6 +1860,9 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         /// (GHSA-9g4v-h9hm-846r), so a Reference-scoping test has to sign the
         /// URI it wants judged. `None` targets the enclosing assertion.
         pub reference_uri_override: Option<String>,
+        /// Sign with this `(PKCS#8 DER key, certificate PEM)` instead of the
+        /// committed IdP fixture, e.g. an rcgen cert with a chosen validity.
+        pub signer: Option<(Vec<u8>, String)>,
     }
 
     impl<'a> AssertionBuilder<'a> {
@@ -1805,6 +1889,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 corrupt_signature_value: false,
                 name_id_fragment: None,
                 reference_uri_override: None,
+                signer: None,
             }
         }
 
@@ -1941,13 +2026,15 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                     .expect("test SignedInfo must canonicalize");
 
             // Pick the signing key + matching cert.
-            let (key_pkcs8_b64, cert_pem) = if self.sign_with_untrusted_key {
-                (UNTRUSTED_IDP_KEY_PKCS8_B64, UNTRUSTED_IDP_CERT_PEM)
-            } else {
-                (TEST_IDP_KEY_PKCS8_B64, TEST_IDP_CERT_PEM)
+            let (pkcs8, cert_pem) = match &self.signer {
+                Some((pkcs8, cert_pem)) => (pkcs8.clone(), cert_pem.as_str()),
+                None if self.sign_with_untrusted_key => (
+                    decode_b64(UNTRUSTED_IDP_KEY_PKCS8_B64),
+                    UNTRUSTED_IDP_CERT_PEM,
+                ),
+                None => (decode_b64(TEST_IDP_KEY_PKCS8_B64), TEST_IDP_CERT_PEM),
             };
 
-            let pkcs8 = decode_b64(key_pkcs8_b64);
             let key_pair =
                 RsaKeyPair::from_pkcs8(&pkcs8).expect("test fixture RSA key is valid PKCS#8");
             let mut sig_bytes = vec![0u8; key_pair.public().modulus_len()];
@@ -2050,6 +2137,64 @@ async fn test_saml_valid_signed_assertion_accepted() {
         ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
         Some("alice@example.com"),
         "Subject NameID must be exported as metadata"
+    );
+}
+
+/// A pinned IdP signing certificate outside its validity window no longer
+/// authenticates assertions, even though its fingerprint is trusted and the
+/// signature verifies.
+#[tokio::test]
+async fn test_saml_pinned_signing_cert_outside_validity_window_rejected() {
+    for (label, validity) in [
+        ("expired", EXPIRED_CERT_VALIDITY),
+        ("not yet valid", NOT_YET_VALID_CERT_VALIDITY),
+    ] {
+        let (pkcs8, cert_pem, _) = mint_rsa_signer("soap-saml-validity-test", Some(validity));
+        let bundle = saml_fixtures::IdpBundle::with_trusted_cert(&cert_pem);
+        let plugin = SoapWsSecurity::new(&saml_config(&bundle, None))
+            .unwrap_or_else(|e| panic!("{label} pin must still be admitted: {e}"));
+
+        let mut builder = saml_fixtures::AssertionBuilder::new(
+            "_assertion-validity",
+            "https://idp.example.com/metadata",
+            "alice@example.com",
+        );
+        builder.signer = Some((pkcs8, cert_pem));
+        let body = wrap_saml_assertion(&builder.build());
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+        assert_eq!(reject_status(&result), 401, "{label}");
+        assert!(
+            reject_body(&result).contains("outside its validity period"),
+            "{label}: got {}",
+            reject_body(&result)
+        );
+    }
+}
+
+/// The same rcgen signer inside its window is accepted, so the rejection
+/// above is attributable to the validity check alone.
+#[tokio::test]
+async fn test_saml_pinned_signing_cert_inside_validity_window_accepted() {
+    let (pkcs8, cert_pem, _) = mint_rsa_signer("soap-saml-validity-test", None);
+    let bundle = saml_fixtures::IdpBundle::with_trusted_cert(&cert_pem);
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-validity-ok",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.signer = Some((pkcs8, cert_pem));
+    let body = wrap_saml_assertion(&builder.build());
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "in-window rcgen signer should pass, got {result:?}"
     );
 }
 
@@ -3683,10 +3828,7 @@ mod x509_roundtrip {
     use super::*;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
-    use rcgen::{
-        CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256,
-        PKCS_RSA_SHA256,
-    };
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
     use ring::rand::SystemRandom;
     use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 
@@ -3701,22 +3843,15 @@ mod x509_roundtrip {
     }
 
     fn mint_rsa_cert() -> TestRsaCert {
-        let key_pair = KeyPair::generate_for(&PKCS_RSA_SHA256)
-            .expect("rcgen RSA keypair (requires aws_lc_rs feature on rcgen)");
-        let mut params = CertificateParams::new(vec!["soap-ws-security-test".to_string()])
-            .expect("rcgen CertificateParams");
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "soap-ws-security-test");
-        params.distinguished_name = dn;
-        let cert = params
-            .self_signed(&key_pair)
-            .expect("rcgen self-sign RSA cert");
-        let cert_pem = cert.pem();
-        let cert_der_b64 = B64.encode(cert.der().as_ref());
+        mint_rsa_cert_with_validity(None)
+    }
+
+    fn mint_rsa_cert_with_validity(validity: Option<CertValidityDates>) -> TestRsaCert {
+        let (pkcs8_der, cert_pem, cert_der) = mint_rsa_signer("soap-ws-security-test", validity);
+        let cert_der_b64 = B64.encode(&cert_der);
 
         // rcgen `KeyPair::serialize_der` exposes the key as a PKCS#8 DER, which
         // is the input format ring's `RsaKeyPair::from_pkcs8` expects.
-        let pkcs8_der = key_pair.serialize_der();
         let signing_key =
             RsaKeyPair::from_pkcs8(&pkcs8_der).expect("ring RsaKeyPair from rcgen PKCS#8 DER");
 
@@ -4076,6 +4211,36 @@ mod x509_roundtrip {
             "expected Continue with valid RSA signature, got {:?}",
             result,
         );
+    }
+
+    /// A pinned signer certificate is trusted only inside its own
+    /// `notBefore..=notAfter` window. The fingerprint still matches and the
+    /// signature is otherwise perfect, so only the validity check can refuse
+    /// these. Admission keeps the pin (staged rotation, reload safety) and
+    /// warns; the request path refuses it.
+    #[tokio::test]
+    async fn pinned_cert_outside_validity_window_is_rejected() {
+        for (label, validity) in [
+            ("expired", EXPIRED_CERT_VALIDITY),
+            ("not yet valid", NOT_YET_VALID_CERT_VALIDITY),
+        ] {
+            let cert = mint_rsa_cert_with_validity(Some(validity));
+            let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+            let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()))
+                .unwrap_or_else(|e| panic!("{label} pin must still be admitted: {e}"));
+
+            let body = build_signed_soap_envelope(&cert);
+            let mut ctx = make_ctx_with_soap_body(&body);
+            let mut headers = soap_headers();
+            let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+            assert_eq!(reject_status(&result), 401, "{label}");
+            assert!(
+                reject_body(&result).contains("outside its validity period"),
+                "{label}: got {}",
+                reject_body(&result)
+            );
+        }
     }
 
     #[tokio::test]

@@ -3570,6 +3570,14 @@ This applies to `NameID`, `Issuer`, `Audience`, `Username`, `Password`, `Nonce`,
 still accepted — only comments *inside* a value are refused. The rejection body
 names the reason and never echoes the element's content.
 
+Every instant (`wsu:Created`, `wsu:Expires`, the UsernameToken `Created`, and the
+SAML `NotBefore`, `NotOnOrAfter`, and `SubjectConfirmationData` bounds) must carry
+an explicit zone designator: `Z` or a numeric `±hh:mm` offset. An
+`xsd:dateTime` without one has no defined instant, and WS-Security and SAML 2.0
+both require UTC, so such a value is rejected as invalid rather than assumed to
+be UTC — a guess would shift every freshness and validity window by the
+sender's offset.
+
 #### Removing the credential before the backend
 
 A verified PasswordText credential is a reusable secret, and validating it does
@@ -3810,6 +3818,10 @@ config:
 
 `allowed_algorithms` and `allowed_digest_algorithms` are gated independently. The defaults (`rsa-sha256` and `sha256` respectively) reject SHA-1 in either position; explicitly add `rsa-sha1` / `sha1` only to interoperate with legacy signers.
 
+**Pinned certificates are trusted only inside their validity window.** A fingerprint match authenticates the key, not its lifetime, so every request also checks the matched certificate's `notBefore`/`notAfter` against the gateway clock and refuses a signature from a certificate that has expired or is not yet valid (`401`, "signing certificate is outside its validity period"). Admission still loads such a certificate, so a replacement can be staged ahead of its `notBefore` and a reload never fails just because an old entry has lapsed, but each out-of-window entry is logged as a warning when the plugin is built. Remove expired entries once their replacement is in service. No CA chain, revocation, or key-usage check is performed: trust is the pin itself.
+
+**SHA-1 is a legacy opt-in.** `rsa-sha1` and `sha1` exist only for partners that cannot sign with SHA-256. SHA-1 is not collision resistant, so a SHA-1 `DigestValue` binds the signed content far more weakly than SHA-256, and a SHA-1 `SignatureMethod` lets anyone who can get a chosen message signed by the pinned key attempt a collision. Enable them per route, for the specific signer that needs them, and remove them once that signer moves to SHA-256. FIPS builds refuse them regardless of this list.
+
 #### SAML Assertion Validation
 
 The plugin cryptographically verifies the SAML assertion's `<Signature>` element before any other field is trusted. Verification order:
@@ -3849,7 +3861,9 @@ config:
     require: true
 ```
 
-`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
+`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs (see the SHA-1 note under [X.509 Signature Verification](#x509-signature-verification)).
+
+A trusted IdP signing certificate is honored only inside its own `notBefore`/`notAfter` window, exactly as for `x509_signature.trusted_certs`: an expired or not-yet-valid pin is loaded with a warning but refuses every assertion it signs (`401`, "SAML signing certificate is outside its validity period"). That makes the overlap rotation below safe to stage before the new certificate's `notBefore`.
 
 **Rotating an IdP signing cert does not require a restart.** The trust list is read when the plugin *generation* is constructed, and every configuration reload builds a new generation: change `trusted_signing_certs` and apply a reload — file-mode `SIGHUP`, a database or CP configuration change, a DP push — and the new signer is admitted while the retired one is refused, from the first request the new generation serves. The process, its listeners, and its in-flight connections are untouched.
 
