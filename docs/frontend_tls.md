@@ -485,6 +485,21 @@ are listed at the end of this section.
   A CRL that expires while the gateway is running therefore stops authorizing
   **new** handshakes on every surface it is installed on, without a reload and
   without a restart. Keep the CRL refreshed ahead of its own `nextUpdate`.
+- **No session resumption while a CRL is enforced.** A resumed TLS 1.2 or
+  TLS 1.3 session restores the client certificate from the session and skips
+  the verifier, including its `nextUpdate` check. Every inbound listener whose
+  client-certificate verifier enforces at least one CRL therefore disables TLS
+  1.3 tickets, TLS 1.2 session tickets and the TLS 1.2 session-ID cache:
+  frontend HTTPS/H2 and TCP+TLS, HTTP/3, admin HTTPS, CP gRPC, and the mesh
+  inbound listener. This holds with or without
+  `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`, so a client admitted before a CRL
+  expired cannot keep reconnecting after it (issue #6538). Every new connection
+  to such a listener pays a full handshake; established connections are not
+  affected. A frontend, admin, CP gRPC or mesh operator-CA mTLS listener
+  without a CRL and without live reload keeps normal resumption. A
+  live-reload (scope-bound) listener disables it, and so does any listener
+  that installs the live SPIFFE peer verifier: that verifier reads CRLs and
+  trust bundles on every handshake.
 - **CRL refresh is a restart-blocking dependency.** The same refusal applies at
   **startup**, not only at reload: `FERRUM_TLS_CRL_FILE_PATH` /
   `FERRUM_TLS_CRL_SOURCE` is loaded during startup in every serving mode
@@ -908,7 +923,10 @@ deliberately empty) and the suppression of TLS 1.3 session tickets and the
 stateful session cache — are likewise applied **only where a client-trust
 generation can actually be published**: an mTLS listener built without
 `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` keeps its `certificate_authorities`
-hints and its session resumption exactly as before. Suppressing resumption is
+hints and its session resumption exactly as before. The one independent
+exception is resumption on a listener whose verifier enforces a CRL: that is
+disabled with or without live reload, so the CRL `nextUpdate` check runs on
+every handshake (see "No session resumption while a CRL is enforced" above). Suppressing resumption is
 required once a withdrawal can land mid-life, because a session ticket does not
 re-run client-certificate verification; where no generation can ever advance,
 there is no withdrawn generation for a ticket to outlive. The one exception is
@@ -1538,7 +1556,7 @@ When using load balancers:
 ## Performance Considerations
 
 - **TLS Handshake Overhead**: Initial connections have higher latency
-- **Session Resumption**: Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption is disabled on an mTLS listener whose client-trust scope can advance under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, so a ticket cannot outlive an accepted client-CA or CRL withdrawal; static mTLS listeners retain normal resumption. Resumption otherwise saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
+- **Session Resumption**: Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption (TLS 1.3 tickets, TLS 1.2 tickets and the TLS 1.2 session-ID cache) is disabled on an mTLS listener whose client verifier enforces a CRL, so every handshake reaches the CRL `nextUpdate` check, and on an mTLS listener whose client-trust scope can advance under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, so a session cannot outlive an accepted client-CA or CRL withdrawal. Static mTLS listeners without a CRL retain normal resumption. Resumption otherwise saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
 - **Hardware Acceleration**: Consider for high-throughput scenarios
 - **Certificate Size**: Smaller certificates improve performance
 

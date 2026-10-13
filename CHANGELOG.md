@@ -72,6 +72,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notifications and mesh SPIFFE outbound configs. Reconnects through those
   configs pay a full handshake; empty-CRL and skip-verify configs keep
   resumption.
+- **CRL-enforcing inbound mTLS listeners no longer resume sessions** (issue
+  #6538, inbound twin of the outbound fix above). A resumed TLS 1.2 or TLS 1.3
+  session skips the client-certificate verifier, so a client admitted before a
+  CRL's `nextUpdate` could keep reconnecting after it expired whenever
+  `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` was off (the default).
+  - Every inbound listener whose client verifier enforces at least one CRL
+    now disables TLS 1.3 tickets, TLS 1.2 session tickets and the TLS 1.2
+    session-ID cache, with or without live reload: frontend HTTPS/H2 and
+    TCP+TLS, HTTP/3, admin HTTPS, CP gRPC and the mesh operator-CA listener.
+    New connections pay a full handshake; established connections are
+    unaffected. Static frontend and operator-CA mTLS listeners without a
+    CRL keep resumption.
+  - The mesh inbound listener that installs the SPIFFE peer verifier, and
+    the standalone `build_spiffe_inbound_config`, always disable resumption,
+    because that verifier reads the enforced CRLs and peer trust bundles live
+    on every handshake.
+  - The existing live-reload suppression now also disables TLS 1.2 session
+    tickets. Before, it stopped only TLS 1.3 tickets and the stateful cache.
 - **`mcp_gateway` upstream calls log a redacted endpoint** (PR #6316,
   sibling of GHSA-4ghp-v85j-5hvq). `initialize`, the `initialized`
   notification, session `DELETE` and discovery now use the redacted tracked
