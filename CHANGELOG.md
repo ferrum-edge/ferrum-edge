@@ -142,6 +142,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Plugin hot-path allocations** (issues #6617, #6628). `prometheus_metrics`
+  counter maps and the global JWKS cache are now sharded through
+  `pool_shard_amount`, like other hot-path `DashMap`s. `mcp_gateway` reads
+  the one session field it needs instead of deep-cloning the whole downstream
+  session. Route header `add` rules no longer allocate a key when appending
+  to an existing header.
+
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB

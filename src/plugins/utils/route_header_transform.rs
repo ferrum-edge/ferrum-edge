@@ -39,7 +39,6 @@
 //! should use `set`, which translates to `update`.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use http::header::{HeaderName, HeaderValue};
@@ -268,25 +267,23 @@ pub fn apply_route_header_transforms_tracked(
         match rule.operation {
             RouteHeaderTransformOp::Add => {
                 if let Some(value) = rule.value.as_ref() {
-                    match headers.entry(rule.key.clone()) {
-                        Entry::Occupied(mut existing) => {
-                            let existing = existing.get_mut();
-                            if existing.is_empty() {
-                                existing.push_str(value);
+                    // Look up by `&str` first so appending to an existing
+                    // header does not allocate an owned key per request.
+                    if let Some(existing) = headers.get_mut(rule.key.as_str()) {
+                        if existing.is_empty() {
+                            existing.push_str(value);
+                        } else {
+                            if rule.key.eq_ignore_ascii_case("set-cookie") {
+                                existing.push('\n');
                             } else {
-                                if rule.key.eq_ignore_ascii_case("set-cookie") {
-                                    existing.push('\n');
-                                } else {
-                                    existing.push(',');
-                                }
-                                existing.push_str(value);
+                                existing.push(',');
                             }
+                            existing.push_str(value);
                         }
-                        Entry::Vacant(slot) => {
-                            slot.insert(value.clone());
-                            if let Some(sink) = inserted_keys.as_mut() {
-                                sink.push(rule.key.clone());
-                            }
+                    } else {
+                        headers.insert(rule.key.clone(), value.clone());
+                        if let Some(sink) = inserted_keys.as_mut() {
+                            sink.push(rule.key.clone());
                         }
                     }
                 }

@@ -252,7 +252,14 @@ fn ensure_trust_health_hook() {
 
 fn global_cache() -> &'static Arc<DashMap<String, JwksCacheEntry>> {
     ensure_trust_health_hook();
-    JWKS_CACHE.get_or_init(|| Arc::new(DashMap::new()))
+    // Read on every JWT verification: shard like other hot-path maps. The map
+    // is process-global and built before `EnvConfig` is consulted, so it uses
+    // the auto-sized formula (`FERRUM_POOL_SHARD_AMOUNT=0`).
+    JWKS_CACHE.get_or_init(|| {
+        Arc::new(DashMap::with_shard_amount(
+            crate::util::sharding::pool_shard_amount(0),
+        ))
+    })
 }
 
 fn discovered_jwks_uris() -> &'static DashMap<String, String> {

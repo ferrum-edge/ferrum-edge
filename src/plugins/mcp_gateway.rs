@@ -1828,13 +1828,12 @@ impl McpGateway {
     }
 
     fn upstream_session_id(&self, downstream_id: &str, server_id: &str) -> Option<String> {
-        self.downstream_session_clone(downstream_id)
-            .and_then(|session| {
-                session
-                    .upstream_sessions
-                    .get(server_id)
-                    .and_then(|upstream| upstream.upstream_session_id.clone())
-            })
+        self.session_store.get(downstream_id).and_then(|session| {
+            session
+                .upstream_sessions
+                .get(server_id)
+                .and_then(|upstream| upstream.upstream_session_id.clone())
+        })
     }
 
     fn set_route_to_server(
@@ -2532,8 +2531,11 @@ impl McpGateway {
     }
 
     fn catalog_for_session(&self, downstream_session_id: &str) -> Option<Arc<RwLock<McpCatalog>>> {
-        self.downstream_session_clone(downstream_session_id)
-            .map(|session| session.catalog)
+        // Project the one field under the shard guard instead of deep-cloning
+        // the whole session (upstream-session map, client info) per call.
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| Arc::clone(&session.catalog))
     }
 
     async fn require_live_downstream_session(
@@ -2712,7 +2714,8 @@ impl McpGateway {
         // here, so concurrent first-touch of different sessions/servers proceeds
         // in parallel and a slow upstream does not block unrelated initializes.
         let init_lock = self
-            .downstream_session_clone(downstream_session_id)
+            .session_store
+            .get(downstream_session_id)
             .and_then(|session| {
                 session
                     .upstream_sessions
@@ -2721,15 +2724,16 @@ impl McpGateway {
             })
             .ok_or_else(|| "downstream MCP session is not initialized".to_string())?;
         let _guard = init_lock.lock().await;
-        if let Some(upstream_session_id) = self
-            .downstream_session_clone(downstream_session_id)
-            .and_then(|session| {
-                session
-                    .upstream_sessions
-                    .get(server_id)
-                    .filter(|upstream| upstream.initialized)
-                    .map(|upstream| upstream.upstream_session_id.clone())
-            })
+        if let Some(upstream_session_id) =
+            self.session_store
+                .get(downstream_session_id)
+                .and_then(|session| {
+                    session
+                        .upstream_sessions
+                        .get(server_id)
+                        .filter(|upstream| upstream.initialized)
+                        .map(|upstream| upstream.upstream_session_id.clone())
+                })
         {
             return Ok(upstream_session_id);
         }
@@ -2944,7 +2948,8 @@ impl McpGateway {
     }
 
     fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
-        self.downstream_session_clone(downstream_session_id)
+        self.session_store
+            .get(downstream_session_id)
             .map(|session| session.protocol_version.clone())
             .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
@@ -2954,13 +2959,14 @@ impl McpGateway {
         downstream_session_id: &str,
         server_id: &str,
     ) -> String {
-        self.downstream_session_clone(downstream_session_id)
+        self.session_store
+            .get(downstream_session_id)
             .and_then(|session| {
                 session
                     .upstream_sessions
                     .get(server_id)
                     .and_then(|upstream| upstream.protocol_version.clone())
-                    .or(Some(session.protocol_version))
+                    .or_else(|| Some(session.protocol_version.clone()))
             })
             .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
