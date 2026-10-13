@@ -652,7 +652,17 @@ of the path conditions see (`/admin;x/users` is not `/admin/users`).
 
 `global_exemptions` short-circuits the entire WAF for matching requests, so keep
 the entries tight — an over-broad `paths` entry silently disables the WAF on
-unintended routes:
+unintended routes. `paths`, `methods`, `ips`, and `consumers` are combined by
+`match`:
+
+- `match: all` (default) — a request is exempt only when **every** configured
+  criterion matches it. Adding a criterion narrows the exemption:
+  `{"paths": ["/health"], "methods": ["GET"]}` exempts `GET /health`, not every
+  `GET` plus every method on `/health`.
+- `match: any` — any one configured criterion exempts the request (the
+  pre-existing behavior; use it only when each criterion is safe on its own).
+
+An exemption with no `paths`/`methods`/`ips`/`consumers` exempts nothing.
 
 - `paths` — exact, `prefix*`, or `~regex`. All three match from the **start** of
   the path: a non-wildcard entry is an exact full-path match, `prefix*` is a
@@ -661,14 +671,17 @@ unintended routes:
   containing it. Use `~^/a|^/b` for alternation, or `~.*pattern` if you really
   need a floating substring match.
 - `methods`, `consumers`, `ips` (CIDR)
-- `header_present` — suppress rules when a header is present/equal. **Clients
-  choose their own headers**: an entry keyed on a header the client can send
-  (for example `x-internal-scan`) lets any caller switch the WAF off for their
-  request. Key it only on a header that a trusted component in front of the
-  gateway always strips or overwrites — Ferrum's own `request_transformer`
-  runs in `before_proxy`, after the WAF has decided, so it cannot protect
-  this — or exempt authenticated callers via `consumers` instead. The same
-  caution applies to per-rule `conditions.headers`.
+- `header_present` — suppress every rule for a request that carries the header
+  with **exactly** the configured value. **Clients choose their own headers**,
+  so the value is a shared secret: it must be a string of at least 16
+  characters, it is compared in constant time, and presence-only (`null`)
+  entries are rejected at admission. Have a trusted component in front of the
+  gateway inject it (and strip any client copy), and rotate it like any other
+  credential; the header is still forwarded to the backend. Ferrum's own
+  `request_transformer` runs in `before_proxy`, after the WAF has decided, so
+  it cannot inject it. Exempting authenticated callers via `consumers` is
+  usually the better tool. Per-rule `conditions.headers` keeps plain value
+  matching, so scope rules on client-controlled headers with the same care.
 - `fp_capture_filters` — suppress any matched value matching these patterns
   (these match anywhere in the value by design and are **not** anchored)
 
@@ -740,8 +753,8 @@ while `inspect_binary_body` is off:
 
 | Value | Non-empty unlisted body |
 | --- | --- |
-| `allow` (default) | forwarded uninspected, as before |
-| `fail_closed` | rejected when an enforcing request-body policy applies to this request (an applicable `action: enforce` body rule, or anomaly scoring over one), so an enforcing rule cannot be sidestepped by relabelling; otherwise forwarded and recorded |
+| `allow` | forwarded uninspected |
+| `fail_closed` (default) | rejected when an enforcing request-body policy applies to this request (an applicable `action: enforce` body rule, or anomaly scoring over one), so an enforcing rule cannot be sidestepped by relabelling; otherwise forwarded and recorded |
 | `block` | rejected while `mode: enforce` — a strict allowlist of inspectable types |
 
 The decision is exact: when a value could refuse the request, the WAF asks the
@@ -760,8 +773,39 @@ HTTP/3, native gRPC, and gRPC-Web requests — and among those only:
   inspection on, with an active request-body rule or `FE-ENCODING-001` /
   `FE-ENCODING-002` enabled).
 
-Response bodies are never governed by it, and WebSocket messages carry no
+Response bodies are governed by the separate
+`on_unlisted_response_content_type` (below), and WebSocket messages carry no
 `Content-Type` and are always scanned.
+
+`fail_closed` is the default because the request `Content-Type` is chosen by
+the client: under an enforcing request-body policy, relabelling a payload must
+not be a way around it. Monitor-only deployments (`mode: monitor`, or no body
+rule set to enforce) never start blocking; they record
+`waf.body_uninspected=content_type` instead. Set `allow` explicitly to keep the
+old forward-uninspected behavior on routes that carry opaque uploads you cannot
+list or exempt.
+
+#### Responses: `on_unlisted_response_content_type`
+
+The same scan scope applies to response bodies when `response_inspection` and
+`response_body_inspection` are on. A non-empty response whose `Content-Type`
+falls outside it used to stream past every response-body rule (stack-trace,
+source and data-leak detection) with no record. `on_unlisted_response_content_type`
+takes the same three values:
+
+| Value | Non-empty unlisted response body |
+| --- | --- |
+| `allow` (default) | forwarded uninspected; recorded as `waf.body_uninspected=content_type` with `waf.body_uninspected_target=response_body` when the body was buffered anyway |
+| `fail_closed` | rejected when an enforcing response-body policy applies to the request |
+| `block` | rejected while `mode: enforce` |
+
+Refusing values buffer the unlisted body and decide over the exact bytes, so an
+empty body passes. `text/event-stream` responses, bodiless responses (`HEAD`,
+1xx, 204, 304), and exempt requests are never governed. The response default
+stays `allow` because the origin, not the client, chooses the response type,
+and images, archives, and protobuf are routine; an enforce-mode instance with
+enforcing response-body rules logs a warning at construction while the option
+is unset. Neither value satisfies `mode: enforce` admission on its own.
 
 Because a refusing configuration reads the whole body before it rejects, a
 large or long-running upload receives the rejection (`reject_status_code`,
@@ -790,7 +834,7 @@ never fire, and it does not satisfy admission (the configuration is still
 accepted when some other enforcement path exists). `fail_closed` never
 satisfies admission.
 
-Before switching to `block` or `fail_closed`, list every type your backends
+Before switching to `block`, or enabling enforcing body rules under the `fail_closed` default, list every type your backends
 legitimately accept: add them to `body_content_types` (scanned as text), turn
 on `inspect_multipart` for uploads, or exempt upload-only routes with
 `global_exemptions`. gRPC (`application/grpc`, `application/grpc+proto`),
@@ -808,7 +852,7 @@ suffix, so they are **scanned** as JSON whenever `application/json` is in
 `body_content_types`, not refused as unlisted.
 Bodies on methods outside `body_methods` (for example a `GET` with a body)
 are not governed; add the method to `body_methods` if a backend reads such
-bodies.
+bodies. The default list includes `DELETE`, which may carry content.
 
 Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
@@ -1202,7 +1246,8 @@ logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.paranoia`, `waf.detection_rule_hits` / `waf.detection_paranoia` (see
 [Detection paranoia level](#detection-paranoia-level)), plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
-`response_body`) / `waf.body_uninspected` (`content_type`). All of these are
+`response_body`) / `waf.body_uninspected` (`content_type`) /
+`waf.body_uninspected_target` (`request_body` or `response_body`). All of these are
 fixed-cardinality; body bytes are never logged. Blocked requests reject before
 backend dispatch and still produce a transaction summary carrying these fields,
 so blocks are visible in the same per-request log line as allowed traffic.
@@ -1256,8 +1301,9 @@ fire, then switch to `enforce`.
 | `on_scan_timeout` | enum | `log_and_allow` | `allow` / `block` / `fail_closed` / `log_and_allow` |
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
-| `on_unlisted_content_type` | enum | `allow` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
-| `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose HTTP request bodies are scanned and governed by `on_unlisted_content_type`; WebSocket messages ignore it |
+| `on_unlisted_content_type` | enum | `fail_closed` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
+| `on_unlisted_response_content_type` | enum | `allow` | `allow` / `fail_closed` / `block`; the same for response bodies (see [Responses](#responses-on_unlisted_response_content_type)) |
+| `body_methods` | string[] | `[POST,PUT,PATCH,DELETE]` | methods whose HTTP request bodies are scanned and governed by `on_unlisted_content_type`; WebSocket messages ignore it |
 | `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |
 | `inspect_binary_body` | bool | `false` | scan bodies with unknown/binary type |

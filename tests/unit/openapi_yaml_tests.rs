@@ -2549,10 +2549,39 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
                 "mode": "enforce",
                 "default_rule_action": "enforce",
                 "rule_modes": { "FE-XSS-001": "enforce" },
-                "global_exemptions": { "header_present": { "x-skip-waf": null } }
+                "global_exemptions": {
+                    "header_present": { "x-skip-waf": "trusted-hop-shared-secret" },
+                    "match": "any"
+                }
             }))
             .is_ok()
     );
+    for (exemptions, why) in [
+        (
+            json!({ "header_present": { "x-skip-waf": null } }),
+            "presence-only header_present entries are not admitted",
+        ),
+        (
+            json!({ "header_present": { "x-skip-waf": "short" } }),
+            "header_present values must be long shared secrets",
+        ),
+        (json!({ "match": "either" }), "match is all or any"),
+    ] {
+        assert!(
+            validator
+                .validate(&json!({ "global_exemptions": exemptions }))
+                .is_err(),
+            "{why}"
+        );
+    }
+    for value in ["allow", "fail_closed", "block"] {
+        assert!(
+            validator
+                .validate(&json!({ "on_unlisted_response_content_type": value }))
+                .is_ok(),
+            "on_unlisted_response_content_type {value} must be admitted"
+        );
+    }
     assert!(
         validator
             .validate(&json!({

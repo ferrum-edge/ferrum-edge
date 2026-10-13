@@ -553,7 +553,10 @@ async fn body_encoding_specials_trigger_buffering_without_body_rules() {
     binary_req_ctx
         .headers
         .insert("content-type".into(), "application/octet-stream".into());
-    assert!(!plugin.should_buffer_request_body(&binary_req_ctx));
+    // Unlisted bodies are never scanned; the default
+    // `on_unlisted_content_type: fail_closed` still buffers one here because
+    // the enforcing encoding special makes it refusable.
+    assert!(plugin.should_buffer_request_body(&binary_req_ctx));
 
     let mut resp_ctx = ctx("GET", "/download");
     let response_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
@@ -1304,7 +1307,8 @@ fn request_exempt_from_waf_keeps_its_backend_trailers() {
             "paths": ["/internal/*"],
             "methods": ["OPTIONS"],
             "ips": ["198.51.100.0/24"],
-            "consumers": ["trusted-partner"]
+            "consumers": ["trusted-partner"],
+            "match": "any"
         },
         "custom_rules": [{
             "id": "CUSTOM-RESP-HEADER-EXEMPT",
@@ -2637,7 +2641,7 @@ fn intentional_open_maps_and_valid_closed_configs_still_construct() {
         },
         "global_exemptions": {
             "paths": ["/health"],
-            "header_present": { "x-skip-waf": null }
+            "header_present": { "x-skip-waf": "0123456789abcdef-waf-bypass" }
         },
         "custom_rules": [{
             "id": "CUSTOM-OPEN",
@@ -3258,7 +3262,8 @@ async fn inspect_multipart_gates_body_scanning() {
     let result = default_plugin
         .on_final_request_body_with_context(&mut default_ctx, &headers, b"bash -i")
         .await;
-    assert!(matches!(result, PluginResult::Continue));
+    // Not scanned: refused for its type by the fail-closed default instead.
+    assert!(refused_as_unlisted(&result, &default_ctx));
 
     let multipart_plugin = waf(json!({
         "inspect_multipart": true,
@@ -3616,7 +3621,7 @@ async fn utf16_transcoding_does_not_widen_binary_or_multipart_body_gates() {
     let (binary_result, binary_ctx) =
         scan_body_with_content_type(&plugin, "application/octet-stream; charset=utf-16le", &body)
             .await;
-    assert!(matches!(binary_result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&binary_result, &binary_ctx));
     assert!(!monitored(&binary_ctx, "FE-SSRF-001"));
 
     let (multipart_result, multipart_ctx) = scan_body_with_content_type(
@@ -3625,7 +3630,7 @@ async fn utf16_transcoding_does_not_widen_binary_or_multipart_body_gates() {
         &body,
     )
     .await;
-    assert!(matches!(multipart_result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&multipart_result, &multipart_ctx));
     assert!(!monitored(&multipart_ctx, "FE-SSRF-001"));
 
     let multipart_plugin = waf(json!({
@@ -3855,7 +3860,7 @@ async fn utf32_transcoding_does_not_change_utf8_or_utf16_body_matches() {
         &encode_utf32(payload, false),
     )
     .await;
-    assert!(matches!(binary_result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&binary_result, &binary_ctx));
     assert!(!monitored(&binary_ctx, "FE-SQLI-001-B"));
 }
 
@@ -4230,7 +4235,7 @@ async fn global_exemptions_cover_ips_headers_and_capture_filters() {
         "rule_modes": { "FE-XSS-001": "enforce" },
         "global_exemptions": {
             "ips": ["10.0.0.0/8"],
-            "header_present": { "x-waf-fp": "known" },
+            "header_present": { "x-waf-fp": "known-trusted-hop-secret" },
             "fp_capture_filters": ["<script>safe</script>"]
         }
     }))
@@ -4243,7 +4248,9 @@ async fn global_exemptions_cover_ips_headers_and_capture_filters() {
     assert!(!ip_ctx.metadata.contains_key("waf.rule_hits"));
 
     let mut header_ctx = ctx("GET", "/search");
-    header_ctx.headers.insert("x-waf-fp".into(), "known".into());
+    header_ctx
+        .headers
+        .insert("x-waf-fp".into(), "known-trusted-hop-secret".into());
     header_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
     let result = plugin.authorize(&mut header_ctx).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -4355,6 +4362,15 @@ fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
     ctx.metadata
         .get("waf.rule_hits")
         .is_some_and(|hits| hits.split(',').any(|hit| hit == rule_id))
+}
+
+/// The body was refused for its `Content-Type` (the default
+/// `on_unlisted_content_type: fail_closed` under an enforcing body policy)
+/// rather than scanned: no rule ran over it.
+fn refused_as_unlisted(result: &PluginResult, ctx: &RequestContext) -> bool {
+    matches!(result, PluginResult::Reject { .. })
+        && ctx.metadata.get("waf.block_reason").map(String::as_str) == Some("content_type")
+        && !ctx.metadata.contains_key("waf.rule_hits")
 }
 
 #[tokio::test]
@@ -7463,14 +7479,16 @@ async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
         "include_default_rules": false,
         "max_scan_bytes": SCAN_CAP,
         "global_exemptions": {
-            "header_present": { "x-waf-exempt": null }
+            "header_present": { "x-waf-exempt": "trusted-hop-shared-secret" }
         },
         "custom_rules": [enforcing_request_body_rule()]
     }))
     .unwrap();
     let mut ctx = body_ctx();
-    ctx.headers
-        .insert("x-waf-exempt".to_string(), "true".to_string());
+    ctx.headers.insert(
+        "x-waf-exempt".to_string(),
+        "trusted-hop-shared-secret".to_string(),
+    );
     let headers = ctx.headers.clone();
 
     let result = plugin
@@ -7984,7 +8002,7 @@ async fn opaque_binary_content_type_still_skips_body_inspection() {
     )
     .await;
 
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&result, &request_ctx));
     assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
 }
 
@@ -8006,7 +8024,7 @@ async fn suffix_mapping_reuses_the_configured_allowlist_and_adds_no_hidden_types
         br#"{"q":"id=1 UNION SELECT password FROM users"}"#,
     )
     .await;
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&result, &request_ctx));
     assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
 
     // The configured entry itself is unaffected.
@@ -8031,7 +8049,7 @@ async fn multipart_gate_is_unchanged_by_the_suffix_rule() {
         b"id=1 UNION SELECT password FROM users",
     )
     .await;
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(refused_as_unlisted(&result, &request_ctx));
     assert!(!monitored(&request_ctx, "FE-SQLI-001-B"));
 
     let multipart_plugin = waf(json!({
@@ -8075,7 +8093,10 @@ async fn scan_wide_direction(
 }
 
 fn wide_parity_waf() -> Waf {
+    // These fixtures test decoding parity, not the unlisted-type disposition,
+    // so unlisted bodies are forwarded rather than refused.
     waf(json!({
+        "on_unlisted_content_type": "allow",
         "include_default_rules": false,
         "response_inspection": true,
         "response_body_inspection": true,

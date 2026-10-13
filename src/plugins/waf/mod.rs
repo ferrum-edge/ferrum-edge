@@ -76,6 +76,7 @@ const WAF_CONFIG_KEYS: &[&str] = &[
     "on_scan_timeout",
     "on_body_too_large",
     "on_unlisted_content_type",
+    "on_unlisted_response_content_type",
     "include_default_rules",
     "disabled_default_rules",
     "rule_modes",
@@ -143,9 +144,11 @@ enum TooLargeAction {
     Block,
 }
 
-/// What happens to a request body the WAF will not inspect because its
-/// `Content-Type` falls outside the configured scan scope
-/// (`body_content_types`, `inspect_multipart`, `inspect_binary_body`).
+/// What happens to a body the WAF will not inspect because its `Content-Type`
+/// falls outside the configured scan scope (`body_content_types`,
+/// `inspect_multipart`, `inspect_binary_body`). `on_unlisted_content_type`
+/// governs request bodies and `on_unlisted_response_content_type` response
+/// bodies.
 ///
 /// The declared media type is attacker-controlled, and many backends parse a
 /// body without consulting it (Go handlers that `json.Unmarshal` the raw body,
@@ -155,11 +158,13 @@ enum TooLargeAction {
 /// rule is skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnlistedContentTypeAction {
-    /// Default. Forward the body uninspected.
+    /// Forward the body uninspected. Default for responses, whose type is
+    /// chosen by the origin and is routinely binary media.
     Allow,
-    /// Reject a non-empty unlisted body when an enforcing request-body policy
-    /// applies to this request, so an enforcing rule cannot be sidestepped by
-    /// relabelling the payload. Monitor-only policy never starts blocking.
+    /// Reject a non-empty unlisted body when an enforcing body policy for its
+    /// direction applies to this request, so an enforcing rule cannot be
+    /// sidestepped by relabelling the payload. Monitor-only policy never
+    /// starts blocking. Default for requests.
     FailClosed,
     /// Strict allowlist: reject every non-empty unlisted body while globally
     /// enforcing.
@@ -202,6 +207,7 @@ struct WafConfig {
     on_scan_timeout: TimeoutAction,
     on_body_too_large: TooLargeAction,
     on_unlisted_content_type: UnlistedContentTypeAction,
+    on_unlisted_response_content_type: UnlistedContentTypeAction,
     body_methods: Vec<String>,
     body_content_types: Vec<String>,
     inspect_multipart: bool,
@@ -435,8 +441,25 @@ impl Waf {
                 .as_deref()
                 .unwrap_or("fail_closed"),
         )?;
+        // The request Content-Type is client-chosen, so relabelling a payload
+        // must not sidestep an enforcing body rule: fail closed by default.
+        // `fail_closed` never refuses unless an enforcing request-body policy
+        // applies, so monitor-only deployments are unaffected.
         let on_unlisted_content_type = parse_unlisted_content_type_action(
+            "on_unlisted_content_type",
             optional_string(object, "on_unlisted_content_type")?
+                .as_deref()
+                .unwrap_or("fail_closed"),
+        )?;
+        // The response Content-Type is chosen by the origin and binary media
+        // is the norm, so responses default to `allow`; a configuration that
+        // leaves enforcing response-body rules blind to unlisted types is
+        // warned about below.
+        let on_unlisted_response_content_type_configured =
+            optional_string(object, "on_unlisted_response_content_type")?;
+        let on_unlisted_response_content_type = parse_unlisted_content_type_action(
+            "on_unlisted_response_content_type",
+            on_unlisted_response_content_type_configured
                 .as_deref()
                 .unwrap_or("allow"),
         )?;
@@ -519,6 +542,24 @@ impl Waf {
             on_body_too_large,
             on_unlisted_content_type,
         )?;
+        if on_unlisted_response_content_type_configured.is_none()
+            && !inspect_binary_body
+            && response_body_rules_enforce(
+                mode,
+                &compiled,
+                scoring.as_ref(),
+                response_inspection && response_body_inspection,
+            )
+        {
+            tracing::warn!(
+                plugin = "waf",
+                "waf: enforcing response-body rules do not inspect responses whose \
+                 Content-Type is outside the scan scope, and \
+                 `on_unlisted_response_content_type` defaults to `allow`; set it to \
+                 `fail_closed` or `block` to refuse such responses, or to `allow` to \
+                 silence this warning"
+            );
+        }
 
         let config = WafConfig {
             mode,
@@ -535,6 +576,7 @@ impl Waf {
             on_scan_timeout,
             on_body_too_large,
             on_unlisted_content_type,
+            on_unlisted_response_content_type,
             body_methods,
             body_content_types: optional_string_vec(object, "body_content_types")?
                 .unwrap_or_else(default_body_content_types)
@@ -739,6 +781,64 @@ impl Waf {
             return;
         }
         ctx.set_waf_metadata("waf.body_uninspected", "content_type");
+        ctx.set_waf_metadata(
+            "waf.body_uninspected_target",
+            BodyDirection::Request.as_metadata_target(),
+        );
+    }
+
+    /// Whether a non-empty response body outside the scan scope would be
+    /// REFUSED on this request under `on_unlisted_response_content_type` —
+    /// the response-side mirror of [`Self::unlisted_content_type_refuses`].
+    /// Callers have already established that response-body buffering applies
+    /// (inspection on, an active response-body rule, request not exempt).
+    fn unlisted_response_content_type_refuses(&self, ctx: &RequestContext) -> bool {
+        match self.config.on_unlisted_response_content_type {
+            UnlistedContentTypeAction::Allow => false,
+            UnlistedContentTypeAction::Block => self.config.mode == GlobalMode::Enforce,
+            UnlistedContentTypeAction::FailClosed => self.has_enforcing_response_body_policy(ctx),
+        }
+    }
+
+    /// The `on_unlisted_response_content_type` decision over a buffered,
+    /// client-visible response body this instance does not scan. An empty
+    /// body carries nothing to inspect and always passes; a body that is not
+    /// refused is recorded and forwarded.
+    fn decide_unlisted_response_content_type(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+    ) -> PluginResult {
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+        let refuses = self.unlisted_response_content_type_refuses(ctx);
+        if self.config.log_to_metadata {
+            ctx.set_waf_metadata("waf.body_uninspected", "content_type");
+            ctx.set_waf_metadata(
+                "waf.body_uninspected_target",
+                BodyDirection::Response.as_metadata_target(),
+            );
+            if refuses {
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "content_type");
+            }
+        }
+        if !refuses {
+            return PluginResult::Continue;
+        }
+        if self.config.log_to_stdout {
+            warn_sampled!(
+                target: "waf",
+                proxy = %proxy_id(ctx),
+                client_ip = %ctx.client_ip,
+                path = %ctx.path,
+                method = %ctx.method,
+                action = ?self.config.on_unlisted_response_content_type,
+                "WAF refused a response body whose Content-Type is outside the inspection scope"
+            );
+        }
+        self.reject()
     }
 
     /// The exact `on_unlisted_content_type` decision, over the finalized
@@ -760,6 +860,10 @@ impl Waf {
         let refuses = self.unlisted_content_type_refuses(ctx);
         if self.config.log_to_metadata {
             ctx.set_waf_metadata("waf.body_uninspected", "content_type");
+            ctx.set_waf_metadata(
+                "waf.body_uninspected_target",
+                BodyDirection::Request.as_metadata_target(),
+            );
             if refuses {
                 ctx.set_waf_metadata("waf.action", "blocked");
                 ctx.set_waf_metadata_if_absent("waf.block_reason", "content_type");
@@ -2069,10 +2173,15 @@ impl Plugin for Waf {
         // scanning (non-allowlisted / binary with `inspect_binary_body=false`)
         // would be buffered and then skipped by `on_final_response_body`, so let
         // the proxy stream it instead of collecting bytes nothing will inspect.
+        //
+        // An unlisted body is buffered only when
+        // `on_unlisted_response_content_type` would refuse a non-empty one, so
+        // the final hook decides over the exact bytes and an empty body passes.
         self.should_buffer_response_body(ctx)
             && !synthetic_response_omits_body(&ctx.method, response_status)
             && !content_type.is_some_and(is_text_event_stream_media_type)
-            && self.response_body_eligible_for_scan(content_type)
+            && (self.response_body_eligible_for_scan(content_type)
+                || self.unlisted_response_content_type_refuses(ctx))
     }
 
     /// Claim the buffered response so the shared representation gate decodes an
@@ -2202,7 +2311,12 @@ impl Plugin for Waf {
         }
         let content_type = response_headers.get("content-type").map(String::as_str);
         if !self.response_body_eligible_for_scan(content_type) {
-            return PluginResult::Continue;
+            // An event stream is never buffered for this policy (it is
+            // unbounded), so a collected copy reaching here is not judged by it.
+            if content_type.is_some_and(is_text_event_stream_media_type) {
+                return PluginResult::Continue;
+            }
+            return self.decide_unlisted_response_content_type(ctx, body);
         }
         let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Response, body) {
             Ok(value) => value,
@@ -2246,8 +2360,12 @@ fn proxy_id(ctx: &RequestContext) -> &str {
         .unwrap_or("-")
 }
 
+/// Methods whose request bodies are scanned by default. `DELETE` is included
+/// because RFC 9110 lets it carry content and common frameworks parse it, so
+/// leaving it out let a body-borne payload skip every body rule by method
+/// choice alone.
 fn default_body_methods() -> Vec<String> {
-    vec!["POST".into(), "PUT".into(), "PATCH".into()]
+    vec!["POST".into(), "PUT".into(), "PATCH".into(), "DELETE".into()]
 }
 
 fn default_body_content_types() -> Vec<String> {
@@ -2318,15 +2436,39 @@ fn parse_timeout_action(raw: &str) -> Result<TimeoutAction, String> {
     }
 }
 
-fn parse_unlisted_content_type_action(raw: &str) -> Result<UnlistedContentTypeAction, String> {
+fn parse_unlisted_content_type_action(
+    field: &str,
+    raw: &str,
+) -> Result<UnlistedContentTypeAction, String> {
     match raw {
         "allow" => Ok(UnlistedContentTypeAction::Allow),
         "fail_closed" => Ok(UnlistedContentTypeAction::FailClosed),
         "block" => Ok(UnlistedContentTypeAction::Block),
         other => Err(format!(
-            "waf: `on_unlisted_content_type` must be allow, fail_closed, or block; got {other:?}"
+            "waf: `{field}` must be allow, fail_closed, or block; got {other:?}"
         )),
     }
+}
+
+/// Whether some response-body rule can refuse a response under this
+/// configuration: globally enforcing, response-body inspection reachable, and
+/// an applicable-in-principle `ResponseBody` rule that enforces or feeds
+/// anomaly scoring. Conditions are request-scoped and are deliberately not
+/// evaluated: this only drives an admission-time warning.
+fn response_body_rules_enforce(
+    mode: GlobalMode,
+    compiled: &CompiledRules,
+    scoring: Option<&ScoringConfig>,
+    response_body_surface: bool,
+) -> bool {
+    mode == GlobalMode::Enforce
+        && response_body_surface
+        && compiled.rules.iter().any(|rule| {
+            matches!(rule.target, RuleTarget::ResponseBody)
+                && !rule.detection_only
+                && (rule.action == RuleAction::Enforce
+                    || scoring.is_some_and(|scoring| scoring.contribution(rule) > 0))
+        })
 }
 
 fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
