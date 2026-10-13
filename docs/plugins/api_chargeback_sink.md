@@ -1172,10 +1172,12 @@ built-in paths do not populate them and their exported values are absent/null.
 Raw events emitted during the last hour (including sessions that started earlier):
 
 ```sql
-SELECT count(), sum(charge_total)
+SELECT currency, pricing_version, count(), sum(charge_total)
 FROM ferrum.charges_raw FINAL
 WHERE node_id = 'edge-a'
-  AND received_at >= now() - INTERVAL 1 HOUR;
+  AND received_at >= now() - INTERVAL 1 HOUR
+GROUP BY currency, pricing_version
+ORDER BY currency, pricing_version;
 ```
 
 Consumer daily invoice rollup (partitioned by currency and pricing generation —
@@ -1196,9 +1198,7 @@ generation on reload) cannot produce unitless USD+EUR-style rollups. Re-apply
 `schemas/clickhouse/charges.sql` to refresh those views (`CREATE OR
 REPLACE VIEW`).
 
-For snapshot mode, compare `/charges` totals to `sum(call_count)`,
-`sum(bytes_sent)`, `sum(bytes_received)`, and `sum(charge_total)` over the same
-node and time window.
+For snapshot mode, compare `/charges` totals to `sum(call_count)`, `sum(bytes_sent)`, `sum(bytes_received)`, and `sum(charge_total)` over the same node and time window, retaining currency and pricing-version boundaries for monetary totals.
 
 ## Status And Metrics
 

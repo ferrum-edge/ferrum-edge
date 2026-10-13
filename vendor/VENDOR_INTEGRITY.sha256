@@ -11,13 +11,13 @@ c821cfbb361ff4c5d67d5567c4933b4ff76b7e1eb61257c5f1ab22a8316dd79d  vendor/dimpl-0
 5a739a6e4635d434b9e2bb709db04ed16c361e7e0549075a0a1017f74dedb4e8  vendor/dimpl-0.6.1-ferrum-patched/.taplo.toml
 212695f9b42c278cc2bbdc9ff159378d34c093c2150d5c6d95982c653e68bacb  vendor/dimpl-0.6.1-ferrum-patched/.vscode/settings.json
 c44c1e82acad138cdbd5863fb52bb3d0e8f5c7f6c0b659b2043b5611f632e7fe  vendor/dimpl-0.6.1-ferrum-patched/CHANGELOG.md
-11c443c0859cf563a68135cfc811c123c5d564651225eb44487347a12fcde5eb  vendor/dimpl-0.6.1-ferrum-patched/CLAUDE.md
+4854d001c382dbbce3cf0580a0babfe6191e60d75acd1ea7c47723998288dee8  vendor/dimpl-0.6.1-ferrum-patched/CLAUDE.md
 e6e01088110a9449721862af9875e9aa6ff249f72457c99c2a93fd29af156256  vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock
 6212f5859a3a5ae45c83675305cc7b5241ce96471736fd893548097f8a2cc0a3  vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml
 df7c99c8ebd5b246bea89599a598c81db6db92599414630dee7e53e82284f0fd  vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml.orig
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  vendor/dimpl-0.6.1-ferrum-patched/LICENSE-APACHE.txt
 5b460f37be48ac4cf2181596181cc6cae432fc2caae05944873f380730829a4b  vendor/dimpl-0.6.1-ferrum-patched/LICENSE-MIT.txt
-c824e523a981d01c5b1c4383e5357a8e1cfecb8e0e612da4be3fed7260dd5d1a  vendor/dimpl-0.6.1-ferrum-patched/README.md
+e9b1d0a23059bc0812643b881a52b358f6b39c95bef35258e931cbdb71b6e057  vendor/dimpl-0.6.1-ferrum-patched/README.md
 b11c250576e50c550cd7236eec6464e2058211abfcd2b692bd89086128a13fc5  vendor/dimpl-0.6.1-ferrum-patched/cargo_deny.sh
 d10ea9bda37371ca7dafa463a0d3173b2d6e26ef56014bff09ee059a7ad31572  vendor/dimpl-0.6.1-ferrum-patched/clippy.toml
 e03c98143e694653963665100c2c65b16aa14282f7c3a9462d1e3810ce2fbedf  vendor/dimpl-0.6.1-ferrum-patched/deny.toml

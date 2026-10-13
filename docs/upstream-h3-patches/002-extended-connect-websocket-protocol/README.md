@@ -6,7 +6,7 @@
 |---|---|
 | Patch ID | 002-extended-connect-websocket-protocol |
 | Target crate | `h3` |
-| Target version | 0.0.8 (forward-ports cleanly to master at the time of writing) |
+| Target version | 0.0.8 — the vendored crate at `vendor/h3-0.0.8-ferrum-patched` is the supported, verified target. Forward-porting to master is **unverified**: inspected fork master `704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1` already exposes `Protocol::WEBSOCKET` (and CONNECT-IP) while retaining the plain `InvalidProtocol`, so a master rebase needs separate review before this patch is applied there |
 | State | **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`** |
 | Upstream issue | _Deliberate fork — unfiled upstream (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
 | Upstream PR | _Deliberate fork — unfiled upstream; no published fork ref yet (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
@@ -48,7 +48,7 @@ the "Retirement" section below.
 |---|---|
 | `issue.md` | Bug report for hyperium/h3. Paste into a new GitHub issue verbatim. |
 | `pr-description.md` | PR description for the fix. Submit alongside the patch. |
-| `h3-ext-rs.patch` | Unified diff against `h3` 0.0.8 (`h3/src/ext.rs`). Should forward-port to master with minimal effort. |
+| `h3-ext-rs.patch` | Unified diff against `h3` 0.0.8 (`h3/src/ext.rs`), regenerated from the vendored crate so its tests use the vendored `match`-based parse helper (`InvalidProtocol` has no `Debug`, so `.expect()`/`.unwrap()` do not compile). Forward-port to master is unverified (see Status). |
 
 ## Hand-off — how to file the upstream issue + PR
 
