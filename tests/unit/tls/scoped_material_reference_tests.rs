@@ -1022,8 +1022,15 @@ mod windows_confined_files {
 
     #[test]
     fn windows_plain_and_file_uri_loads_keep_unicode_paths_and_rotation() {
-        let root = tempfile::tempdir().unwrap();
-        let file = root.path().join("certificate α&+%.pem");
+        let temp = tempfile::tempdir().unwrap();
+        // Hosted runners report TEMP through an 8.3 short name
+        // (`C:\Users\RUNNER~1\...`), which the lexical root check cannot
+        // equate with the long canonical form below. Configure the root in
+        // its long DOS form, as an operator would.
+        let long_root = std::fs::canonicalize(temp.path()).unwrap();
+        let long_root = PathBuf::from(long_root.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        let root_paths = [long_root.clone()];
+        let file = long_root.join("certificate α&+%.pem");
         std::fs::write(&file, INLINE_CERT).unwrap();
         for value in [
             file.display().to_string(),
@@ -1033,30 +1040,20 @@ mod windows_confined_files {
         ] {
             let bound = bound_file(&value, MaterialKind::Cert);
             assert_eq!(
-                load(
-                    &bound,
-                    MaterialKind::Cert,
-                    &[root.path().to_path_buf()],
-                    1024
-                )
-                .unwrap()
-                .bytes
-                .expose_secret(),
+                load(&bound, MaterialKind::Cert, &root_paths, 1024)
+                    .unwrap_or_else(|error| panic!("{value}: {error:?}"))
+                    .bytes
+                    .expose_secret(),
                 INLINE_CERT.as_bytes()
             );
-            let replacement = root.path().join("replacement.pem");
+            let replacement = long_root.join("replacement.pem");
             std::fs::write(&replacement, b"rotated in-root bytes").unwrap();
             std::fs::rename(&replacement, &file).unwrap();
             assert_eq!(
-                load(
-                    &bound,
-                    MaterialKind::Cert,
-                    &[root.path().to_path_buf()],
-                    1024
-                )
-                .unwrap()
-                .bytes
-                .expose_secret(),
+                load(&bound, MaterialKind::Cert, &root_paths, 1024)
+                    .unwrap()
+                    .bytes
+                    .expose_secret(),
                 b"rotated in-root bytes"
             );
             std::fs::write(&file, INLINE_CERT).unwrap();
