@@ -12,7 +12,7 @@ the scheduled `.github/workflows/dependency-audit.yml` workflow,
 > **tracked** (an upstream PR — or a governed [deliberate-fork record](#deliberate-fork-policy-and-sla)
 > — plus a retirement trigger, recorded and polled weekly), and
 > **covered** (behavioral regression tests). Security advisories in the
-> dependency tree are gated on every PR and re-checked weekly, so a fix landing
+> dependency tree are gated whenever CI selects the dependency-audit lane and re-checked weekly, so a fix landing
 > in the reqwest/h3 lineage cannot be missed silently.
 
 ## Why we vendor
@@ -214,7 +214,9 @@ open proposal with its own release-adoption trigger.
 
 ### 1. Blocking dependency gate (`deny.toml` + CI)
 
-`cargo deny check advisories bans sources licenses` runs on **every PR**
+`cargo deny check advisories bans sources licenses` runs whenever CI selects
+the full dependency-audit lane (`ci-plan` full mode plus `run_dependency_audit`)
+for an eligible pull request, merge group, push to `main`, or manual dispatch
 (`dependency-audit` job in `.github/workflows/ci.yml`) and is **blocking**: any
 RUSTSEC advisory in the resolved tree that is not explicitly time-boxed in
 `deny.toml` fails CI. `unmaintained`/`unsound` are set to `all` (not the 0.19

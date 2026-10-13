@@ -323,7 +323,8 @@ FERRUM_DNS_RESOLVER_ADDRESS="[2606:4700:4700::1111]:53"
 ### Global TTL Override
 
 ```bash
-# Force all DNS entries to use 60-second TTL regardless of native record TTL
+# Use a 60-second global positive TTL override when no per-proxy TTL applies,
+# subject to the minimum TTL floor; error caching uses FERRUM_DNS_ERROR_TTL.
 FERRUM_DNS_TTL_OVERRIDE_SECONDS=60
 ```
 
@@ -379,10 +380,11 @@ FERRUM_DNS_REFRESH_THRESHOLD_PERCENT=95
 ### Failed DNS Retry Configuration
 
 ```bash
-# Retry failed DNS lookups every 5 seconds (more aggressive than default)
+# Scan for eligible failed DNS entries every 5 seconds.
+# Each entry's error TTL/backoff determines eligibility; slow cycles may delay scans.
 FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS=5
 
-# Disable automatic retry of failed DNS lookups
+# Disable the background failed-DNS retry task.
 FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS=0
 ```
 

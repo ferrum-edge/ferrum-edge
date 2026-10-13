@@ -1620,6 +1620,10 @@ where
 #[path = "tests/support/tcp_echo_tests.rs"]
 mod tcp_echo_tests;
 
+#[cfg(test)]
+#[path = "tests/support/saturation_threshold_tests.rs"]
+mod saturation_threshold_tests;
+
 async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid TCP target address")?;
     let mut phases =
@@ -2010,6 +2014,17 @@ async fn connect_h1_saturate(
     }
 }
 
+/// Exact `peak_alive >= 99% x N` saturation gate.
+///
+/// The documented verdict requires at least 99% of `connections` to be
+/// simultaneously alive. Comparing against `((n as f64) * 0.99) as u64`
+/// truncates the fractional threshold (for N=101 it accepts a peak of 99,
+/// which is ~98.02% of 101). Cross-multiplying in `u128` keeps the
+/// comparison exact for every `u64` input without overflow.
+fn peak_meets_threshold(peak_alive: u64, connections: u64) -> bool {
+    u128::from(peak_alive) * 100 >= u128::from(connections) * 99
+}
+
 async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     use hdrhistogram::Histogram;
     use std::sync::Mutex;
@@ -2322,7 +2337,7 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     // under load — exactly the breakage we want to detect.
     let verdict = if connect_success_rate >= 0.99
         && heartbeat_success_rate >= 0.99
-        && peak_alive >= ((args.connections as f64) * 0.99) as u64
+        && peak_meets_threshold(peak_alive, args.connections)
         && survivorship_rate >= 0.99
     {
         "ok"

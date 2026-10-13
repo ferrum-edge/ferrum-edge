@@ -624,9 +624,15 @@ profile ferrum-node-agent /app/ferrum-edge {
 }
 ```
 
-Anything not in the profile is denied with an audit log entry, which
-makes deviation from the documented surface visible in the host audit
-log without breaking the agent on its expected paths.
+Adapt this profile to the selected topology and configured paths. When the
+node agent publishes the pod registry for NodeWaypoint or Ambient topology,
+the effective profile must permit directory creation, temporary-file creation
+and writes, entry replacement, and directory reads at the configured registry
+path (Helm default: `/run/ferrum/node-waypoint-pods`). Review the included
+host abstractions and any path overrides before relying on this example as
+complete filesystem coverage. Anything not in the profile is denied with an
+audit log entry, which makes deviation from the documented surface visible in
+the host audit log.
 
 ## Pod Security Standards compatibility
 
@@ -689,7 +695,7 @@ spec:
       app.kubernetes.io/name: ferrum-mesh-node-agent
   policyTypes: ["Ingress", "Egress"]
   egress:
-    # Kubernetes API server only (resolved via cluster DNS or env)
+    # DNS to the selected kube-dns pods only
     - to:
         - namespaceSelector:
             matchLabels:
@@ -702,6 +708,7 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # TCP 443/6443 to any destination (no `to` restriction)
     - ports:
         - protocol: TCP
           port: 443    # API server
@@ -709,6 +716,11 @@ spec:
           port: 6443   # API server (kubeadm default)
   # No ingress rules — loopback-only admin doesn't traverse the pod network.
 ```
+
+The second egress rule permits TCP ports 443 and 6443 to any destination
+wherever this policy applies. For API-server-only egress, add a destination
+restriction appropriate to your cluster; the port numbers alone do not
+identify the API server.
 
 NetworkPolicy has **no effect on `hostNetwork: true` pods** because the
 CNI does not see their traffic. Operators relying on per-pod

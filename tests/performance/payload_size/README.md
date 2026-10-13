@@ -55,7 +55,7 @@ bash run_payload_test.sh all-protocols --envoy
 |---|---|---|
 | `xml` | HTTP/1.1 | `application/xml` — legacy APIs |
 | `soap-xml` | HTTP/1.1 | `application/soap+xml` — SOAP web services |
-| `graphql` | HTTP/1.1 | `application/graphql` — GraphQL mutations with large variables |
+| `graphql` | HTTP/1.1 | GraphQL over `application/json` (report label `application/graphql`) — GraphQL mutations with large variables |
 
 `sse` (`text/event-stream`) is also accepted as a content type but belongs to no
 tier or protocol group; run it explicitly with `bash run_payload_test.sh sse`.
@@ -169,7 +169,7 @@ Each content type generates structurally valid data:
 
 ### Backend Behavior
 
-The backend echoes each request body back with the same `Content-Type` header and approximately the same payload size. For gRPC, it echoes the protobuf `payload` bytes field. For WebSocket, it echoes binary frames. TCP uses `io::copy` for bidirectional echo. UDP echoes each datagram back to the sender.
+The backend echoes each request body back with the same `Content-Type` header and approximately the same payload size. For gRPC, it echoes the protobuf `payload` bytes field. For WebSocket, it echoes binary frames. TCP uses `io::copy` for bidirectional echo. UDP echoes each datagram back to the sender. The exception is the explicit SSE route (`/sse`): it does not echo the body as-is, but re-encodes each request byte as two hexadecimal characters inside `id:`/`event:`/`data:` event framing, so a non-empty SSE response is more than twice the request size. Response-byte accounting for explicit SSE runs therefore includes that hex expansion and framing, unlike the same-size echo routes.
 
 ---
 

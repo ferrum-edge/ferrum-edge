@@ -10,7 +10,11 @@ verification and SRTP key export yourself.
 ## Goals
 - **DTLS 1.2 and 1.3**: Implements the DTLS handshake and record layer used by WebRTC.
 - **Safety**: `forbid(unsafe_code)` throughout the crate.
-- **Minimal Rust‑only deps**: Uses small, well‑maintained Rust crypto crates.
+- **Minimal deps**: Aims for a small dependency set. Whether the crypto
+  dependencies are Rust-only depends on the selected crypto provider (see
+  "Crypto providers" below): the default features select `aws-lc-rs`,
+  which enables the native `aws-lc-sys`, while the `rust-crypto` feature
+  selects the RustCrypto provider instead.
 - **Low overhead**: Tight control over allocations and buffers; Sans‑IO integration.
 
 ### Non‑goals
@@ -48,6 +52,18 @@ Four constructors control which DTLS version is used:
   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
 - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
 
+### Crypto providers
+
+Two built-in providers are available behind Cargo features: `aws-lc-rs`
+(backed by AWS-LC through the native `aws-lc-sys` dependency) and
+`rust-crypto` (backed by RustCrypto crates). The crate's default features
+are `aws-lc-rs` and `rcgen`, and `rcgen` also selects `aws-lc-rs`, so a
+default build is **not** Rust-only; a Rust-only crypto configuration
+requires selecting the `rust-crypto` feature (without `aws-lc-rs` /
+`rcgen`). At runtime the provider is resolved in this order: an explicit
+`with_crypto_provider()` value, an installed default provider, AWS-LC if
+its feature is enabled, then RustCrypto if its feature is enabled.
+
 ### Certificate model
 During the handshake the engine emits
 [`Output::PeerCert`][peer_cert] with the peer's leaf
@@ -71,6 +87,7 @@ references into your provided buffer:
 - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
 - `Connected`: handshake complete
 - `PeerCert(&[u8])`: peer leaf certificate (DER) — validate in your app
+- `PeerCertChain`: complete peer certificate chain, leaf‑first — validate in your app
 - `KeyingMaterial(KeyingMaterial, SrtpProfile)`: DTLS‑SRTP export
 - `ApplicationData(&[u8])`: plaintext received from peer
 - `CloseNotify`: peer sent a `close_notify` alert (graceful shutdown)
@@ -90,6 +107,7 @@ fn send_udp(_bytes: &[u8]) {}
 
 fn example_event_loop(mut dtls: Dtls) -> Result<(), dimpl::Error> {
     let mut next_wake: Option<Instant> = None;
+    let mut close_received = false;
     loop {
         // Drain engine output until we have to wait for I/O or a timer
         let mut out_buf = vec![0u8; 2048];
@@ -101,7 +119,11 @@ fn example_event_loop(mut dtls: Dtls) -> Result<(), dimpl::Error> {
                     // DTLS established — application may start sending
                 }
                 Output::PeerCert(_der) => {
-                    // Inspect peer leaf certificate if desired
+                    // Application MUST validate the peer leaf certificate
+                    // against its own policy (see "Certificate model" above)
+                }
+                Output::PeerCertChain(_chain) => {
+                    // Application MUST validate the peer chain per its policy
                 }
                 Output::KeyingMaterial(_km, _profile) => {
                     // Provide to SRTP stack
@@ -110,11 +132,19 @@ fn example_event_loop(mut dtls: Dtls) -> Result<(), dimpl::Error> {
                     // Deliver plaintext to application
                 }
                 Output::CloseNotify => {
-                    // Peer initiated graceful shutdown
-                    break;
+                    // Peer initiated graceful shutdown. Record it and keep
+                    // draining: `Timeout` is the last output of a poll cycle
+                    // and internal state is only consistent after reaching it,
+                    // so never break the inner loop here.
+                    close_received = true;
                 }
                 _ => {}
             }
+        }
+
+        // The poll cycle reached `Timeout`; only now act on the close.
+        if close_received {
+            return Ok(());
         }
 
         // Block waiting for either UDP input or the scheduled timeout

@@ -122,11 +122,16 @@ The shared bounds live in `common/containers.rs`:
 - `start_within_deadline()` / `CONTAINER_START_TIMEOUT` — 5 minutes for one
   `start()` phase (image pull + create + start), including any retries. It
   takes a closure that builds and starts a fresh request per attempt, and
-  retries **only** transient image-pull/registry errors
-  (`is_transient_image_pull_error()`: `failed to pull`, `bytes remaining on
-  stream`, connection resets, timeouts, TLS handshake failures,
-  `toomanyrequests`, registry 5xx) up to `CONTAINER_START_ATTEMPTS` (3) times
-  with a short linear backoff, logging each retry to stderr. Wait-condition
+  retries selected transient container-start error text through a bounded
+  text heuristic (`is_transient_image_pull_error()`: `failed to pull`,
+  `bytes remaining on stream`, connection resets, timeouts, TLS handshake
+  failures, `toomanyrequests`, registry 5xx) up to
+  `CONTAINER_START_ATTEMPTS` (3) times with a short linear backoff, logging
+  each retry to stderr. The heuristic is intended to recover
+  image-pull/registry flakes, but its generic transport markers (a bare
+  `Timeout error`, `connection reset`, `unexpected eof`) match on error text
+  alone and do not by themselves establish that the failure happened in the
+  pull/registry phase rather than elsewhere in the start operation. Wait-condition
   failures (`container startup timeout`, unhealthy/exited containers),
   deterministic registry answers (`manifest unknown`, `pull access denied`,
   `unauthorized`) and host-port collisions are returned after the first

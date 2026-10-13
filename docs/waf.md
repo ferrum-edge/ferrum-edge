@@ -58,8 +58,10 @@ A request is rejected only when a matched rule's effective action is `enforce`
 
 The built-in rule pack ships with every rule set to `monitor`. This is a safe
 default: deploy the WAF, watch what it flags, then enforce deliberately. It
-also means `mode: enforce` **alone does not block anything** — you must opt
-rules into enforcement. There are three ways:
+also means that with the default monitor-only pack and no other reachable
+enforcement path, `mode: enforce` is rejected at construction. Opt rules into
+enforcement, or configure one of the separately documented enforcement paths.
+There are three ways:
 
 1. **`default_rule_action`** — bulk-set the action of built-in rules that
    inherit it. `default_rule_action: "enforce"` enforces the low-false-positive
@@ -580,8 +582,15 @@ rule or scoping it away with `conditions` also drops its coverage of every
 other field. `exclude` removes only the named fields from one rule (CRS-style
 target exclusions):
 
+This is a monitor-mode tuning fragment. Merge it into a configuration that
+already declares a custom rule with `id: "ACME-COOKIE-1"` and target
+`cookies`, or remove that override if you have no such rule. Overrides tune
+existing rules; they do not declare them, and unknown rule IDs are rejected.
+Exclusions do not enable enforcement.
+
 ```json
 {
+  "mode": "monitor",
   "rule_overrides": {
     "FE-XSS-001":      { "exclude": { "query_params": ["html"] } },
     "FE-PATHTRAV-001": { "exclude": { "query_params": ["relpath"] } },

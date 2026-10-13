@@ -113,7 +113,7 @@ To re-run benchmarks with newer Kong, Tyk, or KrakenD releases:
 KONG_VERSION=3.16 TYK_VERSION=v5.15 KRAKEND_VERSION=2.13.11 ENVOY_VERSION=1.39-latest ./comparison/run_comparison.sh
 ```
 
-The script pulls the specified Docker image tags automatically. Results are overwritten in `comparison/results/` — copy or rename the directory if you want to preserve previous runs.
+The script pulls the specified Docker image tags automatically. Results are overwritten in `comparison/results/` — copy or rename the directory if you want to preserve previous runs. Result files from a previous run that the new run does not re-create (for example, a gateway skipped via `SKIP_GATEWAYS`) stay on disk but are excluded from the new report: each run records the files it produced in `meta.json` as `result_files`, and the report generator only reads those files when the manifest is present.
 
 ## Docker Images
 

@@ -942,6 +942,7 @@ A transient breaker never accumulates failures, so it can never open. `ferrum_ci
 ### Complete YAML Example
 
 ```yaml
+version: "1"
 proxies:
   - id: "api-proxy"
     listen_path: "/api"

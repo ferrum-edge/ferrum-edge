@@ -125,8 +125,10 @@ HTTP/2 up to about 16% in one iteration. The current timer is lazy:
 
 h2 accepts each chunk into the stream's send buffer while the stream holds
 capacity, and it exposes no count of buffered-but-unsent bytes. It grants
-capacity up to the lower of the peer's window and the connection's send-buffer
-limit (`max_send_buf_size`, 1 MiB by default for a hyper client). Beyond that
+capacity up to the lower of the peer's window and the per-stream
+send-buffer/backpressure limit (`max_send_buf_size`, 1 MiB by default for a
+hyper client; a stream may buffer up to or over this setting, so it is not a
+strict memory ceiling). Beyond that
 sit h2's write buffer (about 64 KiB with h2 patch 001) and the kernel's socket
 buffers.
 

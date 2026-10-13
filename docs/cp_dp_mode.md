@@ -9,8 +9,8 @@ Ferrum Edge supports a distributed CP/DP architecture where a Control Plane (one
                           │    Control Plane      │
                           │                       │
                           │  ┌─────────────────┐  │
-        ┌─────────────────┤  │   Database /     │  │
-        │  Admin API      │  │   File Config    │  │
+        ┌─────────────────┤  │  Configuration  │  │
+        │  Admin API      │  │    Database     │  │
         │  (read/write)   │  └────────┬────────┘  │
         └─────────────────┤           │            │
                           │  ┌────────▼────────┐  │
@@ -38,6 +38,8 @@ Ferrum Edge supports a distributed CP/DP architecture where a Control Plane (one
                     │  (read-only) │  │  (read-only)  │
                     └──────────────┘  └───────────────┘
 ```
+
+CP mode requires `FERRUM_DB_TYPE` and `FERRUM_DB_URL`; standalone file mode is a separate operating mode.
 
 ## Communication Protocol
 
