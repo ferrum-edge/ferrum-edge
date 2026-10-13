@@ -1497,11 +1497,7 @@ fn jwt_output_claim_to_headers(
         let (header, claim) =
             crate::modes::mesh::config::validate_mesh_jwt_claim_header(header, claim)
                 .map_err(|error| invalid_resource(object, format!("{path}: {error}")))?;
-        // Backend-equivalent spellings (`X_Tenant_Id` / `x-tenant-id`) are one
-        // destination, matching the injected `jwks_auth` admission.
-        if out.iter().any(|existing| {
-            crate::proxy::headers::field_names_equivalent_for_backends(&existing.header, &header)
-        }) {
+        if out.iter().any(|existing| existing.header == header) {
             return Err(invalid_resource(
                 object,
                 format!(

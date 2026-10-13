@@ -23557,8 +23557,6 @@ components:
               claim_headers:
                 type: object
                 maxProperties: 16
-                propertyNames:
-                  maxLength: 256
                 additionalProperties:
                   type: string
                 description: >-
@@ -23722,8 +23720,6 @@ components:
         claim_headers:
           type: object
           maxProperties: 16
-          propertyNames:
-            maxLength: 256
           additionalProperties:
             type: string
           description: >-
@@ -24146,7 +24142,6 @@ components:
                 type: object
                 maxProperties: 16
                 propertyNames:
-                  maxLength: 256
                   pattern: '^[^.]+(\.[^.]+)*$'
                 additionalProperties:
                   type: string
@@ -24368,8 +24363,6 @@ components:
               claim_headers:
                 type: object
                 maxProperties: 16
-                propertyNames:
-                  maxLength: 256
                 additionalProperties:
                   type: string
                 description: >-

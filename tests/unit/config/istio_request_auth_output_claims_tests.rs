@@ -183,46 +183,6 @@ fn duplicate_output_claim_destination_is_rejected() {
     );
 }
 
-/// Backend-equivalent spellings are one destination (`X_Tenant_Id` reaches a
-/// CGI-style backend as `X-Tenant-Id`), matching the injected `jwks_auth`.
-#[test]
-fn underscore_equivalent_output_claim_destination_is_rejected() {
-    let error = translate_in(
-        "default",
-        &[request_authentication(
-            "default",
-            json!({
-                "jwtRules": [{
-                    "issuer": "https://issuer.example.com",
-                    "jwksUri": "https://issuer.example.com/jwks",
-                    "outputClaimToHeaders": [
-                        {"header": "X-Tenant-Id", "claim": "tenant"},
-                        {"header": "X_Tenant_Id", "claim": "role"},
-                    ],
-                }]
-            }),
-        )],
-    )
-    .expect_err("backend-equivalent destinations are one destination");
-    assert!(
-        error.contains("more than once"),
-        "expected a duplicate-destination diagnostic, got: {error}"
-    );
-
-    let native = ferrum_edge::modes::mesh::config::validate_mesh_jwt_output_claim_headers(&[
-        ferrum_edge::modes::mesh::config::MeshJwtClaimHeader {
-            header: "x-tenant-id".to_string(),
-            claim: "tenant".to_string(),
-        },
-        ferrum_edge::modes::mesh::config::MeshJwtClaimHeader {
-            header: "x_tenant_id".to_string(),
-            claim: "role".to_string(),
-        },
-    ])
-    .expect_err("native mesh admission must agree with translation");
-    assert!(native.contains("more than once"), "{native}");
-}
-
 #[test]
 fn recognized_but_unenforced_jwt_rule_fields_still_translate() {
     // `outputPayloadToHeader` / `fromCookies` are reported as deferred fields

@@ -158,10 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form's admission rules: at most 16 mappings, bounded claim paths and header
   names, no duplicate destination, and the strict reserved-destination list
   (`cookie`, `content-length`, `x-forwarded-*`, `x-ferrum-*` and the other
-  framing and provenance names). Both forms compare destinations the way a
-  CGI-style backend does, so `X_Real_IP` is reserved like `X-Real-IP` and
-  `X_Tenant_Id` duplicates `X-Tenant-Id`, including across `jwks_auth`'s
-  `claim_headers` and `output_claim_headers`.
+  framing and provenance names). `claim_headers` compares destinations the
+  way a CGI-style backend does, so `X_Real_IP` is reserved like `X-Real-IP`
+  and `X_Tenant_Id` duplicates `X-Tenant-Id`, including against `jwks_auth`'s
+  `output_claim_headers`; instances owning such spellings sanitize one shared
+  destination.
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB

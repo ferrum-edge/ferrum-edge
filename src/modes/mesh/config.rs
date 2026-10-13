@@ -2491,9 +2491,7 @@ pub fn validate_mesh_jwt_output_claim_headers(
     let mut seen: Vec<String> = Vec::with_capacity(entries.len());
     for entry in entries {
         let (header, _claim) = validate_mesh_jwt_claim_header(&entry.header, &entry.claim)?;
-        if seen.iter().any(|existing| {
-            crate::proxy::headers::field_names_equivalent_for_backends(existing, &header)
-        }) {
+        if seen.contains(&header) {
             return Err(format!(
                 "outputClaimToHeaders declares header {header:?} more than once; a destination may be asserted from exactly one claim"
             ));

@@ -19023,8 +19023,9 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
     assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
 }
 
-/// Issue #6620: every `claim_headers` schema encodes the representable object
-/// bounds the runtime enforces (16 mappings, 256-byte claim paths).
+/// Issue #6620: every `claim_headers` schema encodes the 16-mapping bound the
+/// runtime enforces. Path and header lengths stay prose-only: the runtime
+/// checks them after trimming, so a raw-key `maxLength` would be stricter.
 #[test]
 fn claim_headers_schemas_encode_runtime_object_bounds() {
     let spec: serde_json::Value =
@@ -19055,19 +19056,6 @@ fn claim_headers_schemas_encode_runtime_object_bounds() {
         assert!(
             validator.validate(&json!(over_cap)).is_err(),
             "{pointer}: 17 mappings"
-        );
-
-        let mut long_path = serde_json::Map::new();
-        long_path.insert("a".repeat(257), json!("x-claim"));
-        assert!(
-            validator.validate(&json!(long_path)).is_err(),
-            "{pointer}: 257-byte claim path"
-        );
-        let mut path_at_cap = serde_json::Map::new();
-        path_at_cap.insert("a".repeat(256), json!("x-claim"));
-        assert!(
-            validator.validate(&json!(path_at_cap)).is_ok(),
-            "{pointer}: 256-byte claim path"
         );
     }
 }
