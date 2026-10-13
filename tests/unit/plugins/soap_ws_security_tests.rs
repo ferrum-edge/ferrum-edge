@@ -1172,6 +1172,29 @@ async fn test_password_text_config_rejects_passworddigest_type() {
 }
 
 #[tokio::test]
+async fn test_prefixed_type_attribute_cannot_mask_the_password_type() {
+    // roxmltree 0.21 `attribute("Type")` matches the local name in any
+    // namespace and returns the first match. A preceding `x:Type` naming the
+    // configured PasswordText must not hide the real (unqualified) Type.
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password xmlns:x="urn:example:x" x:Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText" Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">secret123</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("Password Type does not match"),
+        "expected password-type-mismatch rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
 async fn test_username_token_unknown_user_rejects() {
     let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
     let ut = r#"<wsse:UsernameToken>
