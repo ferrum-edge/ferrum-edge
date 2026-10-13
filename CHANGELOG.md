@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — `cors` treats public-suffix wildcards as effectively
-  universal.** A native `"*.suffix"` origin whose suffix is a single label
+  universal.** (issue n/a, PR #6639) A native `"*.suffix"` origin whose suffix is a single label
   (`*.com`, `*.localhost`) or a Public Suffix List entry (`*.co.uk`,
   `*.github.io`) is now refused together with `allow_credentials: true`,
   like `*`-equivalent prefixes and regexes. A domain with any Public
