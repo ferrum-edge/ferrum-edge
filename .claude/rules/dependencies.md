@@ -255,9 +255,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - Dependabot `cargo` version updates cover `/` and `/tests/performance/mesh`,
   with minor/patch grouped. Every `[patch.crates-io]` crate plus `sqlx*` is in
   `ignore`: a bump past the vendored version silently drops the patch (Cargo
-  only warns "patch was not used"). Keep those entries equal to the patch table.
-  The one compatibility entry, `mongodb` `>= 3.9`, mirrors the `Cargo.toml`
-  cap that keeps MongoDB 4.2 support; do not drop it while the cap stands.
+  only warns "patch was not used"). Keep those entries equal to the patch table;
+  do not add compatibility caps there (`mongodb` tracks the latest driver).
   See `docs/dependency-policy.md` → "Cargo dependency updates".
 
 ## Drift Guard

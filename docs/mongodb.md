@@ -12,11 +12,33 @@ This guide covers deploying Ferrum Edge with MongoDB as the configuration databa
 | You're deploying on MongoDB Atlas | You're using managed RDS/Cloud SQL |
 | You want driver-managed topology discovery | You need SQL read-replica admin-read offload |
 
+## Supported Server Versions
+
+Ferrum Edge uses the Rust `mongodb` driver 3.9.1, which accepts servers that
+report wire versions 9 through 29: **MongoDB 4.4 through 9.0**. The driver
+rejects older servers during server selection with an incompatible wire version
+error, so the gateway cannot start against them.
+
+| Server | Status |
+|---|---|
+| MongoDB 9.0 | Supported and recommended. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on it. |
+| MongoDB 5.0 – 8.x | Supported. |
+| MongoDB 4.4 | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
+| MongoDB 4.2 and older | Not supported (wire version 8 or lower). |
+| MongoDB Atlas | Supported on any Atlas-offered version. |
+| Azure Cosmos DB for MongoDB (RU) | Accounts on server version 5.0, 6.0, or 7.0 are supported. Accounts on 4.2 or older report a wire version below 9 and are rejected; upgrade the account's server version first. |
+| Azure Cosmos DB for MongoDB (vCore) | Supported (5.0 and later). |
+| AWS DocumentDB | Engine 5.0 and 8.0 are supported. DocumentDB 3.6 and 4.0 report wire versions 6 and 7 and are rejected; upgrade the cluster. See [AWS DocumentDB](#aws-documentdb) for the behavior differences. |
+
+Replica-set features (transactions, `POST /batch`, change streams) need a
+replica set on any version; see [Replica Sets and
+Transactions](#replica-sets-and-transactions).
+
 ## Quick Start
 
 ```bash
 # Start MongoDB (Docker)
-docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:7
+docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:9
 
 # Start Ferrum Edge
 FERRUM_MODE=database \
@@ -69,7 +91,7 @@ MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI
 | Max pool size | `maxPoolSize` URI option | MongoDB equivalent of pool capacity. Example: `?maxPoolSize=100` |
 | Minimum idle pool size | `minPoolSize` URI option | Keeps warm driver connections open. Example: `?minPoolSize=5` |
 | Idle connection age | `maxIdleTimeMS` URI option | Driver-side idle eviction. Example: `?maxIdleTimeMS=600000` |
-| Pool checkout wait | Not supported | The pinned `mongodb` 3.8.2 driver parses `waitQueueTimeoutMS` from the URI but does not implement it as a connection-checkout deadline; pooling waits on a connection request without a checkout timeout. Do not rely on it when tuning under pool pressure. |
+| Pool checkout wait | Not supported | The `mongodb` 3.9.1 driver parses `waitQueueTimeoutMS` from the URI but does not implement it as a connection-checkout deadline; pooling waits on a connection request without a checkout timeout. Do not rely on it when tuning under pool pressure. |
 | Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | Read preference | Ignored by Ferrum's config store | Runtime config reads are forced to primary for authoritative polling consistency. |
@@ -398,7 +420,7 @@ available.
 
 ```bash
 # Start a single-node replica set for development
-docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0
+docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:9 --replSet rs0
 docker exec mongo-rs mongosh --eval "rs.initiate()"
 
 # Configure Ferrum Edge
