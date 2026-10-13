@@ -625,7 +625,6 @@ const MIRROR_BENIGN_KEY_PASS_SEGMENTS: &[&str] = &[
     "passengers",
     "passage",
     "passive",
-    "bypass",
     "compass",
     "sacred",
     "spin",
@@ -2506,7 +2505,8 @@ fn parse_forward_sensitive_query_allowlist(
                 // Query names are not header names: brackets (`filter[key]`,
                 // `key[]`) and other visible ASCII are valid. Entries match
                 // the decoded name, so `%` and the query delimiters are refused.
-                if !trimmed.bytes().all(|b| b.is_ascii_graphic())
+                if trimmed.len() != name.len()
+                    || !trimmed.bytes().all(|b| b.is_ascii_graphic())
                     || trimmed.contains(['=', '&', '?', '#', '/', '@', ';', '%', '+'])
                 {
                     return Err(format!(

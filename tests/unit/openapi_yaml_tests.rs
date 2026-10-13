@@ -8979,6 +8979,21 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         }),
         json!({
             "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": [" access_token "]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["\taccess_token"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token\n"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
             "forward_sensitive_query_allowlist": ["access_token"]
         }),
         // Operator pattern lists reject blank entries.

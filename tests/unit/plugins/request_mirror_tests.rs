@@ -6643,6 +6643,7 @@ async fn mirror_strips_unlisted_credential_class_headers() {
         "x-clientsid",
         "x-pin",
         "x-userpin",
+        "x-vercel-protection-bypass",
     ];
     for (idx, name) in credential_names.iter().enumerate() {
         headers.insert((*name).to_string(), format!("cred-value-{idx}"));
@@ -6695,6 +6696,8 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         "%2563ode_verifier=q25&clientPass=q26&",
         "clientCred=q27&clientSid=q28&sids=q29&%73igs=q30&%2563lientSid=q31&",
         "pin=q32&user_pin=q33&pincode=q34&%70in=q35&",
+        "x-vercel-protection-bypass=q36&x-vercel-protection-%62ypass=q37&",
+        "x-vercel-protection-%2562ypass=q38&",
         "continuation_token=c3&continuation%5Ftoken=c4&continuation%255Ftoken=c5&",
         "author=a1&signal=1&page=2&keyword=shoes&country_code=us&spin_count=3"
     );
@@ -6708,7 +6711,7 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         )),
         "benign pairs must be retained in order: {request_line}"
     );
-    for idx in 1..=35 {
+    for idx in 1..=38 {
         let value = format!("=q{idx}&");
         let tail = format!("=q{idx} ");
         assert!(
@@ -6779,17 +6782,27 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
     );
 
     let mut allowed = make_ctx_with_proxy();
-    allowed.set_raw_query_string("%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x=1".to_string());
+    allowed.set_raw_query_string(
+        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&x=1".to_string(),
+    );
     let allowed_line = capture_mirror_request_line_with_config(
         &mut allowed,
         json!({
             "forward_sensitive_query": true,
-            "forward_sensitive_query_allowlist": ["phpsessid", "code", "clientsid", "pin"]
+            "forward_sensitive_query_allowlist": [
+                "phpsessid",
+                "code",
+                "clientsid",
+                "pin",
+                "x-vercel-protection-bypass"
+            ]
         }),
     )
     .await;
     assert!(
-        allowed_line.contains("?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x=1 "),
+        allowed_line.contains(
+            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&x=1 "
+        ),
         "exact allowlist must forward the decoded name with its raw encoding: {allowed_line}"
     );
 }
