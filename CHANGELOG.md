@@ -9,44 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — backend TLS reference admission follows the `ns` claim**
-  (issue #6092; PR #6316, residual of GHSA-wmmp-c4pg-rg6p). An `operator` token
-  that carries an `ns` claim is now limited to inline PEM, `system://` or a
-  `k8s://` Secret in the addressed namespace for backend TLS references even
-  when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`, matching the namespace
-  bound #6093 applies to every other route. The same admission now covers the
-  route-local `client_cert_path`, `client_key_path` and `server_ca_cert_path`
-  under `rules[].destination.backend_tls` in `mesh_route_dispatch` plugin
-  configs, the `udp_logging` DTLS fields (`dtls_cert_path`, `dtls_key_path`,
-  `dtls_ca_cert_path`) and the `kafka_logging` SSL fields
-  (`ssl_certificate_location`, `ssl_key_location`, `ssl_ca_location`), which
-  the gateway also loads with its own credentials. librdkafka reads the Kafka
-  fields as local filenames, so such operators cannot introduce them at all;
-  set them with an `admin` token. A value already stored in the same
-  field (same rule index for `mesh_route_dispatch`) stays admitted, and
-  `admin` tokens are unaffected.
+- **BREAKING — gateway material references are default-deny for
+  namespace-claimed operators** (issue #6092; PR #6316, residual of
+  GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is
+  confined even when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`, matching
+  the namespace bound #6093 applies to every other route. A value already
+  stored in the same field path stays admitted, and `admin` tokens are
+  unaffected.
+  - Backend TLS references (`backend_tls_client_cert_path`,
+    `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) and the
+    TLS-material plugin fields admit only inline PEM, `system://` or a
+    `k8s://` Secret in the addressed namespace. The plugin fields are the
+    `mesh_route_dispatch` route-local `backend_tls` fields, the `udp_logging`
+    `dtls_*` fields, and the `soap_ws_security` `trusted_certs` and
+    `trusted_signing_certs` entries.
+  - Plugin fields that name a gateway filesystem path or a native library
+    setting are refused outright: the `kafka_logging` `ssl_*_location` fields
+    and any `producer_config` key outside a reviewed tuning-only list (for
+    example `ssl.providers`, `ssl.engine.location`, `plugin.library.paths`
+    and `sasl.kerberos.kinit.cmd`), the `api_chargeback_sink` ClickHouse TLS
+    files and `spool.dir`, the `grpc.descriptor_path` fields of
+    `ai_response_guard` and `ai_transcript_audit`, the `body_validator`
+    `protobuf_descriptor_path`, and the `geo_restriction` `db_path`.
+  - A plugin that is not a built-in (a custom plugin) cannot be classified,
+    so such an operator may not introduce or change its config.
+  - Every field is declared in one registry
+    (`src/admin/crud/scoped_references.rs`). A unit test fails when a
+    built-in plugin schema gains a path-, file-, certificate-, key-, module-
+    or library-shaped field that is neither registered nor reviewed.
 - **Tenant DestinationRule TLS files stay confined after admission** (PR
-  #6316). A file that a non-root-namespace DestinationRule names under
-  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` is bound to a confined reference when
-  it is projected onto upstreams. Every later load, cache rebuild and file
-  watch re-resolves it under the configured roots and opens it one component
-  at a time without following swapped symlinks (`openat` + `O_NOFOLLOW` on
-  Unix, handle-relative no-reparse opens on Windows). Outside material is
-  never loaded. A tenant file refused after admission fails new backend TLS
-  closed for its own destinations only. The exception is an otherwise
-  unchanged TCP+TLS stream listener, which keeps serving with its last
-  admitted config under the existing keep-last-good rule until the file is
-  valid again. While a gateway-owned (non-tenant) backend TLS source is
-  itself unreadable, the whole backend TLS surface stays on its last-good
-  generation, and a tenant refusal is applied on the first poll after that
-  source recovers. A refusal whose rebuild fails is retried on every poll
-  until a rebuild succeeds. The refusal confines a tenant to its own
-  namespace: a backend TLS cache that was filled while the tenant's file was
-  still valid keeps that tenant's own previously admitted material until the
-  next rebuild. A refused tenant file no longer stalls rotation of
-  unrelated backend TLS sources. Files named only in per-port
-  (`portLevelSettings`) or per-subset TLS overrides are now watched for
-  rotation too.
+  #6316).
+  - A file that a non-root-namespace DestinationRule names under
+    `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` is bound to a confined reference when
+    it is projected onto upstreams. Every later load, cache rebuild and file
+    watch re-resolves it under the configured roots and opens it one
+    component at a time without following swapped symlinks (`openat` +
+    `O_NOFOLLOW` on Unix, handle-relative no-reparse opens on Windows).
+    Outside material is never loaded.
+  - When the backend TLS watcher observes a tenant file refused, it holds
+    that refusal: every load of the reference fails closed until the watcher
+    itself observes the file readable again. A cache, pool or client built
+    between two polls therefore cannot capture the file during a brief
+    return inside its root. The hold applies even while a gateway-owned
+    (non-tenant) backend TLS source is unreadable. In that window, cached
+    configs stay on the last-good generation until the next successful
+    rebuild.
+  - A refusal whose rebuild fails is retried on every poll until a rebuild
+    succeeds.
+  - New backend TLS for the refused file's destinations fails closed. The
+    exception is an otherwise unchanged TCP+TLS stream listener, which keeps
+    serving with its last admitted config under the existing keep-last-good
+    rule until the file is valid again.
+  - A refused tenant file no longer stalls rotation of unrelated backend TLS
+    sources. Files named only in per-port (`portLevelSettings`) or per-subset
+    TLS overrides are now watched for rotation too.
 - **CRL-enforcing outbound TLS clients no longer resume sessions** (PR
   #6316, follow-up to #4297). TLS 1.2 tickets and TLS 1.3 PSK resumption
   skip certificate reverification, so a cached session could outlive a CRL's

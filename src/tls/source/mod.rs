@@ -1002,11 +1002,102 @@ pub fn load_material_blocking_with(
 
 /// The shared loader with explicit roots for isolated regression tests.
 /// Production callers use the immutable process policy via the public wrapper.
+/// Production loads (no explicit roots) also honor the backend watcher's held
+/// tenant refusals; see [`publish_held_refused_tenant_files`].
 pub(crate) fn load_material_blocking_with_tenant_roots(
     source: &CertSource,
     fallback_kind: MaterialKind,
     max_bytes: usize,
     tenant_roots: Option<&[PathBuf]>,
+) -> Result<MaterializedMaterial, MaterialError> {
+    load_material_blocking_inner(
+        source,
+        fallback_kind,
+        max_bytes,
+        tenant_roots,
+        tenant_roots.is_none(),
+    )
+}
+
+/// The watcher's own fingerprint read. It must see a held tenant file
+/// recover, so it alone ignores the hold it publishes.
+pub(crate) fn load_material_blocking_for_watcher(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<MaterializedMaterial, MaterialError> {
+    load_material_blocking_inner(source, fallback_kind, max_bytes, None, false)
+}
+
+/// Async [`load_material_blocking_for_watcher`] on the shared executor.
+pub(crate) async fn load_material_for_watcher(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<MaterializedMaterial, MaterialError> {
+    let source = source.clone();
+    effective_tls_source_executor()?
+        .run_blocking(move || load_material_blocking_for_watcher(&source, fallback_kind, max_bytes))
+        .await
+}
+
+/// Tenant file identifiers each watcher surface currently holds refused.
+static HELD_REFUSED_TENANT_FILES: std::sync::LazyLock<
+    arc_swap::ArcSwap<Vec<(&'static str, String)>>,
+> = std::sync::LazyLock::new(|| arc_swap::ArcSwap::from_pointee(Vec::new()));
+
+/// Publish the tenant files `surface`'s watcher last observed as refused.
+///
+/// Until the same watcher observes a file readable again, every production
+/// load of that tenant reference fails closed. A cache, pool or client built
+/// between two polls therefore cannot capture the file during a brief window
+/// in which it resolved inside its root again: only the watcher's accepted
+/// recovery, followed by its cache-draining rebuild, lifts the hold.
+pub(crate) fn publish_held_refused_tenant_files(surface: &'static str, identifiers: Vec<String>) {
+    let current = HELD_REFUSED_TENANT_FILES.load();
+    let unchanged = current
+        .iter()
+        .filter(|(held_surface, _)| *held_surface == surface)
+        .map(|(_, identifier)| identifier)
+        .eq(identifiers.iter());
+    if unchanged {
+        return;
+    }
+    let _ = HELD_REFUSED_TENANT_FILES.rcu(|held| {
+        let mut next: Vec<(&'static str, String)> = held
+            .iter()
+            .filter(|(held_surface, _)| *held_surface != surface)
+            .cloned()
+            .collect();
+        next.extend(
+            identifiers
+                .iter()
+                .map(|identifier| (surface, identifier.clone())),
+        );
+        next
+    });
+}
+
+/// The watcher-facing tenant identifier of `source`, when it is a bound tenant
+/// file reference.
+pub(crate) fn tenant_file_identifier(source: &CertSource) -> Option<&str> {
+    match source {
+        CertSource::Uri(uri) if is_tenant_file_uri(uri) => Some(uri.identifier.as_str()),
+        _ => None,
+    }
+}
+
+fn tenant_file_held_refused(identifier: &str) -> bool {
+    let held = HELD_REFUSED_TENANT_FILES.load();
+    !held.is_empty() && held.iter().any(|(_, held)| held == identifier)
+}
+
+fn load_material_blocking_inner(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+    tenant_roots: Option<&[PathBuf]>,
+    honor_watcher_hold: bool,
 ) -> Result<MaterializedMaterial, MaterialError> {
     let max_bytes = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
     validate_source_field_kind(source, fallback_kind)?;
@@ -1032,6 +1123,9 @@ pub(crate) fn load_material_blocking_with_tenant_roots(
             }
             if is_tenant_file_uri(uri) {
                 let path = tenant_file_uri_path(uri)?;
+                if honor_watcher_hold && tenant_file_held_refused(&uri.identifier) {
+                    return Err(invalid_tenant_file_source());
+                }
                 let effective_roots;
                 let roots = match tenant_roots {
                     Some(roots) => roots,

@@ -104,6 +104,53 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// The plugin material registry as `(plugin, field path, class)`, where
+    /// class is `tls`, `gateway_only` or `open_map`.
+    pub fn scoped_plugin_registry_for_test() -> Vec<(&'static str, &'static str, &'static str)> {
+        use crate::admin::crud::scoped_references::{PLUGIN_SCOPED_FIELDS, ScopedReferenceClass};
+        let mut rows = Vec::new();
+        for entry in PLUGIN_SCOPED_FIELDS {
+            for field in entry.fields {
+                let class = match field.class {
+                    ScopedReferenceClass::TlsMaterial(_) => "tls",
+                    ScopedReferenceClass::GatewayOnly => "gateway_only",
+                };
+                rows.push((entry.plugin, field.path, class));
+            }
+            for map in entry.open_maps {
+                rows.push((entry.plugin, map.path, "open_map"));
+            }
+        }
+        rows
+    }
+
+    /// Reviewed path-shaped plugin fields that name no gateway material.
+    pub fn reviewed_non_material_plugin_fields_for_test() -> &'static [(&'static str, &'static str)]
+    {
+        crate::admin::crud::scoped_references::REVIEWED_NON_MATERIAL_FIELDS
+    }
+
+    /// Concrete references the admission gate classifies in a plugin config,
+    /// as `(field path, value, class)`.
+    pub fn plugin_scoped_references_for_test(
+        plugin: &str,
+        config: &serde_json::Value,
+    ) -> Vec<(String, String, &'static str)> {
+        use crate::admin::crud::scoped_references::{
+            ScopedReferenceClass, plugin_scoped_references,
+        };
+        plugin_scoped_references(plugin, config)
+            .into_iter()
+            .map(|(path, value, class)| {
+                let class = match class {
+                    ScopedReferenceClass::TlsMaterial(_) => "tls",
+                    ScopedReferenceClass::GatewayOnly => "gateway_only",
+                };
+                (path, value.to_string(), class)
+            })
+            .collect()
+    }
+
     pub fn spawn_backend_material_reload_for_test(
         config: crate::tls::source::subscription::DynamicMaterialSetReloadConfig,
         shutdown: Option<tokio::sync::watch::Receiver<bool>>,

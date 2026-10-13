@@ -12761,7 +12761,17 @@ components:
           type: [object, "null"]
           default: {}
           description: >-
-            Plugin-specific JSON configuration. May be JSON `null` when the
+            Plugin-specific JSON configuration. When admin namespace-claim
+            enforcement is on, or the token carries an `ns` claim even with
+            enforcement off, an `operator` may introduce gateway TLS material
+            in a plugin field only as inline PEM, `system://`, or a `k8s://`
+            Secret in the addressed namespace. It may not introduce a field
+            that names a gateway filesystem path or native library setting at
+            all, and it may not create or change a non-built-in plugin's config.
+            Such writes are refused with `400`. Values already stored at the
+            same field path are exempt, and `admin`-role tokens are not
+            restricted.
+            May be JSON `null` when the
             selected plugin's schema permits it (for example `stdout_logging`);
             object-only plugins still reject null while enabled. Resource-level
             size and depth constraints are always validated. Plugin-specific

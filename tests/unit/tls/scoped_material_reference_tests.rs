@@ -527,6 +527,177 @@ async fn failed_rebuild_keeps_tenant_refusal_invalidation_pending_until_it_succe
         .unwrap();
 }
 
+/// A tenant file the backend watcher observed refused stays held: a cache
+/// built between two polls, while the file briefly resolves inside its root
+/// again, cannot capture it. Only the watcher's own observed recovery (and
+/// its cache-draining rebuild) lifts the hold, and the next refusal is held
+/// again even though a cache was populated in between.
+///
+/// Tenant roots and the hold are process-global, so the body runs in its own
+/// child process.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_tenant_refusal_blocks_cache_population_until_the_watcher_sees_recovery() {
+    use ferrum_edge::tls::backend::BackendTlsConfigCache;
+    use ferrum_edge::tls::source::{
+        CertSource, install_mesh_tenant_tls_file_roots, load_material_blocking,
+        subscription::{
+            DynamicMaterialSetReloadConfig, WatchedMaterialSource, request_material_set_reload,
+        },
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    const CHILD_ENV: &str = "UNIT_TEST_TENANT_TLS_HOLD_CHILD";
+    const TEST_NAME: &str = "unit::tls::scoped_material_reference_tests::\
+         held_tenant_refusal_blocks_cache_population_until_the_watcher_sees_recovery";
+    const SURFACE: &str = "test_tenant_refusal_hold";
+    const KEY: &str = "ca=|cert=|key=|sni=|san=|verify=1|svidg=static";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve unit test executable"),
+        )
+        .env(CHILD_ENV, "1")
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .output()
+        .expect("run isolated tenant hold test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated tenant hold test failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        return;
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("tenant");
+    let outside = work.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    install_mesh_tenant_tls_file_roots(vec![root.clone()]).unwrap();
+    let replace_link = |link: &std::path::Path, target: &std::path::Path| {
+        let next = link.with_extension("link-next");
+        let _ = std::fs::remove_file(&next);
+        std::os::unix::fs::symlink(target, &next).unwrap();
+        std::fs::rename(&next, link).unwrap();
+    };
+    let inside = root.join("inside.pem");
+    std::fs::write(&inside, b"tenant bytes").unwrap();
+    let escaped = outside.join("platform.pem");
+    std::fs::write(&escaped, b"platform bytes").unwrap();
+    let link = root.join("ca.pem");
+    replace_link(&link, &inside);
+    let source = CertSource::parse(
+        bound_file(link.to_str().unwrap(), MaterialKind::CaBundle),
+        MaterialKind::CaBundle,
+    );
+
+    let cache = BackendTlsConfigCache::new();
+    let build = |source: CertSource| {
+        move || -> Result<rustls::ClientConfig, String> {
+            load_material_blocking(&source, MaterialKind::CaBundle)
+                .map_err(|error| error.to_string())?;
+            Ok(rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth())
+        }
+    };
+
+    let rebuild_cache = cache.clone();
+    let sources = vec![WatchedMaterialSource::new(
+        "backend_ca",
+        source.clone(),
+        MaterialKind::CaBundle,
+    )];
+    let (revision_tx, mut revision_rx) = tokio::sync::watch::channel(0u64);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = ferrum_edge::_test_support::spawn_backend_material_reload_for_test(
+        DynamicMaterialSetReloadConfig {
+            surface: SURFACE,
+            collect_sources: Box::new(move || sources.clone()),
+            file_default_interval: Duration::from_secs(3600),
+            provider_default_interval: Duration::from_secs(3600),
+            revision_tx,
+            max_material_bytes: 4096,
+            rebuild: Box::new(move || {
+                rebuild_cache.clear();
+                Ok(())
+            }),
+        },
+        Some(shutdown_rx),
+    );
+    let next_revision = |rx: &mut tokio::sync::watch::Receiver<u64>| {
+        let mut rx = rx.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), rx.changed())
+                .await
+                .expect("the watcher publishes a revision")
+                .unwrap();
+            *rx.borrow_and_update()
+        }
+    };
+
+    // Accepted: the cache fills from the confined file.
+    assert!(
+        cache
+            .get_or_try_build(KEY.to_string(), build(source.clone()))
+            .is_ok()
+    );
+    assert!(cache.contains_key(KEY));
+
+    // Escape: the watcher observes the refusal, holds it, and drains.
+    replace_link(&link, &escaped);
+    assert!(request_material_set_reload(SURFACE));
+    assert_eq!(next_revision(&mut revision_rx).await, 1);
+    assert!(cache.is_empty(), "the refusal drains cached configs");
+
+    // Brief recovery between polls: the file resolves inside its root again,
+    // but the watcher has not observed it, so nothing can be cached.
+    replace_link(&link, &inside);
+    assert!(load_material_blocking(&source, MaterialKind::CaBundle).is_err());
+    assert!(
+        cache
+            .get_or_try_build(KEY.to_string(), build(source.clone()))
+            .is_err()
+    );
+    assert!(
+        cache.is_empty(),
+        "a held refusal must not populate the cache"
+    );
+
+    // Escape again before the next poll: the unchanged refusal stays held.
+    replace_link(&link, &escaped);
+    assert!(request_material_set_reload(SURFACE));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        cache
+            .get_or_try_build(KEY.to_string(), build(source.clone()))
+            .is_err()
+    );
+    assert!(cache.is_empty());
+
+    // Real recovery observed by the watcher lifts the hold.
+    replace_link(&link, &inside);
+    assert!(request_material_set_reload(SURFACE));
+    assert_eq!(next_revision(&mut revision_rx).await, 2);
+    assert!(
+        cache
+            .get_or_try_build(KEY.to_string(), build(source.clone()))
+            .is_ok()
+    );
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        load_material_blocking(&source, MaterialKind::CaBundle).is_ok(),
+        "a stopped watcher releases its holds"
+    );
+}
+
 #[test]
 fn constrained_file_uri_roundtrip_keeps_path_options_identity_and_refreshability() {
     use ferrum_edge::tls::source::{

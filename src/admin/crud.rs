@@ -36,6 +36,9 @@ use crate::config::types::{
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use crate::tls::source::{MaterialKind, check_namespace_scoped_material_reference};
 
+pub(crate) mod scoped_references;
+use scoped_references::ScopedReferenceClass;
+
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
 pub(crate) struct ValidationCtx<'a> {
@@ -2581,10 +2584,16 @@ pub(crate) trait AdminResource:
     /// Default is a no-op.
     fn set_actor(&mut self, _actor: &str) {}
 
-    /// TLS material references this resource asks the gateway to resolve, as
-    /// `(field, value, field kind)`. Default: none.
-    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
+    /// References this resource asks the gateway to resolve or use with its
+    /// own identity, as `(field, value, class)`. Default: none.
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
         Vec::new()
+    }
+
+    /// `(plugin name, config)` of a resource whose gateway material use the
+    /// registry cannot classify. Default: none.
+    fn unclassified_material_owner(&self) -> Option<(&str, &Value)> {
+        None
     }
 
     /// Re-read the committed record after a successful create/update and use
@@ -3808,7 +3817,7 @@ impl AdminResource for Upstream {
         Some(&mut self.labels)
     }
 
-    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
         backend_tls_material_references(
             self.backend_tls_client_cert_path.as_deref(),
             self.backend_tls_client_key_path.as_deref(),
@@ -4249,63 +4258,13 @@ pub(crate) const GATEWAY_TRUST_BUNDLE_SINGLETON_CONFLICT_MESSAGE: &str =
 
 #[async_trait::async_trait]
 impl AdminResource for PluginConfig {
-    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
-        // Logging sinks whose TLS identity and trust are loaded with the
-        // gateway's own credentials, exactly like backend TLS material.
-        let sink_fields: &[(&str, MaterialKind)] = match self.plugin_name.as_str() {
-            "udp_logging" => &[
-                ("dtls_cert_path", MaterialKind::Cert),
-                ("dtls_key_path", MaterialKind::Key),
-                ("dtls_ca_cert_path", MaterialKind::CaBundle),
-            ],
-            "kafka_logging" => &[
-                ("ssl_certificate_location", MaterialKind::Cert),
-                ("ssl_key_location", MaterialKind::Key),
-                ("ssl_ca_location", MaterialKind::CaBundle),
-            ],
-            _ => &[],
-        };
-        if !sink_fields.is_empty() {
-            let mut references = Vec::new();
-            for (field, kind) in sink_fields {
-                if let Some(value) = self.config.get(*field).and_then(Value::as_str) {
-                    references.push((format!("config.{field}"), value, *kind));
-                }
-            }
-            return references;
-        }
-        if self.plugin_name != "mesh_route_dispatch" {
-            return Vec::new();
-        }
-        let Some(rules) = self.config.get("rules").and_then(Value::as_array) else {
-            return Vec::new();
-        };
-        let mut references = Vec::new();
-        for (index, rule) in rules.iter().enumerate() {
-            let Some(tls) = rule
-                .get("destination")
-                .and_then(|destination| destination.get("backend_tls"))
-            else {
-                continue;
-            };
-            for (field, kind) in [
-                ("client_cert_path", MaterialKind::Cert),
-                ("client_key_path", MaterialKind::Key),
-                ("server_ca_cert_path", MaterialKind::CaBundle),
-            ] {
-                if let Some(value) = tls.get(field).and_then(Value::as_str) {
-                    // Preserve the exact field identity for the existing-value
-                    // exemption: moving an admin's reference to another rule
-                    // is a new material use, not an unrelated update.
-                    references.push((
-                        format!("config.rules[{index}].destination.backend_tls.{field}"),
-                        value,
-                        kind,
-                    ));
-                }
-            }
-        }
-        references
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
+        scoped_references::plugin_scoped_references(&self.plugin_name, &self.config)
+    }
+
+    fn unclassified_material_owner(&self) -> Option<(&str, &Value)> {
+        (!scoped_references::plugin_is_classified(&self.plugin_name))
+            .then_some((self.plugin_name.as_str(), &self.config))
     }
 
     fn labels_mut(&mut self) -> Option<&mut std::collections::BTreeMap<String, String>> {
@@ -4846,7 +4805,7 @@ impl AdminResource for Proxy {
         Some(&mut self.labels)
     }
 
-    fn tls_material_references(&self) -> Vec<(String, &str, MaterialKind)> {
+    fn tls_material_references(&self) -> Vec<(String, &str, ScopedReferenceClass)> {
         backend_tls_material_references(
             self.backend_tls_client_cert_path.as_deref(),
             self.backend_tls_client_key_path.as_deref(),
@@ -5861,7 +5820,7 @@ fn backend_tls_material_references<'a>(
     client_cert_path: Option<&'a str>,
     client_key_path: Option<&'a str>,
     server_ca_path: Option<&'a str>,
-) -> Vec<(String, &'a str, MaterialKind)> {
+) -> Vec<(String, &'a str, ScopedReferenceClass)> {
     let candidates = [
         (
             "backend_tls_client_cert_path",
@@ -5882,7 +5841,11 @@ fn backend_tls_material_references<'a>(
     let mut references = Vec::new();
     for (field, value, kind) in candidates {
         if let Some(value) = value {
-            references.push((field.to_string(), value, kind));
+            references.push((
+                field.to_string(),
+                value,
+                ScopedReferenceClass::TlsMaterial(kind),
+            ));
         }
     }
     references
@@ -5911,6 +5874,27 @@ fn tls_reference_refusal<R: AdminResource>(
     {
         return None;
     }
+    let refuse = |message: String| {
+        Some(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ))
+    };
+    // Default-deny: a plugin the registry cannot classify may not be
+    // introduced or changed, because its gateway material use is unknown.
+    if let Some((plugin, config)) = resource.unclassified_material_owner() {
+        let unchanged = existing
+            .and_then(|existing| existing.unclassified_material_owner())
+            .is_some_and(|stored| stored == (plugin, config));
+        if !unchanged {
+            return refuse(
+                "this plugin's use of gateway filesystem paths, credentials and native \
+                 modules cannot be classified, so namespace-scoped configuration may not \
+                 introduce or change its config"
+                    .to_string(),
+            );
+        }
+    }
     let stored: HashSet<_> = existing
         .map(|existing| existing.tls_material_references())
         .unwrap_or_default()
@@ -5920,13 +5904,21 @@ fn tls_reference_refusal<R: AdminResource>(
         if stored.contains(&reference) {
             continue;
         }
-        let (field, value, kind) = reference;
-        let verdict = check_namespace_scoped_material_reference(value, kind, namespace, &[]);
-        if let Err(refusal) = verdict {
-            return Some(super::json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("`{field}`: {}", refusal.reason())}),
-            ));
+        let (field, value, class) = reference;
+        match class {
+            ScopedReferenceClass::TlsMaterial(kind) => {
+                let verdict =
+                    check_namespace_scoped_material_reference(value, kind, namespace, &[]);
+                if let Err(refusal) = verdict {
+                    return refuse(format!("`{field}`: {}", refusal.reason()));
+                }
+            }
+            ScopedReferenceClass::GatewayOnly => {
+                return refuse(format!(
+                    "`{field}`: gateway filesystem paths and native library settings are not \
+                     available to namespace-scoped configuration"
+                ));
+            }
         }
     }
     None

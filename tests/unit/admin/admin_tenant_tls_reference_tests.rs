@@ -513,6 +513,98 @@ async fn namespace_claim_confines_udp_logging_dtls_material_on_create_and_put() 
     }
 }
 
+/// Default-deny: registered gateway-only fields, unsafe native-library keys
+/// and unclassifiable (non-built-in) plugins are refused for a
+/// namespace-claimed operator, whether or not the claim is required, while an
+/// `admin` token is not namespace-confined.
+#[tokio::test]
+async fn namespace_claim_refuses_gateway_only_fields_and_unclassified_plugins() {
+    let temp = TempDir::new().unwrap();
+    for require in [false, true] {
+        let db = sqlite_store(&temp, &format!("default-deny-{require}.db")).await;
+        let mut state = tenant_control_plane_state(db);
+        state.admin_require_namespace_claim = require;
+        let (base, _shutdown) = start_admin(state).await;
+        let operator = operator_token(&["tenant-a"]);
+        let (status, response) = post(
+            &base,
+            "/proxies",
+            &operator,
+            &proxy_with("backend_tls_server_ca_cert_path", "system://"),
+        )
+        .await;
+        assert!((200..300).contains(&status), "{response}");
+        let plugin = |id: &str, name: &str, config: Value| {
+            json!({
+                "id": id, "plugin_name": name, "scope": "proxy",
+                "proxy_id": "p-partner", "enabled": true, "config": config
+            })
+        };
+        for (id, body, echoed) in [
+            (
+                "geo-db",
+                plugin(
+                    "geo-db",
+                    "geo_restriction",
+                    json!({"db_path": "/var/lib/platform/GeoIP2.mmdb", "allow_countries": ["US"]}),
+                ),
+                "/var/lib/platform/GeoIP2.mmdb",
+            ),
+            (
+                "kafka-native",
+                plugin(
+                    "kafka-native",
+                    "kafka_logging",
+                    json!({
+                        "bootstrap_servers": "127.0.0.1:9093",
+                        "topic": "audit",
+                        "security_protocol": "ssl",
+                        "producer_config": {"linger.ms": "5", "ssl.providers": "/tmp/evil"}
+                    }),
+                ),
+                "/tmp/evil",
+            ),
+            (
+                "soap-trust",
+                plugin(
+                    "soap-trust",
+                    "soap_ws_security",
+                    json!({"x509_signature": {
+                        "enabled": true,
+                        "trusted_certs": ["k8s://tenant-b/idp#tls.crt"]
+                    }}),
+                ),
+                "tenant-b",
+            ),
+            (
+                "custom",
+                plugin(
+                    "custom",
+                    "unregistered_custom_plugin",
+                    json!({"library": "/opt/plugins/anything.so"}),
+                ),
+                "/opt/plugins/anything.so",
+            ),
+        ] {
+            let (status, response) = post(&base, "/plugins/config", &operator, &body).await;
+            assert_eq!(status, 400, "{require} {id}: {response}");
+            assert!(is_scope_refusal(&response), "{id}: {response}");
+            assert!(!response.to_string().contains(echoed), "{id}: {response}");
+            let (_, response) = post(
+                &base,
+                "/plugins/config",
+                &token("admin", &["tenant-a"]),
+                &body,
+            )
+            .await;
+            assert!(
+                !is_scope_refusal(&response),
+                "{id}: admin tokens are not namespace-confined: {response}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn namespace_scoped_operator_keeps_material_it_may_reference() {
     let temp_dir = TempDir::new().unwrap();
