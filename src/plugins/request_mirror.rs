@@ -570,6 +570,7 @@ const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "auth",
     "token",
     "session",
+    "sessid",
     "secret",
     "passw",
     "passphrase",

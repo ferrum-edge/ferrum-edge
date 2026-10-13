@@ -6633,6 +6633,7 @@ async fn mirror_strips_unlisted_credential_class_headers() {
         "x-passphrase",
         "x-ssoticket",
         "x-clientassertion",
+        "x-phpsessid",
     ];
     for (idx, name) in credential_names.iter().enumerate() {
         headers.insert((*name).to_string(), format!("cred-value-{idx}"));
@@ -6680,6 +6681,7 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         "keep=1&session_id=q1&sessionId=q2&jwt=q3&access_key=q4&private_key=q5&",
         "key=q6&sid=q7&pwd=q8&ticket=q9&auth=q10&x.auth.code=q11&otp=q12&",
         "ssoTicket=q13&clientAssertion=q14&%73essionid=q15&sess%2569on_key=q16&",
+        "PHPSESSID=q17&%50HPSESSID=q18&%2550HPSESSID=q19&",
         "continuation_token=c3&continuation%5Ftoken=c4&continuation%255Ftoken=c5&",
         "author=a1&signal=1&page=2"
     );
@@ -6693,7 +6695,7 @@ async fn mirror_strips_unlisted_credential_class_query_names() {
         )),
         "benign pairs must be retained in order: {request_line}"
     );
-    for idx in 1..=16 {
+    for idx in 1..=19 {
         let value = format!("=q{idx}&");
         let tail = format!("=q{idx} ");
         assert!(
@@ -6749,6 +6751,34 @@ fn operator_pattern_alone_makes_a_vendor_name_sensitive() {
             "{allow_key}: the operator pattern must make x-vendor-value allowlistable"
         );
     }
+}
+
+/// A credential-class query name forwards only through the exact allowlist,
+/// matched on the decoded name.
+#[tokio::test]
+async fn credential_class_query_name_forwards_only_when_allowlisted() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("PHPSESSID=live&x=1".to_string());
+    let default_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        default_line.contains("?x=1 ") && !default_line.contains("live"),
+        "default mirror must drop the session id: {default_line}"
+    );
+
+    let mut allowed = make_ctx_with_proxy();
+    allowed.set_raw_query_string("%50HPSESSID=live&x=1".to_string());
+    let allowed_line = capture_mirror_request_line_with_config(
+        &mut allowed,
+        json!({
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["phpsessid"]
+        }),
+    )
+    .await;
+    assert!(
+        allowed_line.contains("?%50HPSESSID=live&x=1 "),
+        "exact allowlist must forward the decoded name with its raw encoding: {allowed_line}"
+    );
 }
 
 /// Names caught only by the credential-class rule are still opt-in-able
