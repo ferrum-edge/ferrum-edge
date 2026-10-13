@@ -3122,7 +3122,7 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
             .load()
             .consumers
             .iter()
-            .all(|consumer| consumer.labels.get("tier").is_none()),
+            .all(|consumer| !consumer.labels.contains_key("tier")),
         "the rejected metadata update must not publish"
     );
     assert_eq!(live_winner(&state), full_build_winner(&state));
