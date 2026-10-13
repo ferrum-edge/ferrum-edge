@@ -337,6 +337,10 @@ mod azure {
         pub fn route_through_proxy(&self, guard: &EnvGuard) {
             guard.set_other("HTTPS_PROXY", &self.proxy_url);
             guard.set_other("https_proxy", &self.proxy_url);
+            // An ambient NO_PROXY (e.g. `*` or `.vault.azure.net`) would bypass
+            // the proxy and send the test to the real network.
+            guard.set_other("NO_PROXY", "");
+            guard.set_other("no_proxy", "");
         }
 
         /// `https://ferrum-kv.vault.azure.net/secrets/<name>`; reaches the fake
