@@ -306,7 +306,7 @@ CORS plugin is emitted, and the VirtualService's
 `status.ferrum.translation.deferred_fields` names `http[].corsPolicy`. That
 applies to a malformed or unknown origin matcher, a matcher value or list beyond
 its bound, an un-compilable or over-complex regex, an unparseable `maxAge`, an
-invalid method/header token, and credentialed exact `*`, opaque exact `null`, or an effectively universal prefix/regex (which cannot emit a host-constrained origin credentialed CORS requires). Ferrum never approximates
+invalid method/header token, and credentialed exact `*`, opaque exact `null`, or an effectively universal prefix, or a regex the reserved-name probes show to be universal (which cannot emit a host-constrained origin credentialed CORS requires). A credentialed regex that passes those probes but fails the host-pinning proof is instead projected, and `cors` construction refuses it. That rejects the update, and the previous generation keeps serving. Ferrum never approximates
 or widens such a policy.
 
 These rules do not alter operator-authored native direct-plugin behavior.
