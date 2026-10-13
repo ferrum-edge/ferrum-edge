@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Reproducible release builds and no persisted checkout tokens** (issues
+  #6574, #6581). The production `Dockerfile` builds its eBPF ELF with a dated
+  nightly (`EBPF_NIGHTLY_TOOLCHAIN`, currently `nightly-2026-09-30`) instead
+  of the floating `nightly` channel. The `Dockerfile` builds, the native
+  release builds, and the x86_64 GNU sysroot builder pass `cargo build
+  --locked`, so a stale `Cargo.lock` fails the build instead of being
+  re-resolved. Every non-pushing `actions/checkout` sets
+  `persist-credentials: false`, and `verify_workflow_permissions.py` rejects
+  a checkout that omits it.
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is

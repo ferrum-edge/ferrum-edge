@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - name: Require tag to match Cargo package version
         env:
@@ -56,6 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       # Issue #4302. The complete, repository-required product check set --
@@ -249,7 +252,7 @@ jobs:
       - name: Build release binary
         if: matrix.target != 'x86_64-unknown-linux-gnu'
         timeout-minutes: 165
-        run: cargo build --features cloud-secrets --release --target ${{ matrix.target }} --timings
+        run: cargo build --locked --features cloud-secrets --release --target ${{ matrix.target }} --timings
 
       # Canonical x86_64 GNU producer. The digest-pinned AlmaLinux 8.10
       # sysroot links against glibc 2.28, below the declared GLIBC_2.34 floor,
@@ -504,6 +507,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
@@ -713,6 +718,8 @@ jobs:
             arch_dir: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - name: Download Linux binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -869,6 +876,8 @@ jobs:
             arch_dir: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4

@@ -801,6 +801,19 @@ exact version, and records why in the file itself: lint parity with the
 The compiler identity of a *release* build is fixed by the digest-pinned
 `rust:<tag>@sha256:…` builder image, which fixes the rustc inside it.
 
+The one nightly that reaches a published image, the eBPF ELF build in
+`Dockerfile`, is pinned by date through the `EBPF_NIGHTLY_TOOLCHAIN` build
+argument (currently the fuzz lane's `nightly-2026-09-30`). It is never the
+floating `nightly` channel. Move it forward with a normal pull request, which
+the production eBPF image smoke gates. The `Dockerfile` builds, the native
+release builds in `release.yml`, and the x86_64 GNU sysroot builder all pass
+`cargo build --locked`. They compile exactly the committed `Cargo.lock` and
+fail instead of re-resolving a dependency (#6574). The ARM64 Cross release job
+is byte-frozen by the trusted Cross policy's `WORKFLOW_CONTRACTS` digest, so it
+can gain `--locked` only through a reviewed policy migration. It builds the
+same tagged commit and lockfile. If that lockfile is stale, the `--locked`
+native builds fail, and `create-release` cannot publish without them.
+
 ## CI Actions and Kubernetes tooling
 
 GitHub Actions and the kind / kubectl / Helm binaries used by live Kubernetes

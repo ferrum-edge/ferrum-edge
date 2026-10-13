@@ -13,7 +13,10 @@ status-check rulesets trust). So every workflow must state its own default:
 * a workflow that pull-request, push, merge-queue, or `workflow_run` events
   can start keeps a read-only (or empty) top-level default. Jobs that need a
   write scope ask for it in their own job-level `permissions:` block, where
-  review sees it next to the steps that use it.
+  review sees it next to the steps that use it;
+* every `actions/checkout` step states `persist-credentials: false`, so the
+  token is not left in `.git/config` for later steps. `true` is admitted only
+  in a workflow none of those events can start (#6581).
 
 Executed by verify_required_ci.py inside the `Tests` aggregate, so a pull
 request that adds or edits a workflow without explicit permissions fails CI.
@@ -50,6 +53,13 @@ SCOPE_LINE = re.compile(
 FLOW_ENTRY = re.compile(r"^\s*" + QUOTED.format("scope") + r"\s*:\s*" + QUOTED.format("level") + r"\s*$")
 EVENT_NAME = re.compile(r"^\s*" + QUOTED.format("event") + r"\s*$")
 EVENT_LINE = re.compile(r"^  " + QUOTED.format("event") + r"\s*:(?:\s.*)?$")
+# Block-style step keys only; `lead` ends where the key starts, so its length
+# is the step's key column whether or not the key sits on the `- ` line.
+CHECKOUT_USES = re.compile(r"^(?P<lead> *(?:- +)?)uses *: *[\"']?actions/checkout@")
+WITH_KEY = re.compile(r"^(?P<lead> *(?:- +)?)with *:(?P<rest>.*)$")
+PERSIST_LINE = re.compile(
+    r"^ +persist-credentials *: *(?P<q>[\"']?)(?P<value>[A-Za-z]+)(?P=q) *(?:#.*)?$"
+)
 
 
 def _strip_comment(value: str) -> str:
@@ -175,6 +185,111 @@ def workflow_permission_errors(text: str, source: str) -> list[str]:
     return errors
 
 
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _is_content(line: str) -> bool:
+    return bool(line.strip()) and not line.lstrip().startswith("#")
+
+
+def checkout_credential_errors(text: str, source: str) -> list[str]:
+    """Every `actions/checkout` step states `persist-credentials` explicitly.
+
+    The action's default (`true`) writes the job's `GITHUB_TOKEN` into
+    `.git/config`, where every later step, build script, and test can read it
+    (#6581). A checkout must say `persist-credentials: false`. `true` is
+    admitted only in a workflow that no pull-request, push, merge-queue, or
+    `workflow_run` event can start, for jobs that push with the persisted
+    token. Any spelling this line-based reader cannot follow fails closed.
+    """
+
+    lines = text.splitlines()
+    triggers = workflow_triggers(text)
+    code_triggered = triggers is None or bool(triggers & CODE_TRIGGERED_EVENTS)
+    errors: list[str] = []
+    for index, line in enumerate(lines):
+        if "actions/checkout" not in line or line.lstrip().startswith("#"):
+            continue
+        located = f"{source}:{index + 1}"
+        match = CHECKOUT_USES.match(line)
+        if match is None:
+            errors.append(
+                f"{located} names actions/checkout outside a block-style `uses:` "
+                "step key; write the step in block style so persist-credentials "
+                "can be verified"
+            )
+            continue
+        key_indent = len(match.group("lead"))
+        start = index
+        if "-" not in match.group("lead"):
+            start = -1
+            for back in range(index - 1, -1, -1):
+                if _is_content(lines[back]) and _indent(lines[back]) < key_indent:
+                    start = back
+                    break
+            dash_line = lines[start] if start >= 0 else ""
+            if not dash_line.lstrip().startswith("- ") or (
+                _indent(dash_line) + 2 != key_indent
+            ):
+                errors.append(f"{located} checkout step start could not be read")
+                continue
+        end = index + 1
+        while end < len(lines) and not (
+            _is_content(lines[end]) and _indent(lines[end]) < key_indent
+        ):
+            end += 1
+        with_lines = [
+            number
+            for number in range(start, end)
+            if WITH_KEY.match(lines[number]) is not None
+            and len(WITH_KEY.match(lines[number]).group("lead")) == key_indent
+        ]
+        values: list[str] = []
+        unreadable = False
+        if len(with_lines) > 1:
+            unreadable = True
+        for number in with_lines:
+            if _strip_comment(WITH_KEY.match(lines[number]).group("rest")):
+                unreadable = True  # flow mapping or scalar: not read here
+                continue
+            for body in lines[number + 1 : end]:
+                if not _is_content(body):
+                    continue
+                if _indent(body) <= key_indent:
+                    break
+                if "persist-credentials" not in body:
+                    continue
+                persist = PERSIST_LINE.match(body)
+                if persist is None:
+                    unreadable = True
+                else:
+                    values.append(persist.group("value"))
+        if unreadable or len(values) > 1:
+            errors.append(
+                f"{located} checkout `with:` must be one block mapping holding a "
+                "single plain `persist-credentials: false`"
+            )
+        elif not values:
+            errors.append(
+                f"{located} checkout must set `persist-credentials: false` so the "
+                "job token is not left in .git/config for later steps"
+            )
+        elif values[0] == "true":
+            if code_triggered:
+                errors.append(
+                    f"{located} checkout persists credentials in a workflow that "
+                    "pull-request, push, merge-queue, or workflow_run events can "
+                    "start; use `persist-credentials: false`"
+                )
+        elif values[0] != "false":
+            errors.append(
+                f"{located} checkout persist-credentials must be `false` "
+                f"(found {values[0]!r})"
+            )
+    return errors
+
+
 def check_repository(root: Path = Path(".")) -> list[str]:
     directory = root / WORKFLOW_DIR
     paths = sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])
@@ -182,9 +297,9 @@ def check_repository(root: Path = Path(".")) -> list[str]:
         return [f"no workflows found under {directory}"]
     errors: list[str] = []
     for path in paths:
-        errors.extend(
-            workflow_permission_errors(path.read_text(encoding="utf-8"), path.as_posix())
-        )
+        text = path.read_text(encoding="utf-8")
+        errors.extend(workflow_permission_errors(text, path.as_posix()))
+        errors.extend(checkout_credential_errors(text, path.as_posix()))
     return errors
 
 
@@ -256,6 +371,61 @@ def run_self_test() -> list[str]:
             failures.append(f"workflow permission self-test {label!r} rejected: {errors}")
         if not accepted and not errors:
             failures.append(f"workflow permission self-test {label!r} was accepted")
+
+    pin = "actions/checkout@" + "0" * 40 + " # v6"
+    pr = "on:\n  pull_request:\npermissions:\n  contents: read\njobs:\n  build:\n    steps:\n"
+    scheduled = "on:\n  schedule:\n    - cron: '0 0 * * *'\npermissions: {}\njobs:\n  build:\n    steps:\n"
+    tail = "      - run: true\n"
+    checkout_cases = (
+        ("dash false", pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail, True),
+        (
+            "named false after other input",
+            pr + f"      - name: Checkout\n        uses: {pin}\n        with:\n"
+            "          fetch-depth: 0\n          persist-credentials: 'false'  # no token\n" + tail,
+            True,
+        ),
+        (
+            "with before uses",
+            pr + "      - name: Checkout\n        with:\n          persist-credentials: false\n"
+            f"        uses: {pin}\n" + tail,
+            True,
+        ),
+        ("scheduled push true", scheduled + f"      - uses: {pin}\n        with:\n          persist-credentials: true\n" + tail, True),
+        ("missing with", pr + f"      - uses: {pin}\n" + tail, False),
+        ("missing key", pr + f"      - uses: {pin}\n        with:\n          fetch-depth: 0\n" + tail, False),
+        ("pr true", pr + f"      - uses: {pin}\n        with:\n          persist-credentials: true\n" + tail, False),
+        (
+            "expression",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: ${{{{ inputs.p }}}}\n" + tail,
+            False,
+        ),
+        ("flow with", pr + f"      - uses: {pin}\n        with: {{persist-credentials: false}}\n" + tail, False),
+        ("flow step", pr + f"      - {{uses: {pin}, with: {{persist-credentials: false}}}}\n" + tail, False),
+        (
+            "next step's input",
+            pr + f"      - uses: {pin}\n      - uses: other/action@{'0' * 40}\n"
+            "        with:\n          persist-credentials: false\n" + tail,
+            False,
+        ),
+        (
+            "duplicate value",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "          persist-credentials: true\n" + tail,
+            False,
+        ),
+        (
+            "unreadable trigger true",
+            "on: ${{ x }}\npermissions: {}\njobs:\n  build:\n    steps:\n"
+            f"      - uses: {pin}\n        with:\n          persist-credentials: true\n" + tail,
+            False,
+        ),
+    )
+    for label, text, accepted in checkout_cases:
+        errors = checkout_credential_errors(text, f"self-test checkout {label}")
+        if accepted and errors:
+            failures.append(f"checkout credential self-test {label!r} rejected: {errors}")
+        if not accepted and not errors:
+            failures.append(f"checkout credential self-test {label!r} was accepted")
     return failures
 
 
@@ -265,7 +435,10 @@ def main() -> int:
         print(f"::error::{error}", file=sys.stderr)
     if errors:
         return 1
-    print("Every workflow declares explicit least-privilege top-level permissions.")
+    print(
+        "Every workflow declares explicit least-privilege top-level permissions "
+        "and every checkout sets persist-credentials."
+    )
     return 0
 
 
