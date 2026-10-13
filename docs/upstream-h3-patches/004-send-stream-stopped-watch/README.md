@@ -34,11 +34,17 @@ associated-type `impl Trait` (`type Stopped = impl Future`) is intentionally
 avoided: that requires unstable `impl_trait_in_assoc_type`.
 
 Return-position `impl Trait` in traits was stabilized in Rust 1.75, so this
-trait syntax sets the vendored packages' compiler floor: both
+trait syntax is the vendored source's compiler lower bound: both
 `vendor/h3-0.0.8-ferrum-patched/Cargo.toml` and
 `vendor/h3-quinn-0.0.10-ferrum-patched/Cargo.toml` declare
-`rust-version = "1.75"` (no other vendored h3/h3-quinn source or dependency
-requirement inspected needs a newer compiler; Ferrum itself builds on stable).
+`rust-version = "1.75"`. That value is the RPITIT syntax floor of the local
+source only, not a guarantee about any particular resolved dependency graph.
+Ferrum's own `Cargo.lock` resolves Quinn 0.11.12, quinn-proto 0.11.19 and
+quinn-udp 0.5.16, whose published manifests declare Rust 1.85, so the shipped
+graph needs at least that compiler. h3-quinn's caret `quinn = "0.11.7"`
+requirement can select older Quinn releases; building these packages on 1.75
+needs its own compatible dependency resolution (for example Cargo's
+MSRV-aware resolver), which Ferrum does not test.
 
 ## Files
 
