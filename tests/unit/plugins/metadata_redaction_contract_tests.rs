@@ -595,6 +595,17 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "x-hsmpin",
     "totpseed",
     "dbpwd",
+    "x-csrfValue",
+    "x-csrfvalue",
+    "x-vendorPin",
+    "x-vendorpin",
+    "smsotp",
+    "privateecckey",
+    "privatepkcs12key",
+    "awsaccess_key",
+    "x-awsaccess-key",
+    "private_rsapem_key",
+    "x-private-rsapem-key",
     // The outcome-signal exemption covers only its complete key.
     "session_id.assertion_out_of_scope",
     "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
@@ -624,6 +635,13 @@ fn credential_classes_redact_unlisted_spellings_and_keep_ordinary_dimensions() {
         assert!(
             is_sensitive_metadata_key_with_extras(key, &extras),
             "{key} must be redacted"
+        );
+        // Normalization (HTTP header names are lowercased) must not change
+        // the decision.
+        let lowered = key.to_ascii_lowercase();
+        assert!(
+            is_sensitive_metadata_key_with_extras(&lowered, &extras),
+            "{lowered} (lowercased {key}) must be redacted"
         );
     }
     for key in CREDENTIAL_CLASS_NEGATIVE_CONTROLS {

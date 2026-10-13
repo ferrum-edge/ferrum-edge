@@ -334,14 +334,19 @@ credential-class word (`session`, `sessions`, `sess`, `sessid`, `sessionid`,
 `csrf`, `xsrf`). It is also credential-shaped when a segment contains a
 credential stem or a qualified compound (`usersession`, `dbpassword`,
 `dbpwd`, `gpgpassphrase`, `idjwt`, `requestsignature`, `assertion`,
-`clientassertion`, `totpseed`, `hsmpin`, `otpcode`, `mfasecret`), or ends in
-`token` after a qualifier (`accesstoken`). Key material counts when a
+`clientassertion`, `csrfvalue`, `totpseed`, `hsmpin`, `otpcode`, `mfasecret`),
+ends in `pin`/`pins` after a qualifier of at least three letters (`vendorpin`;
+ordinary words such as `spin` and `hairpin` stay visible), ends in `otp`
+after a qualifier (`smsotp`), or ends in `token` after a qualifier
+(`accesstoken`). Key material counts when a
 key-material qualifier (`private`, `access`, `secret`, `signing`, `session`,
 `client`, `master`, `encryption`, `decryption`, `ssh`, `pgp`, `gpg`, `hmac`,
 `jwt`) reaches `key`/`keys`. Algorithm or encoding words such as `rsa`,
-`ec`, `ed25519`, `pem` or `pkcs8` may sit in between, either across segments
-(`private_key`, `private_rsa_key`, `privateRsaKey`) or inside one segment
-(`privatekey`, `x-clientkey`, `awsaccesskeyid`). Lowercase compounds are
+`ec`, `ecc`, `ed25519`, `pem`, `pkcs8` or `pkcs12` may sit in between, and a
+qualifier may end a longer segment. This works across segments
+(`private_key`, `private_rsa_key`, `privateRsaKey`, `awsaccess_key`,
+`private_rsapem_key`) and inside one segment (`privatekey`, `x-clientkey`,
+`awsaccesskeyid`, `privateecckey`, `privatepkcs12key`). Lowercase compounds are
 recognized as well as camelCase ones, so a name normalized before
 classification (an HTTP header name such as `x-hsmpin`) is still caught. The
 only exemption is the complete documented outcome key

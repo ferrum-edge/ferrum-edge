@@ -197,6 +197,10 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "TOTPSEED",
         "PRIVATE_RSA_KEY",
         "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
+        "PRIVATEECCKEY",
+        "PRIVATEPKCS12KEY",
+        "AWSACCESS_KEY",
+        "VENDORPIN",
     ];
 
     for env_var in cases {
@@ -319,6 +323,11 @@ fn custom_header_tags_reject_credential_class_header_names() {
         "x-hsmPin",
         "x-totpSeed",
         "x-private-rsa-key",
+        "x-csrfValue",
+        "x-vendorPin",
+        "x-awsaccess-key",
+        "x-private-rsapem-key",
+        "x-privateecckey",
     ] {
         let error = workload_metrics_new_with_env_lookup_for_test(
             &json!({

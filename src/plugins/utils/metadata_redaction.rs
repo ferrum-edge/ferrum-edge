@@ -302,6 +302,8 @@ const CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "jwt",
     "signature",
     "assertion",
+    "csrf",
+    "xsrf",
     "totp",
     "hotp",
     "otpseed",
@@ -363,21 +365,73 @@ const NON_SECRET_ASSERTION_SIGNAL_KEYS: &[&str] =
 /// Longest segment lowercased on the stack; longer segments (rare) allocate.
 const CLASSIFIER_STACK_SEGMENT_BYTES: usize = 64;
 
-/// Whether `rest` (what follows a qualifier inside one segment) reaches `key`
-/// after skipping algorithm / encoding words (`rsakey`, `rsapemkey`, `key`).
-fn reaches_key_after_intervening_words(mut rest: &str) -> bool {
-    loop {
-        if rest.starts_with("key") {
-            return true;
-        }
-        let Some(word) = KEY_MATERIAL_INTERVENING_WORDS
-            .iter()
-            .find(|word| rest.starts_with(**word))
-        else {
-            return false;
-        };
-        rest = &rest[word.len()..];
+/// Whether `rest` (what follows a qualifier) reaches `key` after skipping
+/// algorithm / encoding words (`key`, `rsakey`, `ecckey`, `pkcs12key`).
+/// Backtracks over overlapping words (`ec`/`ecc`, `pkcs1`/`pkcs12`); every
+/// step consumes at least two bytes, so the search is bounded by the segment.
+fn reaches_key_after_intervening_words(rest: &str) -> bool {
+    rest.starts_with("key")
+        || KEY_MATERIAL_INTERVENING_WORDS.iter().any(|word| {
+            rest.strip_prefix(word)
+                .is_some_and(reaches_key_after_intervening_words)
+        })
+}
+
+/// Whether `rest` consists entirely of algorithm / encoding words (`rsapem`).
+fn consumed_by_intervening_words(rest: &str) -> bool {
+    rest.is_empty()
+        || KEY_MATERIAL_INTERVENING_WORDS.iter().any(|word| {
+            rest.strip_prefix(word)
+                .is_some_and(consumed_by_intervening_words)
+        })
+}
+
+/// Whether a segment leaves a key-material context open for the NEXT
+/// segment: it ends in a qualifier, optionally followed by algorithm /
+/// encoding words (`private`, `awsaccess`, `privatersa`), or it continues an
+/// open context with only such words (`rsapem` after `private`).
+fn opens_or_continues_key_context(lower: &str, in_key_context: bool) -> bool {
+    (in_key_context && consumed_by_intervening_words(lower))
+        || CREDENTIAL_KEY_QUALIFIERS.iter().any(|qualifier| {
+            lower.match_indices(qualifier).any(|(offset, _)| {
+                consumed_by_intervening_words(&lower[offset + qualifier.len()..])
+            })
+        })
+}
+
+/// Whole segments that end in `pin` / `pins` without naming a PIN.
+const BENIGN_PIN_SUFFIX_SEGMENTS: &[&str] = &[
+    "spin",
+    "spins",
+    "hairpin",
+    "hairpins",
+    "linchpin",
+    "linchpins",
+    "tailspin",
+    "backspin",
+    "topspin",
+    "sidespin",
+    "tenpin",
+    "tenpins",
+    "clothespin",
+];
+
+/// Qualified short-class compounds that survive lowercasing (`vendorpin`,
+/// `userpins`, `smsotp`). A qualifier of at least three bytes keeps short
+/// ordinary words (`spin`) out; listed words keep the rest out.
+fn has_qualified_short_class_suffix(lower: &str) -> bool {
+    let pin_prefix = lower
+        .strip_suffix("pins")
+        .or_else(|| lower.strip_suffix("pin"));
+    if let Some(prefix) = pin_prefix
+        && prefix.len() >= 3
+        && !BENIGN_PIN_SUFFIX_SEGMENTS.contains(&lower)
+    {
+        return true;
     }
+    lower
+        .strip_suffix("otp")
+        .is_some_and(|prefix| prefix.len() >= 2)
 }
 
 /// Judge one lowercased segment given whether the preceding segments left a
@@ -388,6 +442,7 @@ fn lowered_segment_is_credential(lower: &str, in_key_context: bool) -> bool {
         || CREDENTIAL_CLASS_STEMS
             .iter()
             .any(|stem| lower.contains(stem))
+        || has_qualified_short_class_suffix(lower)
         || (in_key_context && reaches_key_after_intervening_words(lower))
     {
         return true;
@@ -454,10 +509,10 @@ pub fn is_credential_class_metadata_key(key: &str) -> bool {
             heap.as_str()
         };
         sensitive = lowered_segment_is_credential(lower, in_key_context);
-        // A qualifier opens the key-material context; algorithm / encoding
-        // words keep it open; anything else closes it.
-        in_key_context = CREDENTIAL_KEY_QUALIFIERS.contains(&lower)
-            || (in_key_context && KEY_MATERIAL_INTERVENING_WORDS.contains(&lower));
+        // A qualifier (alone or as a segment suffix) opens the key-material
+        // context; algorithm / encoding words keep it open; anything else
+        // closes it.
+        in_key_context = opens_or_continues_key_context(lower, in_key_context);
     });
     sensitive
 }
