@@ -854,7 +854,7 @@ fn reload_rereads_same_length_timestamp_preserving_replacement() {
         load_validated_country_mmdb(path_text(&path)).is_err(),
         "metadata-equivalent replacement must always be re-digested"
     );
-    assert_eq!(old_snapshot.metadata.database_type, "GeoIP2-Country");
+    assert_eq!(old_snapshot.metadata().database_type, "GeoIP2-Country");
 }
 
 #[test]
