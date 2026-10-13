@@ -263,6 +263,27 @@ legacy functional filters, can still select tests that under-report
 child-process coverage until their local `kill()` cleanup paths are migrated to
 the shared coverage-aware shutdown helper.
 
+## Integration remainder shards
+
+The five scoped integration shards (`admin-api`, `admin-config`,
+`mesh-routing`, `mesh-platform`, `protocols-data-plane`) select modules with
+positional nextest filters, so path-scoped plans can run only the owning
+family. Every full plan also adds `integration-remainder-1` and
+`integration-remainder-2`, which carry no positional filters. Their shared
+filterset, `INTEGRATION_REMAINDER_FILTERSET` in
+`.github/scripts/coverage_plan.py`, is `not test(/integration::(...)/)` over
+every scoped filter, split with `nextest --partition hash:N/2`. A positional
+filter and the unanchored regex both match a substring of the test name, so
+the remainder is exactly the complement of the scoped shards. Every registered
+module therefore runs in full coverage, and a new module needs no filter edit
+(#6377). The remainder runs non-ignored tests only, like every integration
+coverage shard, so ignored live-store regressions stay outside coverage.
+
+`verify_coverage_workflow.py` parses `tests/integration/mod.rs` and requires
+every declared module to reach exactly one of a scoped filter or the
+remainder. It also rejects a scoped filter that matches no registered module.
+Path-scoped plans never select the remainder shards.
+
 ## Functional coverage shards
 
 Most of the code the in-process suites miss (the HTTP/3 server and
@@ -286,27 +307,6 @@ therefore adds three functional shards after the integration shards:
 Path-scoped plans never select the functional shards; a scoped plan that
 selects every integration shard is promoted to the full matrix, which includes
 them.
-
-## Integration remainder shards
-
-The five scoped integration shards (`admin-api`, `admin-config`,
-`mesh-routing`, `mesh-platform`, `protocols-data-plane`) select modules with
-positional nextest filters, so path-scoped plans can run only the owning
-family. Every full plan also adds `integration-remainder-1` and
-`integration-remainder-2`, which carry no positional filters. Their shared
-filterset, `INTEGRATION_REMAINDER_FILTERSET` in
-`.github/scripts/coverage_plan.py`, is `not test(/integration::(...)/)` over
-every scoped filter, split with `nextest --partition hash:N/2`. A positional
-filter and the unanchored regex both match a substring of the test name, so
-the remainder is exactly the complement of the scoped shards. Every registered
-module therefore runs in full coverage, and a new module needs no filter edit
-(#6377). The remainder runs non-ignored tests only, like every integration
-coverage shard, so ignored live-store regressions stay outside coverage.
-
-`verify_coverage_workflow.py` parses `tests/integration/mod.rs` and requires
-every declared module to reach exactly one of a scoped filter or the
-remainder. It also rejects a scoped filter that matches no registered module.
-Path-scoped plans never select the remainder shards.
 
 Each functional shard first builds `functional_tests` under
 `cargo llvm-cov nextest` with a filter that selects no test, which also builds
