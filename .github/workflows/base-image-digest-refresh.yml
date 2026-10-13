@@ -16,13 +16,15 @@
 # the full required CI (multi-arch build, FIPS, eBPF, ABI scan, chart smoke)
 # gates like any other change.
 #
-# The distroless runtime base is held, never rewritten here. Its digest is also
-# pinned by the `main-linux-image` job in `ci.yml`, which the trusted Cross
-# policy freezes by whole-job SHA-256, and `verify_ci_runtime_cache.py`
-# requires every distroless reference in the repository to match `Dockerfile`.
-# A pull request can therefore neither leave that pin stale nor move it, so the
-# job reports distroless drift with every consumer for a direct-to-main
-# rotation, still proposes the other refreshed inputs, and then fails.
+# Every tracked non-workflow file that pins a drifted reference is rewritten
+# together, so the distroless runtime base also moves in
+# `tests/performance/multi_protocol/h3_proof/Dockerfile.live`; `ci.yml`'s
+# `main-linux-image` job reads it from `Dockerfile`, so no workflow file pins it.
+# The job runs with its own `GITHUB_TOKEN` only (no stored credential), which
+# cannot change workflow files: a drifted reference pinned in a workflow fails
+# the run instead. Pull requests opened by `GITHUB_TOKEN` start no CI, so a
+# maintainer closes and reopens the refresh PR (or merges `main` into it) to run
+# the required checks, reviews it, and merges it.
 name: Base Image Digest Refresh
 
 on:
@@ -47,8 +49,6 @@ jobs:
     env:
       # One inventory for resolution and staging, including the live image layer.
       DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer Dockerfile.iproute2-layer"
-      # Held for a direct-to-main rotation; see the header comment.
-      HELD_IMAGE: gcr.io/distroless/cc-debian13
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -60,7 +60,6 @@ jobs:
         run: |
           set -euo pipefail
           changed=""
-          held=""
           # Every pinned reference in the governed Dockerfiles, deduplicated.
           refs="$(grep -hoE '[A-Za-z0-9][A-Za-z0-9./_-]*:[A-Za-z0-9][A-Za-z0-9._-]*@sha256:[0-9a-f]{64}' \
             ${DOCKERFILES} | sort -u)"
@@ -84,32 +83,29 @@ jobs:
               echo "up to date: ${tagged} -> ${resolved}"
               continue
             fi
-            case "${tagged}" in
-              "${HELD_IMAGE}":*)
-                consumers="$(git grep -lF "${tagged}@${current}" | tr '\n' ' ')"
-                echo "::warning::held: ${tagged} ${current} -> ${resolved}; consumers: ${consumers}"
-                held="${held}- \`${tagged}\`: \`${current}\` -> \`${resolved}\`; consumers: ${consumers}\n"
-                continue
-                ;;
-            esac
-            echo "refresh: ${tagged} ${current} -> ${resolved}"
-            for file in ${DOCKERFILES}; do
+            # Every tracked consumer of the old reference moves together;
+            # prose and history (CHANGELOG, docs) keep theirs.
+            consumers=""
+            for file in $(git grep -lF "${tagged}@${current}"); do
+              case "${file}" in
+                .github/workflows/*|.github/scripts/verify_cross_build_policy.py)
+                  echo "::error::${file} pins ${tagged}@${current}; the refresh cannot rewrite workflow or trusted policy files, so move that pin into a Dockerfile it reads"
+                  exit 1
+                  ;;
+                *Dockerfile*|*.yml|*.yaml)
+                  consumers="${consumers}${file} "
+                  ;;
+                *)
+                  echo "not rewritten (not a Dockerfile or YAML consumer): ${file}"
+                  ;;
+              esac
+            done
+            echo "refresh: ${tagged} ${current} -> ${resolved} in ${consumers}"
+            for file in ${consumers}; do
               sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"
             done
-            changed="${changed}- \`${tagged}\`: \`${current}\` -> \`${resolved}\`\n"
+            changed="${changed}- \`${tagged}\`: \`${current}\` -> \`${resolved}\` (${consumers% })\n"
           done
-          held_note=""
-          if [ -n "${held}" ]; then
-            echo "held=true" >> "${GITHUB_OUTPUT}"
-            held_note="Rotate every listed consumer, the frozen \`main-linux-image\` job in \`.github/workflows/ci.yml\`, and that job's \`WORKFLOW_CONTRACTS\` digest in \`.github/scripts/verify_cross_build_policy.py\` together in one reviewed direct-to-main commit."
-            {
-              echo "### Held distroless digest drift"
-              echo
-              printf '%b' "${held}"
-              echo
-              echo "${held_note}"
-            } >> "${GITHUB_STEP_SUMMARY}"
-          fi
           if [ -z "${changed}" ]; then
             echo "updated=false" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -127,18 +123,14 @@ jobs:
             echo
             printf '%b' "${changed}"
             echo
-            if [ -n "${held}" ]; then
-              echo "## Held (not in this pull request)"
-              echo
-              printf '%b' "${held}"
-              echo
-              echo "${held_note}"
-              echo
-            fi
             echo "## Test plan"
             echo
             echo "Normal required CI on this pull request: multi-arch image build, FIPS,"
             echo "eBPF, the GNU ABI scan, and the Helm chart smoke."
+            echo
+            echo "This pull request was opened with the workflow's GITHUB_TOKEN, which"
+            echo "starts no CI. Close and reopen it (or merge main into it) to run the"
+            echo "required checks, verify each digest against its registry, then merge."
             echo
             echo "Refs #4444"
             echo "PR_BODY_EOF"
@@ -159,7 +151,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "${BRANCH}"
-          git add -- ${DOCKERFILES}
+          git add --update
           git commit -m "deps: refresh container base image digests"
           git push --force origin "${BRANCH}"
           if [ -n "$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[].number')" ]; then
@@ -172,12 +164,6 @@ jobs:
               --body "${PR_BODY}" \
               --label dependencies
           fi
-
-      - name: Fail on held distroless drift
-        if: always() && steps.resolve.outputs.held == 'true'
-        run: |
-          echo "::error::distroless digest drift is held for a direct-to-main rotation; see the step summary"
-          exit 1
 
   cross-image-drift:
     name: Inspect the admitted Cross image pin

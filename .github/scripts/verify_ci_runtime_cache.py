@@ -4200,14 +4200,22 @@ def check_distroless_digest_consistency(
                 )
 
 
-# The refresh cannot move the distroless pin in `ci.yml`'s `main-linux-image`
-# job (frozen by the trusted Cross policy), so a rewritten distroless digest
-# would fail `check_distroless_digest_consistency` before its PR opens. The
-# refresh must hold that drift for a direct-to-main rotation instead: the
-# held arm bypasses the rewrite, the resolve step publishes `held=true` before
-# any early exit, and a final always-run step fails the run.
-BASE_IMAGE_REFRESH_HELD_ENV = "      HELD_IMAGE: gcr.io/distroless/cc-debian13\n"
-BASE_IMAGE_REFRESH_HOLD_IF = "always() && steps.resolve.outputs.held == 'true'"
+# The refresh rotates every pin, including the distroless runtime base, with its
+# own GITHUB_TOKEN. It must rewrite every non-workflow consumer of a drifted
+# reference together (so `check_distroless_digest_consistency` holds), refuse to
+# rewrite workflow files (GITHUB_TOKEN cannot change them, and `main-linux-image`
+# reads the base from `Dockerfile`) or the trusted policy, and stage every
+# rewritten consumer.
+BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
+    'for file in $(git grep -lF "${tagged}@${current}"); do',
+    ".github/workflows/*|.github/scripts/verify_cross_build_policy.py)",
+    'echo "::error::${file} pins ${tagged}@${current}; the refresh cannot rewrite workflow or trusted policy files, so move that pin into a Dockerfile it reads"',
+    "exit 1",
+    "*Dockerfile*|*.yml|*.yaml)",
+    'consumers="${consumers}${file} "',
+    "for file in ${consumers}; do",
+    'sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"',
+)
 
 
 def named_step(steps: list[str], name: str) -> str | None:
@@ -4235,98 +4243,42 @@ def step_run_block_commands(step: str) -> list[str]:
     return commands
 
 
-def base_image_refresh_hold_errors(workflow: str) -> list[str]:
-    """Return why the digest refresh fails to hold distroless drift."""
+def base_image_refresh_rotation_errors(workflow: str) -> list[str]:
+    """Return why the digest refresh does not rotate every consumer safely."""
 
     job = extract_job(workflow, "refresh")
     if not job:
         return ["the `refresh` job is missing"]
     errors: list[str] = []
-    if BASE_IMAGE_REFRESH_HELD_ENV not in job:
-        errors.append(f"missing {BASE_IMAGE_REFRESH_HELD_ENV.strip()!r}")
+    if "HELD_IMAGE" in job:
+        errors.append("the refresh must not hold any image back from rotation")
     steps = job_steps(job)
-
     resolve = named_step(steps, "Resolve current digests")
     if resolve is None or not re.search(r"(?m)^        id: resolve$", resolve):
-        errors.append("missing one `Resolve current digests` step with `id: resolve`")
-        commands: list[str] = []
-    else:
-        commands = step_run_block_commands(resolve)
-
-    def index_of(command: str, start: int = 0) -> int:
-        for index in range(max(start, 0), len(commands)):
-            if commands[index] == command:
-                return index
-        return -1
-
-    loop = index_of("for ref in ${refs}; do")
-    case = index_of('case "${tagged}" in', loop + 1) if loop >= 0 else -1
-    arm = index_of('"${HELD_IMAGE}":*)', case + 1) if case >= 0 else -1
-    arm_end = index_of(";;", arm + 1) if arm >= 0 else -1
-    esac = index_of("esac", arm_end + 1) if arm_end >= 0 else -1
-    rewrites = [
-        index
-        for index, command in enumerate(commands)
-        if re.match(r"sed\s", command)
-    ]
-    if esac < 0:
-        errors.append(
-            "the resolve loop must match `\"${HELD_IMAGE}\":*)` in a "
-            "`case \"${tagged}\" in` arm"
-        )
-    else:
-        held_arm = commands[arm + 1 : arm_end]
-        if not held_arm or held_arm[-1] != "continue":
-            errors.append(
-                "the held distroless arm must end with `continue` to bypass the rewrite"
-            )
-        if not any(command.startswith('held="${held}') for command in held_arm):
-            errors.append("the held distroless arm must record the drift in `held`")
-        if not rewrites or any(index < esac for index in rewrites):
-            errors.append(
-                "every `sed` rewrite must follow the held distroless `case` in the "
-                "resolve loop"
-            )
-
-    publish = index_of('echo "held=true" >> "${GITHUB_OUTPUT}"')
-    early_exits = [
-        index for index, command in enumerate(commands) if command == "exit 0"
-    ]
-    if (
-        publish < 1
-        or commands[publish - 1] != 'if [ -n "${held}" ]; then'
-        or (rewrites and publish < max(rewrites))
-        or any(index < publish for index in early_exits)
-    ):
-        errors.append(
-            "the resolve step must publish `held=true` to GITHUB_OUTPUT after the "
-            "loop and before any `exit 0`"
-        )
-
-    fail = named_step(steps, "Fail on held distroless drift")
-    if (
-        fail is None
-        or steps[-1] is not fail
-        or step_if(fail) != BASE_IMAGE_REFRESH_HOLD_IF
-        or not step_run_ends_with_exit(fail, 1)
-    ):
-        errors.append(
-            "the final `Fail on held distroless drift` step must run "
-            f"`if: {BASE_IMAGE_REFRESH_HOLD_IF}` and end with `exit 1`"
-        )
+        return [*errors, "missing one `Resolve current digests` step with `id: resolve`"]
+    commands = step_run_block_commands(resolve)
+    index = -1
+    for marker in BASE_IMAGE_REFRESH_RESOLVE_MARKERS:
+        try:
+            index = commands.index(marker, index + 1)
+        except ValueError:
+            errors.append(f"the resolve loop must contain, in order, `{marker}`")
+            break
+    if any(command.startswith("for file in ${DOCKERFILES}") for command in commands):
+        errors.append("the resolve loop must rewrite every consumer, not only the Dockerfiles")
+    opener = named_step(steps, "Open or update the refresh pull request")
+    if opener is None or "git add --update" not in step_run_block_commands(opener):
+        errors.append("the refresh pull request must stage every rewritten consumer")
     return errors
 
 
-def check_base_image_refresh_holds_distroless(
+def check_base_image_refresh_rotates_all_pins(
     workflow: str, failures: list[str]
 ) -> None:
-    """Require the digest refresh to hold, report, and fail on distroless drift."""
+    """Require the digest refresh to rotate every non-workflow consumer."""
 
-    for error in base_image_refresh_hold_errors(workflow):
-        failures.append(
-            "base-image-digest-refresh.yml must hold distroless drift for a "
-            f"direct-to-main rotation: {error}"
-        )
+    for error in base_image_refresh_rotation_errors(workflow):
+        failures.append(f"base-image-digest-refresh.yml: {error}")
 
 
 def workflow_permissions_are_read_only(text: str) -> bool:
@@ -5417,7 +5369,7 @@ def check_dockerfile(failures: list[str]) -> None:
             continue
         repository_files.append((path.relative_to(REPO_ROOT).as_posix(), contents))
     check_distroless_digest_consistency(repository_files, dockerfile, failures)
-    check_base_image_refresh_holds_distroless(
+    check_base_image_refresh_rotates_all_pins(
         BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8"), failures
     )
 
@@ -5456,32 +5408,43 @@ def self_test() -> int:
     )
     refresh_workflow = BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8")
     pin_failures = []
-    check_base_image_refresh_holds_distroless(refresh_workflow, pin_failures)
+    check_base_image_refresh_rotates_all_pins(refresh_workflow, pin_failures)
     require(
         not pin_failures,
-        "self-test: the real refresh workflow must hold distroless drift",
+        "self-test: the real refresh workflow must rotate every pin: "
+        + "; ".join(pin_failures),
         failures,
     )
     for label, original, mutation in (
         (
-            "without the held-arm `continue`",
-            "                continue\n                ;;\n",
-            "                ;;\n",
+            "that rewrites only the Dockerfiles",
+            "            for file in ${consumers}; do\n",
+            "            for file in ${DOCKERFILES}; do\n",
         ),
         (
-            "without `held=true` publication",
-            '            echo "held=true" >> "${GITHUB_OUTPUT}"\n',
-            "",
+            "that may rewrite workflow files",
+            "                .github/workflows/*|.github/scripts/verify_cross_build_policy.py)\n",
+            "                .github/scripts/verify_cross_build_policy.py)\n",
         ),
         (
-            "without the final `exit 1`",
-            'see the step summary"\n          exit 1\n',
-            'see the step summary"\n',
+            "that skips a refused consumer instead of failing",
+            "move that pin into a Dockerfile it reads\"\n                  exit 1\n",
+            "move that pin into a Dockerfile it reads\"\n",
         ),
         (
-            "without `always()` on the final failure",
-            "        if: always() && steps.resolve.outputs.held == 'true'\n",
-            "        if: steps.resolve.outputs.held == 'true'\n",
+            "that never collects a consumer",
+            '                  consumers="${consumers}${file} "\n',
+            "                  true\n",
+        ),
+        (
+            "that stages only the Dockerfiles",
+            "          git add --update\n",
+            "          git add -- ${DOCKERFILES}\n",
+        ),
+        (
+            "that holds an image back",
+            "    steps:\n      - name: Checkout\n",
+            "    env2:\n      HELD_IMAGE: x\n    steps:\n      - name: Checkout\n",
         ),
     ):
         require(
@@ -5490,7 +5453,7 @@ def self_test() -> int:
             failures,
         )
         pin_failures = []
-        check_base_image_refresh_holds_distroless(
+        check_base_image_refresh_rotates_all_pins(
             refresh_workflow.replace(original, mutation), pin_failures
         )
         require(

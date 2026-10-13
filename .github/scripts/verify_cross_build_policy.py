@@ -108,7 +108,9 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "main-linux-image",
-        "f1eb91cba7a7eb23784dca0f7e5d24db15e35c6af6a3f0bba9e84878a4169717",
+        # The job reads its distroless runtime base from Dockerfile's reviewed
+        # `RUNTIME_BASE` pin, so base-image digest rotation never edits it.
+        "2ae821353d25d3c46ddf7a8d8db7b76f04d1818c2bd8288ee937822d179bc2ec",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,

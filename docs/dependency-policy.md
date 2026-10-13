@@ -690,19 +690,28 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   one, never changes an image or tag. Required CI (multi-arch build, FIPS, eBPF,
   GNU ABI scan, chart smoke) and `Trusted Cross Build Policy` must qualify the
   latest reviewed PR head before merge.
-  It never rewrites the `gcr.io/distroless/cc-debian13` runtime base. That
-  digest is also pinned by the `main-linux-image` job in
-  `.github/workflows/ci.yml`, which `verify_cross_build_policy.py` freezes by
-  whole-job SHA-256 (`WORKFLOW_CONTRACTS`), and
-  `check_distroless_digest_consistency()` requires every distroless reference
-  in the repository to match `Dockerfile`. A pull request can neither move that
-  frozen pin nor leave it stale, so on distroless drift the workflow lists every tracked
-  file that pins the old digest in a warning, the step summary, and the refresh
-  PR body (when other inputs changed), still proposes the other refreshed
-  inputs, and then fails. A maintainer rotates the distroless digest in every
-  listed file, including the `main-linux-image` job and its `WORKFLOW_CONTRACTS`
-  digest, in one reviewed direct-to-`main` commit. `verify_ci_runtime_cache.py`
-  fails if the workflow stops holding distroless drift.
+  Every tracked Dockerfile and YAML file that pins a drifted reference is
+  rewritten together; prose such as `CHANGELOG.md` keeps its history. That
+  includes the `gcr.io/distroless/cc-debian13` runtime base: its consumers are
+  the governed Dockerfiles and
+  `tests/performance/multi_protocol/h3_proof/Dockerfile.live`. The protected
+  `main-linux-image` job in `.github/workflows/ci.yml` no longer pins a digest:
+  it reads `RUNTIME_BASE` from `Dockerfile` and fails unless that is a
+  digest-pinned `gcr.io/distroless/cc-debian13:nonroot` reference, so rotating
+  the base never edits a workflow or its `WORKFLOW_CONTRACTS` hash.
+  `check_distroless_digest_consistency()` still requires every distroless
+  reference to match `Dockerfile`.
+  The workflow holds no stored credential; it uses its own `GITHUB_TOKEN`
+  (`contents: write`, `pull-requests: write`). That token cannot change workflow
+  files, so a drifted reference pinned in a workflow, or in the trusted Cross
+  policy, fails the run with an instruction to move the pin into a Dockerfile.
+  Pull requests opened by `GITHUB_TOKEN` start no workflows, so a maintainer
+  closes and reopens the refresh PR (or merges `main` into it) to run the
+  required checks, including `Trusted Cross Build Policy`, verifies each digest
+  against its registry, and merges it. Automatic merging was evaluated and
+  rejected: see the rationale in PR #6535. `verify_ci_runtime_cache.py` fails if
+  the workflow stops rotating every consumer, may rewrite workflow or trusted
+  policy files, or stages only the Dockerfiles.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
   default `BASE_IMAGE` matches the same source runtime pin; an
