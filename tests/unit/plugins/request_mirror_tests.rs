@@ -2760,7 +2760,7 @@ async fn test_mirror_preserves_raw_query_edge_cases() {
     // Issue #2444: repeated pairs, order, flags, empty values, `+`, encoded
     // delimiters, percent escapes, and non-ASCII encoded bytes must survive.
     const RAW: &str =
-        "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&key=a%2Fb&name=%E2%9C%93";
+        "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&dir=a%2Fb&name=%E2%9C%93";
 
     let mut ctx = make_ctx_with_proxy();
     ctx.set_raw_query_string(RAW.to_string());
@@ -6603,4 +6603,131 @@ async fn mirror_carries_the_proxy_hop_count_instead_of_the_copied_value() {
             "a copied `_` spelling is dropped only while the gateway stamps its own count"
         );
     }
+}
+
+/// Credential-class header names that no exact-name or substring entry lists
+/// must still be stripped before a distinct mirror origin, while continuation
+/// cursors, authorship, and idempotency headers survive.
+#[tokio::test]
+async fn mirror_strips_unlisted_credential_class_headers() {
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    let credential_names = [
+        "x-session-id",
+        "x-sessionid",
+        "jwt",
+        "x-jwt-assertion",
+        "x-access-key",
+        "x-private-key",
+        "x-subscriptionkey",
+        "auth",
+        "x-auth",
+        "x-authn-user",
+        "x-sid",
+        "x-pwd",
+        "x-pass",
+        "x-otp",
+        "x-signing-key",
+        "x-sso-ticket",
+        "x-hmac",
+        "x-clientsecretvalue",
+    ];
+    for (idx, name) in credential_names.iter().enumerate() {
+        headers.insert((*name).to_string(), format!("cred-value-{idx}"));
+    }
+    let benign = [
+        ("x-continuation-token", "page2"),
+        ("x-author", "jane"),
+        ("idempotency-key", "op-1"),
+        ("x-custom", "keep-me"),
+    ];
+    for (name, value) in benign {
+        headers.insert(name.to_string(), value.to_string());
+    }
+
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in credential_names {
+        assert!(
+            !observed.contains_key(name),
+            "credential-class header `{name}` must not reach the mirror: {observed:?}"
+        );
+    }
+    for (idx, _) in credential_names.iter().enumerate() {
+        let leaked = format!("cred-value-{idx}");
+        assert!(
+            !observed.values().any(|value| value == &leaked),
+            "credential value `{leaked}` leaked to the mirror: {observed:?}"
+        );
+    }
+    for (name, value) in benign {
+        assert_eq!(
+            observed.get(name).map(String::as_str),
+            Some(value),
+            "benign header `{name}` must survive: {observed:?}"
+        );
+    }
+}
+
+/// Credential-class query names outside the built-in lists (including mixed
+/// case and alternate separators) are dropped from the mirror request-target;
+/// continuation cursors and ordinary names are kept byte-for-byte.
+#[tokio::test]
+async fn mirror_strips_unlisted_credential_class_query_names() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = concat!(
+        "keep=1&session_id=q1&sessionId=q2&jwt=q3&access_key=q4&private_key=q5&",
+        "key=q6&sid=q7&pwd=q8&ticket=q9&auth=q10&x.auth.code=q11&otp=q12&",
+        "continuation_token=c3&author=a1&signal=1&page=2"
+    );
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("?keep=1&continuation_token=c3&author=a1&signal=1&page=2 "),
+        "benign pairs must be retained in order: {request_line}"
+    );
+    for idx in 1..=12 {
+        let value = format!("=q{idx}&");
+        let tail = format!("=q{idx} ");
+        assert!(
+            !request_line.contains(&value) && !request_line.contains(&tail),
+            "credential-class query value q{idx} leaked: {request_line}"
+        );
+    }
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary raw query must remain byte-for-byte unchanged"
+    );
+}
+
+/// Names caught only by the credential-class rule are still opt-in-able
+/// through the exact allowlist, which stays the only way back in.
+#[test]
+fn credential_class_names_are_allowlistable() {
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "forward_sensitive_headers": true,
+                "forward_sensitive_header_allowlist": ["x-session-id", "jwt"],
+                "forward_sensitive_query": true,
+                "forward_sensitive_query_allowlist": ["session_id", "private_key"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "credential-class names must be accepted by the exact allowlists"
+    );
+    let err = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["x-author"]
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-credential name must be rejected");
+    assert!(err.contains("not a recognized sensitive header"), "{err}");
 }

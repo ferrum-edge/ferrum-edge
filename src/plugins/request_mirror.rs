@@ -50,8 +50,12 @@
 //! `X-Api-Key`, …),
 //! contains a built-in credential substring (so vendor variants like
 //! `x-openai-api-key`, `x-amz-security-token`, `x-vendor-auth-token` are also
-//! caught), or matches an operator `sensitive_header_patterns` entry is stripped
-//! before the distinct mirror origin. Because native gRPC metadata is carried as
+//! caught), is credential-shaped (a separator-delimited segment is a
+//! credential-class word such as `auth`, `jwt`, `session`, `sid`, `key`, `pwd`,
+//! contains a credential stem such as `session`/`token`/`secret`, or ends in
+//! `key`; continuation cursors, authorship/authority names and
+//! `Idempotency-Key` excepted), or matches an operator `sensitive_header_patterns` entry is
+//! stripped before the distinct mirror origin. Because native gRPC metadata is carried as
 //! HTTP/2 headers, the same predicate covers gRPC credential metadata. Forwarding
 //! any denied header requires the high-friction, fail-closed pair
 //! `forward_sensitive_headers=true` plus an exact-name
@@ -67,7 +71,8 @@
 //! match that funnel. Cross-origin **query** credential forwarding is the same
 //! deny-by-default posture as headers: built-in credential names/substrings
 //! (plus operator `sensitive_query_patterns`) are dropped from the mirror
-//! request-target only. Classification percent-decodes the name in bounded
+//! request-target only. The same credential-shaped class rule applies to
+//! decoded query names (`session_id`, `jwt`, `access_key`, `key`, `sid`). Classification percent-decodes the name in bounded
 //! stages (every layer through a hard cap of 4) and
 //! fails closed on residual valid `%XX` escapes, malformed percents, or
 //! control-bearing/invalid-UTF-8 forms; the retained pair is never rewritten.
@@ -434,11 +439,10 @@ const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
 /// Built-in credential/session substrings applied to lowercased header names so
 /// vendor-prefixed variants (`x-openai-api-key`, `x-amz-security-token`,
 /// `x-vendor-auth-token`) are stripped without an exact-name allowlist. Chosen
-/// to match credential families only: bare `token`/`key`/`session`/`auth`
-/// substrings are deliberately excluded because they also match benign headers
-/// such as pagination cursors (`x-continuation-token`). `authenticate` is
-/// included so `Proxy-Authenticate` / `WWW-Authenticate` variants are covered
-/// without a bare `auth` match. Operators extend this with
+/// to match credential families. The broader fail-closed class rule
+/// ([`name_has_credential_class`]) covers bare `token`/`key`/`session`/`auth`
+/// segments and stems, with narrow exceptions for pagination cursors
+/// (`x-continuation-token`). Operators extend this with
 /// `sensitive_header_patterns`. gRPC metadata is carried as HTTP/2 headers,
 /// so the same predicate covers native gRPC credential metadata.
 const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
@@ -475,8 +479,9 @@ const MIRROR_SENSITIVE_QUERY_CREDENTIAL_SEGMENTS: &[&str] = &["token", "sig", "s
 /// query parameter names. Seeded from [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]
 /// with `_` variants of hyphenated families so `access_token` / `api_key`
 /// match the same secret classes the header policy already denies. Bare
-/// `token`/`key`/`session`/`auth`/`sig` substrings are excluded; those families
-/// are handled by [`query_name_has_built_in_credential_segment`].
+/// `token`/`key`/`session`/`auth`/`sig` families are handled by
+/// [`query_name_has_built_in_credential_segment`] and the class rule
+/// [`name_has_credential_class`].
 const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
     "authorization",
     "cookie",
@@ -504,6 +509,140 @@ const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
     "secret",
     "credential",
 ];
+
+/// Credential-class words. A header or decoded query name is credential-shaped
+/// when any of its alphanumeric segments (split on every non-alphanumeric byte)
+/// equals one of these words, so `x-session-id`, `jwt`, `x-private-key`,
+/// `auth`, `sid`, or `pwd` fail closed without an exact-name entry.
+const MIRROR_CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
+    "auth",
+    "authn",
+    "authz",
+    "oauth",
+    "jwt",
+    "jws",
+    "jwe",
+    "saml",
+    "token",
+    "tokens",
+    "session",
+    "sessions",
+    "sess",
+    "sessid",
+    "sid",
+    "ssid",
+    "key",
+    "keys",
+    "secret",
+    "secrets",
+    "password",
+    "passwd",
+    "passphrase",
+    "passcode",
+    "pass",
+    "pwd",
+    "pw",
+    "credential",
+    "credentials",
+    "cred",
+    "creds",
+    "cookie",
+    "cookies",
+    "bearer",
+    "sig",
+    "signature",
+    "hmac",
+    "otp",
+    "totp",
+    "hotp",
+    "csrf",
+    "xsrf",
+    "ticket",
+    "assertion",
+];
+
+/// Credential-class stems matched inside a single segment, so concatenated
+/// and spelled-out forms (`sessionid`, `accesstoken`, `clientsecret`,
+/// `authorization`, `jwtassertion`, `privatekey`) fail closed too. A segment
+/// ending in `key`/`keys` (`accesskey`, `subscriptionkey`) is also treated as a
+/// credential; see [`segment_is_credential_shaped`].
+const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
+    "auth",
+    "token",
+    "session",
+    "secret",
+    "passw",
+    "passphrase",
+    "passcode",
+    "credential",
+    "cookie",
+    "bearer",
+    "signature",
+    "jwt",
+    "saml",
+    "csrf",
+    "xsrf",
+];
+
+/// Whole segments that contain the `auth` stem but name authorship or a URI
+/// authority rather than a credential.
+const MIRROR_BENIGN_AUTH_SEGMENTS: &[&str] =
+    &["author", "authors", "authored", "authority", "authorities"];
+
+/// Qualifiers that turn `token` into a pagination cursor rather than a
+/// credential, either as the preceding segment (`continuation_token`,
+/// `x-continuation-token`) or as a concatenated prefix (`continuationtoken`).
+/// Kept to the one cursor family the query policy already exempted, so the
+/// class rule never loosens it.
+const MIRROR_BENIGN_TOKEN_QUALIFIERS: &[&str] = &["continuation"];
+
+/// Credential-class test for one lowercased alphanumeric segment, given the
+/// previous segment of the same name (if any).
+fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
+    if MIRROR_BENIGN_AUTH_SEGMENTS.contains(&segment) {
+        return false;
+    }
+    if segment == "token" || segment == "tokens" {
+        return !previous.is_some_and(|prev| MIRROR_BENIGN_TOKEN_QUALIFIERS.contains(&prev));
+    }
+    if let Some(prefix) = segment
+        .strip_suffix("tokens")
+        .or_else(|| segment.strip_suffix("token"))
+        && MIRROR_BENIGN_TOKEN_QUALIFIERS.contains(&prefix)
+    {
+        return false;
+    }
+    if (segment == "key" || segment == "keys") && previous == Some("idempotency") {
+        return false;
+    }
+    if segment == "idempotencykey" {
+        return false;
+    }
+    MIRROR_CREDENTIAL_CLASS_SEGMENTS.contains(&segment)
+        || MIRROR_CREDENTIAL_CLASS_STEMS
+            .iter()
+            .any(|stem| segment.contains(stem))
+        || segment.ends_with("key")
+        || segment.ends_with("keys")
+}
+
+/// Fail-closed credential-class test shared by the header and query policies.
+/// `name_lower` must already be ASCII-lowercased (and, for query names,
+/// percent-decoded). Splitting on every non-alphanumeric byte means `-`, `_`,
+/// `.`, `+`, space and any other separator spelling yield the same segments.
+fn name_has_credential_class(name_lower: &str) -> bool {
+    let mut previous = None;
+    for segment in name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+    {
+        if segment_is_credential_shaped(segment, previous) {
+            return true;
+        }
+        previous = Some(segment);
+    }
+    false
+}
 
 /// Sampling period for percentage decisions: threshold is tenths of a percent
 /// in `0..=SAMPLE_PERIOD`, so each complete cycle of `SAMPLE_PERIOD` requests
@@ -544,6 +683,7 @@ fn is_port_suffix(rest: &str) -> bool {
 /// `sensitive_header_patterns` substring.
 fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
     MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
+        || name_has_credential_class(name_lower)
         || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
             .iter()
             .any(|substr| name_lower.contains(substr))
@@ -558,6 +698,7 @@ fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) ->
 /// Never logs the name.
 fn is_mirror_sensitive_query_name(name_lower: &str, operator_patterns: &[String]) -> bool {
     query_name_has_built_in_credential_segment(name_lower)
+        || name_has_credential_class(name_lower)
         || query_name_has_adjacent_segments(name_lower, "api", "key")
         || MIRROR_SENSITIVE_QUERY_SUBSTRINGS
             .iter()
@@ -3079,9 +3220,9 @@ mod tests {
             "a=1&&b=2",
             "flag&",
             "path=%2Froot&k=a%26b",
-            "key=a%2Fb",
+            "dir=a%2Fb",
             "name=%E2%9C%93&q=%C3%A9",
-            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&key=a%2Fb&name=%E2%9C%93",
+            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&dir=a%2Fb&name=%E2%9C%93",
         ] {
             let url = plugin.build_mirror_url("/api", Some(raw), &collapsed);
             assert!(
