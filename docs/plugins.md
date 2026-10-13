@@ -3311,8 +3311,13 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `connect_timeout_seconds` | u64 | `5` | Shared DNS-resolution/TCP/TLS establishment bound per connection plus the per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
 | `request_timeout_seconds` | u64 | `max(15, connect timeout)` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow. Set it explicitly to use a shorter deadline than an individual operation |
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
-| `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
+| `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password. A hit skips the bind, so a password change or account disablement takes effect only when the entry expires (see **Cache revocation lag** below) |
+| `group_cache_ttl_seconds` | u64 | `60` | With `required_groups` and the cache enabled, the longest a cached authentication is admitted without re-running the group search (`0` = every hit, maximum `86400`). Never extends `cache_ttl_seconds` |
 | `max_cache_entries` | u64 | `10000` | Strict cache cap (1–1,000,000). Atomic admission preserves the cap under concurrency, and a saturated cache replaces one entry without a full-map scan |
+
+**Cache revocation lag.** The credential cache is off by default. When enabled, a hit skips the directory bind, so a changed password or a disabled account keeps authenticating until its entry expires: `cache_ttl_seconds` is the bound on that lag, and values above 900 seconds log a warning at construction. Group removal is bounded separately and more tightly: with `required_groups` set, a hit whose last group check is older than `group_cache_ttl_seconds` (default 60) re-runs the group search before it is admitted, under the same `max_concurrent_requests` and `request_timeout_seconds` bounds as an uncached flow. A user no longer in any required group then receives `403` and the cached entry is evicted; a directory failure during that re-check returns `500` and keeps the entry for the next attempt.
+
+**Unknown users.** In search-then-bind mode a username that matches no entry still costs one fresh connection and one bind, against a fixed `cn=ferrum-edge-unknown-user` RDN under `search_base_dn` with a random throwaway password, so response timing does not reveal which usernames exist. The client's password is never sent for that bind.
 
 **Authentication modes** (must configure one):
 

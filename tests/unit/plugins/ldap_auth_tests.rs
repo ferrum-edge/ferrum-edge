@@ -3435,3 +3435,250 @@ async fn external_identity_runner_commits_the_mechanism_realm() {
         Some(ExternalIdentityRealm::new("realm_probe", Some([7; 32])))
     );
 }
+
+// ─── Issue #6609: cached credentials re-check required_groups ────────────
+
+/// Direct-bind + `required_groups` plugin with the credential cache enabled.
+fn cached_group_plugin(port: u16, group_cache_ttl_seconds: u64) -> LdapAuth {
+    LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "required_groups": ["gateway-admins"],
+            "cache_ttl_seconds": 300,
+            "group_cache_ttl_seconds": group_cache_ttl_seconds
+        }),
+        http_client(),
+    )
+    .expect("valid cached direct-bind group config")
+}
+
+async fn authenticate_alice(plugin: &LdapAuth) -> PluginResult {
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+    plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+}
+
+/// Answer one anonymous group search (message ID 1 on a fresh connection),
+/// returning the required group when `member` is true and no entry otherwise.
+async fn answer_group_search(stream: &mut tokio::net::TcpStream, member: bool) {
+    use tokio::io::AsyncWriteExt;
+
+    read_ldap_message(stream).await;
+    if member {
+        stream
+            .write_all(&search_result_entry(
+                1,
+                "cn=gateway-admins,ou=groups,dc=example,dc=com",
+                &[("cn", &["gateway-admins"])],
+            ))
+            .await
+            .expect("write group entry");
+    }
+    stream
+        .write_all(&search_result_done(1, 0))
+        .await
+        .expect("write group search done");
+    stream.flush().await.expect("flush group search");
+}
+
+/// Removing a user from every required group takes effect on the next cache
+/// hit once `group_cache_ttl_seconds` has elapsed, instead of after the whole
+/// `cache_ttl_seconds`. The refused entry is evicted, so the following request
+/// binds again.
+#[tokio::test]
+async fn cached_credential_is_refused_after_group_removal() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind group-revalidation LDAP server");
+    let port = listener.local_addr().expect("local addr").port();
+    let task = tokio::spawn(async move {
+        // 1. Uncached authentication: bind + canonical identity search.
+        let (mut stream, _) = listener.accept().await.expect("accept bind");
+        read_ldap_message(&mut stream).await;
+        stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write bind success");
+        answer_canonical_identity_search(&mut stream).await;
+        drop(stream);
+        // 2. Group check for the uncached authentication: still a member.
+        let (mut stream, _) = listener.accept().await.expect("accept group check");
+        answer_group_search(&mut stream, true).await;
+        drop(stream);
+        // 3. Cache hit re-check: removed from the group.
+        let (mut stream, _) = listener.accept().await.expect("accept group re-check");
+        answer_group_search(&mut stream, false).await;
+        drop(stream);
+        // 4. The evicted credential binds again; the directory now refuses it.
+        let (mut stream, _) = listener.accept().await.expect("accept re-bind");
+        read_ldap_message(&mut stream).await;
+        stream
+            .write_all(&bind_response(1, 49))
+            .await
+            .expect("write bind rejection");
+    });
+
+    // group_cache_ttl_seconds = 0 re-checks groups on every cache hit.
+    let plugin = cached_group_plugin(port, 0);
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_reject(authenticate_alice(&plugin).await, Some(403));
+    assert_reject(authenticate_alice(&plugin).await, Some(401));
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("every scripted LDAP exchange ran")
+        .expect("group-revalidation LDAP server");
+}
+
+/// Inside `group_cache_ttl_seconds` a cache hit is served without contacting
+/// the directory at all.
+#[tokio::test]
+async fn cached_credential_inside_group_window_skips_the_directory() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cached LDAP server");
+    let port = listener.local_addr().expect("local addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let accepted = Arc::clone(&accepted);
+        async move {
+            let (mut stream, _) = listener.accept().await.expect("accept bind");
+            accepted.fetch_add(1, Ordering::SeqCst);
+            read_ldap_message(&mut stream).await;
+            stream
+                .write_all(&bind_response(1, 0))
+                .await
+                .expect("write bind success");
+            answer_canonical_identity_search(&mut stream).await;
+            drop(stream);
+            let (mut stream, _) = listener.accept().await.expect("accept group check");
+            accepted.fetch_add(1, Ordering::SeqCst);
+            answer_group_search(&mut stream, true).await;
+            drop(stream);
+            // Any further connection is a regression; count it and hold it.
+            while let Ok((_stream, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let plugin = cached_group_plugin(port, 300);
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_continue(authenticate_alice(&plugin).await);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "cache hits inside the group window must not contact the directory"
+    );
+    task.abort();
+}
+
+#[test]
+fn test_group_cache_ttl_bounds() {
+    let base = || {
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "cache_ttl_seconds": 300
+        })
+    };
+    for accepted in [0, 60, LDAP_AUTH_MAX_CACHE_TTL_SECONDS] {
+        let mut config = base();
+        config["group_cache_ttl_seconds"] = json!(accepted);
+        LdapAuth::new(&config, http_client())
+            .unwrap_or_else(|error| panic!("group_cache_ttl_seconds={accepted}: {error}"));
+    }
+    let mut config = base();
+    config["group_cache_ttl_seconds"] = json!(LDAP_AUTH_MAX_CACHE_TTL_SECONDS + 1);
+    let error = LdapAuth::new(&config, http_client())
+        .err()
+        .expect("over-maximum group_cache_ttl_seconds must be refused");
+    assert!(error.contains("group_cache_ttl_seconds"), "{error}");
+}
+
+/// Search-then-bind answers an unknown username with the same directory work
+/// a known user's bind costs: a fresh connection and one bind. The bind never
+/// carries the client's password and never targets a client-chosen DN.
+#[tokio::test]
+async fn search_bind_unknown_user_performs_an_equalizing_bind() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unknown-user LDAP server");
+    let port = listener.local_addr().expect("local addr").port();
+    let task = tokio::spawn(async move {
+        let (mut service_stream, _) = listener.accept().await.expect("accept service bind");
+        read_ldap_message(&mut service_stream).await;
+        service_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write service bind success");
+        read_ldap_message(&mut service_stream).await;
+        service_stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write empty user search");
+        service_stream.flush().await.expect("flush user search");
+
+        let (mut equalizer_stream, _) = listener.accept().await.expect("accept equalizer bind");
+        let bind = read_ldap_message_bytes(&mut equalizer_stream).await;
+        equalizer_stream
+            .write_all(&bind_response(1, 49))
+            .await
+            .expect("write equalizer bind rejection");
+        bind
+    });
+
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "service-secret"
+        }),
+        http_client(),
+    )
+    .expect("valid search-bind config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("nobody-here", "client-password-123"),
+    );
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(result, Some(401));
+
+    let bind = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("unknown user must still cost one bind")
+        .expect("unknown-user LDAP server");
+    assert!(
+        ldap_message_contains(
+            &bind,
+            "cn=ferrum-edge-unknown-user,ou=users,dc=example,dc=com"
+        ),
+        "the equalizing bind targets the fixed RDN under search_base_dn"
+    );
+    assert!(!ldap_message_contains(&bind, "client-password-123"));
+    assert!(!ldap_message_contains(&bind, "nobody-here"));
+}
