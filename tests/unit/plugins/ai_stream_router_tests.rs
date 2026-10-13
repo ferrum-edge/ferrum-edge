@@ -10425,3 +10425,44 @@ async fn test_anthropic_normalizer_fails_closed_on_malformed_usage() {
     assert!(out.contains("malformed Anthropic usage"), "{out}");
     assert!(!out.contains("\"prompt_tokens\""), "{out}");
 }
+
+#[tokio::test]
+async fn test_gemini_normalizer_publishes_one_sided_usage_with_its_total() {
+    let one_sided = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":10000,\"totalTokenCount\":10000}}\n\n";
+    let out = run_gemini_normalizer(4096, one_sided, "text/event-stream").await;
+    assert!(out.contains("\"prompt_tokens\":10000"), "{out}");
+    assert!(out.contains("\"total_tokens\":10000"), "{out}");
+    assert!(!out.contains("\"completion_tokens\""), "{out}");
+
+    let total_only = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"totalTokenCount\":77}}\n\n";
+    let out = run_gemini_normalizer(4096, total_only, "text/event-stream").await;
+    assert!(out.contains("\"total_tokens\":77"), "{out}");
+    assert!(!out.contains("\"prompt_tokens\""), "{out}");
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_ignores_the_start_output_placeholder() {
+    // A terminal delta without an output counter leaves completion (and so the
+    // total) unreported rather than taking `message_start`'s placeholder.
+    let sse = ANTHROPIC_SSE.replace(",\"usage\":{\"output_tokens\":5}", "");
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":null"), "{out}");
+    assert!(out.contains("\"total_tokens\":null"), "{out}");
+}

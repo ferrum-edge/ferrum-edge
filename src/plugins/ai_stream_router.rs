@@ -4754,7 +4754,11 @@ impl AnthropicSseNormalizer {
                 if let Some(m) = message.get("model").and_then(Value::as_str) {
                     self.model = m.to_string();
                 }
-                if !self.absorb_anthropic_usage(message) {
+                // `output_tokens` here is a placeholder the terminal delta
+                // supersedes; only the input side is authoritative.
+                let start_usage =
+                    super::utils::ai_providers::anthropic_message_start_usage(message);
+                if !self.absorb_anthropic_usage(&start_usage) {
                     self.fail_bound(
                         "upstream provider sent malformed Anthropic usage; stream terminated",
                         out,
@@ -6466,37 +6470,52 @@ impl GeminiUsageCounters {
         // `UsageCategories` fold every other metering surface uses).
         let prompt_base = self.prompt.or_else(|| self.tool_use_prompt.map(|_| 0));
         let candidates = self.candidates.or_else(|| self.thoughts.map(|_| 0));
-        let (Some(prompt_base), Some(candidates)) = (prompt_base, candidates) else {
-            return Ok(None);
-        };
         // Gemini bills tool-use prompting on the input side, and OpenAI's
         // `completion_tokens` is defined to include reasoning tokens, so each
         // extra category folds into the counter that already carries it.
-        let prompt = checked_usage_sum(prompt_base, self.tool_use_prompt)?;
-        let completion = checked_usage_sum(candidates, self.thoughts)?;
-        let derived = prompt
-            .checked_add(completion)
+        let prompt = prompt_base
+            .map(|base| checked_usage_sum(base, self.tool_use_prompt))
+            .transpose()?;
+        let completion = candidates
+            .map(|base| checked_usage_sum(base, self.thoughts))
+            .transpose()?;
+        if prompt.is_none() && completion.is_none() && self.total.is_none() {
+            return Ok(None);
+        }
+        // Components the provider did report, even one-sided, are published;
+        // an unreported side stays absent rather than charged as zero.
+        let known = prompt
+            .unwrap_or(0)
+            .checked_add(completion.unwrap_or(0))
             .ok_or(GEMINI_USAGE_OVERFLOW_MESSAGE)?;
         // The provider's own total stays authoritative and may exceed the sum
         // of the categories this adapter can represent (a category added by a
         // later API revision). Never publish a total below the components
-        // printed in the same chunk either.
-        let total = self.total.map_or(derived, |reported| reported.max(derived));
+        // printed in the same chunk either. Without a provider total, only
+        // both sides make a complete one.
+        let total = match (self.total, prompt, completion) {
+            (Some(reported), _, _) => Some(reported.max(known)),
+            (None, Some(_), Some(_)) => Some(known),
+            _ => None,
+        };
 
-        let mut usage = json!({
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "total_tokens": total,
-        });
-        if let Some(thoughts) = self.thoughts
-            && let Some(object) = usage.as_object_mut()
-        {
-            object.insert(
+        let mut usage = serde_json::Map::new();
+        if let Some(prompt) = prompt {
+            usage.insert("prompt_tokens".to_string(), json!(prompt));
+        }
+        if let Some(completion) = completion {
+            usage.insert("completion_tokens".to_string(), json!(completion));
+        }
+        if let Some(total) = total {
+            usage.insert("total_tokens".to_string(), json!(total));
+        }
+        if let Some(thoughts) = self.thoughts {
+            usage.insert(
                 "completion_tokens_details".to_string(),
                 json!({ "reasoning_tokens": thoughts }),
             );
         }
-        Ok(Some(usage))
+        Ok(Some(Value::Object(usage)))
     }
 }
 

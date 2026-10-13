@@ -855,12 +855,25 @@ impl UsageCategories {
     /// longer be trusted to rebuild a complete total, so the usage is
     /// unmetered as a whole rather than resynthesized from them.
     pub(crate) fn invalid_sides(&self) -> (bool, bool) {
-        if self.reported_total == Counter::Invalid {
+        if self.reported_total == Counter::Invalid || self.total_overflows() {
             return (true, true);
         }
         (
             self.side(self.prompt_base, &self.prompt_extras) == Counter::Invalid,
             self.side(self.completion_base, &[self.completion_extra]) == Counter::Invalid,
+        )
+    }
+
+    /// Both sides fit individually but their sum does not: no complete total
+    /// can be stated, and a previously recorded one is stale.
+    fn total_overflows(&self) -> bool {
+        matches!(
+            (
+                self.side(self.prompt_base, &self.prompt_extras),
+                self.side(self.completion_base, &[self.completion_extra]),
+            ),
+            (Counter::Value(prompt), Counter::Value(completion))
+                if prompt.checked_add(completion).is_none()
         )
     }
 
@@ -873,7 +886,7 @@ impl UsageCategories {
         };
         // A malformed or overflowing side also invalidates the total: the
         // whole usage is then unmetered rather than partially counted.
-        if self.reported_total == Counter::Invalid {
+        if self.reported_total == Counter::Invalid || self.total_overflows() {
             return (None, None, None);
         }
         if prompt == Counter::Invalid || completion == Counter::Invalid {

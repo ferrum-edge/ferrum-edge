@@ -1251,3 +1251,32 @@ fn malformed_total_is_never_rebuilt_from_components() {
     assert!(!merged.is_complete_for_mode("total_tokens"));
     assert_eq!(merged.total_for_mode("total_tokens"), None);
 }
+
+#[test]
+fn combined_overflow_clears_a_stale_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let mut merged = extract_response_usage(
+        &json!({"usage": {"input_tokens": 10, "output_tokens": 5}}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(merged.total_tokens, Some(15));
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"usage": {"cache_read_input_tokens": u64::MAX - 10}}),
+        AiProvider::Anthropic,
+    ));
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+
+    let body = sse(&[
+        &json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}).to_string(),
+        &json!({"type": "message_delta", "usage": {"output_tokens": 5}}).to_string(),
+        &json!({"type": "message_delta", "usage": {"cache_read_input_tokens": u64::MAX - 10}})
+            .to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
+}
