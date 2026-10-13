@@ -161,6 +161,48 @@ const ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES: &[&str] = &[
     "moz-extension://11111111-1111-4111-8111-111111111111",
 ];
 
+/// Public suffixes probed by [`origin_regex_is_effectively_universal`]. A regex
+/// that admits every probe label under one of these (for example
+/// `https://.*\.com` or `https://[a-z]+\.github\.io`) reflects origins that
+/// anyone can register, which is as broad as `*` for credentialed reflection.
+/// The reserved-name probes above cannot catch that shape because they never
+/// sit under a real public suffix. This is a fixed sample of high-volume
+/// ICANN and shared-hosting suffixes, not the whole Public Suffix List: a
+/// regex can only be probed, not enumerated.
+const ORIGIN_REGEX_PUBLIC_SUFFIX_PROBES: &[&str] = &[
+    "com",
+    "net",
+    "org",
+    "io",
+    "dev",
+    "app",
+    "co",
+    "ai",
+    "me",
+    "xyz",
+    "info",
+    "co.uk",
+    "com.au",
+    "github.io",
+    "gitlab.io",
+    "herokuapp.com",
+    "vercel.app",
+    "netlify.app",
+    "pages.dev",
+    "workers.dev",
+    "web.app",
+    "firebaseapp.com",
+    "appspot.com",
+    "azurewebsites.net",
+    "cloudfront.net",
+    "ngrok.io",
+];
+
+/// Host labels placed under each [`ORIGIN_REGEX_PUBLIC_SUFFIX_PROBES`] entry.
+/// Letters-only, so a regex that admits any registrable alphabetic label under
+/// a public suffix matches all of them.
+const ORIGIN_REGEX_PUBLIC_SUFFIX_PROBE_LABELS: &[&str] = &["a", "zq", "probe"];
+
 /// Construction-time breadth of one origin matcher or of a whole policy.
 ///
 /// This is the single classifier used by the credentials interlock,
@@ -170,7 +212,8 @@ const ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES: &[&str] = &[
 pub(crate) enum OriginPolicyBreadth {
     /// Explicit allow-all: native `"*"` or Istio `{exact: "*"}`.
     Wildcard,
-    /// An opaque exact `null`, or a prefix/regex that admits every origin (or
+    /// An opaque exact `null`, a `*.suffix` wildcard whose suffix is a single
+    /// label or a public suffix, or a prefix/regex that admits every origin (or
     /// every origin of a scheme). Not the `AllowedOrigins::Wildcard` variant,
     /// but equivalent for credentialed reflection.
     EffectivelyUniversal,
@@ -189,6 +232,10 @@ pub(crate) enum OriginMatcherSpec<'a> {
     /// `null` is non-strict because unrelated sandboxed/file origins collapse
     /// to that same value.
     Exact(&'a str),
+    /// Native `*.suffix` wildcard-subdomain string, as configured (`*.` form).
+    /// An entry the wildcard validator refuses is not classified universal —
+    /// the caller already refused it at admission.
+    WildcardSubdomain(&'a str),
     Prefix(&'a str),
     /// Already-compiled regex (plugin construction).
     CompiledRegex(&'a Regex),
@@ -211,6 +258,12 @@ pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolic
                 OriginPolicyBreadth::Strict
             }
         }
+        OriginMatcherSpec::WildcardSubdomain(pattern) => match validate_wildcard_origin(pattern) {
+            Ok(suffix) if wildcard_suffix_is_effectively_universal(&suffix) => {
+                OriginPolicyBreadth::EffectivelyUniversal
+            }
+            _ => OriginPolicyBreadth::Strict,
+        },
         OriginMatcherSpec::Prefix(prefix) => {
             if origin_prefix_is_effectively_universal(prefix) {
                 OriginPolicyBreadth::EffectivelyUniversal
@@ -238,6 +291,11 @@ pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolic
 pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMatcherSpec<'_>> {
     match origin {
         Value::String(value) if value == "*" => Some(OriginMatcherSpec::AllowAll),
+        // Native plain strings starting with `*` are wildcard-subdomain
+        // patterns at plugin construction; classify them the same way here.
+        Value::String(value) if value.starts_with('*') => {
+            Some(OriginMatcherSpec::WildcardSubdomain(value))
+        }
         Value::String(value) => Some(OriginMatcherSpec::Exact(value)),
         Value::Object(map) => {
             if let Some(exact) = map.get("exact").and_then(Value::as_str) {
@@ -264,6 +322,27 @@ pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMat
 pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
     origin_matcher_spec_from_entry(origin)
         .is_some_and(|spec| origin_matcher_breadth(spec) != OriginPolicyBreadth::Strict)
+}
+
+/// Whether a validated wildcard-subdomain suffix (`.example.com`, as stored
+/// by [`validate_wildcard_origin`]) admits hosts that anyone can register.
+///
+/// `*.com` or `*.co.uk` matches every site under a TLD or public registry
+/// suffix, and `*.github.io` every tenant of a shared hosting suffix, so for
+/// credentialed reflection they are as broad as `*`. A suffix is therefore
+/// strict only when it has at least two labels AND is not itself a public
+/// suffix (ICANN or private section of the Public Suffix List). A suffix the
+/// list does not resolve is treated as universal (fail closed).
+pub(crate) fn wildcard_suffix_is_effectively_universal(suffix: &str) -> bool {
+    let domain = suffix.strip_prefix('.').unwrap_or(suffix);
+    let domain = domain
+        .strip_suffix('.')
+        .unwrap_or(domain)
+        .to_ascii_lowercase();
+    if domain.is_empty() || !domain.contains('.') {
+        return true;
+    }
+    psl::suffix_str(&domain).is_none_or(|public_suffix| public_suffix == domain)
 }
 
 /// A prefix is strict only when it terminates at an origin boundary, i.e. it
@@ -315,6 +394,19 @@ pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
         || matches_all(ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES)
         || matches_all(ORIGIN_REGEX_CHROME_EXTENSION_UNIVERSALITY_PROBES)
         || matches_all(ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES)
+        || origin_regex_admits_a_public_suffix(re)
+}
+
+/// Whether `re` admits every probe label under at least one sampled public
+/// suffix, for HTTPS or HTTP. Cold path only (construction / admission).
+fn origin_regex_admits_a_public_suffix(re: &Regex) -> bool {
+    ORIGIN_REGEX_PUBLIC_SUFFIX_PROBES.iter().any(|suffix| {
+        ["https", "http"].iter().any(|scheme| {
+            ORIGIN_REGEX_PUBLIC_SUFFIX_PROBE_LABELS
+                .iter()
+                .all(|label| re.is_match(&format!("{scheme}://{label}.{suffix}")))
+        })
+    })
 }
 
 const CORS_CONFIG_KEYS: &[&str] = &[
@@ -611,7 +703,13 @@ fn origin_pattern_breadth(pattern: &OriginPattern) -> OriginPolicyBreadth {
         OriginPattern::Exact(value) | OriginPattern::LiteralExact(value) => {
             OriginMatcherSpec::Exact(value)
         }
-        OriginPattern::WildcardSubdomain(_) => return OriginPolicyBreadth::Strict,
+        OriginPattern::WildcardSubdomain(suffix) => {
+            return if wildcard_suffix_is_effectively_universal(suffix) {
+                OriginPolicyBreadth::EffectivelyUniversal
+            } else {
+                OriginPolicyBreadth::Strict
+            };
+        }
         OriginPattern::Prefix(prefix) => OriginMatcherSpec::Prefix(prefix),
         OriginPattern::Regex(re) => OriginMatcherSpec::CompiledRegex(re),
     };
@@ -727,11 +825,13 @@ impl CorsPlugin {
                 OriginPolicyBreadth::EffectivelyUniversal => {
                     return Err(
                         "cors: allow_credentials=true is incompatible with an effectively \
-                         universal origin matcher (the opaque exact `null` origin, a prefix \
+                         universal origin matcher (the opaque exact `null` origin, a `*.suffix` \
+                         wildcard whose suffix is a single label or a public suffix such as \
+                         `*.com` or `*.co.uk`, a prefix \
                          that does not terminate at an origin boundary — only a \
                          `scheme://host:` prefix pins the host, because prefix matching is an \
                          unbounded starts_with — or a regex that admits every origin of a \
-                         scheme); specify a host-constraining origin policy to use credentials"
+                         scheme or every host under a public suffix); specify a host-constraining origin policy to use credentials"
                             .to_string(),
                     );
                 }

@@ -2381,6 +2381,91 @@ fn test_constructor_accepts_credentialed_anchored_host_regex() {
     assert!(plugin.uses_strict_origin_policy());
 }
 
+#[test]
+fn test_constructor_rejects_credentialed_public_suffix_wildcards() {
+    // A `*.suffix` wildcard over a single label or a public suffix admits
+    // hosts anyone can register, so it is as broad as `*` with credentials.
+    for origin in [
+        "*.com",
+        "*.COM.",
+        "*.io",
+        "*.localhost",
+        "*.co.uk",
+        "*.com.au",
+        "*.github.io",
+        "*.herokuapp.com",
+    ] {
+        let err = CorsPlugin::new(&json!({
+            "allowed_origins": [origin],
+            "allow_credentials": true
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("credentialed public-suffix wildcard must be refused: {origin}"));
+        assert!(
+            err.contains("allow_credentials") && err.contains("effectively universal"),
+            "got: {err} for {origin}"
+        );
+
+        // Without credentials the same pattern still constructs, but it is
+        // not reported as a strict origin policy.
+        let plugin = CorsPlugin::new(&json!({ "allowed_origins": [origin] }))
+            .unwrap_or_else(|err| panic!("uncredentialed {origin} must construct: {err}"));
+        assert!(
+            !plugin.uses_strict_origin_policy(),
+            "{origin} must not classify as a strict origin policy"
+        );
+    }
+}
+
+#[test]
+fn test_constructor_accepts_credentialed_registrable_wildcards() {
+    for origin in [
+        "*.example.com",
+        "*.api.example.co.uk",
+        "*.tenant.github.io",
+        "*.svc.cluster.local",
+        "*.corp.internal",
+    ] {
+        let plugin = CorsPlugin::new(&json!({
+            "allowed_origins": [origin],
+            "allow_credentials": true
+        }))
+        .unwrap_or_else(|err| panic!("registrable wildcard {origin} must construct: {err}"));
+        assert!(
+            plugin.uses_strict_origin_policy(),
+            "{origin} must stay a strict origin policy"
+        );
+    }
+}
+
+#[test]
+fn test_constructor_rejects_credentialed_public_suffix_regex() {
+    for regex in [
+        "https://[a-z]+\\.com",
+        "^https://.*\\.com$",
+        "https://[a-z0-9-]+\\.github\\.io",
+        "http://[a-z]+\\.co\\.uk",
+        "https?://[a-z]+\\.(com|net|org)",
+    ] {
+        let err = CorsPlugin::new(&json!({
+            "allowed_origins": [{"regex": regex}],
+            "allow_credentials": true
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("credentialed public-suffix regex must be refused: {regex}"));
+        assert!(
+            err.contains("allow_credentials") && err.contains("effectively universal"),
+            "got: {err} for {regex}"
+        );
+    }
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "^https://[a-z]+\\.example\\.com$"}],
+        "allow_credentials": true
+    }))
+    .expect("host-constraining regex + credentials must construct");
+    assert!(plugin.uses_strict_origin_policy());
+}
+
 #[tokio::test]
 async fn test_credentialed_host_bounded_prefix_reflects_only_that_host() {
     let plugin = CorsPlugin::new(&json!({

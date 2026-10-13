@@ -28298,7 +28298,11 @@ components:
             matching is an unbounded starts_with; a regex must not match `null`
             or every origin of a scheme (universality is probed against
             reserved DNS-shaped origins, so a hostname-character-class pattern
-            such as `https://[\w.-]+` is effectively universal).
+            such as `https://[\w.-]+` is effectively universal) and must not
+            admit every label under a sampled public suffix such as `.com` or
+            `.github.io`. A native `*.suffix` wildcard is refused with
+            credentials when the suffix is a single label or a public suffix
+            (`*.com`, `*.co.uk`, `*.github.io`).
         max_age:
           type: integer
           format: uint64
