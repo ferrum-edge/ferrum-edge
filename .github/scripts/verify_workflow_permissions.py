@@ -242,22 +242,28 @@ def _decode_escapes(line: str) -> str:
     return ESCAPE.sub(unescape, line)
 
 
-CHILD_INPUT = re.compile(r"^ *[A-Za-z0-9_-]+ *:(?: +(?P<value>.*))?$")
+CHILD_INPUT = re.compile(r"^ *(?P<key>[A-Za-z0-9_-]+) *:(?: +(?P<value>.*))?$")
+# Step keys whose empty value opens a nested mapping this reader understands.
+STEP_MAPPING_KEYS = frozenset({"with", "env"})
 SINGLE_QUOTED_VALUE = re.compile(r"^'(?:[^']|'')*' *(?:#.*)?$")
 DOUBLE_QUOTED_VALUE = re.compile(r'^"(?:[^"\\]|\\.)*" *(?:#.*)?$')
 
 
-def _single_line_input(line: str) -> bool:
-    """Whether a `with:` child is a key whose value cannot continue onto later lines.
+def _single_line_input(line: str, mapping_keys: frozenset[str] = frozenset()) -> bool:
+    """Whether a key's value is complete on this line and cannot continue onward.
 
     Block scalars (`|`, `>`) are fine: their bodies are indented deeper than
     the key and are skipped. Quoted and flow values must close on this line.
+    An empty value is admitted only for the named mapping keys: elsewhere it
+    lets a scalar start on the next, deeper line and swallow what follows.
     """
 
     match = CHILD_INPUT.match(line)
     if match is None:
         return False
     value = (match.group("value") or "").strip()
+    if not value or value.startswith("#"):
+        return match.group("key") in mapping_keys
     if value.startswith("'"):
         return SINGLE_QUOTED_VALUE.match(value) is not None
     if value.startswith('"'):
@@ -362,7 +368,9 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
                 continue
             if number == start and step_line.lstrip().startswith("- "):
                 step_line = " " * key_indent + step_line.lstrip()[2:].lstrip()
-            if _indent(step_line) == key_indent and not _single_line_input(step_line):
+            if _indent(step_line) == key_indent and not _single_line_input(
+                step_line, STEP_MAPPING_KEYS
+            ):
                 step_keys_readable = False
                 break
         if not step_keys_readable:
@@ -669,6 +677,28 @@ def run_self_test() -> list[str]:
         (
             "escaped line continuation",
             pr + '      - uses: "actions/che\\\n          ckout@' + sha + '"\n' + tail,
+        ),
+        (
+            "empty input value impersonation",
+            pr + f"      - uses: {pin}\n        with:\n          ssh-known-hosts:\n"
+            "            'ignored\n          persist-credentials: false\n            '\n" + tail,
+        ),
+        (
+            "empty name hides with",
+            pr + f"      - uses: {pin}\n        name:\n          'ignored\n        with:\n"
+            "          persist-credentials: false\n          '\n" + tail,
+        ),
+        (
+            "composite empty input value impersonation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        ssh-known-hosts:\n"
+            "          'ignored\n        persist-credentials: false\n          '\n",
+        ),
+        (
+            "composite empty name hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      name:\n        'ignored\n      with:\n"
+            "        persist-credentials: false\n        '\n",
         ),
         (
             "composite block scalar impersonation",
