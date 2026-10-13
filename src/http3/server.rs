@@ -4462,16 +4462,11 @@ async fn handle_h3_request(
         http_flavor
     };
 
-    // Materialize query params before authentication. HTTP/3 historically
-    // exposed raw, non-percent-decoded values to plugins; keep that default
-    // so enabling this PR does not silently change auth/cache keys. Plugins
-    // with query-param semantics that require H1/H2 parity opt in via the
-    // capability bit below.
-    if capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS) {
-        ctx.materialize_query_params();
-    } else {
-        ctx.materialize_query_params_raw();
-    }
+    // Materialize query params before authentication, percent-decoded exactly
+    // as HTTP/1.1 and HTTP/2 do. HTTP/3 used to expose the raw form unless a
+    // plugin opted in, so a custom plugin that did not know to opt in could
+    // decide on `%2Fadmin` over HTTP/3 and `/admin` over HTTP/1.1 (#6580).
+    ctx.materialize_query_params();
 
     // An exempted CORS preflight (issue #6110) exists only so the route's
     // `cors` plugin can answer it, which it does in the phase above. One that
