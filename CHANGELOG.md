@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — keyauth API keys need at least 16 non-whitespace characters**
+  (issue #6577). Any non-empty key used to be accepted, including a single
+  character. Consumer create, update, batch, restore, and the dedicated
+  credential endpoints now reject a shorter key with `400`, and file-mode
+  config loading fails on one. Database and CP snapshots that already hold a
+  shorter key keep serving it with a validation warning, so rotate those keys.
+  The OpenAPI `KeyAuthCredential` and `KeyAuthCredentialBackup` schemas carry
+  the same floor. The floor is lower than the 32-character HMAC/JWT secret
+  minimum because an API key can only be guessed online, while those secrets
+  can be attacked offline from one captured signature or token.
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is

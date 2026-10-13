@@ -116,14 +116,14 @@ Plaintext Basic-auth passwords are hashed during batch preparation. This require
       "username": "user-1",
       "custom_id": "tenant-1",
       "credentials": {
-        "keyauth": [{ "key": "api-key-abc123" }]
+        "keyauth": [{ "key": "api-key-abc123-0123456789" }]
       }
     },
     {
       "username": "user-2",
       "custom_id": "tenant-2",
       "credentials": {
-        "keyauth": [{ "key": "api-key-def456" }]
+        "keyauth": [{ "key": "api-key-def456-0123456789" }]
       }
     }
   ]
@@ -197,11 +197,11 @@ Create consumers, proxies, and plugin configs in a single request:
   "consumers": [
     {
       "username": "tenant-1",
-      "credentials": {"keyauth": [{ "key": "key-001" }]}
+      "credentials": {"keyauth": [{ "key": "key-001-0123456789abcdef" }]}
     },
     {
       "username": "tenant-2",
-      "credentials": {"keyauth": [{ "key": "key-002" }]}
+      "credentials": {"keyauth": [{ "key": "key-002-0123456789abcdef" }]}
     }
   ],
   "proxies": [

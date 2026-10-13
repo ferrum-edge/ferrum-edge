@@ -124,6 +124,13 @@ pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Minimum length for hmac_auth shared secrets.
 pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+/// Minimum non-whitespace length for keyauth API keys.
+///
+/// Lower than the HMAC/JWT secret floor on purpose: those secrets can be
+/// brute-forced offline from one captured signature or token, while an API key
+/// can only be guessed online against the gateway. Sixteen characters rules out
+/// trivially guessable keys; generate keys from a CSPRNG for real entropy.
+pub const MIN_KEYAUTH_KEY_LENGTH: usize = 16;
 /// Placeholder substituted for secret credential values in ordinary Consumer
 /// responses and audit diffs.
 pub const CREDENTIAL_REDACTION_PLACEHOLDER: &str = "[REDACTED]";
@@ -9114,9 +9121,19 @@ impl Consumer {
                 }
                 if cred_type == "keyauth" {
                     match obj.get("key") {
-                        Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {}
-                        Some(serde_json::Value::String(_)) => {
+                        Some(serde_json::Value::String(key)) if key.trim().is_empty() => {
                             errors.push(format!("{}.key must not be empty", prefix));
+                        }
+                        Some(serde_json::Value::String(key)) => {
+                            // Whitespace does not count toward the floor, the
+                            // same rule as hmac_auth secrets.
+                            let strength = hmac_secret_strength(key);
+                            if strength < MIN_KEYAUTH_KEY_LENGTH {
+                                errors.push(format!(
+                                    "{}.key must be at least {} non-whitespace characters (got {})",
+                                    prefix, MIN_KEYAUTH_KEY_LENGTH, strength
+                                ));
+                            }
                         }
                         Some(_) => errors.push(format!("{}.key must be a string", prefix)),
                         None => errors.push(format!("{}.key is required", prefix)),

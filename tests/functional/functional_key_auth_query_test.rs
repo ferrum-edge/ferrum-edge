@@ -11,7 +11,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-const VALID_QUERY: &str = "api%5Fkey=wrong&api_key=alpha%2Fbeta&keep=1";
+const VALID_QUERY: &str = "api%5Fkey=wrong&api_key=alpha%2Fbeta-0123456789&keep=1";
 const INVALID_QUERY: &str = "api%5Fkey=wrong%2Fkey";
 
 #[ignore]
@@ -140,7 +140,7 @@ fn key_auth_query_config(backend_port: u16) -> String {
         "consumers": [{
             "id": "query-consumer",
             "username": "query-user",
-            "credentials": {"keyauth": [{"key": "alpha/beta"}]}
+            "credentials": {"keyauth": [{"key": "alpha/beta-0123456789"}]}
         }],
         "upstreams": [],
         "plugin_configs": [{

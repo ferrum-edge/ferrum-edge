@@ -828,7 +828,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         "namespace": "ferrum",
         "custom_id": "ext-123",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "basicauth": [{"password_hash": password_hash}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}],
@@ -930,7 +930,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     let valid_create = json!({
         "username": "alice",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "basicauth": [{"password": "correct horse battery staple"}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}],
@@ -1481,7 +1481,7 @@ fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
     let real_values = json!({
         "username": "alice",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}]
         }

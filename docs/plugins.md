@@ -3002,8 +3002,14 @@ are rejected.
 credentials:
   keyauth:
     - key: "the-api-key-value"
-    - key: "new-api-key"
+    - key: "new-api-key-value"
 ```
+
+Each `key` must contain at least 16 non-whitespace characters (and at most
+4096). Create, update, batch, restore, and the credential endpoints reject a
+shorter key, and so does file-mode config loading. Database and CP snapshots
+that already hold a shorter key keep serving it with a validation warning until
+it is rotated. Generate keys from a CSPRNG.
 
 ### `basic_auth`
 

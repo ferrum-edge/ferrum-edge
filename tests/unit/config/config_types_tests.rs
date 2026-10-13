@@ -1640,11 +1640,15 @@ fn test_unique_listen_paths_duplicate() {
 #[test]
 fn test_unique_consumer_credentials_valid() {
     let mut c1 = make_consumer("c1", "alice");
-    c1.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "key-aaa"}]));
+    c1.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "key-aaa-0123456789"}]),
+    );
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "key-bbb"}]));
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "key-bbb-0123456789"}]),
+    );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     assert!(config.validate_unique_consumer_credentials().is_ok());
@@ -1653,18 +1657,22 @@ fn test_unique_consumer_credentials_valid() {
 #[test]
 fn test_unique_consumer_credentials_duplicate_keyauth() {
     let mut c1 = make_consumer("c1", "alice");
-    c1.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    c1.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "same-key-0123456789"}]),
+    );
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "same-key-0123456789"}]),
+    );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     let err = config.validate_unique_consumer_credentials().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("Duplicate keyauth API key"));
     // Verify the API key value is NOT in the error message (security)
-    assert!(!err[0].contains("same-key"));
+    assert!(!err[0].contains("same-key-0123456789"));
 }
 
 #[test]
@@ -1707,13 +1715,17 @@ fn test_validate_unique_hmac_credentials_narrow_surface() {
     c1.credentials
         .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
     // Unrelated keyauth collision must NOT surface through the narrow check.
-    c1.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    c1.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "same-key-0123456789"}]),
+    );
     let mut c2 = make_consumer("c2", "bob");
     c2.credentials
         .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
-    c2.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "same-key-0123456789"}]),
+    );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
 
@@ -2189,11 +2201,13 @@ fn test_unique_credentials_array_duplicate_keyauth_across_consumers() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "key-aaa"}, {"key": "key-bbb"}]),
+        serde_json::json!([{"key": "key-aaa-0123456789"}, {"key": "key-bbb-0123456789"}]),
     );
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "key-bbb"}]));
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "key-bbb-0123456789"}]),
+    );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     let err = config.validate_unique_consumer_credentials().unwrap_err();
@@ -2206,11 +2220,13 @@ fn test_unique_credentials_array_no_duplicate() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "key-aaa"}, {"key": "key-bbb"}]),
+        serde_json::json!([{"key": "key-aaa-0123456789"}, {"key": "key-bbb-0123456789"}]),
     );
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "key-ccc"}]));
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "key-ccc-0123456789"}]),
+    );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
     assert!(config.validate_unique_consumer_credentials().is_ok());
@@ -2236,11 +2252,38 @@ fn test_unique_credentials_array_duplicate_mtls_across_consumers() {
 }
 
 #[test]
+fn test_validate_fields_rejects_short_keyauth_key() {
+    for (key, strength) in [
+        ("abc", 3),
+        ("fifteen-chars-x", 15),
+        ("short key  padded  ", 14),
+    ] {
+        let mut c = make_consumer("c1", "alice");
+        c.credentials
+            .insert("keyauth".into(), serde_json::json!([{"key": key}]));
+        let err = c.validate_fields().unwrap_err();
+        assert!(
+            err.iter().any(|e| e.contains("credentials.keyauth[0].key")
+                && e.contains("at least 16 non-whitespace characters")
+                && e.contains(&format!("(got {strength})"))),
+            "unexpected errors for {key:?}: {err:?}"
+        );
+    }
+
+    let mut c = make_consumer("c1", "alice");
+    c.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "sixteen-chars-xy"}]),
+    );
+    assert!(c.validate_fields().is_ok());
+}
+
+#[test]
 fn test_validate_fields_array_credentials_within_limit() {
     let mut c = make_consumer("c1", "alice");
     c.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "k1"}, {"key": "k2"}]),
+        serde_json::json!([{"key": "k1-0123456789abcd"}, {"key": "k2-0123456789abcd"}]),
     );
     assert!(c.validate_fields().is_ok());
 }

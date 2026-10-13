@@ -310,7 +310,8 @@ Replace `YOUR_PROXY_ID` with the `id` returned by `POST /proxies`.
 Required field is `username`. Built-in credential map keys are `keyauth`,
 `basicauth`, `jwt`, `hmac_auth`, and `mtls_auth`. Each value is a **non-empty
 rotation array** of objects, not a single object. `keyauth` is the API-key
-credential type; `key_auth` is rejected here.
+credential type; `key_auth` is rejected here. Each `keyauth` `key` needs at
+least 16 non-whitespace characters; a shorter key is rejected with `400`.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
@@ -1341,13 +1342,13 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/consumers
 # Create consumer
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"username": "alice", "credentials": {"keyauth": [{"key": "my-key"}]}}' \
+  -d '{"username": "alice", "credentials": {"keyauth": [{"key": "my-key-0123456789abcdef"}]}}' \
   http://localhost:9000/consumers
 
 # Replace all credentials of a type (PUT replaces entirely and stores an array)
 curl -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '[{"key": "new-api-key"}]' \
+  -d '[{"key": "new-api-key-0123456789"}]' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
 # Append a credential for zero-downtime rotation (POST adds to array)
