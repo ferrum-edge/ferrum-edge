@@ -623,7 +623,10 @@ by a vendored `[patch.crates-io]` copy, and the `sqlx*` crates (which pin
 version would make Cargo pick the crates.io release and drop the Ferrum patch
 without failing the build. Cargo only warns that the patch was unused. These
 crates move only through "Refreshing a vendored patch", "Retiring a vendored
-patch", or the emergency procedure above.
+patch", or the emergency procedure above. `mongodb` is ignored from 3.9 on:
+`Cargo.toml` caps it below 3.9 to keep MongoDB 4.2 / Cosmos DB
+server-version-4.2 support, and the grouped update would otherwise widen that
+cap.
 
 The other standalone lockfiles get no version updates: `ebpf/` and `fuzz/` pin
 nightly toolchains, `tests/performance/multi_protocol/` must keep `# SYNC:`
@@ -738,9 +741,13 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   rewrites the digest in place, re-runs the pin verifier, and opens or updates a
   single pull request on the fixed branch `deps/base-image-digests`. It is
   digest-preserving by construction: it substitutes a digest and never removes
-  one, never changes an image or tag. Required CI (multi-arch build, FIPS, eBPF,
-  GNU ABI scan, chart smoke) and `Trusted Cross Build Policy` must qualify the
-  latest reviewed PR head before merge.
+  one, never changes an image or tag, and it moves the `# Digest resolved
+  YYYY-MM-DD` comment above each rewritten pin (walking up over adjacent
+  `FROM`/`ARG` pin lines) to the run's UTC date. The ordinary required PR checks
+  and `Trusted Cross Build Policy` must qualify the latest reviewed PR head
+  before merge. Those are path-selected: for Dockerfile changes they include
+  the amd64 production Dockerfile smoke build, but multi-architecture image
+  builds, FIPS and the GNU ABI scan are not guaranteed to run on the PR.
   Every tracked Dockerfile and YAML file that pins a drifted reference is
   rewritten together; prose such as `CHANGELOG.md` keeps its history. That
   includes the `gcr.io/distroless/cc-debian13` runtime base: its consumers are
