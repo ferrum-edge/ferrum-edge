@@ -45,9 +45,10 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-    # The repository-root Cargo config selects sccache and host linker flags,
-    # but this isolated fuzz job installs neither sccache nor mold. Disable both
-    # Cargo wrapper inputs and inherited rustflags explicitly.
+    # The repository-root Cargo config selects host linker flags (mold), and a
+    # runner- or user-level rustc-wrapper may select sccache, but this isolated
+    # fuzz job installs neither sccache nor mold. Disable both Cargo wrapper
+    # inputs and inherited rustflags explicitly.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
