@@ -26,6 +26,24 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Upgrading to the next release (unreleased)
+
+### Backend TLS references from `ns`-claimed operator tokens (#6092, PR #6316)
+
+An `operator` admin token that carries an `ns` claim is now limited to inline
+PEM, `system://`, or a `k8s://` Secret in the addressed namespace for
+`backend_tls_client_cert_path`, `backend_tls_client_key_path` and
+`backend_tls_server_ca_cert_path` on proxies and upstreams, even when
+`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`. The same rule now covers the
+route-local `client_cert_path`, `client_key_path` and `server_ca_cert_path`
+under `rules[].destination.backend_tls` in `mesh_route_dispatch` plugin
+configs. Anything else is refused with `400` before it is loaded.
+
+Values already stored in the same field (for `mesh_route_dispatch`, the same
+rule index and field) keep working and survive unrelated updates, and `admin`
+tokens are not restricted. Automation that writes file paths or secret-manager
+references with `ns`-claimed operator tokens must use an `admin` token instead.
+
 ## Upgrading to 0.9.17
 
 0.9.17 was published on 2026-10-10 UTC from commit

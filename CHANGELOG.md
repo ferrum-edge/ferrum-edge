@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — backend TLS reference admission follows the `ns` claim**
-  (PR #6316, residual of GHSA-wmmp-c4pg-rg6p / #6092). An `operator` token
+  (issue #6092; PR #6316, residual of GHSA-wmmp-c4pg-rg6p). An `operator` token
   that carries an `ns` claim is now limited to inline PEM, `system://` or a
   `k8s://` Secret in the addressed namespace for backend TLS references even
   when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`, matching the namespace
