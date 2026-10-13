@@ -14173,9 +14173,14 @@ fn inject_mesh_request_auth_plugin(
     // extraction location and claim-output header stays owned. A union that
     // still exceeds the bound fails plugin construction, and the data plane
     // keeps its last accepted configuration (fail closed).
+    // Collection stops one past the provider cap, so dedupe work stays
+    // bounded and the oversized union still fails construction.
     let mut providers: Vec<serde_json::Value> = Vec::new();
-    for ra in &applicable {
+    'collect: for ra in &applicable {
         for rule in &ra.jwt_rules {
+            if providers.len() > crate::plugins::jwks_auth::MAX_JWKS_PROVIDERS {
+                break 'collect;
+            }
             if let Some(provider) = build_jwks_provider_config(rule)
                 && !providers.contains(&provider)
             {

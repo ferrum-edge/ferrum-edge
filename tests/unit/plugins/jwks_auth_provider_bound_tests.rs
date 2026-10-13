@@ -4,10 +4,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ferrum_edge::_test_support::{
-    jwks_auth_candidate_providers_for_test, jwks_auth_observe_verifications_for_test,
-    jwks_auth_take_verification_attempts_for_test,
-};
+use ferrum_edge::_test_support::jwks_auth_candidate_providers_for_test;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::Plugin;
 use ferrum_edge::plugins::jwks_auth::{JwksAuth, MAX_JWKS_CANDIDATE_PROVIDERS, MAX_JWKS_PROVIDERS};
@@ -216,64 +213,4 @@ async fn issuerless_provider_still_accepts_any_issuer() {
             .await,
     );
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("open-user"));
-}
-
-/// Drives the real authentication path and records every provider whose
-/// verification ran. Reintroducing a try-every-provider fallback makes the
-/// recorded list longer than the candidate set and fails this test.
-#[tokio::test]
-async fn authentication_verifies_each_candidate_once_and_nothing_else() {
-    let jwks = inline_jwks();
-    let shared = "https://shared.example.com";
-    let mut providers: Vec<Value> = Vec::new();
-    // 0..6: pinned to the shared issuer.
-    for _ in 0..6 {
-        providers.push(provider(Some(shared), &jwks));
-    }
-    // 6..56: fifty unrelated issuers.
-    for i in 0..50 {
-        providers.push(provider(
-            Some(&format!("https://other{i}.example.com")),
-            &jwks,
-        ));
-    }
-    // 56, 57: no issuer.
-    providers.push(provider(None, &jwks));
-    providers.push(provider(None, &jwks));
-    let plugin = build(providers).expect("valid config");
-    plugin.warmup_jwks().await;
-    jwks_auth_observe_verifications_for_test(&plugin);
-
-    let cases: Vec<(Value, Vec<usize>)> = vec![
-        // Matching issuer: its six providers, then the two issuer-less ones.
-        (
-            json!({"iss": shared, "sub": "x"}),
-            vec![0, 1, 2, 3, 4, 5, 56, 57],
-        ),
-        // Unknown, missing, array and numeric issuers: issuer-less only.
-        (json!({"iss": "https://unknown.example.com"}), vec![56, 57]),
-        (json!({"sub": "x"}), vec![56, 57]),
-        (
-            json!({"iss": [shared, "https://other1.example.com"]}),
-            vec![56, 57],
-        ),
-        (json!({"iss": 42}), vec![56, 57]),
-    ];
-    for (payload, expected) in cases {
-        // Correct kid, forged signature: every attempted provider runs a
-        // signature verification and fails.
-        let token = unsigned_token(&payload);
-        let mut ctx = make_ctx();
-        ctx.headers
-            .insert("authorization".to_string(), format!("Bearer {token}"));
-        assert_reject(
-            plugin
-                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
-                .await,
-            Some(401),
-        );
-        let attempts = jwks_auth_take_verification_attempts_for_test(&plugin);
-        assert_eq!(attempts, expected, "payload {payload}");
-        assert!(attempts.len() <= MAX_JWKS_CANDIDATE_PROVIDERS);
-    }
 }

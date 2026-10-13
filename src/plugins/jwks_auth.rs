@@ -187,9 +187,9 @@ pub struct JwksAuth {
     /// Only a committed generation may contribute to readiness and metrics.
     discovery_owner_committed: Arc<AtomicBool>,
     discovery_publication_gate: Arc<Mutex<()>>,
-    /// Test-only record of provider verifications. Unset in production, where
-    /// recording costs one atomic load per verification.
-    verification_observer: std::sync::OnceLock<Mutex<Vec<usize>>>,
+    /// Unit-test record of provider verifications; compiled out of builds.
+    #[cfg(test)]
+    verification_attempts: Mutex<Vec<usize>>,
 }
 
 /// Fixed-capacity, ordered list of providers one token is verified against.
@@ -1046,7 +1046,8 @@ impl JwksAuth {
             discovery_owner_live: Arc::new(AtomicBool::new(true)),
             discovery_owner_committed: Arc::new(AtomicBool::new(false)),
             discovery_publication_gate: Arc::new(Mutex::new(())),
-            verification_observer: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            verification_attempts: Mutex::new(Vec::new()),
         })
     }
 
@@ -1245,28 +1246,6 @@ impl JwksAuth {
             .to_vec()
     }
 
-    /// Test-only: start recording provider verifications.
-    pub(crate) fn observe_verifications_for_test(&self) {
-        let _ = self.verification_observer.set(Mutex::new(Vec::new()));
-    }
-
-    /// Test-only: provider indices verified since
-    /// [`Self::observe_verifications_for_test`], in order, then cleared.
-    pub(crate) fn take_verification_attempts_for_test(&self) -> Vec<usize> {
-        self.verification_observer
-            .get()
-            .and_then(|observer| observer.lock().ok().map(|mut v| std::mem::take(&mut *v)))
-            .unwrap_or_default()
-    }
-
-    fn record_verification_attempt(&self, idx: usize) {
-        if let Some(observer) = self.verification_observer.get()
-            && let Ok(mut attempts) = observer.lock()
-        {
-            attempts.push(idx);
-        }
-    }
-
     /// Try to validate a token against the allowed configured providers.
     ///
     /// Each candidate from [`Self::candidate_provider_indices`] is verified at
@@ -1282,7 +1261,12 @@ impl JwksAuth {
             let Some(prov) = self.providers.get(idx) else {
                 continue;
             };
-            self.record_verification_attempt(idx);
+            #[cfg(test)]
+            {
+                if let Ok(mut attempts) = self.verification_attempts.lock() {
+                    attempts.push(idx);
+                }
+            }
             if let Some(claims) = try_validate_with_provider(prov, token).await {
                 return Ok((claims, idx));
             }
@@ -3191,4 +3175,83 @@ fn hostname_from_url(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
         .and_then(|u| hostname_from_parsed_url(&u))
+}
+
+#[cfg(test)]
+mod verification_bound_tests {
+    //! The per-token verification bound is observed on the real
+    //! authentication path; the recorder exists only in test builds.
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::json;
+
+    fn jwks() -> String {
+        // A syntactically valid 2048-bit RSA key; no token here is signed by
+        // it, so every attempted verification runs and fails.
+        json!({"keys": [{
+            "kty": "RSA",
+            "kid": "k1",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode([0xC3u8; 256]),
+            "e": "AQAB"
+        }]})
+        .to_string()
+    }
+
+    fn forged(payload: &Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"k1","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("{header}.{body}.c2lnbmF0dXJl")
+    }
+
+    #[tokio::test]
+    async fn each_candidate_is_verified_once_and_nothing_else() {
+        let jwks = jwks();
+        let shared = "https://shared.example.com";
+        let mut providers = Vec::new();
+        for _ in 0..6 {
+            providers.push(json!({"issuer": shared, "jwks": jwks}));
+        }
+        for i in 0..50 {
+            providers
+                .push(json!({"issuer": format!("https://other{i}.example.com"), "jwks": jwks}));
+        }
+        providers.push(json!({"jwks": jwks}));
+        providers.push(json!({"jwks": jwks}));
+        let plugin = JwksAuth::new(
+            &json!({"providers": providers}),
+            PluginHttpClient::default(),
+        )
+        .expect("valid config");
+        plugin.warmup_jwks().await;
+
+        let cases: Vec<(Value, Vec<usize>)> = vec![
+            (
+                json!({"iss": shared, "sub": "x"}),
+                vec![0, 1, 2, 3, 4, 5, 56, 57],
+            ),
+            (json!({"iss": "https://unknown.example.com"}), vec![56, 57]),
+            (json!({"sub": "x"}), vec![56, 57]),
+            (
+                json!({"iss": [shared, "https://other1.example.com"]}),
+                vec![56, 57],
+            ),
+            (json!({"iss": 42}), vec![56, 57]),
+        ];
+        let all: Vec<usize> = (0..plugin.providers.len()).collect();
+        for (payload, expected) in cases {
+            let token = forged(&payload);
+            assert!(
+                plugin
+                    .validate_token_for_providers(&token, &all)
+                    .await
+                    .is_err()
+            );
+            let attempts = std::mem::take(&mut *plugin.verification_attempts.lock().unwrap());
+            assert_eq!(attempts, expected, "payload {payload}");
+            assert!(attempts.len() <= MAX_JWKS_CANDIDATE_PROVIDERS);
+        }
+    }
 }
