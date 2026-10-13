@@ -266,7 +266,7 @@ tokio-util = { version = "0.7.18", default-features = false }
 prost-reflect = "0.16"
 brotli = "8"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
