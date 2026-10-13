@@ -112,8 +112,8 @@ fn replace_direct_country_with_supported_code(
 fn partially_corrupt_mmdb(mut bytes: Vec<u8>) -> Vec<u8> {
     let reader = maxminddb::Reader::from_source(bytes.as_slice())
         .expect("valid fixture opens before corruption");
-    let search_tree_size =
-        reader.metadata.node_count as usize * reader.metadata.record_size as usize / 4;
+    let metadata = reader.metadata();
+    let search_tree_size = metadata.node_count as usize * metadata.record_size as usize / 4;
     drop(reader);
 
     for offset in 0..search_tree_size {
