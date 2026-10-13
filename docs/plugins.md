@@ -177,7 +177,7 @@ the shared render/cleanup tunables must match across instances; pricing and
 | *(none)* | `http_logging` (ps1), `http_logging` (ps2) | ps1, ps2 |
 | `http_logging` (g1), `cors` (g2) | `http_logging` (ps1) | ps1, g2 (only same-name global replaced) |
 
-Use `priority_override` to control the relative execution order of instances that share the same built-in priority. Without it, instances at the same priority execute in a stable but implicit order based on config iteration.
+Use `priority_override` to control the relative execution order of instances that share the same built-in priority. Without it, equal-priority plugins run in plugin-name order, and instances of the same plugin run globals first, then proxy-scoped, then proxy-group instances, each in ascending plugin-config `id` (see [Plugin Execution Order](plugin_execution_order.md)). Row, file, and association order never change the chain.
 
 ### Per-Instance Execution Triggers
 

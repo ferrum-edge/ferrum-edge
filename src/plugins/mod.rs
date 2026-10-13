@@ -9926,7 +9926,9 @@ pub struct StreamTransactionSummary {
 /// Plugin execution priority bands.
 ///
 /// Plugins are sorted by priority (lowest runs first) within each lifecycle
-/// phase. Plugins at the same priority have no guaranteed relative order.
+/// phase. Ties break deterministically by plugin name, then scope (global,
+/// proxy, proxy group), then plugin-config id; see `plugin_chain_order` in
+/// `plugin_cache.rs`.
 /// Gaps between bands leave room for future plugins to slot in.
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |

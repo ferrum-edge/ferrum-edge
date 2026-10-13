@@ -261,6 +261,24 @@ Your `new()` constructor must validate the plugin config and return `Err(String)
 
 Sensible defaults for optional fields (e.g., `limit_by` defaulting to `"ip"`) are fine — only return `Err` for fields where there is no safe default.
 
+The constructor is also the validator, so keep it free of side effects. Admin
+API writes, control-plane admission, config-file loads, and the synchronous
+`ferrum-edge validate` command all call `create_plugin` and drop the instance
+right away. `ferrum-edge validate` has no Tokio runtime, so a `tokio::spawn`
+in a constructor aborts it. In `new()` and `create_plugin`:
+
+- do not dial the network, spawn tasks or threads, or write files;
+- do not register process-global state (metrics, registries, statics) that
+  outlives the instance;
+- validate and retain the config, plus any pure in-memory state derived from it.
+
+Stage workers in `start_background_tasks()`. That runs only while a cache
+generation is built, and the workers stay dormant until
+`commit_background_tasks()` runs after the generation is installed (see
+[Transaction log hook timing](#transaction-log-hook-timing)). Built-in plugins
+whose construction needs node-local files, credentials, or workers use a
+separate shape-only validator for the same reason.
+
 The `failure_policy()` return value controls cache publication when construction
 or validation fails:
 
@@ -269,6 +287,9 @@ or validation fails:
   keeps serving. Startup also rejects because there is no prior cache.
 - `OptionalFailOpen` logs the failure and omits the plugin from the published
   cache. Use this only for non-enforcing plugins such as best-effort telemetry.
+  The gateway takes the declared policy as given. A plugin that authenticates,
+  authorizes, or otherwise admits requests must not declare `OptionalFailOpen`,
+  because a construction failure would then publish the route without it.
 
 ### 2. Build
 
@@ -297,6 +318,31 @@ FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin cargo build
 Default source, release, and Docker builds leave `FERRUM_CUSTOM_PLUGINS` unset
 so example plugins (and their migrations) do not alter the production registry
 or schema.
+
+### Trust boundary
+
+A custom plugin is ordinary Rust compiled into the gateway binary. There is no
+sandbox, capability check, or separate process:
+
+- **Who is trusted.** Anyone who can write to `custom_plugins/` (or set
+  `FERRUM_CUSTOM_PLUGINS`) for a build is trusted with the whole gateway. When
+  `FERRUM_CUSTOM_PLUGINS` is unset, every `custom_plugins/*.rs` file in the
+  source tree is compiled in.
+- **What a plugin can do.** It runs in-process with the gateway's privileges and
+  memory. It can read every request and response it is attached to, resolved
+  secrets, TLS key material held in memory, and the process environment. It can
+  make arbitrary outbound connections, and a panic aborts the process
+  (`panic = "abort"`).
+- **What the gateway takes on trust.** The plugin's own declarations, including
+  its `failure_policy()`, protocol support, auth/authorize roles, and the
+  capability methods below. The gateway enforces composition rules against
+  those declarations, but it cannot check that the code behaves as declared.
+
+Review custom plugin source the way you would review a change to the gateway
+itself. Build release images from a source tree whose `custom_plugins/`
+directory is under the same access control as the rest of the repository. The
+[threat model](docs/threat_model.md#out-of-scope) lists a malicious custom
+plugin as out of scope for the same reason.
 
 ### 3. Configure
 

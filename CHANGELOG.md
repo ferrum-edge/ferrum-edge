@@ -152,6 +152,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Equal-priority plugins now run in a deterministic order** (issue #6614).
+  Ties used to follow config iteration order, which a database (unordered
+  `proxy_plugins` association rows), a reordered config file, or an
+  incremental reload could change. Chains now order by priority, then plugin
+  name, then scope (global, proxy, proxy group), then plugin-config id.
+  Candidate admission and every rebuild path use the same order. Defaults are
+  unaffected because no two built-in plugins share a priority.
+- **Documented the custom-plugin trust boundary and constructor contract**
+  (issue #6616). `CUSTOM_PLUGINS.md` now states that `custom_plugins/` code is
+  trusted, in-process gateway code whose declared failure policy is taken as
+  given. It also says constructors double as validators and must be free of
+  side effects, because admin, CP, and `ferrum-edge validate` construct and
+  drop them.
+
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
   fuzz lane compiled the stock registry crate instead of the patched DB-TLS
