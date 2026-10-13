@@ -3715,14 +3715,16 @@ permissions** must allow read/write access (including `packages: write`) for
 those per-job grants to take effect.
 
 Checkouts do not leave that token behind. Every `actions/checkout` step that
-does not push sets `persist-credentials: false`, so `GITHUB_TOKEN` is never written into
-`.git/config`, where later build steps, build scripts, and tests could read it
-(#6581). The repository is public, so plain `git fetch` from `origin` needs no
+does not push sets `persist-credentials: false`. The action's default writes `GITHUB_TOKEN` to a
+credentials file under `$RUNNER_TEMP` that the checkout's `.git/config`
+includes, where later build steps, build scripts, and tests could read it or
+use it through git (#6581). The repository is public, so plain `git fetch` from `origin` needs no
 credential. The only `persist-credentials: true` checkouts belong to the
 scheduled or manual jobs that push with that token (`base-image-digest-refresh.yml`
 and the branch-pruning jobs in `prune-stale-prs.yml`).
 `.github/scripts/verify_workflow_permissions.py`, which runs in the `Tests`
-aggregate, rejects a checkout that omits the key. It also rejects `true` in any
+aggregate, rejects a checkout that omits the key, in workflows and in local
+composite actions under `.github/actions/`. It also rejects `true` in any
 workflow that pull-request, push, merge-queue, or `workflow_run` events can
 start.
 

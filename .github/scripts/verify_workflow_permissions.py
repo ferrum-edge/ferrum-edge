@@ -14,9 +14,10 @@ status-check rulesets trust). So every workflow must state its own default:
   can start keeps a read-only (or empty) top-level default. Jobs that need a
   write scope ask for it in their own job-level `permissions:` block, where
   review sees it next to the steps that use it;
-* every `actions/checkout` step states `persist-credentials: false`, so the
-  token is not left in `.git/config` for later steps. `true` is admitted only
-  in a workflow none of those events can start (#6581).
+* every `actions/checkout` step, in a workflow or a local composite action,
+  states `persist-credentials: false`, so the token is not persisted for later
+  steps. `true` is admitted only in a workflow none of those events can start
+  (#6581).
 
 Executed by verify_required_ci.py inside the `Tests` aggregate, so a pull
 request that adds or edits a workflow without explicit permissions fails CI.
@@ -26,9 +27,11 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 WORKFLOW_DIR = Path(".github/workflows")
+ACTIONS_DIR = Path(".github/actions")
 
 # Events whose runs a contributor can start by opening, updating, queueing, or
 # pushing code, rather than only by a maintainer dispatch or a schedule.
@@ -55,7 +58,9 @@ EVENT_NAME = re.compile(r"^\s*" + QUOTED.format("event") + r"\s*$")
 EVENT_LINE = re.compile(r"^  " + QUOTED.format("event") + r"\s*:(?:\s.*)?$")
 # Block-style step keys only; `lead` ends where the key starts, so its length
 # is the step's key column whether or not the key sits on the `- ` line.
-CHECKOUT_USES = re.compile(r"^(?P<lead> *(?:- +)?)uses *: *[\"']?actions/checkout@")
+# GitHub resolves owner/repo case-insensitively, so `Actions/Checkout@` is the
+# same action and must be matched the same way.
+CHECKOUT_USES = re.compile(r"^(?P<lead> *(?:- +)?)uses *: *[\"']?(?i:actions/checkout)@")
 WITH_KEY = re.compile(r"^(?P<lead> *(?:- +)?)with *:(?P<rest>.*)$")
 JOB_KEY = re.compile(r"^  (?P<job>[A-Za-z0-9_-]+): *(?:#.*)?$")
 # Checkouts inside jobs whose bytes the trusted Cross policy
@@ -217,9 +222,10 @@ def _is_content(line: str) -> bool:
 def checkout_credential_errors(text: str, source: str) -> list[str]:
     """Every `actions/checkout` step states `persist-credentials` explicitly.
 
-    The action's default (`true`) writes the job's `GITHUB_TOKEN` into
-    `.git/config`, where every later step, build script, and test can read it
-    (#6581). A checkout must say `persist-credentials: false`. `true` is
+    The action's default (`true`) writes the job's `GITHUB_TOKEN` to a
+    credentials file under `$RUNNER_TEMP` that the checkout's `.git/config`
+    includes, so every later step, build script, and test can read it or use
+    it through git (#6581). A checkout must say `persist-credentials: false`. `true` is
     admitted only in a workflow that no pull-request, push, merge-queue, or
     `workflow_run` event can start, for jobs that push with the persisted
     token. Any spelling this line-based reader cannot follow fails closed.
@@ -230,7 +236,7 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
     code_triggered = triggers is None or bool(triggers & CODE_TRIGGERED_EVENTS)
     errors: list[str] = []
     for index, line in enumerate(lines):
-        if "actions/checkout" not in line or line.lstrip().startswith("#"):
+        if "actions/checkout" not in line.lower() or line.lstrip().startswith("#"):
             continue
         located = f"{source}:{index + 1}"
         match = CHECKOUT_USES.match(line)
@@ -304,7 +310,7 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
                 continue
             errors.append(
                 f"{located} checkout must set `persist-credentials: false` so the "
-                "job token is not left in .git/config for later steps"
+                "job token is not persisted for later steps"
             )
         elif values[0] == "true":
             if code_triggered:
@@ -331,6 +337,17 @@ def check_repository(root: Path = Path(".")) -> list[str]:
         text = path.read_text(encoding="utf-8")
         errors.extend(workflow_permission_errors(text, path.as_posix()))
         errors.extend(checkout_credential_errors(text, path.as_posix()))
+    # A workflow can call a local composite action that runs its own checkout.
+    # An action has no trigger of its own, so it reads as code-triggered and
+    # must always say `false`.
+    actions = root / ACTIONS_DIR
+    action_paths = (
+        [*actions.rglob("action.yml"), *actions.rglob("action.yaml")] if actions.is_dir() else []
+    )
+    for path in sorted(action_paths):
+        errors.extend(
+            checkout_credential_errors(path.read_text(encoding="utf-8"), path.as_posix())
+        )
     return errors
 
 
@@ -457,6 +474,35 @@ def run_self_test() -> list[str]:
             failures.append(f"checkout credential self-test {label!r} rejected: {errors}")
         if not accepted and not errors:
             failures.append(f"checkout credential self-test {label!r} was accepted")
+
+    mixed = pin.replace("actions/checkout", "Actions/Checkout")
+    for label, text in (
+        ("mixed-case missing", pr + f"      - uses: {mixed}\n" + tail),
+        ("mixed-case true", pr + f"      - uses: {mixed}\n        with:\n          persist-credentials: true\n" + tail),
+    ):
+        if not checkout_credential_errors(text, f"self-test checkout {label}"):
+            failures.append(f"checkout credential self-test {label!r} was accepted")
+
+    # Repository level: a compliant workflow cannot hide a credential-persisting
+    # checkout inside a local composite action.
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / WORKFLOW_DIR).mkdir(parents=True)
+        (root / WORKFLOW_DIR / "ci.yml").write_text(
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "      - uses: ./.github/actions/hidden\n",
+            encoding="utf-8",
+        )
+        if check_repository(root):
+            failures.append(f"checkout credential self-test: compliant repository rejected: {check_repository(root)}")
+        (root / ACTIONS_DIR / "hidden").mkdir(parents=True)
+        (root / ACTIONS_DIR / "hidden" / "action.yml").write_text(
+            "name: hidden\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n    - run: true\n      shell: bash\n",
+            encoding="utf-8",
+        )
+        if not check_repository(root):
+            failures.append("checkout credential self-test: composite-action checkout was accepted")
 
     frozen = pr.replace("  build:\n", "  docker:\n") + f"      - uses: {pin}\n" + tail
     if checkout_credential_errors(frozen, ".github/workflows/release.yml"):
