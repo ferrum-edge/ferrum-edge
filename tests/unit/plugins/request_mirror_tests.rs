@@ -6630,7 +6630,7 @@ async fn mirror_strips_unlisted_credential_class_headers() {
         "x-signing-key",
         "x-sso-ticket",
         "x-hmac",
-        "x-clientsecretvalue",
+        "x-passphrase",
     ];
     for (idx, name) in credential_names.iter().enumerate() {
         headers.insert((*name).to_string(), format!("cred-value-{idx}"));
