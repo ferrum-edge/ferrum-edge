@@ -17,7 +17,7 @@ e6e01088110a9449721862af9875e9aa6ff249f72457c99c2a93fd29af156256  vendor/dimpl-0
 df7c99c8ebd5b246bea89599a598c81db6db92599414630dee7e53e82284f0fd  vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml.orig
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  vendor/dimpl-0.6.1-ferrum-patched/LICENSE-APACHE.txt
 5b460f37be48ac4cf2181596181cc6cae432fc2caae05944873f380730829a4b  vendor/dimpl-0.6.1-ferrum-patched/LICENSE-MIT.txt
-ec72ea8d823e30bd4b1189aa54aef5afe1e3037d8ae0a39577e0764b91b79f10  vendor/dimpl-0.6.1-ferrum-patched/README.md
+278be01e18c2f1e42a7a6c7e7bb3526313b9f02b7036e0971368b215aba44b44  vendor/dimpl-0.6.1-ferrum-patched/README.md
 b11c250576e50c550cd7236eec6464e2058211abfcd2b692bd89086128a13fc5  vendor/dimpl-0.6.1-ferrum-patched/cargo_deny.sh
 d10ea9bda37371ca7dafa463a0d3173b2d6e26ef56014bff09ee059a7ad31572  vendor/dimpl-0.6.1-ferrum-patched/clippy.toml
 e03c98143e694653963665100c2c65b16aa14282f7c3a9462d1e3810ce2fbedf  vendor/dimpl-0.6.1-ferrum-patched/deny.toml
@@ -107,7 +107,7 @@ bd4d5e738169c73253e4cc1522b1bb06048af71cf4f715d3eb006cc47190e9ae  vendor/dimpl-0
 8f80a4c75fcb6d559c212dbcef8c1019b5fe873b58a4849f0df133805da38073  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/queue.rs
 f974a3dcb851f4f23e5b83135d00af3d86136f6f4c4f36a970868baf8f2d3d74  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/server.rs
 86baeacfb53745cee38cbc156c688ba6a85b06811c78fc8b8c6e382e43bb972d  vendor/dimpl-0.6.1-ferrum-patched/src/error.rs
-3f26d89b414aa93b09834d27ab6633230ea2d2b911fa8e270aca7484f03f71d2  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
+f0e57022fb10d8b3a1cddfd6a58ae9e49109715e87dc83e91b2d7fe09b39ce2d  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
 fae07477be7a08625fc6bdc9d949b08b744ce8d7d0119f3616f56e80ad5ad1d1  vendor/dimpl-0.6.1-ferrum-patched/src/rng.rs
 49caabfeb201e65a21a4f0cb1ef76020030ca985997d4ba063322f0d2889ceba  vendor/dimpl-0.6.1-ferrum-patched/src/time_tricks.rs
 f134d1fb91dc327fed41cf9667be7e44a4413658aff2846d3fb61bfc77e0f5e6  vendor/dimpl-0.6.1-ferrum-patched/src/timer.rs

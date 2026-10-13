@@ -35,18 +35,6 @@ Four constructors control which DTLS version is used:
   `supported_versions` extension)
 
 ## Cryptography surface
-
-### Crypto providers
-
-Two built-in providers are available behind Cargo features: `aws-lc-rs`
-(backed by AWS-LC through the native `aws-lc-sys` dependency) and
-`rust-crypto` (backed by RustCrypto crates). The crate's default features
-are `aws-lc-rs` and `rcgen`, and `rcgen` also selects `aws-lc-rs`, so a
-default build is **not** Rust-only; a Rust-only crypto configuration
-requires selecting the `rust-crypto` feature (without `aws-lc-rs` /
-`rcgen`). At runtime the provider is resolved in this order: an explicit
-`with_crypto_provider()` value, an installed default provider, AWS-LC if
-its feature is enabled, then RustCrypto if its feature is enabled.
 - **Cipher suites (TLS 1.2 over DTLS)**
   - `ECDHE_ECDSA_AES256_GCM_SHA384`
   - `ECDHE_ECDSA_AES128_GCM_SHA256`
@@ -63,6 +51,18 @@ its feature is enabled, then RustCrypto if its feature is enabled.
 - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_AES_256_GCM`,
   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
 - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
+
+### Crypto providers
+
+Two built-in providers are available behind Cargo features: `aws-lc-rs`
+(backed by AWS-LC through the native `aws-lc-sys` dependency) and
+`rust-crypto` (backed by RustCrypto crates). The crate's default features
+are `aws-lc-rs` and `rcgen`, and `rcgen` also selects `aws-lc-rs`, so a
+default build is **not** Rust-only; a Rust-only crypto configuration
+requires selecting the `rust-crypto` feature (without `aws-lc-rs` /
+`rcgen`). At runtime the provider is resolved in this order: an explicit
+`with_crypto_provider()` value, an installed default provider, AWS-LC if
+its feature is enabled, then RustCrypto if its feature is enabled.
 
 ### Certificate model
 During the handshake the engine emits
