@@ -1507,8 +1507,11 @@ stripped of newlines and backticks before they are written.
 **Runs**: `ubuntu-26.04`
 
 Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
-`profile.dev.debug=0`) so large integration targets stay within hosted-runner
-memory while `CARGO_BUILD_JOBS=2` restores modest compile parallelism:
+`profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
+so large integration targets stay within hosted-runner memory: even two
+parallel jobs could overlap two large integration-target clippy processes on
+a cold cache and starve the runner, so one job removes that overlap at the
+cost of wall clock, not coverage:
 
 ```bash
 cargo clippy \
