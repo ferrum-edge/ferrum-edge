@@ -10158,3 +10158,21 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+/// Issue #6612 sibling audit: `max_body_bytes` is also the per-layer decoded
+/// ceiling with amplification checks off, so it carries a hard admission
+/// ceiling instead of the whole u64 domain.
+#[test]
+fn max_body_bytes_has_a_hard_admission_ceiling() {
+    let mut config = validator_config("block");
+    config["max_body_bytes"] = json!(64 * 1024 * 1024);
+    assert!(OpenapiValidator::new(&config).is_ok());
+    for value in [64 * 1024 * 1024 + 1_u64, u64::MAX] {
+        config["max_body_bytes"] = json!(value);
+        let error = match OpenapiValidator::new(&config) {
+            Ok(_) => panic!("max_body_bytes={value} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("max_body_bytes"), "{error}");
+    }
+}

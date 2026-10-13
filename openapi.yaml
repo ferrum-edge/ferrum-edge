@@ -31532,9 +31532,9 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 67108864
           default: 1048576
-          description: Maximum raw or decompressed body size to validate; also bounded by the target's usize range.
+          description: Maximum raw or decompressed body size to validate, 1 to 67108864 (64 MiB). It is also the per-layer decoded ceiling while undoing Content-Encoding, so a larger value is rejected at admission.
         schema_draft:
           type: string
           enum: [auto, draft7, draft2020-12]

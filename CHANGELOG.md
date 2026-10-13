@@ -140,6 +140,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of failing validation. Admission now rejects anything above the ceiling,
   `openapi.yaml` publishes the same `maximum`, and the predictor's initial
   reservation is capped at 1024 slots whatever `max_entries` is.
+- **BREAKING — `openapi_validator` caps `max_body_bytes` at 64 MiB**
+  (issue #6612 sibling audit). The value is also the per-layer decoded
+  ceiling while undoing `Content-Encoding` (amplification checks off), so an
+  arbitrary 64-bit value let a small compressed body inflate without a
+  meaningful bound. Values above 67108864 are now rejected at admission.
 
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
