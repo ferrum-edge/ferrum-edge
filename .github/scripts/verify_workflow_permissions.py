@@ -60,7 +60,14 @@ EVENT_LINE = re.compile(r"^  " + QUOTED.format("event") + r"\s*:(?:\s.*)?$")
 # is the step's key column whether or not the key sits on the `- ` line.
 # GitHub resolves owner/repo case-insensitively, so `Actions/Checkout@` is the
 # same action and must be matched the same way.
-CHECKOUT_USES = re.compile(r"^(?P<lead> *(?:- +)?)uses *: *[\"']?(?i:actions/checkout)@")
+CHECKOUT_USES = re.compile(
+    r"^(?P<lead> *(?:- +)?)uses *: *(?i:actions/checkout)@[0-9a-f]{40} *(?:#.*)?$"
+)
+# Any `uses` key, block or flow, after escapes are resolved. Its value must be
+# one plain literal on this line: no quotes left open, aliases, tags, or block
+# scalars, so a reference cannot be assembled where this reader cannot see it.
+USES_KEY_LINE = re.compile(r"^ *(?:- +)?[\"']?uses[\"']? *:(?P<value>.*)$", re.IGNORECASE)
+FLOW_USES_KEY = re.compile(r"[{,] *[\"']?uses[\"']? *:", re.IGNORECASE)
 WITH_KEY = re.compile(r"^(?P<lead> *(?:- +)?)with *:(?P<rest>.*)$")
 JOB_KEY = re.compile(r"^  (?P<job>[A-Za-z0-9_-]+): *(?:#.*)?$")
 # Checkouts inside jobs whose bytes the trusted Cross policy
@@ -212,12 +219,16 @@ def workflow_permission_errors(text: str, source: str) -> list[str]:
 
 
 PERSIST_TRUE_TRIGGERS = frozenset({"schedule", "workflow_dispatch"})
-DOUBLE_QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
 ESCAPE = re.compile(r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)")
 
 
-def _decode_double_quoted(line: str) -> str:
-    """Resolve YAML double-quoted escapes, so `actions\\u002fcheckout` is seen."""
+def _decode_escapes(line: str) -> str:
+    """Resolve every backslash escape on the line, quoted or not.
+
+    Deliberately over-eager: YAML decodes escapes only inside double quotes,
+    and deciding where those start needs a full lexer. Decoding everywhere can
+    only reveal more, so an escaped `actions\\u002fcheckout` is always seen.
+    """
 
     def unescape(match: re.Match[str]) -> str:
         code = match.group(1)
@@ -228,7 +239,7 @@ def _decode_double_quoted(line: str) -> str:
                 return code
         return code
 
-    return DOUBLE_QUOTED.sub(lambda m: '"' + ESCAPE.sub(unescape, m.group(1)) + '"', line)
+    return ESCAPE.sub(unescape, line)
 
 
 CHILD_INPUT = re.compile(r"^ *[A-Za-z0-9_-]+ *:(?: +(?P<value>.*))?$")
@@ -294,20 +305,31 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
         if line.lstrip().startswith("#"):
             continue
         located = f"{source}:{index + 1}"
-        decoded = _decode_double_quoted(line)
-        if decoded != line and "actions/checkout" in decoded.lower():
+        decoded = _decode_escapes(line)
+        if FLOW_USES_KEY.search(decoded):
             errors.append(
-                f"{located} spells an actions/checkout reference with YAML escapes; "
-                "write it literally so persist-credentials can be verified"
+                f"{located} declares a step `uses` in flow style; write steps in "
+                "block style so checkout credentials can be verified"
             )
             continue
-        if "actions/checkout" not in line.lower():
+        uses_key = USES_KEY_LINE.match(decoded)
+        if uses_key is not None:
+            value = uses_key.group("value").strip()
+            if value.startswith(("*", "&", "!", "|", ">")) or not _single_line_input(
+                f"uses: {value}"
+            ):
+                errors.append(
+                    f"{located} `uses` must be one literal value on its own line "
+                    "(no alias, tag, block scalar, or open quote)"
+                )
+                continue
+        if "actions/checkout" not in decoded.lower():
             continue
         match = CHECKOUT_USES.match(line)
-        if match is None:
+        if match is None or decoded != line:
             errors.append(
-                f"{located} names actions/checkout outside a block-style `uses:` "
-                "step key; write the step in block style so persist-credentials "
+                f"{located} must reference actions/checkout as a literal block-style "
+                "`uses: actions/checkout@<40-hex SHA>` step key so persist-credentials "
                 "can be verified"
             )
             continue
@@ -330,6 +352,25 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
             _is_content(lines[end]) and _indent(lines[end]) < key_indent
         ):
             end += 1
+        # Every step key must be one complete line. A quoted or flow value left
+        # open (`name: 'x`) would swallow later lines that only look like a
+        # `with:` mapping.
+        step_keys_readable = True
+        for number in range(start, end):
+            step_line = lines[number]
+            if not _is_content(step_line):
+                continue
+            if number == start and step_line.lstrip().startswith("- "):
+                step_line = " " * key_indent + step_line.lstrip()[2:].lstrip()
+            if _indent(step_line) == key_indent and not _single_line_input(step_line):
+                step_keys_readable = False
+                break
+        if not step_keys_readable:
+            errors.append(
+                f"{located} checkout step keys must each be one complete `key: value` "
+                "line; a value left open across lines is refused"
+            )
+            continue
         with_lines = [
             number
             for number in range(start, end)
@@ -599,6 +640,35 @@ def run_self_test() -> list[str]:
             "composite true",
             "name: a\nruns:\n  using: composite\n  steps:\n"
             f"    - uses: {pin}\n      with:\n        persist-credentials: true\n",
+        ),
+        (
+            "quoted name hides with",
+            pr + f"      - uses: {pin}\n        name: 'ignored\n        with:\n"
+            "          persist-credentials: false\n        '\n" + tail,
+        ),
+        (
+            "composite quoted name hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      name: 'ignored\n      with:\n"
+            "        persist-credentials: false\n      '\n    - run: true\n      shell: bash\n",
+        ),
+        (
+            "single-quoted quote hides escaped flow reference",
+            pr + f"      - {{name: '\"', uses: \"actions\\u002fcheckout@{sha}\"}}\n" + tail,
+        ),
+        (
+            "composite single-quoted quote hides escaped flow reference",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - {{name: '\"', uses: \"actions\\u002fcheckout@{sha}\"}}\n",
+        ),
+        (
+            "alias reference",
+            pr.replace("jobs:\n", f"env:\n  REF: &ref actions/checkout@{sha}\njobs:\n")
+            + "      - uses: *ref\n" + tail,
+        ),
+        (
+            "escaped line continuation",
+            pr + '      - uses: "actions/che\\\n          ckout@' + sha + '"\n' + tail,
         ),
         (
             "composite block scalar impersonation",
