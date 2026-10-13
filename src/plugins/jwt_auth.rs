@@ -313,13 +313,10 @@ auth_flow::impl_auth_plugin!(
         &self.request_headers_to_redact
     }
 
-    /// HTTP/3 materializes decoded query parameters only when an active plugin
-    /// declares it needs them; H1/H2 always decode. Without this, the same URL
-    /// authenticates over H1/H2 and returns `401` over H3 whenever the
-    /// configured parameter name or the token itself carries percent-encoding
-    /// (`t%6fken`, or `%2E` for a JWT's `.` separators). `key_auth` and
-    /// `jwks_auth` already declare it for their query token locations; this is
-    /// the same contract for `token_lookup: query:<name>`.
+    /// `token_lookup: query:<name>` decides on a query parameter. Every
+    /// frontend materializes decoded query params (#6580), so a percent-encoded
+    /// name or token (`t%6fken`, `%2E` for a JWT's `.` separators)
+    /// authenticates identically on H1/H2/H3.
     fn requires_decoded_query_params(&self) -> bool {
         matches!(self.token_lookup, TokenLookup::Query(_))
     }
