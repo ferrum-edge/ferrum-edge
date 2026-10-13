@@ -251,9 +251,11 @@ fn fuzz_workspace_patches_every_vendored_crate_the_root_patches() {
     // is how the vendored `sqlx-core` DB-TLS patch went missing (issue #6583).
     let root = vendored_patch_table(ROOT_MANIFEST, "Cargo.toml");
     let fuzz = vendored_patch_table(FUZZ_MANIFEST, "fuzz/Cargo.toml");
+    // Only that a table was found is asserted, not its size, so retiring a
+    // vendored patch from both manifests stays a green change.
     assert!(
-        root.len() >= 10,
-        "expected the root [patch.crates-io] table to be parsed, got {root:?}"
+        !root.is_empty(),
+        "expected the root [patch.crates-io] table to be parsed"
     );
     assert_eq!(
         fuzz, root,
