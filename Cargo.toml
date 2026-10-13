@@ -340,7 +340,7 @@ azure_identity = { version = "0.35", optional = true }
 azure_core = { version = "0.35", optional = true }
 
 # GeoIP (geo_restriction plugin)
-maxminddb = "0.28"
+maxminddb = "0.32"
 
 # Redis (centralized rate limiting across multiple gateway instances)
 redis = { version = "1", features = ["tokio-rustls-comp", "tls-rustls-insecure", "connection-manager"] }
