@@ -807,37 +807,98 @@ pub fn with_ferrum_client_defaults(mut config: kube::Config) -> kube::Config {
     config
 }
 
-/// `kube::Client::try_default()` with [`with_ferrum_client_defaults`] applied
-/// and the configuration loaded through [`infer_kube_config`].
+/// `kube::Client::try_default()`, built through [`build_kube_client_from_config`]
+/// from a configuration loaded by [`infer_kube_config`].
 pub async fn try_default_kube_client() -> Result<kube::Client, String> {
     let config = infer_kube_config().await?;
-    kube::Client::try_from(with_ferrum_client_defaults(config))
-        .map_err(|error| format!("failed to build Kubernetes client: {error}"))
+    build_kube_client_from_config(config)
+}
+
+/// The one constructor for every Ferrum Kubernetes client.
+///
+/// It applies [`with_ferrum_client_defaults`] and wraps the client's service
+/// stack in [`redact_kube_auth_error`], so a credential-bearing exec-plugin
+/// parse error raised on any later request (including a token refresh) reaches
+/// callers and logs as fixed text. A construction error is rendered through
+/// [`redacted_kube_config_error`].
+pub fn build_kube_client_from_config(config: kube::Config) -> Result<kube::Client, String> {
+    let builder = kube::client::ClientBuilder::try_from(with_ferrum_client_defaults(config))
+        .map_err(|error| {
+            format!(
+                "failed to build Kubernetes client: {}",
+                redacted_kube_config_error(&error)
+            )
+        })?;
+    let redact: fn(tower::BoxError) -> tower::BoxError = redact_kube_auth_error;
+    Ok(builder
+        .with_layer(&tower::util::MapErrLayer::new(redact))
+        .build())
 }
 
 /// Fixed text that replaces a kubeconfig YAML parse error.
 pub const KUBECONFIG_PARSE_ERROR_REDACTED: &str =
     "kubeconfig YAML could not be parsed (parser detail withheld: it quotes kubeconfig source)";
 
-/// Render a kubeconfig/inference error without kubeconfig source text.
+/// Fixed text that replaces a kube exec-plugin output parse error.
+pub const KUBE_AUTH_EXEC_PARSE_ERROR_REDACTED: &str = "failed to parse auth exec output \
+     (parser detail withheld: it quotes the credential plugin's output)";
+
+/// Which credential-bearing parse error, if any, is in `error`'s source chain.
 ///
-/// kube 4 parses kubeconfigs with serde-saphyr, whose errors quote the source
-/// lines around the failure. A kubeconfig holds tokens, passwords and keys, so
-/// a malformed entry next to one would put that credential into a log line or
-/// a returned error. If any error in the chain is a YAML parse error, only
-/// [`KUBECONFIG_PARSE_ERROR_REDACTED`] is rendered.
-pub fn redacted_kube_config_error(error: &(dyn std::error::Error + 'static)) -> String {
+/// kube 4 parses kubeconfigs and exec credential-plugin output with
+/// serde-saphyr, whose errors quote the source around the failure. Both inputs
+/// hold tokens, passwords and keys, so either error would put a credential into
+/// a log line or a returned error.
+fn credential_bearing_parse_error(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<&'static str> {
     let mut current = Some(error);
     while let Some(err) = current {
         if matches!(
             err.downcast_ref::<kube::config::KubeconfigError>(),
             Some(kube::config::KubeconfigError::Parse(_))
         ) {
-            return KUBECONFIG_PARSE_ERROR_REDACTED.to_string();
+            return Some(KUBECONFIG_PARSE_ERROR_REDACTED);
+        }
+        if matches!(
+            err.downcast_ref::<kube::client::AuthError>(),
+            Some(kube::client::AuthError::AuthExecParse(_))
+        ) {
+            return Some(KUBE_AUTH_EXEC_PARSE_ERROR_REDACTED);
         }
         current = err.source();
     }
-    error.to_string()
+    None
+}
+
+/// Render a kube configuration or client error without kubeconfig or
+/// exec-plugin source text: any credential-bearing parse error in the chain
+/// renders as fixed text.
+pub fn redacted_kube_config_error(error: &(dyn std::error::Error + 'static)) -> String {
+    match credential_bearing_parse_error(error) {
+        Some(redacted) => redacted.to_string(),
+        None => error.to_string(),
+    }
+}
+
+#[derive(Debug)]
+struct RedactedKubeParseError(&'static str);
+
+impl std::fmt::Display for RedactedKubeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RedactedKubeParseError {}
+
+/// Service-stack error mapper for [`build_kube_client_from_config`]: replaces
+/// a credential-bearing parse error with fixed text and passes others through.
+pub fn redact_kube_auth_error(error: tower::BoxError) -> tower::BoxError {
+    match credential_bearing_parse_error(&*error) {
+        Some(redacted) => Box::new(RedactedKubeParseError(redacted)),
+        None => error,
+    }
 }
 
 /// `kube::Config::infer()` without kubeconfig source text in its errors.
@@ -899,5 +960,5 @@ async fn build_kube_client(
         }
     };
 
-    Ok(kube::Client::try_from(with_ferrum_client_defaults(config))?)
+    build_kube_client_from_config(config).map_err(anyhow::Error::msg)
 }

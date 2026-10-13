@@ -3,11 +3,12 @@
 //! and kubeconfig errors never carry kubeconfig source text
 //! (`k8s_controller::redacted_kube_config_error`).
 
+use std::error::Error as _;
 use std::time::Duration;
 
 use ferrum_edge::k8s_controller::{
-    KUBE_CLIENT_READ_TIMEOUT, KUBECONFIG_PARSE_ERROR_REDACTED, redacted_kube_config_error,
-    with_ferrum_client_defaults,
+    KUBE_AUTH_EXEC_PARSE_ERROR_REDACTED, KUBE_CLIENT_READ_TIMEOUT, KUBECONFIG_PARSE_ERROR_REDACTED,
+    redact_kube_auth_error, redacted_kube_config_error, with_ferrum_client_defaults,
 };
 
 const SENTINEL_TOKEN: &str = "sentinel-token-7f3c9a";
@@ -82,4 +83,95 @@ impl std::error::Error for Wrapper {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.0)
     }
+}
+
+/// A serde-saphyr error whose rendering would quote the sentinels, obtained
+/// through kube (Ferrum has no direct serde-saphyr dependency).
+fn saphyr_parse_error() -> kube::config::KubeconfigError {
+    kube::config::Kubeconfig::from_yaml(&malformed_kubeconfig())
+        .expect_err("malformed kubeconfig must not parse")
+}
+
+#[test]
+fn exec_plugin_parse_errors_are_redacted_in_the_client_stack() {
+    let kube::config::KubeconfigError::Parse(inner) = saphyr_parse_error() else {
+        panic!("expected a YAML parse error");
+    };
+    let auth = kube::client::AuthError::AuthExecParse(*inner);
+    let boxed: tower::BoxError = Box::new(auth);
+
+    let mapped = redact_kube_auth_error(boxed);
+    let rendered = mapped.to_string();
+
+    assert_eq!(rendered, KUBE_AUTH_EXEC_PARSE_ERROR_REDACTED);
+    assert!(!rendered.contains(SENTINEL_TOKEN));
+    assert!(!rendered.contains(SENTINEL_PASSWORD));
+    assert!(
+        mapped.source().is_none(),
+        "the redacted error must not chain the original"
+    );
+    // `kube::Client::send` wraps a middleware error as `Error::Service`.
+    let as_kube = kube::Error::Service(mapped).to_string();
+    assert!(!as_kube.contains(SENTINEL_TOKEN));
+    assert!(!as_kube.contains(SENTINEL_PASSWORD));
+}
+
+#[test]
+fn unrelated_client_errors_pass_through_unchanged() {
+    let original: tower::BoxError = "connection refused".into();
+    assert_eq!(
+        redact_kube_auth_error(original).to_string(),
+        "connection refused"
+    );
+}
+
+/// Every production Kubernetes client must come from
+/// `k8s_controller::build_kube_client_from_config`, which applies the kube 3
+/// read timeout / no-retry defaults and the credential-redacting error layer.
+#[test]
+fn production_kube_clients_use_the_shared_constructor() {
+    let forbidden = [
+        "kube::Client::try_from",
+        "Client::try_default(",
+        "ClientBuilder::try_from",
+        "Config::infer(",
+        "kube::Client::new(",
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            let is_constructor_home = path.ends_with("k8s_controller/mod.rs");
+            for (index, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                for needle in forbidden {
+                    let hit = code.contains(needle);
+                    let allowed = is_constructor_home && needle == "ClientBuilder::try_from";
+                    if hit && !allowed {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            index + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "build Kubernetes clients with k8s_controller::build_kube_client_from_config:\n{}",
+        offenders.join("\n")
+    );
 }
