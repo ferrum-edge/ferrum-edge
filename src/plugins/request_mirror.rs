@@ -592,7 +592,15 @@ const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "otp",
     "mfa",
     "verifier",
+    "jws",
+    "jwe",
 ];
+
+/// Short credential aliases matched as a segment suffix, plural included, so
+/// compounds such as `clientsid`, `userpw`, `clientcred` and `sids` fail
+/// closed. Too short to match as a substring anywhere in a segment.
+const MIRROR_CREDENTIAL_CLASS_SUFFIXES: &[&str] =
+    &["sid", "sids", "pw", "pws", "cred", "creds", "sig", "sigs"];
 
 /// Whole segments that contain `key` or `pass` without naming a credential.
 /// Everything else containing either (`privatekeypem`, `keyid`, `clientpass`)
@@ -616,6 +624,7 @@ const MIRROR_BENIGN_KEY_PASS_SEGMENTS: &[&str] = &[
     "passive",
     "bypass",
     "compass",
+    "sacred",
 ];
 
 /// Whole names (not segments) that are credentials on their own. `code` is the
@@ -661,7 +670,11 @@ fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
         || MIRROR_CREDENTIAL_CLASS_STEMS
             .iter()
             .any(|stem| segment.contains(stem))
-        || ((segment.contains("key") || segment.contains("pass"))
+        || ((segment.contains("key")
+            || segment.contains("pass")
+            || MIRROR_CREDENTIAL_CLASS_SUFFIXES
+                .iter()
+                .any(|suffix| segment.ends_with(suffix)))
             && !MIRROR_BENIGN_KEY_PASS_SEGMENTS.contains(&segment))
 }
 
