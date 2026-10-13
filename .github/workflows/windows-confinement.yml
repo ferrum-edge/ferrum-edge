@@ -26,6 +26,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The repository Cargo config names sccache as the rustc wrapper; this
+  # workflow builds without a compiler cache.
+  RUSTC_WRAPPER: ""
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+  AWS_LC_SYS_PREBUILT_NASM: "1"
 
 # A newer push to the same pull request cancels the superseded run. Every
 # other event gets a unique group so it always runs to completion.
@@ -53,11 +58,12 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install protoc and NASM
+      # Only PROTOC is exported; PATH is left untouched. aws-lc-sys uses its
+      # prebuilt NASM objects instead of a downloaded assembler.
+      - name: Install protoc
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           $protocVersion = "35.1"
           $protocRoot = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion"
           $protocZip = Join-Path $env:RUNNER_TEMP "protoc-$protocVersion-win64.zip"
@@ -70,32 +76,11 @@ jobs:
             throw "protoc archive SHA-256 mismatch: expected $expectedProtocSha256, got $actualProtocSha256"
           }
           Expand-Archive -Path $protocZip -DestinationPath $protocRoot -Force
-          $protocBin = Join-Path $protocRoot "bin"
-          $protocExe = Join-Path $protocBin "protoc.exe"
+          $protocExe = Join-Path (Join-Path $protocRoot "bin") "protoc.exe"
           if (!(Test-Path $protocExe)) {
             throw "protoc.exe was not found after extracting $protocZip"
           }
-          $protocBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
           "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
-
-          $nasmVersion = "3.02"
-          $nasmZip = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
-          $nasmRoot = Join-Path $env:RUNNER_TEMP "nasm"
-          Invoke-WebRequest `
-            -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
-            -OutFile $nasmZip
-          $expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
-          $actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip).Hash.ToLowerInvariant()
-          if ($actualNasmSha256 -ne $expectedNasmSha256) {
-            throw "NASM archive SHA-256 mismatch: expected $expectedNasmSha256, got $actualNasmSha256"
-          }
-          Expand-Archive -Path $nasmZip -DestinationPath $nasmRoot -Force
-          $nasmBin = Join-Path $nasmRoot "nasm-$nasmVersion"
-          $nasmExe = Join-Path $nasmBin "nasm.exe"
-          if (!(Test-Path $nasmExe)) {
-            throw "nasm.exe was not found after extracting $nasmZip"
-          }
-          $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Compile the unit test binary
         shell: bash
