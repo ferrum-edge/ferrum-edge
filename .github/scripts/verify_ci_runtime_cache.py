@@ -47,7 +47,21 @@ from verify_cross_build_policy import (
     NODE_DEFAULT_REGISTRY_WRITE_JOB,
     NODE_WAYPOINT_IMAGE_GATE_JOB,
     extract_job_contract_block,
+    normalize_action_pins,
 )
+
+
+def read_pinned(path: Path) -> str:
+    """Read a contract input with external action pins normalized.
+
+    The frozen templates shared with `verify_cross_build_policy.py` compare
+    pin-normalized text, and so does every contract here: they pin which action
+    runs and how, while the trusted action pin rotation check governs which
+    upstream release commit it is (docs/dependency-policy.md → "Automated
+    action pin rotation").
+    """
+
+    return normalize_action_pins(path.read_text(encoding="utf-8"))
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -97,17 +111,17 @@ COMPLETED_CACHE_PRODUCER_JOBS = (
     ("coverage.yml", "coverage-shard"),
 )
 
-CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
-RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+CHECKOUT = "actions/checkout@0000000000000000000000000000000000000000"
+RUST_TOOLCHAIN = "dtolnay/rust-toolchain@0000000000000000000000000000000000000000"
+RUST_CACHE = "Swatinem/rust-cache@0000000000000000000000000000000000000000"
 BORINGCACHE_CARGO_PREFIX = "boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile "
 BORINGCACHE_DIRECT_PROFILES = {("ci.yml", "build-binaries"): "binaries", ("ci.yml", "build-ebpf"): "ebpf"}
-BUILDX = "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
-BUILD_PUSH = "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc"
-CACHE_RESTORE = "actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae"
-CACHE_SAVE = "actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae"
-UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-DOWNLOAD_ARTIFACT = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+BUILDX = "docker/setup-buildx-action@0000000000000000000000000000000000000000"
+BUILD_PUSH = "docker/build-push-action@0000000000000000000000000000000000000000"
+CACHE_RESTORE = "actions/cache/restore@0000000000000000000000000000000000000000"
+CACHE_SAVE = "actions/cache/save@0000000000000000000000000000000000000000"
+UPLOAD_ARTIFACT = "actions/upload-artifact@0000000000000000000000000000000000000000"
+DOWNLOAD_ARTIFACT = "actions/download-artifact@0000000000000000000000000000000000000000"
 FIPS_CONTRACT_HASHFILES = (
     "hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', "
     "'.github/workflows/fips-build.yml', "
@@ -3245,7 +3259,7 @@ def check_fips_producer_channel(
         failures,
     )
     require(
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        "actions/upload-artifact@0000000000000000000000000000000000000000"
         in test_build_job
         and "if-no-files-found: error" in test_build_job
         and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -3318,7 +3332,7 @@ def check_fips_producer_channel(
     )
 
     require(
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+        "actions/download-artifact@0000000000000000000000000000000000000000"
         in test_job
         and "pattern: fips-test-binaries-${{ github.run_id }}-*" in test_job
         and "merge-multiple: false" in test_job
@@ -4215,6 +4229,13 @@ BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
     'consumers="${consumers}${file} "',
     "for file in ${consumers}; do",
     'sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"',
+    # The resolution date governing each rewritten pin moves with it (#6546).
+    "for file in ${consumers}; do",
+    """awk -v ref="${tagged}@${resolved}" -v today="$(date -u +%F)" '""",
+    "while (j >= 1 && line[j] ~ /^[[:space:]]*(FROM|ARG)[[:space:]]/) j--",
+    'if (j >= 1 && line[j] ~ ("^[[:space:]]*# Digest resolved " date)) {',
+    "sub(date, today, line[j])",
+    'cat "${file}.resolved" > "${file}"',
 )
 
 
@@ -4930,8 +4951,8 @@ def check_completed_cache_producer(job: str, source: str, failures: list[str]) -
 
 
 def check_shared_actions(failures: list[str]) -> None:
-    rust_ci = SETUP_RUST.read_text(encoding="utf-8")
-    sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
+    rust_ci = read_pinned(SETUP_RUST)
+    sccache = read_pinned(SETUP_SCCACHE)
     check_completed_rust_cache_save(rust_ci, failures)
     require(
         "cache-hit:" in rust_ci,
@@ -4940,7 +4961,7 @@ def check_shared_actions(failures: list[str]) -> None:
     )
     check_shell_only_local_action(sccache, "setup-sccache", failures)
     check_shell_only_local_action(
-        SETUP_FAST_LINKER.read_text(encoding="utf-8"),
+        read_pinned(SETUP_FAST_LINKER),
         "setup-fast-linker",
         failures,
     )
@@ -5037,9 +5058,9 @@ def check_shared_actions(failures: list[str]) -> None:
 
 
 def check_docs_and_coverage(failures: list[str]) -> None:
-    ci_cd = CI_CD_DOC.read_text(encoding="utf-8")
-    fips_doc = FIPS_DOC.read_text(encoding="utf-8")
-    coverage = COVERAGE_WORKFLOW.read_text(encoding="utf-8")
+    ci_cd = read_pinned(CI_CD_DOC)
+    fips_doc = read_pinned(FIPS_DOC)
+    coverage = read_pinned(COVERAGE_WORKFLOW)
     require(
         "`fips-build.yml`" in ci_cd or "fips-build.yml" in ci_cd,
         "docs/ci_cd.md must inventory fips-build.yml",
@@ -5304,7 +5325,7 @@ def check_docs_and_coverage(failures: list[str]) -> None:
 
 
 def check_dockerfile(failures: list[str]) -> None:
-    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    dockerfile = read_pinned(DOCKERFILE)
     require(
         builder_arg_features_is_after_apt(dockerfile),
         "Dockerfile builder ARG FEATURES must come after apt-get so ordinary and "
@@ -5321,9 +5342,9 @@ def check_dockerfile(failures: list[str]) -> None:
         "runtime-ebpf target must remain",
         failures,
     )
-    release = DOCKERFILE_RELEASE.read_text(encoding="utf-8")
-    ebpf_tools_layer = DOCKERFILE_EBPF_TOOLS_LAYER.read_text(encoding="utf-8")
-    iproute2_layer = DOCKERFILE_IPROUTE2_LAYER.read_text(encoding="utf-8")
+    release = read_pinned(DOCKERFILE_RELEASE)
+    ebpf_tools_layer = read_pinned(DOCKERFILE_EBPF_TOOLS_LAYER)
+    iproute2_layer = read_pinned(DOCKERFILE_IPROUTE2_LAYER)
     check_dockerfile_log_level("Dockerfile", dockerfile, failures)
     check_dockerfile_log_level("Dockerfile.release", release, failures)
     check_dockerfile_log_level(
@@ -5332,7 +5353,7 @@ def check_dockerfile(failures: list[str]) -> None:
     for label, text in (
         ("Dockerfile", dockerfile),
         ("Dockerfile.release", release),
-        ("Dockerfile.test", DOCKERFILE_TEST.read_text(encoding="utf-8")),
+        ("Dockerfile.test", read_pinned(DOCKERFILE_TEST)),
         ("Dockerfile.ebpf-tools-layer", ebpf_tools_layer),
         ("Dockerfile.iproute2-layer", iproute2_layer),
     ):
@@ -5364,13 +5385,13 @@ def check_dockerfile(failures: list[str]) -> None:
         ):
             continue
         try:
-            contents = path.read_text(encoding="utf-8")
+            contents = read_pinned(path)
         except (OSError, UnicodeDecodeError):
             continue
         repository_files.append((path.relative_to(REPO_ROOT).as_posix(), contents))
     check_distroless_digest_consistency(repository_files, dockerfile, failures)
     check_base_image_refresh_rotates_all_pins(
-        BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8"), failures
+        read_pinned(BASE_IMAGE_REFRESH_WORKFLOW), failures
     )
 
 
@@ -5406,7 +5427,7 @@ def self_test() -> int:
         "self-test: stale distroless image refs must fail with their path",
         failures,
     )
-    refresh_workflow = BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8")
+    refresh_workflow = read_pinned(BASE_IMAGE_REFRESH_WORKFLOW)
     pin_failures = []
     check_base_image_refresh_rotates_all_pins(refresh_workflow, pin_failures)
     require(
@@ -5418,8 +5439,8 @@ def self_test() -> int:
     for label, original, mutation in (
         (
             "that rewrites only the Dockerfiles",
-            "            for file in ${consumers}; do\n",
-            "            for file in ${DOCKERFILES}; do\n",
+            "            for file in ${consumers}; do\n              sed -i ",
+            "            for file in ${DOCKERFILES}; do\n              sed -i ",
         ),
         (
             "that may rewrite workflow files",
@@ -5435,6 +5456,21 @@ def self_test() -> int:
             "that never collects a consumer",
             '                  consumers="${consumers}${file} "\n',
             "                  true\n",
+        ),
+        (
+            "that leaves resolution dates stale",
+            "                      sub(date, today, line[j])\n",
+            "                      true\n",
+        ),
+        (
+            "that never writes the dated file back",
+            '              cat "${file}.resolved" > "${file}"\n',
+            "",
+        ),
+        (
+            "that only redates a directly preceding comment",
+            "                    while (j >= 1 && line[j] ~ /^[[:space:]]*(FROM|ARG)[[:space:]]/) j--\n",
+            "",
         ),
         (
             "that stages only the Dockerfiles",
@@ -5462,7 +5498,7 @@ def self_test() -> int:
             failures,
         )
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
-        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        workflow = read_pinned(CI_WORKFLOW.parent / filename)
         producer = extract_job(workflow, job_name)
         producer_errors: list[str] = []
         check_completed_cache_producer(producer, job_name, producer_errors)
@@ -5490,7 +5526,7 @@ def self_test() -> int:
         producer_errors = []
         check_completed_cache_producer("", job_name, producer_errors)
         require(bool(producer_errors), "self-test: absent producer must fail", failures)
-    completed_cache = SETUP_RUST.read_text(encoding="utf-8")
+    completed_cache = read_pinned(SETUP_RUST)
     cache_errors: list[str] = []
     check_completed_rust_cache_save(completed_cache, cache_errors)
     require(not cache_errors, "self-test: completed-cache action must pass", failures)
@@ -5507,7 +5543,7 @@ def self_test() -> int:
         require(mutated != completed_cache, "self-test: cache mutation must apply", failures)
         check_completed_rust_cache_save(mutated, cache_errors)
         require(bool(cache_errors), "self-test: incomplete cache save must fail", failures)
-    node_reader = NODE_WORKFLOW.read_text(encoding="utf-8")
+    node_reader = read_pinned(NODE_WORKFLOW)
     node_reader = extract_job(node_reader, "production-dockerfile-smoke-ebpf")
     reader_errors: list[str] = []
     check_node_ebpf_registry_reader(node_reader, reader_errors)
@@ -5528,7 +5564,7 @@ def self_test() -> int:
         reader_errors = []
         check_node_ebpf_registry_reader(mutated, reader_errors)
         require(bool(reader_errors), "self-test: Node reader regression must fail", failures)
-    default_registry = NODE_WORKFLOW.read_text(encoding="utf-8")
+    default_registry = read_pinned(NODE_WORKFLOW)
     registry_errors: list[str] = []
     check_node_default_registry_jobs(default_registry, registry_errors)
     require(not registry_errors, "self-test: default registry recipes must pass", failures)
@@ -5843,7 +5879,7 @@ def self_test() -> int:
         "jobs:\n"
         "  x:\n"
         "    steps:\n"
-        f"      - uses: {CHECKOUT} # v6\n"
+        f"      - uses: {CHECKOUT}\n"
     )
     require(
         workflow_permissions_are_read_only(sample),
@@ -5875,7 +5911,7 @@ def self_test() -> int:
     )
 
     build_push = (
-        f"        uses: {BUILD_PUSH} # v7\n"
+        f"        uses: {BUILD_PUSH}\n"
         "        with:\n"
         "          cache-from: type=local,src=/tmp/production-dockerfile-smoke-default\n"
     )
@@ -5893,7 +5929,7 @@ def self_test() -> int:
         f"{build_push}"
         "      - name: Build ordinary production runtime (cold cache)\n"
         f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
+        f"        uses: {BUILD_PUSH}\n"
         "        with:\n"
         "          provenance: false\n"
     )
@@ -5922,7 +5958,7 @@ def self_test() -> int:
         "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
         "      - name: Build ordinary production runtime (cold cache)\n"
         f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
+        f"        uses: {BUILD_PUSH}\n"
         "        with:\n"
         "          provenance: false\n"
     )
@@ -5959,7 +5995,7 @@ def self_test() -> int:
         "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
         "      - name: Build ordinary production runtime (cold cache)\n"
         f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
+        f"        uses: {BUILD_PUSH}\n"
         "        with:\n"
         "          provenance: false\n"
     )
@@ -5993,7 +6029,7 @@ def self_test() -> int:
         f"{build_push}"
         "      - name: Build ordinary production runtime (cold cache)\n"
         f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
+        f"        uses: {BUILD_PUSH}\n"
         "        with:\n"
         "          provenance: false\n"
     )
@@ -6014,7 +6050,7 @@ def self_test() -> int:
 
     rust_step = (
         "      - name: Cache FIPS Rust\n"
-        f"        uses: {RUST_CACHE} # v2\n"
+        f"        uses: {RUST_CACHE}\n"
         "        with:\n"
         "          shared-key: ci-fips\n"
         "          cache-on-failure: \"true\"\n"
@@ -6203,9 +6239,9 @@ def self_test() -> int:
         failures,
     )
 
-    real_fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
-    real_sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
-    real_linker = SETUP_FAST_LINKER.read_text(encoding="utf-8")
+    real_fips = read_pinned(FIPS_WORKFLOW)
+    real_sccache = read_pinned(SETUP_SCCACHE)
+    real_linker = read_pinned(SETUP_FAST_LINKER)
     admitted_failures: list[str] = []
     check_fips_action_allowlist(real_fips, "fips-build.yml", admitted_failures)
     check_no_sccache_credential_exporter(real_fips, "fips-build.yml", admitted_failures)
@@ -6225,7 +6261,7 @@ def self_test() -> int:
         failures,
     )
     github_script = (
-        "actions/github-script@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        "actions/github-script@0000000000000000000000000000000000000000"
     )
     setup_step = "      - uses: ./.github/actions/setup-sccache\n"
     require(
@@ -6464,7 +6500,7 @@ def self_test() -> int:
 
     unlisted_pin = real_fips.replace(
         setup_step,
-        "      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+        "      - uses: actions/setup-node@0000000000000000000000000000000000000000\n"
         + setup_step,
         1,
     )
@@ -6644,7 +6680,7 @@ def self_test() -> int:
     )
     require_fips_carrier(
         "self-test-duplicate-checkout",
-        f"      - uses: {CHECKOUT} # v6\n"
+        f"      - uses: {CHECKOUT}\n"
         "        with:\n"
         "          persist-credentials: false\n",
         ("occurrence counts", "observed="),
@@ -7290,20 +7326,20 @@ def self_test() -> int:
         "jobs:\n"
         "  fips-compile:\n"
         "    steps:\n"
-        f"      - uses: {CACHE_SAVE} # v4.2.4\n"
+        f"      - uses: {CACHE_SAVE}\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
         "          path: ${{ github.workspace }}/target\n"
         "          key: fips-producer-legacy\n"
         "  fips-clippy:\n"
         "    steps:\n"
-        f"      - uses: {CACHE_SAVE} # v4.2.4\n"
+        f"      - uses: {CACHE_SAVE}\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
         "  fips-test:\n"
         "    steps:\n"
-        f"      - uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"      - uses: {CACHE_RESTORE}\n"
         f"        if: {COLD_NOT_TRUE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
@@ -7357,7 +7393,7 @@ def self_test() -> int:
     consumer_download = (
         "      - name: Download FIPS producer handoff\n"
         f"        if: {COLD_NOT_TRUE}\n"
-        f"        uses: {DOWNLOAD_ARTIFACT} # v8\n"
+        f"        uses: {DOWNLOAD_ARTIFACT}\n"
         "        with:\n"
         "          pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*\n"
         "          path: ${{ runner.temp }}/fips-producer-channel\n"
@@ -7447,7 +7483,7 @@ def self_test() -> int:
         "    steps:\n"
         + consumer_download
         + "      - name: Save FIPS producer compile outputs\n"
-        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        uses: {CACHE_SAVE}\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n",
@@ -7535,7 +7571,7 @@ def self_test() -> int:
         failures,
     )
 
-    handoff_channel = FIPS_WORKFLOW.read_text(encoding="utf-8")
+    handoff_channel = read_pinned(FIPS_WORKFLOW)
     handoff_failures: list[str] = []
     check_fips_producer_channel(handoff_channel, handoff_failures)
     require(
@@ -7812,7 +7848,7 @@ def self_test() -> int:
     )
 
     missing_handoff_upload = handoff_channel.replace(
-        f"        uses: {UPLOAD_ARTIFACT} # v7\n",
+        f"        uses: {UPLOAD_ARTIFACT}\n",
         "        uses: actions/upload-artifact@untrusted\n",
         1,
     )
@@ -7863,7 +7899,7 @@ def self_test() -> int:
     eviction_prone_restore = handoff_channel.replace(
         "      - name: Download exact inter-run FIPS handoff artifact\n",
         "      - name: Restore eviction-prone FIPS handoff cache\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        uses: {CACHE_RESTORE}\n"
         "        with:\n"
         "          key: fips-handoff-legacy\n"
         "      - name: Download exact inter-run FIPS handoff artifact\n",
@@ -7914,10 +7950,10 @@ def self_test() -> int:
 
     tolerant_missing_artifact = handoff_channel.replace(
         "        id: inter-run-fips-handoff\n"
-        f"        uses: {DOWNLOAD_ARTIFACT} # v8\n",
+        f"        uses: {DOWNLOAD_ARTIFACT}\n",
         "        id: inter-run-fips-handoff\n"
         "        continue-on-error: true\n"
-        f"        uses: {DOWNLOAD_ARTIFACT} # v8\n",
+        f"        uses: {DOWNLOAD_ARTIFACT}\n",
         1,
     )
     tolerant_missing_failures: list[str] = []
@@ -7934,7 +7970,7 @@ def self_test() -> int:
     consumer_cache_restore = handoff_channel.replace(
         "      - name: Download FIPS producer handoff\n",
         "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        uses: {CACHE_RESTORE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
         "      - name: Download FIPS producer handoff\n",
@@ -7956,7 +7992,7 @@ def self_test() -> int:
     compile_cache_save = handoff_channel.replace(
         "      - name: Package FIPS producer handoff\n",
         "      - name: Save FIPS producer compile outputs\n"
-        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        uses: {CACHE_SAVE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
         "      - name: Package FIPS producer handoff\n",
@@ -8137,7 +8173,7 @@ def self_test() -> int:
     restore_step = (
         "      - name: Restore BuildKit local cache\n"
         f"        if: {COLD_NOT_TRUE}\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        uses: {CACHE_RESTORE}\n"
         "        with:\n"
         f"          path: /tmp/{scope}\n"
         f"          key: {buildkit_cache_key(scope)}\n"
@@ -8147,7 +8183,7 @@ def self_test() -> int:
     save_step = (
         "      - name: Save BuildKit local cache\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
-        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        uses: {CACHE_SAVE}\n"
         "        with:\n"
         f"          path: /tmp/{scope}\n"
         f"          key: {buildkit_cache_key(scope)}\n"
@@ -9109,7 +9145,7 @@ def self_test() -> int:
             chunks.append(
                 f"      - name: {name}\n"
                 f"{if_line}"
-                f"        uses: {BUILD_PUSH} # v7\n"
+                f"        uses: {BUILD_PUSH}\n"
                 "        with:\n"
                 "          context: .\n"
                 "          file: Dockerfile\n"
@@ -9205,10 +9241,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"::error::{failure}", file=sys.stderr)
         return 1 if failures else 0
 
-    fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
-    node = NODE_WORKFLOW.read_text(encoding="utf-8")
-    ambient = AMBIENT_WORKFLOW.read_text(encoding="utf-8")
-    ci = PERFORMANCE_WORKFLOW.read_text(encoding="utf-8")
+    fips = read_pinned(FIPS_WORKFLOW)
+    node = read_pinned(NODE_WORKFLOW)
+    ambient = read_pinned(AMBIENT_WORKFLOW)
+    ci = read_pinned(PERFORMANCE_WORKFLOW)
     check_common_trust(fips, "fips-build.yml", failures)
     check_common_trust(node, "node-waypoint-ebpf-live.yml", failures)
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
@@ -9217,13 +9253,13 @@ def main(argv: list[str] | None = None) -> int:
     check_ambient_workflow_cache_budget(ambient, failures)
     check_shared_actions(failures)
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
-        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        workflow = read_pinned(CI_WORKFLOW.parent / filename)
         check_completed_cache_producer(
             extract_job(workflow, job_name), f"{filename}/{job_name}", failures
         )
     check_performance_cache_wrapper_key(ci, "performance-regression.yml", failures)
     for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
-        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        workflow = read_pinned(CI_WORKFLOW.parent / filename)
         check_direct_rust_cache_diet(
             extract_job(workflow, job_name),
             f"{filename}/{job_name}",

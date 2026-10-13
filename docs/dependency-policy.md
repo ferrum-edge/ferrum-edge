@@ -606,6 +606,60 @@ reqwest/h3/tungstenite lineage needs an explicit path:
 6. Never silence an advisory without an expiry and a rationale — the expiry
    check will fail the weekly run otherwise (by design).
 
+### Cargo dependency updates
+
+`.github/dependabot.yml` schedules weekly `cargo` version updates for two
+directories:
+
+- `/`, the root workspace;
+- `/tests/performance/mesh`, the mesh benchmark crate. It path-depends on the
+  root crate and mirrors its `[patch.crates-io]` table, and the `Mesh Benchmark
+  Lockfile` workflow checks its lockfile.
+
+Minor and patch updates are grouped (`cargo-minor-patch`) into one PR per
+directory per week. A semver-major update gets its own PR. The crates replaced
+by a vendored `[patch.crates-io]` copy, and the `sqlx*` crates (which pin
+`sqlx-core` exactly), are in `ignore`. Moving one of them past its vendored
+version would make Cargo pick the crates.io release and drop the Ferrum patch
+without failing the build. Cargo only warns that the patch was unused. These
+crates move only through "Refreshing a vendored patch", "Retiring a vendored
+patch", or the emergency procedure above. `mongodb` is ignored from 3.9 on:
+`Cargo.toml` caps it below 3.9 to keep MongoDB 4.2 / Cosmos DB
+server-version-4.2 support, and the grouped update would otherwise widen that
+cap.
+
+The other standalone lockfiles get no version updates: `ebpf/` and `fuzz/` pin
+nightly toolchains, `tests/performance/multi_protocol/` must keep `# SYNC:`
+versions equal to the root, and the remaining benchmark harnesses are not worth
+weekly PRs. Dependabot security updates still cover every committed
+`Cargo.lock`, and the dependency-audit lanes audit the root, `ebpf/`, and every
+standalone workspace in the `standalone_cargo_manifests.py` inventory.
+
+**The repository Cargo config must not name a `rustc-wrapper`.** Every cargo
+process under the repository root reads `.cargo/config.toml`, including
+Dependabot's cargo updater. The updater runs `rustc -vV` through the configured
+wrapper and has no sccache. From PR #821 (2026-05-16) until the wrapper was
+removed, every cargo update failed before opening a PR with
+`dependency_file_not_resolvable` (`could not execute process 'sccache …/rustc -vV'`).
+That covered version and security updates, for the root and for every nested
+lockfile. sccache is selected outside the committed file:
+
+- in CI, `.github/actions/setup-sccache` exports `RUSTC_WRAPPER` and
+  `CARGO_BUILD_RUSTC_WRAPPER` as the checksum-verified binary, or clears them;
+- in cross-rs and container builds, `Cross.toml` and
+  `build_linux_gnu_sysroot.sh` pass both as empty values;
+- locally, `scripts/install-build-deps.sh` sets `build.rustc-wrapper` in the
+  user-level `$CARGO_HOME/config.toml`.
+
+`verify_cross_build_policy.py` (`EXPECTED_CARGO_BUILD`) allowlists exactly
+`[build] incremental = false` and rejects any committed `rustc-wrapper`. A
+`.cargo/config[.toml]` below the root is rejected outright, so a nested
+lockfile cannot get its own wrapper either.
+
+Dependabot cargo PRs use the `deps` commit prefix and the `dependencies` label,
+the same as the `docker` ecosystem. They run the ordinary PR CI, including the
+blocking dependency audit when `Cargo.lock` changes.
+
 ## Base image pinning
 
 Production container images (`Dockerfile`, `Dockerfile.release`, and
@@ -687,9 +741,13 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   rewrites the digest in place, re-runs the pin verifier, and opens or updates a
   single pull request on the fixed branch `deps/base-image-digests`. It is
   digest-preserving by construction: it substitutes a digest and never removes
-  one, never changes an image or tag. Required CI (multi-arch build, FIPS, eBPF,
-  GNU ABI scan, chart smoke) and `Trusted Cross Build Policy` must qualify the
-  latest reviewed PR head before merge.
+  one, never changes an image or tag, and it moves the `# Digest resolved
+  YYYY-MM-DD` comment above each rewritten pin (walking up over adjacent
+  `FROM`/`ARG` pin lines) to the run's UTC date. The ordinary required PR checks
+  and `Trusted Cross Build Policy` must qualify the latest reviewed PR head
+  before merge. Those are path-selected: for Dockerfile changes they include
+  the amd64 production Dockerfile smoke build, but multi-architecture image
+  builds, FIPS and the GNU ABI scan are not guaranteed to run on the PR.
   Every tracked Dockerfile and YAML file that pins a drifted reference is
   rewritten together; prose such as `CHANGELOG.md` keeps its history. That
   includes the `gcr.io/distroless/cc-debian13` runtime base: its consumers are
@@ -721,13 +779,16 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   explicit caller override remains supported. The refresh workflow already
   included this Dockerfile and updates its digest-pinned image references.
 
-Dependency and frozen-policy PRs may be admin-merged by a maintainer after
-verification. Before an admin merge, verify every proposed dependency version
-and image digest against its authoritative registry or upstream source, and
-require all other applicable required checks to pass on the reviewed head. Use
-this path only when an intentionally frozen trusted-policy gate cannot qualify
-the change; record the affected gate and its frozen contract in the PR body.
-An admin merge does not waive failed or missing unrelated required checks.
+An action pin rotation needs no admin merge: the trusted policy admits it
+(see "Automated action pin rotation" below), and Dependabot PRs auto-merge once
+green. A frozen-policy PR that the trusted gates cannot qualify by design, such
+as an edit to `verify_cross_build_policy.py` or another frozen executable
+surface, may be admin-merged by a maintainer after verification. Before an
+admin merge, verify every proposed dependency version and image digest against
+its authoritative registry or upstream source. Require all other applicable
+required checks to pass on the reviewed head, and record the affected gate and
+its frozen contract in the PR body. An admin merge does not waive failed or
+missing unrelated required checks.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
@@ -792,69 +853,119 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
 
 ### Refreshing GitHub Actions (Dependabot)
 
-`.github/dependabot.yml` already schedules weekly `github-actions` updates.
-When reviewing an actions Dependabot PR:
+`.github/dependabot.yml` schedules weekly `github-actions` updates for
+`.github/workflows` and every local composite action (`/.github/actions/*`).
+Compatible (minor and patch) updates arrive grouped in one PR; a semver-major
+update gets a PR of its own. Every external action is in scope, including the
+ones whose exact invocations the trusted Cross build, publication, and CI
+runtime-cache contracts freeze. Those used to be on an `ignore` list and needed
+a maintainer override to rotate; the trusted policy now admits their pin
+rotations itself (next section).
 
-1. Confirm the PR pins a full commit SHA (Dependabot for GitHub Actions should
-   produce SHA pins when the repo already uses them).
-2. Keep the trailing version comment accurate for the tag the SHA corresponds
-   to.
-3. Do not accept a PR that reintroduces a mutable tag ref.
+The one remaining `ignore` entry is `dtolnay/rust-toolchain`. It publishes no
+release tags (it keeps one force-updated branch per toolchain), so no new pin
+for it can pass the release-tag rule below. Rotating it stays a manual,
+maintainer-overridden change.
 
-Dependabot version updates are ignored for the external actions whose exact
-invocations are covered by the trusted Cross build and CI runtime-cache
-contracts: `actions/cache/restore`, `actions/cache/save`,
-`actions/checkout`, `actions/download-artifact`, `actions/setup-python`,
-`actions/upload-artifact`, `docker/build-push-action`, `docker/login-action`,
-`docker/setup-buildx-action`, `dtolnay/rust-toolchain`, `Swatinem/rust-cache`,
-and `taiki-e/install-action`. A SHA or version-comment change in these frozen
-jobs can fail the trusted checks on `main`, while `CI Plan` intentionally
-rejects direct edits to the frozen policy scripts. The `ignore` entries suppress
-version-update PRs; Dependabot security updates remain allowed.
+The rules for any action pin, whoever proposes it:
 
-#### Rotating frozen actions
+1. Pin a full 40-character commit SHA. Mutable tags, branches, and short SHAs
+   are rejected (`pr_ci_plan.py --self-test`, and every frozen surface, which
+   only normalizes full-SHA pins).
+2. The trailing version comment is informational. Keep it accurate for new
+   uses. It is not part of any frozen surface, so Dependabot may rewrite it
+   (`# v7.4.0` → `# v7.5.0`) or leave a major-only comment (`# v7`) alone.
+   Some guarded checkout sites still carry a historical `# v6` annotation on
+   the v7.0.1 SHA; an ordinary PR may now correct it.
 
-Schedule a periodic review of the ignored actions for upstream releases and
-security fixes. When an update is due, prepare one coordinated rotation PR,
-modeled on [#5675](https://github.com/ferrum-edge/ferrum-edge/pull/5675): update
-the affected workflow pins and version comments, the corresponding trusted
-contracts, and the action pin records in this document together. The PR is
-expected to fail `CI Plan` and trusted checks that use policy from `main`; this
-is by design. A maintainer override is needed after `Candidate policy
-self-test` and the CI aggregate wiring check pass. Do not land a partial action
-bump and defer the contract update.
+### Automated action pin rotation
 
-The setup-python v7.0.0 pin (`5fda3b95…`) now covers every use, including the
-previously frozen compiler-store `produce` and platform-study `study` jobs.
-Those two jobs were rotated in a coordinated trusted-policy update because their
-Cross-sensitive bodies cannot change through an ordinary pull request. The v7
-action still runs on Node 24 and accepts the existing `python-version: '3.13'`
-input; its removed `pip-install` input is not used here. Future Dependabot
-updates that only retarget already-v7 uses can land via ordinary PR; a SHA
-change inside a Cross-frozen job still requires a coordinated trusted-policy
-rotation.
+`verify_cross_build_policy.py` makes every frozen workflow, local-action, and
+template comparison over pin-normalized text. A
+`uses: owner/repo[/path]@<40-hex SHA>` reference keeps its action path, but its
+commit and trailing comment are replaced by a placeholder
+(`normalize_action_pins`). A frozen surface therefore still freezes which
+action runs, with which inputs, in which job. It no longer freezes which
+upstream release commit of that action runs. Changing the action path, adding a
+`uses:` step, or replacing a pin with a mutable ref still changes the
+normalized text, and the freeze refuses it as before.
 
-The ARM64 Cross build and publication contracts are deliberately frozen by the
-trusted `pull_request_target` verifier. Existing checkout uses on the guarded
-workflow surfaces still carry the historical `# v6` annotation, although their
-pinned `3d3c42e5...` SHA resolves to v7.0.1. The verifier treats an adjacent
-annotation change as a change to that executable surface, so an ordinary pull
-request cannot normalize those comments. Correct them only as part of an
-authorized, coordinated rotation of the trusted policy; do not copy the legacy
-annotation onto new uses.
+The pinned commit is governed by `action_pin_rotation_errors`, which
+`Trusted Cross Build Policy` (the required `pull_request_target` gate, run from
+the live trusted base) applies to every pull request. It judges the YAML lines
+the pull request itself adds, taken from its three-dot diff against the live
+trusted tip (`--proposed-changes`). It checks them against the raw YAML of that
+tip: workflows, local actions, and YAML under the automation roots. A branch
+cut before a rotation therefore does not read as a downgrade of pins it never
+touched, because its merge keeps the trusted tip's newer pin. For each upstream
+repository that the trusted tip already pins, every new commit on an added line
+must pass two checks:
 
-The install-action v2.87.15 pin (`4076c08d…`) covers `ci.yml`,
-`dependency-audit.yml`, the coverage workflow, and the ARM64 release producer.
-The release producer's `WORKFLOW_CONTRACTS` job digest was rotated with the pin;
-the action retains the existing `tool`/`fallback` inputs.
+- **Release tag.** The commit must be the target (peeled, for annotated tags)
+  of an upstream release tag (`v?N[.N…]`). The tags are read from
+  `https://github.com/<owner>/<repo>` itself with `git ls-remote`. A bare
+  commit SHA can also resolve through the fork network, but such a commit is
+  not an upstream release, so it fails this check.
+- **Forward only.** The commit must descend from every commit the trusted base
+  pins for that repository. A commit-only `git fetch --filter=tree:0` of that
+  release tag must contain each trusted pin. This refuses downgrades and side
+  branches.
 
-The docker/setup-buildx-action v4.4.1 pin (`f87e5991…`) and
-docker/build-push-action v7.4.0 pin (`c3c9e263…`) cover the release publication
-jobs and the image build workflows. The trusted ARM64 publication exact-job,
-step, and artifact-selection contracts, along with the NodeWaypoint and Ambient
-registry-cache jobs and the CI runtime-cache pin checks, were rotated to those
-same SHAs. Future SHA changes inside a frozen job require a coordinated
-trusted-policy rotation even when the action inputs stay the same.
+Upstream lookups use literal-argv `git` with the remote supplied as
+configuration, retry transient failures, and fail closed. An unreachable
+upstream refuses the rotation until a re-run succeeds. A repository the
+trusted base does not pin yet is not a rotation, so this check skips it. The
+freeze and ordinary review still apply to it.
+
+The other gates that used to compare exact SHAs now compare pin shape instead
+and leave the commit to the check above:
+
+- `cross-build-policy.yml` and the `CI Plan` early guard accept a
+  `cross-build-policy.yml` change only when the live trusted verifier reports
+  it pin-only (`--pin-normalized-equal`). `verify_cross_build_policy.py` itself
+  stays byte-protected.
+- `verify_trusted_local_action.py` (Helm Chart) treats a YAML file that differs
+  from the trusted bytes only in pins as identical.
+- `verify_ci_runtime_cache.py`, `verify_publication_gate.py`,
+  `verify_release_image_attestations.py`, `verify_required_ci.py`,
+  `test_ci_policy_parallel.py`, `verify_main_latest_image_workflow.py`, and
+  `tests/conformance/live_contract.rs` require a full-commit pin of the named
+  action instead of one literal commit. `verify_main_latest_image_workflow.py`
+  still requires the publisher to use the same pins as `release.yml`.
+
+`CI Policy` runs the trusted verifier against the proposal alone, with no
+trusted baseline to compare against, so it cannot judge rotations. The
+admission authority for pins is `Trusted Cross Build Policy`. Both are
+required.
+
+### Automated dependency merges
+
+`.github/workflows/dependabot-auto-merge.yml` queues GitHub auto-merge, with a
+merge commit, on pull requests that Dependabot opened from a branch of this
+repository and last pushed to. Queuing is not merging. GitHub merges only
+after every required check passes on the PR head, including `Trusted Cross
+Build Policy`'s pin rotation check. The rules:
+
+- semver-major updates are left for a maintainer;
+- a push to a Dependabot branch by anyone other than Dependabot withdraws the
+  queued merge, so a human-edited bump returns to human review;
+- the workflow runs from `main` (`pull_request_target`), never checks out or
+  executes PR content, and holds only the built-in `GITHUB_TOKEN`. No stored
+  credential exists;
+- the repository setting **Allow auto-merge** must stay enabled.
+
+A merge that GitHub performs for a `GITHUB_TOKEN`-queued auto-merge does not
+start `push`-triggered workflows. A Dependabot merge commit therefore has no
+exact-commit push-to-`main` evidence of its own and is not a release candidate
+by itself (see `docs/ci_cd.md` → "Publish-blocking required checks"). The next
+maintainer merge on top of it produces that evidence for a commit that
+contains the bump. `main-latest-image.yml` likewise advances on that next
+push.
+
+Cargo PRs follow the same path (see "Cargo dependency updates"). The grouped
+`cargo-minor-patch` PRs auto-merge once every required check passes, including
+the blocking dependency audit. A semver-major crate update waits for a
+maintainer, and the vendored `[patch.crates-io]` crates are never proposed.
 
 #### Scope of the repository-script (automation) freeze
 

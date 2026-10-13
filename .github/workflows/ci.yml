@@ -128,10 +128,27 @@ jobs:
           # This cheap rejection mirrors the protected-policy workflow. The
           # complete semantic scan runs independently in CI Policy.
           if ! git diff --no-ext-diff --quiet "${TRUSTED_BASE_SHA}...HEAD" -- \
-            .github/scripts/verify_cross_build_policy.py \
-            .github/workflows/cross-build-policy.yml; then
+            .github/scripts/verify_cross_build_policy.py; then
             echo "::error::frozen policy files changed; a reviewed policy migration is required" >&2
             exit 1
+          fi
+          # The policy workflow admits one ordinary change, mirroring its own
+          # guard: an action pin rotation of its steps. The trusted verifier
+          # decides "pins only"; Trusted Cross Build Policy governs the pins.
+          policy_workflow=.github/workflows/cross-build-policy.yml
+          if ! git diff --no-ext-diff --quiet "${TRUSTED_BASE_SHA}...HEAD" -- \
+            "$policy_workflow"; then
+            pin_check="$RUNNER_TEMP/frozen-policy-pin-check"
+            mkdir -p "$pin_check"
+            git show "${TRUSTED_BASE_SHA}:.github/scripts/verify_cross_build_policy.py" \
+              > "$pin_check/verify_cross_build_policy.py"
+            git show "${TRUSTED_BASE_SHA}:${policy_workflow}" > "$pin_check/trusted.yml"
+            git show "HEAD:${policy_workflow}" > "$pin_check/proposed.yml"
+            if ! python3 -I "$pin_check/verify_cross_build_policy.py" \
+              --pin-normalized-equal "$pin_check/trusted.yml" "$pin_check/proposed.yml"; then
+              echo "::error::frozen policy files changed; a reviewed policy migration is required" >&2
+              exit 1
+            fi
           fi
 
       - name: Validate trusted PR CI planner examples
@@ -1704,9 +1721,9 @@ jobs:
       contents: read
       id-token: write
     # cargo-deny only runs `cargo metadata` (no compilation), so this job does
-    # not install sccache. Clear the checked-in sccache rustc-wrapper
-    # (.cargo/config.toml `[build] rustc-wrapper = "sccache"`) — same fallback
-    # the setup-sccache action uses — so `cargo metadata` doesn't try to exec a
+    # not install sccache. `.cargo/config.toml` names no rustc-wrapper, but
+    # clear any runner- or user-level one anyway — same fallback the
+    # setup-sccache action uses — so `cargo metadata` doesn't try to exec a
     # binary that isn't on PATH.
     env:
       RUSTC_WRAPPER: ""

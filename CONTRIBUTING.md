@@ -57,10 +57,19 @@ host sizing, not a missing bootstrap package; do not change `[profile.dev]` for 
 
 ### One-time local bootstrap
 
-The checked-in [`.cargo/config.toml`](.cargo/config.toml) requires **sccache** for all
-targets, **clang + mold** for x86_64/aarch64 GNU/Linux, and **lld** (`ld64.lld` on PATH)
-for x86_64/aarch64 macOS. Install these tools before the first build, or use the explicit
-fallback below. From the cloned repository, run the bootstrap once per workstation:
+The checked-in [`.cargo/config.toml`](.cargo/config.toml) requires **clang + mold** for
+x86_64/aarch64 GNU/Linux and **lld** (`ld64.lld` on PATH) for x86_64/aarch64 macOS.
+Install these tools before the first build, or use the explicit fallback below.
+
+**sccache** is recommended but opt-in. The repository config deliberately names no
+`rustc-wrapper`: every cargo process that reads it would have to exec the wrapper,
+including Dependabot's cargo updater, which has no sccache. Enable it per user instead,
+either with `rustc-wrapper = "sccache"` in the `[build]` table of your
+`$CARGO_HOME/config.toml` (cargo merges it under the repository config) or with
+`export RUSTC_WRAPPER=sccache` in your shell profile. The bootstrap below does the
+former for you.
+
+From the cloned repository, run the bootstrap once per workstation:
 
 ```bash
 ./scripts/install-build-deps.sh
@@ -71,22 +80,28 @@ and apt- or dnf-based Linux with `sudo` access and Rust/Cargo on PATH. On macOS 
 installs `sccache`, `lld`, `cmake`, and `curl` via Homebrew; on Debian/Ubuntu it
 installs `mold`, `clang`, `cmake`, and `libcurl4-openssl-dev` via apt; on Fedora/RHEL
 it installs `mold`, `clang`, `cmake`, and `libcurl-devel` via dnf. Linux then installs
-`sccache` via `cargo install --locked` if missing. It does not install Rust or `protoc`.
+`sccache` via `cargo install --locked` if missing. It then adds
+`rustc-wrapper = "sccache"` to `$CARGO_HOME/config.toml` (default `~/.cargo/config.toml`)
+when that file sets no wrapper and has no existing `[build]` settings; otherwise it prints
+the line to add. This is a per-user setting, so it also applies to your other cargo
+projects. Set `FERRUM_SKIP_CARGO_WRAPPER_CONFIG=1` to skip it. It does not install Rust
+or `protoc`.
 It detects the OS, not the architecture; package availability depends on the host's
 repositories. It does not set up cross-compilation toolchains.
 
 On other Linux distributions, install the same tools through your distribution's package
 manager or use the fallback. The script rejects other operating systems, including Windows.
-Windows keeps its system linker (`link.exe` for MSVC), but still needs `sccache` installed
-manually or the wrapper disabled. Targets outside the four triples above have no fast-linker
-override in the checked-in configuration.
+Windows keeps its system linker (`link.exe` for MSVC) and builds without sccache unless you
+install it and set the wrapper yourself. Targets outside the four triples above have no
+fast-linker override in the checked-in configuration.
 
 CI installs the linker/cache tools through separate setup actions. GitHub-hosted Ubuntu
 images already include `cmake`; Linux CI jobs and `setup-rust-ci` install
 `libcurl4-openssl-dev`. The Docker builder and `Dockerfile.test` install `cmake`;
-ARM64 Cross `pre-build` installs both `cmake` and `libcurl4-openssl-dev`. Missing tools
-locally cause a build failure; there is no automatic local fallback. To relocate the
-compiler cache, set `SCCACHE_DIR` in your shell profile.
+ARM64 Cross `pre-build` installs both `cmake` and `libcurl4-openssl-dev`. A missing linker
+tool locally causes a build failure; there is no automatic local fallback. A wrapper you
+configured but whose `sccache` binary is gone fails the same way. To relocate the compiler
+cache, set `SCCACHE_DIR` in your shell profile.
 
 #### Build without sccache or fast linkers
 
@@ -106,9 +121,9 @@ env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
   CARGO_BUILD_RUSTC_WRAPPER="" RUSTFLAGS="" cargo build --release
 ```
 
-`CARGO_BUILD_RUSTC_WRAPPER=""` overrides `[build] rustc-wrapper` and disables the wrapper.
-To disable only sccache, use that setting without changing linker flags (and unset any
-separate `RUSTC_WRAPPER`). On Windows PowerShell, use
+`CARGO_BUILD_RUSTC_WRAPPER=""` overrides any user-level `[build] rustc-wrapper` and
+disables the wrapper. To disable only sccache, use that setting without changing linker
+flags (and unset any separate `RUSTC_WRAPPER`). On Windows PowerShell, use
 `$env:RUSTC_WRAPPER = ""; $env:CARGO_BUILD_RUSTC_WRAPPER = ""` before `cargo build --release`.
 See Cargo's [environment precedence](https://doc.rust-lang.org/cargo/reference/config.html#environment-variables),
 [wrapper configuration](https://doc.rust-lang.org/cargo/reference/config.html#buildrustc-wrapper),
