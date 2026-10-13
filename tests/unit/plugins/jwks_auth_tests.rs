@@ -1315,6 +1315,72 @@ async fn test_jwks_auth_non_bearer_scheme() {
     assert_continue(result);
 }
 
+/// The mesh metadata-emission flag must not make
+/// authentication optional. A sole `jwks_auth` with only that flag set rejects
+/// a credential-less request in both auth modes.
+#[tokio::test]
+async fn test_mesh_metadata_flag_alone_does_not_allow_missing_token() {
+    let (_server, jwks_uri) = start_jwks_server(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .await;
+    let mut config = single_provider_config(&jwks_uri);
+    config["emit_mesh_request_principal_metadata"] = json!(true);
+    let plugin: Arc<dyn Plugin> = Arc::new(JwksAuth::new(&config, default_client()).unwrap());
+
+    for mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut ctx = make_ctx();
+        let result = ferrum_edge::proxy::run_authentication_phase(
+            mode,
+            std::slice::from_ref(&plugin),
+            &mut ctx,
+            &ConsumerIndex::new(&[]),
+        )
+        .await;
+
+        let (status, _, _) = result.expect("a missing token must be rejected");
+        assert_eq!(status, 401);
+        assert!(
+            !ctx.metadata
+                .contains_key("mesh_request_auth.permissive_missing_token"),
+            "the metadata flag must not mark a missing token permissive"
+        );
+        assert!(ctx.identified_consumer.is_none());
+        assert!(ctx.authenticated_identity.is_none());
+    }
+}
+
+/// The explicit `allow_missing_token` opt-in keeps Istio's permissive
+/// RequestAuthentication semantics for a sole applicable plugin.
+#[tokio::test]
+async fn test_allow_missing_token_passes_credential_less_request() {
+    let (_server, jwks_uri) = start_jwks_server(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .await;
+    let mut config = single_provider_config(&jwks_uri);
+    config["allow_missing_token"] = json!(true);
+    let plugin: Arc<dyn Plugin> = Arc::new(JwksAuth::new(&config, default_client()).unwrap());
+
+    for mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut ctx = make_ctx();
+        let result = ferrum_edge::proxy::run_authentication_phase(
+            mode,
+            std::slice::from_ref(&plugin),
+            &mut ctx,
+            &ConsumerIndex::new(&[]),
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "allow_missing_token must pass a request without a token"
+        );
+        assert!(ctx.identified_consumer.is_none());
+        assert!(ctx.authenticated_identity.is_none());
+    }
+}
+
 // ─── Single Provider JWKS Validation ───────────────────────────────────
 
 #[tokio::test]
@@ -1325,6 +1391,7 @@ async fn test_mesh_request_auth_permissive_foreign_scheme_is_missing_token() {
     .await;
     let mut config = single_provider_config(&jwks_uri);
     config["emit_mesh_request_principal_metadata"] = json!(true);
+    config["allow_missing_token"] = json!(true);
     let plugin: Arc<dyn Plugin> = Arc::new(JwksAuth::new(&config, default_client()).unwrap());
     let mut ctx = make_ctx();
     ctx.headers.insert(

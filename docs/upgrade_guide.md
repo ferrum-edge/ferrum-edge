@@ -39,6 +39,15 @@ contains a short key and keeps its previous config; a newly started DP has no
 config at all. **Rotate every short key before upgrading** file-mode gateways
 and CP/DP deployments, through `POST /consumers/{id}/credentials/keyauth` (add
 the new key, move clients, then delete the old entry).
+### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
+
+`emit_mesh_request_principal_metadata: true` used to let a request without a
+token through unauthenticated when that `jwks_auth` was the only applicable
+auth plugin. It now only emits metadata, and such a request gets `401`. Mesh
+mode is unaffected: its generated RequestAuthentication plugin sets the new
+`allow_missing_token: true` option. If a standalone gateway relied on the old
+pass-through for optional authentication, set `allow_missing_token: true` on
+that `jwks_auth` explicitly. The gateway logs a warning for it.
 
 ### Gateway material references from `ns`-claimed operator tokens (#6092, PR #6316)
 
