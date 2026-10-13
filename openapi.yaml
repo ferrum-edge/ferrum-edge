@@ -28303,9 +28303,9 @@ components:
             a complete origin, contain the literal authority, or end in a fixed
             non-public domain after its first dot (optionally with a literal
             port), or every match must start with a literal scheme://host:. A native `*.suffix` wildcard is refused with credentials
-            when the suffix is a single label, a public suffix, or the parent
-            of a Public Suffix List wildcard rule (`*.com`, `*.co.uk`,
-            `*.github.io`, `*.run.app`).
+            when the suffix is a single label, a public suffix, or has a
+            Public Suffix List rule beneath it (`*.com`, `*.co.uk`,
+            `*.github.io`, `*.run.app`, `*.amazonaws.com`).
         max_age:
           type: integer
           format: uint64
