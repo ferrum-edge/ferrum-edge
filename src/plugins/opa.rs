@@ -687,10 +687,9 @@ impl Plugin for Opa {
         self.include_body.then_some(self.max_body_bytes)
     }
 
-    /// OPA's own decision no longer reads `ctx.query_params` — it decodes the
-    /// forwarded query itself, identically on H1/H2/H3. This stays true so a
-    /// proxy configured with OPA keeps exposing the decoded shared map to the
-    /// other plugins in its chain, rather than flipping H3 back to raw values.
+    /// OPA's decision does not read `ctx.query_params` — it decodes the
+    /// forwarded query itself, identically on H1/H2/H3. Declared when the
+    /// query is part of the policy input.
     fn requires_decoded_query_params(&self) -> bool {
         self.include_query
     }

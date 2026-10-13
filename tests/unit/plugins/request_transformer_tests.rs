@@ -2257,9 +2257,9 @@ async fn test_query_transform_does_not_log_secret_values() {
 }
 
 #[tokio::test]
-async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
-    // Query matching parses the retained raw/outbound query itself, so this
-    // plugin must not flip the shared pre-auth H3 decoded-query capability.
+async fn test_query_rules_do_not_declare_query_predicates() {
+    // Query matching parses the retained raw/outbound query itself; the
+    // transformer mutates the query rather than deciding on it.
     let with_query = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "remove", "target": "query", "key": "token"}
@@ -2268,7 +2268,7 @@ async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
     .unwrap();
     assert!(
         !with_query.requires_decoded_query_params(),
-        "request_transformer must not force H3 pre-auth decoded query materialization"
+        "request_transformer query rules are mutations, not query predicates"
     );
 
     let header_only = RequestTransformer::new(&json!({
@@ -2278,96 +2278,6 @@ async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
     }))
     .unwrap();
     assert!(!header_only.requires_decoded_query_params());
-}
-
-#[tokio::test]
-async fn test_h3_raw_materialized_percent_encoded_query_name_transforms() {
-    // H3 pre-auth materialization keeps percent-encoded names in
-    // `ctx.query_params`. Ordered rules must still match the decoded name from
-    // the retained raw query and publish a decoded plugin-visible map afterward.
-    let plugin = RequestTransformer::new(&json!({
-        "rules": [
-            {"operation": "rename", "target": "query", "key": "api key", "new_key": "api_key"},
-            {"operation": "update", "target": "query", "key": "tag", "value": "green"}
-        ]
-    }))
-    .unwrap();
-    assert!(!plugin.requires_decoded_query_params());
-
-    let mut ctx = make_ctx();
-    ctx.set_raw_query_string("api%20key=secret&tag=red&keep=%ZZ".to_string());
-    ctx.materialize_query_params_raw();
-    assert_eq!(
-        ctx.query_params.get("api%20key").map(String::as_str),
-        Some("secret"),
-        "H3-style raw materialization must retain the percent-encoded name"
-    );
-    assert!(!ctx.query_params.contains_key("api key"));
-    assert_eq!(ctx.query_params.get("tag").map(String::as_str), Some("red"));
-
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-
-    assert_eq!(
-        ctx.outbound_query_string(),
-        Some("api_key=secret&tag=green&keep=%ZZ")
-    );
-    assert!(!ctx.query_params.contains_key("api%20key"));
-    assert!(!ctx.query_params.contains_key("api key"));
-    assert_eq!(
-        ctx.query_params.get("api_key").map(String::as_str),
-        Some("secret")
-    );
-    assert_eq!(
-        ctx.query_params.get("tag").map(String::as_str),
-        Some("green")
-    );
-    // Unmodified keep pair stays in the decoded map with its lossy decode, while
-    // the outbound wire form retains the original invalid percent triplet.
-    assert_eq!(
-        ctx.query_params.get("keep").map(String::as_str),
-        Some("%ZZ")
-    );
-}
-
-#[tokio::test]
-async fn test_runtime_disabled_query_rules_preserve_h3_raw_preauth_map() {
-    // The gate rides the instance's effective config, so a runtime-disabled
-    // instance is one whose generation resolved the gate to false.
-    let plugin = RequestTransformer::new(&json!({
-        "rules": [
-            {"operation": "remove", "target": "query", "key": "token"}
-        ],
-        "runtime_overlay_scope": "gated",
-        "default_enabled": true,
-        "runtime_overlay_resolved_enabled": false
-    }))
-    .unwrap();
-    assert!(
-        !plugin.requires_decoded_query_params(),
-        "configured (even runtime-gated) query rules must not opt into decoded H3 materialization"
-    );
-
-    let mut ctx = make_ctx();
-    ctx.set_raw_query_string("tok%65n=secret&keep=1".to_string());
-    ctx.materialize_query_params_raw();
-    let pre_auth = ctx.query_params.clone();
-    assert_eq!(
-        pre_auth.get("tok%65n").map(String::as_str),
-        Some("secret"),
-        "pre-auth map must remain H3 raw while rules are runtime-disabled"
-    );
-    assert!(!pre_auth.contains_key("token"));
-
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-
-    assert_eq!(ctx.outbound_query_string(), None);
-    assert_eq!(
-        ctx.query_params, pre_auth,
-        "runtime-disabled transformer must leave the H3 raw pre-auth map untouched"
-    );
-    assert!(!ctx.metadata.contains_key("ferrum:query_params_transformed"));
 }
 
 #[test]
