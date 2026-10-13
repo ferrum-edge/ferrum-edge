@@ -1,11 +1,10 @@
 # ── Build configuration shared by local and CI ─────────────────────────────
 #
-# This file is the single source of truth for build speedups. Both local
-# `cargo` invocations and remote CI use the same settings. CI installs the
-# required tools via `.github/actions/setup-sccache` and
-# `.github/actions/setup-fast-linker`; if a tool's install fails, those
-# actions clear the corresponding env vars so cargo falls back to the
-# platform default. Local developers bootstrap the same tools once via
+# This file is the single source of truth for the fast-linker and network
+# settings. Both local `cargo` invocations and remote CI use them. CI installs
+# the linker tools via `.github/actions/setup-fast-linker`; if the install
+# fails, that action clears the corresponding env vars so cargo falls back to
+# the platform default. Local developers bootstrap the same tools once via
 # `scripts/install-build-deps.sh`.
 #
 # Why explicit triples (not cfg() forms): env-var overrides like
@@ -13,12 +12,18 @@
 # cargo does not merge them with cfg()-based sections. Keeping the
 # sections explicit keeps the CI fallback working.
 
-# ── sccache ─────────────────────────────────────────────────────────────
-# Compiler cache. ~100% hit rate on clean rebuilds. Honors $SCCACHE_DIR if
-# set in the shell environment (local custom cache location).
-# Install: `cargo install sccache` (local) or `setup-sccache` action (CI).
+# ── sccache (environment-selected, never committed here) ───────────────
+# This file deliberately sets no `rustc-wrapper`. Every cargo process that
+# reads it would have to exec the wrapper, including ones that only resolve
+# the dependency graph: Dependabot's cargo updater runs `rustc -vV` through
+# it, has no sccache, and failed every run while the wrapper was committed
+# here (`dependency_file_not_resolvable`).
+# - CI: `.github/actions/setup-sccache` exports RUSTC_WRAPPER /
+#   CARGO_BUILD_RUSTC_WRAPPER as the checksum-verified binary, or clears them.
+# - Local: `scripts/install-build-deps.sh` sets `build.rustc-wrapper` in your
+#   user-level $CARGO_HOME/config.toml, or export RUSTC_WRAPPER=sccache.
+# sccache honors $SCCACHE_DIR if it is set in the shell environment.
 [build]
-rustc-wrapper = "sccache"
 incremental = false       # prevent cache corruption on concurrent/agent builds and external APFS volumes
 
 # ── Fast linkers (per-platform) ─────────────────────────────────────────

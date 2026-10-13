@@ -2,7 +2,10 @@
 # Bootstrap the optional toolchain extras that .cargo/config.toml expects,
 # plus the native packages rdkafka-sys needs to compile librdkafka from source
 # (`cmake-build` + vendored TLS for kafka_logging; see docs/dependency-policy.md):
-# - sccache (rustc-wrapper for cross-branch compile cache)
+# - sccache (rustc-wrapper for cross-branch compile cache). The repository
+#   config does not select it (Dependabot's cargo updater has no sccache), so
+#   this script also enables it in your user-level $CARGO_HOME/config.toml.
+#   Set FERRUM_SKIP_CARGO_WRAPPER_CONFIG=1 to leave that file alone.
 # - mold (Linux) / lld (macOS) for faster link times
 # - cmake (configures librdkafka)
 # - curl development headers (librdkafka still requires curl/curl.h even
@@ -26,7 +29,7 @@ case "${os}" in
       exit 1
     fi
     echo "Installing sccache + lld + cmake + curl via Homebrew..."
-    # sccache: rustc-wrapper required by .cargo/config.toml
+    # sccache: compiler cache, enabled as the user-level rustc-wrapper below
     # lld: fast linker (`ld64.lld`) required by .cargo/config.toml on macOS
     # cmake: rdkafka-sys cmake-build configures librdkafka from source
     # curl: Homebrew formula ships curl/curl.h (headers are not on the
@@ -65,6 +68,50 @@ case "${os}" in
     exit 1
     ;;
 esac
+
+# Enable sccache as the user-level rustc wrapper. The checked-in
+# .cargo/config.toml must not name it (see the sccache note there), and cargo
+# merges $CARGO_HOME/config.toml under the repository config, so a wrapper set
+# here applies to this checkout. It is a per-user setting: it also applies to
+# other cargo projects on this machine.
+configure_rustc_wrapper() {
+  if [ "${FERRUM_SKIP_CARGO_WRAPPER_CONFIG:-}" = "1" ]; then
+    echo "FERRUM_SKIP_CARGO_WRAPPER_CONFIG=1: not configuring a rustc wrapper."
+    return
+  fi
+  if ! command -v sccache > /dev/null; then
+    echo "sccache is not on PATH; not configuring a rustc wrapper." >&2
+    return
+  fi
+  if [ -n "${RUSTC_WRAPPER:-}" ] || [ -n "${CARGO_BUILD_RUSTC_WRAPPER:-}" ]; then
+    echo "RUSTC_WRAPPER / CARGO_BUILD_RUSTC_WRAPPER is already set in this shell; leaving cargo config unchanged."
+    return
+  fi
+
+  local cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+  local config="${cargo_home}/config.toml"
+  if [ ! -f "$config" ] && [ -f "${cargo_home}/config" ]; then
+    config="${cargo_home}/config"
+  fi
+
+  if [ -f "$config" ] && grep -Eq '^[[:space:]]*(build\.)?rustc-wrapper[[:space:]]*=' "$config"; then
+    echo "${config} already sets a rustc-wrapper; leaving it unchanged."
+    return
+  fi
+  # Appending a second [build] table (or a [build] table after dotted
+  # `build.*` keys) would make the file invalid TOML and break every cargo
+  # command, so only append to a file that has neither.
+  if [ -f "$config" ] && grep -Eq '^[[:space:]]*(\[build\]|build\.)' "$config"; then
+    echo "${config} already has build settings. Add this to its [build] table to enable sccache:" >&2
+    echo '  rustc-wrapper = "sccache"' >&2
+    return
+  fi
+
+  mkdir -p "$cargo_home"
+  printf '\n[build]\nrustc-wrapper = "sccache"\n' >> "$config"
+  echo "Enabled sccache: added build.rustc-wrapper = \"sccache\" to ${config}"
+}
+configure_rustc_wrapper
 
 echo ""
 echo "Done. Verify:"

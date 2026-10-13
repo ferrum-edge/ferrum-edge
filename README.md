@@ -57,8 +57,10 @@ On Kubernetes, map each mode to its chart or external contract in
 
 - **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
 - **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
-- **sccache and platform linker tools** — required by `.cargo/config.toml`; complete the
-  [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building.
+- **Platform linker tools** — required by `.cargo/config.toml`; complete the
+  [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building. The
+  bootstrap also installs **sccache** and enables it as your user-level rustc wrapper
+  (recommended, not required).
 - **cmake and curl development headers** — required by `rdkafka-sys` to compile
   librdkafka from source (`kafka_logging` vendored TLS). The bootstrap script
   installs `cmake` plus `libcurl4-openssl-dev` (Debian/Ubuntu), `libcurl-devel`

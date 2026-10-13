@@ -2,9 +2,11 @@ name: Setup sccache
 description: >-
   Installs a checksum-pinned sccache release from mozilla/sccache GitHub
   releases and wires it as the cargo rustc wrapper. The checked-in
-  `.cargo/config.toml` hardcodes `[build] rustc-wrapper = "sccache"` so
-  local developers get caching once sccache is on PATH; this action provides
-  the CI half of that contract.
+  `.cargo/config.toml` deliberately sets no `rustc-wrapper` (Dependabot's
+  cargo updater has no sccache and would exec it), so this action is the only
+  thing that enables sccache in CI: it exports `RUSTC_WRAPPER` and
+  `CARGO_BUILD_RUSTC_WRAPPER` as the verified binary path. Local developers
+  opt in through `scripts/install-build-deps.sh`.
 
   This action does not invoke mozilla-actions/sccache-action (or any other
   installer that `core.exportVariable`s `ACTIONS_RUNTIME_TOKEN` /

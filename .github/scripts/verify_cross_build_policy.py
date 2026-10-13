@@ -76,8 +76,11 @@ EXPECTED_PASSTHROUGH = (
     "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
     "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar",
 )
+# No committed `rustc-wrapper`: every cargo process that reads the root config
+# would have to exec it, including Dependabot's cargo updater, which has no
+# sccache. CI selects the verified sccache binary through RUSTC_WRAPPER /
+# CARGO_BUILD_RUSTC_WRAPPER (setup-sccache), and Cross clears both.
 EXPECTED_CARGO_BUILD = {
-    "rustc-wrapper": "sccache",
     "incremental": False,
 }
 EXPECTED_CARGO_TARGETS = {
@@ -6152,8 +6155,7 @@ def validate_cargo_tool_configuration(parsed: Any) -> list[str]:
     errors.extend(exact_keys(build, set(EXPECTED_CARGO_BUILD), ".cargo config build"))
     if not errors and build != EXPECTED_CARGO_BUILD:
         errors.append(
-            ".cargo config build must retain the approved rustc-wrapper and "
-            "incremental values"
+            ".cargo config build must retain the approved incremental value"
         )
 
     targets = parsed["target"]
@@ -20246,6 +20248,14 @@ pre_build = []
         "custom rustc": {
             **valid_cargo_tool,
             "build": {**valid_cargo_tool["build"], "rustc": "./ci/rustc"},
+        },
+        "committed rustc wrapper": {
+            **valid_cargo_tool,
+            "build": {**valid_cargo_tool["build"], "rustc-wrapper": "sccache"},
+        },
+        "repository rustc wrapper": {
+            **valid_cargo_tool,
+            "build": {**valid_cargo_tool["build"], "rustc-wrapper": "./ci/wrapper"},
         },
         "workspace rustc wrapper": {
             **valid_cargo_tool,

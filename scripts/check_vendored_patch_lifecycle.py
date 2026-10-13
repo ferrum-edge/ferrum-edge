@@ -8,6 +8,8 @@ dependency-audit workflow runs --upstream-status after parity passes.
 Parity mode fails closed when the lifecycle contract drifts from:
   - root Cargo.toml [patch.crates-io]
   - tests/performance/mesh/Cargo.toml mirrored [patch.crates-io]
+  - .github/dependabot.yml cargo `ignore` entries, so a Dependabot version
+    update can never move a patched crate past its vendored copy
   - vendor/*-ferrum-patched directories (vendor_path is derived from crate and
     vendored_version, so a version typo cannot hide behind an existing directory)
   - scripts/check_vendored_patch_status.sh safe wrapper delegation
@@ -31,6 +33,7 @@ mutation). --upstream-status self-tests, then parity, then network reporting.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -48,6 +51,11 @@ POLICY_PATH = ROOT / "docs" / "dependency-policy.md"
 ROOT_CARGO = ROOT / "Cargo.toml"
 MESH_PERF_CARGO = ROOT / "tests" / "performance" / "mesh" / "Cargo.toml"
 PATCH_STATUS_SCRIPT = ROOT / "scripts" / "check_vendored_patch_status.sh"
+DEPENDABOT_CONFIG = ROOT / ".github" / "dependabot.yml"
+# Registry crates that pin a patched crate with an exact `=` requirement. A
+# bump of the dependent would require the next patched-crate release, and Cargo
+# would then drop the vendored copy, so Dependabot must ignore the dependent too.
+EXACT_PIN_DEPENDENTS = {"sqlx-core": ("sqlx",)}
 VENDOR_ROOT = ROOT / "vendor"
 
 COMPATIBLE_RELEASE_STATUSES = frozenset(
@@ -187,6 +195,68 @@ def parse_patch_crates_io_text(text: str) -> dict[str, str]:
             if match:
                 patches[match.group(1)] = match.group(2)
     return patches
+
+
+def dependabot_cargo_ignore_names(text: str) -> list[str] | None:
+    """Return the cargo update's `ignore` dependency names, or None if absent.
+
+    The repository has no YAML parser in the audit environment, so this reads
+    the fixed shape `.github/dependabot.yml` uses: one `- package-ecosystem:
+    "cargo"` list item whose `ignore:` entries are `- dependency-name: "..."`.
+    """
+    names: list[str] | None = None
+    in_cargo = False
+    in_ignore = False
+    item_indent = -1
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        ecosystem = re.match(r'^-\s+package-ecosystem:\s*["\']?([\w-]+)["\']?$', stripped)
+        if ecosystem:
+            in_cargo = ecosystem.group(1) == "cargo"
+            in_ignore = False
+            item_indent = indent
+            if in_cargo and names is None:
+                names = []
+            continue
+        if not in_cargo:
+            continue
+        if indent <= item_indent:
+            in_cargo = False
+            in_ignore = False
+            continue
+        if indent == item_indent + 2:
+            in_ignore = stripped == "ignore:"
+            continue
+        if in_ignore:
+            entry = re.match(
+                r'^-\s+dependency-name:\s*["\']([^"\']+)["\']$', stripped
+            )
+            if entry and names is not None:
+                names.append(entry.group(1))
+    return names
+
+
+def dependabot_ignore_parity_errors(
+    dependabot_text: str, patched_crates: set[str]
+) -> list[str]:
+    names = dependabot_cargo_ignore_names(dependabot_text)
+    if names is None:
+        return [".github/dependabot.yml has no cargo update entry"]
+    required = set(patched_crates)
+    for crate in patched_crates:
+        required.update(EXACT_PIN_DEPENDENTS.get(crate, ()))
+    errors: list[str] = []
+    for crate in sorted(required):
+        if not any(fnmatch.fnmatchcase(crate, pattern) for pattern in names):
+            errors.append(
+                f".github/dependabot.yml cargo ignore does not cover {crate}; a "
+                "version update past the vendored copy would silently drop the patch"
+            )
+    return errors
 
 
 def readme_candidates(docs_path: str) -> list[Path]:
@@ -825,6 +895,15 @@ def parity_errors(data: Any) -> list[str]:
                 )
     else:
         errors.append("missing tests/performance/mesh/Cargo.toml patch mirror")
+
+    if DEPENDABOT_CONFIG.is_file():
+        errors.extend(
+            dependabot_ignore_parity_errors(
+                DEPENDABOT_CONFIG.read_text(encoding="utf-8"), set(root_patches)
+            )
+        )
+    else:
+        errors.append("missing .github/dependabot.yml")
 
     return errors
 
@@ -1791,6 +1870,55 @@ true
         })
         expect_contains(validate_lifecycle_shape({**base, "patches": [mutated]}),
                         "status=blocked", "hold cannot hide compatibility outcome")
+
+    dependabot_fixture = """version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directories:
+      - "/"
+    ignore:
+      - dependency-name: "sqlx*" # exact sqlx-core pin
+      - dependency-name: "hyper"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    ignore:
+      - dependency-name: "h2"
+"""
+    expect_empty(
+        dependabot_ignore_parity_errors(dependabot_fixture, {"hyper", "sqlx-core"}),
+        "dependabot ignore covers patched crates and exact-pin dependents",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(dependabot_fixture, {"hyper", "h2"}),
+        "does not cover h2",
+        "another ecosystem's ignore does not cover a cargo patch",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(
+            dependabot_fixture.replace('"sqlx*"', '"sqlx-core"'), {"sqlx-core"}
+        ),
+        "does not cover sqlx;",
+        "exact-pin dependent must be ignored with its patched crate",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(
+            dependabot_fixture.replace('"cargo"', '"docker"', 1), {"hyper"}
+        ),
+        "no cargo update entry",
+        "missing cargo update entry fails closed",
+    )
+    expect_contains(
+        dependabot_ignore_parity_errors(
+            dependabot_fixture.replace('      - dependency-name: "hyper"\n', ""),
+            {"hyper"},
+        ),
+        "does not cover hyper",
+        "removed ignore entry is rejected",
+    )
 
     # Exercise the whole upstream decision with synthetic responses, never live
     # network access. Other merged patches still fail without a reviewed hold.

@@ -606,6 +606,57 @@ reqwest/h3/tungstenite lineage needs an explicit path:
 6. Never silence an advisory without an expiry and a rationale — the expiry
    check will fail the weekly run otherwise (by design).
 
+### Cargo dependency updates
+
+`.github/dependabot.yml` schedules weekly `cargo` version updates for two
+directories:
+
+- `/`, the root workspace;
+- `/tests/performance/mesh`, the mesh benchmark crate. It path-depends on the
+  root crate and mirrors its `[patch.crates-io]` table, and the `Mesh Benchmark
+  Lockfile` workflow checks its lockfile.
+
+Minor and patch updates are grouped (`cargo-minor-patch`) into one PR per
+directory per week. A semver-major update gets its own PR. The crates replaced
+by a vendored `[patch.crates-io]` copy, and the `sqlx*` crates (which pin
+`sqlx-core` exactly), are in `ignore`. Moving one of them past its vendored
+version would make Cargo pick the crates.io release and drop the Ferrum patch
+without failing the build. Cargo only warns that the patch was unused. These
+crates move only through "Refreshing a vendored patch", "Retiring a vendored
+patch", or the emergency procedure above.
+
+The other standalone lockfiles get no version updates: `ebpf/` and `fuzz/` pin
+nightly toolchains, `tests/performance/multi_protocol/` must keep `# SYNC:`
+versions equal to the root, and the remaining benchmark harnesses are not worth
+weekly PRs. Dependabot security updates still cover every committed
+`Cargo.lock`, and the dependency-audit lanes audit the root, `ebpf/`, and every
+standalone workspace in the `standalone_cargo_manifests.py` inventory.
+
+**The repository Cargo config must not name a `rustc-wrapper`.** Every cargo
+process under the repository root reads `.cargo/config.toml`, including
+Dependabot's cargo updater. The updater runs `rustc -vV` through the configured
+wrapper and has no sccache. From PR #821 (2026-05-16) until the wrapper was
+removed, every cargo update failed before opening a PR with
+`dependency_file_not_resolvable` (`could not execute process 'sccache …/rustc -vV'`).
+That covered version and security updates, for the root and for every nested
+lockfile. sccache is selected outside the committed file:
+
+- in CI, `.github/actions/setup-sccache` exports `RUSTC_WRAPPER` and
+  `CARGO_BUILD_RUSTC_WRAPPER` as the checksum-verified binary, or clears them;
+- in cross-rs and container builds, `Cross.toml` and
+  `build_linux_gnu_sysroot.sh` pass both as empty values;
+- locally, `scripts/install-build-deps.sh` sets `build.rustc-wrapper` in the
+  user-level `$CARGO_HOME/config.toml`.
+
+`verify_cross_build_policy.py` (`EXPECTED_CARGO_BUILD`) allowlists exactly
+`[build] incremental = false` and rejects any committed `rustc-wrapper`. A
+`.cargo/config[.toml]` below the root is rejected outright, so a nested
+lockfile cannot get its own wrapper either.
+
+Dependabot cargo PRs use the `deps` commit prefix and the `dependencies` label,
+the same as the `docker` ecosystem. They run the ordinary PR CI, including the
+blocking dependency audit when `Cargo.lock` changes.
+
 ## Base image pinning
 
 Production container images (`Dockerfile`, `Dockerfile.release`, and
