@@ -8107,7 +8107,7 @@ This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-de
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `action` | String | `"reject"` | `reject`, `redact`, or `warn` |
-| `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable |
+| `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable; each name at most once |
 | `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns, at most 256 entries. Closed member set: an unknown member is fatal. `regex` must not match the empty string; `name` is at most 128 characters |
 | `scan_fields` | String | `"content"` | `content` (LLM prompt fields only), `all` (entire body), or `mcp_arguments` (only `params.arguments` of MCP `tools/call` requests — see **MCP tool arguments** below) |
 | `exclude_roles` | String[] | `[]` | Message roles to skip scanning. **`scan_fields: "content"` only** — see below |
@@ -8218,7 +8218,7 @@ Validates and filters LLM response content before it reaches the client. Complem
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `action` | String | `"reject"` | `reject` (502), `redact`, or `warn` |
-| `pii_patterns` | String[] | `[]` | Built-in PII patterns to scan for in responses |
+| `pii_patterns` | String[] | `[]` | Built-in PII patterns to scan for in responses; each name at most once |
 | `custom_pii_patterns` | Object[] | `[]` | Custom `{name, regex}` PII patterns, at most 256 entries. `regex` must not match the empty string; `name` is at most 128 characters |
 | `blocked_phrases` | String[] | `[]` | Case-insensitive literal phrases to block, at most 1024 entries |
 | `blocked_patterns` | Object[] | `[]` | Custom `{name, regex}` content patterns to block, at most 256 entries. `regex` must not match the empty string; `name` is at most 128 characters |

@@ -4889,3 +4889,13 @@ fn custom_patterns_entry_count_is_bounded() {
     };
     assert!(err.contains("at most 256 entries"), "{err}");
 }
+
+#[test]
+fn repeated_built_in_pattern_names_are_refused_before_compilation() {
+    let repeated = vec!["ssn"; 5000];
+    let err = match AiPromptShield::new(&json!({"patterns": repeated})) {
+        Ok(_) => panic!("a repeated built-in name must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("repeats built-in pattern"), "{err}");
+}

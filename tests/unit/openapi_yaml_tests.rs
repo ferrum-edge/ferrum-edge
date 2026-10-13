@@ -14048,6 +14048,14 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     assert_eq!(schema["properties"]["custom_pii_patterns"]["maxItems"], 256);
     assert_eq!(schema["properties"]["blocked_patterns"]["maxItems"], 256);
     assert_eq!(schema["properties"]["blocked_phrases"]["maxItems"], 1024);
+    assert_eq!(schema["properties"]["pii_patterns"]["uniqueItems"], true);
+    assert_eq!(schema["properties"]["pii_patterns"]["maxItems"], 8);
+    assert_component_validity(
+        &spec,
+        "AiResponseGuardConfig",
+        &json!({"pii_patterns": ["ssn", "ssn"]}),
+        false,
+    );
     for list in ["custom_pii_patterns", "blocked_patterns"] {
         assert_eq!(
             schema["properties"][list]["items"]["properties"]["name"]["maxLength"], 128,

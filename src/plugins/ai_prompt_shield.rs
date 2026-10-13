@@ -465,6 +465,9 @@ fn redact_text_bounded(text: &str, patterns: &[PiiPattern], budget: &RedactionBu
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }
+    // Only net growth is charged, so do not retain the spare capacity of an
+    // amplified intermediate pass behind a shrinking rewrite.
+    result.shrink_to_fit();
     result
 }
 
@@ -613,6 +616,14 @@ impl AiPromptShield {
                     "aws_key".to_string(),
                 ]
             });
+
+        // Refuse duplicates before anything is compiled: with unknown names
+        // already fatal, this bounds the list by the built-in catalog.
+        super::ai_response_guard::reject_duplicate_names(
+            &pattern_names,
+            "ai_prompt_shield",
+            "patterns",
+        )?;
 
         let mut patterns: Vec<PiiPattern> = Vec::new();
 

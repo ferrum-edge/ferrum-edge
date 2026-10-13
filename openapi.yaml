@@ -35649,11 +35649,13 @@ components:
           description: Action when PII is detected
         patterns:
           type: array
+          uniqueItems: true
+          maxItems: 8
           items:
             type: string
             enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: [ssn, credit_card, api_key, aws_key]
-          description: "Built-in patterns: ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban"
+          description: "Built-in patterns: ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban. Each name at most once."
         custom_patterns:
           type: array
           maxItems: 256
@@ -35797,11 +35799,13 @@ components:
           description: "Action when a violation is detected in the response body. Buffered SSE is parsed and redacted by complete event; content spanning events that cannot be safely rewritten is rejected. Live SSE requests are never re-buffered by this plugin."
         pii_patterns:
           type: array
+          uniqueItems: true
+          maxItems: 8
           items:
             type: string
             enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: []
-          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban)"
+          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban). Each name at most once."
         custom_pii_patterns:
           type: array
           maxItems: 256

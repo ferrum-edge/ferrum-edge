@@ -305,7 +305,53 @@ fn redact_scalar_bounded<'p>(
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }
-    result.into_owned()
+    // Only net growth is charged, so the retained string must not keep the
+    // spare capacity of an amplified intermediate pass: a grow-then-shrink
+    // policy would otherwise leave an uncharged large allocation behind every
+    // rewritten scalar.
+    let mut result = result.into_owned();
+    result.shrink_to_fit();
+    result
+}
+
+/// Refuse a repeated built-in pattern name before any regex is compiled.
+pub(crate) fn reject_duplicate_names(
+    names: &[String],
+    plugin: &str,
+    field: &str,
+) -> Result<(), String> {
+    let mut seen = HashSet::with_capacity(names.len());
+    for (idx, name) in names.iter().enumerate() {
+        if !seen.insert(name.as_str()) {
+            return Err(format!(
+                "{plugin}: `{field}[{idx}]` repeats built-in pattern {name:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `io::Write` sink that refuses to grow past `cap` bytes, so a serialization
+/// is bounded while it is produced rather than measured afterwards.
+struct CappedWriter {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(bytes.len()) > self.cap {
+            return Err(std::io::Error::other(
+                "serialization exceeds redaction budget",
+            ));
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Render one pattern's redaction placeholder and bound the RESULT (a template
@@ -494,6 +540,11 @@ impl AiResponseGuard {
         // Build PII pattern list
         let pii_pattern_names: Vec<String> =
             optional_string_vec(config, "pii_patterns")?.unwrap_or_default();
+
+        // Refuse duplicates before anything is compiled: with unknown names
+        // already fatal, this bounds the list by the built-in catalog, so a
+        // config repeating one name cannot compile thousands of regexes.
+        reject_duplicate_names(&pii_pattern_names, "ai_response_guard", "pii_patterns")?;
 
         let mut pii_patterns: Vec<ContentPattern> = Vec::new();
 
@@ -1427,6 +1478,7 @@ impl AiResponseGuard {
             return;
         };
         let original = decoded.clone();
+        let allowance_before = budget.remaining.get();
         redact_json_strings(
             &mut decoded,
             &self.pii_patterns,
@@ -1434,11 +1486,35 @@ impl AiResponseGuard {
             false,
             budget,
         );
-        if decoded != original
-            && let Ok(rewritten) = serde_json::to_string(&decoded)
-        {
-            *value = Value::String(rewritten);
+        if budget.is_exhausted() || decoded == original {
+            return;
         }
+        // The leaves were charged as decoded strings, but the document is
+        // re-serialized, and JSON escaping can multiply a placeholder (a
+        // control character becomes `\u00XX`). Serialize under the allowance
+        // this string had before its leaves were charged, then charge whatever
+        // net growth the serialized form adds on top of the leaf charges.
+        let mut writer = CappedWriter {
+            buf: Vec::with_capacity(text.len()),
+            cap: text.len().saturating_add(allowance_before),
+        };
+        if serde_json::to_writer(&mut writer, &decoded).is_err() {
+            budget.fail();
+            return;
+        }
+        let Ok(rewritten) = String::from_utf8(writer.buf) else {
+            budget.fail();
+            return;
+        };
+        let charged = allowance_before.saturating_sub(budget.remaining.get());
+        let growth = rewritten.len().saturating_sub(text.len());
+        let extra = growth.saturating_sub(charged);
+        if extra > 0 && !budget.charge_growth(extra) {
+            return;
+        }
+        let mut rewritten = rewritten;
+        rewritten.shrink_to_fit();
+        *value = Value::String(rewritten);
     }
 
     /// `ScanMode::All` raw string redaction with tool/function argument

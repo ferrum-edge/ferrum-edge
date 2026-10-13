@@ -7438,34 +7438,186 @@ async fn ordinary_expanding_redaction_still_succeeds() {
 }
 
 /// `\b` does not match the empty string, so admission accepts it, but it only
-/// ever produces zero-width spans. Redaction refuses those instead of
-/// inserting a placeholder at every word boundary. (Main also ended in a
-/// refusal, via the residual re-scan after materialising the amplified
-/// rewrite; this pins the fail-closed outcome of the early refusal.)
+/// ever produces zero-width spans. With a later `\w+` pass and a literal `!`
+/// placeholder, main inserted `!` at every boundary, then collapsed the words,
+/// and delivered a clean but amplified rewrite. The runtime refusal must stop
+/// it at the first zero-width match instead.
 #[tokio::test]
 async fn runtime_zero_width_matches_are_refused_by_every_redaction_path() {
+    for scan_fields in ["all", "content"] {
+        let plugin = make_plugin(json!({
+            "blocked_patterns": [
+                {"name": "boundary", "regex": "\\b"},
+                {"name": "word", "regex": "\\w+"}
+            ],
+            "redaction_placeholder": "!",
+            "scan_fields": scan_fields,
+            "action": "redact"
+        }));
+        let mut headers = HashMap::new();
+        if scan_fields == "all" {
+            headers.insert("content-type".to_string(), "text/plain".to_string());
+            assert!(
+                plugin
+                    .transform_response_body(b"hello world", Some("text/plain"), &headers)
+                    .await
+                    .is_none(),
+                "whole-body text redaction must refuse zero-width spans"
+            );
+        }
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let body = br#"{"choices":[{"message":{"content":"hello world"}}]}"#;
+        assert!(
+            plugin
+                .transform_response_body(body, Some("application/json"), &headers)
+                .await
+                .is_none(),
+            "{scan_fields}: structured redaction must refuse zero-width spans"
+        );
+    }
+}
+
+/// A grow-then-shrink policy (`7` → 128 bytes, then the run → one byte) spends
+/// no net allowance. Every rewritten scalar must still come out exact, and the
+/// retained strings are compacted rather than keeping the amplified
+/// intermediate capacity.
+#[tokio::test]
+async fn grow_then_shrink_redaction_across_many_fields_is_exact() {
     let plugin = make_plugin(json!({
-        "blocked_patterns": [{"name": "boundary", "regex": "\\b"}],
-        "scan_fields": "all",
+        "blocked_patterns": [
+            {"name": "8".repeat(128), "regex": "7"},
+            {"name": "x", "regex": "8+"}
+        ],
+        "redaction_placeholder": "{type}",
         "action": "redact"
     }));
+    let contents = vec!["7".repeat(512); 64];
+    let body = chat_body(&contents);
     let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let redacted = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("a shrinking rewrite spends no allowance");
+    let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
+    for index in 0..64 {
+        assert_eq!(value["choices"][index]["message"]["content"], "x");
+    }
+}
+
+/// Re-serializing a tool-argument document can multiply a placeholder (a
+/// control character becomes `\u0000`, six bytes). That growth is charged
+/// too, so a rewrite whose decoded leaves fit the allowance but whose
+/// serialized form does not is refused on the JSON and SSE paths.
+#[tokio::test]
+async fn tool_argument_serialization_growth_is_charged() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512),
+        "action": "redact"
+    }));
+    let call = |count: usize| serde_json::to_string(&json!({"a": "7".repeat(count)})).unwrap();
+    let json_body = |count: usize| {
+        serde_json::to_vec(&json!({"choices": [{"message": {"tool_calls": [{
+            "type": "function",
+            "function": {"name": "f", "arguments": call(count)}
+        }]}}]}))
+        .unwrap()
+    };
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // Control: one match (511 decoded bytes, ~3 KB serialized) redacts.
     assert!(
         plugin
-            .transform_response_body(b"hello world", Some("text/plain"), &headers)
+            .transform_response_body(&json_body(1), Some("application/json"), &headers)
+            .await
+            .is_some()
+    );
+    // 128 matches: 65 408 decoded bytes fit the 64 KiB floor, but the
+    // escaped serialization (~384 KiB) does not.
+    assert!(
+        plugin
+            .transform_response_body(&json_body(128), Some("application/json"), &headers)
             .await
             .is_none(),
-        "whole-body text redaction must refuse zero-width spans"
+        "escaping growth of re-serialized arguments must be charged"
     );
 
-    headers.insert("content-type".to_string(), "application/json".to_string());
-    let body = br#"{"choices":[{"message":{"content":"hello world"}}]}"#;
+    let sse = |count: usize| {
+        let frame = json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"name": "f", "arguments": call(count)}
+        }]}}]});
+        format!("data: {frame}\n\ndata: [DONE]\n\n").into_bytes()
+    };
     assert!(
         plugin
-            .transform_response_body(body, Some("application/json"), &headers)
+            .transform_response_body(&sse(1), Some("text/event-stream"), &sse_headers())
+            .await
+            .is_some()
+    );
+    assert!(
+        plugin
+            .transform_response_body(&sse(128), Some("text/event-stream"), &sse_headers())
             .await
             .is_none(),
-        "structured redaction must refuse zero-width spans"
+        "the SSE argument path charges the same serialization growth"
+    );
+}
+
+#[test]
+fn repeated_built_in_pattern_names_are_refused_before_compilation() {
+    let repeated = vec!["ssn"; 5000];
+    let err = match AiResponseGuard::new(&json!({"pii_patterns": repeated})) {
+        Ok(_) => panic!("a repeated built-in name must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("repeats built-in pattern"), "{err}");
+    assert!(AiResponseGuard::new(&json!({"pii_patterns": ["ssn", "email"]})).is_ok());
+}
+
+/// The growth allowance is shared across every rewritten protobuf string in
+/// every frame of one response.
+#[tokio::test]
+async fn grpc_redaction_budget_is_aggregate_across_frames() {
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "7"}],
+        "redaction_placeholder": "{type}",
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let body = |frames: usize| -> Vec<u8> {
+        (0..frames)
+            .flat_map(|_| grpc_frame(&hello_response_bytes(&"7".repeat(100))))
+            .collect()
+    };
+    let transform = |bytes: Vec<u8>| {
+        let plugin = &plugin;
+        async move {
+            let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+            let _ = plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &bytes)
+                .await;
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &bytes,
+                    Some("application/grpc"),
+                    &grpc_headers(),
+                )
+                .await
+        }
+    };
+    // Two frames (~25 KB of growth) fit; six (~76 KB) exhaust the allowance.
+    assert!(transform(body(2)).await.is_some(), "two frames fit");
+    assert!(
+        transform(body(6)).await.is_none(),
+        "combined growth across frames must exhaust the shared allowance"
     );
 }

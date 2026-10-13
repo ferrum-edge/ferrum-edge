@@ -144,6 +144,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholders fail closed instead of compounding. A zero-width match
   produced at run time also fails closed. Both plugins cap `max_scan_bytes`
   at 64 MiB and custom regex lists at 256 entries (`blocked_phrases` at 1024).
+  Both refuse a repeated built-in pattern name. Re-serialized tool-argument
+  documents are charged against the same allowance, including JSON escaping
+  growth.
 
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
