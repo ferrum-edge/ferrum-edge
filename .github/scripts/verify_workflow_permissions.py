@@ -57,6 +57,27 @@ EVENT_LINE = re.compile(r"^  " + QUOTED.format("event") + r"\s*:(?:\s.*)?$")
 # is the step's key column whether or not the key sits on the `- ` line.
 CHECKOUT_USES = re.compile(r"^(?P<lead> *(?:- +)?)uses *: *[\"']?actions/checkout@")
 WITH_KEY = re.compile(r"^(?P<lead> *(?:- +)?)with *:(?P<rest>.*)$")
+JOB_KEY = re.compile(r"^  (?P<job>[A-Za-z0-9_-]+): *(?:#.*)?$")
+# Checkouts inside jobs whose bytes the trusted Cross policy
+# (`verify_cross_build_policy.py`) freezes: the release ARM64 publication
+# dependency contract and the required live suites' trusted relevance/execution
+# contracts. A pull request cannot change them, so they keep the action default
+# until a reviewed policy migration adds `persist-credentials: false`. A missing
+# key is the only thing admitted here; `true` is still refused.
+POLICY_FROZEN_CHECKOUT_JOBS = frozenset(
+    {
+        ("release.yml", "create-release"),
+        ("release.yml", "docker"),
+        ("release.yml", "docker-ebpf"),
+        ("ambient-host-udp-live.yml", "changes"),
+        ("ambient-host-udp-live.yml", "ambient-host-udp-live"),
+        ("cni-lifecycle-live.yml", "changes"),
+        ("istio-status-cas-live.yml", "changes"),
+        ("mesh-e2e-sidecar-live.yml", "changes"),
+        ("multicluster-federation-live.yml", "changes"),
+        ("multicluster-poller-partition-live.yml", "changes"),
+    }
+)
 PERSIST_LINE = re.compile(
     r"^ +persist-credentials *: *(?P<q>[\"']?)(?P<value>[A-Za-z]+)(?P=q) *(?:#.*)?$"
 )
@@ -271,6 +292,16 @@ def checkout_credential_errors(text: str, source: str) -> list[str]:
                 "single plain `persist-credentials: false`"
             )
         elif not values:
+            job = None
+            for back in range(index - 1, -1, -1):
+                job_match = JOB_KEY.match(lines[back])
+                if job_match is not None:
+                    job = job_match.group("job")
+                    break
+                if _is_content(lines[back]) and _indent(lines[back]) == 0:
+                    break
+            if (Path(source).name, job) in POLICY_FROZEN_CHECKOUT_JOBS:
+                continue
             errors.append(
                 f"{located} checkout must set `persist-credentials: false` so the "
                 "job token is not left in .git/config for later steps"
@@ -426,6 +457,15 @@ def run_self_test() -> list[str]:
             failures.append(f"checkout credential self-test {label!r} rejected: {errors}")
         if not accepted and not errors:
             failures.append(f"checkout credential self-test {label!r} was accepted")
+
+    frozen = pr.replace("  build:\n", "  docker:\n") + f"      - uses: {pin}\n" + tail
+    if checkout_credential_errors(frozen, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: policy-frozen release job was rejected")
+    if not checkout_credential_errors(frozen, ".github/workflows/ci.yml"):
+        failures.append("checkout credential self-test: frozen-job exemption leaked to another file")
+    frozen_true = frozen.replace(tail, "        with:\n          persist-credentials: true\n" + tail)
+    if not checkout_credential_errors(frozen_true, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: policy-frozen job admitted true")
     return failures
 
 

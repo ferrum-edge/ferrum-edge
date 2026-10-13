@@ -3726,6 +3726,14 @@ aggregate, rejects a checkout that omits the key. It also rejects `true` in any
 workflow that pull-request, push, merge-queue, or `workflow_run` events can
 start.
 
+One set of checkouts still uses the action default. The trusted Cross policy
+freezes the bytes of these jobs, so a pull request cannot add the key: the
+`create-release`, `docker`, and `docker-ebpf` jobs in `release.yml` (the ARM64
+publication dependency contract), the `changes` relevance jobs of the six
+required live suites, and the `ambient-host-udp-live` execution job. The
+verifier lists them in `POLICY_FROZEN_CHECKOUT_JOBS`. They change only through
+a reviewed policy migration.
+
 ### Secret Usage in Workflows
 
 The Docker Hub login steps use:

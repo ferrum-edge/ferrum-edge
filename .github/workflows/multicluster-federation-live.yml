@@ -67,7 +67,6 @@ jobs:
       - name: Checkout Ferrum Edge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          persist-credentials: false
           fetch-depth: 0
 
       # Relevance decides whether a REQUIRED live gate runs at all, so it must
