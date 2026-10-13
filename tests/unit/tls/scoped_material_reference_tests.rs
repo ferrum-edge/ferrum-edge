@@ -627,16 +627,13 @@ async fn held_tenant_refusal_blocks_cache_population_until_the_watcher_sees_reco
         },
         Some(shutdown_rx),
     );
-    let next_revision = |rx: &mut tokio::sync::watch::Receiver<u64>| {
-        let mut rx = rx.clone();
-        async move {
-            tokio::time::timeout(Duration::from_secs(5), rx.changed())
-                .await
-                .expect("the watcher publishes a revision")
-                .unwrap();
-            *rx.borrow_and_update()
-        }
-    };
+    async fn next_revision(rx: &mut tokio::sync::watch::Receiver<u64>) -> u64 {
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the watcher publishes a revision")
+            .unwrap();
+        *rx.borrow_and_update()
+    }
 
     // Accepted: the cache fills from the confined file.
     assert!(
