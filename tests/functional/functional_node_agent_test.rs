@@ -8,11 +8,6 @@ use std::time::Duration;
 
 use crate::scaffolding::ports::{BIND_DROP_SPAWN_ATTEMPTS, reserve_port};
 
-fn gateway_binary_path() -> String {
-    std::env::var("CARGO_BIN_EXE_ferrum-edge")
-        .unwrap_or_else(|_| super::namespace_helpers::gateway_binary_path().to_string())
-}
-
 fn terminate(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -71,7 +66,7 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
         let log_path = tmp.path().join(format!("node-agent-{attempt}.log"));
         let log_file = fs::File::create(&log_path).expect("node_agent log file");
         let log_err = log_file.try_clone().expect("clone node_agent log file");
-        let mut command = Command::new(gateway_binary_path());
+        let mut command = Command::new(crate::common::gateway_binary_path());
         command.arg("run");
         prepend_noop_shell(&mut command, tmp.path());
         let metrics_token = uuid::Uuid::new_v4().to_string();

@@ -20,21 +20,12 @@ use tokio::time::sleep;
 
 use crate::scaffolding::ports::{reserve_port, reserve_port_pair};
 
-fn binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 // Resolve the binary to an absolute path so that tests which set a custom
 // `current_dir()` on the Command can still find it.
 fn binary_abs_path() -> std::path::PathBuf {
-    let rel = binary_path();
-    let p = std::path::Path::new(rel);
-    if p.is_absolute() {
-        p.to_path_buf()
+    let rel = crate::common::gateway_binary_path();
+    if rel.is_absolute() {
+        rel
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
@@ -85,7 +76,7 @@ fn kill_child(mut child: std::process::Child) {
 #[ignore]
 #[tokio::test]
 async fn functional_cli_version_prints_version() {
-    let output = Command::new(binary_path())
+    let output = Command::new(crate::common::gateway_binary_path())
         .args(["version"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -102,7 +93,7 @@ async fn functional_cli_version_prints_version() {
 #[ignore]
 #[tokio::test]
 async fn functional_cli_version_json() {
-    let output = Command::new(binary_path())
+    let output = Command::new(crate::common::gateway_binary_path())
         .args(["version", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -121,7 +112,7 @@ async fn functional_cli_version_json() {
 #[ignore]
 #[tokio::test]
 async fn functional_cli_help_shows_subcommands() {
-    let output = Command::new(binary_path())
+    let output = Command::new(crate::common::gateway_binary_path())
         .args(["--help"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -139,7 +130,7 @@ async fn functional_cli_help_shows_subcommands() {
 #[ignore]
 #[tokio::test]
 async fn functional_cli_run_help_shows_options() {
-    let output = Command::new(binary_path())
+    let output = Command::new(crate::common::gateway_binary_path())
         .args(["run", "--help"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1875,7 +1866,7 @@ async fn functional_cli_run_starts_and_stops() {
     )
     .unwrap();
 
-    let mut command = Command::new(binary_path());
+    let mut command = Command::new(crate::common::gateway_binary_path());
     command
         .args([
             "run",
@@ -1950,7 +1941,7 @@ async fn functional_cli_run_with_verbose() {
     .unwrap();
 
     // Start with -v (info level) and capture stderr for log output
-    let mut command = Command::new(binary_path());
+    let mut command = Command::new(crate::common::gateway_binary_path());
     command
         .args([
             "run",
@@ -2007,7 +1998,7 @@ async fn functional_cli_reload_sends_sighup() {
     .unwrap();
 
     // Start a gateway to reload
-    let mut command = Command::new(binary_path());
+    let mut command = Command::new(crate::common::gateway_binary_path());
     command
         .args([
             "run",
@@ -2030,7 +2021,7 @@ async fn functional_cli_reload_sends_sighup() {
     let pid = child.id();
 
     // Use the reload subcommand
-    let output = Command::new(binary_path())
+    let output = Command::new(crate::common::gateway_binary_path())
         .args(["reload", "--pid", &pid.to_string()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

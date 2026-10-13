@@ -29,8 +29,8 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::{
     configure_coverage_gateway_command, continue_if_backend_available,
-    continue_if_tls_fixture_available, explicit_test_binary, host_port_from_db_url,
-    shutdown_gateway_child, tcp_endpoint_reachable,
+    continue_if_tls_fixture_available, host_port_from_db_url, shutdown_gateway_child,
+    tcp_endpoint_reachable,
 };
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -515,17 +515,8 @@ impl Drop for MongoTestHarness {
     }
 }
 
-fn find_binary() -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(path) = explicit_test_binary() {
-        return Ok(path.to_string_lossy().into_owned());
-    }
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        Ok("./target/debug/ferrum-edge".to_string())
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        Ok("./target/release/ferrum-edge".to_string())
-    } else {
-        Err("ferrum-edge binary not found. Run `cargo build` first.".into())
-    }
+fn find_binary() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    crate::common::locate_binary(false).map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
 /// Create a simple echo HTTP server for backend testing.

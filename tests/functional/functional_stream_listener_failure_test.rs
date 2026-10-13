@@ -50,16 +50,6 @@ fn mint_stream_listener_db_identity() -> crate::common::SpawnedGatewayIdentity {
     crate::common::SpawnedGatewayIdentity::mint("stream-listener-db")
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
 /// Lease a port across test processes, releasing only the socket for the child.
 /// [`prove_child_owns_admin`] still verifies the spawned gateway's identity.
 async fn ephemeral_port() -> u16 {
@@ -194,7 +184,7 @@ impl DbHarness {
             temp_dir.path().join("test.db").to_string_lossy()
         );
 
-        let mut cmd = Command::new(gateway_binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -450,7 +440,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
         admin_port_seed = ephemeral_port().await;
         let proxy_port_seed = ephemeral_port().await;
         let identity = mint_stream_listener_db_identity();
-        let mut cmd = Command::new(gateway_binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -520,7 +510,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     let retry_identity = mint_stream_listener_db_identity();
     #[allow(clippy::zombie_processes)]
     let mut child = {
-        let mut cmd = Command::new(gateway_binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -652,7 +642,7 @@ plugin_configs: []
         drop(f);
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("stream-listener-file");
-        let mut cmd = Command::new(gateway_binary_path());
+        let mut cmd = Command::new(crate::common::gateway_binary_path());
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
