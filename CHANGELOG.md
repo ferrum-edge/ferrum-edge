@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also prove that it pins the host: its literal suffixes must be complete
   origins, contain the literal authority, or end in a fixed non-public
   domain (with an optional literal port). `https://[a-z]+\.com`,
-  `https://[a-z]+example\.com`, variable ports and patterns the analysis
-  cannot bound are refused with credentials.
+  `https://[a-z]+example\.com`, hosts not terminated before a variable part
+  and patterns the analysis cannot bound are refused with credentials. A
+  pattern whose every match starts with a literal `scheme://host:` still
+  pins the host.
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only

@@ -2456,8 +2456,8 @@ fn test_constructor_rejects_credentialed_public_suffix_regex() {
         "https://[a-z]+\\.run\\.app",
         // A suffix that starts mid-label admits `evilexample.com`.
         "https://[a-z]+example\\.com",
-        // A variable port cannot be proven.
-        "https://app\\.example\\.com:[0-9]+",
+        // A host that is not terminated before the variable part.
+        "https://app\\.example\\.com[a-z.]*",
     ] {
         let err = CorsPlugin::new(&json!({
             "allowed_origins": [{"regex": regex}],
@@ -2476,6 +2476,8 @@ fn test_constructor_rejects_credentialed_public_suffix_regex() {
         "https://.*\\.api\\.example\\.com",
         "(https|http)://app\\.example\\.com",
         "^https://pr-[0-9]+\\.preview\\.example\\.com$",
+        // A pinned host followed by a variable port.
+        "^https://app\\.example\\.com:[0-9]+$",
         "https://[a-z]+app\\.example\\.com",
         // A finite host alternation is a set of exact origins.
         "^https://(?:a|zq|probe)\\.github\\.io$",

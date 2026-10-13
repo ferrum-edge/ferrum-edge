@@ -343,14 +343,43 @@ fn origin_regex_host_is_provably_constrained(re: &Regex) -> bool {
     else {
         return false;
     };
-    let seq = Extractor::new().kind(ExtractKind::Suffix).extract(&hir);
-    let Some(literals) = seq.literals() else {
+    let suffixes = Extractor::new().kind(ExtractKind::Suffix).extract(&hir);
+    let suffix_proof = suffixes.literals().is_some_and(|literals| {
+        !literals.is_empty()
+            && literals.iter().all(|literal| {
+                origin_suffix_literal_pins_host(literal.as_bytes(), literal.is_exact())
+            })
+    });
+    if suffix_proof {
+        return true;
+    }
+    // A pattern whose every match STARTS with `scheme://host:` (or is a
+    // complete literal origin) also pins the host, whatever follows the port
+    // separator, e.g. `^https://app\.example\.com:[0-9]+$`.
+    let prefixes = Extractor::new().kind(ExtractKind::Prefix).extract(&hir);
+    prefixes.literals().is_some_and(|literals| {
+        !literals.is_empty()
+            && literals.iter().all(|literal| {
+                origin_prefix_literal_pins_host(literal.as_bytes(), literal.is_exact())
+            })
+    })
+}
+
+fn origin_prefix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };
-    !literals.is_empty()
-        && literals
-            .iter()
-            .all(|literal| origin_suffix_literal_pins_host(literal.as_bytes(), literal.is_exact()))
+    let Some((_, authority)) = text.split_once("://") else {
+        return false;
+    };
+    if exact {
+        return !authority.is_empty();
+    }
+    // Inexact: the host must be terminated by the port separator inside the
+    // literal, so nothing after it can extend the host.
+    authority
+        .split_once(':')
+        .is_some_and(|(host, _)| !host.is_empty())
 }
 
 fn origin_suffix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {

@@ -28302,7 +28302,7 @@ components:
             provably pin the host: every literal suffix of the pattern must be
             a complete origin, contain the literal authority, or end in a fixed
             non-public domain after its first dot (optionally with a literal
-            port). A native `*.suffix` wildcard is refused with credentials
+            port), or every match must start with a literal scheme://host:. A native `*.suffix` wildcard is refused with credentials
             when the suffix is a single label, a public suffix, or the parent
             of a Public Suffix List wildcard rule (`*.com`, `*.co.uk`,
             `*.github.io`, `*.run.app`).
