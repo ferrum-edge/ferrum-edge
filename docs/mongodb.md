@@ -28,9 +28,9 @@ so the practical floor is **4.4.2**.
 | MongoDB 4.4.2+ | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
 | MongoDB 4.4.0 – 4.4.1, 4.2 and older | Not supported (no `hello` command, or wire version 8 or lower). |
 | MongoDB Atlas | Supported on any Atlas-offered version. |
-| Azure Cosmos DB for MongoDB (RU) | Accounts on server version 5.0, 6.0, or 7.0 are supported. Accounts on 4.2 or older report a wire version below 9 and are rejected; upgrade the account's server version first. |
-| Azure Cosmos DB for MongoDB (vCore) | Supported (5.0 and later). |
-| AWS DocumentDB | Engine 5.0 and 8.0 are supported. DocumentDB 3.6 and 4.0 report wire versions 6 and 7 and are rejected; upgrade the cluster. See [AWS DocumentDB](#aws-documentdb) for the behavior differences. |
+| Azure Cosmos DB for MongoDB (RU) | Not supported. Accounts on server version 4.2 or older fail the driver's wire-version check. Accounts on 5.0+ pass it, but they cannot create Ferrum's baseline indexes (sparse, and non-unique partial). They also lack cross-collection transactions. See [Azure Cosmos DB](#azure-cosmos-db-mongodb-api). |
+| Azure Cosmos DB for MongoDB (vCore) / Azure DocumentDB | Wire-compatible (5.0 and later). Not tested by Ferrum. |
+| AWS DocumentDB | Engines 5.0 and 8.0 pass the driver's wire-version check. DocumentDB 3.6 and 4.0 report wire versions 6 and 7 and are rejected, so upgrade the cluster. Not tested by Ferrum; see [AWS DocumentDB](#aws-documentdb) for the known behavior differences. |
 
 **Linux kernel note.** MongoDB 8.0.21 and later 8.0 releases, 8.3, and 9.0
 refuse to start on Linux kernels 6.19 through 7.0.13 (a tcmalloc/rseq
@@ -554,9 +554,25 @@ FERRUM_DB_TLS_CA_CERT_PATH=/certs/rds-combined-ca-bundle.pem
 
 ### Azure Cosmos DB (MongoDB API)
 
+The request-unit (RU) offering is **not supported**. Microsoft's compatibility
+pages list three gaps:
+
+- Sparse indexes are not supported, and partial indexes must be unique.
+  Ferrum's migration plan (`src/config/mongo_index_plan.rs`) needs both
+  kinds, so `migrate up` fails.
+- Multi-document transactions cannot span collections, and Ferrum's
+  replica-set batch and config-load paths use them.
+- Server versions 4.2 and older report a wire version below the `mongodb` 3.9
+  driver's floor of 9.
+
+The vCore offering (now Azure DocumentDB) is wire-compatible but untested. If
+you evaluate it, run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` against a
+scratch database first and confirm that every index is created. A vCore
+connection string looks like this:
+
 ```bash
 FERRUM_DB_TYPE=mongodb
-FERRUM_DB_URL="mongodb://ferrum-user:password@ferrum-cosmos.mongo.cosmos.azure.com:10255/ferrum?ssl=true&replicaSet=globaldb&retryWrites=false"
+FERRUM_DB_URL="mongodb+srv://ferrum-user:password@ferrum-cluster.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retryWrites=false"
 FERRUM_MONGO_DATABASE=ferrum
 ```
 

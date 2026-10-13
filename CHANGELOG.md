@@ -83,10 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server.** The
   `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
-  4.2 and Azure Cosmos DB for MongoDB (RU) accounts on server version 4.2 can
-  no longer connect; upgrade the server or the Cosmos account's server version
-  (5.0+) first. AWS DocumentDB 3.6/4.0 were already unsupported; DocumentDB
-  5.0/8.0 work. 3.9.1 also carries the fix for CVE-2026-88024 (GridFS file-ID
+  4.2 can no longer connect. Ferrum also sends `hello`, which MongoDB added in
+  4.4.2. The docs now mark Azure Cosmos DB for MongoDB (RU) as unsupported at
+  any server version: it lacks the sparse and non-unique partial indexes and
+  the cross-collection transactions that Ferrum needs. AWS DocumentDB 3.6/4.0
+  were already below the driver floor. DocumentDB 5.0/8.0 and Cosmos vCore are
+  wire-compatible but untested. 3.9.1 also carries the fix for CVE-2026-88024 (GridFS file-ID
   matching), which Ferrum does not reach because it does not use GridFS.
   `docs/mongodb.md` now lists the supported servers (4.4.2 through 9.0) and the
   Linux 6.19-7.0.13 kernel startup gate in MongoDB 8.0.21+, 8.3 and 9.0.
