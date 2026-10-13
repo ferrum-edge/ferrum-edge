@@ -1,0 +1,53 @@
+name: Ruleset Canary Probe
+
+# Temporary probe for the org-ruleset canary (ruleset-canary branch only).
+# TRUSTED copy: this is the version on refs/heads/ruleset-canary that the org
+# ruleset pins. It passes only when the PR head carries ruleset-canary-gate.txt
+# containing "pass".
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ruleset-canary-probe-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Ruleset Canary Probe
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Context
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          VAR_PROBE: ${{ vars.BORINGCACHE_ENABLED }}
+        run: |
+          echo "copy=TRUSTED"
+          echo "workflow_ref=$WORKFLOW_REF"
+          echo "workflow_sha=$WORKFLOW_SHA"
+          echo "event_name=$EVENT_NAME sha=$SHA ref=$REF head=$HEAD_SHA run=$RUN_ID"
+          echo "vars.BORINGCACHE_ENABLED set: $([ -n "$VAR_PROBE" ] && echo yes || echo no)"
+          sleep 90
+      - name: Gate on PR head content
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          body="$(gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/${GITHUB_REPOSITORY}/contents/ruleset-canary-gate.txt?ref=${HEAD_SHA}" 2>/dev/null || true)"
+          if [ "$body" != "pass" ]; then
+            echo "::error::trusted probe: ruleset-canary-gate.txt is not 'pass' at ${HEAD_SHA}"
+            exit 1
+          fi
+          echo "trusted probe gate passed"
