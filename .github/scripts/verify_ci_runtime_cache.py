@@ -5418,8 +5418,8 @@ def self_test() -> int:
     for label, original, mutation in (
         (
             "that rewrites only the Dockerfiles",
-            "            for file in ${consumers}; do\n",
-            "            for file in ${DOCKERFILES}; do\n",
+            "            for file in ${consumers}; do\n              sed -i ",
+            "            for file in ${DOCKERFILES}; do\n              sed -i ",
         ),
         (
             "that may rewrite workflow files",
