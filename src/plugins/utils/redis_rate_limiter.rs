@@ -2687,6 +2687,15 @@ pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrange
     isize::try_from(max_bytes).map_err(|_| RedisGetrangeEndIndexError::Overflow)
 }
 
+/// Whether a reply is the exact `+OK` acknowledgement `WATCH` / `MULTI` return.
+fn is_ok_acknowledgement(reply: &redis::Value) -> bool {
+    match reply {
+        redis::Value::Okay => true,
+        redis::Value::SimpleString(text) => text == "OK",
+        _ => false,
+    }
+}
+
 /// `GETRANGE` bound for comparing a stored value against `expected` without
 /// downloading the stored value: read `0..=end` (at most `expected.len() + 1`
 /// bytes) next to `EXISTS` and `STRLEN`, and match only when the key exists,
@@ -5802,12 +5811,7 @@ impl RedisRateLimitClient {
         reply: &redis::Value,
         operation: &'static str,
     ) -> Result<(), ()> {
-        let acknowledged = match reply {
-            redis::Value::Okay => true,
-            redis::Value::SimpleString(text) => text == "OK",
-            _ => false,
-        };
-        if acknowledged {
+        if is_ok_acknowledgement(reply) {
             return Ok(());
         }
         warn!(
@@ -5815,6 +5819,27 @@ impl RedisRateLimitClient {
             operation,
             classification = "malformed_response",
             "Redis did not acknowledge with OK; failing closed before the write"
+        );
+        self.mark_unavailable();
+        Err(())
+    }
+
+    /// [`Self::require_ok_acknowledgement`] for the optional quarantine path,
+    /// whose diagnostics are sampled and endpoint-free like its other
+    /// failures. A malformed acknowledgement is still protocol uncertainty, so
+    /// the client is marked unavailable.
+    fn require_quarantine_ok_acknowledgement(
+        &self,
+        reply: &redis::Value,
+        operation: &'static str,
+    ) -> Result<(), ()> {
+        if is_ok_acknowledgement(reply) {
+            return Ok(());
+        }
+        warn_sampled!(
+            operation,
+            classification = "malformed_response",
+            "Redis quarantine comparison failed"
         );
         self.mark_unavailable();
         Err(())
@@ -5935,7 +5960,7 @@ impl RedisRateLimitClient {
         let watch: Result<redis::Value, redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
         match watch {
-            Ok(reply) => self.require_ok_acknowledgement(&reply, "quarantine WATCH")?,
+            Ok(reply) => self.require_quarantine_ok_acknowledgement(&reply, "WATCH")?,
             Err(e) => {
                 self.note_quarantine_command_failure(&e, "WATCH");
                 return Err(());
@@ -5983,7 +6008,7 @@ impl RedisRateLimitClient {
         let multi: Result<redis::Value, redis::RedisError> =
             redis::cmd("MULTI").query_async(&mut conn).await;
         match multi {
-            Ok(reply) => self.require_ok_acknowledgement(&reply, "quarantine MULTI")?,
+            Ok(reply) => self.require_quarantine_ok_acknowledgement(&reply, "MULTI")?,
             Err(e) => {
                 self.note_quarantine_command_failure(&e, "MULTI");
                 return Err(());
