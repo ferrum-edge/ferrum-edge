@@ -4462,10 +4462,11 @@ async fn handle_h3_request(
         http_flavor
     };
 
-    // Materialize query params before authentication, percent-decoded exactly
-    // as HTTP/1.1 and HTTP/2 do. HTTP/3 used to expose the raw form unless a
-    // plugin opted in, so a custom plugin that did not know to opt in could
-    // decide on `%2Fadmin` over HTTP/3 and `/admin` over HTTP/1.1 (#6580).
+    // Materialize query params before authentication. They are
+    // percent-decoded exactly as HTTP/1.1 and HTTP/2 do. HTTP/3 used to expose
+    // the raw form unless a plugin opted in, so a custom plugin that did not
+    // know to opt in could decide on `%2Fadmin` over HTTP/3 and `/admin` over
+    // HTTP/1.1 (#6580).
     ctx.materialize_query_params();
 
     // An exempted CORS preflight (issue #6110) exists only so the route's
