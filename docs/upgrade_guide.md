@@ -28,6 +28,15 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `access_control` refuses an explicitly empty allow-list (#6607)
+
+`allowed_consumers: []` or `allowed_groups: []` used to mean "no allow
+restriction", so beside a deny-list or `allow_authenticated_identity` it
+admitted everyone the deny side did not name. A present but empty allow-list
+is now a config validation error, and a stored config that carries one fails
+to load. Delete the key if no allow restriction is intended, or list the
+consumers or groups that should be admitted. Empty deny-lists are unaffected.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
