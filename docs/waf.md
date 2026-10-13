@@ -608,7 +608,10 @@ Exclusions do not enable enforcement.
   exclusions re-runs its own matcher over the URL rebuilt without the excluded
   pairs, and the hit counts only if it still matches. `FE-HPP-001` drops the
   excluded pairs before comparing duplicates, and the URL-side encoding
-  heuristics judge the rebuilt URL.
+  heuristics judge the rebuilt URL. `FE-HPP-001` compares duplicates under
+  both separator conventions, `&` only and `&` plus an unencoded `;` (issue
+  #6579), so `tenant=admin&x=;tenant=victim` is a conflict; exclusions apply
+  to the pairs of each convention.
 - `headers` — header names, case-insensitive. Applies to `header_names`,
   `header_values`, and `response_headers` rules.
 - `cookies` — cookie names (the text before `=` in the raw crumb),

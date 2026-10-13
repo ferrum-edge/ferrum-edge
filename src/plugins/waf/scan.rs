@@ -883,14 +883,32 @@ impl Waf {
     ) {
         if let Some(rule_index) = self.specials.hpp {
             // An excluded parameter may legitimately repeat (`ids=1&ids=2`),
-            // so its pairs are dropped before duplicates are compared.
-            let judged = match &self.compiled.rules[rule_index].exclusions {
+            // so its pairs are dropped before duplicates are compared, under
+            // the `&`-only and the `&`-plus-`;` separator conventions alike
+            // (issue #6579).
+            let (judged, conflict) = match &self.compiled.rules[rule_index].exclusions {
                 Some(exclusions) if !exclusions.query_params.is_empty() => {
-                    Cow::Owned(query_without_excluded_params(raw_query, exclusions))
+                    let kept = |pair: &&str| {
+                        let raw_key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+                        !exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
+                    };
+                    let conflict =
+                        decode::has_conflicting_duplicate_among(raw_query.split('&').filter(kept))
+                            || (raw_query.contains(';')
+                                && decode::has_conflicting_duplicate_among(
+                                    raw_query.split(['&', ';']).filter(kept),
+                                ));
+                    (
+                        Cow::Owned(query_without_excluded_params(raw_query, exclusions)),
+                        conflict,
+                    )
                 }
-                _ => Cow::Borrowed(raw_query),
+                _ => (
+                    Cow::Borrowed(raw_query),
+                    decode::has_conflicting_duplicate_query_key(raw_query),
+                ),
             };
-            if decode::has_conflicting_duplicate_query_key(&judged) {
+            if conflict {
                 self.push_special(outcome, rule_index, &judged, subject);
             }
         }

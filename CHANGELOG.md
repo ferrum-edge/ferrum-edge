@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call, `mesh_route_dispatch` answers `400`, and `serverless_function` fails
   with `ambiguous_query_encoding`. Under OPA `delegate` the token appears in
   `input.query_ambiguity`. `%3B` stays an unambiguous literal semicolon.
+  Credential stripping (`hide_credentials` query locations, and the
+  `request_transformer` pre-mutation strip) now also drops an `&` segment
+  that carries the credential behind a `;` (`carrier=;api_key=secret`), and
+  WAF `FE-HPP-001` compares duplicates under the `&`+`;` convention too.
 
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of

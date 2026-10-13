@@ -65,9 +65,20 @@ fn decode_form_urlencoded_component_for_hpp(raw: &str) -> String {
 /// routing and delegated policy must use [`CanonicalQuery`] instead, because
 /// they also fail closed on identical duplicates, encoded aliases, literal
 /// plus, and invalid encodings.
+///
+/// Both separator conventions are judged: `&` only, and `&` plus `;` for
+/// backends that also split on `;` (issue #6579). `tenant=admin&x=;tenant=victim`
+/// has one `tenant` under the first and two conflicting ones under the second.
 pub fn has_conflicting_duplicate_query_key(raw_query: &str) -> bool {
+    has_conflicting_duplicate_among(raw_query.split('&'))
+        || (raw_query.contains(';') && has_conflicting_duplicate_among(raw_query.split(['&', ';'])))
+}
+
+/// [`has_conflicting_duplicate_query_key`] over pre-split, still-encoded
+/// pairs, so a caller can drop excluded pairs under each separator convention.
+pub fn has_conflicting_duplicate_among<'a>(pairs: impl IntoIterator<Item = &'a str>) -> bool {
     let mut seen: HashMap<String, String> = HashMap::new();
-    for pair in raw_query.split('&') {
+    for pair in pairs {
         if pair.is_empty() {
             continue;
         }
@@ -332,6 +343,24 @@ pub fn canonical_query_for_policy(ctx: &crate::plugins::RequestContext) -> Canon
     CanonicalQuery::parse(&crate::proxy::effective_backend_query_string(ctx))
 }
 
+/// Whether a still-encoded `&`-separated query pair carries a parameter in
+/// `names` once a backend also splits it on `;` (issue #6579).
+///
+/// `carrier=;api_key=secret` is one `carrier` pair to Ferrum but also an
+/// `api_key` parameter to a `;`-splitting backend, so credential stripping must
+/// drop the whole `&` segment. Matches each `;` sub-pair by raw or decoded
+/// name, the same contract as [`crate::proxy::query_string_after_plugin_strips`].
+/// A segment without `;` never matches here; callers check the pair's own name
+/// separately.
+pub fn semicolon_sub_pair_names_any(segment: &str, names: &HashSet<&str>) -> bool {
+    segment.contains(';')
+        && segment.split(';').any(|sub_pair| {
+            let raw_name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+            names.contains(raw_name)
+                || names.contains(percent_decode_str(raw_name).decode_utf8_lossy().as_ref())
+        })
+}
+
 /// Whether every `%` in `value` begins a complete `%HH` triplet.
 pub fn has_valid_percent_triplets(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -525,7 +554,23 @@ impl OrderedQuery {
         }
         let before = self.pairs.len();
         self.pairs.retain(|pair| {
-            !names.contains(pair.raw_name.as_str()) && !names.contains(pair.decoded_name.as_str())
+            if names.contains(pair.raw_name.as_str()) || names.contains(pair.decoded_name.as_str())
+            {
+                return false;
+            }
+            // A credential smuggled behind a `;` (`carrier=;api_key=secret`)
+            // is still a parameter to a `;`-splitting backend (issue #6579).
+            let has_semicolon = pair.raw_name.contains(';')
+                || pair
+                    .raw_value
+                    .as_deref()
+                    .is_some_and(|value| value.contains(';'));
+            if !has_semicolon {
+                return true;
+            }
+            let mut segment = String::new();
+            pair.write_to(&mut segment);
+            !semicolon_sub_pair_names_any(&segment, names)
         });
         self.pairs.len() != before
     }

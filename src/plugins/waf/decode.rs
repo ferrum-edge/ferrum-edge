@@ -1,4 +1,6 @@
-pub use crate::plugins::utils::query::has_conflicting_duplicate_query_key;
+pub use crate::plugins::utils::query::{
+    has_conflicting_duplicate_among, has_conflicting_duplicate_query_key,
+};
 
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     let needle_bytes = needle.as_bytes();

@@ -11,7 +11,8 @@ use ferrum_edge::plugins::utils::jwt_verifier::{
     JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks,
 };
 use ferrum_edge::plugins::utils::query::{
-    CanonicalQuery, QueryAmbiguity, canonical_query_for_policy, has_conflicting_duplicate_query_key,
+    CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
+    has_conflicting_duplicate_query_key,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
@@ -30,7 +31,7 @@ use ferrum_edge::startup::render_startup_error;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn unknown_key_diagnostics_keep_sorted_suggestions_when_rendered() {
@@ -452,6 +453,57 @@ fn canonical_query_flags_a_duplicate_smuggled_behind_a_semicolon() {
         ambiguities("tenant=admin&x=;tenant=victim"),
         vec![QueryAmbiguity::SemicolonSeparator]
     );
+}
+
+#[test]
+fn hpp_predicate_judges_the_semicolon_separator_convention() {
+    // Issue #6579: conflicting under `&`+`;`, not under `&` alone.
+    assert!(has_conflicting_duplicate_query_key(
+        "tenant=admin&x=;tenant=victim"
+    ));
+    assert!(has_conflicting_duplicate_query_key("a=1;a=2"));
+    // Identical values are still not a conflict, under either convention.
+    assert!(!has_conflicting_duplicate_query_key("a=1&x=;a=1"));
+    // `%3B` is a literal semicolon.
+    assert!(!has_conflicting_duplicate_query_key("a=1&x=%3Ba%3D2"));
+}
+
+#[test]
+fn credential_strip_drops_a_credential_smuggled_behind_a_semicolon() {
+    // Issue #6579: `carrier=;api_key=secret` is an `api_key` parameter to a
+    // `;`-splitting backend, so stripping must not forward it.
+    let mut ctx = ctx_for("api_key=secret&carrier=;api_key=secret&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert!(query.is_unambiguous(), "{:?}", query.ambiguities());
+    assert_eq!(query.len(), 1);
+    assert_eq!(query.get("page"), Some("1"));
+
+    // The name-side and encoded spellings are matched too.
+    for raw in [
+        "x;api_key=secret&page=1",
+        "carrier=;api%5Fkey=secret&page=1",
+    ] {
+        let mut ctx = ctx_for(raw);
+        ctx.metadata.insert(
+            "auth.strip_query_param.api_key".to_string(),
+            "true".to_string(),
+        );
+        let query = canonical_query_for_policy(&ctx);
+        assert_eq!(query.len(), 1, "{raw}");
+        assert_eq!(query.get("page"), Some("1"), "{raw}");
+    }
+}
+
+#[test]
+fn ordered_query_credential_removal_drops_a_semicolon_smuggled_credential() {
+    let names: HashSet<&str> = ["api_key"].into_iter().collect();
+    let mut query = OrderedQuery::parse("carrier=;api_key=secret&x;api_key=s2&keep=a;b&page=1");
+    assert!(query.remove_matching_names(&names));
+    assert_eq!(query.serialize(), "keep=a;b&page=1");
 }
 
 #[test]

@@ -767,6 +767,26 @@ async fn parameter_pollution_ignores_an_excluded_repeated_parameter() {
 }
 
 #[tokio::test]
+async fn hpp_exclusions_apply_under_the_semicolon_separator_convention() {
+    // Issue #6579: a `;`-splitting backend reads `x=;tags=2` as a second `tags`.
+    // An excluded name may still repeat that way, while a conflicting
+    // non-excluded name smuggled behind `;` is still parameter pollution.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": { "exclude": { "query_params": ["tags"] } }
+    }));
+    let (result, request) = query(&plugin, "tags=1&x=;tags=2").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    let (result, request) = query(&plugin, "tags=1&role=user&x=;role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
 async fn excluded_headers_match_case_insensitively() {
     let plugin = recommended_with_overrides(json!({
         "FE-JNDI-001-H": { "exclude": { "headers": ["X-Template-Preview"] } }
