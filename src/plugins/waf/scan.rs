@@ -883,33 +883,43 @@ impl Waf {
     ) {
         if let Some(rule_index) = self.specials.hpp {
             // An excluded parameter may legitimately repeat (`ids=1&ids=2`),
-            // so its pairs are dropped before duplicates are compared, under
-            // the `&`-only and the `&`-plus-`;` separator conventions alike
-            // (issue #6579).
-            let (judged, conflict) = match &self.compiled.rules[rule_index].exclusions {
-                Some(exclusions) if !exclusions.query_params.is_empty() => {
-                    let kept = |pair: &&str| {
-                        let raw_key = pair.split_once('=').map_or(*pair, |(key, _)| key);
-                        !exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
-                    };
-                    let conflict =
-                        decode::has_conflicting_duplicate_among(raw_query.split('&').filter(kept))
-                            || (raw_query.contains(';')
-                                && decode::has_conflicting_duplicate_among(
-                                    raw_query.split(['&', ';']).filter(kept),
-                                ));
-                    (
-                        Cow::Owned(query_without_excluded_params(raw_query, exclusions)),
-                        conflict,
-                    )
-                }
-                _ => (
-                    Cow::Borrowed(raw_query),
-                    decode::has_conflicting_duplicate_query_key(raw_query),
-                ),
+            // so its pairs are dropped before duplicates are compared. Each
+            // separator convention is judged on its own retained pairs, and
+            // false-positive filters see that same text: `&` only, then `&`
+            // plus `;` for backends that also split on `;` (issue #6579). A
+            // conflict that survives suppression under either convention is
+            // enforced.
+            let exclusions = self.compiled.rules[rule_index]
+                .exclusions
+                .as_ref()
+                .filter(|exclusions| !exclusions.query_params.is_empty());
+            let kept = |pair: &&str| {
+                exclusions.is_none_or(|exclusions| {
+                    let raw_key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+                    !exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
+                })
             };
-            if conflict {
-                self.push_special(outcome, rule_index, &judged, subject);
+            if decode::has_conflicting_duplicate_among(raw_query.split('&').filter(kept)) {
+                let judged = match exclusions {
+                    Some(exclusions) => {
+                        Cow::Owned(query_without_excluded_params(raw_query, exclusions))
+                    }
+                    None => Cow::Borrowed(raw_query),
+                };
+                if self.special_hit_allowed(rule_index, &judged, subject) {
+                    self.push_special(outcome, rule_index, &judged, subject);
+                    return;
+                }
+            }
+            if raw_query.contains(';') {
+                let retained: Vec<&str> = raw_query
+                    .split(['&', ';'])
+                    .filter(|pair| !pair.is_empty())
+                    .filter(kept)
+                    .collect();
+                if decode::has_conflicting_duplicate_among(retained.iter().copied()) {
+                    self.push_special(outcome, rule_index, &retained.join("&"), subject);
+                }
             }
         }
     }
@@ -950,6 +960,20 @@ impl Waf {
         }
     }
 
+    /// Whether a special rule's hit on `value` survives scoping, exemptions,
+    /// and the rule's false-positive filters.
+    fn special_hit_allowed(
+        &self,
+        rule_index: usize,
+        value: &str,
+        subject: ScanSubject<'_>,
+    ) -> bool {
+        let rule = &self.compiled.rules[rule_index];
+        self.rule_applies(subject, rule_index)
+            && !self.exemptions.suppresses_value(value)
+            && !rule.suppresses_text(value)
+    }
+
     fn push_special(
         &self,
         outcome: &mut ScanOutcome,
@@ -958,10 +982,7 @@ impl Waf {
         subject: ScanSubject<'_>,
     ) {
         let rule = &self.compiled.rules[rule_index];
-        if self.rule_applies(subject, rule_index)
-            && !self.exemptions.suppresses_value(value)
-            && !rule.suppresses_text(value)
-        {
+        if self.special_hit_allowed(rule_index, value, subject) {
             outcome.push(RuleHit {
                 rule_index,
                 target_name: rule.target.log_target(),

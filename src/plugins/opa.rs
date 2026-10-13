@@ -22,7 +22,7 @@ use url::{Host, Url};
 
 use crate::retry::classify_reqwest_error;
 
-use super::utils::query::{CanonicalQuery, canonical_query_for_policy};
+use super::utils::query::{CanonicalQuery, CanonicalQueryParam, canonical_query_for_policy};
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
@@ -339,7 +339,7 @@ impl Opa {
     fn query_map_input(&self, ctx: &RequestContext, query: &CanonicalQuery) -> Value {
         let mut map = Map::with_capacity(query.len());
         for param in query.params() {
-            if self.query_key_is_redacted(ctx, &param.name) {
+            if self.query_param_is_redacted(ctx, param) {
                 continue;
             }
             map.insert(param.name.clone(), Value::String(param.value.clone()));
@@ -356,7 +356,7 @@ impl Opa {
     fn query_pairs_input(&self, ctx: &RequestContext, query: &CanonicalQuery) -> Value {
         let mut pairs = Vec::with_capacity(query.len());
         for param in query.params() {
-            if self.query_key_is_redacted(ctx, &param.name) {
+            if self.query_param_is_redacted(ctx, param) {
                 continue;
             }
             let mut entry = Map::with_capacity(3);
@@ -366,6 +366,32 @@ impl Opa {
             pairs.push(Value::Object(entry));
         }
         Value::Array(pairs)
+    }
+
+    /// Whether a pair must be withheld from OPA. Beyond its own name, a pair
+    /// is withheld when a `;`-separated sub-pair of it names a redacted key
+    /// (issue #6579): `carrier=;api_key=secret` is one `carrier` pair here but
+    /// an `api_key` credential to a backend that also splits on `;`, and under
+    /// `query_ambiguity_policy: delegate` its value would otherwise reach the
+    /// policy service. The check runs on the decoded text, so an encoded name
+    /// (`;api%5Fkey=`) and a literal `%3B` are both treated as separators; the
+    /// latter only over-redacts.
+    fn query_param_is_redacted(&self, ctx: &RequestContext, param: &CanonicalQueryParam) -> bool {
+        if self.query_key_is_redacted(ctx, &param.name) {
+            return true;
+        }
+        if !param.name.contains(';') && !param.value.contains(';') {
+            return false;
+        }
+        let segment = if param.bare {
+            param.name.clone()
+        } else {
+            format!("{}={}", param.name, param.value)
+        };
+        segment.split(';').any(|sub_pair| {
+            let name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+            self.query_key_is_redacted(ctx, name)
+        })
     }
 
     fn query_key_is_redacted(&self, ctx: &RequestContext, key: &str) -> bool {

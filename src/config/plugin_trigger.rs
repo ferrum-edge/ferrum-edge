@@ -283,6 +283,8 @@ impl PluginTrigger {
 pub struct CompiledPluginTrigger {
     root: CompiledNode,
     reads_authenticated_identity: bool,
+    /// Whether any leaf reads a query parameter.
+    reads_query: bool,
     /// First HTTP-only field name the predicate reads, if any.
     http_only_field: Option<&'static str>,
 }
@@ -409,12 +411,14 @@ impl CompiledPluginTrigger {
         let mut budget = CompileBudget {
             nodes: 0,
             reads_authenticated_identity: false,
+            reads_query: false,
             http_only_field: None,
         };
         let root = compile_node(&trigger.when, 1, &mut budget)?;
         Ok(Self {
             root,
             reads_authenticated_identity: budget.reads_authenticated_identity,
+            reads_query: budget.reads_query,
             http_only_field: budget.http_only_field,
         })
     }
@@ -424,6 +428,13 @@ impl CompiledPluginTrigger {
     /// runs at or before the authentication boundary.
     pub fn reads_authenticated_identity(&self) -> bool {
         self.reads_authenticated_identity
+    }
+
+    /// Whether any leaf reads a query parameter. Such a trigger cannot be
+    /// decided on a query a backend may split differently (an unencoded `;`),
+    /// so the gate runs the instance instead of skipping it.
+    pub fn reads_query(&self) -> bool {
+        self.reads_query
     }
 
     /// The first HTTP-only field name (`method`, `path`, `host`, `header`,
@@ -457,6 +468,7 @@ fn note_http_only_field(budget: &mut CompileBudget, field: &'static str) {
 struct CompileBudget {
     nodes: usize,
     reads_authenticated_identity: bool,
+    reads_query: bool,
     http_only_field: Option<&'static str>,
 }
 
@@ -591,6 +603,7 @@ fn compile_match(
     }
     if let Some(field) = &leaf.query {
         note_http_only_field(budget, "query");
+        budget.reads_query = true;
         return Ok(CompiledMatch::Query(compile_field_match(
             field, "query", false,
         )?));

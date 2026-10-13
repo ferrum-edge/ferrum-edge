@@ -490,6 +490,38 @@ async fn opa_delegate_mode_omits_flat_query_and_reports_ambiguity() {
 }
 
 #[tokio::test]
+async fn opa_delegate_mode_redacts_credentials_behind_a_semicolon() {
+    // Issue #6579: `carrier=;api_key=secret` is a `carrier` pair to Ferrum but
+    // an `api_key` credential to a backend that also splits on `;`. Delegate
+    // mode must not hand its value to the policy service.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({"query_ambiguity_policy": "delegate", "redact_query_keys": ["tenant_secret"]}),
+    );
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(
+        "carrier=;api_key=builtin-secret&x=;api%5Fkey=encoded-secret&y=;tenant_secret=explicit-secret&page=1"
+            .to_string(),
+    );
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let input = &payload["input"];
+    let rendered = serde_json::to_string(&payload).unwrap();
+    for secret in ["builtin-secret", "encoded-secret", "explicit-secret"] {
+        assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+    }
+    assert_eq!(
+        input["query_pairs"],
+        json!([{"name": "page", "value": "1", "bare": false}])
+    );
+    assert_eq!(input["query_ambiguity"], json!(["semicolon_separator"]));
+}
+
+#[tokio::test]
 async fn opa_delegate_mode_still_redacts_query_credentials() {
     // Opting into `delegate` must never widen what OPA is told. The ordered
     // occurrence view is redacted exactly like the flat map, so a duplicated

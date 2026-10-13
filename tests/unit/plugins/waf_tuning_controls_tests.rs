@@ -787,6 +787,29 @@ async fn hpp_exclusions_apply_under_the_semicolon_separator_convention() {
 }
 
 #[tokio::test]
+async fn hpp_false_positive_filters_are_judged_per_separator_convention() {
+    // Issue #6579: the `&`-only view of this query, with `tags` excluded, is
+    // exactly the permitted `role=read&role=write`. A `;`-splitting backend
+    // also receives `role=admin`, and that view is not covered by the filter.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": {
+            "exclude": { "query_params": ["tags"] },
+            "fp_filters": ["^role=read&role=write$"]
+        }
+    }));
+    let (result, request) = query(&plugin, "role=read&role=write").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    let (result, request) = query(&plugin, "role=read&role=write&tags=x;role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
 async fn excluded_headers_match_case_insensitively() {
     let plugin = recommended_with_overrides(json!({
         "FE-JNDI-001-H": { "exclude": { "headers": ["X-Template-Preview"] } }

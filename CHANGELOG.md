@@ -24,7 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Credential stripping (`hide_credentials` query locations, and the
   `request_transformer` pre-mutation strip) now also drops an `&` segment
   that carries the credential behind a `;` (`carrier=;api_key=secret`), and
-  WAF `FE-HPP-001` compares duplicates under the `&`+`;` convention too.
+  WAF `FE-HPP-001` compares duplicates under the `&`+`;` convention too, with
+  exclusions and `fp_filters` judged on each convention's own pairs. OPA
+  `delegate` input withholds a pair whose `;` sub-pair names a redacted
+  credential, and a plugin trigger that reads `query` runs its instance rather
+  than skipping it when the raw query carries an unencoded `;`.
 
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of

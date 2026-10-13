@@ -1347,6 +1347,12 @@ instance when every request must authenticate.
   configured name and is skipped. The bytes are never copied, reflected, or
   logged. Lossy transcoding is deliberately not used — it would let `?q=%FF`
   match a configured `U+FFFD` and, under `not`, switch a security instance off.
+* **A query the backend may split differently always runs the instance.** A
+  trigger that reads any `query` leaf does not decide on a raw query containing
+  an unencoded `;` (issue #6579): it runs the instance instead. A backend that
+  also splits on `;` reads `?x=;action=delete` as an `action` parameter the
+  trigger cannot see, so skipping could hand the request to the backend without
+  the instance's policy. `%3B` is a literal semicolon and is decided normally.
 * **Protocol identity is a set.** Transport and flavor are independent, so an
   HTTP/2 native-gRPC request matches both `http2` and `grpc`.
   Stream identities are likewise client-facing: `udp` versus `dtls` comes from

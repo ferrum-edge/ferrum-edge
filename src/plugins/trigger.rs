@@ -196,7 +196,7 @@ impl PluginTriggerGate {
         if phase == TriggerPhase::PreAuth && self.compiled.reads_authenticated_identity() {
             return true;
         }
-        let decision = {
+        let decision = self.query_forces_run(ctx) || {
             let facts = HttpTriggerFacts::new(ctx);
             self.compiled.evaluate(&facts)
         };
@@ -225,7 +225,21 @@ impl PluginTriggerGate {
         if inputs_may_change || identity_pending {
             return None;
         }
-        Some(self.compiled.evaluate(&HttpTriggerFacts::new(ctx)))
+        Some(self.query_forces_run(ctx) || self.compiled.evaluate(&HttpTriggerFacts::new(ctx)))
+    }
+
+    /// A query-reading trigger is not decided on a query that carries an
+    /// unencoded `;` (issue #6579): a backend that also splits on `;` reads
+    /// parameters the trigger cannot see (`?x=;action=delete`), so skipping
+    /// could hand that request to the backend without the instance's policy.
+    /// The instance runs instead; it is then the instance's own query handling
+    /// (for example the canonical-query `semicolon_separator` rejection) that
+    /// decides. Triggers may only ever remove work, never a guard.
+    fn query_forces_run(&self, ctx: &RequestContext) -> bool {
+        self.compiled.reads_query()
+            && ctx
+                .raw_query_string()
+                .is_some_and(|query| query.contains(';'))
     }
 
     /// Read-only view of an already-memoized decision.

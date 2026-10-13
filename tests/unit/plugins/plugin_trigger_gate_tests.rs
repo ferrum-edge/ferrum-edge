@@ -331,6 +331,63 @@ async fn source_cidr_predicates_read_the_gateway_resolved_client_ip() {
 }
 
 #[tokio::test]
+async fn a_query_trigger_runs_the_instance_when_the_query_carries_a_raw_semicolon() {
+    // Issue #6579: `?x=;action=delete` has no `action` under `&`-only parsing,
+    // but a `;`-splitting backend executes `action=delete`. A query-reading
+    // trigger must not skip a policy instance on a query it cannot decide.
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"match": {"query": {"name": "action"}}}}),
+            )],
+        ),
+        "api",
+    );
+
+    let mut smuggled = request("GET", "/api");
+    smuggled.set_raw_query_string("x=;action=delete".to_string());
+    assert!(
+        !run_request(&plugins, &mut smuggled).await.is_empty(),
+        "an unencoded ';' must not let a query trigger skip the instance"
+    );
+    assert!(
+        !smuggled
+            .metadata
+            .contains_key("plugin_trigger.stamp.skipped")
+    );
+
+    // Without a raw `;` the trigger decides as before.
+    let mut plain = request("GET", "/api");
+    plain.set_raw_query_string("x=1".to_string());
+    assert!(run_request(&plugins, &mut plain).await.is_empty());
+
+    // `%3B` is a literal semicolon, not a separator, so it does not force a run.
+    let mut encoded = request("GET", "/api");
+    encoded.set_raw_query_string("x=%3Baction%3Ddelete".to_string());
+    assert!(run_request(&plugins, &mut encoded).await.is_empty());
+
+    // The same holds beneath `not`: "run unless action=delete" must not be
+    // switched off by a `;`-smuggled pair it cannot see either way.
+    let negated = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"not": {"match": {"query": {
+                    "name": "action", "value": {"exact": ["delete"]}
+                }}}}}),
+            )],
+        ),
+        "api",
+    );
+    let mut smuggled = request("GET", "/api");
+    smuggled.set_raw_query_string("action=delete&x=;action=read".to_string());
+    assert!(!run_request(&negated, &mut smuggled).await.is_empty());
+}
+
+#[tokio::test]
 async fn an_unrepresentable_query_pair_can_never_match_a_replacement_character() {
     // A lossy percent-decoder turns `%FF` into U+FFFD, so this trigger would
     // MATCH a hostile byte sequence the client never spelled that way.
