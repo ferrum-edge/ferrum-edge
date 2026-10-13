@@ -25,9 +25,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
-  # cargo-deny runs `cargo metadata`; this workflow doesn't install sccache, so
-  # clear the checked-in sccache rustc-wrapper (.cargo/config.toml) — the same
-  # fallback the setup-sccache action applies — to avoid exec'ing a missing tool.
+  # cargo-deny runs `cargo metadata`; this workflow doesn't install sccache.
+  # The repository `.cargo/config.toml` names no rustc-wrapper, but clear any
+  # runner- or user-level one anyway — the same fallback the setup-sccache
+  # action applies — so cargo never execs a missing tool.
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
 
