@@ -40,8 +40,15 @@ CODE_TRIGGERED_EVENTS = frozenset(
 )
 
 TOP_LEVEL_KEY = re.compile(r"^(?P<key>[\"']?[A-Za-z_][A-Za-z0-9_-]*[\"']?):(?P<rest>.*)$")
-SCOPE_LINE = re.compile(r"^\s+(?P<scope>[a-z-]+):\s*(?P<level>[a-z-]+)\s*(?:#.*)?$")
-FLOW_SCOPE = re.compile(r"(?P<scope>[a-z-]+)\s*:\s*(?P<level>[a-z-]+)")
+# A scalar may be bare or wrapped in matching single or double quotes; the
+# quotes are YAML syntax, not part of the value, so both spellings normalize to
+# the same scope or event name.
+QUOTED = r"(?P<{0}q>[\"']?)(?P<{0}>[A-Za-z_-]+)(?P={0}q)"
+SCOPE_LINE = re.compile(
+    r"^\s+" + QUOTED.format("scope") + r"\s*:\s*" + QUOTED.format("level") + r"\s*(?:#.*)?$"
+)
+FLOW_ENTRY = re.compile(r"^\s*" + QUOTED.format("scope") + r"\s*:\s*" + QUOTED.format("level") + r"\s*$")
+EVENT_LINE = re.compile(r"^  " + QUOTED.format("event") + r"\s*:(?:\s.*)?$")
 
 
 def _strip_comment(value: str) -> str:
@@ -84,9 +91,16 @@ def workflow_triggers(text: str) -> set[str] | None:
             return None
         events: set[str] = set()
         for line in body:
-            match = re.match(r"^  (?P<event>[a-z_]+):", line)
-            if match:
-                events.add(match.group("event"))
+            if line.lstrip().startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if indent > 2:
+                continue
+            match = EVENT_LINE.match(line)
+            if match is None:
+                # Any other spelling at event depth is unreadable, never ignored.
+                return None
+            events.add(match.group("event"))
         return events or None
     return None
 
@@ -98,10 +112,14 @@ def permission_grants(inline: str, body: list[str]) -> tuple[str | None, dict[st
         if inline in {"read-all", "write-all"}:
             return inline, {}
         if inline.startswith("{") and inline.endswith("}"):
-            return None, {
-                match.group("scope"): match.group("level")
-                for match in FLOW_SCOPE.finditer(inline[1:-1])
-            }
+            scopes: dict[str, str] = {}
+            inner = inline[1:-1].strip()
+            for entry in inner.split(",") if inner else []:
+                match = FLOW_ENTRY.match(entry)
+                if match is None:
+                    return "unreadable", {}
+                scopes[match.group("scope")] = match.group("level")
+            return None, scopes
         return inline, {}
     scopes: dict[str, str] = {}
     for line in body:
@@ -193,6 +211,26 @@ def run_self_test() -> list[str]:
         ),
         ("expression", "on:\n  pull_request:\npermissions: ${{ fromJSON('{}') }}\n" + jobs, False),
         ("unreadable trigger", "on: ${{ x }}\npermissions: {}\n" + jobs, False),
+        ("quoted flow write", "on: push\npermissions: {checks: \"write\"}\n" + jobs, False),
+        ("quoted flow scope", "on: push\npermissions: {'checks': write}\n" + jobs, False),
+        ("quoted block write", "on: push\npermissions:\n  \"checks\": 'write'\n" + jobs, False),
+        ("garbled flow", "on: push\npermissions: {checks write}\n" + jobs, False),
+        (
+            "mixed quoted triggers",
+            "on:\n  workflow_dispatch:\n  \"push\":\npermissions:\n  contents: write\n" + jobs,
+            False,
+        ),
+        (
+            "single-quoted trigger",
+            "on:\n  'pull_request':\n    branches: [main]\npermissions:\n  checks: write\n" + jobs,
+            False,
+        ),
+        (
+            "unreadable trigger key",
+            "on:\n  workflow_dispatch:\n  ? push\npermissions:\n  contents: write\n" + jobs,
+            False,
+        ),
+        ("quoted read flow", "on: push\npermissions: {\"contents\": 'read'}\n" + jobs, True),
     )
     for label, text, accepted in cases:
         errors = workflow_permission_errors(text, f"self-test {label}")
