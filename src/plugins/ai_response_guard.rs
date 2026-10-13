@@ -201,13 +201,19 @@ struct RedactionBudget {
 }
 
 impl RedactionBudget {
-    fn for_body(body_len: usize) -> Self {
+    /// Allowance for a `body_len`-byte response whose rewritten candidate must
+    /// fit the `ceiling` window reserved for it: growth is capped at a small
+    /// multiple of the body (64 KiB floor, 64 MiB ceiling) AND at the room the
+    /// window leaves above the body, so a structured candidate can never be
+    /// built larger than the window that covers it.
+    fn for_response(body_len: usize, ceiling: usize) -> Self {
         let limit = body_len
             .saturating_mul(REDACTION_OUTPUT_EXPANSION_FACTOR)
             .clamp(
                 MIN_REDACTION_OUTPUT_GROWTH_BYTES,
                 MAX_REDACTION_OUTPUT_GROWTH_BYTES,
-            );
+            )
+            .min(ceiling.saturating_sub(body_len));
         Self {
             remaining: Cell::new(limit),
             exhausted: Cell::new(false),
@@ -1256,12 +1262,12 @@ impl AiResponseGuard {
     /// custom pattern can render an identifier that matches its own regex. The
     /// marker would otherwise report a false residual leak (turning a fully
     /// redacted body into a spurious 502).
-    fn redact_leaves_residual(&self, original: &Value, body_len: usize) -> bool {
+    fn redact_leaves_residual(&self, original: &Value, body_len: usize, ceiling: usize) -> bool {
         if self.detection_pattern_count == 0 {
             return false;
         }
         let mut redacted = original.clone();
-        let budget = RedactionBudget::for_body(body_len);
+        let budget = RedactionBudget::for_response(body_len, ceiling);
         self.redact_all_strings_with_argument_shield(&mut redacted, &budget);
         if budget.is_exhausted() {
             return true;
@@ -1280,7 +1286,18 @@ impl AiResponseGuard {
                 return true;
             }
         }
-        let serialized = self.strip_known_placeholders(&redacted.to_string());
+        // The raw/contextual pass serializes the candidate through the same
+        // window bound; a candidate that does not fit is not deliverable, so it
+        // is treated as residual (fail closed) rather than materialised.
+        let Some(serialized) =
+            crate::proxy::response_buffer_budget::bounded_json_vec(&redacted, ceiling)
+        else {
+            return true;
+        };
+        let Ok(serialized) = String::from_utf8(serialized) else {
+            return true;
+        };
+        let serialized = self.strip_known_placeholders(&serialized);
         self.detection_set.is_match(&serialized)
     }
 
@@ -1292,12 +1309,17 @@ impl AiResponseGuard {
     /// parts (each part alone is clean, so per-part redaction rewrites
     /// nothing), and tool-argument content the argument redactor cannot
     /// rewrite (a decoded object key or numeric scalar).
-    fn content_redact_leaves_residual(&self, original: &Value, body_len: usize) -> bool {
+    fn content_redact_leaves_residual(
+        &self,
+        original: &Value,
+        body_len: usize,
+        ceiling: usize,
+    ) -> bool {
         if self.detection_pattern_count == 0 {
             return false;
         }
         let mut redacted = original.clone();
-        let budget = RedactionBudget::for_body(body_len);
+        let budget = RedactionBudget::for_response(body_len, ceiling);
         self.redact_response_json(&mut redacted, &budget);
         if budget.is_exhausted() {
             return true;
@@ -2214,7 +2236,7 @@ impl AiResponseGuard {
         // stream is never materialised in full before the bound applies
         // (GHSA-pwcm-6rh8-f2gh). Each event is framed/serialized directly into
         // that sink — never as a complete would-be event `String` beside it.
-        let budget = RedactionBudget::for_body(body.len());
+        let budget = RedactionBudget::for_response(body.len(), ceiling);
         let (output, modified) = rewrite_sse_events_bounded(body_str, ceiling, |output, lines| {
             self.redact_sse_event(output, lines, &budget)
         })?;
@@ -2501,7 +2523,7 @@ impl AiResponseGuard {
         use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
         let mut rewritten = BoundedResponseBodySink::with_ceiling(ceiling);
         let mut changed = false;
-        let redaction = RedactionBudget::for_body(body.len());
+        let redaction = RedactionBudget::for_response(body.len(), ceiling);
         for frame in &frames {
             let payload = frame.payload.as_ref();
             let mut message = DynamicMessage::decode(method.descriptor.clone(), payload).ok()?;
@@ -4124,9 +4146,13 @@ impl Plugin for AiResponseGuard {
                 }
                 Some(window) => {
                     let leaves_residual = if self.scan_mode == ScanMode::All {
-                        self.redact_leaves_residual(&json, body.len())
+                        self.redact_leaves_residual(&json, body.len(), window.window_bytes())
                     } else {
-                        self.content_redact_leaves_residual(&json, body.len())
+                        self.content_redact_leaves_residual(
+                            &json,
+                            body.len(),
+                            window.window_bytes(),
+                        )
                     };
                     drop(window);
                     if leaves_residual {
@@ -4580,7 +4606,7 @@ impl AiResponseGuard {
             Err(_) => return None,
         };
 
-        let budget = RedactionBudget::for_body(body.len());
+        let budget = RedactionBudget::for_response(body.len(), ceiling);
         if self.scan_mode == ScanMode::All {
             *detected = self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok());
             if detected.is_empty() {
@@ -4590,7 +4616,7 @@ impl AiResponseGuard {
             // Keep the transform independently representation-safe as well:
             // never mutate decoded keys, numbers, duplicate members, or other
             // matches the value-only redactor cannot rewrite.
-            if self.redact_leaves_residual(&json, body.len()) {
+            if self.redact_leaves_residual(&json, body.len(), ceiling) {
                 return None;
             }
             self.redact_all_strings_with_argument_shield(&mut json, &budget);
@@ -4600,7 +4626,7 @@ impl AiResponseGuard {
             if detected.is_empty() {
                 return None;
             }
-            if self.content_redact_leaves_residual(&json, body.len()) {
+            if self.content_redact_leaves_residual(&json, body.len(), ceiling) {
                 return None;
             }
             self.redact_response_json(&mut json, &budget);

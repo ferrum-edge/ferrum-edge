@@ -7621,3 +7621,40 @@ async fn grpc_redaction_budget_is_aggregate_across_frames() {
         "combined growth across frames must exhaust the shared allowance"
     );
 }
+
+/// The growth allowance is also capped by the window that covers the
+/// rewritten candidate, so inspection refuses a structured rewrite that could
+/// only be built larger than this response's retained ceiling.
+#[tokio::test]
+async fn structured_redaction_budget_respects_the_covering_window() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "7"}],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let content = format!("{} {}", "7".repeat(512), "a".repeat(32_000));
+    let body = chat_body(&[content]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // Control: under an ordinary ceiling the ~65 KB rewrite is promised.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut roomy, 200, &mut headers.clone(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A 64 KiB window over a ~32 KiB body leaves ~32 KiB of room, below the
+    // ~65 KB the rewrite needs: inspection must refuse instead of building it.
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    assert!(body.len() < ctx.max_response_body_size_bytes);
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
