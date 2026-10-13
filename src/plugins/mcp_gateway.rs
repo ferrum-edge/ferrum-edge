@@ -4994,7 +4994,9 @@ impl McpGateway {
                     while !raw.is_char_boundary(end) {
                         end -= 1;
                     }
-                    raw.truncate(end);
+                    // A fresh bounded copy: `truncate` would keep the full
+                    // serialized allocation alive in request metadata.
+                    raw = raw[..end].to_owned();
                     ctx.metadata
                         .insert("mcp.arguments_truncated".to_string(), "true".to_string());
                 }
