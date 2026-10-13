@@ -253,7 +253,7 @@ pin-project-lite = "0.2"
 # load-bearing: `crypto-ring` / `fips`, not reqwest, selects the provider.
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "form", "rustls-no-provider", "stream", "http2", "charset"] }
 hickory-resolver = { version = "0.26.2", features = ["tokio", "system-config"] }
-base64 = "0.22"
+base64 = "0.23"
 # AWS event-stream prelude/message CRC32 (ITU-T V.42). Already transitive via
 # flate2; the explicit dependency makes the Bedrock integrity check intentional.
 crc32fast = "1"
@@ -266,7 +266,7 @@ tokio-util = { version = "0.7.18", default-features = false }
 prost-reflect = "0.16"
 brotli = "8"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -577,7 +577,7 @@ rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # with dev-dependency edges excluded for exactly this reason.
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
-rstest = "0.26"
+rstest = "0.27"
 time = "0.3"
 # Phase 6 cross-protocol matrix macro: concatenates idents at macro
 # expansion to generate one #[tokio::test] per (frontend, backend)
