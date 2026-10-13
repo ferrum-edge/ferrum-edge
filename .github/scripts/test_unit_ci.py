@@ -133,7 +133,11 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
                 "trap 'kill \"$unit_sampler_pid\" 2>/dev/null || true; wait \"$unit_sampler_pid\" || true' EXIT",
             ]
             expected[command_index + 4:command_index + 4] = [
-                'kill "$unit_sampler_pid"',
+                # Guarded kill: a sampler that already exited normally at its
+                # two-hour deadline must not fail a successful compile. The
+                # unguarded `wait` still joins it and fails the step when the
+                # sampler itself exited nonzero.
+                'kill "$unit_sampler_pid" 2>/dev/null || true',
                 'wait "$unit_sampler_pid"',
                 "trap - EXIT",
                 f'cp target/cargo-timings/cargo-timing.html "$RUNNER_TEMP/unit-ci/{phase}.cargo-timing.html"',
@@ -498,6 +502,66 @@ echo reporter-ran > reporter.marker
             self.assertEqual(result.returncode, 42)
             self.assertIn("command-output", (Path(root) / "phase.log").read_text())
             self.assertFalse((Path(root) / "reporter.marker").exists())
+
+    def test_sampler_stop_tolerates_normal_expiry_and_still_joins(self):
+        # Fixed fixture mirroring the workflow stop sequence: the sampler has
+        # already exited normally (its two-hour deadline) before the stop.
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(
+                ["bash", "-c", """set -euo pipefail
+bash -c 'exit 0' &
+unit_sampler_pid=$!
+sleep 1
+kill "$unit_sampler_pid" 2>/dev/null || true
+wait "$unit_sampler_pid"
+echo stopped > stopped.marker
+"""],
+                cwd=root, capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((Path(root) / "stopped.marker").exists())
+
+    def test_sampler_stop_surfaces_a_failed_sampler(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(
+                ["bash", "-c", """set -euo pipefail
+bash -c 'exit 3' &
+unit_sampler_pid=$!
+sleep 1
+kill "$unit_sampler_pid" 2>/dev/null || true
+wait "$unit_sampler_pid"
+echo stopped > stopped.marker
+"""],
+                cwd=root, capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.assertEqual(result.returncode, 3)
+            self.assertFalse((Path(root) / "stopped.marker").exists())
+
+    def test_sampler_stop_still_stops_a_running_sampler(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run(
+                ["bash", "-c", """set -euo pipefail
+python3 -c 'import signal, sys, time; signal.signal(signal.SIGTERM, lambda *args: sys.exit(0)); time.sleep(30)' &
+unit_sampler_pid=$!
+sleep 1
+kill "$unit_sampler_pid" 2>/dev/null || true
+wait "$unit_sampler_pid"
+echo stopped > stopped.marker
+"""],
+                cwd=root, capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((Path(root) / "stopped.marker").exists())
+
+    def test_every_sampler_caller_uses_the_guarded_stop(self):
+        for workflow in (".github/workflows/ci.yml", ".github/workflows/scale-benchmark.yml"):
+            lines = Path(workflow).read_text().splitlines()
+            stops = [line.strip() for line in lines if "unit_sampler_pid" in line]
+            self.assertNotIn('kill "$unit_sampler_pid"', stops, workflow)
+            guarded = stops.count('kill "$unit_sampler_pid" 2>/dev/null || true')
+            joined = stops.count('wait "$unit_sampler_pid"')
+            self.assertGreater(guarded, 0, workflow)
+            self.assertEqual(guarded, joined, workflow)
 
     def test_tee_failure_is_fatal_even_when_command_succeeds(self):
         with tempfile.TemporaryDirectory() as root:

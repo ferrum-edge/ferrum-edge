@@ -57,13 +57,8 @@ fn start_gateway_file_mode(
     // contract used by the [`crate::common::TestGateway`] builder.
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
-    let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        return Err("ferrum-edge binary not found in ./target/debug/ or ./target/release/".into());
-    };
+    let binary_path =
+        crate::common::locate_binary(false).map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     let mut cmd = std::process::Command::new(binary_path);
     cmd.arg("run");

@@ -2,7 +2,9 @@
 version: "1"
 # HTTP/1.1 end-to-end TLS performance test config.
 # Client --HTTPS--> gateway --HTTPS--> backend. Every hop encrypted.
-# Used exclusively by gateways-protocol-benchmark.yml for the "http1-tls" matrix job.
+# Used by gateways-protocol-benchmark.yml for the "http1-tls" matrix job and
+# by the native --envoy comparison in run_protocol_test.sh (paired with
+# configs/envoy/http1_tls.yaml, which likewise originates TLS to 3447).
 proxies:
   - id: "h1-tls-e2e-echo"
     name: "HTTP/1.1+TLS E2E Echo"

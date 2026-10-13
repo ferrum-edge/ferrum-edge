@@ -488,8 +488,12 @@ are listed at the end of this section.
 - **CRL refresh is a restart-blocking dependency.** The same refusal applies at
   **startup**, not only at reload: `FERRUM_TLS_CRL_FILE_PATH` /
   `FERRUM_TLS_CRL_SOURCE` is loaded during startup in every serving mode
-  (database, file, cp, dp, mesh, node_agent) and an expired record fails that
-  load, so the process exits instead of booting. A pod that restarts after
+  that brings up a governed TLS surface (database, file, cp, dp, mesh, and
+  node_agent with an active or explicitly requested admin HTTPS surface) and
+  an expired record fails that load, so the process exits instead of
+  booting. A `node_agent` whose admin surface is disabled or HTTP-only loads
+  no TLS policy or CRL at startup, so an unrelated CRL path does not block
+  it; every surface that does load the CRL keeps this refusal. A pod that restarts after
   `nextUpdate` — rolling deploy, node drain, OOM kill — does not come back, and
   a forgotten CRL refresh job is therefore a fleet-wide outage rather than a
   single-pod incident. This is deliberate (see

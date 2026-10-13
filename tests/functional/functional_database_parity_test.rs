@@ -19,16 +19,8 @@ use std::process::Command;
 use std::time::Duration;
 use uuid::Uuid;
 
-fn gateway_binary() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 fn run_migrate(action: &str, db_type: &str, db_url: &str) -> std::process::Output {
-    Command::new(gateway_binary())
+    Command::new(crate::common::gateway_binary_path())
         .arg("run")
         .env("FERRUM_MODE", "migrate")
         .env("FERRUM_MIGRATE_ACTION", action)

@@ -240,15 +240,6 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-/// Find the gateway binary path.
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
 /// Start the gateway in file mode with additional environment overrides.
 fn start_gateway_with_extra_env(
     config_path: &str,
@@ -262,7 +253,7 @@ fn start_gateway_with_extra_env(
         .local_addr()?
         .port();
     let observability_token = format!("ferrum-edge-grpc-probe-{}", uuid::Uuid::new_v4().simple());
-    let mut cmd = std::process::Command::new(gateway_binary_path());
+    let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)

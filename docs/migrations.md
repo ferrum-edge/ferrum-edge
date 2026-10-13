@@ -304,6 +304,16 @@ dialect construct cannot be parsed safely (unclosed quotes/comments/dollar
 tags, unclosed `BEGIN … END`, or a MySQL `DELIMITER` that is never restored),
 registration/apply fails before any statement executes.
 
+The runner owns every transaction boundary (the SQLite migration lock is itself
+a `BEGIN IMMEDIATE` transaction, and PostgreSQL bodies share one transaction
+with their tracking row), so custom-plugin SQL must not contain top-level
+transaction-control statements: `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`,
+`ROLLBACK` (other than `ROLLBACK … TO` a savepoint), PostgreSQL `ABORT` /
+`PREPARE TRANSACTION`, or MySQL `XA`. A body containing one is rejected, for
+every dialect, before any statement executes. `SAVEPOINT`, `RELEASE`, and
+`ROLLBACK TO` are allowed, as is transaction control inside a stored routine
+body.
+
 ```rust
 sql: r#"
     CREATE TABLE IF NOT EXISTS my_cache (key TEXT PRIMARY KEY, value TEXT);
@@ -320,7 +330,10 @@ Dialect transactionality for custom-plugin migrations:
 - **PostgreSQL (top-level DDL):** statements that must run outside a
   transaction are detected automatically, including `CREATE INDEX CONCURRENTLY`,
   `DROP INDEX CONCURRENTLY`, concurrent `REINDEX`, `VACUUM`, database creation
-  or deletion, and `ALTER SYSTEM`. Ferrum executes every statement first and
+  or deletion, and `ALTER SYSTEM`. Detection reads SQL keywords only, ignoring
+  comments and quoted text: `CREATE /* online */ INDEX CONCURRENTLY` is
+  detected, while a `/* CONCURRENTLY */` comment or a `'CONCURRENTLY'` literal
+  does not select top-level execution. Ferrum executes every statement first and
   records `_ferrum_plugin_migrations` only after all statements succeed. A
   failed statement therefore never creates a tracking row; because PostgreSQL
   cannot roll back this class of DDL as one unit, authors should keep these

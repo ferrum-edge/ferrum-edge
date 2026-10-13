@@ -222,20 +222,18 @@ impl ScalePerfHarness {
             return Err("Failed to build ferrum-edge".into());
         }
 
-        let binary_path = if std::path::Path::new("./target/release/ferrum-edge").exists() {
-            "./target/release/ferrum-edge"
-        } else if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        let binary_path =
+            crate::common::locate_binary(true).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+        if !binary_path.starts_with("./target/release") {
             eprintln!(
-                "WARNING: Using debug build — performance numbers will not be meaningful. Run `cargo build --release` first."
+                "WARNING: Using {} — performance numbers will not be meaningful. Run `cargo build --release` first.",
+                binary_path.display()
             );
-            "./target/debug/ferrum-edge"
-        } else {
-            return Err("ferrum-edge binary not found. Run `cargo build --release` first.".into());
-        };
+        }
 
         // Run migrations first for postgres
         if db_type == "postgres" {
-            let migrate_status = Command::new(binary_path)
+            let migrate_status = Command::new(&binary_path)
                 .arg("run")
                 .env("FERRUM_MODE", "migrate")
                 .env("FERRUM_DB_TYPE", db_type)
@@ -247,7 +245,7 @@ impl ScalePerfHarness {
             }
         }
 
-        let mut command = Command::new(binary_path);
+        let mut command = Command::new(&binary_path);
         command.arg("run");
         command
             .env("FERRUM_MODE", "database")
@@ -1341,11 +1339,17 @@ const RELOAD_STEADY_SECS: u64 = 10;
 /// Measured after the new wave is live, still under the same load.
 const RELOAD_POST_SECS: u64 = 10;
 /// Proxies in each small change applied after every wave. A 12,000-resource
-/// wave exceeds the poller's 10,000-row change-log limit and forces a full
-/// rebuild. Small changes come in two kinds: with new `key_auth` consumers and
-/// proxies-only (new proxies whose plugins admit existing consumers). Both take
-/// the incremental path: consumer changes escalate to a full reload only while
-/// load-time quarantine is active or a changed consumer carries `hmac_auth`
+/// wave stays incremental: the poller pages the change log 10,000 rows at a
+/// time (`CHANGE_LOG_PAGE_ROWS`) under a separate 100,000-row total cap
+/// (`CHANGE_LOG_MAX_ROWS`), and only a backlog reaching that cap
+/// (`changes.len() >= max_rows`) falls back to an authoritative full reload
+/// (issue #6058). Small changes come in two kinds: with new `key_auth`
+/// consumers and proxies-only (new proxies whose plugins admit existing
+/// consumers). Both take the incremental path in this fixture: consumer
+/// changes escalate to a full reload unless the namespace has successfully
+/// recorded clean state (a successful authoritative full load that
+/// quarantined nothing) — unknown or poisoned state also escalates — and a
+/// changed consumer carrying `hmac_auth` is a separate escalation condition
 /// (issue #6060).
 const RELOAD_SMALL_CHANGE_PROXIES: usize = 100;
 /// Index bases for small-change proxies, clear of every wave's range.

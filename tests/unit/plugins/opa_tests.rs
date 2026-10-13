@@ -1491,3 +1491,145 @@ fn opa_headers_cannot_name_the_proxy_hop_count() {
         assert!(validate_plugin_config("opa", &config).is_err(), "{name:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Decision-URL normalization (issue #6368) and header value domain (#6369)
+// ---------------------------------------------------------------------------
+
+fn opa_schema_validator() -> jsonschema::Validator {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/OpaPluginConfig",
+        "components": spec["components"].clone(),
+    });
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("OpaPluginConfig schema compiles")
+}
+
+/// The WHATWG URL parser treats `\` as a separator for http/https, strips
+/// tab/CR/LF, trims trailing spaces and controls, and then removes dot
+/// segments. Every policy path that parsing would rewrite out of (or within)
+/// `/v1/data/` must be refused by BOTH the constructor and the schema.
+#[test]
+fn opa_policy_path_rejects_values_url_normalization_would_rewrite() {
+    let validator = opa_schema_validator();
+    let traversal_shaped = [
+        "..\\..\\outside",
+        "ferrum\\..\\..\\outside",
+        "ferrum/authz\\allow",
+        "ferrum/.. ",
+        "ferrum/allow ",
+        " ferrum/allow",
+        "ferrum/.\t.",
+        "ferrum/\n../outside",
+        "ferrum/\r..",
+        "ferrum/allow\u{0}",
+        "ferrum/allow\u{7f}",
+        "ferrum/al low",
+    ];
+    for policy_path in traversal_shaped {
+        let config = json!({
+            "opa_host": "http://opa.example",
+            "policy_path": policy_path,
+        });
+        let error = match Opa::new(&config, default_client()) {
+            Ok(_) => panic!("policy_path {policy_path:?} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("`policy_path`"),
+            "{policy_path:?}: unexpected error {error}"
+        );
+        assert!(
+            !error.contains("outside"),
+            "{policy_path:?}: the diagnostic must not echo the supplied value: {error}"
+        );
+        assert!(
+            validate_plugin_config("opa", &config).is_err(),
+            "{policy_path:?}: validate_plugin_config must agree with the constructor"
+        );
+        assert!(
+            !validator.is_valid(&config),
+            "{policy_path:?}: OpaPluginConfig must reject what the constructor rejects"
+        );
+    }
+
+    for policy_path in ["ferrum/authz/allow", "ferrum/authz/allów", "a..b/c./.d"] {
+        let config = json!({
+            "opa_host": "http://opa.example",
+            "policy_path": policy_path,
+        });
+        assert!(
+            Opa::new(&config, default_client()).is_ok(),
+            "{policy_path:?}: constructor must admit an ordinary data path"
+        );
+        assert!(
+            validator.is_valid(&config),
+            "{policy_path:?}: OpaPluginConfig must admit what the constructor admits"
+        );
+    }
+}
+
+/// A base path with dot segments is normalized before the Data API prefix is
+/// appended, and the decision call is sent to exactly the admitted URL: the
+/// mock answers only `/v1/data/{policy_path}`, so any other target would fail
+/// closed with a 503 instead of continuing.
+#[tokio::test]
+async fn opa_decision_call_targets_the_normalized_data_api_path() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let config = json!({
+        "opa_host": format!("{}/base/..", server.uri()),
+        "policy_path": POLICY_PATH,
+    });
+    let plugin = Opa::new(&config, default_client()).expect("valid opa config");
+
+    let mut ctx = make_ctx();
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let received = server.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].url.path(), DECISION_PATH);
+}
+
+/// `headers`, `deny_headers`, and `fail_closed_headers` values share one
+/// domain: whatever `HeaderValue::from_str` accepts (visible ASCII, space,
+/// HTAB, and UTF-8 obs-text). NUL, CR, LF, DEL, and other C0 controls are
+/// refused by both the constructor and the schema.
+#[test]
+fn opa_header_value_domain_matches_between_schema_and_constructor() {
+    let validator = opa_schema_validator();
+    let cases = [
+        ("denied", true),
+        ("café", true),
+        ("tab\tseparated", true),
+        ("", true),
+        ("nul\u{0}byte", false),
+        ("carriage\rreturn", false),
+        ("line\nfeed", false),
+        ("del\u{7f}byte", false),
+        ("bell\u{7}byte", false),
+    ];
+    for field in ["headers", "deny_headers", "fail_closed_headers"] {
+        for (value, expected_valid) in cases {
+            let config = json!({
+                "opa_host": "http://127.0.0.1:8181",
+                "policy_path": POLICY_PATH,
+                field: {"X-Policy": value},
+            });
+            assert_eq!(
+                Opa::new(&config, default_client()).is_ok(),
+                expected_valid,
+                "{field} value {value:?}: constructor admission"
+            );
+            assert_eq!(
+                validator.is_valid(&config),
+                expected_valid,
+                "{field} value {value:?}: OpaPluginConfig admission"
+            );
+        }
+    }
+}

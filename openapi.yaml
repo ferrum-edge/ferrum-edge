@@ -3101,13 +3101,13 @@ paths:
                     identities:
                       - pod_uid: "11111111-1111-1111-1111-111111111111"
                         spiffe_id: "spiffe://cluster.local/ns/default/sa/api"
-                        workload_spiffe_hash: 12345678901234567890
+                        workload_spiffe_hash: 7034895985921056185
                         orig_dst4_cookies: 17
                         orig_dst6_cookies: 0
                         has_policy_scope: true
                       - pod_uid: "22222222-2222-2222-2222-222222222222"
                         spiffe_id: "spiffe://cluster.local/ns/default/sa/billing"
-                        workload_spiffe_hash: 9876543210987654321
+                        workload_spiffe_hash: 11217503067615104173
                         orig_dst4_cookies: 0
                         orig_dst6_cookies: 0
                         has_policy_scope: false
@@ -28281,11 +28281,15 @@ components:
         policy_path:
           type: string
           minLength: 1
-          pattern: '^(?!(\.|\.\.)(/|$))[^/?#%]+(/(?!(\.|\.\.)(/|$))[^/?#%]+)*$'
+          pattern: '^(?!(\.|\.\.)(/|$))[^/?#%\\\u0000-\u0020\u007F]+(/(?!(\.|\.\.)(/|$))[^/?#%\\\u0000-\u0020\u007F]+)*$'
           description: >-
             OPA data path appended under /v1/data/. Must be non-empty, must not
-            start with '/', must not contain percent-encoding, a query, or a
-            fragment, and must not contain empty, '.', or '..' segments.
+            start with '/', must not contain percent-encoding, a query, a
+            fragment, a backslash, a space, or an ASCII control character, and
+            must not contain empty, '.', or '..' segments. The normalized
+            decision URL must still address the path under
+            {opa_host}/v1/data/; a value the URL parser would rewrite out of
+            that prefix is rejected at config load.
           example: "ferrum/authz/allow"
         headers:
           type: object
@@ -28298,11 +28302,13 @@ components:
                 - pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss]$'
           additionalProperties:
             type: string
-            pattern: '^[\u0009\u0020-\u007E]*$'
+            pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
           default: {}
           description: >-
             Static HTTP headers sent to OPA on every decision request. Names use
-            HTTP token syntax and values are visible ASCII (plus tab). The
+            HTTP token syntax. Values must be valid HTTP field values: visible
+            ASCII, space, horizontal tab, and UTF-8 (HeaderValue obs-text) are
+            accepted; NUL, CR, LF, DEL, and other C0 controls are rejected. The
             `content-type` header is managed by the plugin and cannot be
             configured here, case-insensitively. Neither can the gateway-owned
             `X-Ferrum-Hops` proxy hop count (any case, `_` or `-`), which the
@@ -28357,11 +28363,14 @@ components:
               pattern: '^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$'
           additionalProperties:
             type: string
-            pattern: '^[\u0009\u0020-\u007E]*$'
+            pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
           default: {}
           description: >-
             Headers added to the policy-denial response. Names and values are
-            validated at config load. Protocol-managed hop-by-hop and framing
+            validated at config load: names use HTTP token syntax and values
+            accept visible ASCII, space, horizontal tab, and UTF-8 (HeaderValue
+            obs-text) while NUL, CR, LF, DEL, and other C0 controls are
+            rejected. Protocol-managed hop-by-hop and framing
             destinations (`connection`, `content-length`, `keep-alive`,
             `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
             `transfer-encoding`, `upgrade`, case-insensitive) are rejected: the
@@ -28389,7 +28398,7 @@ components:
               pattern: '^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$'
           additionalProperties:
             type: string
-            pattern: '^[\u0009\u0020-\u007E]*$'
+            pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
           default: {}
           description: >-
             Headers added to fail-closed OPA error responses. Same name/value
