@@ -179,10 +179,14 @@ fn reject_duplicate_destination(
     field: &str,
     plugin: &str,
 ) -> Result<(), String> {
-    if mappings
-        .iter()
-        .any(|mapping| mapping.destination_header == header_name)
-    {
+    // Compare as a CGI-style backend sees the names: `X_Tenant_Id` and
+    // `x-tenant-id` collapse into one variable there.
+    if mappings.iter().any(|mapping| {
+        crate::proxy::headers::field_names_equivalent_for_backends(
+            &mapping.destination_header,
+            header_name,
+        )
+    }) {
         return Err(format!(
             "{plugin}: `{field}` declares header {header_name:?} more than once; \
              a destination may be asserted from exactly one claim"
@@ -553,7 +557,10 @@ pub fn is_reserved_header(name: &str) -> bool {
 /// enforce this list (issue #6620). It is stricter than [`is_reserved_header`],
 /// which still decides which names the legacy error message calls "reserved".
 pub fn is_output_claim_reserved_header(name: &str) -> bool {
-    let lowercase = name.to_ascii_lowercase();
+    // Fold `_` to `-` as well as case: a CGI-style backend reads `X_Real_IP`
+    // as `X-Real-IP` (`field_names_equivalent_for_backends`), so an underscore
+    // spelling must not slip a reserved destination past this list.
+    let lowercase = name.to_ascii_lowercase().replace('_', "-");
     is_reserved_header(&lowercase)
         || matches!(
             lowercase.as_str(),
@@ -671,6 +678,12 @@ mod tests {
         let error = parse_object(json!({"claim_headers": {"sub": "X-User", "email": "x-user"}}))
             .expect_err("duplicate destination");
         assert!(error.contains("more than once"), "{error}");
+        // Backend-equivalent spellings are the same destination.
+        let error = parse_object(
+            json!({"claim_headers": {"tenant": "X-Tenant-Id", "role": "X_Tenant_Id"}}),
+        )
+        .expect_err("underscore-equivalent duplicate destination");
+        assert!(error.contains("more than once"), "{error}");
 
         for reserved in [
             "cookie",
@@ -680,6 +693,10 @@ mod tests {
             "forwarded",
             "via",
             "x-real-ip",
+            "X_Real_IP",
+            "X_Forwarded_For",
+            "X_Ferrum_Anything",
+            "Content_Length",
         ] {
             let error = parse_object(json!({"claim_headers": {"sub": reserved}}))
                 .expect_err("strict reserved destination");
@@ -699,6 +716,30 @@ mod tests {
         let error = parse_object(json!({"claim_headers": ["secret-value"]}))
             .expect_err("non-object claim_headers");
         assert!(!error.contains("secret-value"), "{error}");
+    }
+
+    #[test]
+    fn list_form_folds_underscores_for_reserved_and_duplicate_destinations() {
+        let parse_list = |config: serde_json::Value| {
+            parse_claim_header_list(
+                config.as_object().expect("object"),
+                "output_claim_headers",
+                "test",
+                "test.",
+            )
+        };
+        for reserved in ["X_Real_IP", "X_Forwarded_For", "X_Ferrum_Anything"] {
+            let error =
+                parse_list(json!({"output_claim_headers": [{"header": reserved, "claim": "sub"}]}))
+                    .expect_err("underscore spelling of a reserved destination");
+            assert!(error.contains("reserved"), "{reserved}: {error}");
+        }
+        let error = parse_list(json!({"output_claim_headers": [
+            {"header": "X-Tenant-Id", "claim": "tenant"},
+            {"header": "X_Tenant_Id", "claim": "role"}
+        ]}))
+        .expect_err("underscore-equivalent duplicate destination");
+        assert!(error.contains("more than once"), "{error}");
     }
 
     #[test]

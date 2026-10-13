@@ -665,9 +665,12 @@ impl JwksAuth {
                 provider_claim_headers.as_slice()
             };
             if let Some(duplicate) = provider_output_claim_headers.iter().find(|output| {
-                effective_claim_headers
-                    .iter()
-                    .any(|mapping| mapping.destination_header == output.destination_header)
+                effective_claim_headers.iter().any(|mapping| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(
+                        &mapping.destination_header,
+                        &output.destination_header,
+                    )
+                })
             }) {
                 return Err(format!(
                     "jwks_auth: `provider[{idx}]` maps header {:?} through both \
