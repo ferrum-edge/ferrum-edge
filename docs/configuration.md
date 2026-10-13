@@ -60,8 +60,10 @@ the address was first used during startup secret resolution). The same rule
 applies to every redirect a Vault server returns, because `X-Vault-Token` is
 carried across redirects: a redirect to a plaintext `http` address is refused
 unless the opt-in is set or both the configured address and the target are
-loopback. A loopback `http` address is always contacted directly, never through
-`HTTP_PROXY`/`ALL_PROXY`, so the token cannot reach a proxy in plaintext. Malformed URLs,
+loopback; a redirect the opt-in alone admits logs the same warning. A loopback
+`http` address is always contacted directly, never through
+`HTTP_PROXY`/`ALL_PROXY`, so the token cannot reach a proxy in plaintext, and
+`localhost` is pinned to `127.0.0.1`/`::1` instead of the system resolver. Malformed URLs,
 unsupported schemes, and refused plaintext addresses fail secret resolution
 with a diagnostic naming `VAULT_ADDR`; `validate` and startup exit non-zero
 without a dependency panic. The diagnostic does not echo the address or token.

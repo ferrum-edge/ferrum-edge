@@ -131,7 +131,7 @@ pub(crate) fn emit_deferred_plaintext_warning() {
 
 fn warn_plaintext_opt_in() {
     tracing::warn!(
-        "VAULT_ADDR uses plaintext http to a non-loopback host because \
+        "Vault traffic uses plaintext http to a non-loopback host because \
          {ALLOW_PLAINTEXT_ENV}=true; VAULT_TOKEN and fetched secrets cross the network \
          unencrypted"
     );
@@ -172,6 +172,18 @@ fn vault_transport(
     if let Some(identity) = &settings.identity {
         builder = builder.identity(identity.clone());
     }
+    // `localhost` is admitted as loopback by name, so pin it to the loopback
+    // addresses rather than trusting the system resolver: NSS or DNS fallback
+    // without a hosts entry could otherwise map it to a network address and
+    // carry the token there in plaintext. This applies to redirect targets as
+    // well, since they go through this same client.
+    builder = builder.resolve_to_addrs(
+        "localhost",
+        &[
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+        ],
+    );
     let loopback_http = settings.address.scheme() == "http" && host_is_loopback(&settings.address);
     if let Some(proxy) = &settings.proxy {
         builder = builder.proxy(
@@ -186,6 +198,12 @@ fn vault_transport(
             return attempt.error("too many Vault redirects");
         }
         if redirect_permitted(attempt.url(), loopback_http, allow_plaintext) {
+            // A hop the opt-in alone admits carries the token in plaintext off
+            // the host, so it gets the same once-per-process warning as a
+            // plaintext `VAULT_ADDR`.
+            if attempt.url().scheme() == "http" && !host_is_loopback(attempt.url()) {
+                note_plaintext_opt_in();
+            }
             attempt.follow()
         } else {
             attempt.error(
