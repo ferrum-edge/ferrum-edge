@@ -92,8 +92,12 @@ paths:
   the complete last accepted verifier, generation, and live sessions.
 - CRL applies to frontend mTLS for H1/H2/H3/DTLS, rustls backend data
   paths, rustls health-check probes, and rustls logging sinks.
-- CRL does not apply to DP-to-CP gRPC or reqwest-based plugin paths because
-  those stacks do not expose compatible CRL config. Skip-verify health
+- CRL does not apply to DP-to-CP gRPC because that stack does not expose
+  compatible CRL config. The shared `PluginHttpClient` reqwest clients apply
+  CRLs through `LiveCrlServerVerifier` (preconfigured rustls) and follow the
+  backend `SharedCrlList`; pooled connections are not retired on refresh, and
+  the dedicated `spec_expose` / custom-TLS `api_chargeback_sink` clients apply
+  none (issue #6651). Skip-verify health
   probes also skip CRL enforcement, matching the data-path skip-verify
   contract.
 - Backend TLS live reload stores the newly admitted `SharedCrlList`
