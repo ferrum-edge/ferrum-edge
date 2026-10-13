@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
+  makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
+  permissive `RequestAuthentication` mode: when that `jwks_auth` was the only
+  applicable auth plugin, a request carrying no token was forwarded
+  unauthenticated in every operating mode, while an invalid token was still
+  rejected. The flag now only emits metadata. Permissive missing-token
+  handling needs the new, explicit `allow_missing_token: true` option, which
+  mesh mode sets on its generated RequestAuthentication instance; a runtime
+  instance under any other plugin-config id logs a warning when it enables
+  it. A standalone `jwks_auth` that set only the metadata flag now returns
+  401 for credential-less requests.
 - **BREAKING — gateway material references are default-deny for
   namespace-claimed operators** (issue #6092; PR #6316, residual of
   GHSA-wmmp-c4pg-rg6p). An `operator` token that carries an `ns` claim is
