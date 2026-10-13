@@ -265,6 +265,22 @@ impl<S> WebSocketStream<S> {
     /// response (or where some frames have already been read and a tail
     /// remains). The returned buffer precedes anything still unread on the
     /// returned stream.
+    ///
+    /// # Frame boundary
+    ///
+    /// Like the synchronous
+    /// [`WebSocket::into_inner_with_read_buffer`](tungstenite::WebSocket::into_inner_with_read_buffer)
+    /// it delegates to, this is lossless only at a frame boundary: before
+    /// any message has been read, or after whole messages have been read.
+    /// If a frame is only partially read — its header has been parsed but
+    /// the payload has not fully arrived, e.g. after a mid-frame
+    /// `WouldBlock` / `Poll::Pending` — the already-parsed header bytes
+    /// have been consumed from the read buffer and cannot be recovered;
+    /// only the partial payload would be returned. The boundary check in
+    /// the codec is a debug assertion, so release builds do not enforce
+    /// this precondition. The intended use, taking over the raw stream
+    /// immediately after the completed handshake and before polling any
+    /// frames, is always at a frame boundary.
     pub fn into_inner_with_read_buffer(self) -> (S, tungstenite::Bytes) {
         let (allow_std, buffer) = self.inner.into_inner_with_read_buffer();
         (allow_std.into_inner(), buffer)
