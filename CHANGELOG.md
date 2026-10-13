@@ -80,20 +80,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — MongoDB 4.4 is now the oldest supported server.** The `mongodb`
-  driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its Dependabot
-  ignore are gone. Driver 3.9 requires wire version 9, so MongoDB 4.2 and
-  Azure Cosmos DB for MongoDB (RU) accounts on server version 4.2 can no longer
-  connect; upgrade the server or the Cosmos account's server version (5.0+)
-  first. AWS DocumentDB 3.6/4.0 were already unsupported; DocumentDB 5.0/8.0
-  work. 3.9.1 also carries the fix for CVE-2026-88024 (GridFS file-ID
+- **BREAKING — MongoDB 4.4.2 is now the oldest supported server.** The
+  `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
+  Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
+  4.2 and Azure Cosmos DB for MongoDB (RU) accounts on server version 4.2 can
+  no longer connect; upgrade the server or the Cosmos account's server version
+  (5.0+) first. AWS DocumentDB 3.6/4.0 were already unsupported; DocumentDB
+  5.0/8.0 work. 3.9.1 also carries the fix for CVE-2026-88024 (GridFS file-ID
   matching), which Ferrum does not reach because it does not use GridFS.
-  `docs/mongodb.md` now lists the supported servers.
-- CI, coverage, the scale benchmarks and the sample `docker-compose.yml`
-  `mongodb` profile run MongoDB 9.0 (`mongo:9`), the latest major. The CI
-  standalone plaintext fixture runs MongoDB 4.4.29 so the floor stays tested.
-  An existing compose `mongodb` volume created by MongoDB 7 cannot be opened
-  by 9.0 directly; recreate it with `docker compose --profile mongodb down -v`.
+  `docs/mongodb.md` now lists the supported servers (4.4.2 through 9.0) and the
+  Linux 6.19-7.0.13 kernel startup gate in MongoDB 8.0.21+, 8.3 and 9.0.
+- The CI standalone plaintext MongoDB fixture runs 4.4.29 so the supported
+  floor stays tested. The other CI fixtures stay on MongoDB 7.0 until an
+  official `mongo:9` image starts on the `ubuntu-26.04` runner kernel.
 
 ### Fixed
 

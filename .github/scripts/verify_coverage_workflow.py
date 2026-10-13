@@ -856,7 +856,7 @@ jobs:
           INTEGRATION_FILTERSET: ${{ matrix.filterset }}
           INTEGRATION_PARTITION: ${{ matrix.partition }}
       - if: matrix.kind == 'functional' && matrix.data_services == 'true'
-        run: docker run -d mongo:9
+        run: docker run -d mongo:7
       - if: matrix.kind == 'functional'
         run: |
           cargo llvm-cov --no-report nextest --test functional_tests --no-tests=pass -E 'none()'

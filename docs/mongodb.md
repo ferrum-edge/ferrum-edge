@@ -17,18 +17,27 @@ This guide covers deploying Ferrum Edge with MongoDB as the configuration databa
 Ferrum Edge uses the Rust `mongodb` driver 3.9.1, which accepts servers that
 report wire versions 9 through 29: **MongoDB 4.4 through 9.0**. The driver
 rejects older servers during server selection with an incompatible wire version
-error, so the gateway cannot start against them.
+error, so the gateway cannot start against them. Ferrum also sends the `hello`
+command directly (server-time reads for leases), which MongoDB added in 4.4.2,
+so the practical floor is **4.4.2**.
 
 | Server | Status |
 |---|---|
-| MongoDB 9.0 | Supported and recommended. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on it. |
-| MongoDB 5.0 – 8.x | Supported. |
-| MongoDB 4.4 | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
-| MongoDB 4.2 and older | Not supported (wire version 8 or lower). |
+| MongoDB 9.0 | Supported and recommended. |
+| MongoDB 5.0 – 8.x | Supported. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 7.0 (see the kernel note below). |
+| MongoDB 4.4.2+ | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
+| MongoDB 4.4.0 – 4.4.1, 4.2 and older | Not supported (no `hello` command, or wire version 8 or lower). |
 | MongoDB Atlas | Supported on any Atlas-offered version. |
 | Azure Cosmos DB for MongoDB (RU) | Accounts on server version 5.0, 6.0, or 7.0 are supported. Accounts on 4.2 or older report a wire version below 9 and are rejected; upgrade the account's server version first. |
 | Azure Cosmos DB for MongoDB (vCore) | Supported (5.0 and later). |
 | AWS DocumentDB | Engine 5.0 and 8.0 are supported. DocumentDB 3.6 and 4.0 report wire versions 6 and 7 and are rejected; upgrade the cluster. See [AWS DocumentDB](#aws-documentdb) for the behavior differences. |
+
+**Linux kernel note.** MongoDB 8.0.21 and later 8.0 releases, 8.3, and 9.0
+refuse to start on Linux kernels 6.19 through 7.0.13 (a tcmalloc/rseq
+safeguard, SERVER-125742). The `mongo:9` image (9.0.2) is affected on hosts
+whose kernel reports 7.0.0, such as Ubuntu 26.04 kernels and the GitHub-hosted
+`ubuntu-26.04` runners (SERVER-136272, fixed in 9.0.4). On such hosts, run
+MongoDB 7.0 or a release that has the fix. Ferrum's CI uses 7.0 for this reason.
 
 Replica-set features (transactions, `POST /batch`, change streams) need a
 replica set on any version; see [Replica Sets and
@@ -38,7 +47,7 @@ Transactions](#replica-sets-and-transactions).
 
 ```bash
 # Start MongoDB (Docker)
-docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:9
+docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:7
 
 # Start Ferrum Edge
 FERRUM_MODE=database \
@@ -420,7 +429,7 @@ available.
 
 ```bash
 # Start a single-node replica set for development
-docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:9 --replSet rs0
+docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0
 docker exec mongo-rs mongosh --eval "rs.initiate()"
 
 # Configure Ferrum Edge
