@@ -850,6 +850,94 @@ async fn concurrent_sqlite_runners_serialize_and_loser_skips_tracking_insert() {
 }
 
 #[tokio::test]
+async fn sqlite_plugin_transaction_control_is_rejected_before_any_statement() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("plugin_transaction_escape.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let pool_one = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .unwrap();
+    let pool_two = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .unwrap();
+    let runner_one = MigrationRunner::new(pool_one.clone(), "sqlite".to_string());
+    let runner_two = MigrationRunner::new(pool_two.clone(), "sqlite".to_string());
+    runner_one.run_pending().await.unwrap();
+
+    // A plugin COMMIT would end the runner's `BEGIN IMMEDIATE` lock
+    // transaction, durably committing the first table before the failing
+    // INSERT and before any tracking row.
+    let escaping = vec![(
+        "escape_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "commit_escape",
+            checksum: "escape-v1",
+            sql: "CREATE TABLE plugin_transaction_escape (id INTEGER);\n\
+                  COMMIT;\n\
+                  INSERT INTO missing_plugin_table VALUES (1);",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    let err = runner_one
+        .run_plugin_pending(&escaping)
+        .await
+        .expect_err("transaction-control plugin SQL must be rejected");
+    assert!(
+        err.to_string().contains("transaction-control"),
+        "unexpected error: {err}"
+    );
+
+    assert!(
+        !table_exists(&pool_one, "plugin_transaction_escape").await,
+        "no plugin statement may execute"
+    );
+    if table_exists(&pool_one, "_ferrum_plugin_migrations").await {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS count FROM _ferrum_plugin_migrations \
+             WHERE plugin_name = 'escape_plugin'",
+        )
+        .fetch_one(&pool_one)
+        .await
+        .unwrap();
+        let count: i64 = row.try_get("count").unwrap();
+        assert_eq!(count, 0, "rejected migration must not be tracked");
+    }
+
+    // Serialization is intact: the rejected run released its lock, and two
+    // competing runners still apply and track a valid migration exactly once.
+    let valid = vec![(
+        "peer_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_peer_data",
+            checksum: "peer-v1",
+            sql: "CREATE TABLE peer_plugin_data (id INTEGER PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    let (first, second) = tokio::join!(
+        runner_one.run_plugin_pending(&valid),
+        runner_two.run_plugin_pending(&valid),
+    );
+    assert_eq!(first.unwrap().len() + second.unwrap().len(), 1);
+    assert!(table_exists(&pool_two, "peer_plugin_data").await);
+    let row = sqlx::query("SELECT COUNT(*) AS count FROM _ferrum_plugin_migrations")
+        .fetch_one(&pool_two)
+        .await
+        .unwrap();
+    let count: i64 = row.try_get("count").unwrap();
+    assert_eq!(count, 1, "only the valid migration may be tracked");
+}
+
+#[tokio::test]
 async fn test_v001_accepts_full_rfc3339_timestamps() {
     let pool = test_pool().await;
 
