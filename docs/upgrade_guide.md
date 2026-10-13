@@ -52,6 +52,21 @@ at the same field path keep working and survive unrelated updates, and `admin`
 tokens are not restricted. Automation that writes these fields with
 `ns`-claimed operator tokens must use an `admin` token instead.
 
+### `kafka_logging` native `producer_config` keys need an opt-in (#6539)
+
+`kafka_logging` now refuses `producer_config` keys that load native code, run
+a host command, or make librdkafka read or write a gateway file, for every
+token including `admin`: `plugin.library.paths`, `ssl.engine.location`,
+`ssl.engine.id`, `ssl.providers`, `sasl.kerberos.kinit.cmd`,
+`sasl.kerberos.keytab`, `sasl.oauthbearer.assertion.private.key.file`,
+`sasl.oauthbearer.assertion.file`,
+`sasl.oauthbearer.assertion.jwt.template.file`, `https.ca.location` and
+`offset.store.path`. A stored config that carries one fails to build its
+producer. Remove the key, or set `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG=true` on
+every node that admits or runs the plugin when you rely on one of these
+librdkafka features and trust your admin writers with code execution on the
+gateway host.
+
 ### MongoDB 4.4.2 is the oldest supported server (#6592, PR #6571)
 
 The `mongodb` driver is now 3.9.1, which refuses servers that report a wire

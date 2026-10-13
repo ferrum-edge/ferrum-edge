@@ -2035,3 +2035,44 @@ fn role_projected_resources_refuse_writing_their_placeholders_back() {
         "the generic write path must run the check with the caller's role"
     );
 }
+
+/// Issue #6539: a disabled row skips plugin construction, but a native
+/// librdkafka key is refused on it anyway, so the admin API (single writes,
+/// batch and restore share this check) can never store one without
+/// `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG=true`.
+#[test]
+fn test_disabled_kafka_config_still_refuses_native_producer_keys() {
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let now = chrono::Utc::now();
+    let plugin_config = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
+        id: "disabled-kafka-native".to_string(),
+        plugin_name: "kafka_logging".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({
+            "broker_list": "localhost:9092",
+            "topic": "logs",
+            "producer_config": {"plugin.library.paths": "/opt/attacker/payload"}
+        }),
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        proxy_id: None,
+        enabled: false,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let error = ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+        .expect_err("a disabled row must not store a native producer_config key");
+    assert!(
+        error.contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
+        "{error}"
+    );
+    assert!(!error.contains("/opt/attacker/payload"), "{error}");
+
+    env.set("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG", "true");
+    ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+        .expect("the opt-in admits the disabled row");
+}

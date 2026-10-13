@@ -7416,3 +7416,70 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
     let (get_status, _) = client.get_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(get_status, reqwest::StatusCode::NOT_FOUND);
 }
+
+/// Issue #6539: a disabled `kafka_logging` entry skips plugin construction,
+/// but a native librdkafka `producer_config` key is still refused on POST and
+/// PUT with 422 (the hosted suite never sets `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`), and
+/// nothing is persisted.
+#[tokio::test]
+async fn disabled_kafka_spec_plugin_with_native_producer_key_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let kafka = |producer_config: Value| {
+        json!({
+            "id": "kafka-native-spec",
+            "plugin_name": "kafka_logging",
+            "enabled": false,
+            "config": {
+                "broker_list": "localhost:9092",
+                "topic": "logs",
+                "producer_config": producer_config
+            }
+        })
+    };
+    let mut spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Disabled Kafka native key", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [kafka(json!({"plugin.library.paths": "/opt/attacker/payload"}))]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.to_string()
+            .contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains("/opt/attacker/payload"),
+        "{body}"
+    );
+
+    // A tuning-only disabled entry is admitted; replacing it with a native key
+    // through PUT is refused the same way.
+    spec["x-ferrum-plugins"][0] = kafka(json!({"linger.ms": "5"}));
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    let spec_id = body["id"].as_str().expect("created spec id").to_string();
+
+    spec["x-ferrum-plugins"][0] = kafka(json!({"Topic.offset.store.path": "/tmp/offsets"}));
+    let (status, body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.to_string()
+            .contains("FERRUM_KAFKA_ALLOW_NATIVE_CONFIG"),
+        "{body}"
+    );
+}

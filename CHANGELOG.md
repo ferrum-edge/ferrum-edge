@@ -37,6 +37,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`src/admin/crud/scoped_references.rs`). A unit test fails when a
     built-in plugin schema gains a path-, file-, certificate-, key-, module-
     or library-shaped field that is neither registered nor reviewed.
+- **BREAKING — `kafka_logging` refuses librdkafka native-loader, command
+  and gateway-file keys for every token** (issue #6539). `producer_config`
+  is forwarded to librdkafka, so any token that could write a
+  `kafka_logging` config, `admin` included, could load a shared library into
+  the gateway (`plugin.library.paths`, `ssl.engine.location`,
+  `ssl.engine.id`, `ssl.providers`), run a host command
+  (`sasl.kerberos.kinit.cmd`), or make librdkafka read or write gateway files
+  (`sasl.kerberos.keytab`, `sasl.oauthbearer.assertion.private.key.file`,
+  `sasl.oauthbearer.assertion.file`,
+  `sasl.oauthbearer.assertion.jwt.template.file`, `https.ca.location`,
+  `offset.store.path`).
+  - These keys are now refused at admission (disabled rows included, for
+    admin writes, batch, restore, API-spec imports, file/database/CP config
+    loads, and every node's snapshot publication, so a data plane without the
+    opt-in rejects a snapshot from an opted-in control plane) and at
+    plugin construction, case-insensitively and with or without a `topic.`
+    prefix, unless the node sets the new
+    `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG=true` (default `false`; a malformed
+    value fails startup). A stored config that carries one no longer builds
+    a producer until the key is removed or the node opts in.
+  - The list lives in the central plugin material registry
+    (`src/admin/crud/scoped_references.rs`) beside the tenant-safe list, so
+    namespace-claimed `operator` tokens still cannot introduce or change
+    these keys on an opted-in node (a value already stored at the same path
+    is left alone, as for every registry-classified field).
 - **Tenant DestinationRule TLS files stay confined after admission** (PR
   #6316).
   - A file that a non-root-namespace DestinationRule names under

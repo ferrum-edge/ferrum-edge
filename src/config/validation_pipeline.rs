@@ -147,6 +147,23 @@ fn collect_plugin_config_errors(
 
     let mut rejected = Vec::new();
     for (index, plugin_config) in config.plugin_configs.iter().enumerate() {
+        // Disabled rows skip construction, but a native librdkafka key is
+        // refused on them too (issue #6539). Never quarantined: it rejects.
+        if !optional_fail_open_only
+            && let Some(error) = crate::plugins::kafka_logging::disabled_config_native_key_refusal(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+            )
+        {
+            rejected.push(RejectedPluginConfig {
+                index,
+                message: format!(
+                    "Plugin {:?} (`id`={:?}): {error}",
+                    plugin_config.plugin_name, plugin_config.id
+                ),
+            });
+            continue;
+        }
         if !plugin_config.enabled {
             continue;
         }
@@ -634,6 +651,19 @@ impl<'a> ValidationPipeline<'a> {
                         errors.extend(graph_errors);
                     }
                     for plugin_config in &config.plugin_configs {
+                        // Refused on disabled rows too (issue #6539).
+                        if let Some(error) =
+                            crate::plugins::kafka_logging::disabled_config_native_key_refusal(
+                                &plugin_config.plugin_name,
+                                &plugin_config.config,
+                            )
+                        {
+                            errors.push(format!(
+                                "Plugin {:?} (id={:?}): {}",
+                                plugin_config.plugin_name, plugin_config.id, error
+                            ));
+                            continue;
+                        }
                         if !plugin_config.enabled {
                             continue;
                         }

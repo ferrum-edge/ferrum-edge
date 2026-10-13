@@ -8594,6 +8594,13 @@ pub(crate) fn validate_plugin_config_definition(
     if let Some(trigger) = pc.trigger.as_ref() {
         trigger.validate()?;
     }
+    // Native librdkafka keys are refused even on a disabled row, so a stored
+    // config can never carry one (issue #6539).
+    if let Some(error) =
+        plugins::kafka_logging::disabled_config_native_key_refusal(&pc.plugin_name, &pc.config)
+    {
+        return Err(error);
+    }
     if !pc.enabled {
         return Ok(());
     }

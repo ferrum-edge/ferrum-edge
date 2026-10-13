@@ -2470,6 +2470,63 @@ pub(crate) fn contains_inline_private_key(value: &str) -> bool {
     })
 }
 
+/// Refusal for a `producer_config` key that loads native code, runs a host
+/// command, or makes librdkafka read or write a gateway file (issue #6539).
+///
+/// Refused for every token unless the operator opted the whole process in.
+/// The list lives in the central plugin material registry, which also keeps
+/// namespace-bounded operators from introducing these keys at all.
+fn native_producer_key_error(key: &str) -> Option<String> {
+    let effect = crate::admin::crud::scoped_references::open_map_native_key(
+        "kafka_logging",
+        "producer_config",
+        key,
+    )?;
+    if crate::config::env_config::kafka_native_config_allowed() {
+        return None;
+    }
+    Some(format!(
+        "kafka_logging: `producer_config` key {key:?} is not allowed because it {effect}; \
+         set {}=true on every node that admits or runs this plugin to allow it",
+        crate::config::env_config::KAFKA_ALLOW_NATIVE_CONFIG_KEY
+    ))
+}
+
+/// The native-key refusal for a plugin config, whether or not it is enabled.
+///
+/// Admission of a disabled row skips plugin construction, so the admin API and
+/// the config load/admission sweeps call this before that skip. A disabled
+/// `kafka_logging` row therefore cannot store a native key either.
+pub(crate) fn disabled_config_native_key_refusal(
+    plugin_name: &str,
+    config: &Value,
+) -> Option<String> {
+    if plugin_name != "kafka_logging" {
+        return None;
+    }
+    config
+        .get("producer_config")?
+        .as_object()?
+        .keys()
+        .find_map(|key| native_producer_key_error(key))
+}
+
+/// [`disabled_config_native_key_refusal`] over every plugin config of a
+/// snapshot, enabled or not, for the shared publication validator. A node
+/// without the opt-in therefore refuses a snapshot (full or incremental) that
+/// carries a native key, even when an opted-in control plane admitted it.
+pub(crate) fn snapshot_native_key_refusals(
+    plugin_configs: &[crate::config::types::PluginConfig],
+) -> Vec<String> {
+    plugin_configs
+        .iter()
+        .filter_map(|plugin_config| {
+            disabled_config_native_key_refusal(&plugin_config.plugin_name, &plugin_config.config)
+                .map(|error| format!("PluginConfig {:?}: {error}", plugin_config.id))
+        })
+        .collect()
+}
+
 /// Admit `producer_config` overrides (budgets, forbidden keys, CRL conflict)
 /// without constructing a Kafka producer.
 fn admit_producer_config(
@@ -2525,6 +2582,9 @@ fn admit_producer_config(
             return Err(format!(
                 "kafka_logging: `producer_config` key {key:?} is not allowed"
             ));
+        }
+        if let Some(error) = native_producer_key_error(key) {
+            return Err(error);
         }
         if let Some((_, rationale)) = UNSUPPORTED_PRODUCER_KEYS
             .iter()

@@ -21532,7 +21532,16 @@ components:
             reports. Retained-byte leases release at terminal delivery, terminal
             failure, purge-on-destroy, or immediate send rejection. Values carrying
             inline PEM private-key material are refused by shape, which JSON
-            Schema does not model here.
+            Schema does not model here. Keys that load native code, run a host
+            command, or make librdkafka read or write a gateway file
+            (plugin.library.paths, ssl.engine.location, ssl.engine.id,
+            ssl.providers, sasl.kerberos.kinit.cmd, sasl.kerberos.keytab,
+            sasl.oauthbearer.assertion.private.key.file,
+            sasl.oauthbearer.assertion.file,
+            sasl.oauthbearer.assertion.jwt.template.file, https.ca.location,
+            offset.store.path) are refused case-insensitively for every token
+            unless the node sets FERRUM_KAFKA_ALLOW_NATIVE_CONFIG=true. That
+            depends on the node's environment, so this schema admits them.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:

@@ -124,6 +124,20 @@ pub mod _test_support {
         rows
     }
 
+    /// The native-key refusals the shared publication validator applies to a
+    /// snapshot's plugin configs, disabled rows included (issue #6539).
+    pub fn kafka_snapshot_native_key_refusals_for_test(
+        plugin_configs: &[crate::config::types::PluginConfig],
+    ) -> Vec<String> {
+        crate::plugins::kafka_logging::snapshot_native_key_refusals(plugin_configs)
+    }
+
+    /// `kafka_logging` `producer_config` keys refused without
+    /// `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`, as `(key, effect)` (issue #6539).
+    pub fn kafka_native_producer_keys_for_test() -> &'static [(&'static str, &'static str)] {
+        crate::admin::crud::scoped_references::KAFKA_NATIVE_PRODUCER_KEYS
+    }
+
     /// Reviewed path-shaped plugin fields that name no gateway material.
     pub fn reviewed_non_material_plugin_fields_for_test() -> &'static [(&'static str, &'static str)]
     {

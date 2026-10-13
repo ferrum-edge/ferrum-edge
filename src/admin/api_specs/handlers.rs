@@ -1774,6 +1774,14 @@ async fn validate_bundle(
                 "Unknown plugin name '{}'. Available plugins: {:?}",
                 plugin.plugin_name, known_plugins
             ));
+        } else if let Some(error) =
+            crate::plugins::kafka_logging::disabled_config_native_key_refusal(
+                &plugin.plugin_name,
+                &plugin.config,
+            )
+        {
+            // Refused even while disabled (issue #6539).
+            plugin_errors.push(error);
         } else if plugin.enabled {
             let validation =
                 if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin) {

@@ -11,6 +11,11 @@
 //! - A key of a registered open map (a config object forwarded verbatim to a
 //!   native library) is admitted only when it is on that map's reviewed
 //!   tenant-safe list.
+//!
+//! An open map may also list native keys: properties that load native code,
+//! run a host command, or make the gateway read one of its own files. Those
+//! are refused for every token, `admin` included, unless the operator opts in
+//! for the process (issue #6539; see [`open_map_native_key`]).
 //! - A plugin that is not a built-in cannot be classified, so a
 //!   namespace-bounded operator may not introduce or change its config.
 //!
@@ -47,6 +52,11 @@ pub(crate) struct OpenMapField {
     /// Keys reviewed as tuning-only (no files, modules, commands or
     /// credentials). Compared case-insensitively.
     pub(crate) tenant_safe_keys: &'static [&'static str],
+    /// `(key, what it makes the gateway do)` for keys that load native code,
+    /// run a host command, or read a gateway file. Refused for every token
+    /// unless the plugin's own operator opt-in is set. Compared
+    /// case-insensitively. Disjoint from `tenant_safe_keys`.
+    pub(crate) native_keys: &'static [(&'static str, &'static str)],
 }
 
 pub(crate) struct PluginScopedFields {
@@ -98,6 +108,51 @@ const KAFKA_TENANT_SAFE_PRODUCER_KEYS: &[&str] = &[
     "topic.metadata.refresh.interval.ms",
 ];
 
+/// librdkafka properties that load native code, run a host command, or make
+/// the gateway read one of its own files (issue #6539).
+///
+/// Audited against `CONFIGURATION.md` of the pinned librdkafka 2.12.1
+/// (`rdkafka-sys 4.10.0+2.12.1`). None of these properties has an alias there.
+/// Properties that already have a top-level field (`ssl.ca.location`,
+/// `ssl.certificate.location`, `ssl.key.location`, `ssl.keystore.location`,
+/// `ssl.ca.certificate.stores`) are refused outright by `kafka_logging`, and
+/// `ssl.crl.location` keeps its own contract there: it is read only as a CRL
+/// and must match the gateway CRL file when one is configured.
+pub(crate) const KAFKA_NATIVE_PRODUCER_KEYS: &[(&str, &str)] = &[
+    (
+        "plugin.library.paths",
+        "loads shared libraries into the gateway process",
+    ),
+    ("ssl.engine.location", "loads an OpenSSL engine library"),
+    ("ssl.engine.id", "loads an OpenSSL engine by name"),
+    ("ssl.providers", "loads OpenSSL provider modules"),
+    (
+        "sasl.kerberos.kinit.cmd",
+        "runs a shell command on the gateway host",
+    ),
+    (
+        "sasl.kerberos.keytab",
+        "makes the Kerberos kinit command read a gateway keytab file",
+    ),
+    (
+        "sasl.oauthbearer.assertion.private.key.file",
+        "signs OAuth assertions with a gateway private key file",
+    ),
+    (
+        "sasl.oauthbearer.assertion.file",
+        "sends a gateway file to the OAuth token endpoint",
+    ),
+    (
+        "sasl.oauthbearer.assertion.jwt.template.file",
+        "reads a gateway file into the OAuth assertion",
+    ),
+    ("https.ca.location", "reads a gateway CA file or directory"),
+    (
+        "offset.store.path",
+        "writes offset files on the gateway host",
+    ),
+];
+
 /// Every built-in plugin field that names gateway-resolved material.
 pub(crate) const PLUGIN_SCOPED_FIELDS: &[PluginScopedFields] = &[
     PluginScopedFields {
@@ -146,6 +201,7 @@ pub(crate) const PLUGIN_SCOPED_FIELDS: &[PluginScopedFields] = &[
         open_maps: &[OpenMapField {
             path: "producer_config",
             tenant_safe_keys: KAFKA_TENANT_SAFE_PRODUCER_KEYS,
+            native_keys: KAFKA_NATIVE_PRODUCER_KEYS,
         }],
     },
     PluginScopedFields {
@@ -313,6 +369,30 @@ pub(crate) fn plugin_scoped_fields(plugin: &str) -> Option<&'static PluginScoped
     PLUGIN_SCOPED_FIELDS
         .iter()
         .find(|entry| entry.plugin == plugin)
+}
+
+/// What a native key of `plugin`'s open map at `map_path` makes the gateway
+/// do, or `None` when `key` is not a registered native key (issue #6539).
+///
+/// The plugin's admission refuses such a key for every token unless its
+/// operator opt-in is set. A namespace-bounded operator cannot introduce or
+/// change one even then, because no native key is tenant-safe.
+pub(crate) fn open_map_native_key(plugin: &str, map_path: &str, key: &str) -> Option<&'static str> {
+    // librdkafka also accepts a topic property at the global level under a
+    // `topic.` prefix, which it strips (`rd_kafka_conf_set`). Match both
+    // spellings so the prefix cannot bypass the gate.
+    let key = match key.get(..6) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("topic.") => &key[6..],
+        _ => key,
+    };
+    plugin_scoped_fields(plugin)?
+        .open_maps
+        .iter()
+        .find(|map| map.path == map_path)?
+        .native_keys
+        .iter()
+        .find(|(native, _)| native.eq_ignore_ascii_case(key))
+        .map(|(_, effect)| *effect)
 }
 
 /// Whether the registry can classify `plugin` at all: every built-in is
