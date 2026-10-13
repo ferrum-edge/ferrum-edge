@@ -16,6 +16,7 @@ const FUZZ_MANIFEST: &str = include_str!("../../../fuzz/Cargo.toml");
 const FUZZ_WORKFLOW: &str = include_str!("../../../.github/workflows/fuzz.yml");
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
 const FUZZ_DOCS: &str = include_str!("../../../docs/fuzz.md");
+const ROOT_MANIFEST: &str = include_str!("../../../Cargo.toml");
 
 /// Every `[[bin]]` name in the isolated fuzz workspace manifest.
 fn registered_targets() -> Vec<String> {
@@ -204,4 +205,59 @@ fn datagram_client_address_corpus_covers_the_documented_boundary_shapes() {
             bytes.len()
         );
     }
+}
+
+/// `(crate, vendored directory)` for every entry of a manifest's
+/// `[patch.crates-io]` table, with the directory reduced to its name under
+/// `vendor/` so the root (`vendor/...`) and fuzz (`../vendor/...`) spellings
+/// compare equal.
+fn vendored_patch_table(manifest: &str, label: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let mut in_patch = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_patch = trimmed == "[patch.crates-io]";
+            continue;
+        }
+        if !in_patch || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (name, value) = trimmed.split_once('=').unwrap_or_else(|| {
+            panic!("{label} [patch.crates-io] line is not `name = ...`: {line}")
+        });
+        let path = value
+            .split_once("path = \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(path, _)| path)
+            .unwrap_or_else(|| {
+                panic!("{label} [patch.crates-io] entry is not a path patch: {line}")
+            });
+        let vendored = path
+            .rsplit_once("vendor/")
+            .map(|(_, dir)| dir)
+            .unwrap_or_else(|| panic!("{label} [patch.crates-io] entry is not vendored: {line}"));
+        entries.push((name.trim().to_string(), vendored.to_string()));
+    }
+    entries.sort();
+    entries
+}
+
+#[test]
+fn fuzz_workspace_patches_every_vendored_crate_the_root_patches() {
+    // The fuzz workspace is isolated, so it does not inherit the root
+    // `[patch.crates-io]` table. A crate patched only at the root is fuzzed as
+    // its stock registry build rather than the code the gateway ships, which
+    // is how the vendored `sqlx-core` DB-TLS patch went missing (issue #6583).
+    let root = vendored_patch_table(ROOT_MANIFEST, "Cargo.toml");
+    let fuzz = vendored_patch_table(FUZZ_MANIFEST, "fuzz/Cargo.toml");
+    assert!(
+        root.len() >= 10,
+        "expected the root [patch.crates-io] table to be parsed, got {root:?}"
+    );
+    assert_eq!(
+        fuzz, root,
+        "fuzz/Cargo.toml [patch.crates-io] must name the same vendored crates as the root \
+         Cargo.toml table; update both together and regenerate fuzz/Cargo.lock"
+    );
 }
