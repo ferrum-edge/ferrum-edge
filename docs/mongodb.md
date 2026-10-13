@@ -32,12 +32,22 @@ so the practical floor is **4.4.2**.
 | Azure Cosmos DB for MongoDB (vCore) / Azure DocumentDB | Wire-compatible (5.0 and later). Not tested by Ferrum. |
 | AWS DocumentDB | Engines 5.0 and 8.0 pass the driver's wire-version check. DocumentDB 3.6 and 4.0 report wire versions 6 and 7 and are rejected, so upgrade the cluster. Not tested by Ferrum; see [AWS DocumentDB](#aws-documentdb) for the known behavior differences. |
 
-**Linux kernel note.** MongoDB 8.0.21 and later 8.0 releases, 8.3, and 9.0
-refuse to start on Linux kernels 6.19 through 7.0.13 (a tcmalloc/rseq
-safeguard, SERVER-125742). The `mongo:9` image (9.0.2) is affected on hosts
-whose kernel reports 7.0.0, such as Ubuntu 26.04 kernels and the GitHub-hosted
-`ubuntu-26.04` runners (SERVER-136272, fixed in 9.0.4). On such hosts, run
-MongoDB 7.0 or a release that has the fix. Ferrum's CI uses 7.0 for this reason.
+**Linux kernel note.** Recent MongoDB releases refuse to start on some Linux
+kernels because of a tcmalloc/rseq safeguard. The upstream compatibility matrix
+is in [SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742).
+
+- 8.0.30+, 8.3.9+, and 9.0 exit on kernels 6.19 through 7.0.13 and run on
+  7.0.14+.
+- 8.0.21–8.0.29 and 8.3.0–8.3.8 exit on every kernel from 6.19 up, including
+  7.0.14+.
+- 8.0.0–8.0.20 start on 6.19+ but can crash shortly afterwards. Do not use them
+  there.
+- 7.0 is unaffected.
+
+The `mongo:9` image (9.0.2) also exits on hosts whose kernel reports 7.0.0, such
+as Ubuntu 26.04 kernels and the GitHub-hosted `ubuntu-26.04` runners
+([SERVER-136272](https://jira.mongodb.org/browse/SERVER-136272), fixed in
+9.0.4). Ferrum's CI uses 7.0 for this reason.
 
 Replica-set features (transactions, `POST /batch`, change streams) need a
 replica set on any version; see [Replica Sets and
@@ -500,7 +510,7 @@ delayed commit can become visible later on another pooled connection. Ferrum
 therefore retains the owner-qualified fence and generation pin for manual
 recovery instead of admitting writes that the delayed clear could erase.
 
-Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time because MongoDB < 4.4 cannot implicitly create collections inside transactions.
+Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time: a cross-shard write transaction cannot create a collection implicitly, and concurrent first writes inside transactions can conflict.
 
 ## Managed Services
 
