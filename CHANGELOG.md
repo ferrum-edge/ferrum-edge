@@ -80,8 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — MongoDB 4.4.2 is now the oldest supported server.** The
-  `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
+- **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
+  #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
   4.2 can no longer connect. Ferrum also sends `hello`, which MongoDB added in
   4.4.2. The docs now mark Azure Cosmos DB for MongoDB (RU) as unsupported at
