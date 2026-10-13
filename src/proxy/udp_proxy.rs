@@ -3715,15 +3715,14 @@ pub async fn start_udp_listener_holding_port(
                 "IP_PKTINFO disabled (FERRUM_UDP_PKTINFO_ENABLED=false or auto-probe failed at startup); reply path uses routing lookup"
             );
         }
-        // UDP_GRO cannot be enabled because the primary receive path uses
-        // tokio's recv_from() in the select! loop, which doesn't expose cmsg
-        // metadata. GRO-coalesced buffers from recv_from would be forwarded as
-        // single oversized datagrams, breaking UDP message boundaries.
-        // The recvmmsg drain loop has cmsg parsing for GRO splitting, but it's
-        // only the secondary path — the first datagram per wakeup always goes
-        // through recv_from. GRO requires ALL receive paths to support cmsg.
-        // To enable GRO, the entire receive loop would need to be rewritten to
-        // use recvmmsg as the primary wakeup mechanism (via AsyncFd + try_io).
+        // UDP_GRO cannot be enabled yet. The pktinfo-active primary receive
+        // branch below already receives through readable() + recvmmsg with
+        // cmsg metadata, but the pktinfo-inactive fallback still uses tokio's
+        // recv_from() in the select! loop, which doesn't expose cmsg.
+        // GRO-coalesced buffers from recv_from would be forwarded as single
+        // oversized datagrams, breaking UDP message boundaries. GRO requires
+        // correct cmsg/GRO handling on ALL enabled receive paths, not only the
+        // pktinfo branch.
         let _ = udp_gro_enabled;
     }
 

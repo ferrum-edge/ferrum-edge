@@ -96,12 +96,22 @@ dimpl is Sans-IO: no sockets, no threads, no async. The caller drives I/O.
 be followed by polling until `Output::Timeout`:
 
 ```rust
-client.handle_timeout(now);
+// `handle_timeout` returns `Result<(), Error>`; propagate or otherwise
+// handle the error deliberately (this illustration assumes a
+// `Result`-returning context).
+client.handle_timeout(now)?;
 loop {
     match client.poll_output(&mut buf) {
         Output::Packet(data) => { /* send to peer */ }
         Output::Connected => { /* handshake complete */ }
+        Output::PeerCert(cert) => { /* validate peer leaf per application policy */ }
+        Output::PeerCertChain(chain) => { /* validate peer chain per application policy */ }
+        Output::KeyingMaterial(km, profile) => { /* hand to SRTP stack */ }
+        Output::ApplicationData(data) => { /* deliver plaintext to application */ }
+        Output::CloseNotify => { /* record close; keep polling to Timeout */ }
         Output::Timeout(when) => break,
+        // `Output` is `#[non_exhaustive]`; external callers need a wildcard.
+        _ => {}
     }
 }
 ```

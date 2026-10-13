@@ -52,7 +52,11 @@ The patch:
 - wraps temporary SEC1-to-PKCS#8 encodings in zeroizing storage and uses
   `pkcs8::SecretDocument` for PEM decoding; and
 - rejects incoming certificate lists beyond parser capacity instead of
-  panicking.
+  panicking; and
+- makes documentation-only corrections to the vendored `README.md` /
+  `CLAUDE.md` Sans-IO poll-loop illustrations so they cover every current
+  `Output` variant and drain to `Timeout` before acting on `CloseNotify`
+  (no protocol or code change).
 
 The zeroization guarantee covers DER byte owners managed by `dimpl`.
 After parsing, signing keys are opaque objects owned by the selected
