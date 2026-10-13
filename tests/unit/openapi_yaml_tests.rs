@@ -8912,6 +8912,12 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
             "forward_sensitive_query": true,
             "forward_sensitive_query_allowlist": ["access_token"]
         }),
+        // Query names are not header names: brackets are valid.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["filter[key]"]
+        }),
         json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": ["x-vault-"]}),
         json!({"mirror_host": "127.0.0.1", "percentage": 0}),
         json!({"mirror_host": "127.0.0.1", "mirror_path": ""}),
@@ -8955,6 +8961,22 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
             "forward_sensitive_header_allowlist": ["auth token"]
         }),
         json!({"mirror_host": "127.0.0.1", "forward_sensitive_query": true}),
+        // Entries match the decoded name, so encoded or delimiter forms are refused.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["api+key"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["api%5fkey"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["a;key"]
+        }),
         json!({
             "mirror_host": "127.0.0.1",
             "forward_sensitive_query_allowlist": ["access_token"]

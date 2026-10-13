@@ -32803,10 +32803,13 @@ components:
             type: string
             minLength: 1
             maxLength: 256
-            pattern: "\\S"
+            pattern: '^[!"$''()*,.0-9:<>A-Z\[\\\]^_`a-z{|}~-]+$(?![\s\S])'
           description: >-
             Lowercased exact allowlist of denied sensitive query parameter names
-            to forward when forward_sensitive_query is true. Each entry is matched
+            to forward when forward_sensitive_query is true. Entries are
+            visible ASCII without whitespace; brackets such as filter[key] are
+            allowed, while % + = & ? # / @ ; are refused because entries match
+            the decoded name. Each entry is matched
             against the fully percent-decoded (bounded staged decode)
             ASCII-lowercased name (at most 256 bytes) that the deny-by-default
             policy actually strips (a built-in credential or a

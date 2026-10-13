@@ -595,13 +595,15 @@ const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "jws",
     "jwe",
     "dpop",
+    "pincode",
 ];
 
 /// Short credential aliases matched as a segment suffix, plural included, so
 /// compounds such as `clientsid`, `userpw`, `clientcred` and `sids` fail
 /// closed. Too short to match as a substring anywhere in a segment.
-const MIRROR_CREDENTIAL_CLASS_SUFFIXES: &[&str] =
-    &["sid", "sids", "pw", "pws", "cred", "creds", "sig", "sigs"];
+const MIRROR_CREDENTIAL_CLASS_SUFFIXES: &[&str] = &[
+    "sid", "sids", "pw", "pws", "cred", "creds", "sig", "sigs", "pin", "pins",
+];
 
 /// Whole segments that contain `key` or `pass` without naming a credential.
 /// Everything else containing either (`privatekeypem`, `keyid`, `clientpass`)
@@ -626,6 +628,8 @@ const MIRROR_BENIGN_KEY_PASS_SEGMENTS: &[&str] = &[
     "bypass",
     "compass",
     "sacred",
+    "spin",
+    "spins",
 ];
 
 /// Whole names (not segments) that are credentials on their own. `code` is the
