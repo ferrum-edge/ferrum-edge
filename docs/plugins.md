@@ -6640,18 +6640,20 @@ Ferrum includes purpose-built AI/LLM API gateway plugins. Response-parsing AI pl
 
 AI plugins reject configurations that would otherwise silently degrade to a no-op or fail open:
 
-- **`ai_request_guard`** requires at least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`). `temperature_range` must be a 2-element array of finite numbers with `min <= max`; an inverted range would reject every request, and non-finite bounds would allow every request (NaN comparisons always return false).
+- **`ai_request_guard`** requires at least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, `strict_schema`, or `required_metadata_fields`). `temperature_range` must be a 2-element array of finite numbers with `min <= max`; an inverted range would reject every request, and non-finite bounds would allow every request (NaN comparisons always return false).
 - **`ai_prompt_shield`** and **`ai_response_guard`** reject unknown built-in pattern names and built-in patterns that fail to compile. Both pre-render their per-pattern redaction placeholders at config load.
-- **`ai_semantic_firewall`** fails closed by default: provider/evaluation errors default to `on_error: reject`, and `stream: true` requests default to `streaming_response: reject` when response-side rules are active. Fail-open behavior requires explicit `on_error: warn`/`allow` or `streaming_response: skip`.
+- **`ai_semantic_firewall`** fails closed by default in `mode: enforce` (the default mode): provider/evaluation errors default to `on_error: reject`, and `stream: true` requests default to `streaming_response: reject` when response-side rules are active. In enforce mode, fail-open behavior requires explicit `on_error: warn`/`allow` or `streaming_response: skip`. Explicit `mode: dry_run` is itself an observational choice that never rejects: it inherits `on_error: warn` and response `streaming_response: skip` defaults instead (each still overridable explicitly).
 - **`ai_rate_limiter`** rejects unknown `count_mode` and `limit_by` values.
 - **`ai_token_metrics`** rejects negative or non-finite (`NaN`/`Inf`) values for `cost_per_prompt_token` and `cost_per_completion_token`, which would produce negative cost metrics or break Prometheus exporters. Zero is accepted (e.g., free-tier accounting).
 - **`ai_federation`** fails closed by default when a JSON POST body cannot be inspected, is missing a top-level string `model` field, or no provider matches that model. Passing such requests to the normal backend requires explicit `fail_on_missing_model: false` and/or `fail_on_no_matching_provider: false`, and is only appropriate when the backend path is protected by equivalent AI gateway policy.
 
-Validation follows the same per-mode tolerance model as other file-dependent config (see the "File Dependency Validation (Isolated Tolerance)" note in `CLAUDE.md`):
+What a rejected AI plugin config does to the surrounding generation follows the plugin's `PluginFailurePolicy`, not only the operating mode. Most AI plugins are generation-rejecting (`FailClosed` or `KeepLastKnownGood`); for those, validation follows the same per-mode tolerance model as other file-dependent config (see the "File Dependency Validation (Isolated Tolerance)" note in `CLAUDE.md`):
 
 - **File mode** — fatal at startup. The gateway refuses to start.
 - **Database mode** — warnings are logged, but the gateway keeps serving with the previous valid config.
 - **DP mode** — the config update from the CP is rejected and the DP continues with its previously applied config.
+
+`ai_token_metrics` is the exception: it is registered `OptionalFailOpen`, so a config its constructor rejects is logged and that plugin instance is omitted from the published cache instead of rejecting the whole generation. Do not generalize that omission to the generation-rejecting AI plugins above.
 
 ### `ai_tool_governor`
 
@@ -8117,7 +8119,7 @@ config:
 
 ### `ai_prompt_compressor`
 
-Shortens prompt text to cut LLM token usage, cost, and latency using a model-free statistical (extractive) filter — no external models, services, or new dependencies. It rewrites `messages[].content` (for the configured roles) and the legacy top-level `prompt` in admitted OpenAI Chat/Text Completions bodies, replacing long content strings with shorter versions. The default `request_family: auto` requires the body shape to match a standard operation-path suffix (`/chat/completions` or `/completions`); a fixed family explicitly opts a compatible custom endpoint into compression. Shape validation still applies, and malformed, provider-native, or ambiguous bodies pass through unchanged.
+Shortens prompt text to cut LLM token usage, cost, and latency using a model-free statistical (extractive) filter — no external models, services, or new dependencies. It rewrites `messages[].content` (for the configured roles) and the legacy top-level `prompt` in admitted OpenAI Chat/Text Completions bodies, replacing long content strings with shorter versions. The default `request_family: auto` requires the body shape to match a standard operation-path suffix (`/chat/completions` or `/completions`); a fixed family explicitly opts a compatible custom endpoint into compression. Shape validation still applies, and malformed JSON, provider-native, or ambiguous bodies that fail coarse family classification pass through unchanged. Valid JSON whose coarse shape is admitted (for example a `messages` array) but whose inner `role`/`content` fields are malformed skips statistical compression; with `preserve_tag` configured, that fallback can still perform marker-only cleanup of JSON string values, while without a configured marker it passes through unchanged.
 
 Request buffering is only enabled for matching JSON `POST` requests without a non-`identity` `Content-Encoding`.
 
@@ -9801,7 +9803,7 @@ See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for
 
 ## Custom Plugins
 
-Ferrum supports drop-in custom plugins. Create a `.rs` file in the `custom_plugins/` directory, export a `create_plugin()` factory function, and rebuild — the build script auto-discovers and registers it.
+Ferrum supports drop-in custom plugins. Create a `.rs` file in the `custom_plugins/` directory, export both the required `create_plugin()` factory function and the required `failure_policy()` metadata function, and rebuild — the build script auto-discovers and registers it. The generated registry calls every selected module's `failure_policy()`, so omitting it fails the build; see [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md) for the complete required-export recipe.
 
 Optionally set `FERRUM_CUSTOM_PLUGINS=plugin_a,plugin_b` at **build time** to include only specific custom plugins. Pedagogical examples under `custom_plugins/examples/` are opt-in only (list them in `FERRUM_CUSTOM_PLUGINS`); default and Docker builds leave them out of the registry and migration collector.
 

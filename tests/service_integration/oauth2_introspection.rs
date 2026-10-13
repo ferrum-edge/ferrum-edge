@@ -441,6 +441,10 @@ async fn oauth2_live_introspection_tokens_claims_cache_and_auth() {
         .authorization_code_tokens(&claim_client, "openid offline_access profile email roles")
         .await
         .expect("claim-bearing opaque token");
+    assert!(
+        jsonwebtoken::decode_header(&claim_token).is_err(),
+        "Hydra authorization-code access tokens must be opaque (not a compact JWT)"
+    );
     let claim_plugin = introspection_plugin(json!({
         "role_claim": "ext.roles",
         "consumer_identity_claim": "ext.email",
