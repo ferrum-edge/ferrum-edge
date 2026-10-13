@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — `request_mirror` strips credential-shaped header and query
-  names by class, not only by list.** Cross-origin credential stripping
+  names by class, not only by list.** (issue n/a, PR #6631) Cross-origin credential stripping
   now splits each header name and decoded query name into alphanumeric
   segments and denies any name with a credential-class word (`auth`, `jwt`,
   `session`, `sid`, `key`, `pass`, `pwd`, `ticket`, `otp`, …), a credential
