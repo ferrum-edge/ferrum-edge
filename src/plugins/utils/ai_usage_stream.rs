@@ -38,7 +38,9 @@
 use base64::Engine;
 use serde_json::Value;
 
-use super::ai_providers::{AiProvider, AiTokenUsage, detect_sse_provider, extract_response_usage};
+use super::ai_providers::{
+    AiProvider, AiTokenUsage, anthropic_input_tokens, detect_sse_provider, extract_response_usage,
+};
 use super::sse::{sse_line_end, strip_sse_boms};
 
 /// Media type AWS Bedrock uses for `InvokeModelWithResponseStream` and
@@ -261,29 +263,31 @@ impl UsageAccumulator {
         }
 
         match json.get("type").and_then(Value::as_str) {
-            // Anthropic streams input tokens once, up front.
+            // Anthropic streams its input tokens up front. The billed input
+            // includes prompt-cache writes and reads, which are reported beside
+            // `input_tokens` rather than inside it.
             Some("message_start") => {
-                if let Some(prompt) = json
-                    .get("message")
-                    .and_then(|message| message.get("usage"))
-                    .and_then(|usage| usage.get("input_tokens"))
-                    .and_then(Value::as_u64)
-                {
+                if let Some(prompt) = anthropic_input_tokens(
+                    json.get("message").and_then(|message| message.get("usage")),
+                ) {
                     self.record(&AiTokenUsage {
                         prompt_tokens: Some(prompt),
                         ..Default::default()
                     });
                 }
             }
-            // ... and the cumulative output tokens on the terminal delta.
+            // ... and the cumulative output tokens on the terminal delta. A
+            // delta that also restates cumulative input counts refreshes them.
             Some("message_delta") => {
-                if let Some(completion) = json
-                    .get("usage")
+                let usage = json.get("usage");
+                let prompt = anthropic_input_tokens(usage);
+                let completion = usage
                     .and_then(|usage| usage.get("output_tokens"))
-                    .and_then(Value::as_u64)
-                {
+                    .and_then(Value::as_u64);
+                if prompt.is_some() || completion.is_some() {
                     self.record(&AiTokenUsage {
-                        completion_tokens: Some(completion),
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
                         ..Default::default()
                     });
                 }

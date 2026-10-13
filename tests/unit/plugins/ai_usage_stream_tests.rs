@@ -740,3 +740,184 @@ fn stacked_leading_boms_are_stripped_before_the_first_sse_line() {
         }
     }
 }
+
+// ─── Issue #6623: cache / thinking / tool-use token categories ─────────
+
+#[test]
+fn anthropic_stream_prompt_includes_cache_creation_and_read_tokens() {
+    let body = sse(&[
+        &json!({
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 25,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 1000,
+                "output_tokens": 1
+            }}
+        })
+        .to_string(),
+        &json!({"type": "message_delta", "usage": {"output_tokens": 40}}).to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
+        Some(1125)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
+        Some(1165)
+    );
+}
+
+#[test]
+fn anthropic_message_delta_cumulative_input_refreshes_the_prompt() {
+    // Newer API revisions restate cumulative input counts on message_delta.
+    let body = sse(&[
+        &json!({"type": "message_start", "message": {"usage": {"input_tokens": 25}}}).to_string(),
+        &json!({
+            "type": "message_delta",
+            "usage": {
+                "input_tokens": 25,
+                "cache_read_input_tokens": 500,
+                "output_tokens": 40
+            }
+        })
+        .to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
+        Some(525)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
+        Some(565)
+    );
+}
+
+#[test]
+fn gemini_stream_counts_thoughts_as_output_and_tool_use_as_input() {
+    let with_total = sse(&[&json!({
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": 3,
+            "totalTokenCount": 58
+        }
+    })
+    .to_string()]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&with_total], "prompt_tokens"),
+        Some(13)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&with_total], "completion_tokens"),
+        Some(45)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&with_total], "total_tokens"),
+        Some(58)
+    );
+
+    // Without a provider total, the derived total includes both categories.
+    let without_total = sse(&[&json!({
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40
+        }
+    })
+    .to_string()]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&without_total], "total_tokens"),
+        Some(55)
+    );
+}
+
+#[test]
+fn bedrock_converse_stream_prompt_includes_cache_tokens() {
+    let payload = serde_json::to_vec(&json!({
+        "usage": {
+            "inputTokens": 5,
+            "outputTokens": 6,
+            "cacheReadInputTokens": 400,
+            "cacheWriteInputTokens": 30,
+            "totalTokens": 441
+        }
+    }))
+    .unwrap();
+    let stream = event_stream_message(b"\x00\x00\x00\x00", &payload);
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "prompt_tokens"
+        ),
+        Some(435)
+    );
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(441)
+    );
+}
+
+#[test]
+fn buffered_extraction_counts_the_same_categories() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let anthropic = extract_response_usage(
+        &json!({"usage": {
+            "input_tokens": 12,
+            "cache_creation_input_tokens": 8,
+            "cache_read_input_tokens": 80,
+            "output_tokens": 20
+        }}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(anthropic.prompt_tokens, Some(100));
+    assert_eq!(anthropic.completion_tokens, Some(20));
+    assert_eq!(anthropic.total_tokens, Some(120));
+
+    let gemini = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": 3,
+            "totalTokenCount": 58
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(gemini.prompt_tokens, Some(13));
+    assert_eq!(gemini.completion_tokens, Some(45));
+    assert_eq!(gemini.total_tokens, Some(58));
+
+    // A provider total below its own components is raised to their sum.
+    let low_total = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 15
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(low_total.total_tokens, Some(55));
+
+    let bedrock = extract_response_usage(
+        &json!({"usage": {
+            "inputTokens": 5,
+            "outputTokens": 6,
+            "cacheReadInputTokens": 400,
+            "cacheWriteInputTokens": 30,
+            "totalTokens": 11
+        }}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(bedrock.prompt_tokens, Some(435));
+    assert_eq!(bedrock.total_tokens, Some(441));
+}

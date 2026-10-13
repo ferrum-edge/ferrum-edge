@@ -10335,3 +10335,34 @@ async fn test_gemini_usage_without_extended_categories_is_unchanged() {
         "no reasoning detail without a reported thoughts count: {out}"
     );
 }
+
+/// Issue #6623: Anthropic reports prompt-cache writes and reads beside
+/// `input_tokens`, not inside it. The normalized OpenAI usage must charge the
+/// whole billed input (`input + cache_creation + cache_read`).
+#[tokio::test]
+async fn test_anthropic_normalized_usage_includes_prompt_cache_tokens() {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}",
+        "\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":200,\"cache_read_input_tokens\":3000,\"output_tokens\":1}",
+    );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":3210"), "{out}");
+    assert!(out.contains("\"completion_tokens\":5"), "{out}");
+    assert!(out.contains("\"total_tokens\":3215"), "{out}");
+}

@@ -4619,6 +4619,36 @@ fn native_usage_pair(
     ))
 }
 
+/// Fold optional provider token categories into a reported base count.
+///
+/// Every present category must be a non-negative integer (the same contract
+/// [`native_usage_pair`] applies to the base pair); an omitted one contributes
+/// nothing. `None` stays `None`: a category never invents a base the provider
+/// did not report.
+fn fold_native_usage_categories(
+    usage: Option<&Value>,
+    base: Option<u64>,
+    categories: &[&str],
+    provider: &str,
+) -> Result<Option<u64>, String> {
+    let usage = usage.and_then(Value::as_object);
+    let mut folded = base;
+    for key in categories {
+        let Some(value) = usage.and_then(|usage| usage.get(*key)) else {
+            continue;
+        };
+        let count = value.as_u64().ok_or_else(|| {
+            format!("ai_federation: {provider} usage.{key} must be a non-negative integer")
+        })?;
+        if let Some(current) = folded {
+            folded = Some(current.checked_add(count).ok_or_else(|| {
+                format!("ai_federation: {provider} token usage total overflowed")
+            })?);
+        }
+    }
+    Ok(folded)
+}
+
 fn summed_usage(
     input: Option<u64>,
     output: Option<u64>,
@@ -4738,6 +4768,14 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
         resp.get("usage"),
         "input_tokens",
         "output_tokens",
+        "Anthropic",
+    )?;
+    // `input_tokens` excludes prompt-cache writes and reads; the billed input
+    // is the sum of all three, so budgets and cost see the whole prompt.
+    let input_tokens = fold_native_usage_categories(
+        resp.get("usage"),
+        input_tokens,
+        &["cache_creation_input_tokens", "cache_read_input_tokens"],
         "Anthropic",
     )?;
     let total = summed_usage(input_tokens, output_tokens, "Anthropic")?;
@@ -4958,9 +4996,26 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
         "candidatesTokenCount",
         "Gemini",
     )?;
-    let total = match resp["usageMetadata"]["totalTokenCount"].as_u64() {
-        Some(total) => Some(total),
-        None => summed_usage(prompt_tokens, completion_tokens, "Gemini")?,
+    // Same folding as the `ai_stream_router` Gemini normalizer: tool-use
+    // prompting is input-side, and thinking tokens are billed output that is
+    // not part of `candidatesTokenCount`.
+    let prompt_tokens = fold_native_usage_categories(
+        resp.get("usageMetadata"),
+        prompt_tokens,
+        &["toolUsePromptTokenCount"],
+        "Gemini",
+    )?;
+    let completion_tokens = fold_native_usage_categories(
+        resp.get("usageMetadata"),
+        completion_tokens,
+        &["thoughtsTokenCount"],
+        "Gemini",
+    )?;
+    // The provider total stays authoritative but never below the components.
+    let derived = summed_usage(prompt_tokens, completion_tokens, "Gemini")?;
+    let total = match (resp["usageMetadata"]["totalTokenCount"].as_u64(), derived) {
+        (Some(reported), Some(derived)) => Some(reported.max(derived)),
+        (reported, derived) => reported.or(derived),
     };
 
     if resp
@@ -5077,9 +5132,19 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
 
     let (input_tokens, output_tokens) =
         native_usage_pair(resp.get("usage"), "inputTokens", "outputTokens", "Bedrock")?;
-    let total = match resp["usage"]["totalTokens"].as_u64() {
-        Some(total) => Some(total),
-        None => summed_usage(input_tokens, output_tokens, "Bedrock")?,
+    // Converse `inputTokens` excludes prompt-cache reads and writes (AWS:
+    // `total input tokens = inputTokens + cacheReadInputTokens +
+    // cacheWriteInputTokens`).
+    let input_tokens = fold_native_usage_categories(
+        resp.get("usage"),
+        input_tokens,
+        &["cacheReadInputTokens", "cacheWriteInputTokens"],
+        "Bedrock",
+    )?;
+    let derived = summed_usage(input_tokens, output_tokens, "Bedrock")?;
+    let total = match (resp["usage"]["totalTokens"].as_u64(), derived) {
+        (Some(reported), Some(derived)) => Some(reported.max(derived)),
+        (reported, derived) => reported.or(derived),
     };
 
     if resp

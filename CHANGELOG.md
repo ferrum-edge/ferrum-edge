@@ -152,6 +152,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **AI token metering counts prompt-cache, thinking and tool-use tokens**
+  (issue #6623). Anthropic `cache_creation_input_tokens` and
+  `cache_read_input_tokens` and Bedrock Converse `cacheReadInputTokens` and
+  `cacheWriteInputTokens` are now part of the prompt count. Gemini
+  `thoughtsTokenCount` is part of the completion count and
+  `toolUsePromptTokenCount` part of the prompt. This applies to buffered and
+  streamed extraction (`ai_rate_limiter`, `ai_token_metrics`) and to the
+  `ai_stream_router` and `ai_federation` normalizers, so token budgets no
+  longer undercharge cached or thinking requests and every surface agrees.
+  A provider total is never published below its own components.
+
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
   fuzz lane compiled the stock registry crate instead of the patched DB-TLS

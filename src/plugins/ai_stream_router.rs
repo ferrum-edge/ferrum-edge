@@ -4722,7 +4722,11 @@ impl AnthropicSseNormalizer {
                 if let Some(m) = message.get("model").and_then(Value::as_str) {
                     self.model = m.to_string();
                 }
-                if let Some(tokens) = message["usage"]["input_tokens"].as_u64() {
+                // Billed input includes prompt-cache writes and reads, which
+                // Anthropic reports beside `input_tokens` rather than in it.
+                if let Some(tokens) =
+                    super::utils::ai_providers::anthropic_input_tokens(message.get("usage"))
+                {
                     self.prompt_tokens = Some(tokens);
                 }
                 if let Some(tokens) = message["usage"]["output_tokens"].as_u64() {
@@ -4854,6 +4858,11 @@ impl AnthropicSseNormalizer {
                 }
                 if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
                     self.completion_tokens = Some(tokens);
+                }
+                if let Some(tokens) =
+                    super::utils::ai_providers::anthropic_input_tokens(event.get("usage"))
+                {
+                    self.prompt_tokens = Some(tokens);
                 }
                 let stop_reason = event["delta"]["stop_reason"].as_str();
                 if self.tools_forbidden && stop_reason == Some("tool_use") {

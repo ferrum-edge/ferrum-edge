@@ -477,9 +477,7 @@ fn extract_openai_usage(json: &Value, provider: AiProvider) -> AiTokenUsage {
 
 fn extract_anthropic_usage(json: &Value) -> AiTokenUsage {
     let usage = json.get("usage");
-    let prompt = usage
-        .and_then(|value| value.get("input_tokens"))
-        .and_then(|value| value.as_u64());
+    let prompt = anthropic_input_tokens(usage);
     let completion = usage
         .and_then(|value| value.get("output_tokens"))
         .and_then(|value| value.as_u64());
@@ -497,19 +495,11 @@ fn extract_anthropic_usage(json: &Value) -> AiTokenUsage {
 
 fn extract_google_usage(json: &Value) -> AiTokenUsage {
     let usage = json.get("usageMetadata");
-    let prompt = usage
-        .and_then(|value| value.get("promptTokenCount"))
-        .and_then(|value| value.as_u64());
-    let completion = usage
-        .and_then(|value| value.get("candidatesTokenCount"))
-        .and_then(|value| value.as_u64());
+    let counts = gemini_usage_counts(usage);
     AiTokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: usage
-            .and_then(|value| value.get("totalTokenCount"))
-            .and_then(|value| value.as_u64())
-            .or_else(|| sum_pair(prompt, completion)),
+        prompt_tokens: counts.prompt,
+        completion_tokens: counts.completion,
+        total_tokens: counts.total,
         model: json
             .get("modelVersion")
             .and_then(|value| value.as_str())
@@ -553,9 +543,21 @@ fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
 
 fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     let usage = json.get("usage");
+    // Converse reports uncached input separately from prompt-cache reads and
+    // writes; the billed input is their sum (AWS: `total input tokens =
+    // inputTokens + cacheReadInputTokens + cacheWriteInputTokens`).
     let converse_prompt = usage
         .and_then(|value| value.get("inputTokens"))
-        .and_then(|value| value.as_u64());
+        .and_then(|value| value.as_u64())
+        .map(|input| {
+            add_optional_counts(
+                input,
+                [
+                    usage_count(usage, "cacheReadInputTokens"),
+                    usage_count(usage, "cacheWriteInputTokens"),
+                ],
+            )
+        });
     let converse_completion = usage
         .and_then(|value| value.get("outputTokens"))
         .and_then(|value| value.as_u64());
@@ -587,10 +589,13 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     AiTokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
-        total_tokens: usage
-            .and_then(|value| value.get("totalTokens"))
-            .and_then(|value| value.as_u64())
-            .or_else(|| sum_pair(prompt, completion)),
+        total_tokens: authoritative_total(
+            usage
+                .and_then(|value| value.get("totalTokens"))
+                .and_then(|value| value.as_u64()),
+            prompt,
+            completion,
+        ),
         model: None,
         provider: Some(AiProvider::Bedrock),
     }
@@ -621,6 +626,87 @@ fn extract_tgi_usage(json: &Value) -> AiTokenUsage {
         total_tokens: sum_pair(prompt, completion),
         model: None,
         provider: Some(AiProvider::Tgi),
+    }
+}
+
+fn usage_count(usage: Option<&Value>, field: &str) -> Option<u64> {
+    usage
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_u64)
+}
+
+/// Add optional token categories to a reported base count. An omitted
+/// category contributes nothing; the sum saturates so a provider-controlled
+/// overflow charges the maximum rather than wrapping to a small number.
+fn add_optional_counts<const N: usize>(base: u64, extras: [Option<u64>; N]) -> u64 {
+    extras.into_iter().flatten().fold(base, u64::saturating_add)
+}
+
+/// A provider total stays authoritative (it may cover a category this parser
+/// does not model), but it is never allowed to fall below the components the
+/// same document reports.
+fn authoritative_total(
+    reported: Option<u64>,
+    prompt: Option<u64>,
+    completion: Option<u64>,
+) -> Option<u64> {
+    match (reported, sum_pair(prompt, completion)) {
+        (Some(reported), Some(derived)) => Some(reported.max(derived)),
+        (reported, derived) => reported.or(derived),
+    }
+}
+
+/// Billed input of an Anthropic Messages `usage` object.
+///
+/// `input_tokens` counts only the tokens after the last cache breakpoint; the
+/// prompt-cache writes (`cache_creation_input_tokens`) and reads
+/// (`cache_read_input_tokens`) are reported separately and are part of the
+/// input the request consumed (Anthropic: `total_input_tokens =
+/// cache_read_input_tokens + cache_creation_input_tokens + input_tokens`).
+/// `None` when `input_tokens` itself was not reported, so a usage fragment
+/// that carries only output counts never overwrites a known prompt.
+pub(crate) fn anthropic_input_tokens(usage: Option<&Value>) -> Option<u64> {
+    let input = usage_count(usage, "input_tokens")?;
+    Some(add_optional_counts(
+        input,
+        [
+            usage_count(usage, "cache_creation_input_tokens"),
+            usage_count(usage, "cache_read_input_tokens"),
+        ],
+    ))
+}
+
+/// Normalized Gemini / Vertex `usageMetadata` counts.
+pub(crate) struct GeminiUsageCounts {
+    pub prompt: Option<u64>,
+    pub completion: Option<u64>,
+    pub total: Option<u64>,
+}
+
+/// Fold Gemini's separately reported categories into prompt/completion the
+/// same way the `ai_stream_router` normalizer does: `toolUsePromptTokenCount`
+/// is input-side, `thoughtsTokenCount` is billed output that is NOT part of
+/// `candidatesTokenCount`. `totalTokenCount` (documented as prompt + tool-use
+/// prompt + thoughts + candidates) stays authoritative but never below the
+/// folded components. proto3 JSON omits zero-valued counters, so an omitted
+/// category is zero when a sibling on the same side was reported.
+pub(crate) fn gemini_usage_counts(usage: Option<&Value>) -> GeminiUsageCounts {
+    let side = |base: Option<u64>, extra: Option<u64>| match (base, extra) {
+        (None, None) => None,
+        (base, extra) => Some(base.unwrap_or(0).saturating_add(extra.unwrap_or(0))),
+    };
+    let prompt = side(
+        usage_count(usage, "promptTokenCount"),
+        usage_count(usage, "toolUsePromptTokenCount"),
+    );
+    let completion = side(
+        usage_count(usage, "candidatesTokenCount"),
+        usage_count(usage, "thoughtsTokenCount"),
+    );
+    GeminiUsageCounts {
+        prompt,
+        completion,
+        total: authoritative_total(usage_count(usage, "totalTokenCount"), prompt, completion),
     }
 }
 

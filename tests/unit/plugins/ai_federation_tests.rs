@@ -9554,3 +9554,88 @@ async fn provider_call_carries_the_proxy_hop_count() {
         assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
     }
 }
+
+/// Issue #6623: federation normalizes provider usage with the same token
+/// categories the native metering paths count.
+#[test]
+fn test_normalized_usage_includes_cache_thinking_and_tool_use_tokens() {
+    let anthropic = json!({
+        "id": "msg_cache",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "cached"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 12,
+            "cache_creation_input_tokens": 8,
+            "cache_read_input_tokens": 80,
+            "output_tokens": 20
+        }
+    });
+    let (normalized, prompt, completion, total) = test_helpers::normalize_response_test(
+        "anthropic",
+        200,
+        &serde_json::to_vec(&anthropic).unwrap(),
+        "claude-sonnet-4-20250514",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (100, 20, 120));
+    assert_eq!(normalized["usage"]["prompt_tokens"], 100);
+
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "thought"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": 3,
+            "totalTokenCount": 58
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (13, 45, 58));
+
+    let bedrock = json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+        "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 5,
+            "outputTokens": 6,
+            "cacheReadInputTokens": 400,
+            "cacheWriteInputTokens": 30,
+            "totalTokens": 441
+        }
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "aws_bedrock",
+        200,
+        &serde_json::to_vec(&bedrock).unwrap(),
+        "anthropic.claude-3-sonnet",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (435, 6, 441));
+
+    // A malformed category is refused like a malformed base count.
+    let mut malformed = anthropic.clone();
+    malformed["usage"]["cache_read_input_tokens"] = json!("lots");
+    assert!(
+        test_helpers::normalize_response_test(
+            "anthropic",
+            200,
+            &serde_json::to_vec(&malformed).unwrap(),
+            "claude-sonnet-4-20250514",
+        )
+        .is_err()
+    );
+}
