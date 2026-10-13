@@ -4622,29 +4622,36 @@ fn native_usage_pair(
 /// Fold optional provider token categories into a reported base count.
 ///
 /// Every present category must be a non-negative integer (the same contract
-/// [`native_usage_pair`] applies to the base pair); an omitted one contributes
-/// nothing. `None` stays `None`: a category never invents a base the provider
-/// did not report.
+/// [`native_usage_pair`] applies to the base pair); an omitted or `null` one
+/// contributes nothing (Anthropic types its cache counters as nullable).
+/// Without a base, a category never invents one — except for Gemini
+/// (`zero_omitted_base`), whose proto3 JSON omits a zero base counter, so a
+/// reported sibling category means the base was zero. This is the same rule
+/// the shared `UsageCategories` fold applies on every other metering surface.
 fn fold_native_usage_categories(
     usage: Option<&Value>,
     base: Option<u64>,
     categories: &[&str],
+    zero_omitted_base: bool,
     provider: &str,
 ) -> Result<Option<u64>, String> {
     let usage = usage.and_then(Value::as_object);
     let mut folded = base;
     for key in categories {
-        let Some(value) = usage.and_then(|usage| usage.get(*key)) else {
-            continue;
+        let value = match usage.and_then(|usage| usage.get(*key)) {
+            None | Some(Value::Null) => continue,
+            Some(value) => value,
         };
         let count = value.as_u64().ok_or_else(|| {
             format!("ai_federation: {provider} usage.{key} must be a non-negative integer")
         })?;
-        if let Some(current) = folded {
-            folded = Some(current.checked_add(count).ok_or_else(|| {
+        folded = match folded {
+            Some(current) => Some(current.checked_add(count).ok_or_else(|| {
                 format!("ai_federation: {provider} token usage total overflowed")
-            })?);
-        }
+            })?),
+            None if zero_omitted_base => Some(count),
+            None => None,
+        };
     }
     Ok(folded)
 }
@@ -4776,6 +4783,7 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
         resp.get("usage"),
         input_tokens,
         &["cache_creation_input_tokens", "cache_read_input_tokens"],
+        false,
         "Anthropic",
     )?;
     let total = summed_usage(input_tokens, output_tokens, "Anthropic")?;
@@ -5003,12 +5011,14 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
         resp.get("usageMetadata"),
         prompt_tokens,
         &["toolUsePromptTokenCount"],
+        true,
         "Gemini",
     )?;
     let completion_tokens = fold_native_usage_categories(
         resp.get("usageMetadata"),
         completion_tokens,
         &["thoughtsTokenCount"],
+        true,
         "Gemini",
     )?;
     // The provider total stays authoritative but never below the components.
@@ -5139,6 +5149,7 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
         resp.get("usage"),
         input_tokens,
         &["cacheReadInputTokens", "cacheWriteInputTokens"],
+        false,
         "Bedrock",
     )?;
     let derived = summed_usage(input_tokens, output_tokens, "Bedrock")?;

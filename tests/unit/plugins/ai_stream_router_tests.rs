@@ -10366,3 +10366,35 @@ async fn test_anthropic_normalized_usage_includes_prompt_cache_tokens() {
     assert!(out.contains("\"completion_tokens\":5"), "{out}");
     assert!(out.contains("\"total_tokens\":3215"), "{out}");
 }
+
+#[tokio::test]
+async fn test_anthropic_normalized_usage_keeps_cache_categories_across_partial_delta() {
+    let sse = ANTHROPIC_SSE
+        .replace(
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}",
+            "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":1}",
+        )
+        .replace(
+            "\"usage\":{\"output_tokens\":5}",
+            "\"usage\":{\"input_tokens\":20,\"output_tokens\":5}",
+        );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":120"), "{out}");
+    assert!(out.contains("\"total_tokens\":125"), "{out}");
+}

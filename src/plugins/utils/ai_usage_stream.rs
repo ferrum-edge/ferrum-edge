@@ -39,7 +39,7 @@ use base64::Engine;
 use serde_json::Value;
 
 use super::ai_providers::{
-    AiProvider, AiTokenUsage, anthropic_input_tokens, detect_sse_provider, extract_response_usage,
+    AiProvider, AiTokenUsage, UsageCategories, detect_sse_provider, extract_response_usage,
 };
 use super::sse::{sse_line_end, strip_sse_boms};
 
@@ -101,6 +101,9 @@ pub struct UsageAccumulator {
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     observed: bool,
+    /// Raw provider categories seen so far, merged field by field, so an event
+    /// that restates only some categories cannot erase the others.
+    categories: UsageCategories,
 }
 
 impl UsageAccumulator {
@@ -124,6 +127,7 @@ impl UsageAccumulator {
             total_tokens: self.total_tokens,
             model: None,
             provider: None,
+            categories: UsageCategories::default(),
         }
     }
 
@@ -141,6 +145,8 @@ impl UsageAccumulator {
     }
 
     fn record(&mut self, usage: &AiTokenUsage) {
+        let folded = self.categories.absorb(usage.clone());
+        let usage = &folded;
         if usage.prompt_tokens.is_none()
             && usage.completion_tokens.is_none()
             && usage.total_tokens.is_none()
@@ -263,34 +269,17 @@ impl UsageAccumulator {
         }
 
         match json.get("type").and_then(Value::as_str) {
-            // Anthropic streams its input tokens up front. The billed input
-            // includes prompt-cache writes and reads, which are reported beside
-            // `input_tokens` rather than inside it.
+            // Anthropic streams its input (with prompt-cache writes and reads
+            // reported beside `input_tokens`) up front, and cumulative output —
+            // sometimes restating cumulative input categories — on the terminal
+            // delta. Categories merge field by field in `record`.
             Some("message_start") => {
-                if let Some(prompt) = anthropic_input_tokens(
-                    json.get("message").and_then(|message| message.get("usage")),
-                ) {
-                    self.record(&AiTokenUsage {
-                        prompt_tokens: Some(prompt),
-                        ..Default::default()
-                    });
+                if let Some(message) = json.get("message") {
+                    self.record(&extract_response_usage(message, AiProvider::Anthropic));
                 }
             }
-            // ... and the cumulative output tokens on the terminal delta. A
-            // delta that also restates cumulative input counts refreshes them.
             Some("message_delta") => {
-                let usage = json.get("usage");
-                let prompt = anthropic_input_tokens(usage);
-                let completion = usage
-                    .and_then(|usage| usage.get("output_tokens"))
-                    .and_then(Value::as_u64);
-                if prompt.is_some() || completion.is_some() {
-                    self.record(&AiTokenUsage {
-                        prompt_tokens: prompt,
-                        completion_tokens: completion,
-                        ..Default::default()
-                    });
-                }
+                self.record(&extract_response_usage(json, AiProvider::Anthropic));
             }
             // Cohere v2 nests counts under `delta.usage.tokens.*`.
             Some("message-end") => {

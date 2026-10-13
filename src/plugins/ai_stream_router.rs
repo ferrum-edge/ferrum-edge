@@ -4559,6 +4559,10 @@ struct AnthropicSseNormalizer {
     next_tool_index: u32,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    /// Raw Anthropic usage categories merged across `message_start` and
+    /// `message_delta`, so a delta restating only some categories cannot erase
+    /// the cache counters an earlier event reported.
+    usage_categories: super::utils::ai_providers::UsageCategories,
 }
 
 impl AnthropicSseNormalizer {
@@ -4584,6 +4588,26 @@ impl AnthropicSseNormalizer {
             next_tool_index: 0,
             prompt_tokens: None,
             completion_tokens: None,
+            usage_categories: Default::default(),
+        }
+    }
+
+    /// Fold one Anthropic `usage` carrier (the `message_start` message or the
+    /// `message_delta` event) into the running counters. The billed input
+    /// includes prompt-cache writes and reads, which Anthropic reports beside
+    /// `input_tokens` rather than in it.
+    fn absorb_anthropic_usage(&mut self, carrier: &Value) {
+        let folded =
+            self.usage_categories
+                .absorb(super::utils::ai_providers::extract_response_usage(
+                    carrier,
+                    super::utils::ai_providers::AiProvider::Anthropic,
+                ));
+        if folded.prompt_tokens.is_some() {
+            self.prompt_tokens = folded.prompt_tokens;
+        }
+        if folded.completion_tokens.is_some() {
+            self.completion_tokens = folded.completion_tokens;
         }
     }
 
@@ -4722,16 +4746,7 @@ impl AnthropicSseNormalizer {
                 if let Some(m) = message.get("model").and_then(Value::as_str) {
                     self.model = m.to_string();
                 }
-                // Billed input includes prompt-cache writes and reads, which
-                // Anthropic reports beside `input_tokens` rather than in it.
-                if let Some(tokens) =
-                    super::utils::ai_providers::anthropic_input_tokens(message.get("usage"))
-                {
-                    self.prompt_tokens = Some(tokens);
-                }
-                if let Some(tokens) = message["usage"]["output_tokens"].as_u64() {
-                    self.completion_tokens = Some(tokens);
-                }
+                self.absorb_anthropic_usage(message);
                 if !self.role_emitted {
                     self.role_emitted = true;
                     self.write_chunk_line(json!({ "role": "assistant" }), None, out);
@@ -4856,14 +4871,7 @@ impl AnthropicSseNormalizer {
                 if !self.require_message_start("message_delta", out) {
                     return true;
                 }
-                if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
-                    self.completion_tokens = Some(tokens);
-                }
-                if let Some(tokens) =
-                    super::utils::ai_providers::anthropic_input_tokens(event.get("usage"))
-                {
-                    self.prompt_tokens = Some(tokens);
-                }
+                self.absorb_anthropic_usage(event);
                 let stop_reason = event["delta"]["stop_reason"].as_str();
                 if self.tools_forbidden && stop_reason == Some("tool_use") {
                     self.emit_upstream_error(
@@ -6433,7 +6441,12 @@ impl GeminiUsageCounters {
     /// must both have been reported before any usage is published at all, and
     /// the optional categories only ever add to what the provider stated.
     fn to_openai_usage(&self) -> Result<Option<Value>, &'static str> {
-        let (Some(prompt_base), Some(candidates)) = (self.prompt, self.candidates) else {
+        // proto3 JSON omits zero counters, so an omitted base is zero when a
+        // sibling on its side was reported (same rule as the shared
+        // `UsageCategories` fold every other metering surface uses).
+        let prompt_base = self.prompt.or_else(|| self.tool_use_prompt.map(|_| 0));
+        let candidates = self.candidates.or_else(|| self.thoughts.map(|_| 0));
+        let (Some(prompt_base), Some(candidates)) = (prompt_base, candidates) else {
             return Ok(None);
         };
         // Gemini bills tool-use prompting on the input side, and OpenAI's

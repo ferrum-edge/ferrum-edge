@@ -921,3 +921,132 @@ fn buffered_extraction_counts_the_same_categories() {
     assert_eq!(bedrock.prompt_tokens, Some(435));
     assert_eq!(bedrock.total_tokens, Some(441));
 }
+
+#[test]
+fn anthropic_partial_delta_does_not_erase_earlier_cache_categories() {
+    // A delta restating `input_tokens` without the cache counters keeps the
+    // cache counters the start reported (categories merge field by field).
+    let body = sse(&[
+        &json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 100}}
+        })
+        .to_string(),
+        &json!({
+            "type": "message_delta",
+            "usage": {"input_tokens": 20, "output_tokens": 5}
+        })
+        .to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
+        Some(120)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
+        Some(125)
+    );
+}
+
+#[test]
+fn cumulative_merge_preserves_categories_for_buffered_sse_metrics() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    // The `ai_token_metrics` SSE path merges per-event extractions.
+    let mut merged = extract_response_usage(
+        &json!({"usage": {"input_tokens": 10, "cache_read_input_tokens": 100}}),
+        AiProvider::Anthropic,
+    );
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"usage": {"input_tokens": 20, "output_tokens": 5}}),
+        AiProvider::Anthropic,
+    ));
+    assert_eq!(merged.prompt_tokens, Some(120));
+    assert_eq!(merged.total_tokens, Some(125));
+
+    // Gemini: a later snapshot that omits the thinking counter keeps it.
+    let mut gemini = extract_response_usage(
+        &json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "thoughtsTokenCount": 40}}),
+        AiProvider::Google,
+    );
+    gemini.merge_cumulative(extract_response_usage(
+        &json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}}),
+        AiProvider::Google,
+    ));
+    assert_eq!(gemini.completion_tokens, Some(45));
+    assert_eq!(gemini.total_tokens, Some(55));
+}
+
+#[test]
+fn malformed_counters_are_unmetered_not_partial() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    // Malformed base, valid extra: never publish the extra alone.
+    let bad_base = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": "bad",
+            "toolUsePromptTokenCount": 3,
+            "candidatesTokenCount": 5
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(bad_base.prompt_tokens, None);
+    assert!(!bad_base.is_complete_for_mode("prompt_tokens"));
+    assert_eq!(bad_base.completion_tokens, Some(5));
+
+    // Valid base, malformed extra: the side is unmetered, not the base alone.
+    let bad_extra = extract_response_usage(
+        &json!({"usage": {
+            "input_tokens": 10,
+            "cache_read_input_tokens": -1,
+            "output_tokens": 5
+        }}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(bad_extra.prompt_tokens, None);
+    assert!(!bad_extra.is_complete_for_mode("prompt_tokens"));
+    assert!(!bad_extra.is_complete_for_mode("total_tokens"));
+
+    // `null` is absence (Anthropic types its cache counters as nullable).
+    let nullable = extract_response_usage(
+        &json!({"usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": null,
+            "cache_read_input_tokens": null,
+            "output_tokens": 5
+        }}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(nullable.prompt_tokens, Some(10));
+    assert_eq!(nullable.total_tokens, Some(15));
+}
+
+#[test]
+fn gemini_zero_omitted_candidates_and_saturating_overflow() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    // proto3 omits a zero `candidatesTokenCount`; thoughts are still output.
+    let filtered = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 50
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(filtered.completion_tokens, Some(40));
+    assert_eq!(filtered.total_tokens, Some(50));
+
+    // An overflowing category saturates; a tiny reported total cannot win.
+    let overflow = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 1,
+            "toolUsePromptTokenCount": u64::MAX,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": 2
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(overflow.prompt_tokens, Some(u64::MAX));
+    assert_eq!(overflow.total_tokens, Some(u64::MAX));
+}

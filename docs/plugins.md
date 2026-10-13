@@ -7868,7 +7868,9 @@ Extracts token usage from LLM HTTP JSON response bodies and writes it to request
 - Gemini/Vertex `toolUsePromptTokenCount` is added to the prompt, and `thoughtsTokenCount` (billed output that is not part of `candidatesTokenCount`) to the completion.
 - A provider total stays authoritative but is never published below the sum of the components it reports.
 
-OpenAI already includes cached and reasoning tokens in `prompt_tokens` / `completion_tokens`. The cost rates are flat per category, so for a prompt-cached request the estimated cost is an upper bound (cache reads and writes are priced at `cost_per_prompt_token`). Prompt-token budgets charge the whole billed input.
+OpenAI already includes cached and reasoning tokens in `prompt_tokens` / `completion_tokens`. The cost rates are flat per category, so for a prompt-cached request the estimate is approximate. Cache reads, which providers bill below the base input rate, are overestimated. Cache writes, which Anthropic bills at 1.25× or 2× the base input rate, are underestimated. Prompt-token budgets charge the whole billed input.
+
+Categories merge field by field across a stream, so an event that restates only some of them (for example an Anthropic `message_delta` carrying `input_tokens` without the cache counters) never erases what an earlier event reported. A malformed counter makes its side unmetered rather than partially counted, a `null` counter is absence, and a Gemini base omitted by proto3 zero-omission counts as zero when a sibling category on that side is reported. Category sums saturate rather than wrap, so an overflowing provider value charges the maximum.
 
 **Status filtering**: Only 2xx responses are inspected for token usage. Error responses (4xx, 5xx) are typically not LLM-shaped JSON and would otherwise pollute token metrics and chargeback accounting.
 

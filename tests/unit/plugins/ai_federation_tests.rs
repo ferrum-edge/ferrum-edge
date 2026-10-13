@@ -9639,3 +9639,51 @@ fn test_normalized_usage_includes_cache_thinking_and_tool_use_tokens() {
         .is_err()
     );
 }
+
+#[test]
+fn test_normalized_usage_nullable_cache_and_zero_omitted_gemini_base() {
+    let anthropic = json!({
+        "id": "msg_null",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 12,
+            "cache_creation_input_tokens": null,
+            "cache_read_input_tokens": null,
+            "output_tokens": 20
+        }
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "anthropic",
+        200,
+        &serde_json::to_vec(&anthropic).unwrap(),
+        "claude-sonnet-4-20250514",
+    )
+    .expect("nullable cache counters are absence, not a malformed response");
+    assert_eq!((prompt, completion, total), (12, 20, 32));
+
+    // A thinking-only completion omits the zero `candidatesTokenCount`.
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 50
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (10, 40, 50));
+}

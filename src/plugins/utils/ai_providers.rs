@@ -40,6 +40,12 @@ pub struct AiTokenUsage {
     pub total_tokens: Option<u64>,
     pub model: Option<String>,
     pub provider: Option<AiProvider>,
+    /// Raw provider token categories behind `prompt_tokens` /
+    /// `completion_tokens`, for providers that report the billed input or
+    /// output as several separately omittable counters. Cumulative merging
+    /// combines these field by field before folding, so an update that omits
+    /// a category never erases one an earlier event reported.
+    pub categories: UsageCategories,
 }
 
 impl AiTokenUsage {
@@ -53,6 +59,7 @@ impl AiTokenUsage {
         if self.provider.is_some() && newer.provider.is_some() && self.provider != newer.provider {
             return;
         }
+        let newer = self.categories.absorb(newer);
 
         let component_updated = newer.prompt_tokens.is_some() || newer.completion_tokens.is_some();
         if newer.prompt_tokens.is_some() {
@@ -476,36 +483,31 @@ fn extract_openai_usage(json: &Value, provider: AiProvider) -> AiTokenUsage {
 }
 
 fn extract_anthropic_usage(json: &Value) -> AiTokenUsage {
-    let usage = json.get("usage");
-    let prompt = anthropic_input_tokens(usage);
-    let completion = usage
-        .and_then(|value| value.get("output_tokens"))
-        .and_then(|value| value.as_u64());
-    AiTokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: sum_pair(prompt, completion),
+    let categories = UsageCategories::anthropic(json.get("usage"));
+    let mut usage = AiTokenUsage {
         model: json
             .get("model")
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(AiProvider::Anthropic),
-    }
+        ..Default::default()
+    };
+    usage.apply_categories(categories);
+    usage
 }
 
 fn extract_google_usage(json: &Value) -> AiTokenUsage {
-    let usage = json.get("usageMetadata");
-    let counts = gemini_usage_counts(usage);
-    AiTokenUsage {
-        prompt_tokens: counts.prompt,
-        completion_tokens: counts.completion,
-        total_tokens: counts.total,
+    let categories = UsageCategories::gemini(json.get("usageMetadata"));
+    let mut usage = AiTokenUsage {
         model: json
             .get("modelVersion")
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(AiProvider::Google),
-    }
+        ..Default::default()
+    };
+    usage.apply_categories(categories);
+    usage
 }
 
 fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
@@ -546,21 +548,14 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     // Converse reports uncached input separately from prompt-cache reads and
     // writes; the billed input is their sum (AWS: `total input tokens =
     // inputTokens + cacheReadInputTokens + cacheWriteInputTokens`).
-    let converse_prompt = usage
-        .and_then(|value| value.get("inputTokens"))
-        .and_then(|value| value.as_u64())
-        .map(|input| {
-            add_optional_counts(
-                input,
-                [
-                    usage_count(usage, "cacheReadInputTokens"),
-                    usage_count(usage, "cacheWriteInputTokens"),
-                ],
-            )
-        });
-    let converse_completion = usage
-        .and_then(|value| value.get("outputTokens"))
-        .and_then(|value| value.as_u64());
+    if let Some(categories) = UsageCategories::bedrock_converse(usage) {
+        let mut converse = AiTokenUsage {
+            provider: Some(AiProvider::Bedrock),
+            ..Default::default()
+        };
+        converse.apply_categories(categories);
+        return converse;
+    }
     let titan_prompt = json
         .get("inputTextTokenCount")
         .and_then(|value| value.as_u64());
@@ -582,22 +577,15 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     let metrics_completion = metrics
         .and_then(|value| value.get("outputTokenCount"))
         .and_then(|value| value.as_u64());
-    let prompt = converse_prompt.or(titan_prompt).or(metrics_prompt);
-    let completion = converse_completion
-        .or(titan_completion)
-        .or(metrics_completion);
+    let prompt = titan_prompt.or(metrics_prompt);
+    let completion = titan_completion.or(metrics_completion);
     AiTokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
-        total_tokens: authoritative_total(
-            usage
-                .and_then(|value| value.get("totalTokens"))
-                .and_then(|value| value.as_u64()),
-            prompt,
-            completion,
-        ),
+        total_tokens: sum_pair(prompt, completion),
         model: None,
         provider: Some(AiProvider::Bedrock),
+        ..Default::default()
     }
 }
 
@@ -629,84 +617,212 @@ fn extract_tgi_usage(json: &Value) -> AiTokenUsage {
     }
 }
 
-fn usage_count(usage: Option<&Value>, field: &str) -> Option<u64> {
-    usage
-        .and_then(|value| value.get(field))
-        .and_then(Value::as_u64)
+/// One raw provider counter. `Invalid` (present but not a non-negative
+/// integer) is kept distinct from `Absent` so a malformed field can never be
+/// read as "omitted, therefore zero".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Counter {
+    #[default]
+    Absent,
+    Value(u64),
+    Invalid,
 }
 
-/// Add optional token categories to a reported base count. An omitted
-/// category contributes nothing; the sum saturates so a provider-controlled
-/// overflow charges the maximum rather than wrapping to a small number.
-fn add_optional_counts<const N: usize>(base: u64, extras: [Option<u64>; N]) -> u64 {
-    extras.into_iter().flatten().fold(base, u64::saturating_add)
-}
+impl Counter {
+    /// `null` is absence: Anthropic types its cache counters as nullable.
+    fn read(usage: Option<&Value>, field: &str) -> Self {
+        match usage.and_then(|value| value.get(field)) {
+            None | Some(Value::Null) => Self::Absent,
+            Some(value) => value.as_u64().map_or(Self::Invalid, Self::Value),
+        }
+    }
 
-/// A provider total stays authoritative (it may cover a category this parser
-/// does not model), but it is never allowed to fall below the components the
-/// same document reports.
-fn authoritative_total(
-    reported: Option<u64>,
-    prompt: Option<u64>,
-    completion: Option<u64>,
-) -> Option<u64> {
-    match (reported, sum_pair(prompt, completion)) {
-        (Some(reported), Some(derived)) => Some(reported.max(derived)),
-        (reported, derived) => reported.or(derived),
+    fn merge(&mut self, newer: Self) {
+        if newer != Self::Absent {
+            *self = newer;
+        }
+    }
+
+    fn is_reported(self) -> bool {
+        self != Self::Absent
     }
 }
 
-/// Billed input of an Anthropic Messages `usage` object.
+/// Which provider's category layout a [`UsageCategories`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CategoryFamily {
+    /// `input_tokens` + `cache_creation_input_tokens` +
+    /// `cache_read_input_tokens`; `output_tokens`.
+    Anthropic,
+    /// `promptTokenCount` + `toolUsePromptTokenCount`; `candidatesTokenCount`
+    /// + `thoughtsTokenCount`; `totalTokenCount`. proto3 JSON omits zero
+    /// counters, so an omitted base is zero when a sibling on its side is
+    /// reported.
+    Gemini,
+    /// `inputTokens` + `cacheReadInputTokens` + `cacheWriteInputTokens`;
+    /// `outputTokens`; `totalTokens`.
+    BedrockConverse,
+}
+
+/// Raw token categories behind a folded prompt/completion pair.
 ///
-/// `input_tokens` counts only the tokens after the last cache breakpoint; the
-/// prompt-cache writes (`cache_creation_input_tokens`) and reads
-/// (`cache_read_input_tokens`) are reported separately and are part of the
-/// input the request consumed (Anthropic: `total_input_tokens =
-/// cache_read_input_tokens + cache_creation_input_tokens + input_tokens`).
-/// `None` when `input_tokens` itself was not reported, so a usage fragment
-/// that carries only output counts never overwrites a known prompt.
-pub(crate) fn anthropic_input_tokens(usage: Option<&Value>) -> Option<u64> {
-    let input = usage_count(usage, "input_tokens")?;
-    Some(add_optional_counts(
-        input,
-        [
-            usage_count(usage, "cache_creation_input_tokens"),
-            usage_count(usage, "cache_read_input_tokens"),
-        ],
-    ))
+/// The billed input of an Anthropic Messages or Bedrock Converse request is
+/// the uncached input PLUS prompt-cache writes and reads, which those
+/// providers report beside the base counter rather than inside it (Anthropic:
+/// `total_input_tokens = cache_read_input_tokens + cache_creation_input_tokens
+/// + input_tokens`; AWS: `inputTokens + cacheReadInputTokens +
+/// cacheWriteInputTokens`). Gemini bills `toolUsePromptTokenCount` as input
+/// and `thoughtsTokenCount` as output outside `candidatesTokenCount`, and
+/// documents `totalTokenCount` as prompt + tool-use prompt + thoughts +
+/// candidates. Folding here is the single rule every metering surface uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageCategories {
+    family: Option<CategoryFamily>,
+    prompt_base: Counter,
+    prompt_extras: [Counter; 2],
+    completion_base: Counter,
+    completion_extra: Counter,
+    reported_total: Counter,
 }
 
-/// Normalized Gemini / Vertex `usageMetadata` counts.
-pub(crate) struct GeminiUsageCounts {
-    pub prompt: Option<u64>,
-    pub completion: Option<u64>,
-    pub total: Option<u64>,
+impl UsageCategories {
+    fn anthropic(usage: Option<&Value>) -> Self {
+        Self {
+            family: Some(CategoryFamily::Anthropic),
+            prompt_base: Counter::read(usage, "input_tokens"),
+            prompt_extras: [
+                Counter::read(usage, "cache_creation_input_tokens"),
+                Counter::read(usage, "cache_read_input_tokens"),
+            ],
+            completion_base: Counter::read(usage, "output_tokens"),
+            completion_extra: Counter::Absent,
+            reported_total: Counter::Absent,
+        }
+    }
+
+    fn gemini(usage: Option<&Value>) -> Self {
+        let candidates = match Counter::read(usage, "candidatesTokenCount") {
+            Counter::Absent => Counter::read(usage, "completionTokenCount"),
+            reported => reported,
+        };
+        Self {
+            family: Some(CategoryFamily::Gemini),
+            prompt_base: Counter::read(usage, "promptTokenCount"),
+            prompt_extras: [
+                Counter::read(usage, "toolUsePromptTokenCount"),
+                Counter::Absent,
+            ],
+            completion_base: candidates,
+            completion_extra: Counter::read(usage, "thoughtsTokenCount"),
+            reported_total: Counter::read(usage, "totalTokenCount"),
+        }
+    }
+
+    /// `None` when the document carries no Converse `usage` counters at all.
+    fn bedrock_converse(usage: Option<&Value>) -> Option<Self> {
+        let categories = Self {
+            family: Some(CategoryFamily::BedrockConverse),
+            prompt_base: Counter::read(usage, "inputTokens"),
+            prompt_extras: [
+                Counter::read(usage, "cacheReadInputTokens"),
+                Counter::read(usage, "cacheWriteInputTokens"),
+            ],
+            completion_base: Counter::read(usage, "outputTokens"),
+            completion_extra: Counter::Absent,
+            reported_total: Counter::read(usage, "totalTokens"),
+        };
+        (categories.prompt_base.is_reported() || categories.completion_base.is_reported())
+            .then_some(categories)
+    }
+
+    fn zero_omitted_base(&self) -> bool {
+        self.family == Some(CategoryFamily::Gemini)
+    }
+
+    fn merge(&mut self, newer: &Self) {
+        if self.family != newer.family {
+            *self = newer.clone();
+            return;
+        }
+        self.prompt_base.merge(newer.prompt_base);
+        for (current, newer) in self.prompt_extras.iter_mut().zip(newer.prompt_extras) {
+            current.merge(newer);
+        }
+        self.completion_base.merge(newer.completion_base);
+        self.completion_extra.merge(newer.completion_extra);
+        self.reported_total.merge(newer.reported_total);
+    }
+
+    /// Fold one side. `None` when the side was not reported, when any of its
+    /// counters is malformed (never publish a partial count as complete), or
+    /// when only a category was reported for a provider that always sends
+    /// the base.
+    fn side(&self, base: Counter, extras: &[Counter]) -> Option<u64> {
+        if base == Counter::Invalid || extras.contains(&Counter::Invalid) {
+            return None;
+        }
+        let base = match base {
+            Counter::Value(base) => base,
+            Counter::Absent
+                if self.zero_omitted_base() && extras.iter().any(|c| c.is_reported()) =>
+            {
+                0
+            }
+            _ => return None,
+        };
+        // Saturate: a provider-controlled overflow charges the maximum rather
+        // than wrapping to a small number.
+        Some(extras.iter().fold(base, |sum, counter| match counter {
+            Counter::Value(value) => sum.saturating_add(*value),
+            _ => sum,
+        }))
+    }
+
+    fn fold(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let prompt = self.side(self.prompt_base, &self.prompt_extras);
+        let completion = self.side(self.completion_base, &[self.completion_extra]);
+        let reported = match self.reported_total {
+            Counter::Value(total) => Some(total),
+            _ => None,
+        };
+        // The provider total stays authoritative (it may cover a category
+        // this parser does not model) but never below its own components.
+        let derived = match (prompt, completion) {
+            (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+            _ => None,
+        };
+        let total = match (reported, derived) {
+            (Some(reported), Some(derived)) => Some(reported.max(derived)),
+            (reported, derived) => reported.or(derived),
+        };
+        (prompt, completion, total)
+    }
+
+    /// Merge `newer`'s categories into this running state and return `newer`
+    /// with its counters replaced by the fold of the MERGED categories, so a
+    /// cumulative consumer sees the whole billed count even when this update
+    /// restated only some categories. A usage without categories passes
+    /// through unchanged.
+    pub(crate) fn absorb(&mut self, mut newer: AiTokenUsage) -> AiTokenUsage {
+        if newer.categories.family.is_none() {
+            return newer;
+        }
+        self.merge(&newer.categories);
+        let (prompt, completion, total) = self.fold();
+        newer.prompt_tokens = prompt;
+        newer.completion_tokens = completion;
+        newer.total_tokens = total;
+        newer
+    }
 }
 
-/// Fold Gemini's separately reported categories into prompt/completion the
-/// same way the `ai_stream_router` normalizer does: `toolUsePromptTokenCount`
-/// is input-side, `thoughtsTokenCount` is billed output that is NOT part of
-/// `candidatesTokenCount`. `totalTokenCount` (documented as prompt + tool-use
-/// prompt + thoughts + candidates) stays authoritative but never below the
-/// folded components. proto3 JSON omits zero-valued counters, so an omitted
-/// category is zero when a sibling on the same side was reported.
-pub(crate) fn gemini_usage_counts(usage: Option<&Value>) -> GeminiUsageCounts {
-    let side = |base: Option<u64>, extra: Option<u64>| match (base, extra) {
-        (None, None) => None,
-        (base, extra) => Some(base.unwrap_or(0).saturating_add(extra.unwrap_or(0))),
-    };
-    let prompt = side(
-        usage_count(usage, "promptTokenCount"),
-        usage_count(usage, "toolUsePromptTokenCount"),
-    );
-    let completion = side(
-        usage_count(usage, "candidatesTokenCount"),
-        usage_count(usage, "thoughtsTokenCount"),
-    );
-    GeminiUsageCounts {
-        prompt,
-        completion,
-        total: authoritative_total(usage_count(usage, "totalTokenCount"), prompt, completion),
+impl AiTokenUsage {
+    fn apply_categories(&mut self, categories: UsageCategories) {
+        let (prompt, completion, total) = categories.fold();
+        self.prompt_tokens = prompt;
+        self.completion_tokens = completion;
+        self.total_tokens = total;
+        self.categories = categories;
     }
 }
 
