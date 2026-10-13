@@ -2089,6 +2089,12 @@ fn test_unique_consumer_auth_credentials_rejects_basicauth_and_mtls_collisions()
     assert_eq!(errors.len(), 2);
     assert!(errors.iter().any(|error| error.contains("basicauth")));
     assert!(errors.iter().any(|error| error.contains("mtls_auth")));
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("shared-user") && !error.contains("client.example.com")),
+        "diagnostics must not carry credential values: {errors:?}"
+    );
 }
 
 #[test]

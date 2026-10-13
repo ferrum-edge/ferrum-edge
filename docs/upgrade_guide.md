@@ -30,8 +30,11 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ### Shared consumer credentials are refused (#6572)
 
-A configuration in which two consumers of one namespace share a `keyauth` key,
-a `basicauth` username, or an exact `mtls_auth` identity is now refused by
+Consumers whose `id`, `username` or `custom_id` collide are still quarantined
+as before: the later consumer is left out of the snapshot. Among the remaining
+consumers, a configuration in which two consumers of one namespace share a
+`keyauth` key, a `basicauth` username, or an exact `mtls_auth` identity is now
+refused by
 database full loads, control planes, data planes, and incremental applies; the
 previous configuration stays live on a running gateway. The Admin API already
 refused to create such collisions, so only rows written out of band or before

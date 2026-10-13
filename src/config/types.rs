@@ -5006,7 +5006,8 @@ impl GatewayConfig {
     /// write-time validation block new collisions; this covers pre-existing
     /// or out-of-band rows. Repeated values inside one Consumer (rotation
     /// entries) are allowed, and the same value may be reused in another
-    /// namespace. Messages never contain an API key.
+    /// namespace. Messages name only consumer ids and the namespace, never
+    /// the key, username, or identity value.
     pub fn validate_unique_consumer_auth_credentials(&self) -> Result<(), Vec<String>> {
         let mut keyauth: HashMap<(&str, &str), &str> = HashMap::new();
         let mut basicauth: HashMap<(&str, &str), &str> = HashMap::new();
@@ -5033,9 +5034,9 @@ impl GatewayConfig {
                 && owner != id
             {
                 errors.push(format!(
-                    "Consumer {:?} shares basicauth username {:?} with consumer {:?} in \
+                    "Consumer {:?} shares its basicauth username with consumer {:?} in \
                      namespace {:?}",
-                    id, consumer.username, owner, namespace
+                    id, owner, namespace
                 ));
             }
             for entry in consumer.credential_entries("mtls_auth") {
@@ -5044,9 +5045,9 @@ impl GatewayConfig {
                     && owner != id
                 {
                     errors.push(format!(
-                        "Consumer {:?} shares mtls_auth identity {:?} with consumer {:?} in \
+                        "Consumer {:?} shares an mtls_auth identity with consumer {:?} in \
                          namespace {:?}",
-                        id, identity, owner, namespace
+                        id, owner, namespace
                     ));
                 }
             }
