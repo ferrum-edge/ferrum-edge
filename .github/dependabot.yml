@@ -26,6 +26,13 @@ updates:
       - dependency-name: "hyper"
       - dependency-name: "hyper-util"
       - dependency-name: "h2"
+      # `Cargo.toml` caps mongodb below 3.9: 3.9 raised the driver's minimum
+      # wire version to 9 (MongoDB 4.4), dropping MongoDB 4.2 / Cosmos DB
+      # server-version-4.2 support. Without this entry the grouped update
+      # widens the cap to `<3.10`.
+      - dependency-name: "mongodb"
+        versions:
+          - ">= 3.9"
     groups:
       # One weekly PR per directory for every compatible update; a
       # semver-major update gets its own PR and a maintainer.
