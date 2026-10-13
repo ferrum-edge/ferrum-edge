@@ -39,7 +39,8 @@ route-local `client_cert_path`, `client_key_path` and `server_ca_cert_path`
 under `rules[].destination.backend_tls` in `mesh_route_dispatch` plugin
 configs, the `udp_logging` `dtls_cert_path`, `dtls_key_path` and
 `dtls_ca_cert_path` fields, and the `kafka_logging` `ssl_certificate_location`,
-`ssl_key_location` and `ssl_ca_location` fields. Anything else is refused with `400` before it is
+`ssl_key_location` and `ssl_ca_location` fields (librdkafka reads these as
+local filenames, so such operators cannot introduce them at all). Anything else is refused with `400` before it is
 loaded.
 
 Values already stored in the same field (for `mesh_route_dispatch`, the same

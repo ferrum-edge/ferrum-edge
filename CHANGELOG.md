@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configs, the `udp_logging` DTLS fields (`dtls_cert_path`, `dtls_key_path`,
   `dtls_ca_cert_path`) and the `kafka_logging` SSL fields
   (`ssl_certificate_location`, `ssl_key_location`, `ssl_ca_location`), which
-  the gateway also loads with its own credentials. A value already stored in the same
+  the gateway also loads with its own credentials. librdkafka reads the Kafka
+  fields as local filenames, so such operators cannot introduce them at all;
+  set them with an `admin` token. A value already stored in the same
   field (same rule index for `mesh_route_dispatch`) stays admitted, and
   `admin` tokens are unaffected.
 - **Tenant DestinationRule TLS files stay confined after admission** (PR
@@ -38,7 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself unreadable, the whole backend TLS surface stays on its last-good
   generation, and a tenant refusal is applied on the first poll after that
   source recovers. A refusal whose rebuild fails is retried on every poll
-  until a rebuild succeeds. A refused tenant file no longer stalls rotation of
+  until a rebuild succeeds. The refusal confines a tenant to its own
+  namespace: a backend TLS cache that was filled while the tenant's file was
+  still valid keeps that tenant's own previously admitted material until the
+  next rebuild. A refused tenant file no longer stalls rotation of
   unrelated backend TLS sources. Files named only in per-port
   (`portLevelSettings`) or per-subset TLS overrides are now watched for
   rotation too.
