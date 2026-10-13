@@ -198,6 +198,12 @@ const EXTERNAL_OPERATION_TOMBSTONE_PUBLICATION_KEY: &str =
 const REDIS_ADMISSION_ATTEMPTS: usize = 3;
 const DEFAULT_INSTANCE_ID: &str = "standalone";
 const DEFAULT_MAX_ENTRY_SIZE_BYTES: usize = 1024 * 1024;
+/// Allowance on top of `max_entry_size_bytes` for the Redis record envelope
+/// (version, state, fingerprint, owner token and field names) that wraps an
+/// admitted replay payload. The payload itself is capped at
+/// `max_entry_size_bytes`, so this keeps every record this instance writes
+/// inside the bound its own reads apply.
+const REDIS_RECORD_ENVELOPE_BYTES: usize = 4 * 1024;
 const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CANONICAL_DECODED_BODY_BYTES: usize = 1024 * 1024;
 const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
@@ -306,7 +312,7 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
 
 use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::{is_per_request_trace_header, sanitize_cached_headers};
-use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+use super::utils::redis_rate_limiter::{BoundedRedisValue, RedisConfig, RedisRateLimitClient};
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePolicyProvenance};
 
@@ -1916,6 +1922,13 @@ impl RequestDeduplication {
         }
     }
 
+    /// Largest Redis record this instance will read: an admitted replay
+    /// payload (at most `max_entry_size_bytes`) plus the record envelope.
+    fn redis_record_read_cap(&self) -> usize {
+        self.max_entry_size_bytes
+            .saturating_add(REDIS_RECORD_ENVELOPE_BYTES)
+    }
+
     /// Read and classify the single operation record for a logical key.
     ///
     /// Ownership and completion share one Redis key so that publishing a result
@@ -1928,9 +1941,19 @@ impl RequestDeduplication {
         redis: &RedisRateLimitClient,
         redis_key: &str,
     ) -> RedisRecordState {
-        let data = match redis.get_bytes(redis_key).await {
-            Ok(Some(data)) => data,
-            Ok(None) => return RedisRecordState::Absent,
+        // Bounded read (issue #6622): one oversized value under the key must
+        // not force an unbounded allocation. A record larger than any record
+        // this configuration writes is not a valid record, so it fails closed
+        // as a conflict exactly like an unparseable one.
+        let data = match redis
+            .get_bytes_bounded(redis_key, self.redis_record_read_cap())
+            .await
+        {
+            Ok(BoundedRedisValue::Found(data)) => data,
+            Ok(BoundedRedisValue::Missing) => return RedisRecordState::Absent,
+            Ok(BoundedRedisValue::Empty | BoundedRedisValue::Oversized { .. }) => {
+                return RedisRecordState::Unreadable;
+            }
             Err(()) => return RedisRecordState::Unavailable,
         };
 
@@ -2121,7 +2144,22 @@ impl RequestDeduplication {
                 RedisPayloadAdmission::Rejected => None,
             }
         });
-        let replayable = replay.is_some();
+        let mut record = SerializableDedupRecord::completed(fingerprint, replay);
+        let Ok(mut record_bytes) = serde_json::to_vec(&record) else {
+            return RedisPublication::Unavailable;
+        };
+        // Peers bound their record read at `redis_record_read_cap()`. A record
+        // they would refuse must never be published as a replay; degrade it to
+        // the non-replayable completion tombstone instead. Unreachable while
+        // the envelope stays within `REDIS_RECORD_ENVELOPE_BYTES`.
+        if record.replay.is_some() && record_bytes.len() > self.redis_record_read_cap() {
+            record.replay = None;
+            let Ok(tombstone) = serde_json::to_vec(&record) else {
+                return RedisPublication::Unavailable;
+            };
+            record_bytes = tombstone;
+        }
+        let replayable = record.replay.is_some();
         // A record with no replay payload, and the fixed external-operation
         // tombstone, exist only to refuse re-execution. Publishing either for
         // `ttl_seconds` when `inflight_ttl_seconds` is longer would free the key
@@ -2130,10 +2168,6 @@ impl RequestDeduplication {
             self.ttl
         } else {
             self.execution_barrier_retention()
-        };
-        let record = SerializableDedupRecord::completed(fingerprint, replay);
-        let Ok(record_bytes) = serde_json::to_vec(&record) else {
-            return RedisPublication::Unavailable;
         };
 
         let redis_key = redis.make_key(&[key]);

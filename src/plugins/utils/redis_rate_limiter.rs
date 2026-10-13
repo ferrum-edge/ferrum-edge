@@ -1646,6 +1646,15 @@ fn push_slot_tag_component(key: &mut String, value: &str) {
 /// returning an unscreened address. Shared by the hot-path connect (`resolve_url`)
 /// AND the background recovery checker so neither can hand an unscreened host to
 /// the Redis crate's own resolver.
+///
+/// `dns_cache: None` skips the hostname screen. Only clients built from a
+/// `PluginHttpClient` without a gateway DNS cache take that branch: config
+/// validation (which constructs plugins but never dials Redis) and tests.
+/// Every serving runtime builds its plugin clients with the shared cache.
+/// Literal-IP endpoints are additionally screened at config admission
+/// (`screen_redis_endpoint_egress`). The remaining `rediss://` hostname
+/// rebinding window is the accepted limitation documented on
+/// `RedisConfig::url_with_resolved_ip`.
 async fn screen_redis_endpoint(
     config: &RedisConfig,
     dns_cache: Option<&DnsCache>,
@@ -2637,7 +2646,7 @@ impl ConnectionPool {
 }
 
 /// Outcome of a size-bounded Redis fetch ([`RedisRateLimitClient::get_bytes_bounded`]).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BoundedRedisValue {
     /// Key is absent.
     Missing,
@@ -2676,6 +2685,31 @@ pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrange
         return Err(RedisGetrangeEndIndexError::ZeroCap);
     }
     isize::try_from(max_bytes).map_err(|_| RedisGetrangeEndIndexError::Overflow)
+}
+
+/// `GETRANGE` bound for comparing a stored value against `expected` without
+/// downloading the stored value: read `0..=end` (at most `expected.len() + 1`
+/// bytes) next to `EXISTS` and `STRLEN`, and match only when the key exists,
+/// its true length equals `expected.len()`, and the prefix equals `expected`.
+struct BoundedCompare {
+    end: isize,
+    max_prefix: usize,
+}
+
+impl BoundedCompare {
+    fn for_expected(expected: &[u8]) -> Result<Self, ()> {
+        // An empty operand still reads one byte: a missing key is not an empty
+        // string, and a one-byte value must not match it.
+        let end = if expected.is_empty() {
+            0
+        } else {
+            redis_getrange_end_index(expected.len()).map_err(|_| ())?
+        };
+        Ok(Self {
+            end,
+            max_prefix: expected.len().checked_add(1).ok_or(())?,
+        })
+    }
 }
 
 /// A Redis-backed limiter/store client shared across plugin instances.
@@ -5263,12 +5297,18 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Get a raw byte value from Redis.
+    /// Unbounded `GET` of a raw byte value. **Test support only.**
     ///
-    /// Used by plugins that need arbitrary key-value storage (e.g., request
-    /// deduplication, AI semantic cache) rather than rate limiting counters.
-    #[allow(clippy::result_unit_err)]
-    pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, ()> {
+    /// A plain `GET` allocates the whole stored value whatever its size, so a
+    /// single oversized value under a consumed key would force an unbounded
+    /// allocation in the gateway (issue #6622). Production reads use
+    /// [`Self::get_bytes_bounded`]; the compare primitives below bound their
+    /// reads the same way. This stays only so connection-screening tests can
+    /// drive one ordinary command through a scripted fake server, and a source
+    /// guard in `redis_rate_limiter_tests` keeps it out of production code.
+    #[doc(hidden)]
+    #[allow(clippy::result_unit_err, dead_code)]
+    pub async fn get_bytes_unbounded_for_test(&self, key: &str) -> Result<Option<Vec<u8>>, ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
         let result: Result<Option<Vec<u8>>, redis::RedisError> =
@@ -5461,7 +5501,10 @@ impl RedisRateLimitClient {
     /// Set a raw byte value only if the key does not already exist, with a TTL.
     ///
     /// Returns `Ok(true)` when the caller acquired the key, `Ok(false)` when an
-    /// existing key prevented the write, and `Err(())` when Redis is unavailable.
+    /// existing key prevented the write, and `Err(())` when Redis is unavailable
+    /// or the reply is neither exactly `OK` nor nil. Any other string proves
+    /// nothing about whether the key was stored, so it fails closed exactly like
+    /// [`Self::set_bytes_nx_with_expire_bounded`].
     #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_nx_with_expire(
         &self,
@@ -5481,10 +5524,23 @@ impl RedisRateLimitClient {
             .await;
 
         match result {
-            Ok(value) => {
-                self.note_command_success()?;
-                Ok(value.is_some())
-            }
+            Ok(value) => match classify_replay_set_nx_reply(value.as_deref()) {
+                Ok(acquired) => {
+                    self.note_command_success()?;
+                    Ok(acquired)
+                }
+                Err(ReplaySetNxReplyError::InvalidClaimReply) => {
+                    // Never render the server-controlled reply.
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "SET NX EX",
+                        classification = "malformed_response",
+                        "Redis SET NX returned a reply other than OK or nil"
+                    );
+                    self.mark_unavailable();
+                    Err(())
+                }
+            },
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
@@ -5616,10 +5672,17 @@ impl RedisRateLimitClient {
     /// command nor silently dropped by a transparent reconnect. `MULTI` is sent
     /// on its own and the `DEL` must be acknowledged `QUEUED` before `EXEC`
     /// (`exec_watched_write`), so an ACL that denies `MULTI` cannot let
-    /// the delete run outside the transaction. Any I/O failure at `WATCH`,
-    /// `GET`, `UNWATCH`, `MULTI`, `DEL`, or `EXEC` fails closed as `Err(())`.
+    /// the delete run outside the transaction. The compare never downloads the
+    /// stored value: `EXISTS`, `STRLEN` and `GETRANGE` transfer at most
+    /// `expected.len() + 1` bytes, so an oversized value under the key cannot
+    /// force an unbounded allocation (issue #6622). Any I/O failure at `WATCH`,
+    /// the compare, `UNWATCH`, `MULTI`, `DEL`, or `EXEC` fails closed as
+    /// `Err(())`.
     #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
+        // Derive the bounded read before dialing so an unrepresentable bound
+        // fails closed without sending a command.
+        let compare = BoundedCompare::for_expected(expected)?;
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
@@ -5636,10 +5699,34 @@ impl RedisRateLimitClient {
             return Err(());
         }
 
-        let current: Result<Option<Vec<u8>>, redis::RedisError> =
-            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        // Bounded compare: transfer at most `expected.len() + 1` bytes however
+        // large the stored value is (issue #6622). Rewrites between these reads
+        // only cause a mismatch or abort the watched EXEC.
+        let current: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(compare.end)
+            .query_async(&mut conn)
+            .await;
         match current {
-            Ok(Some(current)) if current == expected => {}
+            Ok((_, _, prefix)) if prefix.len() > compare.max_prefix => {
+                // A nonconforming reply is protocol uncertainty, never a match.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare EXISTS+STRLEN+GETRANGE",
+                    classification = "malformed_response",
+                    "Redis bounded compare returned more bytes than requested"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+            Ok((exists, length, prefix))
+                if exists == 1 && length == expected.len() && prefix == expected => {}
             Ok(_) => {
                 let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
@@ -5659,7 +5746,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "compare-delete GET",
+                    operation = "compare-delete EXISTS+STRLEN+GETRANGE",
                     error = %e,
                     "Redis command failed"
                 );
@@ -6375,9 +6462,11 @@ impl RedisRateLimitClient {
     ///
     /// `MULTI` is sent on its own and the `SET` must be acknowledged `QUEUED`
     /// before `EXEC` (`exec_watched_write`), so an ACL that denies
-    /// `MULTI` cannot let the write run outside the transaction. Any I/O
-    /// failure at `WATCH`, `GET`, `UNWATCH`, `MULTI`, `SET`, or `EXEC` fails
-    /// closed; a partial transaction is never retried on a fresh connection.
+    /// `MULTI` cannot let the write run outside the transaction. The compare is
+    /// the same bounded `EXISTS`/`STRLEN`/`GETRANGE` read as
+    /// [`Self::delete_if_value_matches`]. Any I/O failure at `WATCH`, the
+    /// compare, `UNWATCH`, `MULTI`, `SET`, or `EXEC` fails closed; a partial
+    /// transaction is never retried on a fresh connection.
     #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_with_expire_if_value_matches(
         &self,
@@ -6386,6 +6475,9 @@ impl RedisRateLimitClient {
         value: &[u8],
         ttl_seconds: u64,
     ) -> Result<bool, ()> {
+        // Derive the bounded read before dialing so an unrepresentable bound
+        // fails closed without sending a command.
+        let compare = BoundedCompare::for_expected(expected)?;
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
@@ -6402,10 +6494,34 @@ impl RedisRateLimitClient {
             return Err(());
         }
 
-        let current: Result<Option<Vec<u8>>, redis::RedisError> =
-            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        // Bounded compare: transfer at most `expected.len() + 1` bytes however
+        // large the stored value is (issue #6622). Rewrites between these reads
+        // only cause a mismatch or abort the watched EXEC.
+        let current: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(compare.end)
+            .query_async(&mut conn)
+            .await;
         match current {
-            Ok(Some(current)) if current == expected => {}
+            Ok((_, _, prefix)) if prefix.len() > compare.max_prefix => {
+                // A nonconforming reply is protocol uncertainty, never a match.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare EXISTS+STRLEN+GETRANGE",
+                    classification = "malformed_response",
+                    "Redis bounded compare returned more bytes than requested"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+            Ok((exists, length, prefix))
+                if exists == 1 && length == expected.len() && prefix == expected => {}
             Ok(_) => {
                 let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
@@ -6425,7 +6541,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "compare-and-set GET",
+                    operation = "compare-and-set EXISTS+STRLEN+GETRANGE",
                     error = %e,
                     "Redis command failed"
                 );
@@ -6573,6 +6689,12 @@ impl RedisRateLimitClient {
     ///
     /// For keys that participate in a multi-key atomic operation use
     /// [`Self::make_slot_key`] instead so they share a hash slot.
+    ///
+    /// Components are joined with `:` WITHOUT escaping, so the layout is only
+    /// injective when no component can carry a caller-controlled `:`. Every
+    /// caller passes fixed literals, lowercase hex digests, or a versioned
+    /// digest such as `v6:<hex>`. Never pass raw request input here: hash it
+    /// first, or use [`Self::make_slot_key`], which escapes its tag components.
     pub fn make_key(&self, components: &[&str]) -> String {
         let mut key = self.config.key_prefix.clone();
         for component in components {

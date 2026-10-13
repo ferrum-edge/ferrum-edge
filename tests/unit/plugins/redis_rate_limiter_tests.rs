@@ -5996,28 +5996,92 @@ fn quarantine_topology_screen_failure_retains_availability_but_cluster_is_termin
     assert!(source.contains("screen_and_arm(&mutconn,purpose)"));
 }
 
-/// Deduplication ownership release keeps its released command profile; only
-/// semantic quarantine may opt into the separate bounded comparison.
+/// The general `SET NX EX` claim (deduplication acquisition, SOAP nonce
+/// claims) accepts only an exact `OK`; any other string fails closed instead of
+/// being read as an acquisition (issue #6622).
 #[test]
-fn ownership_release_retains_get_without_semantic_read_acl_requirements() {
+fn general_set_nx_claim_requires_an_exact_ok_reply() {
     let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
-    let ownership = source
+    let claim = source
+        .split_once("pub async fn set_bytes_nx_with_expire(")
+        .and_then(|(_, rest)| rest.split_once("pub async fn set_bytes_nx_with_expire_bounded("))
+        .map(|(body, _)| body)
+        .expect("general SET NX claim helper");
+    assert!(claim.contains("classify_replay_set_nx_reply(value.as_deref())"));
+    assert!(claim.contains("ReplaySetNxReplyError::InvalidClaimReply"));
+    assert!(claim.contains("self.mark_unavailable();"));
+    assert!(!claim.contains("value.is_some()"));
+}
+
+/// Ownership compare primitives never download the stored value (issue #6622):
+/// the compare transfers at most `expected.len() + 1` bytes through
+/// `EXISTS`/`STRLEN`/`GETRANGE`, and no production path reads a record with an
+/// unbounded `GET`.
+#[test]
+fn ownership_compare_primitives_never_download_the_stored_value() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let release = source
         .split_once("pub async fn delete_if_value_matches(")
         .and_then(|(_, rest)| rest.split_once("pub async fn delete_if_value_matches_bounded("))
         .map(|(body, _)| body)
         .expect("separate ownership and bounded quarantine helpers");
-    for command in ["WATCH", "GET", "UNWATCH"] {
-        assert!(ownership.contains(&format!("redis::cmd(\"{command}\")")));
+    let publish = source
+        .split_once("pub async fn set_bytes_with_expire_if_value_matches(")
+        .and_then(|(_, rest)| rest.split_once("pub fn make_slot_key("))
+        .map(|(body, _)| body)
+        .expect("fenced publication helper");
+    for (name, body) in [("release", release), ("publish", publish)] {
+        assert!(
+            body.contains("BoundedCompare::for_expected(expected)?"),
+            "{name}"
+        );
+        for command in ["WATCH", "UNWATCH"] {
+            assert!(
+                body.contains(&format!("redis::cmd(\"{command}\")")),
+                "{name}"
+            );
+        }
+        for command in ["EXISTS", "STRLEN", "GETRANGE"] {
+            assert!(body.contains(&format!(".cmd(\"{command}\")")), "{name}");
+        }
+        assert!(
+            !body.contains("cmd(\"GET\")"),
+            "{name} must not GET the record"
+        );
+        // The write is queued inside an explicit MULTI, never pipelined with it.
+        assert!(!body.contains(".atomic()"), "{name}");
+        assert!(body.contains("exec_watched_write("), "{name}");
     }
-    // The DEL is queued inside an explicit MULTI, never pipelined with it.
-    assert!(!ownership.contains(".atomic()"));
-    assert!(ownership.contains("exec_watched_write("));
-    for command in ["EXISTS", "STRLEN", "GETRANGE"] {
-        assert!(!ownership.contains(&format!("cmd(\"{command}\")")));
-    }
+
     let dedup = include_str!("../../../src/plugins/request_deduplication.rs");
     assert!(dedup.contains(".delete_if_value_matches(&redis_key, &ownership.record)"));
+    assert!(dedup.contains(".get_bytes_bounded(redis_key, self.redis_record_read_cap())"));
     assert!(!dedup.contains("delete_if_value_matches_bounded"));
+
+    // The unbounded GET survives only as test support for scripted fake
+    // servers; no production source may call it.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![src];
+    let mut callers = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read source");
+                let uses = text.matches("get_bytes_unbounded_for_test(").count()
+                    - text.matches("fn get_bytes_unbounded_for_test(").count();
+                if uses > 0 {
+                    callers.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        callers.is_empty(),
+        "production code must use get_bytes_bounded: {callers:?}"
+    );
 
     let classification = source
         .split_once("fn note_quarantine_command_failure(")
@@ -7120,7 +7184,9 @@ async fn a_server_without_a_cluster_enabled_field_still_serves_policy_operations
     let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
     let client = screened_client(server.port, 5);
 
-    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let served = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert_eq!(
         served,
         Ok(None),
@@ -7141,7 +7207,9 @@ async fn an_unsupported_info_command_error_keeps_the_endpoint_usable() {
     let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
     let client = screened_client(server.port, 5);
 
-    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let served = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert_eq!(
         served,
         Ok(None),
@@ -7161,7 +7229,9 @@ async fn a_cluster_wire_error_on_the_info_probe_is_terminal() {
     let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
     let client = screened_client(server.port, 5);
 
-    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert!(
         refused.is_err(),
         "a Cluster endpoint must not serve a policy operation"
@@ -7192,7 +7262,9 @@ async fn an_endpoint_that_never_answers_info_fails_closed_within_the_connect_tim
     let client = screened_client(server.port, 1);
 
     let started = std::time::Instant::now();
-    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     let elapsed = started.elapsed();
     assert!(
         refused.is_err(),
@@ -7231,7 +7303,9 @@ async fn a_slow_info_screen_still_fits_the_configured_probe_deadline() {
     let server = spawn_screened_redis_server(info, slow_screen, Duration::ZERO).await;
     let client = screened_client(server.port, 2);
 
-    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let served = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert_eq!(
         served,
         Ok(None),
@@ -7259,7 +7333,9 @@ async fn an_info_screen_slower_than_the_configured_deadline_fails_closed() {
     let server = spawn_screened_redis_server(info, over_deadline, Duration::ZERO).await;
     let client = screened_client(server.port, 1);
 
-    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+        .await;
     assert!(
         refused.is_err(),
         "a screen that misses its deadline must fail closed"
@@ -7292,7 +7368,9 @@ async fn a_screened_connection_still_bounds_ordinary_command_replies() {
     let client = screened_client(server.port, 60);
 
     let started = std::time::Instant::now();
-    let refused = client.get_bytes("{ferrum%3Atest:stalled}").await;
+    let refused = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:stalled}")
+        .await;
     let elapsed = started.elapsed();
     assert!(
         refused.is_err(),
@@ -7320,13 +7398,15 @@ async fn a_command_completing_after_a_topology_rejection_fails_closed() {
 
     // Control: this fake really does answer the command successfully, so the
     // failure asserted below is attributable to the rejection alone.
-    let control = client.get_bytes("{ferrum%3Atest:control}").await;
+    let control = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:control}")
+        .await;
     assert_eq!(control, Ok(None));
     assert!(client.is_available());
 
     let racer = Arc::clone(&client);
     let raced_key = "{ferrum%3Atest:raced}";
-    let inflight = tokio::spawn(async move { racer.get_bytes(raced_key).await });
+    let inflight = tokio::spawn(async move { racer.get_bytes_unbounded_for_test(raced_key).await });
     // The server now holds the racing GET's reply.
     wait_for_count(&server.gets, 2, "racing GET").await;
     client.mark_topology_unsupported_for_test();
@@ -7347,7 +7427,9 @@ async fn a_command_completing_after_a_topology_rejection_fails_closed() {
 
     // Later operations, and the redials they would trigger, stay disabled.
     let dials = server.accepts.load(Ordering::Relaxed);
-    let after = client.get_bytes("{ferrum%3Atest:after}").await;
+    let after = client
+        .get_bytes_unbounded_for_test("{ferrum%3Atest:after}")
+        .await;
     assert!(after.is_err());
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),
@@ -8416,7 +8498,12 @@ async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
     let client = screened_client(server.port, 5);
 
     // First operation establishes and screens exactly one physical connection.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Ok(None)
+    );
     assert_eq!(server.accepts.load(Ordering::Relaxed), 1);
     assert_eq!(server.infos.load(Ordering::Relaxed), 1);
     assert_eq!(client.cached_pool_cardinality_for_test(), 1);
@@ -8424,7 +8511,9 @@ async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
     // Second operation hits the server's disconnect. It must FAIL (not silently
     // ride a redis-rs reconnect) and must drop the cached slot.
     assert_eq!(
-        client.get_bytes("{ferrum%3Atest:probe}").await,
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
         Err(()),
         "a disconnected pooled connection must fail the operation, not auto-reconnect"
     );
@@ -8440,7 +8529,12 @@ async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
     );
 
     // Third operation re-establishes — through the full screened path.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Ok(None)
+    );
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),
         2,
@@ -8472,18 +8566,33 @@ async fn cluster_topology_appearing_after_a_disconnect_is_caught_by_the_rescreen
     let client = screened_client(server.port, 5);
 
     // Screened clean, serving normally.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Ok(None)
+    );
     assert!(!client.is_topology_unsupported());
 
     // Disconnect fails the in-flight operation and clears the pool.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Err(())
+    );
     assert!(
         !client.is_topology_unsupported(),
         "an ordinary disconnect is an outage, never proof of Cluster topology"
     );
 
     // The reconnect re-screens and now sees cluster_enabled:1 — terminal refusal.
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Err(())
+    );
     assert!(
         client.is_topology_unsupported(),
         "the post-disconnect re-screen must catch a Cluster endpoint"
@@ -8493,7 +8602,12 @@ async fn cluster_topology_appearing_after_a_disconnect_is_caught_by_the_rescreen
 
     // Terminal: no further dialling of the refused endpoint.
     let accepts_at_rejection = server.accepts.load(Ordering::Relaxed);
-    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        client
+            .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+            .await,
+        Err(())
+    );
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),
         accepts_at_rejection,
@@ -8526,7 +8640,12 @@ async fn every_pool_slot_is_screened_and_the_pool_stays_bounded() {
 
     // Many more operations than slots must reuse the bounded pool, not dial.
     for _ in 0..12 {
-        assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+        assert_eq!(
+            client
+                .get_bytes_unbounded_for_test("{ferrum%3Atest:probe}")
+                .await,
+            Ok(None)
+        );
     }
     assert_eq!(
         server.accepts.load(Ordering::Relaxed),

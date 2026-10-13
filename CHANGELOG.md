@@ -152,6 +152,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Redis-backed plugins no longer download Redis values unbounded**
+  (issue #6622). `request_deduplication` read its operation record with a
+  plain `GET`, and its ownership compare-and-delete and compare-and-set
+  compared against a full `GET` of the stored value, so one oversized value
+  under a consumed key forced an allocation of that size. Records are now read
+  with `EXISTS`/`STRLEN`/`GETRANGE`, capped at `max_entry_size_bytes` plus a
+  4 KiB envelope. An over-cap or empty record is a fail-closed 409 conflict.
+  The ownership compares transfer at most the owner record's length plus one
+  byte. **Redis ACLs for `request_deduplication` must now allow `EXISTS`,
+  `STRLEN`, and `GETRANGE`.** The unbounded `get_bytes` primitive is no longer
+  available to production code. The shared `set_bytes_nx_with_expire`
+  (`request_deduplication` acquisition, `soap_ws_security` nonce claims) now
+  requires an exact `OK` reply and fails closed on any other string, like the
+  replay-authority claim already did.
+
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
   fuzz lane compiled the stock registry crate instead of the patched DB-TLS
