@@ -11901,10 +11901,10 @@ async fn ai_transcript_audit_schema_matches_runtime_admission_contract() {
             "methods": {"/test.Greeter/SayHello": method}
         })
     };
-    // 8 code points, 16 UTF-8 bytes: admitted under a byte-counted minimum,
+    // 16 code points, 32 UTF-8 bytes: admitted under a byte-counted minimum,
     // refused under the character-counted one the schema and the constructor
     // now agree on.
-    let short_multibyte_secret = "\u{00e9}".repeat(8);
+    let short_multibyte_secret = "\u{00e9}".repeat(16);
 
     let cases: Vec<(&str, serde_json::Value, bool)> = vec![
         // ---- null keeps the documented default for every fixed scalar ----
@@ -12127,15 +12127,15 @@ async fn ai_transcript_audit_schema_matches_runtime_admission_contract() {
         ),
         // ---- the hash_secret minimum is counted in CHARACTERS ----
         (
-            "hash_secret of 16 characters",
+            "hash_secret of 32 characters",
             json!({
-                "redaction": {"hash_secret": "fleet-stable-key"},
+                "redaction": {"hash_secret": "fleet-stable-key-0123456789abcdef"},
                 "sink": sink(json!({}))
             }),
             true,
         ),
         (
-            "hash_secret of 8 characters / 16 bytes",
+            "hash_secret of 16 characters / 32 bytes",
             json!({
                 "redaction": {"hash_secret": short_multibyte_secret},
                 "sink": sink(json!({}))

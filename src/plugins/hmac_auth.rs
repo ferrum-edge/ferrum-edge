@@ -122,6 +122,10 @@ const HMAC_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const HMAC_SIGNING_VERSION_V1: &str = "ferrum-hmac-v1";
 const HMAC_SIGNING_VERSION_V2: &str = "ferrum-hmac-v2";
 
+/// Key for the discarded MAC computed when a request names an unknown HMAC
+/// username. Its value never matters; only the work it costs does.
+const UNKNOWN_IDENTITY_HMAC_SECRET: [u8; 32] = [0u8; 32];
+
 /// Widest admissible `clock_skew_seconds`.
 ///
 /// Bounded because the fixed replay retention horizon must dominate the widest
@@ -1362,14 +1366,23 @@ impl HmacAuth {
             .decode(&credential.signature)
             .ok()
             .filter(|signature| signature.len() == expected_signature_len)?;
-        let consumer =
-            consumer_index.find_hmac_by_identity(&credential.namespace, &credential.username)?;
-        let hmac_entries = consumer.credential_entries("hmac_auth");
-        if hmac_entries.is_empty() {
-            return None;
-        }
-
         let signing_string = build_signing_string(credential, self.profile);
+        let consumer = consumer_index
+            .find_hmac_by_identity(&credential.namespace, &credential.username)
+            .filter(|consumer| !consumer.credential_entries("hmac_auth").is_empty());
+        let Some(consumer) = consumer else {
+            // An unknown username (or one with no HMAC secret) still pays for
+            // one MAC over the same signing string, so response timing does
+            // not reveal which usernames exist. The result is discarded.
+            std::hint::black_box(Self::hmac_matches(
+                &UNKNOWN_IDENTITY_HMAC_SECRET,
+                signing_string.as_bytes(),
+                &credential.algorithm,
+                &expected_signature,
+            ));
+            return None;
+        };
+        let hmac_entries = consumer.credential_entries("hmac_auth");
         hmac_entries
             .iter()
             .any(|hmac_cred| {

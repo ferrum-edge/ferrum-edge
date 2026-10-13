@@ -1058,9 +1058,7 @@ fn parse_endpoint(
     let parse_src = endpoint.replace("{model}", "__FERRUM_MODEL__");
 
     let parsed = Url::parse(&parse_src).map_err(|_| {
-        format!(
-            "ai_stream_router: provider {provider_name:?} invalid `endpoint` {endpoint:?}: invalid URL"
-        )
+        format!("ai_stream_router: provider {provider_name:?} invalid `endpoint`: invalid URL")
     })?;
 
     let scheme = match parsed.scheme() {
@@ -1086,7 +1084,7 @@ fn parse_endpoint(
         Some(Host::Ipv6(h)) => (h.to_string(), true),
         _ => {
             return Err(format!(
-                "ai_stream_router: provider {provider_name:?} `endpoint` {endpoint:?} has no host"
+                "ai_stream_router: provider {provider_name:?} `endpoint` has no host"
             ));
         }
     };
@@ -1110,7 +1108,7 @@ fn parse_endpoint(
     // (issue #5302).
     if parsed.port() == Some(0) {
         return Err(format!(
-            "ai_stream_router: provider {provider_name:?} `endpoint` {endpoint:?} must not use port 0; port 0 disables a listener and cannot be dialed as a provider destination"
+            "ai_stream_router: provider {provider_name:?} `endpoint` must not use port 0; port 0 disables a listener and cannot be dialed as a provider destination"
         ));
     }
     let port = parsed.port().unwrap_or(default_port);

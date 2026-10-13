@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `ai_transcript_audit` `redaction.hash_secret` must be at least
+  32 characters** (was 16; issue #6617). The key protects small PII value
+  spaces from offline guessing, so it now has the same floor as the OIDC
+  session secret. Shorter values are rejected at construction and by the
+  OpenAPI `minLength`.
+- **Credential and diagnostic hygiene across plugins** (issues #6617, #6628).
+  `hmac_auth` spends one discarded MAC when a request names an unknown
+  username, so timing no longer separates unknown from known users. The
+  `Debug` output of extracted credentials and of AWS SigV4 signing configs
+  redacts tokens, passwords, API keys, secret keys and session tokens.
+  `transaction_debugger` also redacts any header whose name the central
+  metadata classifier treats as credential-shaped. `oidc_relying_party`
+  relays a provider callback `error` only when it is a short token-like code.
+  `compression`, `ai_stream_router` and `spiffe_identity` no longer echo a
+  client header value, a configured endpoint, or a rejected config value in
+  their diagnostics. `mcp_gateway` caps `observability.log_raw_arguments`
+  metadata at 4096 bytes and marks a cut value with `mcp.arguments_truncated`.
+  `api_chargeback` length-prefixes the text fields of its registry key so names
+  containing `|` cannot merge two consumers' charges.
+
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only
