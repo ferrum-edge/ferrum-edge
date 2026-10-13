@@ -352,10 +352,8 @@ impl BodyValidator {
             .is_some_and(|pool| pool.files().any(|file| file.syntax() == Syntax::Proto2));
         let protobuf_reject_unknown_fields =
             optional_bool(config, "protobuf_reject_unknown_fields")?.unwrap_or(false);
-        let grpc_max_decompressed_size_bytes = match optional_usize(
-            config,
-            "grpc_max_decompressed_size_bytes",
-        )? {
+        let configured_grpc_limit = optional_usize(config, "grpc_max_decompressed_size_bytes")?;
+        let grpc_max_decompressed_size_bytes = match configured_grpc_limit {
             Some(0) => {
                 return Err(
                     "body_validator: `grpc_max_decompressed_size_bytes` must be greater than zero"
@@ -961,13 +959,23 @@ fn parse_grpc_frame(
 }
 
 fn default_grpc_max_decompressed_size_bytes() -> usize {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
+    inherited_grpc_max_decompressed_size_bytes(
+        crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
+            .as_deref(),
+    )
+}
+
+/// The omitted-field default resolved from a raw
+/// `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` value. A node-wide request-body setting
+/// above [`MAX_GRPC_DECOMPRESSED_SIZE_CEILING`] is clamped rather than refused,
+/// so it cannot fail every body_validator config on that node, but it can never
+/// lift the decompression bound. Pure, so the clamp is testable without
+/// mutating process environment in a parallel test binary.
+#[doc(hidden)]
+pub fn inherited_grpc_max_decompressed_size_bytes(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE)
-        // A node-wide request-body setting above the ceiling is clamped rather
-        // than refused, so it cannot fail every body_validator config on that
-        // node, but it can never lift the decompression bound.
         .min(MAX_GRPC_DECOMPRESSED_SIZE_CEILING)
 }
 

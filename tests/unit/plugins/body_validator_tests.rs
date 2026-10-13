@@ -6495,3 +6495,31 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+/// Issue #6612 sibling audit: an inherited `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`
+/// above the 64 MiB ceiling cannot lift the gRPC decompression bound.
+#[test]
+fn inherited_grpc_decompression_default_is_clamped_to_the_ceiling() {
+    use ferrum_edge::plugins::body_validator::inherited_grpc_max_decompressed_size_bytes;
+
+    let ceiling = 64 * 1024 * 1024;
+    assert_eq!(
+        inherited_grpc_max_decompressed_size_bytes(Some("134217728")),
+        ceiling
+    );
+    assert_eq!(
+        inherited_grpc_max_decompressed_size_bytes(Some(&u64::MAX.to_string())),
+        ceiling
+    );
+    assert_eq!(
+        inherited_grpc_max_decompressed_size_bytes(Some(" 1048576 ")),
+        1_048_576
+    );
+    // Absent, zero and unparsable values keep the 10 MiB fallback.
+    for raw in [None, Some("0"), Some("lots")] {
+        assert_eq!(
+            inherited_grpc_max_decompressed_size_bytes(raw),
+            10 * 1024 * 1024
+        );
+    }
+}
