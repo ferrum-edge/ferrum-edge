@@ -153,6 +153,59 @@ fn test_verify_request_failure_never_echoes_token_content() {
     }
 }
 
+/// A correctly signed admin token whose `aud` is malformed (null, number,
+/// object, mixed array) or present while no audience is configured is
+/// rejected; jsonwebtoken alone would accept the malformed forms.
+#[test]
+fn test_admin_token_with_malformed_or_unexpected_audience_is_rejected() {
+    let manager = JwtManager::new(test_jwt_config());
+    let now = Utc::now();
+    for aud in [
+        json!(null),
+        json!(123),
+        json!({"service": "other"}),
+        json!(["other", 1]),
+        json!("other-service"),
+    ] {
+        let token = encode_json_claims(
+            json!({
+                "iss": "test-issuer",
+                "sub": "admin-user",
+                "iat": now.timestamp(),
+                "nbf": now.timestamp(),
+                "exp": (now + Duration::seconds(600)).timestamp(),
+                "jti": uuid::Uuid::new_v4().to_string(),
+                "role": "admin",
+                "aud": aud
+            }),
+            "test-secret",
+            Algorithm::HS256,
+        );
+        assert!(
+            manager.verify_token(&token).is_err(),
+            "aud {aud} must be rejected"
+        );
+    }
+
+    let token = encode_json_claims(
+        json!({
+            "iss": "test-issuer",
+            "sub": "admin-user",
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + Duration::seconds(600)).timestamp(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "role": "admin"
+        }),
+        "test-secret",
+        Algorithm::HS256,
+    );
+    assert!(
+        manager.verify_token(&token).is_ok(),
+        "absent aud still verifies"
+    );
+}
+
 #[test]
 fn test_jwt_required_claims_are_enforced() {
     let manager = JwtManager::new(test_jwt_config());
