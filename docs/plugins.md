@@ -2666,7 +2666,8 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `consumer_header_claim` | String | Global JWT display claim for `X-Authenticated-Identity` (default: each provider's effective `consumer_identity_claim`, so a provider identity override also selects its display claim) |
 | `claim_headers` | Object | Global claim-to-header mappings used when the matched provider has no provider override |
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
-| `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
+| `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`). Metadata only: it never relaxes authentication |
+| `allow_missing_token` | Boolean | Istio `RequestAuthentication` semantics (default: `false`). When `true` and this is the only applicable auth plugin, a request that carries **no** token is forwarded **unauthenticated**; an invalid token is still rejected. Mesh mode sets this on its generated RequestAuthentication instance. Leave it `false` on a standalone gateway unless optional authentication is intended — the gateway logs a warning when a non-mesh instance enables it |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
 | `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`, min: `1`, max: `86400`); must not exceed each remote provider's effective maximum-stale value |
 | `sync_mode` | String | `local` or `redis` (default `local`). `redis` is required by, and only valid with, at least one provider declaring `dpop_replay_scope: shared` |

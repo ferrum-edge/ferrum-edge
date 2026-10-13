@@ -28,12 +28,16 @@ We take security vulnerabilities seriously. If you discover a security issue in 
 
 ### Private Disclosure Process
 
-Please do not report security issues in public GitHub issues. Submit a report
-through [GitHub's private vulnerability reporting form](https://github.com/ferrum-edge/ferrum-edge/security/advisories/new)
-so maintainers can coordinate a fix and disclosure privately. Published reports
-are listed in the [GitHub Security Advisories](https://github.com/ferrum-edge/ferrum-edge/security/advisories).
+Please do not report security issues in public GitHub issues, discussions, or
+pull requests. Email your report to **contact@ferrumedge.com** with a subject
+starting with `[SECURITY]`. This address is always the private reporting
+channel, so maintainers can coordinate a fix and disclosure privately.
 
-If private reporting is unavailable, email **contact@ferrumedge.com**.
+If the repository's **Security** tab shows a **Report a vulnerability** button,
+GitHub's private vulnerability reporting form is also available and works just
+as well. If that button is missing, or the form does not open, use the email
+address above; do not fall back to a public issue. Published advisories are
+listed in the [GitHub Security Advisories](https://github.com/ferrum-edge/ferrum-edge/security/advisories).
 
 Include the following information:
 - Description of the vulnerability

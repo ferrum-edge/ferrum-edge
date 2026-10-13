@@ -32,6 +32,10 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
   `[patch.crates-io]` block, and `scripts/check_vendored_patch_lifecycle.py` in sync.
+  The isolated `fuzz/` workspace does not inherit that block: `fuzz/Cargo.toml`
+  must carry the same entries (with `../vendor/` paths) and `fuzz/Cargo.lock`
+  must resolve them as path crates, or the fuzz lane exercises stock registry
+  code (issue #6583). `fuzz_target_schedule_parity_tests.rs` fails on drift.
   The parity gate lives in the `dependency-audit` job, which must stay behind
   `mode == 'full'`, so `pr_ci_plan.py` keeps `docs/dependency-policy.md`,
   `docs/vendored-patch-lifecycle.json`, and `docs/upstream-*-patches/` off the
