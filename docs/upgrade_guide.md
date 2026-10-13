@@ -28,6 +28,25 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `waf` exemption and unlisted-content-type defaults are stricter (PR #6646)
+
+- `global_exemptions.header_present` values must be shared secrets of at
+  least 16 characters. Replace any `null` (presence-only) or short value with
+  a secret that a trusted hop in front of the gateway injects, and have that
+  hop strip client copies of the header.
+- `global_exemptions` criteria now combine with AND. If an exemption lists
+  several of `paths`, `methods`, `ips`, and `consumers` and relied on any one
+  of them matching, add `match: any` (or split the intent so each criterion is
+  safe alone).
+- `on_unlisted_content_type` and the new `on_unlisted_response_content_type`
+  default to `fail_closed`. Under enforcing body rules, a non-empty body whose
+  `Content-Type` is not in the scan scope is now refused (`403`). Before
+  upgrading, add the types your routes legitimately carry to
+  `body_content_types`, enable `inspect_multipart` / `inspect_binary_body`,
+  exempt upload/download routes, or set the option to `allow` explicitly.
+  gRPC, protobuf, and image bodies are unlisted by default.
+- `body_methods` now includes `DELETE`.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a

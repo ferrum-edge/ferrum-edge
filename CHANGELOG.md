@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `waf` tightens exemption and body-scope defaults.**
+- **BREAKING — `waf` tightens exemption and body-scope defaults** (issue n/a,
+  PR #6646).
   - `global_exemptions.header_present` values must now be shared secrets of at
     least 16 characters, compared in constant time. Presence-only (`null`)
     entries are rejected at admission, because clients choose their own headers.
