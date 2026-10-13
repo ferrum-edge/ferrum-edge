@@ -335,6 +335,35 @@ fn vs_cors_policy_uncompilable_regex_origin_not_projected() {
     }
 }
 
+/// A credentialed regex that passes the reserved-name probe screen but cannot
+/// prove a pinned host is still projected, so the route keeps CORS ownership.
+/// `cors` construction then refuses it, and because `cors` is fail-closed the
+/// reload is rejected and the last published policy keeps serving.
+#[test]
+fn vs_cors_policy_credentialed_unprovable_regex_fails_closed_at_construction() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].corsPolicy credentialed unprovable regex",
+        status = Status::Supported,
+        notes = "Projected, then refused by fail-closed cors construction (reload rejected, last published policy retained) instead of being deferred, which would leave the route without CORS ownership.",
+    );
+    let projected = cors_plugin_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+            "corsPolicy": {
+                "allowOrigins": [{"regex": "^https://[a-z]{2,}\\.com$"}],
+                "allowCredentials": true
+            }
+        }]
+    }))])
+    .expect("an unprovable credentialed regex must still be projected");
+    let err = ferrum_edge::plugins::cors::CorsPlugin::new(&projected.config)
+        .err()
+        .expect("cors construction must refuse it");
+    assert!(err.contains("effectively universal"), "{err}");
+}
+
 /// Credentialed opaque `null` and effectively universal prefix/regex origin
 /// matchers cannot be projected: they would reflect an arbitrary origin with
 /// credentials. Exact `*` keeps the documented deferral; these matchers are
@@ -362,9 +391,6 @@ fn vs_cors_policy_credentialed_universal_matcher_not_projected() {
         json!([{"regex": ".*"}]),
         json!([{"regex": "https://.*"}]),
         json!([{"regex": "null"}]),
-        // Public-suffix-wide regexes cannot prove a pinned host.
-        json!([{"regex": "^https://[a-z]{2,}\\.com$"}]),
-        json!([{"regex": "https://[a-z]+\\.biz"}]),
     ] {
         assert!(
             cors_plugin_for(&[virtual_service(json!({

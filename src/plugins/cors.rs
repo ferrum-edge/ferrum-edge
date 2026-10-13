@@ -277,9 +277,22 @@ pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMat
 
 /// Whether one projected `allowed_origins` entry is wildcard or effectively
 /// universal. Shared Istio/mesh admission screen (issue #4269).
+///
+/// Istio translation deliberately screens with the reserved-name probe set
+/// only, not the host-pinning proof. A credentialed policy that is only
+/// unprovable (for example `^https://[a-z]{2,}\.com$`) is therefore still
+/// projected, and `cors` construction then refuses it. `cors` is registered
+/// fail-closed, so the reload is rejected and the last published policy keeps
+/// serving. Deferring it instead would publish the route with no CORS
+/// ownership, letting a backend's own permissive CORS headers through.
 pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
-    origin_matcher_spec_from_entry(origin)
-        .is_some_and(|spec| origin_matcher_breadth(spec) != OriginPolicyBreadth::Strict)
+    origin_matcher_spec_from_entry(origin).is_some_and(|spec| match spec {
+        OriginMatcherSpec::CompiledRegex(re) => origin_regex_matches_universality_probes(re),
+        OriginMatcherSpec::RegexPattern(pattern) => compile_origin_regex(pattern)
+            .is_ok_and(|re| origin_regex_matches_universality_probes(&re)),
+        OriginMatcherSpec::WildcardSubdomain(_) => false,
+        other => origin_matcher_breadth(other) != OriginPolicyBreadth::Strict,
+    })
 }
 
 /// Whether a validated wildcard-subdomain suffix (`.example.com`, as stored
@@ -574,6 +587,12 @@ pub(crate) fn origin_prefix_is_effectively_universal(prefix: &str) -> bool {
 /// probe in at least one scheme group. Bounded: the probe sets are fixed, the
 /// engine is finite-automaton based, and this runs once at config construction.
 pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
+    origin_regex_matches_universality_probes(re) || !origin_regex_host_is_provably_constrained(re)
+}
+
+/// The reserved-name probe screen alone: matches `null` or every probe origin
+/// of one scheme.
+fn origin_regex_matches_universality_probes(re: &Regex) -> bool {
     // `null` represents every opaque origin (for example sandboxed documents
     // and local files), so admitting it with credentials is itself non-strict.
     let matches_all = |probes: &[&str]| probes.iter().all(|origin| re.is_match(origin));
@@ -582,7 +601,6 @@ pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
         || matches_all(ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES)
         || matches_all(ORIGIN_REGEX_CHROME_EXTENSION_UNIVERSALITY_PROBES)
         || matches_all(ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES)
-        || !origin_regex_host_is_provably_constrained(re)
 }
 
 const CORS_CONFIG_KEYS: &[&str] = &[
