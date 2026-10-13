@@ -182,8 +182,6 @@ struct ContentPattern {
     placeholder: String,
 }
 
-/// How to scan the response body.
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// Aggregate output/work allowance for one structured redaction pass over one
 /// response body, shared by every string scalar the pass rewrites.
 ///
@@ -332,6 +330,8 @@ fn check_custom_pattern_name(list_field: &str, idx: usize, name: &str) -> Result
     Ok(())
 }
 
+/// How to scan the response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ScanMode {
     /// Only scan supported client-visible completion and tool-call fields.
     Content,
