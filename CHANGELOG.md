@@ -152,6 +152,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
+  `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the
+  fuzz lane compiled the stock registry crate instead of the patched DB-TLS
+  code the gateway ships. A unit test now fails when the fuzz and root
+  `[patch.crates-io]` tables drift.
+
 - **Native HTTP/3 backend streams survive pool retirement** (PR #6316).
   Each opened request stream (and both halves after `split()`) now holds its
   own session sender, so evicting or force-draining a pooled H3 connection
