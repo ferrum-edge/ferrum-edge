@@ -578,10 +578,11 @@ closed with an empty trust store. Whether plugin egress enforces CRLs is
 decided at startup: a CRL source first configured later needs a restart. A
 refreshed CRL applies to every **new** plugin connection; a pooled keep-alive
 connection established before the refresh is reused until it closes, unlike
-backend pools, which backend TLS reload drains. Two plugins build dedicated
-reqwest clients and do not apply CRLs: `spec_expose` spec fetches and
+backend pools, which backend TLS reload drains. Three plugins build dedicated
+reqwest clients and do not apply CRLs: `spec_expose` spec fetches,
 `api_chargeback_sink` when ClickHouse custom TLS (`clickhouse.tls.*`) is
-configured. Both are tracked in issue #6651. The CP gRPC server does enforce the configured
+configured, and `load_testing` loopback traffic with `gateway_tls: true`. All
+three are tracked in issue #6651. The CP gRPC server does enforce the configured
 CRL when verifying DP client certificates, including on live reload.
 `kafka_logging` uses librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
 Skip-verify health probes (`backend_tls_verify_server_cert: false` or

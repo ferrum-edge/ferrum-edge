@@ -387,7 +387,7 @@ pub(crate) struct LiveCrlServerVerifier {
 
 impl LiveCrlServerVerifier {
     fn new(roots: rustls::RootCertStore, crls: &CrlList) -> Result<Self, anyhow::Error> {
-        let verifier = crate::tls::build_server_verifier_with_crls(roots.clone(), crls)?;
+        let verifier = generation_verifier(&roots, crls)?;
         Ok(Self {
             roots: Arc::new(roots),
             source: arc_swap::ArcSwap::new(crate::tls::shared_crl_list(Arc::clone(crls))),
@@ -410,12 +410,11 @@ impl LiveCrlServerVerifier {
         if Arc::ptr_eq(&cached.crls, &crls) {
             return Ok(Arc::clone(&cached.verifier));
         }
-        let verifier = crate::tls::build_server_verifier_with_crls((*self.roots).clone(), &crls)
-            .map_err(|_| {
-                rustls::Error::General(
-                    "gateway CRLs could not be applied to the plugin HTTP verifier".to_string(),
-                )
-            })?;
+        let verifier = generation_verifier(&self.roots, &crls).map_err(|_| {
+            rustls::Error::General(
+                "gateway CRLs could not be applied to the plugin HTTP verifier".to_string(),
+            )
+        })?;
         self.current.store(Arc::new(CrlGenerationVerifier {
             crls,
             verifier: Arc::clone(&verifier),
@@ -500,6 +499,15 @@ impl PluginAlpn {
     }
 }
 
+/// The single construction site for one CRL generation's WebPKI verifier,
+/// shared by the startup build and every live-generation rebuild.
+fn generation_verifier(
+    roots: &rustls::RootCertStore,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> Result<Arc<rustls::client::WebPkiServerVerifier>, anyhow::Error> {
+    crate::tls::build_server_verifier_with_crls(roots.clone(), crls)
+}
+
 /// rustls config for [`PluginTlsPosture::CrlEnforced`]. Resumption is
 /// disabled so every new connection reaches the verifier's CRL checks,
 /// including each CRL's `nextUpdate`.
@@ -507,12 +515,17 @@ fn crl_enforced_rustls_config(
     verifier: &Arc<LiveCrlServerVerifier>,
     alpn: PluginAlpn,
 ) -> Result<rustls::ClientConfig, anyhow::Error> {
+    let startup_crls = Arc::clone(&verifier.current.load().crls);
     let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = verifier.clone();
     let mut tls = crate::tls::backend_client_config_builder(None)?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     tls.alpn_protocols = alpn.protocols();
+    // The shared policy (a nonempty startup set is a precondition of this
+    // posture); then disabled outright, because a later live generation may
+    // differ and these configs are never rebuilt.
+    crate::tls::apply_crl_enforced_client_resumption(&mut tls, &startup_crls);
     tls.resumption = rustls::client::Resumption::disabled();
     Ok(tls)
 }

@@ -307,8 +307,8 @@ request content through a logging or AI plugin.
 - **Plugin egress CRL coverage is partial.** The shared plugin HTTP clients
   apply the gateway CRLs to every new connection and follow live CRL reloads,
   but a pooled connection established before a refresh is reused until it
-  closes, and the dedicated `spec_expose` and custom-TLS `api_chargeback_sink`
-  clients apply no CRLs —
+  closes, and the dedicated `spec_expose`, custom-TLS `api_chargeback_sink`
+  and `load_testing` loopback clients apply no CRLs —
   [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach).
 - Logging and AI plugins are, by design, a path for request and response content
   to leave the gateway. Their destinations are part of your data-handling
@@ -332,7 +332,7 @@ release, not an open defect awaiting a fix in this document's scope.
 | Residual | Boundary | Reference |
 |---|---|---|
 | CRLs are not applied to DP-to-CP gRPC | 4 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
-| Plugin egress: pooled connections outlive a CRL refresh; `spec_expose` and custom-TLS `api_chargeback_sink` apply no CRLs | 6 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
+| Plugin egress: pooled connections outlive a CRL refresh; `spec_expose`, custom-TLS `api_chargeback_sink` and `load_testing` loopback clients apply no CRLs | 6 | [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach) |
 | A chain no configured CRL covers still verifies | 1, 2 | [What the verifier enforces](frontend_tls.md#what-the-verifier-enforces) |
 | `keyauth` / `jwt` / `hmac_auth` consumer secrets are recoverable at rest | 6 | [plugins.md](plugins.md) |
 | Frontend/admin TLS live reload is opt-in; inline PEM is static until config reload | 1 | [Configuration Reference](configuration.md#tls-material-sources) |

@@ -96,8 +96,8 @@ paths:
   compatible CRL config. The shared `PluginHttpClient` reqwest clients apply
   CRLs through `LiveCrlServerVerifier` (preconfigured rustls) and follow the
   backend `SharedCrlList`; pooled connections are not retired on refresh, and
-  the dedicated `spec_expose` / custom-TLS `api_chargeback_sink` clients apply
-  none (issue #6651). Skip-verify health
+  the dedicated `spec_expose` / custom-TLS `api_chargeback_sink` /
+  `load_testing` loopback clients apply none (issue #6651). Skip-verify health
   probes also skip CRL enforcement, matching the data-path skip-verify
   contract.
 - Backend TLS live reload stores the newly admitted `SharedCrlList`
