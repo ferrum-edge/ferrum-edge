@@ -2403,8 +2403,21 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
         .expect("multicluster-federation-live.yml must declare a `gate` job");
     let gate_body = &WORKFLOW[gate_start..];
 
+    // Any full-commit pin: which upstream release it names is governed by the
+    // trusted action pin rotation check (docs/dependency-policy.md →
+    // "Automated action pin rotation").
+    let download_pin = gate_body
+        .split("uses: actions/download-artifact@")
+        .nth(1)
+        .map(|rest| rest.chars().take_while(char::is_ascii_hexdigit).count());
+    assert_eq!(
+        download_pin,
+        Some(40),
+        "the multicluster live release gate must download the published artifact with a \
+         full-commit-pinned `actions/download-artifact`"
+    );
+
     for pinned in [
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         "name: multicluster-federation-results",
         "python3 .github/scripts/validate_live_assertions.py --self-test",
         "--artifact multicluster-federation-artifact/live-assertions.json",
