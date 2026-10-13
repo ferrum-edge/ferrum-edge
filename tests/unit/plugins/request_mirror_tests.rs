@@ -6791,6 +6791,62 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
     );
 }
 
+/// Bracketed object-key query names are stripped when credential-shaped and
+/// can be forwarded through the exact decoded-name allowlist.
+#[tokio::test]
+async fn bracketed_query_names_strip_and_allowlist() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("filter[key]=a&key[]=b&filter[color]=red&x=1".to_string());
+    let default_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        default_line.contains("?filter[color]=red&x=1 "),
+        "credential-shaped bracketed names must be dropped: {default_line}"
+    );
+
+    let mut allowed = make_ctx_with_proxy();
+    allowed.set_raw_query_string("filter%5Bkey%5D=a&key[]=b&x=1".to_string());
+    let allowed_line = capture_mirror_request_line_with_config(
+        &mut allowed,
+        json!({
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["filter[key]"]
+        }),
+    )
+    .await;
+    assert!(
+        allowed_line.contains("?filter%5Bkey%5D=a&x=1 "),
+        "allowlisted bracketed name must forward with its raw encoding: {allowed_line}"
+    );
+}
+
+/// The DPoP proof header is a credential and is stripped by default.
+#[tokio::test]
+async fn dpop_proof_header_is_stripped_unless_allowlisted() {
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert("dpop".to_string(), "proof-jwt".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(!observed.contains_key("dpop"), "{observed:?}");
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "forward_sensitive_headers": true,
+                "forward_sensitive_header_allowlist": ["dpop"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "dpop must be allowlistable"
+    );
+}
+
 /// Names caught only by the credential-class rule are still opt-in-able
 /// through the exact allowlist, which stays the only way back in.
 #[test]

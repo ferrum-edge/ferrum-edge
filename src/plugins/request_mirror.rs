@@ -594,6 +594,7 @@ const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "verifier",
     "jws",
     "jwe",
+    "dpop",
 ];
 
 /// Short credential aliases matched as a segment suffix, plural included, so
@@ -2498,11 +2499,11 @@ fn parse_forward_sensitive_query_allowlist(
                         "request_mirror: `forward_sensitive_query_allowlist[{idx}]` exceeds maximum length of {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN} bytes"
                     ));
                 }
-                if trimmed
-                    .bytes()
-                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-                    || trimmed.contains(['=', '&', '?', '#', '/', '@'])
-                    || http::HeaderName::from_bytes(trimmed.as_bytes()).is_err()
+                // Query names are not header names: brackets (`filter[key]`,
+                // `key[]`) and other visible ASCII are valid. Entries match
+                // the decoded name, so `%` and the query delimiters are refused.
+                if !trimmed.bytes().all(|b| b.is_ascii_graphic())
+                    || trimmed.contains(['=', '&', '?', '#', '/', '@', ';', '%', '+'])
                 {
                     return Err(format!(
                         "request_mirror: `forward_sensitive_query_allowlist[{idx}]` is not a valid query parameter name"
