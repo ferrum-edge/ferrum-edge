@@ -936,10 +936,9 @@ fn token_lookup_header_redaction_uses_the_canonical_name() {
 // Issue #5019 — HTTP/3 query decoding parity (sibling of #2200)
 // ────────────────────────────────────────────────────────────────────
 
-/// HTTP/3 materializes decoded query parameters only for plugins that declare
-/// they need them; H1/H2 always decode. Without the declaration the same URL
-/// authenticates over H1/H2 and returns `401` over H3 as soon as the parameter
-/// name or the token carries percent-encoding.
+/// Every frontend now materializes decoded query parameters (#6580), so this
+/// no longer gates H3 decoding. A `query:` token lookup still declares that the
+/// plugin decides on the query, the hint early route-total planning reads.
 #[test]
 fn query_token_lookup_requires_decoded_query_params() {
     for (config, expected) in [
@@ -952,7 +951,7 @@ fn query_token_lookup_requires_decoded_query_params() {
         assert_eq!(
             plugin.requires_decoded_query_params(),
             expected,
-            "unexpected H3 decoded-query capability for {config}"
+            "unexpected query-predicate hint for {config}"
         );
     }
 }

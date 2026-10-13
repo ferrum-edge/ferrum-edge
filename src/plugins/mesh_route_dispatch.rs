@@ -3549,7 +3549,7 @@ mod tests {
         .unwrap();
         assert!(
             !method_only.requires_decoded_query_params(),
-            "method/header-only routing must not change HTTP/3 query-param materialization"
+            "method/header-only routing declares no query predicate"
         );
 
         let query_rule = MeshRouteDispatch::new(&json!({
