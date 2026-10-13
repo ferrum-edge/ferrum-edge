@@ -28,6 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `soap_ws_security` checks pinned certificate validity and refuses zoneless instants (PR #6632)
+
+A certificate in `x509_signature.trusted_certs` or
+`saml.trusted_signing_certs` is now trusted only between its `notBefore` and
+`notAfter`. Signatures from an expired or not-yet-valid pin get `401`. Such a
+pin still loads, with a warning, so a replacement can be staged ahead of its
+`notBefore`. Before upgrading, replace any pinned certificate that has expired.
+`xsd:dateTime` values without a `Z` or `±hh:mm` designator (Timestamp,
+PasswordDigest `Created`, SAML `Conditions`/`SubjectConfirmationData`) are now
+rejected. Make sure partners send UTC instants with a designator.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
@@ -90,6 +101,19 @@ check the server version with `db.version()`.
 
 See [docs/mongodb.md](mongodb.md#supported-server-versions) for the full table
 and the Linux kernel note for MongoDB 8.0.21+, 8.3 and 9.0.
+
+### HTTP/3 `ctx.query_params` is percent-decoded (#6580)
+
+HTTP/3 now fills `ctx.query_params` with percent-decoded names and values, as
+HTTP/1.1 and HTTP/2 always have. Built-in plugins are unaffected. A custom
+plugin that read the raw HTTP/3 form (`%2Fadmin`) now sees `/admin`, the
+same value it already saw over HTTP/1.1 and HTTP/2. Remove any HTTP/3-only
+decoding you added. A custom plugin that called
+`RequestContext::materialize_query_params_raw()` or tested the
+`NEEDS_DECODED_QUERY_PARAMS` capability bit must drop those calls, because both
+are removed. For a security decision on the query, use
+`plugins::utils::query::canonical_query_for_policy`, as described in
+[CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md#request-context).
 
 ## Upgrading to 0.9.17
 
