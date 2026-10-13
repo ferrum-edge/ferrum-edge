@@ -17,8 +17,8 @@ use crate::config::file_loader::decode_and_validate_config_document;
 use crate::config_sources::k8s::{K8sObject, K8sTranslationOptions, translate_k8s_objects};
 use crate::identity::ca::PublishedJwtAuthority;
 use crate::identity::jwt_svid::{
-    authorities_from_jwks, jwks_document, parse_strict_json_object, validate_jwt_svid,
-    validate_published_authorities,
+    authorities_from_jwks, decoding_key_for_authority, jwks_document, parse_strict_json_object,
+    validate_jwt_svid, validate_published_authorities,
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::plugins::otel_tracing::{OtelTracing, build_traceparent};
@@ -342,9 +342,11 @@ pub fn fuzz_jwt_svid_invariant(data: &[u8]) -> bool {
 }
 
 /// An externally supplied JWKS the bundle consumer accepts must survive
-/// publication and re-consumption unchanged: same key ids, declared
-/// algorithms, and public keys. Anything else means the hand-written
-/// JWK/SPKI conversions disagree with each other.
+/// publication and re-consumption unchanged: same key ids, public keys, and
+/// effective verification algorithms. The declared `alg` itself may change —
+/// publication states the algorithm an undeclared key is already limited to —
+/// so the comparison is on what `decoding_key_for_authority` would allow.
+/// Anything else means the hand-written JWK/SPKI conversions disagree.
 fn jwks_round_trip_invariant(document: &[u8]) -> bool {
     let Some(trust_domain) = fuzz_jwt_trust_domain() else {
         return true;
@@ -358,11 +360,17 @@ fn jwks_round_trip_invariant(document: &[u8]) -> bool {
     let Ok(reconsumed) = authorities_from_jwks(&trust_domain, &published) else {
         return false;
     };
+    let allowed = |authority: &PublishedJwtAuthority| {
+        decoding_key_for_authority(authority).map(|(_, algorithms)| algorithms)
+    };
     accepted.len() == reconsumed.len()
         && accepted.iter().zip(&reconsumed).all(|(first, second)| {
             first.key_id == second.key_id
-                && first.declared_alg == second.declared_alg
                 && first.public_key_pem == second.public_key_pem
+                && matches!(
+                    (allowed(first), allowed(second)),
+                    (Ok(a), Ok(b)) if a == b
+                )
         })
 }
 

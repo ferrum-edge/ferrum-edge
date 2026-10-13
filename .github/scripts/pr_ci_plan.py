@@ -1619,7 +1619,13 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/tls/mod.rs"],
-            src_only | {"run_acme": True, "run_pkcs11": True},
+            src_only
+            | {
+                "run_acme": True,
+                "run_pkcs11": True,
+                "run_fuzz_smoke": True,
+                "run_standalone_cargo": True,
+            },
         ),
         (
             "pull_request",
