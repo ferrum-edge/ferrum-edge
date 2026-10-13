@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for every issuer the providers sharing it plus the providers without an
   `issuer` must total at most 8, so one token costs at most 8 signature
   verifications.
+- **BREAKING — HTTP/3 always percent-decodes `ctx.query_params`** (issue
+  #6580). HTTP/3 used to materialize the raw form (`%2Fadmin`) unless an
+  active plugin opted in through `requires_decoded_query_params()`, while
+  HTTP/1.1 and HTTP/2 always decoded (`/admin`). Built-in query consumers
+  already opted in or read the canonical query view, but a custom plugin that
+  authenticated or authorized on `ctx.query_params` without opting in could
+  decide differently for the same URL over HTTP/3, and the representation
+  also flipped with whichever other plugins were attached to the route. Every
+  frontend now decodes the same way. The `NEEDS_DECODED_QUERY_PARAMS`
+  capability bit and `RequestContext::materialize_query_params_raw()` are
+  removed; `requires_decoded_query_params()` remains only as the
+  query-predicate hint early route-total planning reads.
+
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only
