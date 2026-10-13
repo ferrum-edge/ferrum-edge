@@ -1,7 +1,7 @@
 use ferrum_edge::fuzz_support::{
-    MAX_FUZZ_INPUT_BYTES, fuzz_crl_window_accepts, fuzz_decode_config_document,
-    fuzz_drain_mesh_udp_frames, fuzz_jwks_accepts, fuzz_jwt_svid_invariant,
-    fuzz_parse_datagram_header, fuzz_parse_proxy_protocol, fuzz_tls_material_invariant,
+    MAX_FUZZ_INPUT_BYTES, fuzz_decode_config_document, fuzz_drain_mesh_udp_frames,
+    fuzz_jwks_accepts, fuzz_jwt_svid_invariant, fuzz_parse_datagram_header,
+    fuzz_parse_proxy_protocol, fuzz_tls_material_accepts, fuzz_tls_material_invariant,
     fuzz_translate_k8s_json, fuzz_validate_ocsp_structure, fuzz_validate_plugin_config,
     mesh_udp_frame_round_trip, ocsp_structure_invariant, smoke_invariants,
     traceparent_round_trip_invariant,
@@ -99,6 +99,11 @@ fn jwt_svid_seeds_hold_the_forgery_invariant() {
                 fuzz_jwks_accepts(&bytes[1..]),
                 "{name} must be an accepted JWKS so the round trip is exercised"
             );
+        } else if name.starts_with("jwks_") {
+            assert!(
+                !fuzz_jwks_accepts(&bytes[1..]),
+                "{name} is a policy-negative JWKS and must be refused"
+            );
         }
         seeds += 1;
     }
@@ -106,7 +111,7 @@ fn jwt_svid_seeds_hold_the_forgery_invariant() {
 }
 
 #[test]
-fn tls_material_seeds_hold_invariants_and_the_valid_crl_is_admitted() {
+fn tls_material_seeds_hold_invariants_and_pin_admission() {
     let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/tls_material");
     let mut seeds = 0;
     for entry in std::fs::read_dir(&corpus).expect("tls_material corpus") {
@@ -114,12 +119,13 @@ fn tls_material_seeds_hold_invariants_and_the_valid_crl_is_admitted() {
         let bytes = std::fs::read(&path).expect("seed bytes");
         assert!(fuzz_tls_material_invariant(&bytes), "{}", path.display());
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("valid_crl") {
-            assert!(
-                fuzz_crl_window_accepts(&bytes[1..]),
-                "{name} must be inside its validity window"
-            );
-        }
+        // `valid_*` seeds must be admitted and every other seed refused, so a
+        // bypassed record limit, key-count, key-form, or window check fails.
+        assert_eq!(
+            fuzz_tls_material_accepts(&bytes),
+            name.starts_with("valid_"),
+            "{name}: unexpected admission outcome"
+        );
         seeds += 1;
     }
     assert!(seeds > 0);
