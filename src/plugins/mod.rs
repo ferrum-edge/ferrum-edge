@@ -2422,16 +2422,15 @@ pub struct RequestContext {
     /// or framing headers. Kept out of public metadata so a client or plugin
     /// cannot forge cache eligibility.
     replay_request_body_empty_proven: bool,
-    /// Whether either decoded or raw query-param materialization has already
-    /// populated `query_params`. Keeps materialization one-shot while preserving
+    /// Whether query-param materialization has already populated
+    /// `query_params`. Keeps materialization one-shot while preserving
     /// `raw_query_string` for inspection.
     query_params_materialized: bool,
-    /// Parsed query parameters. Empty until `materialize_query_params()` or
-    /// `materialize_query_params_raw()` is called.
+    /// Parsed query parameters. Empty until `materialize_query_params()` is
+    /// called.
     ///
-    /// HTTP/1.1 and HTTP/2 materialize percent-decoded query params for
-    /// historical compatibility. HTTP/3 materializes raw query params unless
-    /// an active plugin explicitly requires the decoded representation.
+    /// HTTP/1.1, HTTP/2, and HTTP/3 all materialize percent-decoded query
+    /// params, so a plugin sees the same map on every frontend (#6580).
     /// After a query transform, this map is rebuilt from the ordered outbound
     /// representation (last occurrence wins) so later plugins see coherent
     /// state without re-parsing the wire query.
@@ -6788,32 +6787,6 @@ impl RequestContext {
                 let decoded_v = percent_decode_str(v).decode_utf8_lossy();
                 self.query_params
                     .insert(decoded_k.into_owned(), decoded_v.into_owned());
-            }
-        }
-        self.query_params_materialized = true;
-    }
-
-    /// Materialize the raw query string into `self.query_params` without
-    /// percent-decoding. Empty pairs are skipped and parameters without `=`
-    /// (e.g., `?flag`) are stored with an empty-string value, matching the
-    /// decoded variant so the only plugin-visible difference between the two is
-    /// percent-decoding (and duplicate-pair collapse via the retained raw
-    /// query string).
-    ///
-    /// HTTP/3 uses this by default to preserve its legacy plugin-visible query
-    /// representation unless an active plugin explicitly opts into decoded
-    /// query params.
-    pub fn materialize_query_params_raw(&mut self) {
-        if self.query_params_materialized {
-            return;
-        }
-        if let Some(raw) = self.raw_query_string.as_deref() {
-            for pair in raw.split('&') {
-                if pair.is_empty() {
-                    continue;
-                }
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                self.query_params.insert(k.to_string(), v.to_string());
             }
         }
         self.query_params_materialized = true;
@@ -12779,10 +12752,14 @@ pub trait Plugin: Any + Send + Sync {
     /// override this and set `requires_ws_disconnect_hooks()` to `true`.
     async fn on_ws_disconnect(&self, _ctx: &WsDisconnectContext) {}
 
-    /// Returns `true` when this plugin requires HTTP/3 query params to use the
-    /// percent-decoded representation. HTTP/3 historically exposed raw query
-    /// params to plugins, so this opt-in is intentionally narrow: enabling it
-    /// affects the shared `ctx.query_params` map for all plugins on the proxy.
+    /// Returns `true` when this plugin decides on query parameters.
+    ///
+    /// Every frontend (HTTP/1.1, HTTP/2, and HTTP/3) materializes the same
+    /// percent-decoded `ctx.query_params`, so a plugin does not need this to
+    /// see decoded values (#6580). It is a planning hint: early route-total
+    /// selection builds the canonical query view only when a step declares it.
+    /// Security decisions on the query must still use
+    /// `utils::query::canonical_query_for_policy`, not the lossy shared map.
     fn requires_decoded_query_params(&self) -> bool {
         false
     }
