@@ -319,6 +319,9 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
             jwks.config["emit_mesh_request_principal_metadata"],
             serde_json::json!(true)
         );
+        // Permissive missing-token handling is an explicit opt-in on the
+        // mesh-generated instance, never implied by the metadata flag.
+        assert_eq!(jwks.config["allow_missing_token"], serde_json::json!(true));
         // Mesh injection carries no cooldown knob, so the injected generation
         // inherits the shared store's default unknown-`kid` refetch: an IdP
         // rotation recovers for mesh workloads exactly as it does for a
