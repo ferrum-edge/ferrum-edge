@@ -22,9 +22,12 @@
 # `main-linux-image` job reads it from `Dockerfile`, so no workflow file pins it.
 # The job runs with its own `GITHUB_TOKEN` only (no stored credential), which
 # cannot change workflow files: a drifted reference pinned in a workflow fails
-# the run instead. Pull requests opened by `GITHUB_TOKEN` start no CI, so a
-# maintainer closes and reopens the refresh PR (or merges `main` into it) to run
-# the required checks, reviews it, and merges it.
+# the run instead. A pull request opened by `GITHUB_TOKEN` does not start its
+# required CI on its own: `pull_request` runs, if created, wait for maintainer
+# approval, and the `pull_request_target` trusted policy never starts, so
+# approving them is not enough. A maintainer closes and reopens the refresh PR
+# (or pushes a commit to it, for example by merging `main`) to run every
+# required check, reviews it, and merges it.
 name: Base Image Digest Refresh
 
 on:
@@ -128,9 +131,11 @@ jobs:
             echo "Normal required CI on this pull request: multi-arch image build, FIPS,"
             echo "eBPF, the GNU ABI scan, and the Helm chart smoke."
             echo
-            echo "This pull request was opened with the workflow's GITHUB_TOKEN, which"
-            echo "starts no CI. Close and reopen it (or merge main into it) to run the"
-            echo "required checks, verify each digest against its registry, then merge."
+            echo "This pull request was opened with the workflow's GITHUB_TOKEN, so its"
+            echo "required CI does not start on its own: any pull_request runs wait for"
+            echo "approval and the Trusted Cross Build Policy never starts. Close and"
+            echo "reopen it (or merge main into it) to run every required check, verify"
+            echo "each digest against its registry, then merge."
             echo
             echo "Refs #4444"
             echo "PR_BODY_EOF"

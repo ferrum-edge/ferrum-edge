@@ -705,9 +705,12 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   (`contents: write`, `pull-requests: write`). That token cannot change workflow
   files, so a drifted reference pinned in a workflow, or in the trusted Cross
   policy, fails the run with an instruction to move the pin into a Dockerfile.
-  Pull requests opened by `GITHUB_TOKEN` start no workflows, so a maintainer
-  closes and reopens the refresh PR (or merges `main` into it) to run the
-  required checks, including `Trusted Cross Build Policy`, verifies each digest
+  A pull request opened by `GITHUB_TOKEN` does not start its required CI on its
+  own: `pull_request` runs, if GitHub creates them, wait for maintainer
+  approval, and the `pull_request_target` trusted policy never starts. A
+  maintainer therefore closes and reopens the refresh PR (or merges `main` into
+  it) to run every required check, including `Trusted Cross Build Policy`,
+  verifies each digest
   against its registry, and merges it. Automatic merging was evaluated and
   rejected: see the rationale in PR #6535. `verify_ci_runtime_cache.py` fails if
   the workflow stops rotating every consumer, may rewrite workflow or trusted
