@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `jwks_auth` bounds per-token verification work.** A token
+  is now verified only against providers whose `issuer` equals its
+  unverified `iss`, then providers without an `issuer`, each at most once.
+  Providers pinning a different issuer are no longer tried, since they
+  would reject the token anyway. `providers` is capped at 64 entries, and
+  for every issuer the providers sharing it plus the providers without an
+  `issuer` must total at most 8, so one token costs at most 8 signature
+  verifications.
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only

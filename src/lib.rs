@@ -3620,6 +3620,14 @@ pub mod _test_support {
         )
     }
 
+    /// Providers `jwks_auth` would verify `token` against, in order.
+    pub fn jwks_auth_candidate_providers_for_test(
+        plugin: &crate::plugins::jwks_auth::JwksAuth,
+        token: &str,
+    ) -> Vec<usize> {
+        plugin.candidate_provider_indices_for_test(token)
+    }
+
     pub fn request_mirror_retained_request_body_bytes_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> u64 {
