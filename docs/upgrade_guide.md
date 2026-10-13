@@ -457,17 +457,12 @@ outside its own namespace. Before rolling out, check:
   in its own namespace. Root-namespace rules are unchanged.
 - **Namespace-scoped Admin API operators.** Where the `ns` claim is enforced
   (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, or a multi-namespace control
-  plane), and for any `operator` token that carries an `ns` claim even with
-  enforcement off, an `operator` token can set `backend_tls_client_cert_path`,
+  plane), an `operator` token can set `backend_tls_client_cert_path`,
   `backend_tls_client_key_path` and `backend_tls_server_ca_cert_path` only to
   inline PEM, `system://`, or a `k8s://` Secret in the addressed namespace.
-  The same restriction now applies to the route-local `client_cert_path`,
-  `client_key_path` and `server_ca_cert_path` under
-  `rules[].destination.backend_tls` in `mesh_route_dispatch` plugin configs.
   Automation that writes file paths or secret-manager references with operator
-  tokens must use an `admin` token instead. Values already stored in the same
-  field (for `mesh_route_dispatch`, the same rule index and field) keep working
-  and survive unrelated updates; `admin` tokens are not restricted. The check treats the
+  tokens must use an `admin` token instead. Values already stored on a
+  resource keep working and survive unrelated updates. The check treats the
   Ferrum namespace an operator is scoped to as the Kubernetes namespace of the
   same name: `k8s://<that namespace>/…` stays admitted and is read with the
   gateway's own ServiceAccount. Do not give a Ferrum tenant namespace the name

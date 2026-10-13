@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING — backend TLS reference admission follows the `ns` claim**
+  (PR #6316, residual of GHSA-wmmp-c4pg-rg6p / #6092). An `operator` token
+  that carries an `ns` claim is now limited to inline PEM, `system://` or a
+  `k8s://` Secret in the addressed namespace for backend TLS references even
+  when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=false`, matching the namespace
+  bound #6093 applies to every other route. The same admission now covers the
+  route-local `client_cert_path`, `client_key_path` and `server_ca_cert_path`
+  under `rules[].destination.backend_tls` in `mesh_route_dispatch` plugin
+  configs. A value already stored in the same field (same rule index for
+  `mesh_route_dispatch`) stays admitted, and `admin` tokens are unaffected.
+- **Tenant DestinationRule TLS files stay confined after admission** (PR
+  #6316). A file that a non-root-namespace DestinationRule names under
+  `FERRUM_MESH_TENANT_TLS_FILE_ROOTS` is bound to a confined reference when
+  it is projected onto upstreams. Every later load, cache rebuild and file
+  watch re-resolves it under the configured roots and opens it one component
+  at a time without following swapped symlinks (`openat` + `O_NOFOLLOW` on
+  Unix, handle-relative no-reparse opens on Windows). A refused tenant file
+  fails closed for its own destinations only and no longer stalls rotation
+  of unrelated backend TLS sources.
+- **CRL-enforcing outbound TLS clients no longer resume sessions** (PR
+  #6316, follow-up to #4297). TLS 1.2 tickets and TLS 1.3 PSK resumption
+  skip certificate reverification, so a cached session could outlive a CRL's
+  `nextUpdate`. Resumption is now disabled for every cached rustls client
+  config with a nonempty CRL set: backend data paths, verified HTTPS/gRPC
+  health probes, `tcp_logging`, `ws_logging`, `ldap_auth`, SMTP
+  notifications and mesh SPIFFE outbound configs. Reconnects through those
+  configs pay a full handshake; empty-CRL and skip-verify configs keep
+  resumption.
+- **`mcp_gateway` upstream calls log a redacted endpoint** (PR #6316,
+  sibling of GHSA-4ghp-v85j-5hvq). `initialize`, the `initialized`
+  notification, session `DELETE` and discovery now use the redacted tracked
+  HTTP helper, so a credential in the upstream URL path is not written to
+  slow-call or egress-denial warnings.
+
+### Fixed
+
+- **Native HTTP/3 backend streams survive pool retirement** (PR #6316).
+  Each opened request stream (and both halves after `split()`) now holds its
+  own session sender, so evicting or force-draining a pooled H3 connection
+  stops new dispatch without closing streams that are still in flight.
+- **TLS gRPC health probes build their dial URI for the custom connector**
+  (PR #6316). The probe dials the screened address over its own rustls
+  connector with an `http://` URI, so tonic does not expect to add a second
+  TLS layer. The request keeps the original `https` origin and authority, and
+  the verifier keeps the configured server name, trust and CRLs.
+
 ## [0.9.17] - 2026-10-10
 
 This version carries forward the changes prepared for 0.9.16. That immutable tag
