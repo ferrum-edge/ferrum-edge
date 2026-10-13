@@ -963,7 +963,9 @@ Build Policy`'s pin rotation check. The rules:
   queued merge, so a human-edited bump returns to human review;
 - the workflow runs from `main` (`pull_request_target`), never checks out or
   executes PR content, and holds only the built-in `GITHUB_TOKEN`. No stored
-  credential exists;
+  credential exists. Both the queuing and the withdrawing job request
+  `contents: write` and `pull-requests: write` at job level, because GitHub
+  requires both to enable or to disable auto-merge;
 - the repository setting **Allow auto-merge** must stay enabled.
 
 A merge that GitHub performs for a `GITHUB_TOKEN`-queued auto-merge does not

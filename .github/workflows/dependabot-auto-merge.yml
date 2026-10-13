@@ -81,7 +81,11 @@ jobs:
       && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-26.04
     timeout-minutes: 5
+    # disablePullRequestAutoMerge needs the same grant as enabling it: with
+    # `pull-requests: write` alone GitHub answers "Resource not accessible by
+    # integration" (#6591). Like `queue`, the job executes no PR content.
     permissions:
+      contents: write
       pull-requests: write
     steps:
       - name: Withdraw the queued merge
