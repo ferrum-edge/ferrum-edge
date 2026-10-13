@@ -44,6 +44,7 @@ Thumbs.db
 comparison/results/*.txt
 comparison/results/*.html
 comparison/results/*.json
+comparison/results/.current_run_results
 
 # Performance test artifacts
 tests/performance/ci_results/

@@ -86,6 +86,13 @@ request ends the loop; an admitted partial payload remains an I/O failure.
 Writer failures remain errors, and the direct TLS backend sends close_notify
 after its echo copy drains. No EOF error is exempted from measurement validation.
 
-The focused hosted contract covers completion before waiting, coalesced
-notifications, a pending reader and an admitted partial write. Backend logs
-are retained per round. A new full paired study is required after this repair.
+The pipelined writer/reader above was later replaced by the current bounded
+echo worker, and the former admission-race contract tests were retired with
+it. The focused hosted contract is now `tcp_echo_tests` in the `proto_bench`
+binary (selected by the `tcp-admission` job in
+`.github/workflows/release-profile-study.yml`, which fails if that selection
+ever comes up empty): complete, failing, and stalled stream shutdowns after
+measured echoes remain diagnostic (`transport_close_timed_out`) without being
+counted as measurement errors, under both the TCP and TCP+TLS labels.
+Backend logs are retained per round. A new full paired study is required
+after this repair.

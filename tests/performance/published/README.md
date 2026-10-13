@@ -15,7 +15,7 @@ bundles: they are the record behind numbers that were published at the time.
 |---|---|---|
 | `manifest.json` | `multi_protocol/run_published_benchmark.sh` | Commit, version, toolchain, OS, CPU, memory, load average, arguments |
 | `summary.md` / `summary.json` | `multi_protocol/summarize_published_benchmark.py` | Medians, min/max, CV, added latency, gateway CPU per request, flags |
-| `samples.json.sha256` | `shasum -a 256 samples.json` | Checksum of the run's `samples.json` (every raw `proto_bench` report and gateway CPU sample). The raw file stays out of git: at about 1 MB it exhausts the trusted Cross build-policy verifier, which scans everything under `tests/performance`. `summary.json` keeps every per-run value |
+| `samples.json.sha256` | `shasum -a 256 samples.json` | Checksum of the run's `samples.json` (every raw `proto_bench` report and gateway CPU sample). The raw file stays out of git: at about 1 MB it exhausts the trusted Cross build-policy verifier, which scans everything under `tests/performance`. `summary.json` keeps only selected per-run statistics (RPS, p50/p99, error counts, and gateway CPU seconds) for complete gateway/direct pairs, plus an `incomplete-runs` flag when observations are missing; it is not a complete archival copy of the raw samples. The checksum proves which `samples.json` a bundle was summarized from, but the raw samples themselves are recoverable only from the original run directory, not from the committed summary. |
 | `scale-sqlite.json` | `functional/functional_scale_perf_test.rs` with `FERRUM_SCALE_RESULTS_JSON` | Every 3k-proxy wave of the 30k scale test |
 
 ## Reproducing a bundle
