@@ -10,14 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
-  refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB full loaders only
-  warned when two consumers in one namespace shared an API key, basicauth
-  username, or exact mTLS identity, and the consumer index then authenticated
+  refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
+  full loaders only warned when two consumers in one namespace, whose
+  identities did not collide, shared an API key or exact mTLS identity, and
+  the consumer index then authenticated
   that credential as whichever consumer was indexed last. Database full loads,
   CP snapshots and deltas, and every runtime swap (including DP snapshots and
   incremental applies) now refuse such a config and keep the previous one,
   the same way case-variant mTLS DNS identities were already refused and file
-  mode already failed. Admin writes were already blocked from creating these
+  mode already failed. Identity collisions keep their existing quarantine
+  (#2121), which drops the later consumer. Admin writes were already blocked from creating these
   collisions. On a running gateway, repair a pre-existing one through the Admin
   API while the previous config stays live. An initial database load that is
   refused has no previous config and needs a valid backup, so repair
