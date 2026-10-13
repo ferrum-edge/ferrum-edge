@@ -5124,4 +5124,42 @@ mod tests {
             evaluate(&policies, &[alpha, beta])
         );
     }
+
+    #[test]
+    fn repeated_records_on_one_endpoint_and_routes_over_two_ports_collapse() {
+        use super::{
+            DestinationBackendKey, NodeWaypointRouteUpstreamConfig, destination_policy_scope_index,
+        };
+
+        // Two equal workload records behind ONE endpoint address.
+        let mut slice = reviews_slice(vec![reviews_replica(0, "v1"), reviews_replica(0, "v1")]);
+        // A second port on the same Service carries the same scopes.
+        slice.services[0].ports = serde_json::from_value(serde_json::json!([
+            {"port": 9080},
+            {"port": 9443}
+        ]))
+        .expect("ports");
+        let route: NodeWaypointRouteUpstreamConfig = serde_json::from_value(serde_json::json!({
+            "id": "route-reviews",
+            "namespace": "shop",
+            "targets": [
+                {"host": "reviews.shop", "port": 9080},
+                {"host": "reviews.shop", "port": 9443}
+            ]
+        }))
+        .expect("route upstream");
+        let index = destination_policy_scope_index(&slice, &[], &[route]);
+
+        let endpoint = DestinationBackendKey::new("10.1.0.1", 9080).expect("endpoint key");
+        assert_eq!(
+            index.by_backend[&endpoint].len(),
+            1,
+            "equal records on one endpoint must not repeat its scope"
+        );
+        assert_eq!(
+            index.by_upstream["route-reviews"].len(),
+            1,
+            "a route over two ports of one Service evaluates its scope once"
+        );
+    }
 }
