@@ -27,8 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WAF `FE-HPP-001` compares duplicates under the `&`+`;` convention too, with
   exclusions and `fp_filters` judged on each convention's own pairs. OPA
   `delegate` input withholds a pair whose `;` sub-pair names a redacted
-  credential, and a plugin trigger that reads `query` runs its instance rather
-  than skipping it when the raw query carries an unencoded `;`.
+  credential (split on the encoded bytes, so `%3B` stays content).
 - **BREAKING — HTTP/3 always percent-decodes `ctx.query_params`** (issue
   #6580). HTTP/3 used to materialize the raw form (`%2Fadmin`) unless an
   active plugin opted in through `requires_decoded_query_params()`, while

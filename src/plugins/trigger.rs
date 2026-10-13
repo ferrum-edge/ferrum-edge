@@ -196,18 +196,9 @@ impl PluginTriggerGate {
         if phase == TriggerPhase::PreAuth && self.compiled.reads_authenticated_identity() {
             return true;
         }
-        let decision = match self.http_verdict(ctx) {
-            HttpTriggerVerdict::Decided(decision) => decision,
-            // Authentication keeps the `&`-only decision and does not memoize
-            // it: running an extra authentication instance would widen the
-            // accepted credentials, so `;` must neither add nor remove one
-            // there. The first post-authentication phase decides for good.
-            HttpTriggerVerdict::Ambiguous { ampersand_only } if phase == TriggerPhase::PreAuth => {
-                return ampersand_only;
-            }
-            // Past authentication a trigger can only remove work, never a
-            // guard, so an undecidable query runs the instance.
-            HttpTriggerVerdict::Ambiguous { .. } => true,
+        let decision = {
+            let facts = HttpTriggerFacts::new(ctx);
+            self.compiled.evaluate(&facts)
         };
         let decision = ctx.record_plugin_trigger_decision(self.token, decision);
         if !decision {
@@ -234,36 +225,7 @@ impl PluginTriggerGate {
         if inputs_may_change || identity_pending {
             return None;
         }
-        match self.http_verdict(ctx) {
-            HttpTriggerVerdict::Decided(decision) => Some(decision),
-            HttpTriggerVerdict::Ambiguous { .. } => None,
-        }
-    }
-
-    /// Evaluate the trigger for an HTTP request (issue #6579).
-    ///
-    /// A query-reading trigger on a raw query that carries an unencoded `;`
-    /// is evaluated twice: once splitting pairs on `&` only, once on `&` and
-    /// `;`, the way some backends read `?x=;action=delete`. The whole tree is
-    /// evaluated each time, so a decisive non-query condition (a path, host,
-    /// or source leaf) still decides. Only when the two readings disagree is
-    /// the verdict ambiguous.
-    fn http_verdict(&self, ctx: &RequestContext) -> HttpTriggerVerdict {
-        let ampersand_only = self.compiled.evaluate(&HttpTriggerFacts::new(ctx));
-        let semicolon_query = self.compiled.reads_query()
-            && ctx
-                .raw_query_string()
-                .is_some_and(|query| query.contains(';'));
-        if !semicolon_query {
-            return HttpTriggerVerdict::Decided(ampersand_only);
-        }
-        let mut facts = HttpTriggerFacts::new(ctx);
-        facts.split_query_on_semicolons = true;
-        if self.compiled.evaluate(&facts) == ampersand_only {
-            HttpTriggerVerdict::Decided(ampersand_only)
-        } else {
-            HttpTriggerVerdict::Ambiguous { ampersand_only }
-        }
+        Some(self.compiled.evaluate(&HttpTriggerFacts::new(ctx)))
     }
 
     /// Read-only view of an already-memoized decision.
@@ -410,23 +372,12 @@ impl PluginTriggerGate {
 // HTTP-family facts
 // ---------------------------------------------------------------------------
 
-/// Outcome of evaluating a trigger against an HTTP request.
-enum HttpTriggerVerdict {
-    Decided(bool),
-    /// The `&`-only and the `&`-plus-`;` query readings disagree.
-    Ambiguous {
-        ampersand_only: bool,
-    },
-}
-
 /// Zero-copy [`TriggerFacts`] view over a live HTTP request context.
 pub struct HttpTriggerFacts<'a> {
     ctx: &'a RequestContext,
     host: Option<&'a str>,
     protocols: [PluginTriggerProtocol; 3],
     protocol_len: usize,
-    /// Also split query pairs on `;`, the reading of a backend that does.
-    split_query_on_semicolons: bool,
 }
 
 impl<'a> HttpTriggerFacts<'a> {
@@ -463,7 +414,6 @@ impl<'a> HttpTriggerFacts<'a> {
             host: ctx.request_authority.as_deref().map(authority_host),
             protocols,
             protocol_len,
-            split_query_on_semicolons: false,
         }
     }
 }
@@ -579,12 +529,7 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
         let Some(query) = self.ctx.raw_query_string() else {
             return;
         };
-        let separators: &[char] = if self.split_query_on_semicolons {
-            &['&', ';']
-        } else {
-            &['&']
-        };
-        for pair in query.split(separators) {
+        for pair in query.split('&') {
             if pair.is_empty() {
                 continue;
             }
