@@ -52,8 +52,9 @@
 //! `x-openai-api-key`, `x-amz-security-token`, `x-vendor-auth-token` are also
 //! caught), is credential-shaped (a separator-delimited segment is a
 //! credential-class word such as `auth`, `jwt`, `session`, `sid`, `key`, `pwd`,
-//! contains a credential stem such as `session`/`token`/`secret`, or ends in
-//! `key`; continuation cursors, authorship/authority names and
+//! contains a credential stem such as `session`/`token`/`secret`, or contains
+//! `key`/`pass` outside a few ordinary words; continuation cursors,
+//! authorship/authority names and
 //! `Idempotency-Key` excepted), or matches an operator `sensitive_header_patterns` entry is
 //! stripped before the distinct mirror origin. Because native gRPC metadata is carried as
 //! HTTP/2 headers, the same predicate covers gRPC credential metadata. Forwarding

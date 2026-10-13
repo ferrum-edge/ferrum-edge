@@ -14,12 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now splits each header name and decoded query name into alphanumeric
   segments and denies any name with a credential-class word (`auth`, `jwt`,
   `session`, `sid`, `key`, `pass`, `pwd`, `ticket`, `otp`, …), a credential
-  stem inside a segment (`session`, `token`, `secret`, `auth`, `passw`, …),
-  or a segment ending in `key`. Names such as `x-session-id`, `jwt`,
-  `x-access-key`, `x-private-key`, `session_id` and `key` no longer reach the
-  mirror origin. The exceptions are continuation cursors
-  (`x-continuation-token`, `continuation_token`), `author`/`authority`
-  names and `Idempotency-Key`. The exact `forward_sensitive_*_allowlist`
+  stem inside a segment (`session`, `sessid`, `token`, `secret`, `auth`,
+  `passw`, `pwd`, `otp`, `verifier`, …), or a segment containing `key` or
+  `pass` (other than ordinary words such as `keyword` or `passenger`). The
+  whole name `code` (OAuth authorization code) is denied too. Names such as
+  `x-session-id`, `jwt`, `x-access-key`, `x-private-key`, `session_id`,
+  `PHPSESSID` and `key` no longer reach the mirror origin. The exceptions
+  are continuation cursors (`x-continuation-token`, `continuation_token`),
+  `author`/`authority` names and `Idempotency-Key`. The exact `forward_sensitive_*_allowlist`
   stays the only way to forward a denied name.
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
