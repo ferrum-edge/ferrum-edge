@@ -98,7 +98,8 @@ use async_trait::async_trait;
 /// wrapped instance — a capability regression that appears only when an operator
 /// sets `priority_override` or a trigger. Adding a `Plugin` hook means adding it
 /// here; `tests/unit/plugins/plugin_trigger_gate_tests.rs` pins the ones whose
-/// default is a silent no-op.
+/// default is a silent no-op, and `tests/unit/plugins/plugin_cache_tests.rs`
+/// fails when any `Plugin` trait method lacks a forward here.
 ///
 /// `is_deferred_cors_wrapper` is the one deliberate exception: this wrapper is
 /// not that marker, and claiming it would stop `install_cors_finalizer` from
@@ -1128,6 +1129,18 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn answers_cors_preflights(&self) -> bool {
         self.inner.answers_cors_preflights()
+    }
+    fn cors_uses_strict_origin_policy(&self) -> bool {
+        self.inner.cors_uses_strict_origin_policy()
+    }
+    fn rejects_with_origin_response(&self) -> bool {
+        self.inner.rejects_with_origin_response()
+    }
+    /// Forwarded regardless of the trigger: the kTLS handoff is decided before
+    /// the handshake, when a gated instance may still admit a principal on
+    /// this connection, so the listener must stay on the buffered path.
+    fn admits_authenticated_stream_principal(&self) -> bool {
+        self.inner.admits_authenticated_stream_principal()
     }
     fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
         self.inner.country_mmdb_snapshot()
