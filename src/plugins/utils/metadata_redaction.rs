@@ -334,6 +334,8 @@ const CREDENTIAL_CLASS_STEMS: &[&str] = &[
 /// observable.
 const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "api",
+    "mfa",
+    "integrity",
     "private",
     "access",
     "secret",

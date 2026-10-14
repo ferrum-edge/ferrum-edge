@@ -680,6 +680,10 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "mfa_code",
     "mfa_seed",
     "x-mfa-code",
+    "x-mfaKey",
+    "mfakey",
+    "redis_integrity_key",
+    "x-integrity-key",
     "mesh.signingkeybase64url",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",
@@ -723,6 +727,7 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "tokenizer_name",
     "tokens_per_second",
     "tokenspersecond",
+    "integrity_status",
 ];
 
 #[test]
