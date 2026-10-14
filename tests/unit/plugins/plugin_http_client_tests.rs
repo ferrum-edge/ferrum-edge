@@ -2032,7 +2032,11 @@ mod plugin_egress_crls {
                 proxy.listen_path = Some("/".to_string());
                 ctx.matched_proxy = Some(Arc::new(proxy));
                 match plugin.on_request_received(&mut ctx).await {
-                    ferrum_edge::plugins::PluginResult::Reject { status_code, .. } => status_code,
+                    // A served spec is RejectBinary; a fetch failure is Reject.
+                    ferrum_edge::plugins::PluginResult::Reject { status_code, .. }
+                    | ferrum_edge::plugins::PluginResult::RejectBinary { status_code, .. } => {
+                        status_code
+                    }
                     other => panic!("spec_expose must answer /specz itself, got {other:?}"),
                 }
             }

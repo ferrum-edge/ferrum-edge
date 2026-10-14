@@ -586,21 +586,24 @@ impl SpecExpose {
     /// Fetch the spec from the upstream. The caller publishes either the fresh
     /// success or a sanitized negative-cache completion.
     async fn fetch_spec(&self) -> Result<CachedSpec, FetchFailure> {
-        let response = self
-            .http_client
-            .current()
-            .get(&self.spec_url)
-            .send()
-            .await
-            .map_err(|e| {
-                let error_class = classify_reqwest_error(&e);
-                tracing::warn!(
-                    spec_origin = %self.spec_origin,
-                    error_class = %error_class,
-                    "spec_expose: failed to fetch spec document"
-                );
-                fetch_failure(502, "Failed to fetch API specification from upstream")
-            })?;
+        // A failed CRL-generation rebuild leaves no usable client: fail the
+        // fetch closed instead of reusing the previous generation's pool.
+        let client = self.http_client.current().map_err(|_| {
+            tracing::warn!(
+                spec_origin = %self.spec_origin,
+                "spec_expose: plugin HTTP client unavailable for the current CRL generation"
+            );
+            fetch_failure(502, "Failed to fetch API specification from upstream")
+        })?;
+        let response = client.get(&self.spec_url).send().await.map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            tracing::warn!(
+                spec_origin = %self.spec_origin,
+                error_class = %error_class,
+                "spec_expose: failed to fetch spec document"
+            );
+            fetch_failure(502, "Failed to fetch API specification from upstream")
+        })?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();

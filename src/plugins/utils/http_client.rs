@@ -278,6 +278,10 @@ pub struct PluginHttpClient {
     /// builds fresh clients, so connections pooled under the previous
     /// generation are retired with their old client instead of being reused.
     crl_rotation: Option<Arc<CrlClientRotation>>,
+    /// Gateway CRLs were configured with verification on, whether or not the
+    /// CRL posture could be built (`live_crl_verifier` is `None` when it
+    /// failed closed).
+    crl_enforcement_configured: bool,
     /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
     /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
     /// collisions when multiple gateway instances with different namespaces share
@@ -321,7 +325,10 @@ pub struct PluginHttpClient {
 impl std::fmt::Debug for PluginHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginHttpClient")
-            .field("has_shared_client", &self.client.is_some())
+            .field(
+                "has_shared_client",
+                &(self.client.is_some() || self.crl_rotation.is_some()),
+            )
             .field("has_http2_client", &self.http2_client.is_some())
             .field("has_http1_client", &self.http1_client.is_some())
             .field("slow_threshold", &self.slow_threshold)
@@ -632,7 +639,9 @@ pub(crate) enum DedicatedClientAlpn {
 
 struct DedicatedGeneration {
     crls: CrlList,
-    client: reqwest::Client,
+    /// `None` after a failed rebuild: requests are refused until the next
+    /// rebuild succeeds.
+    client: Option<reqwest::Client>,
 }
 
 struct DedicatedRotation {
@@ -679,14 +688,17 @@ impl DedicatedRotation {
     fn build_for(&self, crls: CrlList) -> Result<Arc<DedicatedGeneration>, String> {
         let tls = dedicated_tls_config(&self.verifier, self.alpn, self.client_auth.as_ref())?;
         let client = (self.build)(Some(tls))?;
-        Ok(Arc::new(DedicatedGeneration { crls, client }))
+        Ok(Arc::new(DedicatedGeneration {
+            crls,
+            client: Some(client),
+        }))
     }
 
-    fn current(&self) -> reqwest::Client {
+    fn current(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
         let live = self.verifier.live_generation();
         let current = self.current.load_full();
         if Arc::ptr_eq(&current.crls, &live) {
-            return current.client.clone();
+            return current.client.clone().ok_or(PluginHttpClientUnavailable);
         }
         let _guard = self
             .rebuild
@@ -694,25 +706,29 @@ impl DedicatedRotation {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.current.load_full();
         if Arc::ptr_eq(&current.crls, &live) {
-            return current.client.clone();
+            return current.client.clone().ok_or(PluginHttpClientUnavailable);
         }
-        match self.build_for(live) {
-            Ok(next) => {
-                let client = next.client.clone();
-                self.current.store(next);
-                client
-            }
+        let next = match self.build_for(Arc::clone(&live)) {
+            Ok(next) => next,
             Err(error) => {
-                // Keep the previous generation's client: its handshakes still
-                // consult the live CRL generation through the shared verifier,
-                // so only pooled-connection retirement is deferred.
+                // Fail closed: the previous generation's pool may hold a
+                // connection to a now-revoked peer, so it must not carry new
+                // requests. The next call retries the rebuild.
                 tracing::warn!(
                     error = %sanitize_startup_cause(&error, &[]),
-                    "Failed to rebuild a dedicated plugin HTTP client for a new CRL generation"
+                    "Failed to rebuild a dedicated plugin HTTP client for a new CRL generation; \
+                     refusing requests until it can be rebuilt"
                 );
-                current.client.clone()
+                self.current.store(Arc::new(DedicatedGeneration {
+                    crls: current.crls.clone(),
+                    client: None,
+                }));
+                return Err(PluginHttpClientUnavailable);
             }
-        }
+        };
+        let client = next.client.clone();
+        self.current.store(next);
+        client.ok_or(PluginHttpClientUnavailable)
     }
 }
 
@@ -742,10 +758,12 @@ impl DedicatedPluginClient {
         }
     }
 
-    /// The client for the current CRL generation.
-    pub(crate) fn current(&self) -> reqwest::Client {
+    /// The client for the current CRL generation. `Err` when a rebuild for a
+    /// new generation failed: callers must fail closed rather than reuse the
+    /// previous generation's pool.
+    pub(crate) fn current(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
         match &self.inner {
-            DedicatedPluginClientInner::Fixed(client) => client.clone(),
+            DedicatedPluginClientInner::Fixed(client) => Ok(client.clone()),
             DedicatedPluginClientInner::CrlRotating(rotation) => rotation.current(),
         }
     }
@@ -1406,6 +1424,7 @@ impl PluginHttpClient {
         let dns_cache_clone = dns_cache.clone();
         let tls_posture =
             PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path, &tls_crls);
+        let crl_enforcement_configured = !tls_no_verify && !tls_crls.is_empty();
 
         let client = accept_plugin_http_client(
             build_configured_plugin_client(
@@ -1429,21 +1448,29 @@ impl PluginHttpClient {
             build_http1_only_plugin_client(pool_config, Some(dns_cache.clone()), &tls_posture),
             "Failed to build the HTTP/1.1 plugin HTTP companion client",
         );
-        let crl_rotation = match &tls_posture {
-            PluginTlsPosture::CrlEnforced(verifier) => Some(Arc::new(CrlClientRotation {
-                verifier: Arc::clone(verifier),
-                pool_config: pool_config.clone(),
-                dns_cache,
-                posture: tls_posture.clone(),
-                current: arc_swap::ArcSwap::from_pointee(ClientGeneration {
-                    crls: verifier.live_generation(),
-                    shared: client.as_deref().cloned(),
-                    http2: http2_client.as_deref().cloned(),
-                    http1: http1_client.as_deref().cloned(),
-                }),
-                rebuild: std::sync::Mutex::new(()),
-            })),
-            _ => None,
+        // With CRLs enforced the rotating generations own the clients: the
+        // fixed fields stay empty so a retired generation's pools close once
+        // its last in-flight user finishes.
+        let (client, http2_client, http1_client, crl_rotation) = match &tls_posture {
+            PluginTlsPosture::CrlEnforced(verifier) => (
+                None,
+                None,
+                None,
+                Some(Arc::new(CrlClientRotation {
+                    verifier: Arc::clone(verifier),
+                    pool_config: pool_config.clone(),
+                    dns_cache,
+                    posture: tls_posture.clone(),
+                    current: arc_swap::ArcSwap::from_pointee(ClientGeneration {
+                        crls: verifier.live_generation(),
+                        shared: client.map(Arc::unwrap_or_clone),
+                        http2: http2_client.map(Arc::unwrap_or_clone),
+                        http1: http1_client.map(Arc::unwrap_or_clone),
+                    }),
+                    rebuild: std::sync::Mutex::new(()),
+                })),
+            ),
+            _ => (client, http2_client, http1_client, None),
         };
 
         Self {
@@ -1464,6 +1491,7 @@ impl PluginHttpClient {
                 _ => None,
             },
             crl_rotation,
+            crl_enforcement_configured,
             namespace: namespace.to_string(),
             real_ip_header: None,
             backend_allow_ips,
@@ -1533,6 +1561,7 @@ impl PluginHttpClient {
             tls_crl_source_configured: false,
             live_crl_verifier: None,
             crl_rotation: None,
+            crl_enforcement_configured: false,
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             real_ip_header: None,
             backend_allow_ips: BackendEgressPolicy::unrestricted(),
@@ -1854,7 +1883,7 @@ impl PluginHttpClient {
     /// Whether the gateway CRLs are enforced on plugin egress (configured at
     /// startup with verification on).
     pub(crate) fn enforces_gateway_crls(&self) -> bool {
-        self.live_crl_verifier.is_some()
+        self.crl_enforcement_configured
     }
 
     /// Build a plugin-owned `reqwest::Client` that applies the gateway CRLs
@@ -1880,8 +1909,18 @@ impl PluginHttpClient {
         + Sync
         + 'static,
     ) -> Result<DedicatedPluginClient, String> {
-        let Some(shared_verifier) = self.live_crl_verifier.as_ref().filter(|_| verify) else {
+        if !verify || !self.crl_enforcement_configured {
             return build(None).map(DedicatedPluginClient::fixed);
+        }
+        // CRLs are configured and verification is on, but the shared CRL
+        // posture could not be built (its trust store or verifier failed):
+        // refuse rather than build a client that silently ignores the CRLs.
+        let Some(shared_verifier) = self.live_crl_verifier.as_ref() else {
+            return Err(
+                "gateway CRLs are configured but could not be applied; refusing to build a \
+                 client without revocation checks"
+                    .to_string(),
+            );
         };
         let verifier = match custom_ca_pem {
             Some(pem) => {
@@ -1912,7 +1951,7 @@ impl PluginHttpClient {
         let rotation = DedicatedRotation {
             current: arc_swap::ArcSwap::from_pointee(DedicatedGeneration {
                 crls,
-                client: first,
+                client: Some(first),
             }),
             verifier,
             alpn,

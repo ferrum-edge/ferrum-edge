@@ -1076,8 +1076,15 @@ impl Plugin for LoadTesting {
         let max_response_body_bytes = self.max_response_body_bytes;
         let request_timeout_ms = self.request_timeout_ms;
         let gateway_base_url = self.gateway_base_url.clone();
-        // One CRL generation's client for this run.
-        let load_test_client = self.load_test_client.current();
+        // One CRL generation's client for this run. A failed CRL-generation
+        // rebuild leaves no usable client: refuse the run instead of reusing
+        // the previous generation's pool.
+        let Ok(load_test_client) = self.load_test_client.current() else {
+            tracing::warn!(
+                "load_testing: plugin HTTP client unavailable for the current CRL generation; ignoring trigger"
+            );
+            return self.refuse_for_resource_budget(is_fanout);
+        };
         let state = Arc::clone(&self.state);
         let gateway_addresses = self.gateway_addresses.clone();
         let http_client = self.http_client.clone();

@@ -4945,7 +4945,15 @@ async fn post_json_each_row_bytes(
                 };
             }
         },
-        ClickHouseHttpClient::Dedicated(client) => client.current().post(&cfg.insert_url),
+        ClickHouseHttpClient::Dedicated(client) => match client.current() {
+            Ok(dedicated) => dedicated.post(&cfg.insert_url),
+            Err(_) => {
+                return DeliveryOutcome::Permanent {
+                    status: 502,
+                    message: "plugin HTTP client unavailable".to_string(),
+                };
+            }
+        },
     }
     .timeout(cfg.timeout)
     .header(CONTENT_TYPE, "application/json")
