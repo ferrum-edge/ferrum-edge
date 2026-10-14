@@ -9,23 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Log metadata redaction classifies credential names by class** (issue
-  #6619). The central redactor matched a fixed substring list plus the
-  `token` and API-key classifiers. Metadata under names such as `session_id`,
-  `passwd`, `credential`, `passphrase`, `private_key`, `jwt`, `signature` or
-  `access_key` therefore reached every log sink verbatim. A credential-class
-  classifier now fails closed on unlisted spellings across delimiters,
-  camelCase and concatenation: session identifiers, passwords, passphrases
-  and passcodes, PINs and one-time codes, credentials, JWTs, signatures,
-  private/access/signing keys, bearer assertions and CSRF state. Ordinary
-  dimensions such as `cache_key`, `request_id` and `ai_total_tokens` stay
-  visible. The same decision now governs log-schema field names, mesh trace
-  attributes, `workload_metrics` custom tag names and header tags, and
-  `workload_metrics` environment-variable tags, so `GPG_PASSPHRASE`, `HSM_PIN`
-  and `x-session-id` can no longer be copied into telemetry. Admin
-  plugin-config projection keeps its listed-name floor, so configuration
-  fields such as `session_ttl_seconds` stay visible.
-
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
