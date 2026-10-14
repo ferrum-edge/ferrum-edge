@@ -462,7 +462,9 @@ curl https://localhost:8443/api/v1
 consumes them — frontend and admin mTLS (HTTP/1.1, HTTP/2, HTTP/3, and TCP+TLS),
 frontend DTLS, the mesh operator-CA and SPIFFE peer verifiers, rustls backend
 server verification on the proxy data path, active HTTPS and gRPC health-check
-probes, and the rustls LDAP / TCP / UDP / WebSocket logging sinks. Across those
+probes, the rustls LDAP / TCP / UDP / WebSocket logging sinks, and the shared
+plugin HTTP clients (JWKS, OIDC discovery, token introspection, webhooks and
+HTTP logging sinks). Across those
 surfaces there is no per-surface CRL setting and no way for one of them to run a
 weaker posture than another. The surfaces the CRL source does not reach at all
 are listed at the end of this section.
@@ -565,8 +567,22 @@ timestamps, and secret source URIs are never logged.
 ### Surfaces CRLs do not reach
 
 CRLs are not applied to the DP gRPC client’s verification of CP server
-certificates or to reqwest-based plugin egress; those stacks do not expose a
-compatible CRL configuration. The CP gRPC server does enforce the configured
+certificates; that stack does not expose a compatible CRL configuration.
+Plugin HTTP egress applies them through a preconfigured rustls verifier (issue
+#6621): with `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared
+plugin clients trust `FERRUM_TLS_CA_BUNDLE_PATH` exclusively or, without it,
+the bundled webpki roots (not the OS trust store), refuse revoked chains,
+disable session resumption, and follow the backend CRL generation that backend
+TLS live reload publishes. A CA bundle or verifier that cannot be built fails
+closed with an empty trust store. Whether plugin egress enforces CRLs is
+decided at startup: a CRL source first configured later needs a restart. A
+refreshed CRL applies to every **new** plugin connection; a pooled keep-alive
+connection established before the refresh is reused until it closes, unlike
+backend pools, which backend TLS reload drains. Three plugins build dedicated
+reqwest clients and do not apply CRLs: `spec_expose` spec fetches,
+`api_chargeback_sink` when ClickHouse custom TLS (`clickhouse.tls.*`) is
+configured, and `load_testing` loopback traffic with `gateway_tls: true`. All
+three are tracked in issue #6651. The CP gRPC server does enforce the configured
 CRL when verifying DP client certificates, including on live reload.
 `kafka_logging` uses librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
 Skip-verify health probes (`backend_tls_verify_server_cert: false` or

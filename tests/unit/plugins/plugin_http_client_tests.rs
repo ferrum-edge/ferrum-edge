@@ -1660,3 +1660,249 @@ async fn tracked_through_body_charges_header_time_exactly_once() {
         "the header wait must be charged exactly once, got {charged:?}"
     );
 }
+
+// ── Gateway CRLs on plugin egress (issue #6621) ────────────────────────────
+
+mod plugin_egress_crls {
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::plugins::PluginHttpClient;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
+    use std::io::Write;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const HOST: &str = "plugin-crl.invalid";
+    const REVOKED_SERIAL: u64 = 0x6621;
+    const OTHER_SERIAL: u64 = 0x6622;
+
+    struct TestCa {
+        cert_pem: String,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn test_ca() -> TestCa {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Plugin CRL Test CA");
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
+        let cert = params.self_signed(&key_pair).expect("self-sign CA");
+        TestCa {
+            cert_pem: cert.pem(),
+            issuer: Issuer::new(params, key_pair),
+        }
+    }
+
+    fn leaf(ca: &TestCa, serial: u64) -> (String, String) {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::new(vec![HOST.to_string()]).expect("leaf params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, HOST);
+        params.serial_number = Some(rcgen::SerialNumber::from(serial));
+        let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
+    fn crl_revoking(ca: &TestCa, serial: u64) -> CertificateRevocationListDer<'static> {
+        use rcgen::{
+            CertificateRevocationListParams, RevocationReason, RevokedCertParams, SerialNumber,
+        };
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let now = OffsetDateTime::now_utc();
+        let params = CertificateRevocationListParams {
+            this_update: now - TimeDuration::minutes(1),
+            next_update: now + TimeDuration::days(7),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(serial),
+                revocation_time: now - TimeDuration::minutes(1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        params
+            .signed_by(&ca.issuer)
+            .expect("sign CRL")
+            .der()
+            .clone()
+    }
+
+    /// HTTPS origin that answers every request with a small JWKS-shaped body
+    /// and closes the connection, so each fetch performs a new handshake.
+    async fn spawn_https_origin(cert_pem: &str, key_pem: &str) -> u16 {
+        let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("leaf cert");
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("leaf key");
+        let provider = Arc::new(ferrum_edge::fips::base_crypto_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("server protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTPS origin");
+        let port = listener.local_addr().expect("origin address").port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buf[..read]),
+                        }
+                    }
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                              content-length: 11\r\nconnection: close\r\n\r\n{\"keys\":[]}",
+                        )
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn plugin_client(
+        ca_path: &str,
+        crls: Vec<CertificateRevocationListDer<'static>>,
+    ) -> PluginHttpClient {
+        let dns_cache = DnsCache::new(DnsConfig {
+            global_overrides: std::collections::HashMap::from([(
+                HOST.to_string(),
+                "127.0.0.1".to_string(),
+            )]),
+            ..DnsConfig::default()
+        });
+        PluginHttpClient::new(
+            &PoolConfig::default(),
+            dns_cache,
+            1_000,
+            0,
+            100,
+            false,
+            Some(ca_path),
+            Arc::new(crls),
+            "default",
+            BackendEgressPolicy::unrestricted(),
+            Arc::new(Vec::new()),
+            0,
+        )
+    }
+
+    async fn fetch(client: &reqwest::Client, port: u16) -> Result<u16, reqwest::Error> {
+        client
+            .get(format!("https://{HOST}:{port}/.well-known/jwks.json"))
+            .send()
+            .await
+            .map(|response| response.status().as_u16())
+    }
+
+    fn write_ca(ca: &TestCa) -> tempfile::NamedTempFile {
+        let mut ca_file = tempfile::NamedTempFile::new().expect("CA temp file");
+        ca_file
+            .write_all(ca.cert_pem.as_bytes())
+            .expect("write CA PEM");
+        ca_file
+    }
+
+    #[tokio::test]
+    async fn plugin_egress_rejects_a_certificate_revoked_by_the_gateway_crl() {
+        let ca = test_ca();
+        let ca_file = write_ca(&ca);
+        let ca_path = ca_file.path().to_str().expect("CA path").to_string();
+        let (cert_pem, key_pem) = leaf(&ca, REVOKED_SERIAL);
+        let port = spawn_https_origin(&cert_pem, &key_pem).await;
+
+        // Baseline: the CA-signed certificate is trusted without a CRL.
+        let no_crl = plugin_client(&ca_path, Vec::new());
+        assert_eq!(
+            fetch(no_crl.get().expect("shared client"), port)
+                .await
+                .expect("baseline fetch"),
+            200
+        );
+
+        // A CRL for the same issuer that does not list this serial still
+        // admits it: the CRL posture keeps the configured trust anchors.
+        let other_crl = plugin_client(&ca_path, vec![crl_revoking(&ca, OTHER_SERIAL)]);
+        for client in [
+            other_crl.get().expect("shared client"),
+            other_crl.get_http1().expect("HTTP/1.1 companion"),
+        ] {
+            assert_eq!(
+                fetch(client, port)
+                    .await
+                    .expect("fetch with an unrelated revocation"),
+                200
+            );
+        }
+
+        // The CRL revoking this serial refuses the handshake on the shared
+        // client and the HTTP/1.1 companion. (The HTTP/2 companion shares the
+        // same posture; this HTTP/1.1-only origin cannot prove it separately.)
+        let revoked = plugin_client(&ca_path, vec![crl_revoking(&ca, REVOKED_SERIAL)]);
+        for (shape, client) in [
+            ("shared", revoked.get().expect("shared client")),
+            ("http1", revoked.get_http1().expect("HTTP/1.1 companion")),
+        ] {
+            assert!(
+                fetch(client, port).await.is_err(),
+                "{shape} plugin client must refuse a certificate revoked by the gateway CRL"
+            );
+        }
+    }
+
+    /// A CRL refresh published on the gateway's shared list (backend TLS live
+    /// reload) reaches new plugin connections without rebuilding the client,
+    /// in both directions.
+    #[tokio::test]
+    async fn plugin_egress_follows_live_crl_generations() {
+        let ca = test_ca();
+        let ca_file = write_ca(&ca);
+        let ca_path = ca_file.path().to_str().expect("CA path").to_string();
+        let (cert_pem, key_pem) = leaf(&ca, REVOKED_SERIAL);
+        let port = spawn_https_origin(&cert_pem, &key_pem).await;
+
+        let startup = vec![crl_revoking(&ca, OTHER_SERIAL)];
+        let live = ferrum_edge::tls::shared_crl_list(Arc::new(startup.clone()));
+        let client = plugin_client(&ca_path, startup).with_live_crls(Arc::clone(&live));
+        let shared = client.get().expect("shared client");
+        assert_eq!(fetch(shared, port).await.expect("startup generation"), 200);
+
+        live.store(Arc::new(vec![crl_revoking(&ca, REVOKED_SERIAL)]));
+        assert!(
+            fetch(shared, port).await.is_err(),
+            "a revocation published after startup must reach new plugin connections"
+        );
+
+        live.store(Arc::new(vec![crl_revoking(&ca, OTHER_SERIAL)]));
+        assert_eq!(
+            fetch(shared, port).await.expect("revocation withdrawn"),
+            200
+        );
+    }
+}
