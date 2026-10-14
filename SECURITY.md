@@ -80,7 +80,12 @@ Include the following information:
 7. **Keep dependencies updated**: Monitor for security advisories
 8. **Enable audit logging**: Track administrative changes
 9. **Run with minimal privileges**: Don't run as root in containers
-10. **Protect the configuration database and its backups**: Consumer API keys
+10. **Treat custom plugins as gateway code**: anything compiled from
+    `custom_plugins/` runs in-process with full gateway privileges and
+    self-declares its failure policy. Review it like a core change and
+    restrict who can write to that directory in your build. See
+    [Custom plugin trust boundary](CUSTOM_PLUGINS.md#trust-boundary).
+11. **Protect the configuration database and its backups**: Consumer API keys
     (`keyauth`) and shared secrets (`jwt`, `hmac_auth`) are stored recoverable
     at rest so the gateway can verify them; only Basic passwords are hashed.
     A database, replica, or backup read recovers them. See

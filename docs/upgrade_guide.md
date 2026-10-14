@@ -28,39 +28,27 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### Cleartext OPA, serverless and tracing endpoints need an opt-in (issue #6617)
+### Shared consumer credentials are refused (#6572)
 
-`opa` (`opa_host`), `serverless_function` (`function_url`, `aws_endpoint_url`),
-`otel_tracing` (`endpoint`) and `workload_metrics` (tracing-provider URLs) now
-refuse an `http://` endpoint at load time unless its host is a loopback IP
-literal written as `127.d.d.d` or `[::1]`. Before upgrading, for each such
-plugin either:
+Consumers whose `id`, `username` or `custom_id` collide are still quarantined
+as before: the later consumer is left out of the snapshot. Among the remaining
+consumers, a configuration in which two consumers of one namespace share a
+`keyauth` key, a `basicauth` username, or an exact `mtls_auth` identity is now
+refused by
+database full loads, control planes, data planes, and incremental applies; the
+previous configuration stays live on a running gateway. The Admin API already
+refused to create such collisions, so only rows written out of band or before
+that check can trigger it.
 
-- switch the endpoint to `https://`,
-- point a co-located sidecar at `127.0.0.1` instead of `localhost`, or
-- set `allow_plaintext: true` on the plugin when cleartext to that host is
-  intended (for example an in-cluster OPA or collector service).
+At **startup** there is no previous configuration: a database-mode gateway
+whose initial load is refused falls back to a valid backup if one is configured,
+and otherwise exits before its Admin API binds. **Before upgrading**, look for
+`Credential collision` warnings in the gateway log and rotate or remove one
+side of each collision, either through the Admin API of a still-running
+(pre-upgrade) instance or directly in storage.
+### `openapi_validator` bypass headers need a secret (PR #6634)
 
-Mesh mode needs no action: injection sets `allow_plaintext: true` on the
-`workload_metrics` plugin for translated providers that use `http://`. A
-`workload_metrics` instance you configure directly needs the flag yourself.
-
-### Cleartext AI embedding endpoints need an opt-in (issue #6617)
-
-`ai_semantic_cache` and `ai_semantic_firewall` send an API key with every
-embedding call. An `http://` embedding endpoint is now refused at load time
-unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`.
-The name `localhost` does not count, because DNS overrides decide where it
-connects. Before upgrading, either:
-
-- switch the endpoint to `https://`,
-- point a local sidecar at `127.0.0.1` instead of `localhost`, or
-- set `semantic_embedding_allow_plaintext: true` (cache) or
-  `provider.allow_plaintext: true` (firewall) when cleartext to that host is
-  intended.
-
-`ai_semantic_firewall` also refuses a `provider.endpoint` that contains
-whitespace or control characters instead of trimming them.
+Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
 
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 

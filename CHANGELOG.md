@@ -9,27 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `opa`, `serverless_function`, `otel_tracing` and
-  `workload_metrics` refuse a cleartext endpoint off loopback** (issue
-  #6617). Each sends authorization input, invocation payloads, spans, or
-  credentials to its endpoint. An `http://` `opa_host`, `function_url`,
-  `aws_endpoint_url`, OTLP `endpoint`, or tracing-provider URL is now admitted
-  without an opt-in only for a `127.d.d.d` or `[::1]` literal; any other host,
-  `localhost` included, needs `allow_plaintext: true` on that plugin. Mesh
-  injection writes `allow_plaintext: true` on the injected `workload_metrics`
-  plugin whenever a translated Telemetry/MeshConfig provider uses `http://`,
-  so in-cluster collectors keep working with the posture visible in config.
-  The trusted `AWS_LAMBDA_ENDPOINT_URL` environment fallback is not screened.
-
-- **BREAKING — `ai_semantic_cache` and `ai_semantic_firewall` refuse a
-  cleartext embedding endpoint off loopback** (issue #6617). Both send an API
-  key with every embedding call. An `http://` endpoint is now admitted without
-  an opt-in only for a `127.0.0.0/8` or `::1` literal. Any other host, the name
-  `localhost` included, needs
-  `semantic_embedding_allow_plaintext: true` (cache) or
-  `provider.allow_plaintext: true` (firewall), matching the `allow_plaintext`
-  opt-in `ai_federation` and `ai_stream_router` already require. `ai_semantic_firewall`
-  also refuses whitespace or control characters in `provider.endpoint`.
+- **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
+  refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
+  full loaders only warned when two consumers in one namespace, whose
+  identities did not collide, shared an API key or exact mTLS identity, and
+  the consumer index then authenticated
+  that credential as whichever consumer was indexed last. Database full loads,
+  CP snapshots and deltas, and every runtime swap (including DP snapshots and
+  incremental applies) now refuse such a config and keep the previous one,
+  the same way case-variant mTLS DNS identities were already refused and file
+  mode already failed. Identity collisions keep their existing quarantine
+  (#2121), which drops the later consumer. Admin writes were already blocked from creating these
+  collisions. On a running gateway, repair a pre-existing one through the Admin
+  API while the previous config stays live. An initial database load that is
+  refused has no previous config and needs a valid backup, so repair
+  collisions before upgrading.
+- **BREAKING — `openapi_validator` `bypass.header_present` requires a
+  shared secret.** (issue n/a, PR #6634) Each entry now maps a header name to a secret of
+  16–4096 visible ASCII characters, and a request skips validation only
+  when that header carries exactly the secret, compared in constant time.
+  Presence-only entries (`null`) and short, padded, non-ASCII or control
+  values are rejected at construction, because a client can send any header
+  name. The bypass header names are redacted from diagnostics and policy
+  calls. Inject the header from a trusted hop or gateway plugin.
+- **Reproducible release builds and no persisted checkout tokens** (issues
+  #6574, #6581). The production `Dockerfile` builds its eBPF ELF with a dated
+  nightly (`EBPF_NIGHTLY_TOOLCHAIN`, currently `nightly-2026-09-30`) instead
+  of the floating `nightly` channel. The `Dockerfile` builds, the native
+  release builds, and the x86_64 GNU sysroot builder pass `cargo build
+  --locked`, so a stale `Cargo.lock` fails the build instead of being
+  re-resolved. Non-pushing `actions/checkout` steps set
+  `persist-credentials: false`, and `verify_workflow_permissions.py` rejects
+  a checkout that omits it. Jobs frozen by the trusted Cross policy are listed
+  and wait for a policy migration.
 - **BREAKING — HTTP/3 always percent-decodes `ctx.query_params`** (issue
   #6580). HTTP/3 used to materialize the raw form (`%2Fadmin`) unless an
   active plugin opted in through `requires_decoded_query_params()`, while
@@ -168,13 +180,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Plugin hot-path allocations** (issues #6617, #6628). `prometheus_metrics`
-  counter maps and the global JWKS cache are now sharded through
-  `pool_shard_amount`, like other hot-path `DashMap`s. `mcp_gateway` reads
-  the one session field it needs instead of deep-cloning the whole downstream
-  session. Route header `add` rules no longer allocate a key when appending
-  to an existing header.
-
+- **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
+  `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
+  clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging
+  sinks) verify servers through a rustls verifier that applies the shared CRL
+  policy, so a revoked certificate is refused there as on every other TLS
+  surface. They trust `FERRUM_TLS_CA_BUNDLE_PATH` exclusively or, without it,
+  the bundled webpki roots instead of the OS trust store, disable session
+  resumption, and follow the backend CRL generation that backend TLS live
+  reload publishes. A trust store or verifier that cannot be built fails
+  closed. `FERRUM_TLS_NO_VERIFY` still disables verification, and now logs a
+  warning when a CA bundle or CRL source is configured alongside it.
+- **`ldap_auth` re-checks `required_groups` on cached credentials** (issue
+  #6609). With the opt-in credential cache, a hit used to skip the group
+  search for the whole `cache_ttl_seconds` (up to 24 hours). A hit whose last
+  group check is older than the new `group_cache_ttl_seconds` (default 60,
+  `0` = every hit) now re-runs it under the usual concurrency and deadline
+  bounds; a user removed from every required group gets 403 and the entry is
+  evicted. Password-change and disablement lag stays bounded by
+  `cache_ttl_seconds`, now documented, and values above 900 seconds log a
+  warning. Search-then-bind also spends one connection and bind on an unknown
+  username, removing the extra round trips a known user's wrong password used
+  to cost; directory-side password-hash cost for existing entries can still
+  differ.
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
@@ -192,6 +220,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   official `mongo:9` image starts on the `ubuntu-26.04` runner kernel.
 
 ### Fixed
+
+- **`ws_logging` charges one back-off per failed attempt and none after the
+  last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
+  failure, including after the final attempt, and `send_batch` added
+  `retry_delay_ms` on top, so at the defaults a batch aimed at an
+  unreachable collector held the single delivery worker for about 44 s.
+  The retry ladder now owns the back-off. That is `reconnect_delay_ms` after
+  a failed connection and `retry_delay_ms` after a failed send, never both
+  and never after the final attempt, and per-attempt warnings are sampled.
+  The same change removes the unreachable empty-`endpoint_url` flush branch
+  and refuses a partially staged activation before consuming its config.
+  `ws_rate_limiting` single-flights its over-cap idle sweep behind the same
+  cooldown CAS gate `udp_rate_limiting` uses, as defense in depth.
+- **Equal-priority plugins now run in a deterministic order** (issue #6614).
+  Ties used to follow config iteration order, which a database (unordered
+  `proxy_plugins` association rows), a reordered config file, or an
+  incremental reload could change. Chains now order by priority, then plugin
+  name, then scope (global, proxy, proxy group), then plugin-config id.
+  Candidate admission and every rebuild path use the same order. No two
+  built-in plugins share a default priority, so chains of distinct plugin
+  types are unchanged. Several instances of one plugin at the same priority
+  now run in plugin-config id order instead of config/association order, and
+  two `cors` instances sharing a priority can no longer be split by an
+  equal-priority interloper.
+- **Documented the custom-plugin trust boundary and constructor contract**
+  (issue #6616). `CUSTOM_PLUGINS.md` now states that `custom_plugins/` code is
+  trusted, in-process gateway code whose declared failure policy is taken as
+  given. It also says constructors double as validators and must be free of
+  side effects, because admin, CP, and `ferrum-edge validate` construct and
+  drop them.
+- **Plugin instances with a `priority_override` or trigger keep every
+  capability declaration** (issue #6606). The cache wrapper did not forward
+  `admits_authenticated_stream_principal`, `cors_uses_strict_origin_policy`
+  or `rejects_with_origin_response`, so a wrapped `mtls_auth` or
+  `spiffe_identity` instance on a kTLS TCP listener was refused at relay time
+  instead of staying on the buffered path, a wrapped strict `cors` instance
+  skipped the WebSocket-origin warning, and a wrapped cache plugin's origin
+  responses were tagged as gateway rejections. A unit test now fails when any
+  `Plugin` trait method lacks a wrapper forward.
 
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the

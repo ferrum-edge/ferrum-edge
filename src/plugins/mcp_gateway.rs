@@ -1314,6 +1314,10 @@ enum McpSessionQuotaKey {
     Anonymous(String),
 }
 
+/// A session's catalog and its refresh lock, projected together so callers can
+/// await without holding the session store's shard guard.
+type SessionCatalogLocks = (Arc<RwLock<McpCatalog>>, Arc<Mutex<()>>);
+
 #[derive(Clone)]
 struct DownstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
@@ -2532,10 +2536,7 @@ impl McpGateway {
 
     /// The session's catalog and its refresh lock, cloned as two `Arc`s under
     /// the shard guard so callers can await without deep-cloning the session.
-    fn session_catalog_locks(
-        &self,
-        downstream_session_id: &str,
-    ) -> Option<(Arc<RwLock<McpCatalog>>, Arc<Mutex<()>>)> {
+    fn session_catalog_locks(&self, downstream_session_id: &str) -> Option<SessionCatalogLocks> {
         self.session_store
             .get(downstream_session_id)
             .map(|session| {
