@@ -919,10 +919,16 @@ impl UsageCategories {
         }
         let base = match base {
             Counter::Value(base) => base,
+            // proto3 zero-omission: a reported sibling means the base was 0.
             Counter::Absent
                 if self.zero_omitted_base() && extras.iter().any(|c| c.is_reported()) =>
             {
                 0
+            }
+            // A category without the base its provider always sends is not a
+            // count of that side: unmeter it rather than undercount it.
+            Counter::Absent if extras.iter().any(|c| c.is_reported()) => {
+                return Counter::Invalid;
             }
             _ => return Counter::Absent,
         };
@@ -997,7 +1003,16 @@ impl UsageCategories {
             // without its base (cache reads beside an omitted input count)
             // still keeps a low total from standing; an overflowing floor
             // leaves the total unstated.
-            Counter::Value(reported) => self.reported_floor().map(|floor| reported.max(floor)),
+            // A total below the reported counters is inconsistent; it can only
+            // be raised to them when every side is known, otherwise the result
+            // is a lower bound, not a complete total.
+            Counter::Value(reported) => self.reported_floor().and_then(|floor| {
+                if reported >= floor || (prompt.is_some() && completion.is_some()) {
+                    Some(reported.max(floor))
+                } else {
+                    None
+                }
+            }),
             // Without a provider total, only both sides make a complete one.
             _ => match (prompt, completion) {
                 (Some(p), Some(c)) => p.checked_add(c),

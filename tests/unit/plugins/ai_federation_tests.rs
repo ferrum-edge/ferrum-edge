@@ -9702,31 +9702,35 @@ fn test_normalized_usage_clamps_one_sided_low_totals() {
         },
         "modelVersion": "gemini-2.0-flash"
     });
-    let (_, prompt, _, total) = test_helpers::normalize_response_test(
+    let (normalized, prompt, _, _) = test_helpers::normalize_response_test(
         "google_gemini",
         200,
         &serde_json::to_vec(&gemini).unwrap(),
         "gemini-2.0-flash",
     )
     .unwrap();
-    assert_eq!((prompt, total), (1010, 1010));
+    // The low provider total is inconsistent with the reported prompt while the
+    // completion side is unknown, so no complete total is published.
+    assert_eq!(prompt, 1010);
+    assert!(normalized["usage"].get("total_tokens").is_none());
 }
 
 #[test]
-fn test_normalized_bedrock_total_is_floored_by_categories_without_base() {
+fn test_normalized_bedrock_rejects_categories_without_base() {
     let bedrock = json!({
         "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
         "stopReason": "end_turn",
         "usage": {"cacheReadInputTokens": 1000, "outputTokens": 5, "totalTokens": 5}
     });
-    let (_, _, completion, total) = test_helpers::normalize_response_test(
-        "aws_bedrock",
-        200,
-        &serde_json::to_vec(&bedrock).unwrap(),
-        "anthropic.claude-3-sonnet",
-    )
-    .unwrap();
-    assert_eq!((completion, total), (5, 1005));
+    assert!(
+        test_helpers::normalize_response_test(
+            "aws_bedrock",
+            200,
+            &serde_json::to_vec(&bedrock).unwrap(),
+            "anthropic.claude-3-sonnet",
+        )
+        .is_err()
+    );
 }
 
 #[test]

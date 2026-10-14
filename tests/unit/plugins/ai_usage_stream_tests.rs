@@ -1061,8 +1061,11 @@ fn gemini_zero_omitted_candidates_overflow_and_one_sided_total() {
         }}),
         AiProvider::Google,
     );
+    // A provider total below the reported prompt, with the completion side
+    // unknown, is an inconsistent partial report: not published as complete.
     assert_eq!(one_sided.prompt_tokens, Some(1010));
-    assert_eq!(one_sided.total_tokens, Some(1010));
+    assert_eq!(one_sided.total_tokens, None);
+    assert!(!one_sided.is_complete_for_mode("total_tokens"));
 }
 
 #[test]
@@ -1282,15 +1285,28 @@ fn combined_overflow_clears_a_stale_total() {
 }
 
 #[test]
-fn categories_without_their_base_still_floor_a_reported_total() {
+fn categories_without_their_base_unmeter_instead_of_flooring() {
     use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
 
+    // Cache reads without the uncached-input base Bedrock always sends cannot
+    // be a complete prompt, and the inconsistent provider total (5) cannot
+    // stand in for it either: the usage is unmetered, never complete.
     let usage = extract_response_usage(
         &json!({"usage": {"cacheReadInputTokens": 1000, "outputTokens": 5, "totalTokens": 5}}),
         AiProvider::Bedrock,
     );
     assert_eq!(usage.prompt_tokens, None);
-    assert_eq!(usage.total_tokens, Some(1005));
+    assert_eq!(usage.total_tokens, None);
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+    assert!(!usage.is_complete_for_mode("prompt_tokens"));
+
+    // Anthropic: cache reads without `input_tokens` likewise unmeter.
+    let usage = extract_response_usage(
+        &json!({"usage": {"cache_read_input_tokens": 1000, "output_tokens": 5}}),
+        AiProvider::Anthropic,
+    );
+    assert!(!usage.is_complete_for_mode("prompt_tokens"));
+    assert!(!usage.is_complete_for_mode("total_tokens"));
 
     // Streamed: a total-only snapshot followed by a cache-only update.
     let usage_message = |usage: serde_json::Value| {
@@ -1299,14 +1315,10 @@ fn categories_without_their_base_still_floor_a_reported_total() {
     };
     let mut stream = usage_message(json!({"totalTokens": 5}));
     stream.extend_from_slice(&usage_message(json!({"cacheReadInputTokens": 1000})));
-    assert_eq!(
-        extract(
-            UsageStreamFormat::AwsEventStream,
-            &[&stream],
-            "total_tokens"
-        ),
-        Some(1000)
-    );
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
 }
 
 #[test]

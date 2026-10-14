@@ -6493,9 +6493,12 @@ impl GeminiUsageCounters {
         // later API revision). Never publish a total below the components
         // printed in the same chunk either. Without a provider total, only
         // both sides make a complete one.
+        // A provider total below the reported components is raised to them
+        // only when both sides are known; with a side missing it is an
+        // inconsistent partial report and is not published as complete.
         let total = match (self.total, prompt, completion) {
-            (Some(reported), _, _) => Some(reported.max(known)),
-            (None, Some(_), Some(_)) => Some(known),
+            (Some(reported), _, _) if reported >= known => Some(reported),
+            (Some(_), Some(_), Some(_)) | (None, Some(_), Some(_)) => Some(known),
             _ => None,
         };
 

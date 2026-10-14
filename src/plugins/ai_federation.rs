@@ -4654,7 +4654,13 @@ fn fold_native_usage_categories(
                 format!("ai_federation: {provider} token usage total overflowed")
             })?),
             None if zero_omitted_base => Some(count),
-            None => None,
+            // A category without the base the provider always sends is not a
+            // usable count; refuse it like any other malformed usage.
+            None => {
+                return Err(format!(
+                    "ai_federation: {provider} usage.{key} is reported without its base count"
+                ));
+            }
         };
     }
     Ok(folded)
@@ -4676,8 +4682,16 @@ fn clamped_reported_total(
     let known = input
         .unwrap_or(0)
         .checked_add(output.unwrap_or(0))
-        .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed"))?;
-    Ok(Some(reported.max(known).max(floor)))
+        .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed"))?
+        .max(floor);
+    // A total below the reported counters can only be raised to them when
+    // both components are known; otherwise it is an inconsistent partial
+    // report, not a complete total.
+    if reported >= known || (input.is_some() && output.is_some()) {
+        Ok(Some(reported.max(known)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Checked sum of every listed counter present in `usage` (absent and `null`
