@@ -494,6 +494,15 @@ impl WorkloadMetrics {
         let tracing_providers = parse_tracing_providers(config)?;
         validate_trace_provider_secret_refs(&tracing_providers)
             .map_err(|error| format!("workload_metrics: {error}"))?;
+        // Typed whenever supplied, even when no exporter is built (no
+        // providers, or span reporting disabled), so a stored value cannot
+        // become a latent admission failure.
+        if config
+            .get("allow_plaintext")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("workload_metrics: `allow_plaintext` must be a boolean".to_string());
+        }
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
             .or_else(|| config.get("disable_span_reporting"))

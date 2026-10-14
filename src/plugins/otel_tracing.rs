@@ -1527,6 +1527,9 @@ impl DatadogTraceExporter {
         mut options: TraceExporterOptions,
     ) -> Result<Self, String> {
         options.service_name = service_name;
+        // Screen the configured spelling: the derived traces URL is normalized
+        // (`127.1` becomes `127.0.0.1`) and must not widen the exemption.
+        screen_cleartext_endpoint("Datadog", &agent_url, options.allow_plaintext)?;
         let cfg = TraceHttpExporterConfig::from_options(
             "Datadog",
             datadog_traces_endpoint(&agent_url)?,
@@ -1726,6 +1729,7 @@ pub(crate) fn probe_trace_batch_materialization_for_test(
         service_name: "ferrum-edge".to_string(),
         deployment_environment: None,
         payload_kind: TracePayloadKind::Otlp,
+        allow_plaintext: false,
         ceiling,
     };
 
@@ -1877,6 +1881,7 @@ fn validate_trace_provider_endpoint(
                 .map_err(|error| format!("`url`: {error}"))?;
         }
         TracingProvider::Datadog { agent_url, .. } => {
+            screen_cleartext_endpoint("Datadog", agent_url, allow_plaintext)?;
             let endpoint = datadog_traces_endpoint(agent_url)?;
             validate_endpoint_for_provider("Datadog", &endpoint, allow_plaintext)?;
         }
@@ -3280,9 +3285,22 @@ fn validate_endpoint_for_provider(
     }
     let hostname = normalized_url_hostname(&url)
         .ok_or_else(|| format!("{provider_name}: `endpoint` must include a hostname"))?;
-    // Spans (request metadata) and any `authorization`/`headers` credential or
-    // provider token travel on this export. Cleartext is admitted without an
-    // opt-in only to a loopback IP literal (a node-local collector or agent).
+    screen_cleartext_endpoint(provider_name, endpoint, allow_plaintext)?;
+    Ok(hostname)
+}
+
+/// Spans (request metadata) and any `authorization`/`headers` credential or
+/// provider token travel on an export. Cleartext is admitted without an opt-in
+/// only to a loopback IP literal (a node-local collector or agent), judged on
+/// the configured spelling.
+fn screen_cleartext_endpoint(
+    provider_name: &str,
+    endpoint: &str,
+    allow_plaintext: bool,
+) -> Result<(), String> {
+    let Ok(url) = Url::parse(endpoint) else {
+        return Ok(());
+    };
     if url.scheme() == "http"
         && !allow_plaintext
         && !is_loopback_ip_literal_endpoint(endpoint, url.host())
@@ -3291,7 +3309,7 @@ fn validate_endpoint_for_provider(
             "{provider_name}: `endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `allow_plaintext: true`"
         ));
     }
-    Ok(hostname)
+    Ok(())
 }
 
 fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {

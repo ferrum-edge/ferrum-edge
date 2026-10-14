@@ -1784,3 +1784,47 @@ fn opa_header_value_domain_matches_between_schema_and_constructor() {
         }
     }
 }
+
+/// A non-loopback cleartext `opa_host` carries the authorization input and the
+/// decision in clear, so it needs the explicit opt-in.
+#[test]
+fn opa_cleartext_host_needs_opt_in_off_loopback() {
+    let with = |host: &str, opt_in: Option<Value>| {
+        let mut config = base_config(host);
+        if let Some(flag) = opt_in {
+            config["allow_plaintext"] = flag;
+        }
+        config
+    };
+    for config in [
+        with("http://opa.internal:8181", None),
+        with("http://opa.internal:8181", Some(json!(false))),
+        with("http://localhost:8181", None),
+        with("http://127.1:8181", None),
+        with("http://[0:0:0:0:0:0:0:1]:8181", None),
+    ] {
+        let error = match Opa::new(&config, default_client()) {
+            Ok(_) => panic!("{config} must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("allow_plaintext"), "{config}: {error}");
+        assert!(validate_plugin_config("opa", &config).is_err(), "{config}");
+    }
+    for config in [
+        with("http://opa.internal:8181", Some(json!(true))),
+        with("http://127.0.0.1:8181", None),
+        with("http://[::1]:8181", None),
+        with("https://opa.internal:8181", None),
+    ] {
+        assert!(Opa::new(&config, default_client()).is_ok(), "{config}");
+    }
+    // The flag is typed whenever supplied, even where it has no effect.
+    for flag in [json!("yes"), Value::Null] {
+        let config = with("https://opa.internal:8181", Some(flag));
+        let error = match Opa::new(&config, default_client()) {
+            Ok(_) => panic!("{config} must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("allow_plaintext"), "{config}: {error}");
+    }
+}

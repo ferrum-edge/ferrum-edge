@@ -724,6 +724,8 @@ impl Plugin for Opa {
 /// Parse `opa_host` + `policy_path` into the wire decision URL, its
 /// diagnostic-safe rendering, and the hostname used for DNS warmup.
 fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(Url, String, String), String> {
+    // Typed whenever supplied, even for an https host it does not affect.
+    let allow_plaintext = parse_optional_bool(object, "allow_plaintext")?.unwrap_or(false);
     let opa_host = required_string(object, "opa_host")?;
     let parsed =
         Url::parse(opa_host).map_err(|error| format!("opa: invalid `opa_host`: {error}"))?;
@@ -776,7 +778,7 @@ fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(Url, String, 
     // call. Cleartext is admitted without an opt-in only to a loopback IP
     // literal (a co-located OPA sidecar).
     if parsed.scheme() == "http"
-        && !parse_optional_bool(object, "allow_plaintext")?.unwrap_or(false)
+        && !allow_plaintext
         && !is_loopback_ip_literal_endpoint(opa_host, parsed.host())
     {
         return Err(

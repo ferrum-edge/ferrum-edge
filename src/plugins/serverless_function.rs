@@ -1415,6 +1415,8 @@ const MAX_AWS_QUALIFIER_CHARS: usize = 128;
 /// cannot form an HTTP header (issue #5189) is a deterministic operator error
 /// whichever provider is active.
 fn validate_supplied_provider_fields(config: &Value) -> Result<(), String> {
+    // Typed whenever supplied, even when no configured URL uses it.
+    allow_plaintext_config(config)?;
     for field in PROVIDER_STRING_CONFIG_FIELDS {
         if let Some(value) = config.get(*field)
             && !value.is_string()
@@ -1570,13 +1572,7 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
 /// (function key, bearer token, or SigV4 signature). The trusted
 /// `AWS_LAMBDA_ENDPOINT_URL` environment fallback is not screened here.
 fn screen_configured_plaintext(config: &Value, field: &str, url: &str) -> Result<(), String> {
-    let allow_plaintext = match config.get("allow_plaintext") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(value)) => *value,
-        Some(_) => {
-            return Err("serverless_function: `allow_plaintext` must be a boolean".to_string());
-        }
-    };
+    let allow_plaintext = allow_plaintext_config(config)?;
     let Ok(parsed) = Url::parse(url) else {
         return Ok(());
     };
@@ -1589,6 +1585,16 @@ fn screen_configured_plaintext(config: &Value, field: &str, url: &str) -> Result
         ));
     }
     Ok(())
+}
+
+/// `allow_plaintext`: omitted or `null` means `false`; any other non-boolean is
+/// refused.
+fn allow_plaintext_config(config: &Value) -> Result<bool, String> {
+    match config.get("allow_plaintext") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err("serverless_function: `allow_plaintext` must be a boolean".to_string()),
+    }
 }
 
 fn validate_aws_endpoint_url(url: &str) -> Result<(), String> {
