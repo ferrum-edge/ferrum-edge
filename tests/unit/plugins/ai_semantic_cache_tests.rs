@@ -7007,7 +7007,9 @@ fn redis_quarantine_compare_delete_read_is_bounded_and_watched() {
         "only a full bounded byte/length match on the dedicated watched connection may authorize DEL"
     );
     let multi = helper.find("redis::cmd(\"MULTI\")").unwrap();
-    let multi_error = helper.find("ifletErr(e)=multi{").unwrap();
+    let multi_error = helper
+        .find("self.require_quarantine_ok_acknowledgement(&reply,\"MULTI\")?")
+        .unwrap();
     let exec = helper.find("redis::cmd(\"EXEC\")").unwrap();
     assert!(range < multi && multi < multi_error && multi_error < delete && delete < exec);
     let mismatch = source_region(helper, "prefix==expected=>{}", "Err(e)=>{");
