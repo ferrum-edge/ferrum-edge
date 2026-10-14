@@ -319,7 +319,7 @@ pub(crate) fn replace_sequentially_bounded<'p>(
 /// excluded). Redaction output is serialized into JSON documents and SSE
 /// frames, where a placeholder of control characters can grow six-fold, so the
 /// growth allowance is charged on this measure rather than on decoded length.
-fn json_escaped_len(text: &str) -> usize {
+pub(crate) fn json_escaped_len(text: &str) -> usize {
     text.bytes().fold(0usize, |len, byte| {
         len.saturating_add(match byte {
             b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,

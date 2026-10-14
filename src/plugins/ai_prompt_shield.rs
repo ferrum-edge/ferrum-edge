@@ -428,7 +428,11 @@ fn redact_text_bounded(text: &str, patterns: &[PiiPattern], budget: &RedactionBu
         budget.fail();
         return text.to_string();
     };
-    let growth = result.len().saturating_sub(text.len());
+    // Charged on the JSON-escaped form: the rewritten prompt is serialized
+    // back into a JSON document, where a control-character placeholder grows
+    // six-fold.
+    let growth = super::ai_response_guard::json_escaped_len(&result)
+        .saturating_sub(super::ai_response_guard::json_escaped_len(text));
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }

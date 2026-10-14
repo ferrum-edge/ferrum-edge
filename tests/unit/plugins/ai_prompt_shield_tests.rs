@@ -4899,3 +4899,34 @@ fn repeated_built_in_pattern_names_are_refused_before_compilation() {
     };
     assert!(err.contains("repeats built-in pattern"), "{err}");
 }
+
+/// Growth is charged on the JSON-escaped form of the rewritten prompt, so a
+/// control-character placeholder cannot slip past the allowance through
+/// serialization escaping.
+#[tokio::test]
+async fn escaped_placeholder_growth_is_charged() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": [],
+        "custom_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512)
+    }))
+    .unwrap();
+
+    // 10 matches: ~30 KB escaped growth fits the 64 KiB floor.
+    let small = json!({"prompt": "7".repeat(10)});
+    let mut ctx = make_post_ctx(&small);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+
+    // 30 matches: 15 KB decoded growth, but ~92 KB once escaped.
+    let large = json!({"prompt": "7".repeat(30)});
+    let mut ctx = make_post_ctx(&large);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
+    assert_eq!(
+        ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+        Some("redaction_budget_exceeded")
+    );
+}
