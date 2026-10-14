@@ -3915,9 +3915,14 @@ async fn handle_admin_request_inner(
             ));
         }
         Err(JwtError::VerificationFailed(msg)) => {
+            // One static body for every verification failure: reflecting the
+            // jsonwebtoken reason (expired vs bad signature vs wrong issuer or
+            // audience) would give unauthenticated callers a validation-policy
+            // oracle. The reason never contains the token itself.
+            debug!(reason = %msg, "Admin API token verification failed");
             return Ok(json_response(
                 StatusCode::UNAUTHORIZED,
-                &json!({"error": format!("Token verification failed: {}", msg)}),
+                &json!({"error": "Token verification failed"}),
             ));
         }
     };

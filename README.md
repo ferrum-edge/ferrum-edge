@@ -318,7 +318,7 @@ consumers:
     username: "alice"
     credentials:
       keyauth:
-        - key: "alice-api-key"
+        - key: "alice-api-key-0123456789"
     acl_groups:
       - "engineering"
 

@@ -43,9 +43,9 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    AnthropicEvent, SseEventName, SseReassembler, SseTextKind, is_text_event_stream_media_type,
-    is_tgi_stream_frame, original_response_is_event_stream, parse_sse_data_frames_checked,
-    split_sse_line_terminator, sse_lines_inclusive, strip_sse_boms,
+    AnthropicEvent, MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseReassembler, SseTextKind,
+    is_text_event_stream_media_type, is_tgi_stream_frame, original_response_is_event_stream,
+    parse_sse_data_frames_checked, split_sse_line_terminator, sse_lines_inclusive, strip_sse_boms,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -1963,6 +1963,10 @@ impl AiResponseGuard {
         let mut reassembler = SseReassembler::default();
         let mut provider_texts: std::collections::BTreeMap<(u8, usize), String> =
             std::collections::BTreeMap::new();
+        // Same per-family live-key ceiling the shared reassembler applies, so
+        // provider-chosen indexes cannot grow these side accumulators either.
+        let mut provider_key_counts = [0usize; 6];
+        let mut provider_overflow = false;
 
         for (frame_index, frame) in frames.iter().enumerate() {
             // Shared OpenAI chat/completions + Responses API + Anthropic
@@ -1989,15 +1993,26 @@ impl AiResponseGuard {
                         .and_then(|delta| delta.get("function_call"))
                     {
                         if let Some(name) = function_call.get("name").and_then(Value::as_str) {
-                            provider_texts.entry((2, index)).or_default().push_str(name);
+                            bounded_provider_text(
+                                &mut provider_texts,
+                                &mut provider_key_counts,
+                                &mut provider_overflow,
+                                2,
+                                index,
+                            )
+                            .push_str(name);
                         }
                         if let Some(arguments) =
                             function_call.get("arguments").and_then(Value::as_str)
                         {
-                            provider_texts
-                                .entry((3, index))
-                                .or_default()
-                                .push_str(arguments);
+                            bounded_provider_text(
+                                &mut provider_texts,
+                                &mut provider_key_counts,
+                                &mut provider_overflow,
+                                3,
+                                index,
+                            )
+                            .push_str(arguments);
                         }
                     }
                     if let Some(refusal) = choice
@@ -2005,10 +2020,14 @@ impl AiResponseGuard {
                         .and_then(|delta| delta.get("refusal"))
                         .and_then(Value::as_str)
                     {
-                        provider_texts
-                            .entry((4, index))
-                            .or_default()
-                            .push_str(refusal);
+                        bounded_provider_text(
+                            &mut provider_texts,
+                            &mut provider_key_counts,
+                            &mut provider_overflow,
+                            4,
+                            index,
+                        )
+                        .push_str(refusal);
                     }
                 }
             }
@@ -2026,15 +2045,19 @@ impl AiResponseGuard {
                     .and_then(Value::as_u64)
                     .and_then(|value| usize::try_from(value).ok())
                     .unwrap_or(0);
-                provider_texts
-                    .entry((5, index))
-                    .or_default()
-                    .push_str(delta);
+                bounded_provider_text(
+                    &mut provider_texts,
+                    &mut provider_key_counts,
+                    &mut provider_overflow,
+                    5,
+                    index,
+                )
+                .push_str(delta);
             }
         }
 
         let mut texts: Vec<String> = Vec::new();
-        let fully_reassembled = !reassembler.provider_stream_uninspectable();
+        let fully_reassembled = !reassembler.provider_stream_uninspectable() && !provider_overflow;
         for sse_text in reassembler.into_texts() {
             if matches!(
                 sse_text.kind,
@@ -4711,6 +4734,32 @@ impl AiResponseGuard {
 
         crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling)
     }
+}
+
+/// Find or create one legacy `function_call` / refusal side accumulator,
+/// folding a key beyond [`MAX_OPENAI_STREAM_ACCUMULATORS`] live keys of its
+/// kind into one overflow accumulator. The text is kept for inspection; the
+/// overflow marks the stream not fully reassembled so enforcing actions fail
+/// closed, exactly as the shared reassembler's own fold does.
+fn bounded_provider_text<'a>(
+    texts: &'a mut std::collections::BTreeMap<(u8, usize), String>,
+    counts: &mut [usize; 6],
+    overflow: &mut bool,
+    kind: u8,
+    index: usize,
+) -> &'a mut String {
+    let slot = usize::from(kind);
+    let key = if texts.contains_key(&(kind, index)) || counts[slot] < MAX_OPENAI_STREAM_ACCUMULATORS
+    {
+        (kind, index)
+    } else {
+        *overflow = true;
+        (kind, usize::MAX)
+    };
+    if !texts.contains_key(&key) {
+        counts[slot] += 1;
+    }
+    texts.entry(key).or_default()
 }
 
 /// One `replace_all` pass with a LITERAL replacement, written through `sink`.

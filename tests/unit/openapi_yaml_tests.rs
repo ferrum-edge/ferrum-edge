@@ -828,7 +828,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         "namespace": "ferrum",
         "custom_id": "ext-123",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "basicauth": [{"password_hash": password_hash}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}],
@@ -930,7 +930,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     let valid_create = json!({
         "username": "alice",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "basicauth": [{"password": "correct horse battery staple"}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}],
@@ -1481,7 +1481,7 @@ fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
     let real_values = json!({
         "username": "alice",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}]
         }
@@ -2549,10 +2549,39 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
                 "mode": "enforce",
                 "default_rule_action": "enforce",
                 "rule_modes": { "FE-XSS-001": "enforce" },
-                "global_exemptions": { "header_present": { "x-skip-waf": null } }
+                "global_exemptions": {
+                    "header_present": { "x-skip-waf": "trusted-hop-shared-secret" },
+                    "match": "any"
+                }
             }))
             .is_ok()
     );
+    for (exemptions, why) in [
+        (
+            json!({ "header_present": { "x-skip-waf": null } }),
+            "presence-only header_present entries are not admitted",
+        ),
+        (
+            json!({ "header_present": { "x-skip-waf": "short" } }),
+            "header_present values must be long shared secrets",
+        ),
+        (json!({ "match": "either" }), "match is all or any"),
+    ] {
+        assert!(
+            validator
+                .validate(&json!({ "global_exemptions": exemptions }))
+                .is_err(),
+            "{why}"
+        );
+    }
+    for value in ["allow", "fail_closed", "block"] {
+        assert!(
+            validator
+                .validate(&json!({ "on_unlisted_response_content_type": value }))
+                .is_ok(),
+            "on_unlisted_response_content_type {value} must be admitted"
+        );
+    }
     assert!(
         validator
             .validate(&json!({
@@ -2651,7 +2680,6 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_consumers": ["alice"]}),
         json!({"disallowed_consumers": ["bad"], "allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true}),
-        json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
         json!({"allowed_consumers": ["  alice  "]}),
         // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
         json!({"allowed_consumers": ["\u{feff}"]}),
@@ -2680,6 +2708,11 @@ fn access_control_schema_matches_runtime_validation() {
         json!({}),
         json!({"allowed_consumer": ["alice"]}),
         json!({"allowed_consumers": [], "allowed_groups": []}),
+        // Issue #6607: an explicitly empty allow-list is refused, not allow-all.
+        json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
+        json!({"allowed_consumers": [], "disallowed_consumers": ["mallory"]}),
+        json!({"allowed_groups": [], "disallowed_groups": ["banned"]}),
+        json!({"allowed_consumers": [], "allowed_groups": ["engineering"]}),
         json!({"allowed_consumers": ["alice"], "allow_authenticated_identity": true}),
         json!({"allowed_groups": ["engineering"], "allow_authenticated_identity": true}),
         json!({"allowed_consumers": [""]}),
@@ -7474,6 +7507,20 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
         false,
     );
+    // Hard ceiling: component and constructor agree at and just above it.
+    for (limit, expected_valid) in [
+        (67_108_864_u64, true),
+        (67_108_865, false),
+        (u64::MAX, false),
+    ] {
+        let config = json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": limit});
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, expected_valid);
+        assert_eq!(
+            ferrum_edge::plugins::body_validator::BodyValidator::new(&config).is_ok(),
+            expected_valid,
+            "constructor must agree on grpc_max_decompressed_size_bytes={limit}"
+        );
+    }
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
@@ -8915,6 +8962,12 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
             "forward_sensitive_query": true,
             "forward_sensitive_query_allowlist": ["access_token"]
         }),
+        // Query names are not header names: brackets are valid.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["filter[key]"]
+        }),
         json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": ["x-vault-"]}),
         json!({"mirror_host": "127.0.0.1", "percentage": 0}),
         json!({"mirror_host": "127.0.0.1", "mirror_path": ""}),
@@ -8958,6 +9011,37 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
             "forward_sensitive_header_allowlist": ["auth token"]
         }),
         json!({"mirror_host": "127.0.0.1", "forward_sensitive_query": true}),
+        // Entries match the decoded name, so encoded or delimiter forms are refused.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["api+key"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["api%5fkey"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["a;key"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": [" access_token "]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["\taccess_token"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token\n"]
+        }),
         json!({
             "mirror_host": "127.0.0.1",
             "forward_sensitive_query_allowlist": ["access_token"]
@@ -11906,10 +11990,10 @@ async fn ai_transcript_audit_schema_matches_runtime_admission_contract() {
             "methods": {"/test.Greeter/SayHello": method}
         })
     };
-    // 8 code points, 16 UTF-8 bytes: admitted under a byte-counted minimum,
+    // 16 code points, 32 UTF-8 bytes: admitted under a byte-counted minimum,
     // refused under the character-counted one the schema and the constructor
     // now agree on.
-    let short_multibyte_secret = "\u{00e9}".repeat(8);
+    let short_multibyte_secret = "\u{00e9}".repeat(16);
 
     let cases: Vec<(&str, serde_json::Value, bool)> = vec![
         // ---- null keeps the documented default for every fixed scalar ----
@@ -12132,15 +12216,15 @@ async fn ai_transcript_audit_schema_matches_runtime_admission_contract() {
         ),
         // ---- the hash_secret minimum is counted in CHARACTERS ----
         (
-            "hash_secret of 16 characters",
+            "hash_secret of 32 characters",
             json!({
-                "redaction": {"hash_secret": "fleet-stable-key"},
+                "redaction": {"hash_secret": "fleet-stable-key-0123456789abcdef"},
                 "sink": sink(json!({}))
             }),
             true,
         ),
         (
-            "hash_secret of 8 characters / 16 bytes",
+            "hash_secret of 16 characters / 32 bytes",
             json!({
                 "redaction": {"hash_secret": short_multibyte_secret},
                 "sink": sink(json!({}))
@@ -15124,10 +15208,30 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         schema["properties"]["ttl_seconds"]["maximum"],
         json!(u64::MAX)
     );
+    // Issue #6612: `max_entries` sizes eviction bookkeeping, so it carries a
+    // hard admission ceiling instead of the whole u64 domain.
     assert_eq!(
         schema["properties"]["max_entries"]["maximum"],
-        json!(u64::MAX)
+        json!(10_000_000)
     );
+    for (max_entries, expected_valid) in [
+        (10_000_000_u64, true),
+        (10_000_001, false),
+        (u64::MAX, false),
+    ] {
+        let config = json!({"max_entries": max_entries});
+        assert_component_validity(&spec, "ResponseCachingConfig", &config, expected_valid);
+        assert_eq!(
+            ResponseCaching::new(&config).is_ok(),
+            expected_valid,
+            "component and constructor must agree on max_entries={max_entries}"
+        );
+        assert_eq!(
+            validate_plugin_config("response_caching", &config).is_ok(),
+            expected_valid,
+            "shared admission must agree on max_entries={max_entries}"
+        );
+    }
     assert_eq!(
         schema["properties"]["max_entry_size_bytes"]["maximum"],
         json!(u64::MAX)
@@ -19051,4 +19155,93 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         b"{}"
     ));
     assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
+}
+
+/// Cleartext embedding endpoints need the explicit opt-in unless the host is a
+/// loopback IP literal; the published schemas and runtime admission agree.
+#[test]
+fn ai_embedding_plaintext_opt_in_matches_schema_and_runtime() {
+    let yaml: Value = serde_yaml::from_str(include_str!("../../openapi.yaml"))
+        .expect("openapi.yaml parses without duplicate mapping keys");
+    let spec = serde_json::to_value(yaml).expect("openapi.yaml is JSON-compatible");
+
+    let cache = |endpoint: &str, opt_in: Option<bool>| {
+        let mut config = json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": endpoint,
+        });
+        if let Some(flag) = opt_in {
+            config["semantic_embedding_allow_plaintext"] = json!(flag);
+        }
+        config
+    };
+    let firewall = |endpoint: &str, opt_in: Option<bool>| {
+        let mut provider = json!({
+            "type": "openai_compatible_embeddings",
+            "endpoint": endpoint,
+        });
+        if let Some(flag) = opt_in {
+            provider["allow_plaintext"] = json!(flag);
+        }
+        json!({ "provider": provider })
+    };
+
+    // `http:` without `//` still parses as a remote http URL. The firewall's
+    // `endpoint` is a plain URI, so the plaintext rule alone decides it; the
+    // cache's enabled-mode endpoint pattern already requires `scheme://`.
+    for (endpoint, opt_in, valid) in [
+        ("http:embeddings.example.com/v1", None, false),
+        ("http:embeddings.example.com/v1", Some(false), false),
+        ("http:embeddings.example.com/v1", Some(true), true),
+        ("http:/embeddings.example.com/v1", None, false),
+        ("http:/embeddings.example.com/v1", Some(false), false),
+        ("http:/embeddings.example.com/v1", Some(true), true),
+        // Whitespace and control characters are refused outright, never
+        // trimmed or stripped into a different URL.
+        (" http://embeddings.example.com/v1", None, false),
+        (" http://embeddings.example.com/v1", Some(true), false),
+        ("ht\ttp://embeddings.example.com/v1", Some(true), false),
+        ("https://embeddings.example.com/v1\n", None, false),
+        (" https://embeddings.example.com/v1", None, false),
+    ] {
+        let config = firewall(endpoint, opt_in);
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", &config, valid);
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
+            valid,
+            "ai_semantic_firewall runtime admission for {config}"
+        );
+    }
+
+    let cases: [(&str, Option<bool>, bool); 11] = [
+        ("https://embeddings.example.com/v1", None, true),
+        ("http://127.0.0.1:9/v1", None, true),
+        ("http://127.0.0.1", None, true),
+        ("http://[::1]:9/v1", None, true),
+        // Loopback, but not the canonical literal spelling the schema names:
+        // both sides refuse it without the opt-in.
+        ("http://[0:0:0:0:0:0:0:1]:9/v1", None, false),
+        ("http://127.1:9/v1", None, false),
+        ("http://127.1:9/v1", Some(true), true),
+        ("http://embeddings.example.com/v1", Some(true), true),
+        ("http://embeddings.example.com/v1", None, false),
+        ("http://embeddings.example.com/v1", Some(false), false),
+        ("http://localhost:9/v1", None, false),
+    ];
+    for (endpoint, opt_in, valid) in cases {
+        let config = cache(endpoint, opt_in);
+        assert_component_validity(&spec, "AiSemanticCacheConfig", &config, valid);
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_cache", &config).is_ok(),
+            valid,
+            "ai_semantic_cache runtime admission for {config}"
+        );
+        let config = firewall(endpoint, opt_in);
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", &config, valid);
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
+            valid,
+            "ai_semantic_firewall runtime admission for {config}"
+        );
+    }
 }

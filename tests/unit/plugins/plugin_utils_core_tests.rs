@@ -11,16 +11,17 @@ use ferrum_edge::plugins::utils::jwt_verifier::{
     JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks,
 };
 use ferrum_edge::plugins::utils::query::{
-    CanonicalQuery, QueryAmbiguity, canonical_query_for_policy, has_conflicting_duplicate_query_key,
+    CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
+    has_conflicting_duplicate_query_key, semicolon_sub_pair_names,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
-    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseEventName,
-    SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
-    classify_forwarded_sse_prefix, parse_sse_data_frames_checked, split_sse_line_terminator,
-    sse_event_end, sse_event_end_after, sse_line_end, sse_lines, sse_lines_inclusive,
-    strip_sse_boms,
+    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES,
+    MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseForwardedPrefix, SseReassembler, SseText,
+    SseTextKind, UTF8_BOM, classify_forwarded_sse_prefix, parse_sse_data_frames_checked,
+    split_sse_line_terminator, sse_event_end, sse_event_end_after, sse_line_end, sse_lines,
+    sse_lines_inclusive, strip_sse_boms,
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
@@ -30,7 +31,7 @@ use ferrum_edge::startup::render_startup_error;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn unknown_key_diagnostics_keep_sorted_suggestions_when_rendered() {
@@ -419,6 +420,141 @@ fn canonical_query_ambiguity_reasons_are_stable_tokens() {
     assert_eq!(QueryAmbiguity::NonUtf8Name.reason(), "non_utf8_name");
     assert_eq!(QueryAmbiguity::NonUtf8Value.reason(), "non_utf8_value");
     assert_eq!(QueryAmbiguity::DuplicateName.reason(), "duplicate_name");
+    assert_eq!(
+        QueryAmbiguity::SemicolonSeparator.reason(),
+        "semicolon_separator"
+    );
+}
+
+#[test]
+fn canonical_query_flags_unencoded_semicolon_in_name_or_value() {
+    // Issue #6579: a backend that also splits on `;` (Rack < 3, Go < 1.17,
+    // Python < 3.9.2) sees `token=x` as its own parameter, while Ferrum sees
+    // one `a` whose value is `1;token=x`.
+    let query = CanonicalQuery::parse("a=1;token=x");
+    assert_eq!(query.ambiguities(), &[QueryAmbiguity::SemicolonSeparator]);
+    assert_eq!(query.len(), 1, "Ferrum still separates pairs only on '&'");
+    assert_eq!(
+        ambiguities("a;b=1"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+    assert_eq!(
+        ambiguities("flag;other"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+}
+
+#[test]
+fn canonical_query_flags_a_duplicate_smuggled_behind_a_semicolon() {
+    // To Ferrum `tenant` occurs once (`admin`); a `;`-splitting backend reads a
+    // second `tenant=victim` and, under last-value-wins, executes it. The
+    // duplicate-name pass cannot see it, so the semicolon class must.
+    assert_eq!(
+        ambiguities("tenant=admin&x=;tenant=victim"),
+        vec![QueryAmbiguity::SemicolonSeparator]
+    );
+}
+
+#[test]
+fn hpp_predicate_judges_the_semicolon_separator_convention() {
+    // Issue #6579: conflicting under `&`+`;`, not under `&` alone.
+    assert!(has_conflicting_duplicate_query_key(
+        "tenant=admin&x=;tenant=victim"
+    ));
+    assert!(has_conflicting_duplicate_query_key("a=1;a=2"));
+    // Identical values are still not a conflict, under either convention.
+    assert!(!has_conflicting_duplicate_query_key("a=1&x=;a=1"));
+    // `%3B` is a literal semicolon.
+    assert!(!has_conflicting_duplicate_query_key("a=1&x=%3Ba%3D2"));
+}
+
+#[test]
+fn credential_strip_drops_a_credential_smuggled_behind_a_semicolon() {
+    // Issue #6579: `carrier=;api_key=secret` is an `api_key` parameter to a
+    // `;`-splitting backend, so stripping must not forward it.
+    let mut ctx = ctx_for("api_key=secret&carrier=;api_key=secret&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert!(query.is_unambiguous(), "{:?}", query.ambiguities());
+    assert_eq!(query.len(), 1);
+    assert_eq!(query.get("page"), Some("1"));
+
+    // The name-side and encoded spellings are matched too.
+    for raw in [
+        "x;api_key=secret&page=1",
+        "carrier=;api%5Fkey=secret&page=1",
+    ] {
+        let mut ctx = ctx_for(raw);
+        ctx.metadata.insert(
+            "auth.strip_query_param.api_key".to_string(),
+            "true".to_string(),
+        );
+        let query = canonical_query_for_policy(&ctx);
+        assert_eq!(query.len(), 1, "{raw}");
+        assert_eq!(query.get("page"), Some("1"), "{raw}");
+    }
+}
+
+#[test]
+fn semicolon_sub_pair_names_cover_form_decoding_and_keep_encoded_semicolons() {
+    let names = semicolon_sub_pair_names("carrier=;private+key=x;a%2Bb=1");
+    assert!(names.contains(&"private key".to_string()), "{names:?}");
+    assert!(names.contains(&"private+key".to_string()), "{names:?}");
+    // `%2B` is a literal plus under either decoding.
+    assert!(names.contains(&"a+b".to_string()), "{names:?}");
+    assert!(!names.contains(&"a b".to_string()), "{names:?}");
+    // `%3B` is content, not a separator.
+    assert!(semicolon_sub_pair_names("a=1%3Bapi_key%3Dx").is_empty());
+}
+
+#[test]
+fn credential_strip_matches_a_form_decoded_semicolon_name() {
+    // A JWKS `from_params: ["private key"]` credential consumed at
+    // `private%20key` must not survive as a hidden `;private+key=` copy that a
+    // form-decoding backend reads under the same name.
+    let mut ctx = ctx_for("private%20key=token&carrier=;private+key=token&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.private key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert_eq!(query.len(), 1, "{:?}", query.params());
+    assert_eq!(query.get("page"), Some("1"));
+}
+
+#[test]
+fn credential_strip_matches_an_ordinary_form_decoded_alias() {
+    // `private+key` is `private key` to a form-decoding backend; `%2B` stays a
+    // literal plus and is not the credential.
+    let mut ctx = ctx_for("private%20key=token&private+key=token&private%2Bkey=kept&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.private key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert_eq!(query.get("private key"), None);
+    assert_eq!(query.get("private+key"), Some("kept"));
+    assert_eq!(query.get("page"), Some("1"));
+}
+
+#[test]
+fn ordered_query_credential_removal_drops_a_semicolon_smuggled_credential() {
+    let names: HashSet<&str> = ["api_key"].into_iter().collect();
+    let mut query = OrderedQuery::parse("carrier=;api_key=secret&x;api_key=s2&keep=a;b&page=1");
+    assert!(query.remove_matching_names(&names));
+    assert_eq!(query.serialize(), "keep=a;b&page=1");
+}
+
+#[test]
+fn canonical_query_accepts_percent_encoded_semicolon() {
+    // `%3B` is a literal `;` to every decoder, so it is not a separator.
+    let query = CanonicalQuery::parse("a=1%3Btoken%3Dx&b=%3b");
+    assert!(query.is_unambiguous());
+    assert_eq!(query.get("a"), Some("1;token=x"));
+    assert_eq!(query.get("b"), Some(";"));
 }
 
 #[test]
@@ -2358,4 +2494,100 @@ fn cached_header_sanitizer_ratelimit_match_is_bounded_and_keeps_existing_familie
     ] {
         assert!(!is_sensitive_header(name), "{name} should be kept");
     }
+}
+
+/// Issue #6624: the OpenAI-style families key by provider-supplied indexes
+/// too, so they fold past a live-accumulator ceiling exactly like the
+/// Anthropic/Gemini paths, keep every byte for inspection, and fail closed.
+#[test]
+fn openai_and_responses_stream_indexes_fold_and_flag() {
+    let overflow = 500;
+    let total = MAX_OPENAI_STREAM_ACCUMULATORS + overflow;
+    let frames: Vec<serde_json::Value> = vec![
+        // chat delta.content per choice
+        serde_json::json!({"choices": (0..total)
+            .map(|i| serde_json::json!({"index": i, "delta": {"content": "c"}}))
+            .collect::<Vec<_>>()}),
+        // legacy Completions text per choice
+        serde_json::json!({"choices": (0..total)
+            .map(|i| serde_json::json!({"index": i, "text": "t"}))
+            .collect::<Vec<_>>()}),
+    ];
+    let mut reassembler = SseReassembler::new();
+    for frame in &frames {
+        reassembler.push_frame(frame);
+    }
+    // Two-dimensional tool-call keys: the cap is on live keys, so choice x
+    // tool cannot multiply it.
+    for choice in 0..30 {
+        let calls: Vec<_> = (0..30)
+            .map(|tool| {
+                serde_json::json!({"index": tool, "function": {"name": "n", "arguments": "a"}})
+            })
+            .collect();
+        reassembler.push_frame(&serde_json::json!({
+            "choices": [{"index": choice, "delta": {"tool_calls": calls}}]
+        }));
+    }
+    for index in 0..total {
+        reassembler.push_frame(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": index,
+            "content_index": index,
+            "delta": "r"
+        }));
+        reassembler.push_frame(&serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": index,
+            "delta": "f"
+        }));
+    }
+
+    assert!(
+        reassembler.provider_stream_uninspectable(),
+        "an index family past the ceiling fails closed"
+    );
+    assert_eq!(
+        reassembler.accumulator_count(),
+        5 * (MAX_OPENAI_STREAM_ACCUMULATORS + 1),
+        "each family holds at most the ceiling plus one shared overflow accumulator"
+    );
+    let texts = reassembler.texts();
+    assert_eq!(texts, reassembler.clone().into_texts());
+    let bytes_of = |kind: SseTextKind| -> usize {
+        texts
+            .iter()
+            .filter(|text| text.kind == kind)
+            .map(|text| text.text.len())
+            .sum()
+    };
+    // Every delta byte is still present for inspection, none dropped.
+    assert_eq!(bytes_of(SseTextKind::ChatContent), total);
+    assert_eq!(bytes_of(SseTextKind::CompletionText), total);
+    assert_eq!(bytes_of(SseTextKind::ChatToolName), 900);
+    assert_eq!(bytes_of(SseTextKind::ChatToolArguments), 900);
+    assert_eq!(bytes_of(SseTextKind::ResponsesText), total);
+    assert_eq!(bytes_of(SseTextKind::ResponsesArguments), total);
+}
+
+#[test]
+fn openai_stream_within_the_index_ceiling_stays_inspectable() {
+    let mut reassembler = SseReassembler::new();
+    reassembler.push_frame(
+        &serde_json::json!({"choices": (0..MAX_OPENAI_STREAM_ACCUMULATORS)
+        .map(|i| serde_json::json!({"index": i, "delta": {"content": "c"}}))
+        .collect::<Vec<_>>()}),
+    );
+    assert!(!reassembler.provider_stream_uninspectable());
+    assert_eq!(
+        reassembler.accumulator_count(),
+        MAX_OPENAI_STREAM_ACCUMULATORS
+    );
+    // Draining releases slots, so a later stream segment can reuse them.
+    reassembler.drain_assistant_prefix(usize::MAX);
+    assert_eq!(reassembler.accumulator_count(), 0);
+    reassembler.push_frame(&serde_json::json!({
+        "choices": [{"index": 999, "delta": {"content": "late"}}]
+    }));
+    assert!(!reassembler.provider_stream_uninspectable());
 }

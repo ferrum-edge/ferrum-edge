@@ -884,7 +884,7 @@ fn test_same_timestamp_consumer_credential_rotation_is_modification() {
     let mut consumer = make_consumer("c1", "alice", t);
     consumer.credentials.insert(
         "keyauth".to_string(),
-        serde_json::json!([{"key": "old-test-key"}]),
+        serde_json::json!([{"key": "old-test-key-0123456789"}]),
     );
     let old = GatewayConfig {
         consumers: vec![consumer],
@@ -893,7 +893,7 @@ fn test_same_timestamp_consumer_credential_rotation_is_modification() {
     let mut new = old.clone();
     new.consumers[0].credentials.insert(
         "keyauth".to_string(),
-        serde_json::json!([{"key": "new-test-key"}]),
+        serde_json::json!([{"key": "new-test-key-0123456789"}]),
     );
 
     let delta = ConfigDelta::compute(&old, &new);
@@ -1104,7 +1104,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         // `ConsumerIndex` reads keyauth credentials as an array of entries.
         consumer.credentials.insert(
             "keyauth".to_string(),
-            serde_json::json!([{"key": "old-test-key"}]),
+            serde_json::json!([{"key": "old-test-key-0123456789"}]),
         );
         let mut plugin = make_plugin_config("pc1", "key_auth", PluginScope::Global, None, t);
         plugin.enabled = false;
@@ -1126,7 +1126,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         assert!(
             state
                 .consumer_index
-                .find_by_api_key("old-test-key")
+                .find_by_api_key("old-test-key-0123456789")
                 .is_some()
         );
         assert!(
@@ -1138,7 +1138,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         let mut candidate = state.config.load_full().as_ref().clone();
         candidate.consumers[0].credentials.insert(
             "keyauth".to_string(),
-            serde_json::json!([{"key": "new-test-key"}]),
+            serde_json::json!([{"key": "new-test-key-0123456789"}]),
         );
         candidate.plugin_configs[0].enabled = true;
         if change_route {
@@ -1149,13 +1149,13 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         assert!(
             state
                 .consumer_index
-                .find_by_api_key("old-test-key")
+                .find_by_api_key("old-test-key-0123456789")
                 .is_none()
         );
         assert!(
             state
                 .consumer_index
-                .find_by_api_key("new-test-key")
+                .find_by_api_key("new-test-key-0123456789")
                 .is_some()
         );
         assert_eq!(
@@ -1168,7 +1168,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         let epoch = state.request_epoch.load();
         assert_eq!(
             epoch.config().consumers[0].credentials["keyauth"][0]["key"],
-            "new-test-key"
+            "new-test-key-0123456789"
         );
         assert!(epoch.config().plugin_configs[0].enabled);
     }

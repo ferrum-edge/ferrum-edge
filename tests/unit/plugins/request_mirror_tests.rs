@@ -2760,7 +2760,7 @@ async fn test_mirror_preserves_raw_query_edge_cases() {
     // Issue #2444: repeated pairs, order, flags, empty values, `+`, encoded
     // delimiters, percent escapes, and non-ASCII encoded bytes must survive.
     const RAW: &str =
-        "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&key=a%2Fb&name=%E2%9C%93";
+        "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&dir=a%2Fb&name=%E2%9C%93";
 
     let mut ctx = make_ctx_with_proxy();
     ctx.set_raw_query_string(RAW.to_string());
@@ -2949,7 +2949,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
                 "mirror_host": "mirror.local",
                 "sensitive_query_patterns": ["x-vendor-"],
                 "forward_sensitive_query": true,
-                "forward_sensitive_query_allowlist": ["x-vendor-token"]
+                "forward_sensitive_query_allowlist": ["x-vendor-value"]
             }),
             PluginHttpClient::default(),
         )
@@ -3616,7 +3616,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
                 "mirror_host": "mirror.local",
                 "sensitive_header_patterns": ["x-vendor-"],
                 "forward_sensitive_headers": true,
-                "forward_sensitive_header_allowlist": ["x-vendor-token"]
+                "forward_sensitive_header_allowlist": ["x-vendor-value"]
             }),
             PluginHttpClient::default(),
         )
@@ -4443,7 +4443,7 @@ async fn sensitive_header_patterns_and_substrings_strip_vendor_credentials() {
     // Caught by the built-in `security-token` substring:
     headers.insert("x-amz-security-token".to_string(), "amz-tok".to_string());
     // Caught only by the operator pattern `x-vault-`:
-    headers.insert("x-vault-token".to_string(), "vault-tok".to_string());
+    headers.insert("x-vault-value".to_string(), "vault-tok".to_string());
     // Benign: contains only the excluded bare `token` substring — must survive.
     headers.insert("x-continuation-token".to_string(), "page2".to_string());
     headers.insert("x-custom".to_string(), "keep-me".to_string());
@@ -4459,7 +4459,7 @@ async fn sensitive_header_patterns_and_substrings_strip_vendor_credentials() {
         "x-openai-api-key:",
         "x-datadog-api-key:",
         "x-amz-security-token:",
-        "x-vault-token:",
+        "x-vault-value:",
         "sk-openai",
         "dd-key",
         "amz-tok",
@@ -6603,4 +6603,364 @@ async fn mirror_carries_the_proxy_hop_count_instead_of_the_copied_value() {
             "a copied `_` spelling is dropped only while the gateway stamps its own count"
         );
     }
+}
+
+/// Credential-class header names that no exact-name or substring entry lists
+/// must still be stripped before a distinct mirror origin, while continuation
+/// cursors, authorship, and idempotency headers survive.
+#[tokio::test]
+async fn mirror_strips_unlisted_credential_class_headers() {
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    let credential_names = [
+        "x-session-id",
+        "x-sessionid",
+        "jwt",
+        "x-jwt-assertion",
+        "x-access-key",
+        "x-private-key",
+        "x-subscriptionkey",
+        "auth",
+        "x-auth",
+        "x-authn-user",
+        "x-sid",
+        "x-pwd",
+        "x-pass",
+        "x-otp",
+        "x-signing-key",
+        "x-sso-ticket",
+        "x-hmac",
+        "x-passphrase",
+        "x-ssoticket",
+        "x-clientassertion",
+        "x-phpsessid",
+        "x-privatekeypem",
+        "x-clientpwd",
+        "x-totpcode",
+        "x-keyid",
+        "x-clientjwe",
+        "x-userpw",
+        "x-clientsid",
+        "x-pin",
+        "x-userpin",
+        "x-vercel-protection-bypass",
+        "x-device-code",
+        "x-usercode",
+    ];
+    for (idx, name) in credential_names.iter().enumerate() {
+        headers.insert((*name).to_string(), format!("cred-value-{idx}"));
+    }
+    let benign = [
+        ("x-continuation-token", "page2"),
+        ("x-author", "jane"),
+        ("idempotency-key", "op-1"),
+        ("x-custom", "keep-me"),
+    ];
+    for (name, value) in benign {
+        headers.insert(name.to_string(), value.to_string());
+    }
+
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in credential_names {
+        assert!(
+            !observed.contains_key(name),
+            "credential-class header `{name}` must not reach the mirror: {observed:?}"
+        );
+    }
+    for (idx, _) in credential_names.iter().enumerate() {
+        let leaked = format!("cred-value-{idx}");
+        assert!(
+            !observed.values().any(|value| value == &leaked),
+            "credential value `{leaked}` leaked to the mirror: {observed:?}"
+        );
+    }
+    for (name, value) in benign {
+        assert_eq!(
+            observed.get(name).map(String::as_str),
+            Some(value),
+            "benign header `{name}` must survive: {observed:?}"
+        );
+    }
+}
+
+/// Credential-class query names outside the built-in lists (including mixed
+/// case and alternate separators) are dropped from the mirror request-target;
+/// continuation cursors and ordinary names are kept byte-for-byte.
+#[tokio::test]
+async fn mirror_strips_unlisted_credential_class_query_names() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = concat!(
+        "keep=1&session_id=q1&sessionId=q2&jwt=q3&access_key=q4&private_key=q5&",
+        "key=q6&sid=q7&pwd=q8&ticket=q9&auth=q10&x.auth.code=q11&otp=q12&",
+        "ssoTicket=q13&clientAssertion=q14&%73essionid=q15&sess%2569on_key=q16&",
+        "PHPSESSID=q17&%50HPSESSID=q18&%2550HPSESSID=q19&",
+        "clientPwd=q20&totpCode=q21&privateKeyPem=q22&code=q23&%63ode=q24&",
+        "%2563ode_verifier=q25&clientPass=q26&",
+        "clientCred=q27&clientSid=q28&sids=q29&%73igs=q30&%2563lientSid=q31&",
+        "pin=q32&user_pin=q33&pincode=q34&%70in=q35&",
+        "x-vercel-protection-bypass=q36&x-vercel-protection-%62ypass=q37&",
+        "x-vercel-protection-%2562ypass=q38&",
+        "%20code=q39&+code=q40&%2520code=q41&",
+        "user_code=q42&device_code=q43&%75ser_code=q44&%2564eviceCode=q45&",
+        "continuation_token=c3&continuation%5Ftoken=c4&continuation%255Ftoken=c5&",
+        "author=a1&signal=1&page=2&keyword=shoes&country_code=us&spin_count=3"
+    );
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains(concat!(
+            "?keep=1&continuation_token=c3&continuation%5Ftoken=c4&",
+            "continuation%255Ftoken=c5&author=a1&signal=1&page=2&keyword=shoes&country_code=us&spin_count=3 "
+        )),
+        "benign pairs must be retained in order: {request_line}"
+    );
+    for idx in 1..=45 {
+        let value = format!("=q{idx}&");
+        let tail = format!("=q{idx} ");
+        assert!(
+            !request_line.contains(&value) && !request_line.contains(&tail),
+            "credential-class query value q{idx} leaked: {request_line}"
+        );
+    }
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary raw query must remain byte-for-byte unchanged"
+    );
+}
+
+/// Operator patterns still decide names outside every built-in classifier.
+#[test]
+fn operator_pattern_alone_makes_a_vendor_name_sensitive() {
+    for (patterns_key, forward_key, allow_key) in [
+        (
+            "sensitive_header_patterns",
+            "forward_sensitive_headers",
+            "forward_sensitive_header_allowlist",
+        ),
+        (
+            "sensitive_query_patterns",
+            "forward_sensitive_query",
+            "forward_sensitive_query_allowlist",
+        ),
+    ] {
+        let without_pattern = RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                forward_key: true,
+                allow_key: ["x-vendor-value"]
+            }),
+            PluginHttpClient::default(),
+        );
+        assert!(
+            without_pattern.is_err(),
+            "{allow_key}: x-vendor-value is not built-in sensitive and must be rejected"
+        );
+        let with_pattern = RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                patterns_key: ["x-vendor-"],
+                forward_key: true,
+                allow_key: ["x-vendor-value"]
+            }),
+            PluginHttpClient::default(),
+        );
+        assert!(
+            with_pattern.is_ok(),
+            "{allow_key}: the operator pattern must make x-vendor-value allowlistable"
+        );
+    }
+}
+
+/// A credential-class query name forwards only through the exact allowlist,
+/// matched on the decoded name.
+#[tokio::test]
+async fn credential_class_query_name_forwards_only_when_allowlisted() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("PHPSESSID=live&x=1".to_string());
+    let default_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        default_line.contains("?x=1 ") && !default_line.contains("live"),
+        "default mirror must drop the session id: {default_line}"
+    );
+
+    let mut allowed = make_ctx_with_proxy();
+    allowed.set_raw_query_string(
+        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1"
+            .to_string(),
+    );
+    let allowed_line = capture_mirror_request_line_with_config(
+        &mut allowed,
+        json!({
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": [
+                "phpsessid",
+                "code",
+                "clientsid",
+                "pin",
+                "x-vercel-protection-bypass",
+                "user_code"
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        allowed_line.contains(
+            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1 "
+        ),
+        "exact allowlist must forward the decoded name with its raw encoding: {allowed_line}"
+    );
+}
+
+/// Bracketed object-key query names are stripped when credential-shaped and
+/// can be forwarded through the exact decoded-name allowlist.
+#[tokio::test]
+async fn bracketed_query_names_strip_and_allowlist() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("filter[key]=a&key[]=b&filter[color]=red&x=1".to_string());
+    let default_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        default_line.contains("?filter[color]=red&x=1 "),
+        "credential-shaped bracketed names must be dropped: {default_line}"
+    );
+
+    let mut allowed = make_ctx_with_proxy();
+    allowed.set_raw_query_string("filter%5Bkey%5D=a&key[]=b&x=1".to_string());
+    let allowed_line = capture_mirror_request_line_with_config(
+        &mut allowed,
+        json!({
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["filter[key]"]
+        }),
+    )
+    .await;
+    assert!(
+        allowed_line.contains("?filter%5Bkey%5D=a&x=1 "),
+        "allowlisted bracketed name must forward with its raw encoding: {allowed_line}"
+    );
+}
+
+/// The DPoP proof header is a credential and is stripped by default.
+#[tokio::test]
+async fn dpop_proof_header_is_stripped_unless_allowlisted() {
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert("dpop".to_string(), "proof-jwt".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(!observed.contains_key("dpop"), "{observed:?}");
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "forward_sensitive_headers": true,
+                "forward_sensitive_header_allowlist": ["dpop"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "dpop must be allowlistable"
+    );
+}
+
+/// Names caught only by the credential-class rule are still opt-in-able
+/// through the exact allowlist, which stays the only way back in.
+#[test]
+fn credential_class_names_are_allowlistable() {
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "forward_sensitive_headers": true,
+                "forward_sensitive_header_allowlist": ["x-session-id", "jwt"],
+                "forward_sensitive_query": true,
+                "forward_sensitive_query_allowlist": ["session_id", "private_key"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "credential-class names must be accepted by the exact allowlists"
+    );
+    let err = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["x-author"]
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-credential name must be rejected");
+    assert!(err.contains("not a recognized sensitive header"), "{err}");
+}
+
+/// Credential locations an auth plugin uses on this route are credentials at
+/// the mirror boundary whatever they are called: a `key_auth` header the
+/// primary keeps (`hide_credentials: false`) and a marked query credential
+/// are both withheld from the mirror while the primary request keeps them.
+#[tokio::test]
+async fn route_credential_locations_are_withheld_from_the_mirror() {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+
+    let key_auth = create_plugin(
+        "key_auth",
+        &json!({"key_location": "header:x-proof", "hide_credentials": false}),
+    )
+    .expect("key_auth config")
+    .expect("key_auth plugin");
+    let route_headers = key_auth.request_headers_to_redact().to_vec();
+    assert_eq!(route_headers, vec!["x-proof".to_string()]);
+
+    let mut ctx = make_ctx_with_proxy();
+    set_replay_credential_headers_for_test(&mut ctx, route_headers);
+    let mut headers = HashMap::new();
+    headers.insert("x-proof".to_string(), "live-api-key".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(!observed.contains_key("x-proof"), "{observed:?}");
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+    assert_eq!(
+        headers.get("x-proof").map(String::as_str),
+        Some("live-api-key"),
+        "the primary request keeps its credential"
+    );
+
+    let mut query_ctx = make_ctx_with_proxy();
+    const RAW: &str = "proof=live-api-key&x=1";
+    query_ctx.set_raw_query_string(RAW.to_string());
+    query_ctx
+        .query_params
+        .insert("proof".to_string(), "live-api-key".to_string());
+    query_ctx.metadata.insert(
+        "auth.query_credential_param.proof".to_string(),
+        "true".to_string(),
+    );
+    let request_line = capture_mirror_request_line(&mut query_ctx).await;
+    assert!(
+        request_line.contains("?x=1 ") && !request_line.contains("live-api-key"),
+        "{request_line}"
+    );
+    assert_eq!(query_ctx.raw_query_string(), Some(RAW));
+
+    // A configured name that keeps a literal escape after one decode.
+    let mut escaped_ctx = make_ctx_with_proxy();
+    escaped_ctx.set_raw_query_string("proof%2531=live-api-key&x=1".to_string());
+    escaped_ctx.metadata.insert(
+        "auth.query_credential_param.proof%31".to_string(),
+        "true".to_string(),
+    );
+    let escaped_line = capture_mirror_request_line(&mut escaped_ctx).await;
+    assert!(
+        escaped_line.contains("?x=1 ") && !escaped_line.contains("live-api-key"),
+        "{escaped_line}"
+    );
 }

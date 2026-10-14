@@ -348,9 +348,18 @@ fn write_chargeback_key(
     // Include protocol_family so status-0 WebSocket bandwidth (HTTP family) and
     // zero-connection-price stream sessions cannot collide when every other
     // key dimension matches (issue #2571).
+    //
+    // The four free-form text dimensions are length-prefixed: names may
+    // themselves contain `|`, so without the lengths `("a|b", "c")` and
+    // `("a", "b|c")` would build the same key and merge two consumers' (or
+    // namespaces') charges into one entry.
     let _ = write!(
         buf,
-        "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        "{}.{}.{}.{}|{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        consumer.len(),
+        proxy_namespace.len(),
+        proxy_id.len(),
+        scope.currency.len(),
         consumer,
         proxy_namespace,
         proxy_id,
@@ -1454,9 +1463,14 @@ impl ChargebackRegistry {
             // Currency comes from the recording instance; namespace comes from
             // the matched proxy so global instances preserve tenant identity.
             // Capacity covers separators, status, protocol_family label
-            // ("stream" is longest), and three 16-hex price bit fields.
+            // ("stream" is longest), three 16-hex price bit fields, and the
+            // four length prefixes.
             let mut owned_key = String::with_capacity(
-                consumer.len() + proxy_namespace.len() + proxy_id.len() + scope.currency.len() + 74,
+                consumer.len()
+                    + proxy_namespace.len()
+                    + proxy_id.len()
+                    + scope.currency.len()
+                    + 158,
             );
             write_chargeback_key(
                 &mut owned_key,

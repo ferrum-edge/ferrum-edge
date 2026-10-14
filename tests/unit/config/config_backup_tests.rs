@@ -129,7 +129,7 @@ fn backup_rejects_malformed_consumer_credentials_without_echoing_values() {
 fn backup_preserves_canonical_secrets_and_custom_schema_fields() {
     let credentials = json!({
         "jwt": [{"secret": "a-valid-test-secret-with-at-least-32-chars"}],
-        "keyauth": [{"key": "first-key"}, {"key": "rotation-key"}],
+        "keyauth": [{"key": "first-key-0123456789"}, {"key": "rotation-key-0123456789"}],
         "custom": [{"schema": {"private_key": {"type": "string"}}}]
     });
     let mut value = administrative_backup();
@@ -198,13 +198,13 @@ fn backup_rejects_oversized_files_before_reading_them() {
 fn backup_rejects_duplicate_credentials_inside_the_served_namespace() {
     let mut value = administrative_backup();
     value["consumers"] = json!([
-        {"id": "a", "username": "alice", "credentials": {"keyauth": [{"key": "same-test-key"}]}},
-        {"id": "b", "username": "bob", "credentials": {"keyauth": [{"key": "same-test-key"}]}}
+        {"id": "a", "username": "alice", "credentials": {"keyauth": [{"key": "same-test-key-0123456789"}]}},
+        {"id": "b", "username": "bob", "credentials": {"keyauth": [{"key": "same-test-key-0123456789"}]}}
     ]);
     let (_tmp, path) = write_tmp_file(&value.to_string());
     let error = load_config_backup(&path, "ferrum").unwrap_err().to_string();
     assert!(error.contains("duplicate credential"));
-    assert!(!error.contains("same-test-key"));
+    assert!(!error.contains("same-test-key-0123456789"));
 }
 
 fn write_tmp_file(content: &str) -> (tempfile::NamedTempFile, String) {
@@ -644,13 +644,13 @@ const TWO_NAMESPACE_BACKUP: &str = r#"{
             "id": "consumer-a",
             "username": "alice",
             "namespace": "tenant-a",
-            "credentials": {"keyauth": [{"key": "key-alpha"}]}
+            "credentials": {"keyauth": [{"key": "key-alpha-0123456789"}]}
         },
         {
             "id": "consumer-b",
             "username": "bob",
             "namespace": "tenant-b",
-            "credentials": {"keyauth": [{"key": "key-bravo"}]}
+            "credentials": {"keyauth": [{"key": "key-bravo-0123456789"}]}
         }
     ],
     "plugin_configs": [
@@ -710,7 +710,7 @@ fn multi_namespace_backup_serves_only_the_configured_namespace() {
     // The foreign tenant's credential must not be reachable at all.
     let serialized = serde_json::to_string(&loaded).expect("candidate must serialize");
     assert!(
-        !serialized.contains("key-bravo") && !serialized.contains("bob"),
+        !serialized.contains("key-bravo-0123456789") && !serialized.contains("bob"),
         "no tenant-b consumer or credential may survive the filter"
     );
     assert!(
@@ -855,7 +855,7 @@ fn backup_rejection_text_never_carries_the_payload_or_foreign_names() {
                 "id": "consumer-b",
                 "username": "bob",
                 "namespace": "tenant-b",
-                "credentials": {"keyauth": [{"key": "key-bravo"}]}
+                "credentials": {"keyauth": [{"key": "key-bravo-0123456789"}]}
             }
         ],
         "plugin_configs": [],
@@ -879,7 +879,12 @@ fn backup_rejection_text_never_carries_the_payload_or_foreign_names() {
     // Deliberately excludes short tokens like the username: the message embeds
     // the randomly named temporary backup path, and a 3-character needle could
     // match it by chance. The distinctive tokens below cannot.
-    for forbidden in ["key-bravo", "secret-upstream", "10.0.0.2", "tenant-b"] {
+    for forbidden in [
+        "key-bravo-0123456789",
+        "secret-upstream",
+        "10.0.0.2",
+        "tenant-b",
+    ] {
         assert!(
             !msg.contains(forbidden),
             "backup rejection leaked '{forbidden}': {msg}"

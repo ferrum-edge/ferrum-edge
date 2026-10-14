@@ -50,8 +50,13 @@
 //! `X-Api-Key`, …),
 //! contains a built-in credential substring (so vendor variants like
 //! `x-openai-api-key`, `x-amz-security-token`, `x-vendor-auth-token` are also
-//! caught), or matches an operator `sensitive_header_patterns` entry is stripped
-//! before the distinct mirror origin. Because native gRPC metadata is carried as
+//! caught), is credential-shaped (a separator-delimited segment is a
+//! credential-class word such as `auth`, `jwt`, `session`, `sid`, `key`, `pwd`,
+//! contains a credential stem such as `session`/`token`/`secret`, or contains
+//! `key`/`pass` outside a few ordinary words; continuation cursors,
+//! authorship/authority names and
+//! `Idempotency-Key` excepted), or matches an operator `sensitive_header_patterns` entry is
+//! stripped before the distinct mirror origin. Because native gRPC metadata is carried as
 //! HTTP/2 headers, the same predicate covers gRPC credential metadata. Forwarding
 //! any denied header requires the high-friction, fail-closed pair
 //! `forward_sensitive_headers=true` plus an exact-name
@@ -67,7 +72,8 @@
 //! match that funnel. Cross-origin **query** credential forwarding is the same
 //! deny-by-default posture as headers: built-in credential names/substrings
 //! (plus operator `sensitive_query_patterns`) are dropped from the mirror
-//! request-target only. Classification percent-decodes the name in bounded
+//! request-target only. The same credential-shaped class rule applies to
+//! decoded query names (`session_id`, `jwt`, `access_key`, `key`, `sid`). Classification percent-decodes the name in bounded
 //! stages (every layer through a hard cap of 4) and
 //! fails closed on residual valid `%XX` escapes, malformed percents, or
 //! control-bearing/invalid-UTF-8 forms; the retained pair is never rewritten.
@@ -434,11 +440,10 @@ const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
 /// Built-in credential/session substrings applied to lowercased header names so
 /// vendor-prefixed variants (`x-openai-api-key`, `x-amz-security-token`,
 /// `x-vendor-auth-token`) are stripped without an exact-name allowlist. Chosen
-/// to match credential families only: bare `token`/`key`/`session`/`auth`
-/// substrings are deliberately excluded because they also match benign headers
-/// such as pagination cursors (`x-continuation-token`). `authenticate` is
-/// included so `Proxy-Authenticate` / `WWW-Authenticate` variants are covered
-/// without a bare `auth` match. Operators extend this with
+/// to match credential families. The broader fail-closed class rule
+/// ([`name_has_credential_class`]) covers bare `token`/`key`/`session`/`auth`
+/// segments and stems, with narrow exceptions for pagination cursors
+/// (`x-continuation-token`). Operators extend this with
 /// `sensitive_header_patterns`. gRPC metadata is carried as HTTP/2 headers,
 /// so the same predicate covers native gRPC credential metadata.
 const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
@@ -475,8 +480,9 @@ const MIRROR_SENSITIVE_QUERY_CREDENTIAL_SEGMENTS: &[&str] = &["token", "sig", "s
 /// query parameter names. Seeded from [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]
 /// with `_` variants of hyphenated families so `access_token` / `api_key`
 /// match the same secret classes the header policy already denies. Bare
-/// `token`/`key`/`session`/`auth`/`sig` substrings are excluded; those families
-/// are handled by [`query_name_has_built_in_credential_segment`].
+/// `token`/`key`/`session`/`auth`/`sig` families are handled by
+/// [`query_name_has_built_in_credential_segment`] and the class rule
+/// [`name_has_credential_class`].
 const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
     "authorization",
     "cookie",
@@ -504,6 +510,234 @@ const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
     "secret",
     "credential",
 ];
+
+/// Credential-class words. A header or decoded query name is credential-shaped
+/// when any of its alphanumeric segments (split on every non-alphanumeric byte)
+/// equals one of these words, so `x-session-id`, `jwt`, `x-private-key`,
+/// `auth`, `sid`, or `pwd` fail closed without an exact-name entry.
+const MIRROR_CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
+    "auth",
+    "authn",
+    "authz",
+    "oauth",
+    "jwt",
+    "jws",
+    "jwe",
+    "saml",
+    "token",
+    "tokens",
+    "session",
+    "sessions",
+    "sess",
+    "sessid",
+    "sid",
+    "ssid",
+    "key",
+    "keys",
+    "secret",
+    "secrets",
+    "password",
+    "passwd",
+    "passphrase",
+    "passcode",
+    "pass",
+    "pwd",
+    "pw",
+    "credential",
+    "credentials",
+    "cred",
+    "creds",
+    "cookie",
+    "cookies",
+    "bearer",
+    "sig",
+    "signature",
+    "hmac",
+    "otp",
+    "totp",
+    "hotp",
+    "csrf",
+    "xsrf",
+    "ticket",
+    "assertion",
+];
+
+/// Credential-class stems matched inside a single segment, so concatenated
+/// and spelled-out forms (`sessionid`, `accesstoken`, `clientsecret`,
+/// `authorization`, `jwtassertion`, `clientpwd`, `totpcode`, `codeverifier`)
+/// fail closed too. A segment containing `key` or `pass` (`accesskey`,
+/// `privatekeypem`, `clientpass`) is also treated as a credential unless it is
+/// a listed benign word; see [`segment_is_credential_shaped`].
+const MIRROR_CREDENTIAL_CLASS_STEMS: &[&str] = &[
+    "auth",
+    "token",
+    "session",
+    "sessid",
+    "secret",
+    "passw",
+    "passphrase",
+    "passcode",
+    "credential",
+    "cookie",
+    "bearer",
+    "signature",
+    "jwt",
+    "saml",
+    "csrf",
+    "xsrf",
+    "ticket",
+    "assertion",
+    "hmac",
+    "pwd",
+    "otp",
+    "mfa",
+    "verifier",
+    "jws",
+    "jwe",
+    "dpop",
+    "pincode",
+];
+
+/// Short credential aliases matched as a segment suffix, plural included, so
+/// compounds such as `clientsid`, `userpw`, `clientcred` and `sids` fail
+/// closed. Too short to match as a substring anywhere in a segment.
+const MIRROR_CREDENTIAL_CLASS_SUFFIXES: &[&str] = &[
+    "sid", "sids", "pw", "pws", "cred", "creds", "sig", "sigs", "pin", "pins",
+];
+
+/// Whole segments that contain `key` or `pass` without naming a credential.
+/// Everything else containing either (`privatekeypem`, `keyid`, `clientpass`)
+/// fails closed.
+const MIRROR_BENIGN_KEY_PASS_SEGMENTS: &[&str] = &[
+    "keyword",
+    "keywords",
+    "keyboard",
+    "keystroke",
+    "keystrokes",
+    "keynote",
+    "monkey",
+    "donkey",
+    "turkey",
+    "hockey",
+    "jockey",
+    "whiskey",
+    "passenger",
+    "passengers",
+    "passage",
+    "passive",
+    "compass",
+    "sacred",
+    "spin",
+    "spins",
+];
+
+/// Names that are credentials when they are the name's only alphanumeric
+/// segment. `code` is the OAuth authorization-code callback parameter; next to
+/// other segments it is too common (`country_code`, `zip-code`) to treat as a
+/// credential.
+const MIRROR_CREDENTIAL_WHOLE_NAMES: &[&str] = &["code"];
+
+/// Whole segments that contain the `auth` stem but name authorship or a URI
+/// authority rather than a credential.
+const MIRROR_BENIGN_AUTH_SEGMENTS: &[&str] =
+    &["author", "authors", "authored", "authority", "authorities"];
+
+/// Qualifiers that turn `token` into a pagination cursor rather than a
+/// credential, either as the preceding segment (`continuation_token`,
+/// `x-continuation-token`) or as a concatenated prefix (`continuationtoken`).
+/// Kept to the one cursor family the query policy already exempted, so the
+/// class rule never loosens it.
+const MIRROR_BENIGN_TOKEN_QUALIFIERS: &[&str] = &["continuation"];
+
+/// Qualifiers that make `code` an authorization or one-time code rather than an
+/// ordinary code (`country_code`): as the preceding segment (`user_code`,
+/// `x-device-code`) or as a concatenated prefix (`devicecode`).
+const MIRROR_CREDENTIAL_CODE_QUALIFIERS: &[&str] = &[
+    "user",
+    "device",
+    "verification",
+    "access",
+    "recovery",
+    "backup",
+    "login",
+    "reset",
+    "security",
+    "activation",
+    "confirmation",
+    "magic",
+];
+
+/// Credential-class test for one lowercased alphanumeric segment, given the
+/// previous segment of the same name (if any).
+fn segment_is_credential_shaped(segment: &str, previous: Option<&str>) -> bool {
+    if segment == "code" || segment == "codes" {
+        return previous.is_some_and(|prev| MIRROR_CREDENTIAL_CODE_QUALIFIERS.contains(&prev));
+    }
+    if let Some(prefix) = segment
+        .strip_suffix("codes")
+        .or_else(|| segment.strip_suffix("code"))
+        && MIRROR_CREDENTIAL_CODE_QUALIFIERS.contains(&prefix)
+    {
+        return true;
+    }
+    if MIRROR_BENIGN_AUTH_SEGMENTS.contains(&segment) {
+        return false;
+    }
+    if segment == "token" || segment == "tokens" {
+        return !previous.is_some_and(|prev| MIRROR_BENIGN_TOKEN_QUALIFIERS.contains(&prev));
+    }
+    if let Some(prefix) = segment
+        .strip_suffix("tokens")
+        .or_else(|| segment.strip_suffix("token"))
+        && MIRROR_BENIGN_TOKEN_QUALIFIERS.contains(&prefix)
+    {
+        return false;
+    }
+    if (segment == "key" || segment == "keys") && previous == Some("idempotency") {
+        return false;
+    }
+    if segment == "idempotencykey" {
+        return false;
+    }
+    MIRROR_CREDENTIAL_CLASS_SEGMENTS.contains(&segment)
+        || MIRROR_CREDENTIAL_CLASS_STEMS
+            .iter()
+            .any(|stem| segment.contains(stem))
+        || ((segment.contains("key")
+            || segment.contains("pass")
+            || MIRROR_CREDENTIAL_CLASS_SUFFIXES
+                .iter()
+                .any(|suffix| segment.ends_with(suffix)))
+            && !MIRROR_BENIGN_KEY_PASS_SEGMENTS.contains(&segment))
+}
+
+/// Fail-closed credential-class test shared by the header and query policies.
+/// `name_lower` must already be ASCII-lowercased (and, for query names,
+/// percent-decoded). Splitting on every non-alphanumeric byte means `-`, `_`,
+/// `.`, `+`, space and any other separator spelling yield the same segments.
+fn name_has_credential_class(name_lower: &str) -> bool {
+    // A whole-name credential also matches when separators surround it
+    // (` code`, `+code`, `code[]`): form decoders strip or normalise those.
+    let mut segments = name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty());
+    if let (Some(only), None) = (segments.next(), segments.next())
+        && MIRROR_CREDENTIAL_WHOLE_NAMES.contains(&only)
+    {
+        return true;
+    }
+    let mut previous = None;
+    for segment in name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+    {
+        if segment_is_credential_shaped(segment, previous) {
+            return true;
+        }
+        previous = Some(segment);
+    }
+    false
+}
 
 /// Sampling period for percentage decisions: threshold is tenths of a percent
 /// in `0..=SAMPLE_PERIOD`, so each complete cycle of `SAMPLE_PERIOD` requests
@@ -544,6 +778,7 @@ fn is_port_suffix(rest: &str) -> bool {
 /// `sensitive_header_patterns` substring.
 fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
     MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
+        || name_has_credential_class(name_lower)
         || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
             .iter()
             .any(|substr| name_lower.contains(substr))
@@ -557,6 +792,16 @@ fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) ->
 /// built-in substrings, and operator `sensitive_query_patterns` all deny.
 /// Never logs the name.
 fn is_mirror_sensitive_query_name(name_lower: &str, operator_patterns: &[String]) -> bool {
+    is_mirror_sensitive_query_name_staged(name_lower, operator_patterns)
+        || name_has_credential_class(name_lower)
+}
+
+/// The list-based part of [`is_mirror_sensitive_query_name`], applied to every
+/// staged decode layer. The class rule ([`name_has_credential_class`]) runs
+/// only on the fully decoded name, because a raw `%XX` escape splits segments
+/// (`continuation%5Ftoken` would read as `continuation` + `5ftoken`) and would
+/// defeat its narrow exceptions.
+fn is_mirror_sensitive_query_name_staged(name_lower: &str, operator_patterns: &[String]) -> bool {
     query_name_has_built_in_credential_segment(name_lower)
         || query_name_has_adjacent_segments(name_lower, "api", "key")
         || MIRROR_SENSITIVE_QUERY_SUBSTRINGS
@@ -719,6 +964,7 @@ enum MirrorQueryNameDecision {
 fn classify_mirror_query_name(
     raw_name: &str,
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) -> MirrorQueryNameDecision {
     if raw_name.len() > MAX_MIRROR_QUERY_NAME_CLASSIFY_BYTES {
         return MirrorQueryNameDecision::FailClosed;
@@ -745,7 +991,18 @@ fn classify_mirror_query_name(
             } else {
                 Cow::Owned(current.to_ascii_lowercase())
             };
-            if is_mirror_sensitive_query_name(lower.as_ref(), operator_patterns) {
+            // The class rule runs once, on the fully decoded layer (see
+            // `is_mirror_sensitive_query_name_staged`).
+            // Route credential names are compared at every decode layer: an
+            // auth plugin may match a name that still carries an escape
+            // (`proof%31`) after the single decode the request parser applies.
+            if is_mirror_sensitive_query_name_staged(lower.as_ref(), operator_patterns)
+                || route_credentials
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(lower.as_ref()))
+                || (!name_has_valid_percent_escape(current.as_ref())
+                    && name_has_credential_class(lower.as_ref()))
+            {
                 sensitive = true;
             }
         }
@@ -854,6 +1111,30 @@ pub(crate) fn resolve_mirror_timeout_ms(
     raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
 }
 
+/// Query parameter names that an authentication plugin marked as credential
+/// locations on this request (whether or not it strips them from the primary
+/// request). Empty, without allocating, when none were marked.
+fn route_query_credential_names(ctx: &RequestContext) -> Vec<String> {
+    use crate::plugins::utils::token_extract::{
+        QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
+    };
+    let mut names: Vec<String> = ctx
+        .query_credential_partition_digests()
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    for key in ctx.metadata.keys() {
+        if let Some(name) = key
+            .strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX)
+            .or_else(|| key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX))
+            && !names.iter().any(|known| known == name)
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 /// Strip origin-bound credentials before a distinct mirror origin. Deny by
 /// default: a sensitive header survives only when `forward_sensitive_headers`
 /// is set and the exact lowercased name is in the fail-closed allowlist.
@@ -862,10 +1143,15 @@ fn apply_mirror_credential_policy(
     forward_sensitive_headers: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) {
     headers.retain(|(name, _)| {
         let lower = name.to_ascii_lowercase();
-        if !is_mirror_sensitive_header(&lower, operator_patterns) {
+        if !is_mirror_sensitive_header(&lower, operator_patterns)
+            && !route_credentials
+                .iter()
+                .any(|credential| credential.eq_ignore_ascii_case(&lower))
+        {
             return true;
         }
         forward_sensitive_headers && allowlist.iter().any(|allowed| allowed == &lower)
@@ -880,6 +1166,7 @@ fn mirror_query_pair_allowed(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) -> bool {
     // Some application query parsers still accept `;` as a parameter
     // separator. Ferrum's canonical query uses `&`, so forwarding a raw
@@ -890,7 +1177,7 @@ fn mirror_query_pair_allowed(
         return false;
     }
     let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-    match classify_mirror_query_name(raw_name, operator_patterns) {
+    match classify_mirror_query_name(raw_name, operator_patterns, route_credentials) {
         MirrorQueryNameDecision::NonSensitive => true,
         MirrorQueryNameDecision::FailClosed => false,
         MirrorQueryNameDecision::Sensitive { decoded_lower } => {
@@ -910,6 +1197,7 @@ fn apply_mirror_query_credential_policy<'a>(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) -> Cow<'a, str> {
     if query.is_empty() {
         return Cow::Borrowed(query);
@@ -925,6 +1213,7 @@ fn apply_mirror_query_credential_policy<'a>(
                 forward_sensitive_query,
                 allowlist,
                 operator_patterns,
+                route_credentials,
             )
     });
     if !needs_strip {
@@ -939,6 +1228,7 @@ fn apply_mirror_query_credential_policy<'a>(
                 forward_sensitive_query,
                 allowlist,
                 operator_patterns,
+                route_credentials,
             )
         {
             continue;
@@ -1934,6 +2224,7 @@ impl RequestMirror {
         original_path: &str,
         raw_query: Option<&str>,
         query_params: &HashMap<String, String>,
+        route_query_credentials: &[String],
     ) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
 
@@ -1956,6 +2247,7 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
+                route_query_credentials,
             );
             if !filtered.is_empty() {
                 url.push('?');
@@ -1968,6 +2260,7 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
+                route_query_credentials,
             );
             if !filtered.is_empty() {
                 url.push('?');
@@ -2288,11 +2581,12 @@ fn parse_forward_sensitive_query_allowlist(
                         "request_mirror: `forward_sensitive_query_allowlist[{idx}]` exceeds maximum length of {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN} bytes"
                     ));
                 }
-                if trimmed
-                    .bytes()
-                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-                    || trimmed.contains(['=', '&', '?', '#', '/', '@'])
-                    || http::HeaderName::from_bytes(trimmed.as_bytes()).is_err()
+                // Query names are not header names: brackets (`filter[key]`,
+                // `key[]`) and other visible ASCII are valid. Entries match
+                // the decoded name, so `%` and the query delimiters are refused.
+                if trimmed.len() != name.len()
+                    || !trimmed.bytes().all(|b| b.is_ascii_graphic())
+                    || trimmed.contains(['=', '&', '?', '#', '/', '@', ';', '%', '+'])
                 {
                     return Err(format!(
                         "request_mirror: `forward_sensitive_query_allowlist[{idx}]` is not a valid query parameter name"
@@ -2592,8 +2886,15 @@ impl Plugin for RequestMirror {
             } else {
                 None
             };
-        let mirror_url =
-            self.build_mirror_url(mirror_path, effective_query.as_deref(), &ctx.query_params);
+        // Query names an auth plugin used as a credential location on this
+        // request are credentials whatever they are called.
+        let route_query_credentials = route_query_credential_names(ctx);
+        let mirror_url = self.build_mirror_url(
+            mirror_path,
+            effective_query.as_deref(),
+            &ctx.query_params,
+            &route_query_credentials,
+        );
         let method = ctx.method.clone();
 
         // Mirror destinations are an egress boundary just like the primary
@@ -2619,11 +2920,15 @@ impl Plugin for RequestMirror {
             ctx.forwarding_peer_trusted,
             &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
         );
+        // Header names configured as credential locations on this route
+        // (`key_auth` `header:x-proof`, custom JWT headers, ...) are
+        // credentials too, even when the authenticating plugin keeps them.
         apply_mirror_credential_policy(
             &mut mirror_headers,
             self.forward_sensitive_headers,
             &self.forward_sensitive_header_allowlist,
             &self.sensitive_header_patterns,
+            ctx.request_headers_requiring_redaction(),
         );
         if let Some(shadow_host) = mesh_shadow_host {
             // Keep the configured mirror URL as the dial/TLS identity. Only
@@ -3053,11 +3358,16 @@ mod tests {
         query_params.insert("page".to_string(), "1".to_string());
 
         assert_eq!(
-            plugin.build_mirror_url("/shadow", None, &query_params),
+            plugin.build_mirror_url("/shadow", None, &query_params, &[]),
             "https://[2001:db8::10]:8443/shadow?page=1"
         );
         assert_eq!(
-            plugin.build_mirror_url("/shadow", Some("tag=red&tag=blue&q=a+b"), &query_params),
+            plugin.build_mirror_url(
+                "/shadow",
+                Some("tag=red&tag=blue&q=a+b"),
+                &query_params,
+                &[]
+            ),
             "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
         );
     }
@@ -3079,11 +3389,11 @@ mod tests {
             "a=1&&b=2",
             "flag&",
             "path=%2Froot&k=a%26b",
-            "key=a%2Fb",
+            "dir=a%2Fb",
             "name=%E2%9C%93&q=%C3%A9",
-            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&key=a%2Fb&name=%E2%9C%93",
+            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&dir=a%2Fb&name=%E2%9C%93",
         ] {
-            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed);
+            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed, &[]);
             assert!(
                 url.ends_with(&format!("?{raw}")),
                 "raw query must be preserved exactly: got {url}"
