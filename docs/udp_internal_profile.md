@@ -55,6 +55,7 @@ then infinity. Occupancy bins are 0, 1, 2–4, 5–8, 9–16, 17–32, 33–64, 
 | Borrowed / queued send | Successful borrowed backend sends and returned bytes, WouldBlock/errors, egress enqueue/drop/dequeue, and successful authorization-aware queued commits. Queue admission is not a send. Setup/hook asynchronous backend sends remain outside these send totals. |
 | Poll / readiness / notify | Egress receiver/commit polls, reply receive polls, Pending/Ready outcomes, frontend `readable()` returns, drain WouldBlock outcomes, reply-stop/hook notify calls. No scheduler wake, context switch, or CPU-contention claim. Egress poll totals combine queue receive and commit; they are not whole-task poll counts. |
 | `ingress_rx_*` | Actual frontend `recvmmsg` requested/returned occupied slots; error/WouldBlock counts; raw returned bytes; logical packets from parsed GRO segment sizes. Parsing failure, payload/control truncation and invalid GRO segment size are explicit and leave logical-packet coverage incomplete. Zero-length datagrams count as packets. Tokio's cached not-ready path does not count as an actual syscall. |
+| `reply_rx_*` | Actual backend-socket `recvmmsg` requested/returned occupied slots, raw returned bytes, and logical packets (one per slot: `UDP_GRO` is never enabled on backend sockets, so no GRO splitting applies and the `reply_rx_gro_*` fields stay zero). One call per reply burst on Linux plain UDP; the awaited readiness wait is counted under reply polls, not here. |
 | `reply_tx_*` | Actual `sendmmsg` occupied input slots, accepted slots/bytes, partial calls/remainders, error slots, and explicit discard/oversize outcomes. Retries count the remaining requested slots again. Errors clear the original queue; partial sends retain it in original order. |
 | `reply_gso_*` | Occupied segments/bytes/segment-size sum, full accepted segments and returned bytes, errors/short results, fallback segments handed to sendmmsg or direct send, explicit discards. A fallback handoff is not acceptance; final mmsg/direct outcomes are separate. Single-segment success alone does not prove batching. Kernel acceptance does not prove NIC offload. |
 | `reply_direct_*` | Logical Tokio send futures or explicit pktinfo attempts, accepted bytes and errors. Tokio internal syscall retries are opaque. A canceled future can leave calls without a terminal outcome. |
@@ -62,9 +63,11 @@ then infinity. Occupancy bins are 0, 1, 2–4, 5–8, 9–16, 17–32, 33–64, 
 Directions are attached to batch owners and survive task migration. `other_*`
 isolates shared batch helpers used by mesh capture/DTLS instead of pretending
 those calls belong to the plain UDP listener. Plain UDP backend receives are
-individual `recv`/`try_recv`, and borrowed client-to-backend sends do not use
-sendmmsg/GSO. Thus reply recvmmsg and ingress mmsg/GSO are unexercised in this
-path, not evidence of missing syscalls in those directions. Quinn HTTP/3,
+one `recvmmsg` per reply burst on the connected backend socket (Linux; issue
+#6672), counted under `reply_rx_*`; non-Linux keeps individual
+`recv`/`try_recv`. Borrowed client-to-backend sends do not use
+sendmmsg/GSO. Thus ingress mmsg/GSO remains unexercised in this
+path, not evidence of missing syscalls in that direction. Quinn HTTP/3,
 DTLS crypto drivers, mesh identity revalidation, native allocations, complete
 copy traffic, queue delay, whole-task scheduling, and CPU stacks are opaque.
 GRO logical counts describe ancillary-derived packets before later admission;

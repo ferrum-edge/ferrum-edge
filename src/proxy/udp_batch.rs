@@ -382,6 +382,178 @@ fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<Soc
     }
 }
 
+/// Batched receive buffers for a *connected* backend UDP socket (issue
+/// #6672), the reply-direction counterpart of [`RecvMmsgBatch`].
+///
+/// Leaner than the frontend batch by construction: the socket is connected
+/// to exactly one backend peer, so no source-address capture is needed, and
+/// `UDP_GRO` is never enabled on backend sockets (`set_udp_gro` has no
+/// production caller), so no ancillary-data buffers or GRO splitting are
+/// needed either. Each slot is a full `MAX_DGRAM_SIZE` buffer, allocated
+/// lazily on first use exactly like [`SendMmsgBatch`] slots, so a fresh
+/// per-session batch reserves no datagram memory and a burst that only
+/// ever occupies one slot only ever allocates one slot.
+///
+/// Only available on Linux. On other platforms the reply path keeps its
+/// `recv` + `try_recv` drain.
+#[cfg(target_os = "linux")]
+pub struct BackendRecvBatch {
+    /// Per-slot datagram buffers. Empty until the slot is first used; then
+    /// sized to `MAX_DGRAM_SIZE` so no valid UDP datagram can truncate.
+    bufs: Vec<Vec<u8>>,
+    /// Per-slot received datagram lengths (from `mmsghdr.msg_len`).
+    lens: Vec<u32>,
+    /// Pre-allocated iovec array (one per slot, rebuilt before each call).
+    iovecs: Vec<libc::iovec>,
+    /// Pre-allocated mmsghdr array (one per slot, rebuilt before each call).
+    msgs: Vec<libc::mmsghdr>,
+    /// Maximum datagrams per `recvmmsg` call.
+    capacity: usize,
+    /// Number of datagrams received in the last `recv()` call.
+    count: usize,
+}
+
+/// Per-session reply `recvmmsg` capacity. Matches the frontend batch size
+/// and the reply send batches' slot counts, so one receive burst can fill
+/// one send flush; datagrams beyond it stay queued in the kernel and
+/// re-arm readiness immediately.
+#[cfg(target_os = "linux")]
+pub const BACKEND_RECV_BATCH_CAPACITY: usize = 64;
+
+// SAFETY: Same reasoning as RecvMmsgBatch — raw pointers in iovecs/msgs point
+// into Vec buffers owned by the same struct, only dereferenced inside recv()
+// which rebuilds them first. Exclusively owned by a single tokio task (the
+// per-session reply task).
+#[cfg(target_os = "linux")]
+unsafe impl Send for BackendRecvBatch {}
+
+#[cfg(target_os = "linux")]
+impl BackendRecvBatch {
+    /// Create a batch for up to `capacity` datagrams per call, with lazy
+    /// slot buffers (no datagram memory reserved up front).
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            bufs: (0..capacity).map(|_| Vec::new()).collect(),
+            lens: vec![0u32; capacity],
+            iovecs: vec![
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                capacity
+            ],
+            msgs: vec![unsafe { std::mem::zeroed() }; capacity],
+            capacity,
+            count: 0,
+        }
+    }
+
+    /// Maximum datagrams this batch can receive in a single call.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Number of datagrams received in the last `recv()` call.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Total capacity currently reserved across per-slot datagram buffers.
+    ///
+    /// Used by memory-footprint contract tests. Fresh batches report `0`
+    /// because slot buffers are allocated lazily.
+    #[allow(dead_code)]
+    pub fn datagram_buffer_capacity_bytes(&self) -> usize {
+        self.bufs.iter().map(Vec::capacity).sum()
+    }
+
+    /// The datagram in slot `i` from the last `recv()` call.
+    pub fn datagram(&self, i: usize) -> &[u8] {
+        debug_assert!(i < self.count);
+        &self.bufs[i][..self.lens[i] as usize]
+    }
+
+    /// Ensure slot `i` has a full-size buffer, allocating on first use only.
+    fn ensure_slot_buf(&mut self, i: usize) {
+        let buf = &mut self.bufs[i];
+        if buf.len() < MAX_DGRAM_SIZE {
+            buf.resize(MAX_DGRAM_SIZE, 0);
+        }
+    }
+
+    /// Receive up to `max_count` datagrams in a single `recvmmsg` syscall.
+    ///
+    /// Non-blocking (`MSG_DONTWAIT`): returns `Err(WouldBlock)` when the
+    /// connected socket has nothing queued. No name or control buffers are
+    /// attached — the peer is fixed by the connection and `UDP_GRO` is not
+    /// enabled on backend sockets, so each returned slot is exactly one
+    /// whole datagram (slots are `MAX_DGRAM_SIZE`, so truncation is
+    /// impossible for a valid UDP payload).
+    ///
+    /// # Safety
+    /// Same contract as [`RecvMmsgBatch::recv`]: pointer arrays are rebuilt
+    /// before the syscall and the batch outlives it.
+    pub fn recv(&mut self, fd: std::os::fd::RawFd, max_count: usize) -> std::io::Result<usize> {
+        let n = max_count.min(self.capacity);
+        if n == 0 {
+            self.count = 0;
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        for i in 0..n {
+            self.ensure_slot_buf(i);
+            self.iovecs[i] = libc::iovec {
+                iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+                iov_len: MAX_DGRAM_SIZE,
+            };
+            self.msgs[i] = unsafe { std::mem::zeroed() };
+            self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
+            self.msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            let error = std::io::Error::last_os_error();
+            #[cfg(feature = "bench-udp-profile")]
+            crate::udp_profile::recvmmsg(
+                crate::udp_profile::Direction::Reply,
+                n,
+                &Err(error.kind().into()),
+            );
+            self.count = 0;
+            return Err(error);
+        }
+        let received = ret as usize;
+        for i in 0..received {
+            self.lens[i] = self.msgs[i].msg_len;
+        }
+        #[cfg(feature = "bench-udp-profile")]
+        {
+            crate::udp_profile::recvmmsg(crate::udp_profile::Direction::Reply, n, &Ok(received));
+            let bytes: usize = self.lens[..received].iter().map(|len| *len as usize).sum();
+            crate::udp_profile::batch_count(
+                crate::udp_profile::Direction::Reply,
+                BatchField::RxBytes,
+                bytes,
+            );
+            crate::udp_profile::batch_count(
+                crate::udp_profile::Direction::Reply,
+                BatchField::RxLogicalPackets,
+                received,
+            );
+        }
+        self.count = received;
+        Ok(received)
+    }
+}
+
 /// Lazily-allocated buffers for batched UDP send via `sendmmsg(2)`.
 ///
 /// Collects datagrams and their destination addresses, then flushes them all
@@ -847,6 +1019,20 @@ pub struct RecvMmsgBatch;
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 impl RecvMmsgBatch {
+    pub fn new(_capacity: usize) -> Self {
+        Self
+    }
+}
+
+/// Non-Linux stub for BackendRecvBatch. The reply drain loop is gated with
+/// `#[cfg(target_os = "linux")]` and falls back to `recv` + `try_recv`.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub struct BackendRecvBatch;
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+impl BackendRecvBatch {
     pub fn new(_capacity: usize) -> Self {
         Self
     }

@@ -1690,8 +1690,10 @@ fn the_reply_task_arms_its_authorization_timer_once() {
         receive_loop
             .matches("udp_reply_recv_until_stop_or_expiry(")
             .count(),
-        2,
-        "both the DTLS-backend and plain-UDP-backend receive arms are bounded"
+        3,
+        "the DTLS-backend arm and both cfg twins of the plain-UDP-backend \
+         arm (Linux batched `recvmmsg`, other targets single `recv`; \
+         exactly one twin compiles per target) are bounded"
     );
 }
 

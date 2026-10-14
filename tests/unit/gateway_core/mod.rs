@@ -11,6 +11,7 @@ mod backend_dispatch_tests;
 mod backend_egress_attestation_tests;
 mod backend_handoff_auth_lifetime_tests;
 mod backend_pending_limit_scope_tests;
+mod backend_recv_batch_tests;
 mod backend_reqwest_no_proxy_tests;
 mod backend_send_queue_tests;
 mod backend_tls_cold_build_tests;

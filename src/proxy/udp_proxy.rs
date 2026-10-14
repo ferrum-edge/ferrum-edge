@@ -7284,6 +7284,49 @@ where
     }
 }
 
+/// Wait for backend-reply readiness, then receive one burst of datagrams
+/// with a single `recvmmsg` (issue #6672).
+///
+/// The readiness wait is the future handed to
+/// [`udp_reply_recv_until_stop_or_expiry`], so the stop/expiry/shutdown race
+/// is byte-for-byte the one the previous single `recv` took: an
+/// already-elapsed authorization plan settles without polling this at all,
+/// and a stop while parked in `readable()` resolves as `Stopped`, never as
+/// a received burst. After readiness, `try_io` performs the non-blocking
+/// batch receive; a spurious `WouldBlock` (readiness raced another reader
+/// or the datagram was withdrawn) re-arms the wait inside this future
+/// instead of surfacing as a burst, mirroring how the previous `recv`
+/// future simply stayed pending. Real errors surface exactly like a
+/// `recv` error did.
+///
+/// Returns the number of datagrams now readable via
+/// [`super::udp_batch::BackendRecvBatch::datagram`]. Profile accounting
+/// matches the previous shape: the caller's `udp_poll!` observes this
+/// future's polls, `udp_drain!` counts a `recvmmsg` that found nothing as
+/// an empty backend drain, and the batch itself records the `reply_rx_*`
+/// syscall counters.
+#[cfg(target_os = "linux")]
+async fn recv_backend_reply_batch(
+    sock: &UdpSocket,
+    batch: &mut super::udp_batch::BackendRecvBatch,
+    want: usize,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    loop {
+        sock.readable().await?;
+        match udp_drain!(
+            true,
+            sock.try_io(tokio::io::Interest::READABLE, || {
+                batch.recv(sock.as_raw_fd(), want)
+            })
+        ) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Whether an admitted DTLS session may still be handed to the relay tasks.
 ///
 /// Setup between two await points is synchronous work the deadline arms cannot
@@ -8899,6 +8942,9 @@ async fn create_session(
     #[cfg(not(target_os = "linux"))]
     let _ = udp_gso_enabled;
     tokio::spawn(async move {
+        // Linux plain-UDP replies receive into `recv_batch` slots instead
+        // (issue #6672); the single scratch buffer remains for other targets.
+        #[cfg(not(target_os = "linux"))]
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
 
         // Authorization arm for the backend→client direction, armed ONCE here
@@ -8940,6 +8986,18 @@ async fn create_session(
         // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
+        // Batched backend receive (Linux, plain UDP only; issue #6672): one
+        // `recvmmsg` per burst replaces the awaited `recv` plus the
+        // `try_recv` drain, whose final call always found the socket empty
+        // at echo queue depths. `reply_batch_next` is the next slot the
+        // drain section will process; slot 0 takes the first-datagram path.
+        #[cfg(target_os = "linux")]
+        let mut recv_batch =
+            super::udp_batch::BackendRecvBatch::new(super::udp_batch::BACKEND_RECV_BATCH_CAPACITY);
+        #[cfg(target_os = "linux")]
+        let mut reply_batch_count: usize = 0;
+        #[cfg(target_os = "linux")]
+        let mut reply_batch_next: usize = 0;
         'reply: loop {
             // Listener/global shutdown may already be set; borrow() also
             // advances each watch "seen" version so the cancel future's
@@ -8951,6 +9009,17 @@ async fn create_session(
             {
                 break;
             }
+
+            // Adaptive burst bound for this wakeup, read before the receive
+            // so the Linux batch receive can size its single `recvmmsg` to
+            // exactly the datagrams this burst may process (first + drain).
+            // Pure EWMA-tier read with no session-state effect; the DTLS
+            // arm never consults it.
+            let reply_batch_limit = if backend_socket.is_some() {
+                reply_adaptive_buffer.get_batch_limit(&reply_proxy_namespace, &reply_proxy_id)
+            } else {
+                0
+            };
 
             // Read from backend — via DTLS (channel-based) or raw UDP
             // (socket-based). Both paths share `udp_reply_recv_until_stop`
@@ -9013,6 +9082,34 @@ async fn create_session(
                     }
                 }
             } else if let Some(ref sock) = backend_socket {
+                // Linux receives the whole burst in one `recvmmsg` (issue
+                // #6672); other targets keep the single awaited `recv` and
+                // the `try_recv` drain below. Both futures go through the
+                // same fenced helper, so stop/expiry/shutdown outcomes are
+                // indistinguishable from before.
+                #[cfg(target_os = "linux")]
+                let recv_result = udp_reply_recv_until_stop_or_expiry(
+                    &reply_session.stop_reply_task,
+                    reply_stop_notify.as_ref(),
+                    reply_authorization_plan,
+                    &mut reply_authorization_deadline,
+                    udp_poll!(
+                        true,
+                        recv_backend_reply_batch(
+                            sock,
+                            &mut recv_batch,
+                            reply_batch_limit
+                                .saturating_add(1)
+                                .min(super::udp_batch::BACKEND_RECV_BATCH_CAPACITY),
+                        )
+                    ),
+                    udp_reply_shutdown_cancel(
+                        &mut reply_listener_shutdown,
+                        &mut reply_global_shutdown,
+                    ),
+                )
+                .await;
+                #[cfg(not(target_os = "linux"))]
                 let recv_result = udp_reply_recv_until_stop_or_expiry(
                     &reply_session.stop_reply_task,
                     reply_stop_notify.as_ref(),
@@ -9038,9 +9135,20 @@ async fn create_session(
                         break 'reply;
                     }
                     UdpReplyRecvOutcome::Received(Ok(n)) => {
-                        len = n;
-                        data_vec = None;
-                        data_slice = Some(&buf[..n]);
+                        #[cfg(target_os = "linux")]
+                        {
+                            reply_batch_count = n;
+                            reply_batch_next = 1;
+                            len = recv_batch.datagram(0).len();
+                            data_vec = None;
+                            data_slice = Some(recv_batch.datagram(0));
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            len = n;
+                            data_vec = None;
+                            data_slice = Some(&buf[..n]);
+                        }
                     }
                     UdpReplyRecvOutcome::Received(Err(e)) => {
                         debug!(
@@ -9239,7 +9347,37 @@ async fn create_session(
             if send_batched {
                 #[cfg(target_os = "linux")]
                 {
-                    if reply_udp_gso && !gso_failed {
+                    if reply_batch_count == 1 {
+                        // Single-datagram burst (issue #6672): the batch
+                        // receive proved nothing else is queued, so send
+                        // straight from the receive slot via the existing
+                        // pktinfo-aware direct path instead of copying into
+                        // the GSO batch to flush one segment. The direct
+                        // helper rechecks the authorization plan immediately
+                        // before the send and owns it during, exactly like
+                        // the oversized/post-flush escape hatches below; the
+                        // pre-send destination/source revalidations above
+                        // already ran for this datagram, and with nothing
+                        // queued behind it no reply can be reordered. The
+                        // flush section below finds both batches empty.
+                        if let Some(termination) = direct_send_reply_or_drop(
+                            &frontend,
+                            send_data,
+                            client_addr,
+                            session_local_ip,
+                            &reply_proxy_id,
+                            "single_datagram_burst",
+                            &mut send_drops,
+                            reply_authorization_plan,
+                        )
+                        .await
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
+                    } else if reply_udp_gso && !gso_failed {
                         if let Some(termination) = try_gso_send_or_fallback(
                             &mut gso_batch,
                             &mut send_batch,
@@ -9324,11 +9462,15 @@ async fn create_session(
             // For plain UDP, drain additional pending replies without yielding.
             // DTLS reads are channel-based (async only), so skip batching for DTLS backends.
             if !is_dtls {
+                #[cfg(not(target_os = "linux"))]
                 let Some(ref sock) = backend_socket else {
                     break;
                 };
-                let batch_limit =
-                    reply_adaptive_buffer.get_batch_limit(&reply_proxy_namespace, &reply_proxy_id);
+                #[cfg(target_os = "linux")]
+                if backend_socket.is_none() {
+                    break;
+                }
+                let batch_limit = reply_batch_limit;
                 for _ in 0..batch_limit {
                     // Expiry during/among try_recv processing must stop accepting
                     // further backend payloads; already-queued client datagrams
@@ -9343,8 +9485,29 @@ async fn create_session(
                         }
                         break 'reply;
                     }
-                    match udp_drain!(true, sock.try_recv(&mut buf)) {
+                    // Linux drains the slots of the burst already received
+                    // by `recv_backend_reply_batch` (no further syscall);
+                    // other targets keep the `try_recv` drain. Either way
+                    // `drain_slice` is the datagram the body below admits,
+                    // hooks, and enqueues, in the original receive order.
+                    #[cfg(target_os = "linux")]
+                    let mut drain_slot: usize = 0;
+                    #[cfg(target_os = "linux")]
+                    let drain_result = if reply_batch_next < reply_batch_count {
+                        drain_slot = reply_batch_next;
+                        reply_batch_next += 1;
+                        Ok(recv_batch.datagram(drain_slot).len())
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let drain_result = udp_drain!(true, sock.try_recv(&mut buf));
+                    match drain_result {
                         Ok(len2) => {
+                            #[cfg(target_os = "linux")]
+                            let drain_slice = recv_batch.datagram(drain_slot);
+                            #[cfg(not(target_os = "linux"))]
+                            let drain_slice = &buf[..len2];
                             if let Some(source) = reply_session.node_waypoint_source.as_ref()
                                 && let Err(refusal) =
                                     source.revalidate(source.ingress_ifindex, client_addr.ip())
@@ -9395,7 +9558,7 @@ async fn create_session(
                                     listen_port: reply_listen_port,
                                     datagram_size: len2,
                                     direction: UdpDatagramDirection::BackendToClient,
-                                    payload: &buf[..len2],
+                                    payload: drain_slice,
                                     payload_kind: reply_session.datagram_payload_kind,
                                     metadata_sink: Some(UdpMetadataSink::new(
                                         &reply_session.metadata,
@@ -9476,7 +9639,7 @@ async fn create_session(
                                             &mut send_batch,
                                             &frontend,
                                             client_addr,
-                                            &buf[..len2],
+                                            drain_slice,
                                             &mut gso_failed,
                                             &reply_proxy_id,
                                             session_local_ip,
@@ -9494,7 +9657,7 @@ async fn create_session(
                                         &mut send_batch,
                                         &frontend,
                                         client_addr,
-                                        &buf[..len2],
+                                        drain_slice,
                                         session_local_ip,
                                         &reply_proxy_id,
                                         &mut send_drops,
@@ -9511,7 +9674,7 @@ async fn create_session(
                             } else {
                                 match udp_frontend_send_until_expiry(
                                     reply_authorization_plan,
-                                    udp_direct!(frontend.send_to(&buf[..len2], client_addr)),
+                                    udp_direct!(frontend.send_to(drain_slice, client_addr)),
                                 )
                                 .await
                                 {
