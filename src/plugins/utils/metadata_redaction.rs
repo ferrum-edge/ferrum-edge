@@ -473,7 +473,7 @@ const BENIGN_LEADING_SHORT_CLASS_WORDS: &[&str] = &[
     "pinned",
     "pinning",
     "pinpoint",
-    "pine",
+    "pineapple",
     "pink",
     "pint",
     "pinch",
@@ -524,8 +524,14 @@ const SHORT_CLASS_TRAILERS: &[&str] = &[
 
 /// Short credential classes that only count inside a qualified compound,
 /// with the minimum qualifier length in front of them when nothing follows.
-const QUALIFIED_SHORT_CLASSES: &[(&str, usize)] =
-    &[("pin", 2), ("sid", 2), ("otp", 2), ("sig", 2), ("cred", 2)];
+const QUALIFIED_SHORT_CLASSES: &[(&str, usize)] = &[
+    ("pin", 2),
+    ("sid", 2),
+    ("otp", 2),
+    ("sig", 2),
+    ("cred", 2),
+    ("sess", 2),
+];
 
 /// Qualified short-class compounds that survive lowercasing: a short class
 /// followed by a listed trailer word (`pinvalue`, `dbpinvalue`, `sigvalue`,
@@ -545,7 +551,7 @@ fn has_qualified_short_class(lower: &str) -> bool {
     if QUALIFIED_SHORT_CLASSES
         .iter()
         .any(|(class, _)| lower.len() > class.len() && lower.starts_with(class))
-        && lower != "sign"
+        && !matches!(lower, "sign" | "pine" | "pines")
         && !BENIGN_LEADING_SHORT_CLASS_WORDS
             .iter()
             .any(|word| lower.starts_with(word))
