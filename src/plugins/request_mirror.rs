@@ -3559,7 +3559,7 @@ mod tests {
                 "/shadow",
                 Some("tag=red&tag=blue&q=a+b"),
                 &query_params,
-                &[]
+                &Default::default()
             ),
             "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
         );

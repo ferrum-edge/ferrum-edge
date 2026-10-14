@@ -6796,8 +6796,11 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
     );
 
     let mut allowed = make_ctx_with_proxy();
+    // Value digests are credential provenance too, so every value here is
+    // distinct: a benign pair reusing a credential's exact value is treated
+    // as that credential under a new name (covered separately below).
     allowed.set_raw_query_string(
-        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1"
+        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=9876&x-vercel-protection-bypass=v&user_code=u&x=1"
             .to_string(),
     );
     let allowed_line = capture_mirror_request_line_with_config(
@@ -6817,9 +6820,22 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
     .await;
     assert!(
         allowed_line.contains(
-            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1 "
+            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=9876&x-vercel-protection-bypass=v&user_code=u&x=1 "
         ),
         "exact allowlist must forward the decoded name with its raw encoding: {allowed_line}"
+    );
+}
+
+/// A benign-named query pair carrying a presented credential's exact value
+/// is treated as that credential under a new name and withheld by default.
+#[tokio::test]
+async fn query_pair_reusing_a_credential_value_is_withheld_from_the_mirror() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("pin=9876&tracking=9876&x=1".to_string());
+    let default_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        default_line.contains("?x=1 ") && !default_line.contains("9876"),
+        "default mirror must drop both the credential and its renamed copy: {default_line}"
     );
 }
 
