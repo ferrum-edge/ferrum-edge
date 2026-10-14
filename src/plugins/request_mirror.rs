@@ -776,7 +776,7 @@ fn is_port_suffix(rest: &str) -> bool {
 /// sensitive if it is a well-known credential name, contains a built-in
 /// credential substring, or contains any operator-configured
 /// `sensitive_header_patterns` substring.
-fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
+pub(crate) fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
     MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
         || name_has_credential_class(name_lower)
         || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
@@ -1111,6 +1111,42 @@ pub(crate) fn resolve_mirror_timeout_ms(
     raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
 }
 
+/// Whether a request header name is a credential for provenance purposes:
+/// built-in mirror classes, the replay credential inventory, the route
+/// registry, or an earlier credential rename. Used by `request_transformer`
+/// to carry credential provenance across a rename.
+pub(crate) fn request_header_name_is_credential(ctx: &RequestContext, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    is_mirror_sensitive_header(&lower, &[])
+        || crate::plugins::utils::replay_partition::is_credential_context_header(&lower)
+        || ctx
+            .request_headers_requiring_redaction()
+            .iter()
+            .chain(ctx.renamed_credential_headers())
+            .any(|known| known.eq_ignore_ascii_case(&lower))
+}
+
+/// Query counterpart of [`request_header_name_is_credential`], over the
+/// raw name: built-in classes, marked credential locations, and earlier
+/// credential renames.
+pub(crate) fn request_query_name_is_credential(ctx: &RequestContext, name: &str) -> bool {
+    let marked = MirrorRouteCredentials::marked_query_names(ctx);
+    !matches!(
+        classify_mirror_query_name(name, &[], &marked),
+        MirrorQueryNameDecision::NonSensitive
+    )
+}
+
+/// Route-registered credential header names plus names a rename gave to a
+/// credential header.
+fn route_credential_header_names(ctx: &RequestContext) -> Vec<String> {
+    ctx.request_headers_requiring_redaction()
+        .iter()
+        .chain(ctx.renamed_credential_headers())
+        .cloned()
+        .collect()
+}
+
 /// Credential provenance for one mirrored request, gathered from the request
 /// context rather than from the outbound names, so a credential renamed by a
 /// later plugin (`request_transformer` header/query `rename`, route overlays)
@@ -1130,6 +1166,35 @@ struct MirrorRouteCredentials {
 }
 
 impl MirrorRouteCredentials {
+    /// Query names marked as credential locations on this request, plus
+    /// names a rename gave to a credential query parameter.
+    fn marked_query_names(ctx: &RequestContext) -> Vec<String> {
+        use crate::plugins::utils::token_extract::{
+            QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
+        };
+        let mut names: Vec<String> = Vec::new();
+        let mut add = |name: &str| {
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        };
+        for (name, _) in ctx.query_credential_partition_digests() {
+            add(name);
+        }
+        for key in ctx.metadata.keys() {
+            if let Some(name) = key
+                .strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX)
+                .or_else(|| key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX))
+            {
+                add(name);
+            }
+        }
+        for name in ctx.renamed_credential_query_names() {
+            add(name);
+        }
+        names
+    }
+
     /// Gather provenance from every place a credential value is visible
     /// before renames can hide it: the pristine inbound headers, the
     /// materialised request headers, the final outbound headers (values a
@@ -1146,27 +1211,12 @@ impl MirrorRouteCredentials {
     ) -> Self {
         use crate::fips::approved::Sha256;
         use crate::plugins::utils::replay_partition::is_credential_context_header;
-        use crate::plugins::utils::token_extract::{
-            QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
-        };
 
-        let mut query_names: Vec<String> = Vec::new();
+        let query_names = Self::marked_query_names(ctx);
         let mut value_digests: Vec<[u8; 32]> = Vec::new();
-        for (name, digest) in ctx.query_credential_partition_digests() {
-            if !query_names.iter().any(|known| known == name) {
-                query_names.push(name.clone());
-            }
+        for (_, digest) in ctx.query_credential_partition_digests() {
             if !value_digests.contains(digest) {
                 value_digests.push(*digest);
-            }
-        }
-        for key in ctx.metadata.keys() {
-            if let Some(name) = key
-                .strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX)
-                .or_else(|| key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX))
-                && !query_names.iter().any(|known| known == name)
-            {
-                query_names.push(name.to_string());
             }
         }
 
@@ -1179,13 +1229,14 @@ impl MirrorRouteCredentials {
                 digests.push(digest);
             }
         }
-        let registry = ctx.request_headers_requiring_redaction();
         let header_is_credential = |name: &str| {
             let lower = name.to_ascii_lowercase();
             is_mirror_sensitive_header(&lower, header_patterns)
                 || is_credential_context_header(&lower)
-                || registry
+                || ctx
+                    .request_headers_requiring_redaction()
                     .iter()
+                    .chain(ctx.renamed_credential_headers())
                     .any(|known| known.eq_ignore_ascii_case(&lower))
         };
         if let Some(raw) = ctx.raw_headers_snapshot() {
@@ -1230,9 +1281,19 @@ impl MirrorRouteCredentials {
     /// form) is a presented credential value.
     fn carries_credential_value(&self, value: &[u8]) -> bool {
         use crate::fips::approved::Sha256;
-        !value.is_empty()
-            && !self.value_digests.is_empty()
-            && self.value_digests.contains(&Sha256::digest(value))
+        if value.is_empty() || self.value_digests.is_empty() {
+            return false;
+        }
+        if self.value_digests.contains(&Sha256::digest(value)) {
+            return true;
+        }
+        // A later `add` can append to a renamed credential (`secret,marker`):
+        // check each comma-separated member as well.
+        value.contains(&b',')
+            && value.split(|byte| *byte == b',').any(|member| {
+                let member = member.trim_ascii();
+                !member.is_empty() && self.value_digests.contains(&Sha256::digest(member))
+            })
     }
 
     fn query_value_carries_credential(&self, raw_value: &str) -> bool {
@@ -3067,7 +3128,7 @@ impl Plugin for RequestMirror {
             self.forward_sensitive_headers,
             &self.forward_sensitive_header_allowlist,
             &self.sensitive_header_patterns,
-            ctx.request_headers_requiring_redaction(),
+            &route_credential_header_names(ctx),
             &route_credentials,
         );
         if let Some(shadow_host) = mesh_shadow_host {

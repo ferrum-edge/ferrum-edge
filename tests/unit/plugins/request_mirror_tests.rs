@@ -7120,3 +7120,73 @@ async fn plugin_installed_credential_values_keep_provenance() {
         Some("keep-me")
     );
 }
+
+/// Credentials introduced or renamed by `request_transformer` keep
+/// provenance by name: an operator-added `x-api-key` / `api_key` renamed in
+/// the same instance, and a route credential renamed twice across chained
+/// instances, are withheld under their final names, and a value appended to a
+/// renamed credential still carries it.
+#[tokio::test]
+async fn transformer_introduced_and_chained_renames_keep_provenance() {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+
+    let first = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-api-key", "value": "backend-secret"},
+            {"operation": "rename", "target": "header", "key": "x-api-key", "new_key": "x-debug"},
+            {"operation": "rename", "target": "header", "key": "x-proof", "new_key": "x-hop-a"},
+            {"operation": "add", "target": "query", "key": "api_key", "value": "backend-query-secret"},
+            {"operation": "rename", "target": "query", "key": "api_key", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("first transformer config")
+    .expect("first transformer plugin");
+    let second = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-hop-a", "new_key": "x-hop-b"}
+        ]}),
+    )
+    .expect("second transformer config")
+    .expect("second transformer plugin");
+
+    let build = |first: Arc<dyn Plugin>, second: Arc<dyn Plugin>| async move {
+        let mut ctx = make_ctx_with_proxy();
+        set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+        ctx.headers
+            .insert("x-proof".to_string(), "live-api-key".to_string());
+        ctx.set_raw_query_string("x=1".to_string());
+        ctx.query_params.insert("x".to_string(), "1".to_string());
+        let mut headers = ctx.headers.clone();
+        headers.insert("x-custom".to_string(), "keep-me".to_string());
+        plugin_utils::assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("x-debug").map(String::as_str),
+            Some("backend-secret"),
+            "the primary keeps the renamed operator credential"
+        );
+        // A later route-header `add` appends to the renamed credential.
+        headers.insert("x-hop-b".to_string(), "live-api-key,marker".to_string());
+        (ctx, headers)
+    };
+
+    let (mut ctx, _) = build(first.clone(), second.clone()).await;
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !line.contains("backend-query-secret") && !line.contains("tracking="),
+        "renamed operator query credential leaked: {line}"
+    );
+    assert!(line.contains("x=1"), "{line}");
+
+    let (mut ctx, mut headers) = build(first, second).await;
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in ["x-debug", "x-hop-a", "x-hop-b", "x-proof", "x-api-key"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}
