@@ -1111,28 +1111,108 @@ pub(crate) fn resolve_mirror_timeout_ms(
     raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
 }
 
-/// Query parameter names that an authentication plugin marked as credential
-/// locations on this request (whether or not it strips them from the primary
-/// request). Empty, without allocating, when none were marked.
-fn route_query_credential_names(ctx: &RequestContext) -> Vec<String> {
-    use crate::plugins::utils::token_extract::{
-        QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
-    };
-    let mut names: Vec<String> = ctx
-        .query_credential_partition_digests()
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect();
-    for key in ctx.metadata.keys() {
-        if let Some(name) = key
-            .strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX)
-            .or_else(|| key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX))
-            && !names.iter().any(|known| known == name)
-        {
-            names.push(name.to_string());
+/// Credential provenance for one mirrored request, gathered from the request
+/// context rather than from the outbound names, so a credential renamed by a
+/// later plugin (`request_transformer` header/query `rename`, route overlays)
+/// is still recognised.
+#[derive(Default)]
+struct MirrorRouteCredentials {
+    /// Query parameter names an authentication plugin marked as credential
+    /// locations on this request (whether or not it strips them from the
+    /// primary request).
+    query_names: Vec<String>,
+    /// SHA-256 digests of the credential values the client presented: every
+    /// value of a built-in credential header or a route-registered credential
+    /// header on the inbound request, plus the recorded query credential
+    /// digests. Any outbound header or query value with one of these digests
+    /// is treated as a credential, whatever it is now called.
+    value_digests: Vec<[u8; 32]>,
+}
+
+impl MirrorRouteCredentials {
+    fn from_ctx(ctx: &RequestContext) -> Self {
+        use crate::fips::approved::Sha256;
+        use crate::plugins::utils::replay_partition::CREDENTIAL_CONTEXT_HEADERS;
+        use crate::plugins::utils::token_extract::{
+            QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
+        };
+
+        let mut query_names: Vec<String> = Vec::new();
+        let mut value_digests: Vec<[u8; 32]> = Vec::new();
+        for (name, digest) in ctx.query_credential_partition_digests() {
+            if !query_names.iter().any(|known| known == name) {
+                query_names.push(name.clone());
+            }
+            if !value_digests.contains(digest) {
+                value_digests.push(*digest);
+            }
+        }
+        for key in ctx.metadata.keys() {
+            if let Some(name) = key
+                .strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX)
+                .or_else(|| key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX))
+                && !query_names.iter().any(|known| known == name)
+            {
+                query_names.push(name.to_string());
+            }
+        }
+
+        let mut push_value = |bytes: &[u8]| {
+            if bytes.is_empty() {
+                return;
+            }
+            let digest: [u8; 32] = Sha256::digest(bytes);
+            if !value_digests.contains(&digest) {
+                value_digests.push(digest);
+            }
+        };
+        let header_names = CREDENTIAL_CONTEXT_HEADERS.iter().copied().chain(
+            ctx.request_headers_requiring_redaction()
+                .iter()
+                .map(String::as_str),
+        );
+        for name in header_names {
+            for value in ctx.raw_header_value_bytes(name) {
+                push_value(value);
+            }
+            for (key, value) in &ctx.headers {
+                if key.eq_ignore_ascii_case(name) {
+                    push_value(value.as_bytes());
+                }
+            }
+        }
+        Self {
+            query_names,
+            value_digests,
         }
     }
-    names
+
+    /// Whether `value` (or, for a query value, its percent- or form-decoded
+    /// form) is a presented credential value.
+    fn carries_credential_value(&self, value: &[u8]) -> bool {
+        use crate::fips::approved::Sha256;
+        !value.is_empty()
+            && !self.value_digests.is_empty()
+            && self
+                .value_digests
+                .contains(&<[u8; 32]>::from(Sha256::digest(value)))
+    }
+
+    fn query_value_carries_credential(&self, raw_value: &str) -> bool {
+        if self.value_digests.is_empty() || raw_value.is_empty() {
+            return false;
+        }
+        if self.carries_credential_value(raw_value.as_bytes()) {
+            return true;
+        }
+        let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
+        if self.carries_credential_value(&decoded) {
+            return true;
+        }
+        let form = raw_value.replace('+', " ");
+        let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
+        self.carries_credential_value(&form_decoded)
+    }
 }
 
 /// Strip origin-bound credentials before a distinct mirror origin. Deny by
@@ -1144,13 +1224,15 @@ fn apply_mirror_credential_policy(
     allowlist: &[String],
     operator_patterns: &[String],
     route_credentials: &[String],
+    presented: &MirrorRouteCredentials,
 ) {
-    headers.retain(|(name, _)| {
+    headers.retain(|(name, value)| {
         let lower = name.to_ascii_lowercase();
         if !is_mirror_sensitive_header(&lower, operator_patterns)
             && !route_credentials
                 .iter()
                 .any(|credential| credential.eq_ignore_ascii_case(&lower))
+            && !presented.carries_credential_value(value.as_bytes())
         {
             return true;
         }
@@ -1166,7 +1248,7 @@ fn mirror_query_pair_allowed(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
-    route_credentials: &[String],
+    route: &MirrorRouteCredentials,
 ) -> bool {
     // Some application query parsers still accept `;` as a parameter
     // separator. Ferrum's canonical query uses `&`, so forwarding a raw
@@ -1176,8 +1258,21 @@ fn mirror_query_pair_allowed(
     if pair.contains(';') {
         return false;
     }
-    let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-    match classify_mirror_query_name(raw_name, operator_patterns, route_credentials) {
+    let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+    match classify_mirror_query_name(raw_name, operator_patterns, &route.query_names) {
+        // A presented credential value under a name that is no longer a
+        // credential location (renamed by a later plugin) is still one.
+        MirrorQueryNameDecision::NonSensitive
+            if route.query_value_carries_credential(raw_value) =>
+        {
+            forward_sensitive_query
+                && percent_decode_str(raw_name)
+                    .decode_utf8()
+                    .is_ok_and(|decoded| {
+                        let decoded_lower = decoded.to_ascii_lowercase();
+                        allowlist.iter().any(|allowed| allowed == &decoded_lower)
+                    })
+        }
         MirrorQueryNameDecision::NonSensitive => true,
         MirrorQueryNameDecision::FailClosed => false,
         MirrorQueryNameDecision::Sensitive { decoded_lower } => {
@@ -1197,7 +1292,7 @@ fn apply_mirror_query_credential_policy<'a>(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
-    route_credentials: &[String],
+    route: &MirrorRouteCredentials,
 ) -> Cow<'a, str> {
     if query.is_empty() {
         return Cow::Borrowed(query);
@@ -1213,7 +1308,7 @@ fn apply_mirror_query_credential_policy<'a>(
                 forward_sensitive_query,
                 allowlist,
                 operator_patterns,
-                route_credentials,
+                route,
             )
     });
     if !needs_strip {
@@ -1228,7 +1323,7 @@ fn apply_mirror_query_credential_policy<'a>(
                 forward_sensitive_query,
                 allowlist,
                 operator_patterns,
-                route_credentials,
+                route,
             )
         {
             continue;
@@ -2224,7 +2319,7 @@ impl RequestMirror {
         original_path: &str,
         raw_query: Option<&str>,
         query_params: &HashMap<String, String>,
-        route_query_credentials: &[String],
+        route: &MirrorRouteCredentials,
     ) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
 
@@ -2247,7 +2342,7 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
-                route_query_credentials,
+                route,
             );
             if !filtered.is_empty() {
                 url.push('?');
@@ -2260,7 +2355,7 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
-                route_query_credentials,
+                route,
             );
             if !filtered.is_empty() {
                 url.push('?');
@@ -2888,12 +2983,14 @@ impl Plugin for RequestMirror {
             };
         // Query names an auth plugin used as a credential location on this
         // request are credentials whatever they are called.
-        let route_query_credentials = route_query_credential_names(ctx);
+        // Credential provenance comes from the request context, so a
+        // credential renamed by a later plugin is still recognised by value.
+        let route_credentials = MirrorRouteCredentials::from_ctx(ctx);
         let mirror_url = self.build_mirror_url(
             mirror_path,
             effective_query.as_deref(),
             &ctx.query_params,
-            &route_query_credentials,
+            &route_credentials,
         );
         let method = ctx.method.clone();
 
@@ -2929,6 +3026,7 @@ impl Plugin for RequestMirror {
             &self.forward_sensitive_header_allowlist,
             &self.sensitive_header_patterns,
             ctx.request_headers_requiring_redaction(),
+            &route_credentials,
         );
         if let Some(shadow_host) = mesh_shadow_host {
             // Keep the configured mirror URL as the dial/TLS identity. Only
@@ -3358,7 +3456,7 @@ mod tests {
         query_params.insert("page".to_string(), "1".to_string());
 
         assert_eq!(
-            plugin.build_mirror_url("/shadow", None, &query_params, &[]),
+            plugin.build_mirror_url("/shadow", None, &query_params, &Default::default()),
             "https://[2001:db8::10]:8443/shadow?page=1"
         );
         assert_eq!(
@@ -3393,7 +3491,7 @@ mod tests {
             "name=%E2%9C%93&q=%C3%A9",
             "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&dir=a%2Fb&name=%E2%9C%93",
         ] {
-            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed, &[]);
+            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed, &Default::default());
             assert!(
                 url.ends_with(&format!("?{raw}")),
                 "raw query must be preserved exactly: got {url}"

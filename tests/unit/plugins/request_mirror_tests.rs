@@ -6964,3 +6964,77 @@ async fn route_credential_locations_are_withheld_from_the_mirror() {
         "{escaped_line}"
     );
 }
+
+/// Builds a request whose route credentials (`x-proof` header registry,
+/// `Authorization`, `proof` query location) were then renamed by
+/// `request_transformer`, returning the context and outbound headers.
+async fn renamed_credential_request() -> (RequestContext, HashMap<String, String>) {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+    use ferrum_edge::plugins::utils::token_extract::{
+        TokenLocation, mark_present_query_credential_locations,
+    };
+
+    let transformer = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-proof", "new_key": "x-debug"},
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-copy"},
+            {"operation": "rename", "target": "query", "key": "proof", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("request_transformer config")
+    .expect("request_transformer plugin");
+
+    let mut ctx = make_ctx_with_proxy();
+    set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+    ctx.headers
+        .insert("x-proof".to_string(), "live-api-key".to_string());
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer live-token".to_string());
+    ctx.set_raw_query_string("proof=live-query-key&x=1".to_string());
+    ctx.query_params
+        .insert("proof".to_string(), "live-query-key".to_string());
+    ctx.query_params.insert("x".to_string(), "1".to_string());
+    mark_present_query_credential_locations(
+        &mut ctx,
+        &[TokenLocation::QueryParam("proof".to_string())],
+    );
+
+    let mut headers = ctx.headers.clone();
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    plugin_utils::assert_continue(transformer.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("x-debug").map(String::as_str),
+        Some("live-api-key"),
+        "the primary keeps the renamed credential"
+    );
+    (ctx, headers)
+}
+
+/// A credential renamed by `request_transformer` after authentication keeps
+/// its provenance: the mirror recognises the presented value under the new
+/// header or query name.
+#[tokio::test]
+async fn renamed_credentials_are_withheld_from_the_mirror() {
+    let (mut ctx, _) = renamed_credential_request().await;
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !line.contains("live-query-key") && !line.contains("tracking="),
+        "renamed query credential leaked: {line}"
+    );
+    assert!(line.contains("x=1"), "benign pair kept: {line}");
+
+    let (mut ctx, mut headers) = renamed_credential_request().await;
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in ["x-debug", "x-copy", "x-proof", "authorization"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert!(
+        !observed.values().any(|value| value.contains("live-")),
+        "credential value leaked: {observed:?}"
+    );
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}

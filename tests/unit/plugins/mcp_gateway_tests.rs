@@ -16996,3 +16996,21 @@ async fn mcp_transport_errors_withhold_path_credentials_at_all_four_sinks() {
         }
     }
 }
+
+/// Session IDs are bearer-like: the configured downstream and upstream session
+/// header names join the route's credential-header registry, so redaction and
+/// secondary egress (`request_mirror`) withhold them under any custom name.
+#[test]
+fn session_header_names_are_registered_as_credential_headers() {
+    let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+    config["sessions"] = json!({
+        "initialize_upstreams": "passthrough",
+        "downstream_session_header": "X-Client-Session",
+        "upstream_session_header": "x-proof"
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    assert_eq!(
+        plugin.request_headers_to_redact(),
+        &["x-client-session".to_string(), "x-proof".to_string()]
+    );
+}
