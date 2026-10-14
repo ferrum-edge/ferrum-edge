@@ -338,6 +338,8 @@ const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "integrity",
     "aes",
     "rsa",
+    "crypto",
+    "crypt",
     "ecdsa",
     "ed25519",
     "x25519",
@@ -441,10 +443,14 @@ const CREDENTIAL_TOKEN_QUALIFIERS: &[&str] = &[
 /// the key (`refresh_v2_tokens`) or joined in front of it (`accesstokens`).
 fn is_credential_token_plural(lower: &str, in_token_credential_context: bool) -> bool {
     lower.strip_suffix("tokens").is_some_and(|prefix| {
+        // Joined in front, possibly through descriptors (`refreshopaquetokens`);
+        // two-letter qualifiers (`id`) only count directly in front.
         in_token_credential_context
-            || CREDENTIAL_TOKEN_QUALIFIERS
-                .iter()
-                .any(|qualifier| !prefix.is_empty() && prefix.ends_with(qualifier))
+            || CREDENTIAL_TOKEN_QUALIFIERS.iter().any(|qualifier| {
+                !prefix.is_empty()
+                    && (prefix.ends_with(qualifier)
+                        || (qualifier.len() >= 4 && prefix.contains(qualifier)))
+            })
     })
 }
 

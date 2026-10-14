@@ -338,10 +338,20 @@ pub struct TransactionDebugger {
 fn assignment_field_names(line: &str) -> impl Iterator<Item = &str> {
     line.match_indices(['=', ':'])
         .filter_map(move |(offset, _)| {
-            let before = line[..offset].trim_end();
+            // Optional whitespace and a closing quote before the delimiter
+            // (`"hsm_pin": …`, `'totp_seed' = …`).
+            let before = line[..offset]
+                .trim_end()
+                .trim_end_matches(['"', '\''])
+                .trim_end();
+            // Walk back over identifier characters by `char_indices`, so a
+            // multi-byte character in front of the name never yields an index
+            // inside it.
             let start = before
-                .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
-                .map_or(0, |index| index + 1);
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+                .map_or(0, |(index, ch)| index + ch.len_utf8());
             let name = &before[start..];
             (!name.is_empty()).then_some(name)
         })

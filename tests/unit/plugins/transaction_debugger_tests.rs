@@ -2368,3 +2368,20 @@ fn test_text_body_drops_spaced_and_body_policy_field_lines() {
         text.rendered
     );
 }
+
+/// Multi-byte characters around assignments never split a character, and
+/// quoted field names are judged like bare ones.
+#[test]
+fn test_text_body_assignment_parsing_handles_utf8_and_quotes() {
+    let plugin = capture_plugin();
+    let body = "café=1\n🔑hsm_pin=735104\nnote=été\n\"hsm_pin\": \"735105\"\n'totp_seed' = 482916\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in ["735104", "735105", "482916"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}
