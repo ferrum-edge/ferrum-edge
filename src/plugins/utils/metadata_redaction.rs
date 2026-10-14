@@ -387,6 +387,16 @@ const KEY_MATERIAL_TRAILERS: &[&str] = &[
 /// one segment (`vendortokenvalue`, `token1`, `accesstokenhash`). A plural
 /// `tokens` names a usage count and stays visible (`ai_total_tokens`).
 fn has_token_compound(lower: &str) -> bool {
+    // A segment that STARTS with singular `token` and continues fails closed
+    // for unknown representations (`tokenopaque`), except plural counters
+    // (`tokens…`) and the tokenizer vocabulary.
+    if let Some(rest) = lower.strip_prefix("token")
+        && !rest.is_empty()
+        && !rest.starts_with('s')
+        && !rest.starts_with("iz")
+    {
+        return true;
+    }
     lower.match_indices("token").any(|(offset, _)| {
         let rest = &lower[offset + "token".len()..];
         // Plural `tokens` fails the suffix policy on its own (`s` is no
@@ -694,7 +704,10 @@ fn is_credential_class_name(key: &str) -> bool {
         // `pass` + `phrase` / `code` / `word` split across segments
         // (`passPhrase`, `pass_code`); `pass_through` stays visible.
         sensitive = lowered_segment_is_credential(lower, in_key_context)
-            || (previous_is_pass && matches!(lower, "phrase" | "code" | "word" | "wd" | "key"));
+            || (previous_is_pass
+                && ["phrase", "code", "word", "wd", "key"]
+                    .iter()
+                    .any(|word| lower.starts_with(word)));
         previous_is_pass = lower == "pass";
         // Once a qualifier appears, the context stays open for the rest of
         // the key: a later `key` segment is key material.
