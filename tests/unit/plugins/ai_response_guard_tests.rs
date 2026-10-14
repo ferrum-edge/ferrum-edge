@@ -7182,6 +7182,680 @@ async fn test_sse_other_providers_are_unaffected_by_tgi_reassembly() {
     }
 }
 
+// ─── Admission bounds and bounded per-string redaction (#6608) ──────────
+
+#[test]
+fn custom_patterns_that_match_the_empty_string_are_refused() {
+    for list in ["custom_pii_patterns", "blocked_patterns"] {
+        for regex in ["a*", "x?", "^", "(?:)", "\\s*"] {
+            let config = json!({
+                list: [{"name": "zero_width", "regex": regex}],
+                "action": "redact"
+            });
+            let err = match AiResponseGuard::new(&config) {
+                Ok(_) => panic!("{list} regex {regex:?} matches \"\" and must be refused"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("must not match the empty string"),
+                "unexpected error for {list} {regex:?}: {err}"
+            );
+        }
+        // A pattern that needs at least one character is still admitted.
+        let config = json!({
+            list: [{"name": "ok", "regex": "a+"}],
+            "action": "redact"
+        });
+        assert!(AiResponseGuard::new(&config).is_ok());
+    }
+}
+
+#[test]
+fn max_scan_bytes_has_a_hard_ceiling() {
+    let ceiling: u64 = 64 * 1024 * 1024;
+    assert!(
+        AiResponseGuard::new(&json!({"pii_patterns": ["ssn"], "max_scan_bytes": ceiling})).is_ok()
+    );
+    let err = match AiResponseGuard::new(
+        &json!({"pii_patterns": ["ssn"], "max_scan_bytes": ceiling + 1}),
+    ) {
+        Ok(_) => panic!("max_scan_bytes above the ceiling must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("max_scan_bytes"), "{err}");
+    assert!(
+        AiResponseGuard::new(&json!({"pii_patterns": ["ssn"], "max_scan_bytes": u64::MAX}))
+            .is_err()
+    );
+}
+
+#[test]
+fn custom_pattern_lists_have_count_and_name_bounds() {
+    for list in ["custom_pii_patterns", "blocked_patterns"] {
+        let at_cap: Vec<_> = (0..256)
+            .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+            .collect();
+        assert!(
+            AiResponseGuard::new(&json!({list: at_cap})).is_ok(),
+            "{list} at cap"
+        );
+
+        let over_cap: Vec<_> = (0..257)
+            .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+            .collect();
+        let err = match AiResponseGuard::new(&json!({list: over_cap})) {
+            Ok(_) => panic!("{list} above the entry cap must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.contains("at most 256 entries"), "{err}");
+
+        let long_name = "n".repeat(129);
+        assert!(
+            AiResponseGuard::new(&json!({list: [{"name": long_name, "regex": "abc"}]})).is_err(),
+            "{list} name above 128 characters must be refused"
+        );
+        let max_name = "é".repeat(128);
+        assert!(
+            AiResponseGuard::new(&json!({list: [{"name": max_name, "regex": "abc"}]})).is_ok(),
+            "{list} name bound is counted in characters"
+        );
+    }
+
+    let phrases: Vec<String> = (0..1025).map(|i| format!("phrase {i}")).collect();
+    assert!(AiResponseGuard::new(&json!({"blocked_phrases": phrases})).is_err());
+}
+
+#[test]
+fn rendered_redaction_placeholder_is_bounded() {
+    let template = "P".repeat(500) + "{type}";
+    // `pii:ssn` renders to 507 bytes: admitted.
+    assert!(
+        AiResponseGuard::new(&json!({
+            "pii_patterns": ["ssn"],
+            "redaction_placeholder": template
+        }))
+        .is_ok()
+    );
+    // `pii:email` renders to 509 bytes, still admitted; a longer custom name
+    // pushes the rendered placeholder past 512 bytes and is refused.
+    let err = match AiResponseGuard::new(&json!({
+        "custom_pii_patterns": [{"name": "long_custom_name", "regex": "abc"}],
+        "redaction_placeholder": template
+    })) {
+        Ok(_) => panic!("a rendered placeholder above 512 bytes must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("redaction_placeholder"), "{err}");
+}
+
+/// Two-pass compounding policy whose regexes match only digits in VALUE
+/// content (never a JSON key) and whose final placeholder (`x…`) matches no
+/// regex, so without the growth budget the redaction is complete and clean.
+fn compounding_digit_policy(scan_fields: &str) -> AiResponseGuard {
+    make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "8".repeat(128), "regex": "7"},
+            {"name": "x".repeat(128), "regex": "8"}
+        ],
+        "redaction_placeholder": "{type}",
+        "scan_fields": scan_fields,
+        "action": "redact"
+    }))
+}
+
+fn chat_body(contents: &[String]) -> Vec<u8> {
+    let choices: Vec<_> = contents
+        .iter()
+        .map(|content| json!({"message": {"content": content}}))
+        .collect();
+    serde_json::to_vec(&json!({ "choices": choices })).unwrap()
+}
+
+/// Sequential patterns compound: pass 2 rewrites every byte pass 1 wrote.
+/// "77777" grows to 640 bytes, then to 81 920, past the 64 KiB floor of the
+/// per-response growth allowance. Without the allowance this rewrite is
+/// complete and leaves no residual, so the refusal is the budget's doing.
+#[tokio::test]
+async fn compounding_structured_redaction_fails_closed_within_budget() {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // Control: the same policy on one digit (128 × 128 = 16 KiB) redacts.
+    for scan_fields in ["content", "all"] {
+        let plugin = compounding_digit_policy(scan_fields);
+        let small = chat_body(&["7".to_string()]);
+        let redacted = plugin
+            .transform_response_body(&small, Some("application/json"), &headers)
+            .await
+            .unwrap_or_else(|| panic!("{scan_fields}: a within-budget rewrite must succeed"));
+        let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "x".repeat(128 * 128)
+        );
+    }
+
+    let body = chat_body(&["77777".to_string()]);
+    for scan_fields in ["content", "all"] {
+        let plugin = compounding_digit_policy(scan_fields);
+        assert!(
+            plugin
+                .transform_response_body(&body, Some("application/json"), &headers)
+                .await
+                .is_none(),
+            "{scan_fields}: no partially redacted document may be produced"
+        );
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), &body)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{scan_fields}: a redaction that cannot complete inside its budget must reject"
+        );
+    }
+}
+
+/// The allowance is per RESPONSE, not per string: six strings that each grow
+/// by ~12.7 KB fit individually but together exceed the 64 KiB floor.
+#[tokio::test]
+async fn structured_redaction_budget_is_aggregate_across_strings_and_events() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "7"}],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let part = "7".repeat(100);
+    let mut json_headers = HashMap::new();
+    json_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // Control: two such strings (~25 KB of growth) redact normally.
+    let two = chat_body(&vec![part.clone(); 2]);
+    assert!(
+        plugin
+            .transform_response_body(&two, Some("application/json"), &json_headers)
+            .await
+            .is_some(),
+        "two strings stay inside the allowance"
+    );
+
+    let six = chat_body(&vec![part.clone(); 6]);
+    assert!(
+        plugin
+            .transform_response_body(&six, Some("application/json"), &json_headers)
+            .await
+            .is_none(),
+        "combined growth across strings must exhaust the shared allowance"
+    );
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers.clone(), &six)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    // The same aggregate across buffered SSE events.
+    let two_events = openai_sse_body(&[part.as_str(), part.as_str()]);
+    assert!(
+        plugin
+            .transform_response_body(&two_events, Some("text/event-stream"), &sse_headers())
+            .await
+            .is_some(),
+        "two events stay inside the allowance"
+    );
+    let six_events = openai_sse_body(&[part.as_str(); 6]);
+    assert!(
+        plugin
+            .transform_response_body(&six_events, Some("text/event-stream"), &sse_headers())
+            .await
+            .is_none(),
+        "combined growth across SSE events must exhaust the shared allowance"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_expanding_redaction_still_succeeds() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "digit", "regex": "[0-9]"}],
+        "action": "redact"
+    }));
+    let body = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "code 1234"}}]
+    }))
+    .unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("a modest expansion redacts normally");
+    let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "code [REDACTED:digit][REDACTED:digit][REDACTED:digit][REDACTED:digit]"
+    );
+}
+
+/// `\b` does not match the empty string, so admission accepts it, but it only
+/// ever produces zero-width spans. With a later `\w+` pass and a literal `!`
+/// placeholder, main inserted `!` at every boundary, then collapsed the words,
+/// and delivered a clean but amplified rewrite. The runtime refusal must stop
+/// it at the first zero-width match instead.
+#[tokio::test]
+async fn runtime_zero_width_matches_are_refused_by_every_redaction_path() {
+    for scan_fields in ["all", "content"] {
+        let plugin = make_plugin(json!({
+            "blocked_patterns": [
+                {"name": "boundary", "regex": "\\b"},
+                {"name": "word", "regex": "\\w+"}
+            ],
+            "redaction_placeholder": "!",
+            "scan_fields": scan_fields,
+            "action": "redact"
+        }));
+        let mut headers = HashMap::new();
+        if scan_fields == "all" {
+            headers.insert("content-type".to_string(), "text/plain".to_string());
+            assert!(
+                plugin
+                    .transform_response_body(b"hello world", Some("text/plain"), &headers)
+                    .await
+                    .is_none(),
+                "whole-body text redaction must refuse zero-width spans"
+            );
+        }
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let body = br#"{"choices":[{"message":{"content":"hello world"}}]}"#;
+        assert!(
+            plugin
+                .transform_response_body(body, Some("application/json"), &headers)
+                .await
+                .is_none(),
+            "{scan_fields}: structured redaction must refuse zero-width spans"
+        );
+    }
+}
+
+/// A grow-then-shrink policy (`7` → 128 bytes, then the run → one byte) spends
+/// no net allowance. Every rewritten scalar must still come out exact, and the
+/// retained strings are compacted rather than keeping the amplified
+/// intermediate capacity.
+#[tokio::test]
+async fn grow_then_shrink_redaction_across_many_fields_is_exact() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "8".repeat(128), "regex": "7"},
+            {"name": "x", "regex": "8+"}
+        ],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let contents = vec!["7".repeat(512); 64];
+    let body = chat_body(&contents);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let redacted = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("a shrinking rewrite spends no allowance");
+    let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
+    for index in 0..64 {
+        assert_eq!(value["choices"][index]["message"]["content"], "x");
+    }
+}
+
+/// Re-serializing a tool-argument document can multiply a placeholder (a
+/// control character becomes `\u0000`, six bytes). That growth is charged
+/// too, so a rewrite whose decoded leaves fit the allowance but whose
+/// serialized form does not is refused on the JSON and SSE paths.
+#[tokio::test]
+async fn tool_argument_serialization_growth_is_charged() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512),
+        "action": "redact"
+    }));
+    let call = |count: usize| serde_json::to_string(&json!({"a": "7".repeat(count)})).unwrap();
+    let json_body = |count: usize| {
+        serde_json::to_vec(&json!({"choices": [{"message": {"tool_calls": [{
+            "type": "function",
+            "function": {"name": "f", "arguments": call(count)}
+        }]}}]}))
+        .unwrap()
+    };
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // Control: 18 matches. Leaf growth (~55 KB escaped) and the embedded
+    // argument string (~64.5 KB once escaped again) both fit the 64 KiB floor.
+    assert!(
+        plugin
+            .transform_response_body(&json_body(18), Some("application/json"), &headers)
+            .await
+            .is_some()
+    );
+    // 20 matches: the leaves (~61 KB escaped) fit, but embedding the
+    // re-serialized argument document escapes it again (~71.7 KB), which only
+    // the argument-serialization charge catches.
+    assert!(
+        plugin
+            .transform_response_body(&json_body(20), Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "escaping growth of re-serialized arguments must be charged"
+    );
+
+    let sse = |count: usize| {
+        let frame = json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"name": "f", "arguments": call(count)}
+        }]}}]});
+        format!("data: {frame}\n\ndata: [DONE]\n\n").into_bytes()
+    };
+    assert!(
+        plugin
+            .transform_response_body(&sse(18), Some("text/event-stream"), &sse_headers())
+            .await
+            .is_some()
+    );
+    assert!(
+        plugin
+            .transform_response_body(&sse(20), Some("text/event-stream"), &sse_headers())
+            .await
+            .is_none(),
+        "the SSE argument path charges the same serialization growth"
+    );
+}
+
+#[test]
+fn repeated_built_in_pattern_names_are_refused_before_compilation() {
+    let repeated = vec!["ssn"; 5000];
+    let err = match AiResponseGuard::new(&json!({"pii_patterns": repeated})) {
+        Ok(_) => panic!("a repeated built-in name must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("repeats built-in pattern"), "{err}");
+    assert!(AiResponseGuard::new(&json!({"pii_patterns": ["ssn", "email"]})).is_ok());
+}
+
+/// The growth allowance is shared across every rewritten protobuf string in
+/// every frame of one response.
+#[tokio::test]
+async fn grpc_redaction_budget_is_aggregate_across_frames() {
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "7"}],
+        "redaction_placeholder": "{type}",
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let body = |frames: usize| -> Vec<u8> {
+        (0..frames)
+            .flat_map(|_| grpc_frame(&hello_response_bytes(&"7".repeat(100))))
+            .collect()
+    };
+    let transform = |bytes: Vec<u8>| {
+        let plugin = &plugin;
+        async move {
+            let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+            let _ = plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &bytes)
+                .await;
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &bytes,
+                    Some("application/grpc"),
+                    &grpc_headers(),
+                )
+                .await
+        }
+    };
+    // Two frames (~25 KB of growth) fit; six (~76 KB) exhaust the allowance.
+    assert!(transform(body(2)).await.is_some(), "two frames fit");
+    assert!(
+        transform(body(6)).await.is_none(),
+        "combined growth across frames must exhaust the shared allowance"
+    );
+}
+
+/// The growth allowance is also capped by the window that covers the
+/// rewritten candidate, so inspection refuses a structured rewrite that could
+/// only be built larger than this response's retained ceiling.
+#[tokio::test]
+async fn structured_redaction_budget_respects_the_covering_window() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "7"}],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let content = format!("{} {}", "7".repeat(512), "a".repeat(32_000));
+    let body = chat_body(&[content]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // Control: under an ordinary ceiling the ~65 KB rewrite is promised.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut roomy, 200, &mut headers.clone(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A 64 KiB window over a ~32 KiB body leaves ~32 KiB of room, below the
+    // ~65 KB the rewrite needs: inspection must refuse instead of building it.
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    assert!(body.len() < ctx.max_response_body_size_bytes);
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+/// A refused SSE rewrite (growth allowance or a runtime zero-width match) must
+/// fail closed. Before, the refusal looked like "no frame modified": the
+/// residual pre-check then scanned the ORIGINAL bytes with placeholders
+/// stripped, and content equal to a placeholder made it look clean.
+#[tokio::test]
+async fn refused_sse_rewrites_fail_closed_at_inspection() {
+    let budget_plugin = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "x"}],
+        "redaction_placeholder": "{type}"
+    }));
+    // 640 `x` = five placeholders' worth; rewriting needs ~81 KB of growth.
+    let body = openai_sse_body(&[&"x".repeat(640)]);
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        budget_plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert!(
+        budget_plugin
+            .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
+            .await
+            .is_none()
+    );
+
+    let zero_width = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [
+            {"name": "boundary", "regex": "\\b"},
+            {"name": "word", "regex": "\\w+"}
+        ],
+        "redaction_placeholder": "!"
+    }));
+    let body = openai_sse_body(&["hello world"]);
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        zero_width
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+/// Growth is charged on the JSON-escaped form for every rewritten string, not
+/// only tool arguments: a control-character placeholder escapes six-fold.
+#[tokio::test]
+async fn escaped_placeholder_growth_is_charged_for_completion_strings() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512),
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // 10 matches: ~30 KB escaped growth fits the 64 KiB floor.
+    assert!(
+        plugin
+            .transform_response_body(
+                &chat_body(&["7".repeat(10)]),
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_some()
+    );
+    // 30 matches: 15 KB decoded growth, but ~92 KB once escaped.
+    assert!(
+        plugin
+            .transform_response_body(
+                &chat_body(&["7".repeat(30)]),
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none()
+    );
+    let sse = |count: usize| openai_sse_body(&[&"7".repeat(count)]);
+    assert!(
+        plugin
+            .transform_response_body(&sse(10), Some("text/event-stream"), &sse_headers())
+            .await
+            .is_some()
+    );
+    assert!(
+        plugin
+            .transform_response_body(&sse(30), Some("text/event-stream"), &sse_headers())
+            .await
+            .is_none()
+    );
+}
+
+/// The live-capacity bound still admits a grow-then-shrink rewrite whose
+/// intermediate nearly fills a 64 KiB window: the shrinking pass reserves only
+/// the room the resident intermediate leaves.
+#[tokio::test]
+async fn grow_then_shrink_fits_a_tight_window() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "8".repeat(128), "regex": "7"},
+            {"name": "x", "regex": "8+"}
+        ],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let body = chat_body(&["7".repeat(480)]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    let redacted = plugin
+        .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &headers)
+        .await
+        .expect("intermediate plus result fit the window");
+    let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
+    assert_eq!(value["choices"][0]["message"]["content"], "x");
+}
+
+/// Protobuf strings are raw UTF-8, so a placeholder that is shorter once
+/// JSON-escaped than the control characters it replaces must still be charged
+/// its raw growth.
+#[tokio::test]
+async fn grpc_raw_growth_is_charged_even_when_escaped_size_shrinks() {
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "\\x00{86}"}],
+        "redaction_placeholder": "{type}{type}{type}{type}",
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let frame = || grpc_frame(&hello_response_bytes(&"\u{0}".repeat(860)));
+    let body: Vec<u8> = (0..20).flat_map(|_| frame()).collect();
+    // Each frame grows 10 x (512 - 86) = 4 260 raw bytes; twenty frames need
+    // ~85 KB against a ~70 KB allowance even though the escaped size shrinks.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &grpc_headers(),
+            )
+            .await
+            .is_none()
+    );
+}
+
+/// Negative control for the live-capacity bound: a same-size second pass
+/// (`8` → `x`, one byte each) would need a second ~61 KB buffer beside the
+/// resident ~61 KB intermediate, which does not fit a 64 KiB window, even
+/// though the final output and its growth charge would.
+#[tokio::test]
+async fn second_pass_cannot_double_the_live_capacity() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "8".repeat(128), "regex": "7"},
+            {"name": "x", "regex": "8"}
+        ],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let body = chat_body(&["7".repeat(480)]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none()
+    );
+}
 /// Issue #6624: provider-chosen choice/output indexes cannot grow the guard's
 /// SSE accumulators without bound. Past the per-family ceiling the excess is
 /// folded, and an enforcing guard treats the stream as uninspectable instead

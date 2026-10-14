@@ -75,6 +75,7 @@ mod unit {
         mod jwks_auth_inline_keys_tests;
         mod jwks_auth_multi_audience_tests;
         mod jwks_auth_output_claim_header_tests;
+        mod jwks_auth_provider_bound_tests;
         #[allow(dead_code, unused_imports)] // consumed by the k–z half
         mod jwks_auth_support;
         mod jwks_auth_tests;

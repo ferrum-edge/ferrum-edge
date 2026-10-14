@@ -3415,7 +3415,7 @@ fn test_max_scan_bytes_numeric_admission_matches_the_published_contract() {
         r#"{"patterns":["ssn"],"max_scan_bytes":1024}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":1024.0}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":1}"#,
-        r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740991}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":67108864}"#,
     ] {
         let config: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
         assert!(
@@ -3430,6 +3430,8 @@ fn test_max_scan_bytes_numeric_admission_matches_the_published_contract() {
         r#"{"patterns":["ssn"],"max_scan_bytes":1024.5}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":-1}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":0}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":67108865}"#,
+        r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740991}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":9007199254740992}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":18446744073709551616}"#,
         r#"{"patterns":["ssn"],"max_scan_bytes":"1024"}"#,
@@ -4870,4 +4872,97 @@ async fn mcp_arguments_mode_rechecks_the_final_request_body() {
             .await,
         Some(400),
     );
+}
+
+#[test]
+fn custom_patterns_entry_count_is_bounded() {
+    let at_cap: Vec<_> = (0..256)
+        .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+        .collect();
+    assert!(AiPromptShield::new(&json!({"patterns": [], "custom_patterns": at_cap})).is_ok());
+    let over_cap: Vec<_> = (0..257)
+        .map(|i| json!({"name": format!("p{i}"), "regex": format!("tok{i}x")}))
+        .collect();
+    let err = match AiPromptShield::new(&json!({"patterns": [], "custom_patterns": over_cap})) {
+        Ok(_) => panic!("custom_patterns above the entry cap must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("at most 256 entries"), "{err}");
+}
+
+#[test]
+fn repeated_built_in_pattern_names_are_refused_before_compilation() {
+    let repeated = vec!["ssn"; 5000];
+    let err = match AiPromptShield::new(&json!({"patterns": repeated})) {
+        Ok(_) => panic!("a repeated built-in name must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("repeats built-in pattern"), "{err}");
+}
+
+/// Growth is charged on the JSON-escaped form of the rewritten prompt, so a
+/// control-character placeholder cannot slip past the allowance through
+/// serialization escaping.
+#[tokio::test]
+async fn escaped_placeholder_growth_is_charged() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": [],
+        "custom_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512)
+    }))
+    .unwrap();
+
+    // 10 matches: ~30 KB escaped growth fits the 64 KiB floor.
+    let small = json!({"prompt": "7".repeat(10)});
+    let mut ctx = make_post_ctx(&small);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+
+    // 30 matches: 15 KB decoded growth, but ~92 KB once escaped.
+    let large = json!({"prompt": "7".repeat(30)});
+    let mut ctx = make_post_ctx(&large);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
+    assert_eq!(
+        ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+        Some("redaction_budget_exceeded")
+    );
+}
+
+/// Numeric scalars replaced by a placeholder string are charged their
+/// serialized growth too (escaped placeholder plus quotes).
+#[tokio::test]
+async fn numeric_scalar_redaction_charges_escaped_growth() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "scan_fields": "all",
+        "patterns": [],
+        "custom_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512)
+    }))
+    .unwrap();
+
+    // 10 numeric 7s: ~30.7 KB of serialized growth fits the 64 KiB floor.
+    let small = json!({"values": vec![7; 10]});
+    let mut ctx = make_post_ctx(&small);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // 30 numeric 7s: 15 KB decoded, ~92 KB serialized.
+    let large = json!({"values": vec![7; 30]});
+    let mut ctx = make_post_ctx(&large);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
+    assert_eq!(
+        ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+        Some("redaction_budget_exceeded")
+    );
+
+    // Mixed numeric and string values share the allowance.
+    let mixed = json!({"values": vec![7; 15], "prompt": "7".repeat(15)});
+    let mut ctx = make_post_ctx(&mixed);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
 }

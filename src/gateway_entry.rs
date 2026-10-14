@@ -645,6 +645,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 return 1;
             }
         };
+        secrets::emit_deferred_startup_warnings();
         // Printed after logging init so any warning emitted by a later stage
         // still has a live subscriber, and before `execute_validate()` so the
         // report reads in resolution order: secrets, then settings, then spec.
@@ -690,6 +691,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             return 1;
         }
     };
+    secrets::emit_deferred_startup_warnings();
 
     // Raise the soft FD cap to the hard cap before any subsystem opens
     // sockets. The call never asks for privileges we don't have (it caps at
@@ -1280,6 +1282,7 @@ fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
             return 1;
         }
     };
+    secrets::emit_deferred_startup_warnings();
     log_resolved_secret_sources(&resolved);
 
     // An enforce request that arrives only through ferrum.conf or an external

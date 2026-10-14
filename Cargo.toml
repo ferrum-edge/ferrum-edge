@@ -558,7 +558,7 @@ wiremock = "0.6"
 # via testcontainers; env-mutating tests serialize via serial_test. Only the
 # `secrets_functional` test target uses testcontainers.
 # See tests/secrets_functional/.
-testcontainers = "0.27"
+testcontainers = "0.28"
 # `serial_test` is also the reader/writer gate in
 # `tests/unit/plugins/serverless_function_tests.rs`: a test that publishes a
 # provider credential fixture is `#[serial(serverless_env)]` and every test that
