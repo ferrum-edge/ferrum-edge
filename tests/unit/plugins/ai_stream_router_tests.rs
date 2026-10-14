@@ -10476,3 +10476,45 @@ async fn test_gemini_normalizer_treats_null_counters_as_absent() {
     assert!(out.contains("\"completion_tokens\":40"), "{out}");
     assert!(out.contains("\"total_tokens\":50"), "{out}");
 }
+
+async fn run_anthropic_normalizer_on(sse: &str) -> String {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    String::from_utf8(collected).unwrap()
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_merges_terminal_invocation_metrics() {
+    let with_metrics = ANTHROPIC_SSE.replace(
+        "data: {\"type\":\"message_stop\"}",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}}",
+    );
+    assert_ne!(
+        with_metrics, ANTHROPIC_SSE,
+        "fixture substitution must apply"
+    );
+    let out = run_anthropic_normalizer_on(&with_metrics).await;
+    assert!(out.contains("\"prompt_tokens\":1010"), "{out}");
+    assert!(out.contains("\"total_tokens\":1015"), "{out}");
+
+    let malformed = ANTHROPIC_SSE.replace(
+        "data: {\"type\":\"message_stop\"}",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"cacheReadInputTokenCount\":\"bad\"}}",
+    );
+    let out = run_anthropic_normalizer_on(&malformed).await;
+    assert!(
+        out.contains("malformed Bedrock invocation metrics"),
+        "{out}"
+    );
+}

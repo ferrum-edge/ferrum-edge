@@ -4619,6 +4619,28 @@ impl AnthropicSseNormalizer {
         true
     }
 
+    /// Merge Bedrock invocation metrics carried on any Anthropic event (an
+    /// InvokeModel stream wrapping the Messages events) into the running
+    /// usage. Returns `false` when they are malformed or overflow.
+    fn absorb_invocation_metrics(&mut self, event: &Value) -> bool {
+        let Some(metrics) = super::utils::ai_providers::extract_bedrock_invocation_metrics(event)
+        else {
+            return true;
+        };
+        let folded = self.usage_categories.absorb(metrics);
+        let (prompt_invalid, completion_invalid) = self.usage_categories.invalid_sides();
+        if prompt_invalid || completion_invalid {
+            return false;
+        }
+        if folded.prompt_tokens.is_some() {
+            self.prompt_tokens = folded.prompt_tokens;
+        }
+        if folded.completion_tokens.is_some() {
+            self.completion_tokens = folded.completion_tokens;
+        }
+        true
+    }
+
     fn unread_len(&self) -> usize {
         self.buf.len().saturating_sub(self.cursor)
     }
@@ -4736,6 +4758,13 @@ impl AnthropicSseNormalizer {
     /// Transcode one Anthropic event JSON into zero or more OpenAI SSE lines.
     /// Returns whether the upstream inspector driver should terminate now.
     fn transcode_event(&mut self, event: &Value, out: &mut NormalizedSseOut) -> bool {
+        if !self.absorb_invocation_metrics(event) {
+            self.fail_bound(
+                "upstream provider sent malformed Bedrock invocation metrics; stream terminated",
+                out,
+            );
+            return true;
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if self.message_started {

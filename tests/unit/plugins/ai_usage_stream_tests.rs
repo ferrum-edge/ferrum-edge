@@ -1585,3 +1585,23 @@ fn inconsistent_partial_update_clears_an_earlier_total() {
     assert_eq!(merged.total_tokens, None);
     assert!(!merged.is_complete_for_mode("total_tokens"));
 }
+
+#[test]
+fn titan_counters_survive_a_later_metrics_only_chunk() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let mut merged =
+        extract_response_usage(&json!({"inputTextTokenCount": 21}), AiProvider::Bedrock);
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"amazon-bedrock-invocationMetrics": {"outputTokenCount": 60}}),
+        AiProvider::Bedrock,
+    ));
+    assert_eq!(
+        (
+            merged.prompt_tokens,
+            merged.completion_tokens,
+            merged.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+}

@@ -624,16 +624,18 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
         (None, Some(metrics)) => return metrics,
         (None, None) => {}
     }
+    // Titan counters live in the same raw layout as invocation metrics, so a
+    // later metrics-only chunk merges with them instead of erasing them.
     let prompt = titan_prompt(json);
     let completion = titan_completion(json);
-    AiTokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: sum_pair(prompt, completion),
-        model: None,
+    let mut titan = AiTokenUsage {
         provider: Some(AiProvider::Bedrock),
         ..Default::default()
+    };
+    if prompt.is_some() || completion.is_some() {
+        titan.apply_categories(UsageCategories::bedrock_bases(prompt, completion));
     }
+    titan
 }
 
 fn titan_prompt(json: &Value) -> Option<u64> {
@@ -854,6 +856,17 @@ impl UsageCategories {
             || categories.completion_base.is_reported()
             || categories.reported_total.is_reported();
         reported.then_some(categories)
+    }
+
+    /// Bare Bedrock input/output counts (Titan), in the invocation-metrics
+    /// layout so they merge with later metrics chunks.
+    fn bedrock_bases(prompt: Option<u64>, completion: Option<u64>) -> Self {
+        Self {
+            family: Some(CategoryFamily::Anthropic),
+            prompt_base: prompt.map_or(Counter::Absent, Counter::Value),
+            completion_base: completion.map_or(Counter::Absent, Counter::Value),
+            ..Self::default()
+        }
     }
 
     /// `amazon-bedrock-invocationMetrics`, in the Anthropic layout (uncached
