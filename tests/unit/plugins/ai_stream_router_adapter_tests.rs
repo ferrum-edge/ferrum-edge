@@ -410,13 +410,13 @@ async fn anthropic_missing_delta_retains_usage_and_errors_never_finish_successfu
             .find(|frame| frame.get("usage").is_some())
             .unwrap();
         assert_eq!(usage["usage"]["prompt_tokens"], 3);
-        if partial_usage {
-            assert!(usage["usage"]["completion_tokens"].is_null());
-            assert!(usage["usage"]["total_tokens"].is_null());
-        } else {
-            assert_eq!(usage["usage"]["completion_tokens"], 1);
-            assert_eq!(usage["usage"]["total_tokens"], 4);
-        }
+        // `message_start`'s `output_tokens` is a placeholder the terminal
+        // `message_delta` supersedes (issue #6623): with no delta, the
+        // completion and total stay unreported whether or not the start
+        // carried one, so the stream is never published as complete usage.
+        let _ = partial_usage;
+        assert!(usage["usage"]["completion_tokens"].is_null());
+        assert!(usage["usage"]["total_tokens"].is_null());
     }
     for terminal in [
         None,
