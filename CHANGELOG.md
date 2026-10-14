@@ -9,22 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `cors` treats public-suffix wildcards as effectively
-  universal.** (issue n/a, PR #6639) A native `"*.suffix"` origin whose suffix is a single label
-  (`*.com`, `*.localhost`) or a Public Suffix List entry (`*.co.uk`,
-  `*.github.io`) is now refused together with `allow_credentials: true`,
-  like `*`-equivalent prefixes and regexes. A domain with any Public
-  Suffix List rule beneath it (`*.run.app`, `*.amazonaws.com`) is treated the
-  same way. Such entries
-  still work without credentials. A credentialed `regex` origin must now
-  also prove that it pins the host: its literal suffixes must be complete
-  origins, contain the literal authority, or end in a fixed non-public
-  domain (a trailing literal or variable numeric port is allowed;
-  numeric IP-fragment suffixes never count). `https://[a-z]+\.com`,
-  `https://[a-z]+example\.com`, hosts not terminated before a variable part
-  and patterns the analysis cannot bound are refused with credentials. A
-  pattern whose every match starts with a literal `scheme://host:` still
-  pins the host.
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose

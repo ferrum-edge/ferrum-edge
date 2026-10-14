@@ -28,10 +28,6 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `cors` credentialed origin matchers (PR #6639)
-
-With `allow_credentials: true`, a `"*.suffix"` origin is refused when the suffix is a single label, a public suffix, or has a Public Suffix List rule beneath it (`*.com`, `*.co.uk`, `*.github.io`, `*.amazonaws.com`). A credentialed `regex` origin must prove that it pins the host. Use exact origins, a registrable-domain wildcard such as `"*.example.com"`, an anchored regex ending in a fixed domain, or the host-bounded prefix `scheme://host:`. Without credentials these matchers are unchanged.
-
 ### Shared consumer credentials are refused (#6572)
 
 Consumers whose `id`, `username` or `custom_id` collide are still quarantined
