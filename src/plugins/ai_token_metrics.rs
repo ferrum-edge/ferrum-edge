@@ -306,12 +306,12 @@ impl AiTokenMetrics {
             };
             let mut snapshots = vec![native];
             if provider != AiProvider::Bedrock
-                && payload.get("amazon-bedrock-invocationMetrics").is_some()
+                && let Some(mut metrics) =
+                    crate::plugins::utils::ai_providers::extract_bedrock_invocation_metrics(payload)
             {
                 // Bedrock's terminal metrics fold in the same layout as the
                 // Anthropic events they follow; keep the stream's provider so
                 // `merge_cumulative` merges them instead of refusing the switch.
-                let mut metrics = extract_response_usage(payload, AiProvider::Bedrock);
                 metrics.provider = Some(provider);
                 snapshots.push(metrics);
             }

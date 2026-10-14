@@ -9803,3 +9803,29 @@ fn test_normalized_gemini_rejects_a_malformed_completion_alternate() {
         .is_err()
     );
 }
+
+#[test]
+fn test_normalized_anthropic_rejects_overflow_without_an_input_base() {
+    let anthropic = json!({
+        "id": "msg_overflow",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "x"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "cache_creation_input_tokens": u64::MAX,
+            "cache_read_input_tokens": 1,
+            "output_tokens": 5
+        }
+    });
+    assert!(
+        test_helpers::normalize_response_test(
+            "anthropic",
+            200,
+            &serde_json::to_vec(&anthropic).unwrap(),
+            "claude-sonnet-4-20250514",
+        )
+        .is_err()
+    );
+}

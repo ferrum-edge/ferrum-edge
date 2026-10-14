@@ -341,8 +341,10 @@ impl UsageAccumulator {
         }
 
         // Bedrock `InvokeModelWithResponseStream` terminal chunk metrics.
-        if json.get("amazon-bedrock-invocationMetrics").is_some() {
-            self.record(&extract_response_usage(json, AiProvider::Bedrock));
+        // Read independently of any native `usage` in the same event, which
+        // the arms above already recorded.
+        if let Some(metrics) = super::ai_providers::extract_bedrock_invocation_metrics(json) {
+            self.record(&metrics);
         }
     }
 }

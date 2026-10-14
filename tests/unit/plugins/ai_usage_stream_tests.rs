@@ -1513,3 +1513,38 @@ fn malformed_gemini_completion_alternate_invalidates_completion() {
     assert_eq!(usage.completion_tokens, None);
     assert!(!usage.is_complete_for_mode("total_tokens"));
 }
+
+#[test]
+fn co_located_invocation_metrics_merge_beside_native_usage() {
+    let mut stream = bedrock_invoke_chunk(json!({
+        "type": "message_start",
+        "message": {"usage": {"input_tokens": 10}}
+    }));
+    stream.extend_from_slice(&bedrock_invoke_chunk(json!({
+        "type": "message_delta",
+        "usage": {"output_tokens": 5},
+        "amazon-bedrock-invocationMetrics": {
+            "inputTokenCount": 10,
+            "outputTokenCount": 5,
+            "cacheReadInputTokenCount": 1000
+        }
+    })));
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(1015)
+    );
+
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+    let buffered = extract_response_usage(
+        &json!({
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "amazon-bedrock-invocationMetrics": {"cacheReadInputTokenCount": 1000}
+        }),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(buffered.total_tokens, Some(1015));
+}

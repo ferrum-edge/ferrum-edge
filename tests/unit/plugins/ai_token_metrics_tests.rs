@@ -1883,3 +1883,32 @@ async fn co_located_native_usage_and_invocation_metrics_both_merge() {
     let ctx = run("{\"cache_read_input_tokens\":\"bad\",\"output_tokens\":5}").await;
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
 }
+
+/// Cache counters supplied only by co-located invocation metrics are merged
+/// beside the native usage of the same event; malformed metrics invalidate.
+#[tokio::test]
+async fn co_located_invocation_metrics_supply_their_own_categories() {
+    let run = |metrics: &'static str| async move {
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+        let mut ctx = create_test_context();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+        let body = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-test\",\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":5}},\"amazon-bedrock-invocationMetrics\":{metrics}}}\n\n"
+        );
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+            .await;
+        ctx
+    };
+    let ctx =
+        run("{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}")
+            .await;
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+    let ctx = run("{\"inputTokenCount\":10,\"cacheReadInputTokenCount\":\"bad\"}").await;
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}

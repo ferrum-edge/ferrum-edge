@@ -4825,6 +4825,18 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
         "output_tokens",
         "Anthropic",
     )?;
+    // Every reported counter must sum without overflow, even when the input
+    // base is absent and the cache categories therefore do not fold into it.
+    native_usage_floor(
+        resp.get("usage"),
+        &[
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+        ],
+        "Anthropic",
+    )?;
     // `input_tokens` excludes prompt-cache writes and reads; the billed input
     // is the sum of all three, so budgets and cost see the whole prompt.
     let input_tokens = fold_native_usage_categories(

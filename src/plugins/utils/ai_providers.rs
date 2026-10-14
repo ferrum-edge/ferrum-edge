@@ -581,23 +581,6 @@ fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
 
 fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     let usage = json.get("usage");
-    // InvokeModel with a Claude model returns the native Anthropic Messages
-    // body (snake_case `input_tokens` / cache counters / `output_tokens`), so
-    // it folds with the Anthropic rule while keeping the Bedrock identity.
-    if usage.is_some_and(|usage| {
-        [
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        ]
-        .iter()
-        .any(|field| usage.get(field).is_some())
-    }) {
-        let mut anthropic = extract_anthropic_usage(json);
-        anthropic.provider = Some(AiProvider::Bedrock);
-        return anthropic;
-    }
     // Converse reports uncached input separately from prompt-cache reads and
     // writes; the billed input is their sum (AWS: `total input tokens =
     // inputTokens + cacheReadInputTokens + cacheWriteInputTokens`).
@@ -609,50 +592,38 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
         converse.apply_categories(categories);
         return converse;
     }
-    let titan_prompt = json
-        .get("inputTextTokenCount")
-        .and_then(|value| value.as_u64());
-    // Titan Text InvokeModel returns exactly one result for one invocation.
-    // More than one result is ambiguous, so do not sum it or select one.
-    let titan_completion = json
-        .get("results")
-        .and_then(|value| value.as_array())
-        .filter(|results| results.len() == 1)
-        .and_then(|results| results[0].get("tokenCount"))
-        .and_then(|value| value.as_u64());
-    // `InvokeModelWithResponseStream` terminal chunk. AWS documents these as the
-    // billed counts for the invocation, so they are authoritative for a native
-    // Bedrock event stream that carries no `usage` block at all.
-    // It may also carry `cacheReadInputTokenCount` / `cacheWriteInputTokenCount`
-    // beside an uncached `inputTokenCount`, the same layout as the Anthropic
-    // body the stream wraps, so it folds (and merges) as that layout.
-    // A streaming Titan chunk can carry `inputTextTokenCount` beside these
-    // metrics (and no `results`), so each component falls back to the Titan
-    // counter only where the metrics did not report it.
-    if let Some(metrics) = json.get("amazon-bedrock-invocationMetrics") {
-        let mut categories =
-            UsageCategories::bedrock_invocation_metrics(Some(metrics)).with_carrier(Some(metrics));
-        // Fill the RAW bases, so the fallback survives cumulative merging
-        // (which re-folds categories) rather than living only in the fold.
-        if categories.prompt_base == Counter::Absent
-            && let Some(prompt) = titan_prompt
-        {
-            categories.prompt_base = Counter::Value(prompt);
+    // InvokeModel with a Claude model returns the native Anthropic Messages
+    // body (snake_case `input_tokens` / cache counters / `output_tokens`), so
+    // it folds with the Anthropic rule while keeping the Bedrock identity.
+    let native = usage
+        .is_some_and(|usage| {
+            [
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ]
+            .iter()
+            .any(|field| usage.get(field).is_some())
+        })
+        .then(|| {
+            let mut anthropic = extract_anthropic_usage(json);
+            anthropic.provider = Some(AiProvider::Bedrock);
+            anthropic
+        });
+    // Terminal invocation metrics co-located with that body are merged on top
+    // (same category layout), never dropped.
+    match (native, extract_bedrock_invocation_metrics(json)) {
+        (Some(mut native), Some(metrics)) => {
+            native.merge_cumulative(metrics);
+            return native;
         }
-        if categories.completion_base == Counter::Absent
-            && let Some(completion) = titan_completion
-        {
-            categories.completion_base = Counter::Value(completion);
-        }
-        let mut invoke = AiTokenUsage {
-            provider: Some(AiProvider::Bedrock),
-            ..Default::default()
-        };
-        invoke.apply_categories(categories);
-        return invoke;
+        (Some(native), None) => return native,
+        (None, Some(metrics)) => return metrics,
+        (None, None) => {}
     }
-    let prompt = titan_prompt;
-    let completion = titan_completion;
+    let prompt = titan_prompt(json);
+    let completion = titan_completion(json);
     AiTokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
@@ -661,6 +632,53 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
         provider: Some(AiProvider::Bedrock),
         ..Default::default()
     }
+}
+
+fn titan_prompt(json: &Value) -> Option<u64> {
+    json.get("inputTextTokenCount").and_then(Value::as_u64)
+}
+
+/// Titan Text InvokeModel returns exactly one result for one invocation. More
+/// than one result is ambiguous, so do not sum it or select one.
+fn titan_completion(json: &Value) -> Option<u64> {
+    json.get("results")
+        .and_then(Value::as_array)
+        .filter(|results| results.len() == 1)
+        .and_then(|results| results[0].get("tokenCount"))
+        .and_then(Value::as_u64)
+}
+
+/// `amazon-bedrock-invocationMetrics` of an `InvokeModelWithResponseStream`
+/// terminal chunk, independent of any native `usage` in the same event.
+///
+/// AWS documents these as the billed counts for the invocation. They may also
+/// carry `cacheReadInputTokenCount` / `cacheWriteInputTokenCount` beside an
+/// uncached `inputTokenCount`, the same layout as the Anthropic body the
+/// stream wraps, so they fold (and merge) as that layout. A streaming Titan
+/// chunk can carry `inputTextTokenCount` beside these metrics (and no
+/// `results`), so each base falls back to the Titan counter only where the
+/// metrics did not report it — in the RAW categories, so the fallback survives
+/// cumulative merging.
+pub fn extract_bedrock_invocation_metrics(json: &Value) -> Option<AiTokenUsage> {
+    let metrics = json.get("amazon-bedrock-invocationMetrics")?;
+    let mut categories =
+        UsageCategories::bedrock_invocation_metrics(Some(metrics)).with_carrier(Some(metrics));
+    if categories.prompt_base == Counter::Absent
+        && let Some(prompt) = titan_prompt(json)
+    {
+        categories.prompt_base = Counter::Value(prompt);
+    }
+    if categories.completion_base == Counter::Absent
+        && let Some(completion) = titan_completion(json)
+    {
+        categories.completion_base = Counter::Value(completion);
+    }
+    let mut invoke = AiTokenUsage {
+        provider: Some(AiProvider::Bedrock),
+        ..Default::default()
+    };
+    invoke.apply_categories(categories);
+    Some(invoke)
 }
 
 /// Hugging Face TGI native usage.
