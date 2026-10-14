@@ -2459,7 +2459,8 @@ With tracing absent, the request unsampled, or propagation-only mode, every atte
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode. Must be an `http`/`https` URL with a non-empty host. URL userinfo is rejected; diagnostics redact path/query. `http://` is accepted without an opt-in because collectors usually run as a local or mesh-encrypted sidecar; span attributes and any `authorization`/`headers` value then travel in clear, so use `https://` for a collector across an untrusted network |
+| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `https://collector:4318/v1/traces`). Omit for propagation-only mode. Must be an `http`/`https` URL with a non-empty host. URL userinfo is rejected; diagnostics redact path/query. An `http://` URL is refused unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`, or `allow_plaintext: true` is set: spans and any `authorization`/`headers` value travel on this export |
+| `allow_plaintext` | Boolean | `false` | Admit an `http://` `endpoint` whose host is not a loopback IP literal (for example an in-cluster collector service). |
 | `service_name` | String | `ferrum-edge` | Service name in spans and resource attributes. Retained as configured; not bounded by `max_attribute_bytes` |
 | `deployment_environment` | String | _(none)_ | `deployment.environment` resource attribute. Retained as configured; not bounded by `max_attribute_bytes` |
 | `generate_trace_id` | Boolean | `true` | Generate trace IDs when no usable incoming context exists |
@@ -4002,7 +4003,8 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. `http://` is accepted without an opt-in for the usual co-located OPA sidecar; the `input` document and any `headers` credential then travel in clear, so use `https://` for an OPA reached over an untrusted network. |
+| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. An `http://` URL is refused unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]` (a co-located sidecar), or `allow_plaintext: true` is set: the `input` document, the decision, and any `headers` credential travel on this call. |
+| `allow_plaintext` | Boolean | `false` | Admit an `http://` `opa_host` whose host is not a loopback IP literal (for example an in-cluster OPA service). |
 | `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, a backslash, a space, or an ASCII control character, or contain empty, `.`, or `..` path segments. The normalized decision URL must still address the path under `{opa_host}/v1/data/`. |
 | `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured, nor can the gateway-owned `X-Ferrum-Hops` (any case, `_` or `-`), which the decision request carries itself. |
 | `timeout_ms` | Integer | `1000` | Requested per-decision timeout. Every positive value is accepted; the effective timeout is capped at `30000` ms. |
@@ -4074,6 +4076,7 @@ The measured boundary is the **complete decision**, not just its response header
 plugin_name: opa
 config:
   opa_host: "http://opa.opa-system.svc.cluster.local:8181"
+  allow_plaintext: true   # in-cluster OPA over http; prefer https off-node
   policy_path: "ferrum/authz/allow"
   timeout_ms: 500
   fail_open: false
@@ -4799,6 +4802,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | `aws_function_name` | String | — | Lambda function name, partial ARN, or full ARN, validated against the Lambda Invoke API `FunctionName` grammar (≤ 170 characters). Falls back to `AWS_LAMBDA_FUNCTION_NAME` env var; the environment value is held to the same grammar |
 | `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var only when `aws_access_key_id` and `aws_secret_access_key` also come from the environment (a token is bound to its access key, so it never completes a config key pair); a process-environment token is [scoped to official AWS Lambda endpoints](#ambient-aws-credential-scope) |
 | `aws_qualifier` | String | — | Optional version/alias qualifier (e.g., `$LATEST`, `prod`), validated against the Lambda Invoke API `Qualifier` grammar: `A-Z a-z 0-9 $ _ -`, ≤ 128 characters |
+| `allow_plaintext` | Boolean | `false` | Admit an `http://` `function_url` / `aws_endpoint_url` whose host is not a loopback IP literal. The invocation payload and provider credential then travel in clear. The `AWS_LAMBDA_ENDPOINT_URL` fallback is not screened. |
 | `aws_endpoint_url` | String | — | Optional HTTP(S) origin-only Lambda endpoint override. No userinfo, path, query, or fragment; falls back to `AWS_LAMBDA_ENDPOINT_URL`. With process-environment credentials a configured `aws_endpoint_url` must be an official AWS Lambda endpoint unless `allow_custom_endpoint_with_ambient_credentials` is `true`; an `AWS_LAMBDA_ENDPOINT_URL` fallback is trusted like the environment credentials |
 | `allow_custom_endpoint_with_ambient_credentials` | Boolean | `false` | Deliberately let process-environment AWS credentials sign invocations for a config-chosen endpoint outside the official scope (LocalStack, an air-gapped ISO partition, the AWS European Sovereign Cloud). See [Ambient AWS credential scope](#ambient-aws-credential-scope) |
 
@@ -4807,7 +4811,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"azure_functions"` |
-| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections. An `http://` URL sends the request payload and any function key in clear; use it only for a local or otherwise protected function runtime |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections. An `http://` URL is refused unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`, or `allow_plaintext: true` is set |
 | `azure_function_key` | String | — | Function key for auth. Falls back to the `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` env var (never the ambient `AZURE_FUNCTIONS_KEY`, because the key is sent to the config-chosen `function_url`). The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
 
 **GCP Cloud Functions** — calls the HTTPS trigger URL:
@@ -4815,7 +4819,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"gcp_cloud_functions"` |
-| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections. An `http://` URL sends the request payload and any function key in clear; use it only for a local or otherwise protected function runtime |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections. An `http://` URL is refused unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`, or `allow_plaintext: true` is set |
 | `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to the `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var (never the ambient `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`). The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
 
 #### Common Parameters
@@ -9856,6 +9860,7 @@ The plugin stamps metric plans; configure `prometheus_metrics` to export those m
 | `metrics` | Object; `{}` | Optional `disabled_metrics` array and `tag_overrides` array; nested unknown keys are ignored. See operations below. |
 | `tracing_provider` | Provider object or null; omitted | Singular fallback; ignored whenever `tracing_providers` is present. Null means no provider. |
 | `tracing_providers` | Provider array or null; omitted | Fan-out to each configured exporter. Present null or `[]` selects no exporters, including when the singular field is set. |
+| `allow_plaintext` | Boolean; omitted | Admit a cleartext `http://` provider URL whose host is not a loopback IP literal (`127.d.d.d` or `[::1]`). Without it, such a provider fails construction. Mesh injection writes `true` whenever a translated Telemetry/MeshConfig provider uses `http://`, so in-cluster collectors keep working and the cleartext posture stays visible in the injected config. |
 | `direction_emit` | Object or null; `{server: true, client: false}` | Boolean `server` and `client` members select inbound SERVER and outbound CLIENT spans; omitted members use those defaults. Unstamped direction uses `server`. Null selects defaults; unknown members are ignored. |
 | `span_reporting_disabled` | Boolean; `false` | Suppresses span export while preserving configuration and trace-context propagation. |
 | `disable_span_reporting`, `disableSpanReporting` | Boolean; omitted | Aliases, in decreasing precedence after `span_reporting_disabled`. First present spelling wins, including explicit false. |

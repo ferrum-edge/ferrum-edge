@@ -13858,6 +13858,14 @@ fn inject_mesh_global_plugins(
             // Keep provider config visible for introspection and propagation even
             // when span_reporting_disabled makes WorkloadMetrics skip exporters.
             workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
+            // In-cluster collectors are routinely cleartext (`http://zipkin:9411`).
+            // Exporters refuse an `http://` endpoint off a loopback IP literal
+            // unless the config opts in, so mesh injection opts in explicitly —
+            // and only when a provider actually uses cleartext — keeping the
+            // posture visible in the injected plugin config.
+            if crate::plugins::otel_tracing::trace_providers_use_plaintext(&tracing.providers) {
+                workload_metrics_config["allow_plaintext"] = serde_json::json!(true);
+            }
         }
         // GAP-3F: project `Telemetry.tracing[].match.mode` into the plugin's
         // `direction_emit` so a single auto-injected workload_metrics instance
@@ -32324,6 +32332,12 @@ mod tests {
                 .pointer("/config/url")
                 .and_then(serde_json::Value::as_str),
             Some("http://zipkin.istio-system:9411/api/v2/spans")
+        );
+        // An in-cluster cleartext collector is admitted through an explicit,
+        // visible opt-in written by injection.
+        assert_eq!(
+            workload_metrics.config["allow_plaintext"],
+            serde_json::json!(true)
         );
         // Sampling percentage from the same Telemetry block is still applied.
         assert_eq!(

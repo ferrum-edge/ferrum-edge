@@ -488,7 +488,7 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
     for selected in [
         json!({"kind": "zipkin", "config": {"url": "https://example.com/api/v2/spans"}}),
         json!({"kind": "datadog", "config": {
-            "agent_url": "http://localhost:8126", "service": null
+            "agent_url": "http://127.0.0.1:8126", "service": null
         }}),
         json!({"kind": "lightstep", "config": {
             "collector_url": "https://example.com/v1/traces",
@@ -623,5 +623,62 @@ fn exporter_diagnostics_keep_batch_bounds_and_later_provider_endpoint() {
         for hidden in ["collector-marker-5594", "endpoint-marker-5594", "got: 0"] {
             assert!(!rendered.contains(hidden), "{rendered}");
         }
+    }
+}
+
+/// Every tracing provider URL is screened for cleartext off a loopback IP
+/// literal (configured spelling); the opt-in admits it and is typed always.
+#[test]
+fn tracing_provider_cleartext_needs_opt_in_off_loopback() {
+    let provider = |kind: &str, url: &str| -> Value {
+        match kind {
+            "zipkin" => json!({"kind": "zipkin", "config": {"url": url}}),
+            "datadog" => json!({"kind": "datadog", "config": {"agent_url": url}}),
+            _ => json!({"kind": "opentelemetry", "config": {"endpoint": url}}),
+        }
+    };
+    let build = |kind: &str, url: &str, opt_in: Option<Value>| {
+        let mut config = json!({"tracing_providers": [provider(kind, url)]});
+        if let Some(flag) = opt_in {
+            config["allow_plaintext"] = flag;
+        }
+        WorkloadMetrics::new(&config)
+    };
+    // Lightstep shares the same endpoint screen but resolves its token from
+    // the process environment first, so it is covered through the shared
+    // validator rather than here.
+    for kind in ["zipkin", "datadog", "opentelemetry"] {
+        for (url, opt_in) in [
+            ("http://collector.internal:9411/api", None),
+            ("http://collector.internal:9411/api", Some(json!(false))),
+            ("http://localhost:9411/api", None),
+            ("http://127.1:9411/api", None),
+            ("http://[0:0:0:0:0:0:0:1]:9411/api", None),
+        ] {
+            let error = match build(kind, url, opt_in.clone()) {
+                Ok(_) => panic!("{kind} {url} {opt_in:?} must be refused"),
+                Err(error) => error,
+            };
+            assert!(error.contains("allow_plaintext"), "{kind} {url}: {error}");
+        }
+        for (url, opt_in) in [
+            ("http://collector.internal:9411/api", Some(json!(true))),
+            ("http://127.0.0.1:9411/api", None),
+            ("http://[::1]:9411/api", None),
+            ("https://collector.internal/api", None),
+        ] {
+            assert!(
+                build(kind, url, opt_in.clone()).is_ok(),
+                "{kind} {url} {opt_in:?} must be admitted"
+            );
+        }
+    }
+    // Typed whenever supplied, even with no provider at all.
+    for flag in [json!("yes"), Value::Null] {
+        let error = match WorkloadMetrics::new(&json!({"allow_plaintext": flag})) {
+            Ok(_) => panic!("non-boolean allow_plaintext must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("allow_plaintext"), "{error}");
     }
 }
