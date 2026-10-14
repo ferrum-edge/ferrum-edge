@@ -8017,6 +8017,16 @@ async fn handle_dtls_client_inner(
     // send settles exactly once even if this task exits before that arm fires.
     let reply_auth_plan = auth_deadline;
     let reply_auth_latch = auth_termination_latch.clone();
+    // One backend reply: plain-UDP datagrams stay borrowed in the task's
+    // receive buffer (length only) instead of being copied into a fresh
+    // Vec just to unify with the backend-DTLS driver's owned plaintext
+    // (issue #6675). Every consumer below — admission metrics, plugin
+    // hooks, and the frontend DTLS send — already borrows the payload.
+    enum DtlsBackendReply {
+        Plain(usize),
+        Owned(Vec<u8>),
+    }
+
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
@@ -8025,10 +8035,10 @@ async fn handle_dtls_client_inner(
             // supervisor's abort lands.
             let received = within_dtls_trust_fence(&b2c_trust, async {
                 if let Some(ref dtls) = backend_dtls {
-                    dtls.recv().await.ok()
+                    dtls.recv().await.ok().map(DtlsBackendReply::Owned)
                 } else if let Some(ref sock) = backend_udp {
                     match sock.recv(&mut buf).await {
-                        Ok(n) => Some(buf[..n].to_vec()),
+                        Ok(n) => Some(DtlsBackendReply::Plain(n)),
                         Err(_) => None,
                     }
                 } else {
@@ -8036,13 +8046,17 @@ async fn handle_dtls_client_inner(
                 }
             })
             .await;
-            let data = match received {
-                Ok(Some(data)) => data,
+            let reply = match received {
+                Ok(Some(reply)) => reply,
                 Ok(None) => break,
                 Err(DtlsTrustWithdrawn) => {
                     b2c_trust.record_fenced_once();
                     return Err(dtls_trust_withdrawn_error());
                 }
+            };
+            let data: &[u8] = match &reply {
+                DtlsBackendReply::Plain(n) => &buf[..*n],
+                DtlsBackendReply::Owned(v) => v.as_slice(),
             };
             if let Some(source) = node_waypoint_source_rev.as_ref()
                 && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
@@ -8088,7 +8102,7 @@ async fn handle_dtls_client_inner(
                     datagram_size: len,
                     direction: UdpDatagramDirection::BackendToClient,
                     // DTLS-terminating frontend: `data` is decrypted plaintext.
-                    payload: &data,
+                    payload: data,
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_rev.as_ref())),
                 };
@@ -8140,7 +8154,7 @@ async fn handle_dtls_client_inner(
                 &b2c_trust,
                 udp_frontend_send_until_expiry(
                     reply_auth_plan,
-                    client_sender.send_committed(&data, reply_auth_plan.map(|plan| plan.at)),
+                    client_sender.send_committed(data, reply_auth_plan.map(|plan| plan.at)),
                 ),
             )
             .await;
