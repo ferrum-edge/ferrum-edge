@@ -488,7 +488,7 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
     for selected in [
         json!({"kind": "zipkin", "config": {"url": "https://example.com/api/v2/spans"}}),
         json!({"kind": "datadog", "config": {
-            "agent_url": "http://localhost:8126", "service": null
+            "agent_url": "http://127.0.0.1:8126", "service": null
         }}),
         json!({"kind": "lightstep", "config": {
             "collector_url": "https://example.com/v1/traces",

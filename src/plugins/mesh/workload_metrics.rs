@@ -207,6 +207,7 @@ pub const WORKLOAD_METRICS_CONFIG_KEYS: &[&str] = &[
     "buffer_max_bytes",
     "max_retries",
     "retry_delay_ms",
+    "allow_plaintext",
 ];
 
 /// One compiled `mesh_authz` baggage gate: the same
@@ -1927,7 +1928,11 @@ pub(crate) fn validate_istio_telemetry_config(
             tracing.custom_header_tags.clone(),
             tracing.custom_env_tags.clone(),
         )?;
-        validate_trace_provider_endpoints(&tracing.providers)
+        // Mesh injection always writes `allow_plaintext: true` beside
+        // providers it emits with a cleartext collector URL (see
+        // `inject_workload_metrics_plugin`), so translation-time screening
+        // admits the same set the injected plugin will.
+        validate_trace_provider_endpoints(&tracing.providers, true)
             .map_err(|error| format!("workload_metrics: `tracing.providers`: {error}"))?;
     }
     if let Some(metrics) = metrics {
@@ -3519,6 +3524,7 @@ mod tests {
     #[tokio::test]
     async fn tracing_provider_zipkin_round_trips_through_config() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "tracing_provider": {
                 "kind": "zipkin",
                 "config": {
@@ -3542,6 +3548,7 @@ mod tests {
     #[tokio::test]
     async fn tracing_provider_datadog_optional_service_round_trips() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "tracing_provider": {
                 "kind": "datadog",
                 "config": {
@@ -3596,6 +3603,7 @@ mod tests {
     #[tokio::test]
     async fn tracing_provider_opentelemetry_round_trips() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "tracing_provider": {
                 "kind": "opentelemetry",
                 "config": {
@@ -3641,6 +3649,7 @@ mod tests {
     #[test]
     fn tracing_provider_config_is_safe_without_tokio_runtime() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "tracing_provider": {
                 "kind": "zipkin",
                 "config": {
@@ -3657,6 +3666,7 @@ mod tests {
     #[tokio::test]
     async fn tracing_providers_array_round_trips() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "tracing_providers": [
                 {
                     "kind": "zipkin",
@@ -3679,6 +3689,7 @@ mod tests {
     #[tokio::test]
     async fn before_proxy_propagates_trace_context_from_header_parameter() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "tracing_providers": [{
                 "kind": "zipkin",
                 "config": {
@@ -3740,6 +3751,7 @@ mod tests {
     #[tokio::test]
     async fn before_proxy_keeps_incoming_sampled_trace_context_when_locally_unsampled() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "sampling_percentage": 0.0,
             "tracing_providers": [{
                 "kind": "zipkin",
@@ -3789,6 +3801,7 @@ mod tests {
     #[tokio::test]
     async fn before_proxy_keeps_incoming_unsampled_trace_context_when_locally_sampled() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "sampling_percentage": 100.0,
             "tracing_providers": [{
                 "kind": "zipkin",
@@ -4074,6 +4087,7 @@ mod tests {
     #[tokio::test]
     async fn disable_span_reporting_keeps_provider_config_but_builds_no_exporters() {
         let metrics = WorkloadMetrics::new(&json!({
+            "allow_plaintext": true,
             "span_reporting_disabled": true,
             "sampling_percentage": 100.0,
             "tracing_providers": [{

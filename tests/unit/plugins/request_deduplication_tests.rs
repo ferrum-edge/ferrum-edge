@@ -3836,6 +3836,7 @@ async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
         &json!({
             "provider": "azure_functions",
             "function_url": "http://169.254.169.254/invoke",
+            "allow_plaintext": true,
             "mode": "terminate"
         }),
         PluginHttpClient::default_with_backend_allow_ips(policy),

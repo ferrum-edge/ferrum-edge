@@ -52,6 +52,7 @@ use super::utils::byte_budget::{
     record_batch_materialization_loss,
 };
 use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
@@ -94,6 +95,7 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "root_sampling",
     "root_sampling_ratio",
     "include_url_path",
+    "allow_plaintext",
 ];
 
 const MIN_BATCH_SIZE: u64 = 1;
@@ -1143,6 +1145,9 @@ pub(crate) struct TraceExporterOptions {
     retry_delay: Duration,
     service_name: String,
     deployment_environment: Option<String>,
+    /// `allow_plaintext`: admit an `http://` exporter endpoint whose host is
+    /// not a loopback IP literal.
+    allow_plaintext: bool,
     /// Retained-byte ceiling every exporter built from these options charges.
     ceiling: &'static RetainedByteCeiling,
 }
@@ -1208,6 +1213,7 @@ impl TraceExporterOptions {
             )?),
             service_name,
             deployment_environment: optional_string_config(config, "deployment_environment")?,
+            allow_plaintext: bool_config(config, "allow_plaintext", false)?,
             ceiling: process_ceiling(),
         })
     }
@@ -1234,6 +1240,8 @@ struct TraceHttpExporterConfig {
     service_name: String,
     deployment_environment: Option<String>,
     payload_kind: TracePayloadKind,
+    /// Admit a cleartext endpoint whose host is not a loopback IP literal.
+    allow_plaintext: bool,
     /// Ceiling the queued spans *and* every batch representation built from them
     /// are charged to. Always the process ceiling in production.
     ceiling: &'static RetainedByteCeiling,
@@ -1268,7 +1276,8 @@ impl BufferedTraceExporter {
         buffer_capacity: usize,
         buffer_max_bytes: usize,
     ) -> Result<Self, String> {
-        let hostname = validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint)?;
+        let hostname =
+            validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint, cfg.allow_plaintext)?;
         // `buffer_capacity` bounds this channel only. The flush worker moves
         // spans out of it into its own batch, so total pending spans can reach
         // `buffer_capacity + batch_size` before a flush completes. Aggregate
@@ -1596,6 +1605,7 @@ impl TraceHttpExporterConfig {
             service_name: options.service_name.clone(),
             deployment_environment: options.deployment_environment.clone(),
             payload_kind,
+            allow_plaintext: options.allow_plaintext,
             ceiling: options.ceiling,
         })
     }
@@ -1831,36 +1841,55 @@ pub(crate) fn validate_trace_provider_secret_refs(
     Ok(())
 }
 
+/// `true` when any provider exports over cleartext `http://`. Mesh injection
+/// uses it to write the explicit `allow_plaintext` opt-in beside providers it
+/// translated from Istio Telemetry / MeshConfig.
+pub(crate) fn trace_providers_use_plaintext(providers: &[TracingProvider]) -> bool {
+    providers.iter().any(|provider| {
+        let url = match provider {
+            TracingProvider::Zipkin { url } => url.as_str(),
+            TracingProvider::Datadog { agent_url, .. } => agent_url.as_str(),
+            TracingProvider::Lightstep { collector_url, .. } => collector_url.as_str(),
+            TracingProvider::OpenTelemetry { endpoint } => endpoint.as_str(),
+        };
+        Url::parse(url.trim()).is_ok_and(|parsed| parsed.scheme() == "http")
+    })
+}
+
 pub(crate) fn validate_trace_provider_endpoints(
     providers: &[TracingProvider],
+    allow_plaintext: bool,
 ) -> Result<(), String> {
     for (index, provider) in providers.iter().enumerate() {
-        validate_trace_provider_endpoint(provider)
+        validate_trace_provider_endpoint(provider, allow_plaintext)
             .map_err(|error| format!("`providers[{index}].config`: {error}"))?;
     }
     Ok(())
 }
 
-fn validate_trace_provider_endpoint(provider: &TracingProvider) -> Result<(), String> {
+fn validate_trace_provider_endpoint(
+    provider: &TracingProvider,
+    allow_plaintext: bool,
+) -> Result<(), String> {
     match provider {
         TracingProvider::Zipkin { url } => {
-            validate_endpoint_for_provider("Zipkin", url)
+            validate_endpoint_for_provider("Zipkin", url, allow_plaintext)
                 .map_err(|error| format!("`url`: {error}"))?;
         }
         TracingProvider::Datadog { agent_url, .. } => {
             let endpoint = datadog_traces_endpoint(agent_url)?;
-            validate_endpoint_for_provider("Datadog", &endpoint)?;
+            validate_endpoint_for_provider("Datadog", &endpoint, allow_plaintext)?;
         }
         TracingProvider::Lightstep {
             collector_url,
             access_token_env,
         } => {
-            validate_endpoint_for_provider("Lightstep", collector_url)
+            validate_endpoint_for_provider("Lightstep", collector_url, allow_plaintext)
                 .map_err(|error| format!("`collector_url`: {error}"))?;
             validate_plugin_secret_env_name(LIGHTSTEP_ACCESS_TOKEN_ENV_FIELD, access_token_env)?;
         }
         TracingProvider::OpenTelemetry { endpoint } => {
-            validate_endpoint_for_provider("OTLP", endpoint)?;
+            validate_endpoint_for_provider("OTLP", endpoint, allow_plaintext)?;
         }
     }
     Ok(())
@@ -3224,7 +3253,11 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
     }
 }
 
-fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result<String, String> {
+fn validate_endpoint_for_provider(
+    provider_name: &str,
+    endpoint: &str,
+    allow_plaintext: bool,
+) -> Result<String, String> {
     let url = Url::parse(endpoint)
         .map_err(|_| format!("{provider_name}: `endpoint` must be a valid URL"))?;
     match url.scheme() {
@@ -3245,8 +3278,20 @@ fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result
             "{provider_name}: `endpoint` must include a hostname"
         ));
     }
-    normalized_url_hostname(&url)
-        .ok_or_else(|| format!("{provider_name}: `endpoint` must include a hostname"))
+    let hostname = normalized_url_hostname(&url)
+        .ok_or_else(|| format!("{provider_name}: `endpoint` must include a hostname"))?;
+    // Spans (request metadata) and any `authorization`/`headers` credential or
+    // provider token travel on this export. Cleartext is admitted without an
+    // opt-in only to a loopback IP literal (a node-local collector or agent).
+    if url.scheme() == "http"
+        && !allow_plaintext
+        && !is_loopback_ip_literal_endpoint(endpoint, url.host())
+    {
+        return Err(format!(
+            "{provider_name}: `endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `allow_plaintext: true`"
+        ));
+    }
+    Ok(hostname)
 }
 
 fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
@@ -3858,6 +3903,7 @@ mod tests {
             service_name: "ferrum-edge".to_string(),
             deployment_environment: None,
             payload_kind: TracePayloadKind::Otlp,
+            allow_plaintext: true,
             ceiling: process_ceiling(),
         }
     }

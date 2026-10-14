@@ -2306,7 +2306,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
                 "channels": ["ops"]
             }]
         }),
-        "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+        "otel_tracing" => json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
         "ai_request_guard" => json!({"max_messages": 100}),
         "ai_rate_limiter" => json!({"token_limit": 100000}),
         "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),

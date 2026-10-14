@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `opa`, `serverless_function`, `otel_tracing` and
+  `workload_metrics` refuse a cleartext endpoint off loopback** (issue
+  #6617). Each sends authorization input, invocation payloads, spans, or
+  credentials to its endpoint. An `http://` `opa_host`, `function_url`,
+  `aws_endpoint_url`, OTLP `endpoint`, or tracing-provider URL is now admitted
+  without an opt-in only for a `127.d.d.d` or `[::1]` literal; any other host,
+  `localhost` included, needs `allow_plaintext: true` on that plugin. Mesh
+  injection writes `allow_plaintext: true` on the injected `workload_metrics`
+  plugin whenever a translated Telemetry/MeshConfig provider uses `http://`,
+  so in-cluster collectors keep working with the posture visible in config.
+  The trusted `AWS_LAMBDA_ENDPOINT_URL` environment fallback is not screened.
+
 - **BREAKING — `ai_semantic_cache` and `ai_semantic_firewall` refuse a
   cleartext embedding endpoint off loopback** (issue #6617). Both send an API
   key with every embedding call. An `http://` endpoint is now admitted without

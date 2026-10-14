@@ -26,6 +26,7 @@ use super::utils::query::{CanonicalQuery, canonical_query_for_policy};
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
@@ -65,6 +66,7 @@ const OPA_CONFIG_KEYS: &[&str] = &[
     "query_ambiguity_policy",
     "redact_headers",
     "redact_query_keys",
+    "allow_plaintext",
 ];
 
 #[derive(Serialize)]
@@ -714,7 +716,6 @@ fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(Url, String, 
             ));
         }
     }
-
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(
             "opa: `opa_host` must not include credentials; configure OPA auth with `headers`"
@@ -750,6 +751,19 @@ fn parse_decision_endpoint(object: &Map<String, Value>) -> Result<(Url, String, 
     let data_prefix = format!("{}{}", parsed.path().trim_end_matches('/'), OPA_DATA_PREFIX);
     ensure_decision_path_under_data_prefix(&parsed_decision_url, &data_prefix, policy_path)?;
     let redacted_decision_url = crate::plugins::utils::redacted_endpoint_url(&parsed_decision_url);
+
+    // Authorization decisions and any `headers` credential travel on this
+    // call. Cleartext is admitted without an opt-in only to a loopback IP
+    // literal (a co-located OPA sidecar).
+    if parsed.scheme() == "http"
+        && !parse_optional_bool(object, "allow_plaintext")?.unwrap_or(false)
+        && !is_loopback_ip_literal_endpoint(opa_host, parsed.host())
+    {
+        return Err(
+            "opa: `opa_host` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `allow_plaintext: true`"
+                .to_string(),
+        );
+    }
 
     Ok((parsed_decision_url, redacted_decision_url, hostname))
 }

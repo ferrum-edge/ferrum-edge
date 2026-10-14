@@ -775,7 +775,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
         "tcp_logging" => json!({"host": "localhost", "port": 5140}),
         "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
-        "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+        "otel_tracing" => json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
         // `hmac_auth` defaults to the single-use `ferrum-hmac-v2` profile, which
         // requires an explicit replay-scope declaration.
         "hmac_auth" => json!({"replay_scope": "process"}),

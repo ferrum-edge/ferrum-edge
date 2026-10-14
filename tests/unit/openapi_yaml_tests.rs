@@ -9832,7 +9832,7 @@ fn opa_schema_matches_runtime_validation_contract() {
     }
 
     let base = json!({
-        "opa_host": "http://opa.internal:8181",
+        "opa_host": "https://opa.internal:8181",
         "policy_path": "ferrum/authz/allow",
         "timeout_ms": 45000,
         "max_response_bytes": 262144,

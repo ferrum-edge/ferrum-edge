@@ -102,18 +102,18 @@ fn opa_validates_config() {
         json!({"policy_path": POLICY_PATH}),
         json!({"opa_host": "file:///tmp/opa", "policy_path": POLICY_PATH}),
         json!({"opa_host": "http://user:pass@localhost:8181", "policy_path": POLICY_PATH}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": ""}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": "/ferrum/authz"}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": "ferrum/../authz"}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": "ferrum%2F..%2Fauthz"}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "deny_status": 200}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "fail_closed_status": 200}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "headers": {"Invalid Header": "value"}}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "headers": {"Content-Type": "text/plain"}}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "fail_open": true, "fail_closed": false}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "max_response_bytes": 0}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "max_body_bytes": 0}),
-        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "redact_query_keys": [""]}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": ""}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": "/ferrum/authz"}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": "ferrum/../authz"}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": "ferrum%2F..%2Fauthz"}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "deny_status": 200}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "fail_closed_status": 200}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "headers": {"Invalid Header": "value"}}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "headers": {"Content-Type": "text/plain"}}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "fail_open": true, "fail_closed": false}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "max_response_bytes": 0}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "max_body_bytes": 0}),
+        json!({"opa_host": "http://127.0.0.1:8181", "policy_path": POLICY_PATH, "redact_query_keys": [""]}),
     ];
 
     for config in invalid_configs {
@@ -126,7 +126,7 @@ fn opa_validates_config() {
     assert!(
         Opa::new(
             &json!({
-                "opa_host": "http://localhost:8181",
+                "opa_host": "http://127.0.0.1:8181",
                 "policy_path": POLICY_PATH,
                 "fail_closed": false
             }),
@@ -147,7 +147,7 @@ fn opa_validates_config() {
 fn opa_plugin_contract() {
     let plugin = Opa::new(
         &json!({
-            "opa_host": "http://localhost:8181",
+            "opa_host": "http://127.0.0.1:8181",
             "policy_path": POLICY_PATH,
         }),
         default_client(),
@@ -168,7 +168,7 @@ fn opa_plugin_contract() {
 
     let body_plugin = Opa::new(
         &json!({
-            "opa_host": "http://localhost:8181",
+            "opa_host": "http://127.0.0.1:8181",
             "policy_path": POLICY_PATH,
             "include_body": true,
         }),
@@ -184,7 +184,7 @@ fn opa_plugin_contract() {
 
     let bounded_body_plugin = Opa::new(
         &json!({
-            "opa_host": "http://localhost:8181",
+            "opa_host": "http://127.0.0.1:8181",
             "policy_path": POLICY_PATH,
             "include_body": true,
             "max_body_bytes": 4096,
@@ -270,7 +270,7 @@ async fn opa_allows_native_grpc_request_shape_when_policy_allows() {
 #[test]
 fn opa_accepts_and_clamps_timeout_above_runtime_cap() {
     let config = json!({
-        "opa_host": "http://localhost:8181",
+        "opa_host": "http://127.0.0.1:8181",
         "policy_path": POLICY_PATH,
         "timeout_ms": 45000,
     });
@@ -290,7 +290,7 @@ fn opa_rejects_unknown_security_sensitive_config_keys() {
         "redact_query_key",
         "query_ambiguity_polcy",
     ] {
-        let mut config = base_config("http://localhost:8181");
+        let mut config = base_config("http://127.0.0.1:8181");
         config
             .as_object_mut()
             .expect("base config is an object")
@@ -499,7 +499,7 @@ async fn opa_delegate_mode_still_redacts_query_credentials() {
 
 #[test]
 fn opa_rejects_unknown_query_ambiguity_policy() {
-    let mut config = base_config("http://localhost:8181");
+    let mut config = base_config("http://127.0.0.1:8181");
     config
         .as_object_mut()
         .expect("base config is an object")
@@ -1479,7 +1479,7 @@ async fn opa_decision_call_carries_the_proxy_hop_count() {
 fn opa_headers_cannot_name_the_proxy_hop_count() {
     for name in ["X-Ferrum-Hops", "x_ferrum_hops", "X_FERRUM_HOPS"] {
         let config = json!({
-            "opa_host": "http://localhost:8181",
+            "opa_host": "http://127.0.0.1:8181",
             "policy_path": POLICY_PATH,
             "headers": {name: "0"},
         });
@@ -1532,7 +1532,7 @@ fn opa_policy_path_rejects_values_url_normalization_would_rewrite() {
     ];
     for policy_path in traversal_shaped {
         let config = json!({
-            "opa_host": "http://opa.example",
+            "opa_host": "https://opa.example",
             "policy_path": policy_path,
         });
         let error = match Opa::new(&config, default_client()) {
@@ -1559,7 +1559,7 @@ fn opa_policy_path_rejects_values_url_normalization_would_rewrite() {
 
     for policy_path in ["ferrum/authz/allow", "ferrum/authz/allów", "a..b/c./.d"] {
         let config = json!({
-            "opa_host": "http://opa.example",
+            "opa_host": "https://opa.example",
             "policy_path": policy_path,
         });
         assert!(

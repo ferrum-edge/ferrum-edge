@@ -28,6 +28,23 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Cleartext OPA, serverless and tracing endpoints need an opt-in (issue #6617)
+
+`opa` (`opa_host`), `serverless_function` (`function_url`, `aws_endpoint_url`),
+`otel_tracing` (`endpoint`) and `workload_metrics` (tracing-provider URLs) now
+refuse an `http://` endpoint at load time unless its host is a loopback IP
+literal written as `127.d.d.d` or `[::1]`. Before upgrading, for each such
+plugin either:
+
+- switch the endpoint to `https://`,
+- point a co-located sidecar at `127.0.0.1` instead of `localhost`, or
+- set `allow_plaintext: true` on the plugin when cleartext to that host is
+  intended (for example an in-cluster OPA or collector service).
+
+Mesh mode needs no action: injection sets `allow_plaintext: true` on the
+`workload_metrics` plugin for translated providers that use `http://`. A
+`workload_metrics` instance you configure directly needs the flag yourself.
+
 ### Cleartext AI embedding endpoints need an opt-in (issue #6617)
 
 `ai_semantic_cache` and `ai_semantic_firewall` send an API key with every
