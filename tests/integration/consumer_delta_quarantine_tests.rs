@@ -239,3 +239,46 @@ async fn sqlite_consumer_delta_quarantine_contract() {
     })
     .await;
 }
+
+/// A stored API key shared by two consumers (a pre-existing row or direct DB
+/// edit that bypassed `consumer_credential_index`) makes the full load refuse
+/// the snapshot instead of resolving the key last-wins (issue #6572).
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_full_load_refuses_shared_keyauth_key() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("consumer-keyauth-collision.db");
+    let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let ns = "keyauth-collision";
+
+    store
+        .create_consumer(&consumer(ns, "c-a", keyauth("shared-key-0123456789")))
+        .await
+        .unwrap();
+    store
+        .create_consumer(&consumer(ns, "c-b", keyauth("key-b-0123456789")))
+        .await
+        .unwrap();
+    store.load_full_config(ns).await.expect("unique keys load");
+
+    let result = sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind(keyauth("shared-key-0123456789").to_string())
+        .bind(ns)
+        .bind("c-b")
+        .execute(&store.pool())
+        .await
+        .expect("out-of-band consumer update");
+    assert_eq!(result.rows_affected(), 1);
+
+    let error = store
+        .load_full_config(ns)
+        .await
+        .expect_err("a shared API key must reject the snapshot");
+    let message = format!("{error:#}");
+    assert!(
+        !message.contains("shared-key-0123456789"),
+        "the rejection must not leak the key: {message}"
+    );
+}
