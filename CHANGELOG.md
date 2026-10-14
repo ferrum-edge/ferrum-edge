@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `openapi_validator` `bypass.header_present` requires a
+  shared secret.** (issue n/a, PR #6634) Each entry now maps a header name to a secret of
+  16–4096 visible ASCII characters, and a request skips validation only
+  when that header carries exactly the secret, compared in constant time.
+  Presence-only entries (`null`) and short, padded, non-ASCII or control
+  values are rejected at construction, because a client can send any header
+  name. The bypass header names are redacted from diagnostics and policy
+  calls. Inject the header from a trusted hop or gateway plugin.
 - **Reproducible release builds and no persisted checkout tokens** (issues
   #6574, #6581). The production `Dockerfile` builds its eBPF ELF with a dated
   nightly (`EBPF_NIGHTLY_TOOLCHAIN`, currently `nightly-2026-09-30`) instead
