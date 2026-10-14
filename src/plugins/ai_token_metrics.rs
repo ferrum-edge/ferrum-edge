@@ -270,27 +270,89 @@ impl AiTokenMetrics {
                     .map(String::from);
             }
 
-            let event_provider = fixed_provider
-                .or_else(|| detect_sse_provider(payload))
-                .or(detected_provider);
+            // An Anthropic Messages event is authoritative by its own shape
+            // (as in the shared streaming accumulator), even under a
+            // configured provider such as `bedrock` that wraps it; otherwise
+            // its usage, cache categories included, would be parsed as the
+            // wrapper's and lost.
+            let anthropic_event = event_type.is_some_and(|kind| {
+                kind.starts_with("message_") || kind.starts_with("content_block_")
+            });
+            let event_provider = if anthropic_event {
+                Some(AiProvider::Anthropic)
+            } else {
+                fixed_provider
+                    .or_else(|| detect_sse_provider(payload))
+                    .or(detected_provider)
+            };
             let Some(provider) = event_provider else {
                 continue;
             };
             detected_provider.get_or_insert(provider);
 
-            let mut extracted = extract_response_usage(payload, provider);
-            if extracted.prompt_tokens.is_none()
-                && extracted.completion_tokens.is_none()
-                && extracted.total_tokens.is_none()
+            // `message_start` carries only the authoritative input side; its
+            // `output_tokens` is a placeholder the terminal delta supersedes.
+            // The event's own usage carrier first (with the `message_start`
+            // output placeholder dropped), then any co-located Bedrock
+            // invocation metrics, each merged independently exactly as the
+            // shared streaming accumulator does.
+            let native = if event_type == Some("message_start") && provider == AiProvider::Anthropic
             {
-                continue;
+                let carrier =
+                    crate::plugins::utils::ai_providers::anthropic_message_start_usage(payload);
+                extract_response_usage(&carrier, provider)
+            } else {
+                extract_response_usage(payload, provider)
+            };
+            let mut snapshots = vec![native];
+            if provider != AiProvider::Bedrock
+                && let Some(mut metrics) =
+                    crate::plugins::utils::ai_providers::extract_bedrock_invocation_metrics(payload)
+            {
+                // Bedrock's terminal metrics fold in the same layout as the
+                // Anthropic events they follow; keep the stream's provider so
+                // `merge_cumulative` merges them instead of refusing the switch.
+                metrics.provider = Some(provider);
+                snapshots.push(metrics);
             }
-            if extracted.model.is_none() {
-                extracted.model = model.clone();
+            // A standalone invocation-metrics event detects as Bedrock, but it
+            // continues the stream already identified; keep that identity so
+            // `merge_cumulative` merges it (same category layout).
+            if fixed_provider.is_none()
+                && payload.get("amazon-bedrock-invocationMetrics").is_some()
+                && let Some(established) = final_usage.as_ref().and_then(|usage| usage.provider)
+            {
+                for snapshot in &mut snapshots {
+                    snapshot.provider = Some(established);
+                }
             }
-            match &mut final_usage {
-                Some(current) => current.merge_cumulative(extracted),
-                None => final_usage = Some(extracted),
+            // The wire parser follows the event's shape, but the exported
+            // identity follows an explicit configuration: wrapped events under
+            // `provider: bedrock` stay labelled Bedrock.
+            if fixed_provider == Some(AiProvider::Bedrock) {
+                for snapshot in &mut snapshots {
+                    snapshot.provider = Some(AiProvider::Bedrock);
+                }
+            }
+            for mut extracted in snapshots {
+                // A category-bearing snapshot is merged even when it folds to no
+                // counter: a malformed (or cache-only) update must still reach
+                // `merge_cumulative` to invalidate (or extend) the running state.
+                if extracted.prompt_tokens.is_none()
+                    && extracted.completion_tokens.is_none()
+                    && extracted.total_tokens.is_none()
+                    && extracted.categories
+                        == crate::plugins::utils::ai_providers::UsageCategories::default()
+                {
+                    continue;
+                }
+                if extracted.model.is_none() {
+                    extracted.model = model.clone();
+                }
+                match &mut final_usage {
+                    Some(current) => current.merge_cumulative(extracted),
+                    None => final_usage = Some(extracted),
+                }
             }
         }
 
