@@ -221,24 +221,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`request_deduplication` no longer downloads Redis records unbounded**
-  (issue #6622). It read its operation record with a plain `GET`, and its
-  ownership compare-and-delete and compare-and-set compared against a full
-  `GET` of the stored value, so one oversized value under a consumed key
-  forced an allocation of that size. Records are now read with
-  `EXISTS`/`STRLEN`/`GETRANGE`, capped at `max_entry_size_bytes` plus a 4 KiB
-  envelope. An over-cap or empty record is a fail-closed 409 conflict. The
-  ownership compares transfer at most the owner record's length plus one
-  byte. **Redis ACLs for `request_deduplication` must now allow `EXISTS`,
-  `STRLEN`, and `GETRANGE`.** The unbounded `get_bytes` helper is now
-  test-only, and a source guard keeps production code from calling it.
-  Counter reads in the rate-limit transactions are tracked separately in
-  #6653. The Redis compare/claim primitives also stop treating malformed
-  replies as success. `WATCH` and `MULTI` must answer exactly `OK` before a
-  fenced write is sent. A fenced publication's `SET` must answer `OK`. The
-  shared `set_bytes_nx_with_expire` (`request_deduplication` acquisition,
-  `soap_ws_security` nonce claims) accepts only `OK` or nil. Any other reply
-  fails closed and marks the client unavailable.
 - **`ws_logging` charges one back-off per failed attempt and none after the
   last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
   failure, including after the final attempt, and `send_batch` added
