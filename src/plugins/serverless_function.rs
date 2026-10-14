@@ -1587,11 +1587,11 @@ fn screen_configured_plaintext(config: &Value, field: &str, url: &str) -> Result
     Ok(())
 }
 
-/// `allow_plaintext`: omitted or `null` means `false`; any other non-boolean is
-/// refused.
+/// `allow_plaintext`: omitted means `false`; any non-boolean is refused (an
+/// explicit `null` never reaches here — the constructor refuses nulls first).
 fn allow_plaintext_config(config: &Value) -> Result<bool, String> {
     match config.get("allow_plaintext") {
-        None | Some(Value::Null) => Ok(false),
+        None => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
         Some(_) => Err("serverless_function: `allow_plaintext` must be a boolean".to_string()),
     }

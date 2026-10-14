@@ -761,6 +761,34 @@ fn test_cleartext_endpoints_need_the_opt_in_off_loopback() {
     );
 }
 
+/// `allow_plaintext` is boolean-only: schema and runtime both refuse null.
+#[test]
+#[parallel(serverless_env)]
+fn test_allow_plaintext_null_is_refused_by_schema_and_runtime() {
+    let config = json!({
+        "provider": "azure_functions",
+        "function_url": "https://functions.example/run",
+        "allow_plaintext": null
+    });
+    expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(ferrum_edge::plugins::validate_plugin_config("serverless_function", &config).is_err());
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ServerlessFunctionConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("schema compiles");
+    assert!(!validator.is_valid(&config));
+    let mut ok = config.clone();
+    ok["allow_plaintext"] = json!(false);
+    assert!(validator.is_valid(&ok));
+    assert!(ServerlessFunction::new(&ok, default_client()).is_ok());
+}
+
 #[test]
 #[parallel(serverless_env)]
 fn test_zero_timeout_rejects() {

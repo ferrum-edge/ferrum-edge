@@ -33329,9 +33329,9 @@ components:
           default: 502
           description: "Final HTTP error status when rejecting an invocation or pre_proxy non-2xx response. Must be in range 400-599."
         allow_plaintext:
-          type: [boolean, "null"]
+          type: boolean
           default: false
-          description: "Admit an http:// function_url or aws_endpoint_url whose host is not a loopback IP literal written as a dotted-quad 127.d.d.d or [::1]. The invocation payload and the provider credential (function key, bearer token, or SigV4 signature) then cross the network in clear. The AWS_LAMBDA_ENDPOINT_URL environment fallback is operator-controlled and is not screened. Omit or null means false."
+          description: "Admit an http:// function_url or aws_endpoint_url whose host is not a loopback IP literal written as a dotted-quad 127.d.d.d or [::1]. The invocation payload and the provider credential (function key, bearer token, or SigV4 signature) then cross the network in clear. The AWS_LAMBDA_ENDPOINT_URL environment fallback is operator-controlled and is not screened. Omit for false; an explicit null is rejected like every other optional field."
       allOf:
         - if:
             required: [provider]
