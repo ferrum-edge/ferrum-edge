@@ -9,14 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `jwks_auth` bounds per-token verification work.** (issue n/a, PR #6644) A token
-  is now verified only against providers whose `issuer` equals its
-  unverified `iss`, then providers without an `issuer`, each at most once.
-  Providers pinning a different issuer are no longer tried, since they
-  would reject the token anyway. `providers` is capped at 64 entries, and
-  for every issuer the providers sharing it plus the providers without an
-  `issuer` must total at most 8, so one token costs at most 8 signature
-  verifications.
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
