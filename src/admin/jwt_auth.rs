@@ -582,6 +582,19 @@ impl JwtManager {
         // Decode and validate
         let token_data = decode::<AdminClaims>(token, &key, &validation)?;
 
+        // jsonwebtoken treats a malformed `aud` (null, number, object, mixed
+        // array) as absent and accepts it; re-check the shape so the strict
+        // audience contract above holds for every JSON form. Applies to both
+        // the primary and the viewer key tier.
+        if !crate::plugins::utils::jwt_verifier::audience_claim_is_acceptable(
+            &token_data.claims.additional,
+            self.config.audience.is_some(),
+        ) {
+            return Err(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidAudience,
+            ));
+        }
+
         // Enforce max TTL.
         //
         // # Contract
@@ -698,8 +711,35 @@ impl JwtManager {
         let token =
             Self::extract_token_from_header(auth_header).ok_or(JwtError::InvalidHeaderFormat)?;
 
-        self.verify_token(&token)
-            .map_err(|e: JwtEncodeError| JwtError::VerificationFailed(e.to_string()))
+        self.verify_token(&token).map_err(|e: JwtEncodeError| {
+            JwtError::VerificationFailed(verification_failure_category(&e).to_string())
+        })
+    }
+}
+
+/// Bounded, payload-free name for a token verification failure.
+///
+/// `jsonwebtoken`'s `Display` embeds serde/base64/UTF-8 error text, which can
+/// quote attacker-chosen header or claim values (for example an unknown
+/// `alg`), so only the error kind's name ever leaves this module.
+fn verification_failure_category(error: &JwtEncodeError) -> &'static str {
+    use jsonwebtoken::errors::ErrorKind;
+    match error.kind() {
+        ErrorKind::InvalidToken => "InvalidToken",
+        ErrorKind::InvalidSignature => "InvalidSignature",
+        ErrorKind::ExpiredSignature => "ExpiredSignature",
+        ErrorKind::ImmatureSignature => "ImmatureSignature",
+        ErrorKind::InvalidIssuer => "InvalidIssuer",
+        ErrorKind::InvalidAudience => "InvalidAudience",
+        ErrorKind::InvalidSubject => "InvalidSubject",
+        ErrorKind::InvalidAlgorithm => "InvalidAlgorithm",
+        ErrorKind::MissingAlgorithm => "MissingAlgorithm",
+        ErrorKind::MissingRequiredClaim(_) => "MissingRequiredClaim",
+        ErrorKind::InvalidClaimFormat(_) => "InvalidClaimFormat",
+        ErrorKind::Json(_) => "Json",
+        ErrorKind::Utf8(_) => "Utf8",
+        ErrorKind::Base64(_) => "Base64",
+        _ => "Other",
     }
 }
 

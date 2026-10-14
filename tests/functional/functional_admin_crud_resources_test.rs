@@ -816,7 +816,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
         .await
         .expect("spawn file backend b");
 
-    let initial_config = file_mode_resource_config(backend_a.port, "old-file-key");
+    let initial_config = file_mode_resource_config(backend_a.port, "old-file-key-0123456789");
     let gateway = TestGateway::builder()
         .mode_file(initial_config)
         .log_level("warn")
@@ -864,7 +864,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     wait_for_server_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("old-file-key"),
+        Some("old-file-key-0123456789"),
         "file-crud-a",
     )
     .await;
@@ -875,7 +875,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
         .expect("file-mode harness exposes config path");
     std::fs::write(
         config_path,
-        file_mode_resource_config(backend_b.port, "new-file-key"),
+        file_mode_resource_config(backend_b.port, "new-file-key-0123456789"),
     )
     .expect("rewrite file-mode config");
     send_sighup(&gateway);
@@ -883,14 +883,14 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     wait_for_status_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("old-file-key"),
+        Some("old-file-key-0123456789"),
         StatusCode::UNAUTHORIZED,
     )
     .await;
     wait_for_server_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("new-file-key"),
+        Some("new-file-key-0123456789"),
         "file-crud-b",
     )
     .await;
@@ -901,7 +901,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     wait_for_status_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("new-file-key"),
+        Some("new-file-key-0123456789"),
         StatusCode::NOT_FOUND,
     )
     .await;

@@ -417,15 +417,16 @@ async fn header_conditions_are_resolved_from_the_upgrade_request() {
 async fn header_present_exemption_is_bound_for_the_whole_session() {
     let mut config = enforcing_request_rule();
     config["global_exemptions"] = json!({
-        "header_present": { "x-skip-waf": null }
+        "header_present": { "x-skip-waf": "trusted-hop-shared-secret" }
     });
     let plugins = vec![waf(config)];
     let original = Message::Text(PROHIBITED.into());
 
     let mut exempt_ctx = upgrade_ctx("/ws");
-    exempt_ctx
-        .headers
-        .insert("x-skip-waf".to_string(), "1".to_string());
+    exempt_ctx.headers.insert(
+        "x-skip-waf".to_string(),
+        "trusted-hop-shared-secret".to_string(),
+    );
     let exempt = relay_to_backend(&plugins, &exempt_ctx, original.clone()).await;
     assert_eq!(
         exempt, original,

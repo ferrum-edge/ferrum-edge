@@ -113,6 +113,99 @@ fn test_verify_request_maps_header_failures_and_accepts_lowercase_bearer() {
     ));
 }
 
+/// Verification failures carry only a bounded category, never jsonwebtoken's
+/// serde text, which can quote attacker-chosen header or claim values.
+#[test]
+fn test_verify_request_failure_never_echoes_token_content() {
+    use base64::Engine;
+    let manager = JwtManager::new(test_jwt_config());
+    let b64 = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+    };
+    let sentinel = "sentinel-credential-material-7f3a";
+    let tokens = [
+        format!(
+            "{}.{}.c2ln",
+            b64(json!({"alg": sentinel, "typ": "JWT"})),
+            b64(json!({"sub": "x"}))
+        ),
+        format!(
+            "{}.{}.c2ln",
+            b64(json!({"alg": "HS256", "typ": "JWT"})),
+            b64(json!({"exp": sentinel}))
+        ),
+        format!("Bearer{sentinel}.{sentinel}.{sentinel}"),
+    ];
+    for token in tokens {
+        let Err(JwtError::VerificationFailed(message)) =
+            manager.verify_request(Some(&format!("Bearer {token}")))
+        else {
+            panic!("malformed token must fail verification");
+        };
+        assert!(
+            !message.contains(sentinel),
+            "verification failure leaked token content: {message}"
+        );
+        assert!(
+            message.chars().all(|c| c.is_ascii_alphanumeric()),
+            "verification failure must be a bare category: {message}"
+        );
+    }
+}
+
+/// A correctly signed admin token whose `aud` is malformed (null, number,
+/// object, mixed array) or present while no audience is configured is
+/// rejected; jsonwebtoken alone would accept the malformed forms.
+#[test]
+fn test_admin_token_with_malformed_or_unexpected_audience_is_rejected() {
+    let manager = JwtManager::new(test_jwt_config());
+    let now = Utc::now();
+    for aud in [
+        json!(null),
+        json!(123),
+        json!({"service": "other"}),
+        json!(["other", 1]),
+        json!("other-service"),
+    ] {
+        let token = encode_json_claims(
+            json!({
+                "iss": "test-issuer",
+                "sub": "admin-user",
+                "iat": now.timestamp(),
+                "nbf": now.timestamp(),
+                "exp": (now + Duration::seconds(600)).timestamp(),
+                "jti": uuid::Uuid::new_v4().to_string(),
+                "role": "admin",
+                "aud": aud
+            }),
+            "test-secret",
+            Algorithm::HS256,
+        );
+        assert!(
+            manager.verify_token(&token).is_err(),
+            "aud {aud} must be rejected"
+        );
+    }
+
+    let token = encode_json_claims(
+        json!({
+            "iss": "test-issuer",
+            "sub": "admin-user",
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + Duration::seconds(600)).timestamp(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "role": "admin"
+        }),
+        "test-secret",
+        Algorithm::HS256,
+    );
+    assert!(
+        manager.verify_token(&token).is_ok(),
+        "absent aud still verifies"
+    );
+}
+
 #[test]
 fn test_jwt_required_claims_are_enforced() {
     let manager = JwtManager::new(test_jwt_config());

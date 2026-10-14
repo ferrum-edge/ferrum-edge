@@ -13,7 +13,10 @@ use super::auth_attempt::AuthenticationAttempt;
 use super::replay_partition::PartitionHasher;
 
 /// What an auth plugin extracted from the request.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand so a stray `{:?}` can never print a bearer
+/// token, API key, password, or certificate bytes.
+#[derive(Clone)]
 pub enum ExtractedCredential {
     BearerToken(String),
     ApiKey(String),
@@ -35,6 +38,38 @@ pub enum ExtractedCredential {
     InvalidFormat(String),
     /// No credential present — multi-auth can continue with the next plugin.
     Missing,
+}
+
+impl fmt::Debug for ExtractedCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BearerToken(_) => formatter
+                .debug_tuple("BearerToken")
+                .field(&"[REDACTED]")
+                .finish(),
+            Self::ApiKey(_) => formatter
+                .debug_tuple("ApiKey")
+                .field(&"[REDACTED]")
+                .finish(),
+            Self::BasicAuth { username, .. } => formatter
+                .debug_struct("BasicAuth")
+                .field("username", username)
+                .field("password", &"[REDACTED]")
+                .finish(),
+            Self::HmacAuth(credential) => {
+                formatter.debug_tuple("HmacAuth").field(credential).finish()
+            }
+            Self::MtlsCert { chain_der, .. } => formatter
+                .debug_struct("MtlsCert")
+                .field("der_bytes", &"[REDACTED]")
+                .field("chain_len", &chain_der.as_ref().map(|chain| chain.len()))
+                .finish_non_exhaustive(),
+            Self::InvalidFormat(body) => {
+                formatter.debug_tuple("InvalidFormat").field(body).finish()
+            }
+            Self::Missing => formatter.write_str("Missing"),
+        }
+    }
 }
 
 /// HMAC credential fields extracted from a request, used to reconstruct the
@@ -888,6 +923,29 @@ mod tests {
     struct FakeMechanism {
         extracted: ExtractedCredential,
         outcome: VerifyOutcome,
+    }
+
+    #[test]
+    fn extracted_credential_debug_never_prints_secret_material() {
+        let cases = [
+            ExtractedCredential::BearerToken("bearer-secret-value".to_string()),
+            ExtractedCredential::ApiKey("api-key-secret-value".to_string()),
+            ExtractedCredential::BasicAuth {
+                username: "alice".to_string(),
+                password: "password-secret-value".to_string(),
+            },
+        ];
+        for credential in cases {
+            let rendered = format!("{credential:?}");
+            assert!(!rendered.contains("secret-value"), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        }
+        let basic = ExtractedCredential::BasicAuth {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        assert!(format!("{basic:?}").contains("alice"));
+        assert_eq!(format!("{:?}", ExtractedCredential::Missing), "Missing");
     }
 
     #[async_trait]

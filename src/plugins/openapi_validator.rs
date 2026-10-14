@@ -55,6 +55,12 @@ use super::utils::xml_bounds::xml_nesting_depth_within_limit;
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Hard admission ceiling for `max_body_bytes`. The value is both the raw-body
+/// ceiling and the per-layer decoded ceiling while undoing `Content-Encoding`
+/// (with amplification checks off), so an arbitrary 64-bit value would let a
+/// small compressed body inflate without a meaningful bound.
+const MAX_BODY_BYTES_CEILING: usize = 64 * 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
 /// Upper bound on stacked `Content-Encoding` layers decoded for validation.
 /// Matches the shared content-coding decoder used elsewhere in the gateway.
@@ -670,6 +676,11 @@ impl OpenapiValidator {
             return Err(
                 "openapi_validator: `max_body_bytes` must be greater than zero".to_string(),
             );
+        }
+        if max_body_bytes > MAX_BODY_BYTES_CEILING {
+            return Err(format!(
+                "openapi_validator: `max_body_bytes` must be at most {MAX_BODY_BYTES_CEILING}"
+            ));
         }
         let request_content_types = normalize_configured_media_types(
             optional_string_vec(object, "request_content_types")?

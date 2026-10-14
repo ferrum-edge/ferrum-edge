@@ -1642,6 +1642,8 @@ async fn test_charges_requires_admin_jwt() {
         .unwrap();
     assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    let invalid_body: Value = invalid.json().await.unwrap();
+
     let expired_token = generate_expired_test_token(&tc);
     let expired = client
         .get(format!("{}/charges", base_url))
@@ -1650,6 +1652,46 @@ async fn test_charges_requires_admin_jwt() {
         .await
         .unwrap();
     assert_eq!(expired.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let expired_body: Value = expired.json().await.unwrap();
+
+    let wrong_secret = generate_test_token(&TestConfig {
+        jwt_secret: "a-different-secret-key-for-admin-api".to_string(),
+        ..TestConfig::default()
+    });
+    let bad_signature = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", wrong_secret))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_signature.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let bad_signature_body: Value = bad_signature.json().await.unwrap();
+
+    let wrong_issuer = generate_test_token(&TestConfig {
+        jwt_issuer: "some-other-issuer".to_string(),
+        ..TestConfig::default()
+    });
+    let bad_issuer = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", wrong_issuer))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_issuer.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let bad_issuer_body: Value = bad_issuer.json().await.unwrap();
+
+    // Every verification failure returns one static body, so an
+    // unauthenticated caller cannot tell expiry from a bad signature,
+    // issuer, or malformed token.
+    let expected = json!({"error": "Token verification failed"});
+    for body in [
+        &invalid_body,
+        &expired_body,
+        &bad_signature_body,
+        &bad_issuer_body,
+    ] {
+        assert_eq!(body, &expected);
+    }
 }
 
 #[tokio::test]
@@ -7577,7 +7619,7 @@ async fn test_consumer_delete_referenced_by_access_control_returns_409() {
     let consumer = json!({
         "id": "acl-cs",
         "username": "acluser",
-        "credentials": {"keyauth": [{"key": "acl-key-1"}]}
+        "credentials": {"keyauth": [{"key": "acl-key-1-0123456789"}]}
     });
     let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
     assert_eq!(status, 201, "Create consumer failed: {:?}", body);

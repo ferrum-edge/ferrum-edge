@@ -6143,9 +6143,11 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         cors.get("allowCredentials"),
         None | Some(Value::Null) | Some(Value::Bool(_))
     );
-    // Exact `*`, opaque exact `null`, AND effectively universal prefix/regex
-    // matchers share one
-    // breadth classifier with plugin construction (issue #4269). Credentialed
+    // Exact `*`, opaque exact `null`, effectively universal prefixes and
+    // probe-universal regexes are screened here (issue #4269). A credentialed
+    // regex that only fails the host-pinning proof is projected on purpose:
+    // fail-closed `cors` construction rejects the update, so the route never
+    // loses CORS ownership. Credentialed
     // exact `*` stays deferred because projecting it would drop credentials;
     // credentialed opaque/universal matcher is refused at construction, so it
     // must be deferred here rather than failing plugin construction later.

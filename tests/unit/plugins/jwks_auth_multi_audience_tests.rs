@@ -319,3 +319,44 @@ async fn unconfigured_audiences_keep_jsonwebtoken_aud_default() {
         .await;
     assert_reject(with_result, Some(401));
 }
+
+/// With no audience configured, malformed `aud` values that jsonwebtoken
+/// treats as absent or unparsed (null, number, object, mixed array) are still
+/// rejected at the verified-claims boundary in `jwt_verifier`.
+#[tokio::test]
+async fn unconfigured_audiences_reject_malformed_aud_shapes() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "jwks": inline_jwks()
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    for aud in [
+        json!(null),
+        json!(123),
+        json!({"service": "orders-api"}),
+        json!(["orders-api", 1]),
+    ] {
+        let token = create_rs256_token(
+            &json!({
+                "iss": "https://issuer.example.com",
+                "sub": "aud-user",
+                "aud": aud
+            }),
+            private_key_pem,
+        );
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        let result = plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await;
+        assert_reject(result, Some(401));
+    }
+}
