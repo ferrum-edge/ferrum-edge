@@ -221,15 +221,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The streamed-SSE reassembler bounds its OpenAI-style index families**
-  (issue #6624). Chat choices, legacy Completions choices, `(choice, tool)`
-  tool calls, and Responses-API output text and arguments were keyed by
-  unbounded provider-supplied indexes. Each family now holds at most 128 live
-  accumulators, and further keys fold into one overflow accumulator whose
-  text is still inspected. The stream is marked uninspectable so enforcing
-  callers fail closed, the same rule the Anthropic and Gemini paths already
-  apply. The streamed-inspect `texts()` snapshot no longer deep-clones the
-  reassembler on every call.
 - **`ws_logging` charges one back-off per failed attempt and none after the
   last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
   failure, including after the final attempt, and `send_batch` added
