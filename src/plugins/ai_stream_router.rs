@@ -6576,7 +6576,8 @@ fn gemini_optional_usage_count(
     usage: &serde_json::Map<String, Value>,
     field: &'static str,
 ) -> Result<Option<u64>, &'static str> {
-    let Some(value) = usage.get(field) else {
+    // ProtoJSON defines `null` as unset, the same as an omitted field.
+    let Some(value) = usage.get(field).filter(|value| !value.is_null()) else {
         return Ok(None);
     };
     match value.as_u64() {

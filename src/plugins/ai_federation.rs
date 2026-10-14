@@ -4607,7 +4607,11 @@ fn native_usage_pair(
         .as_object()
         .ok_or_else(|| format!("ai_federation: {provider} usage must be an object"))?;
     for key in [input_key, output_key] {
-        if usage.get(key).is_some_and(|value| !value.is_u64()) {
+        // ProtoJSON (and Anthropic's nullable counters) define `null` as unset.
+        if usage
+            .get(key)
+            .is_some_and(|value| !value.is_null() && !value.is_u64())
+        {
             return Err(format!(
                 "ai_federation: {provider} usage.{key} must be a non-negative integer"
             ));
@@ -5088,7 +5092,7 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
     if resp
         .get("usageMetadata")
         .and_then(|usage| usage.get("totalTokenCount"))
-        .is_some_and(|value| !value.is_u64())
+        .is_some_and(|value| !value.is_null() && !value.is_u64())
     {
         return Err(
             "ai_federation: Gemini usageMetadata.totalTokenCount must be an integer".to_string(),
@@ -5230,7 +5234,7 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
     if resp
         .get("usage")
         .and_then(|usage| usage.get("totalTokens"))
-        .is_some_and(|value| !value.is_u64())
+        .is_some_and(|value| !value.is_null() && !value.is_u64())
     {
         return Err("ai_federation: Bedrock usage.totalTokens must be an integer".to_string());
     }

@@ -10466,3 +10466,13 @@ async fn test_anthropic_normalizer_ignores_the_start_output_placeholder() {
     assert!(out.contains("\"completion_tokens\":null"), "{out}");
     assert!(out.contains("\"total_tokens\":null"), "{out}");
 }
+
+#[tokio::test]
+async fn test_gemini_normalizer_treats_null_counters_as_absent() {
+    let sse = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":null,\"thoughtsTokenCount\":40,\"toolUsePromptTokenCount\":null,\"totalTokenCount\":50}}\n\n";
+    let out = run_gemini_normalizer(4096, sse, "text/event-stream").await;
+    assert!(!out.contains("upstream_error"), "{out}");
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":40"), "{out}");
+    assert!(out.contains("\"total_tokens\":50"), "{out}");
+}

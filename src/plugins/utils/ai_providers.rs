@@ -608,15 +608,25 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     // It may also carry `cacheReadInputTokenCount` / `cacheWriteInputTokenCount`
     // beside an uncached `inputTokenCount`, the same layout as the Anthropic
     // body the stream wraps, so it folds (and merges) as that layout.
-    if let Some(metrics) = json.get("amazon-bedrock-invocationMetrics")
-        && titan_prompt.is_none()
-        && titan_completion.is_none()
-    {
+    // A streaming Titan chunk can carry `inputTextTokenCount` beside these
+    // metrics (and no `results`), so each component falls back to the Titan
+    // counter only where the metrics did not report it.
+    if let Some(metrics) = json.get("amazon-bedrock-invocationMetrics") {
         let mut invoke = AiTokenUsage {
             provider: Some(AiProvider::Bedrock),
             ..Default::default()
         };
         invoke.apply_categories(UsageCategories::bedrock_invocation_metrics(Some(metrics)));
+        let (prompt_invalid, completion_invalid) = invoke.categories.invalid_sides();
+        if invoke.prompt_tokens.is_none() && !prompt_invalid {
+            invoke.prompt_tokens = titan_prompt;
+        }
+        if invoke.completion_tokens.is_none() && !completion_invalid {
+            invoke.completion_tokens = titan_completion;
+        }
+        if invoke.total_tokens.is_none() && !prompt_invalid && !completion_invalid {
+            invoke.total_tokens = sum_pair(invoke.prompt_tokens, invoke.completion_tokens);
+        }
         return invoke;
     }
     let prompt = titan_prompt;
@@ -864,7 +874,7 @@ impl UsageCategories {
     /// longer be trusted to rebuild a complete total, so the usage is
     /// unmetered as a whole rather than resynthesized from them.
     pub(crate) fn invalid_sides(&self) -> (bool, bool) {
-        if self.reported_total == Counter::Invalid || self.total_overflows() {
+        if self.reported_total == Counter::Invalid || self.reported_floor().is_none() {
             return (true, true);
         }
         (
@@ -874,7 +884,9 @@ impl UsageCategories {
     }
 
     /// Checked sum of every counter this usage reported, base or category,
-    /// whether or not its side folds to a complete value.
+    /// whether or not its side folds to a complete value. `None` (overflow)
+    /// means no complete total can be stated and a previously recorded one is
+    /// stale, so the whole usage is unmetered.
     fn reported_floor(&self) -> Option<u64> {
         let counters = [
             self.prompt_base,
@@ -891,19 +903,6 @@ impl UsageCategories {
             })
     }
 
-    /// Both sides fit individually but their sum does not: no complete total
-    /// can be stated, and a previously recorded one is stale.
-    fn total_overflows(&self) -> bool {
-        matches!(
-            (
-                self.side(self.prompt_base, &self.prompt_extras),
-                self.side(self.completion_base, &[self.completion_extra]),
-            ),
-            (Counter::Value(prompt), Counter::Value(completion))
-                if prompt.checked_add(completion).is_none()
-        )
-    }
-
     fn fold(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         let prompt = self.side(self.prompt_base, &self.prompt_extras);
         let completion = self.side(self.completion_base, &[self.completion_extra]);
@@ -913,7 +912,7 @@ impl UsageCategories {
         };
         // A malformed or overflowing side also invalidates the total: the
         // whole usage is then unmetered rather than partially counted.
-        if self.reported_total == Counter::Invalid || self.total_overflows() {
+        if self.reported_total == Counter::Invalid || self.reported_floor().is_none() {
             return (None, None, None);
         }
         if prompt == Counter::Invalid || completion == Counter::Invalid {

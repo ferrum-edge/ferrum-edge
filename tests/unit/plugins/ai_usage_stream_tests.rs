@@ -1308,3 +1308,94 @@ fn categories_without_their_base_still_floor_a_reported_total() {
         Some(1000)
     );
 }
+
+#[test]
+fn titan_stream_chunk_keeps_terminal_metrics_completion() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({
+            "outputText": "done",
+            "inputTextTokenCount": 21,
+            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 21, "outputTokenCount": 60}
+        }),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+
+    // A component the metrics omit falls back to the Titan counter.
+    let usage = extract_response_usage(
+        &json!({
+            "results": [{"tokenCount": 60}],
+            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 21}
+        }),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+}
+
+#[test]
+fn overflowing_category_floor_clears_a_stale_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let mut merged = extract_response_usage(
+        &json!({"usage": {"outputTokens": 5, "totalTokens": 5}}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(merged.total_tokens, Some(5));
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"usage": {"cacheReadInputTokens": u64::MAX}}),
+        AiProvider::Bedrock,
+    ));
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+
+    let usage_message = |usage: serde_json::Value| {
+        let payload = serde_json::to_vec(&json!({ "usage": usage })).unwrap();
+        event_stream_message(b"\x00\x00\x00\x00", &payload)
+    };
+    let mut stream = usage_message(json!({"outputTokens": 5, "totalTokens": 5}));
+    stream.extend_from_slice(&usage_message(json!({"cacheReadInputTokens": u64::MAX})));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
+}
+
+#[test]
+fn nullable_gemini_counters_are_absence() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": null,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 50
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (Some(10), Some(40), Some(50))
+    );
+}

@@ -9728,3 +9728,29 @@ fn test_normalized_bedrock_total_is_floored_by_categories_without_base() {
     .unwrap();
     assert_eq!((completion, total), (5, 1005));
 }
+
+#[test]
+fn test_normalized_gemini_nullable_counters_are_absence() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": null,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": null,
+            "totalTokenCount": 50
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .expect("null counters are unset, not malformed");
+    assert_eq!((prompt, completion, total), (10, 40, 50));
+}
