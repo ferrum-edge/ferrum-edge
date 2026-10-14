@@ -104,6 +104,13 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// `body_validator`'s omitted-field gRPC decompression default resolved
+    /// from a raw `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` value (clamped to the
+    /// hard ceiling).
+    pub fn inherited_grpc_max_decompressed_size_bytes_for_test(raw: Option<&str>) -> usize {
+        crate::plugins::body_validator::inherited_grpc_max_decompressed_size_bytes(raw)
+    }
+
     /// The plugin material registry as `(plugin, field path, class)`, where
     /// class is `tls`, `gateway_only` or `open_map`.
     pub fn scoped_plugin_registry_for_test() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -3620,6 +3627,14 @@ pub mod _test_support {
         )
     }
 
+    /// Providers `jwks_auth` would verify `token` against, in order.
+    pub fn jwks_auth_candidate_providers_for_test(
+        plugin: &crate::plugins::jwks_auth::JwksAuth,
+        token: &str,
+    ) -> Vec<usize> {
+        plugin.candidate_provider_indices_for_test(token)
+    }
+
     pub fn request_mirror_retained_request_body_bytes_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> u64 {
@@ -3884,6 +3899,13 @@ pub mod _test_support {
 
     pub fn request_deduplication_redis_record_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_record_payload_is_valid_for_test(data)
+    }
+
+    pub async fn request_deduplication_redis_record_state_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        key: &str,
+    ) -> &'static str {
+        plugin.redis_record_state_for_test(key).await
     }
 
     pub fn request_deduplication_completed_size_snapshot_for_test(

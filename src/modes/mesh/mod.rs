@@ -13858,6 +13858,14 @@ fn inject_mesh_global_plugins(
             // Keep provider config visible for introspection and propagation even
             // when span_reporting_disabled makes WorkloadMetrics skip exporters.
             workload_metrics_config["tracing_providers"] = serde_json::json!(tracing.providers);
+            // In-cluster collectors are routinely cleartext (`http://zipkin:9411`).
+            // Exporters refuse an `http://` endpoint off a loopback IP literal
+            // unless the config opts in, so mesh injection opts in explicitly —
+            // and only when a provider actually uses cleartext — keeping the
+            // posture visible in the injected plugin config.
+            if crate::plugins::otel_tracing::trace_providers_use_plaintext(&tracing.providers) {
+                workload_metrics_config["allow_plaintext"] = serde_json::json!(true);
+            }
         }
         // GAP-3F: project `Telemetry.tracing[].match.mode` into the plugin's
         // `direction_emit` so a single auto-injected workload_metrics instance
@@ -14166,10 +14174,24 @@ fn inject_mesh_request_auth_plugin(
         return;
     }
 
-    let mut providers = Vec::new();
-    for ra in &applicable {
+    // Several applicable RequestAuthentications are combined into one
+    // `jwks_auth` instance. Identical rules are installed once: verifying the
+    // same provider twice is pointless and would count twice against the
+    // per-token verification bound. Nothing else is dropped, so every
+    // extraction location and claim-output header stays owned. A union that
+    // still exceeds the bound fails plugin construction, and the data plane
+    // keeps its last accepted configuration (fail closed).
+    // Collection stops one past the provider cap, so dedupe work stays
+    // bounded and the oversized union still fails construction.
+    let mut providers: Vec<serde_json::Value> = Vec::new();
+    'collect: for ra in &applicable {
         for rule in &ra.jwt_rules {
-            if let Some(provider) = build_jwks_provider_config(rule) {
+            if providers.len() > crate::plugins::jwks_auth::MAX_JWKS_PROVIDERS {
+                break 'collect;
+            }
+            if let Some(provider) = build_jwks_provider_config(rule)
+                && !providers.contains(&provider)
+            {
                 providers.push(provider);
             }
         }
@@ -32311,6 +32333,12 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("http://zipkin.istio-system:9411/api/v2/spans")
         );
+        // An in-cluster cleartext collector is admitted through an explicit,
+        // visible opt-in written by injection.
+        assert_eq!(
+            workload_metrics.config["allow_plaintext"],
+            serde_json::json!(true)
+        );
         // Sampling percentage from the same Telemetry block is still applied.
         assert_eq!(
             workload_metrics.config["sampling_percentage"],
@@ -35841,6 +35869,79 @@ mod tests {
             providers[0].get("issuer").and_then(|v| v.as_str()),
             Some("https://api-jwt.example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn mesh_runtime_request_auth_union_dedupes_identical_rules() {
+        let runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let scope = || PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+        };
+        // Two resources share one issuer: five rules each, with one rule
+        // identical across both.
+        let rules = |prefix: &str| -> Vec<MeshJwtRule> {
+            (0..5)
+                .map(|i| {
+                    let source = if i == 0 {
+                        "shared".to_string()
+                    } else {
+                        format!("{prefix}{i}")
+                    };
+                    MeshJwtRule {
+                        issuer: "https://idp.example.com".to_string(),
+                        audiences: vec!["test-app".to_string()],
+                        jwks_uri: Some(format!("https://idp.example.com/{source}/jwks")),
+                        jwks: None,
+                        from_headers: Vec::new(),
+                        from_params: Vec::new(),
+                        forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
+                    }
+                })
+                .collect()
+        };
+        let mut first = test_request_authentication("ra-a", scope());
+        first.jwt_rules = rules("a");
+        let mut second = test_request_authentication("ra-b", scope());
+        second.jwt_rules = rules("b");
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![first, second],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin injected");
+        let providers = jwks
+            .config
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+        // 10 rules, the shared one installed once: 9 providers, all kept so
+        // every extraction location and claim-output header stays owned.
+        assert_eq!(providers.len(), 9);
+        // Nine providers for one issuer exceed the per-token bound, so the
+        // fail-closed plugin refuses the union and the last accepted
+        // configuration keeps serving.
+        let err = crate::plugins::jwks_auth::JwksAuth::new(
+            &jwks.config,
+            crate::plugins::PluginHttpClient::default(),
+        )
+        .err()
+        .expect("an over-bound union must fail construction");
+        assert!(err.contains("sharing one `issuer`"), "{err}");
     }
 
     #[test]

@@ -302,7 +302,7 @@ fn test_redact_consumer_keyauth_key_redacted() {
     let mut consumer = make_consumer("c1", "alice");
     consumer.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "my-api-key-123"}]),
+        serde_json::json!([{"key": "my-api-key-123-0123456789"}]),
     );
     let redacted = redact_consumer_credentials(&consumer);
     let keyauth = redacted.credentials.get("keyauth").unwrap();
@@ -404,9 +404,10 @@ fn test_redact_consumer_multiple_credential_types_all_redacted() {
         "hmac_auth".into(),
         serde_json::json!([{"secret": "hmac-secret"}]),
     );
-    consumer
-        .credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "my-key"}]));
+    consumer.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "my-key-0123456789"}]),
+    );
 
     let redacted = redact_consumer_credentials(&consumer);
 

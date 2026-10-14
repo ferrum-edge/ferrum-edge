@@ -21,6 +21,7 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::response_body::read_response_body_bounded;
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::utils::sse::{
     SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
     classify_forwarded_sse_prefix, encode_sse_error_event, is_gemini_stream_frame,
@@ -3224,7 +3225,33 @@ fn parse_provider_config(
     }
 
     let endpoint = required_non_empty_string(provider.get("endpoint"), "provider.endpoint")?;
-    let validated_endpoint = validate_provider_endpoint(&endpoint, backend_allow_ips)?;
+    // Refuse whitespace and control characters anywhere in the configured
+    // value instead of trimming or letting URL parsing strip them, so the
+    // admitted spelling is the one the published schema pattern judges.
+    if provider
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .is_some_and(|raw| {
+            raw.chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '\u{feff}')
+        })
+    {
+        return Err(
+            "ai_semantic_firewall: `provider.endpoint` must not contain whitespace or control characters"
+                .to_string(),
+        );
+    }
+    let allow_plaintext = match provider.get("allow_plaintext") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(
+                "ai_semantic_firewall: `provider.allow_plaintext` must be a boolean".to_string(),
+            );
+        }
+    };
+    let validated_endpoint =
+        validate_provider_endpoint(&endpoint, allow_plaintext, backend_allow_ips)?;
 
     let model = optional_string_from_object(provider, "model")?
         .map(str::trim)
@@ -3263,6 +3290,7 @@ struct ValidatedProviderEndpoint {
 
 fn validate_provider_endpoint(
     endpoint: &str,
+    allow_plaintext: bool,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<ValidatedProviderEndpoint, String> {
     let parsed = Url::parse(endpoint)
@@ -3291,6 +3319,19 @@ fn validate_provider_endpoint(
         return Err(format!(
             "ai_semantic_firewall: `provider.endpoint` IP \"{ip}\" denied by backend egress policy"
         ));
+    }
+
+    // The embedding call carries the provider API key. Cleartext is admitted
+    // without an opt-in only to a loopback IP literal (a local sidecar); any other
+    // `http://` destination needs `provider.allow_plaintext: true`.
+    if parsed.scheme() == "http"
+        && !allow_plaintext
+        && !is_loopback_ip_literal_endpoint(endpoint, parsed.host())
+    {
+        return Err(
+            "ai_semantic_firewall: `provider.endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `provider.allow_plaintext: true`"
+                .to_string(),
+        );
     }
 
     Ok(ValidatedProviderEndpoint {
@@ -8249,6 +8290,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 "model",
                 "api_key_env",
                 "request_timeout_ms",
+                "allow_plaintext",
             ],
         )?;
     }

@@ -4607,7 +4607,11 @@ fn native_usage_pair(
         .as_object()
         .ok_or_else(|| format!("ai_federation: {provider} usage must be an object"))?;
     for key in [input_key, output_key] {
-        if usage.get(key).is_some_and(|value| !value.is_u64()) {
+        // ProtoJSON (and Anthropic's nullable counters) define `null` as unset.
+        if usage
+            .get(key)
+            .is_some_and(|value| !value.is_null() && !value.is_u64())
+        {
             return Err(format!(
                 "ai_federation: {provider} usage.{key} must be a non-negative integer"
             ));
@@ -4617,6 +4621,101 @@ fn native_usage_pair(
         usage.get(input_key).and_then(Value::as_u64),
         usage.get(output_key).and_then(Value::as_u64),
     ))
+}
+
+/// Fold optional provider token categories into a reported base count.
+///
+/// Every present category must be a non-negative integer (the same contract
+/// [`native_usage_pair`] applies to the base pair); an omitted or `null` one
+/// contributes nothing (Anthropic types its cache counters as nullable).
+/// Without a base, a category never invents one — except for Gemini
+/// (`zero_omitted_base`), whose proto3 JSON omits a zero base counter, so a
+/// reported sibling category means the base was zero. This is the same rule
+/// the shared `UsageCategories` fold applies on every other metering surface.
+fn fold_native_usage_categories(
+    usage: Option<&Value>,
+    base: Option<u64>,
+    categories: &[&str],
+    zero_omitted_base: bool,
+    provider: &str,
+) -> Result<Option<u64>, String> {
+    let usage = usage.and_then(Value::as_object);
+    let mut folded = base;
+    for key in categories {
+        let value = match usage.and_then(|usage| usage.get(*key)) {
+            None | Some(Value::Null) => continue,
+            Some(value) => value,
+        };
+        let count = value.as_u64().ok_or_else(|| {
+            format!("ai_federation: {provider} usage.{key} must be a non-negative integer")
+        })?;
+        folded = match folded {
+            Some(current) => Some(current.checked_add(count).ok_or_else(|| {
+                format!("ai_federation: {provider} token usage total overflowed")
+            })?),
+            None if zero_omitted_base => Some(count),
+            // A category without the base the provider always sends is not a
+            // usable count; refuse it like any other malformed usage.
+            None => {
+                return Err(format!(
+                    "ai_federation: {provider} usage.{key} is reported without its base count"
+                ));
+            }
+        };
+    }
+    Ok(folded)
+}
+
+/// A reported provider total, never below the sum of every counter the same
+/// response reports (`floor`, which includes categories whose base was
+/// omitted); without one, only both components make a total.
+fn clamped_reported_total(
+    reported: Option<u64>,
+    input: Option<u64>,
+    output: Option<u64>,
+    floor: u64,
+    provider: &str,
+) -> Result<Option<u64>, String> {
+    let Some(reported) = reported else {
+        return summed_usage(input, output, provider);
+    };
+    let known = input
+        .unwrap_or(0)
+        .checked_add(output.unwrap_or(0))
+        .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed"))?
+        .max(floor);
+    // A total below the reported counters can only be raised to them when
+    // both components are known; otherwise it is an inconsistent partial
+    // report, not a complete total.
+    if reported >= known || (input.is_some() && output.is_some()) {
+        Ok(Some(reported.max(known)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Checked sum of every listed counter present in `usage` (absent and `null`
+/// contribute nothing; anything else must be a non-negative integer).
+fn native_usage_floor(
+    usage: Option<&Value>,
+    fields: &[&str],
+    provider: &str,
+) -> Result<u64, String> {
+    let usage = usage.and_then(Value::as_object);
+    let mut floor = 0u64;
+    for key in fields {
+        let value = match usage.and_then(|usage| usage.get(*key)) {
+            None | Some(Value::Null) => continue,
+            Some(value) => value,
+        };
+        let count = value.as_u64().ok_or_else(|| {
+            format!("ai_federation: {provider} usage.{key} must be a non-negative integer")
+        })?;
+        floor = floor
+            .checked_add(count)
+            .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed"))?;
+    }
+    Ok(floor)
 }
 
 fn summed_usage(
@@ -4738,6 +4837,27 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
         resp.get("usage"),
         "input_tokens",
         "output_tokens",
+        "Anthropic",
+    )?;
+    // Every reported counter must sum without overflow, even when the input
+    // base is absent and the cache categories therefore do not fold into it.
+    native_usage_floor(
+        resp.get("usage"),
+        &[
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+        ],
+        "Anthropic",
+    )?;
+    // `input_tokens` excludes prompt-cache writes and reads; the billed input
+    // is the sum of all three, so budgets and cost see the whole prompt.
+    let input_tokens = fold_native_usage_categories(
+        resp.get("usage"),
+        input_tokens,
+        &["cache_creation_input_tokens", "cache_read_input_tokens"],
+        false,
         "Anthropic",
     )?;
     let total = summed_usage(input_tokens, output_tokens, "Anthropic")?;
@@ -4958,15 +5078,51 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
         "candidatesTokenCount",
         "Gemini",
     )?;
-    let total = match resp["usageMetadata"]["totalTokenCount"].as_u64() {
-        Some(total) => Some(total),
-        None => summed_usage(prompt_tokens, completion_tokens, "Gemini")?,
-    };
+    // `completionTokenCount` is the alternate spelling the shared extractor
+    // and the stream router also accept when the canonical field is absent.
+    // Validated even when the canonical field is present, like the router.
+    let alternate_completion = native_usage_pair(
+        resp.get("usageMetadata"),
+        "promptTokenCount",
+        "completionTokenCount",
+        "Gemini",
+    )?
+    .1;
+    let completion_tokens = completion_tokens.or(alternate_completion);
+    // Same folding as the `ai_stream_router` Gemini normalizer: tool-use
+    // prompting is input-side, and thinking tokens are billed output that is
+    // not part of `candidatesTokenCount`.
+    let prompt_tokens = fold_native_usage_categories(
+        resp.get("usageMetadata"),
+        prompt_tokens,
+        &["toolUsePromptTokenCount"],
+        true,
+        "Gemini",
+    )?;
+    let completion_tokens = fold_native_usage_categories(
+        resp.get("usageMetadata"),
+        completion_tokens,
+        &["thoughtsTokenCount"],
+        true,
+        "Gemini",
+    )?;
+    // The provider total stays authoritative but never below the components
+    // it reports, even when only one side is present.
+    // Gemini folds zero-omitted bases, so every reported counter is already
+    // inside the folded sides and their sum is the floor.
+    let floor = 0;
+    let total = clamped_reported_total(
+        resp["usageMetadata"]["totalTokenCount"].as_u64(),
+        prompt_tokens,
+        completion_tokens,
+        floor,
+        "Gemini",
+    )?;
 
     if resp
         .get("usageMetadata")
         .and_then(|usage| usage.get("totalTokenCount"))
-        .is_some_and(|value| !value.is_u64())
+        .is_some_and(|value| !value.is_null() && !value.is_u64())
     {
         return Err(
             "ai_federation: Gemini usageMetadata.totalTokenCount must be an integer".to_string(),
@@ -5077,15 +5233,38 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
 
     let (input_tokens, output_tokens) =
         native_usage_pair(resp.get("usage"), "inputTokens", "outputTokens", "Bedrock")?;
-    let total = match resp["usage"]["totalTokens"].as_u64() {
-        Some(total) => Some(total),
-        None => summed_usage(input_tokens, output_tokens, "Bedrock")?,
-    };
+    // Converse `inputTokens` excludes prompt-cache reads and writes (AWS:
+    // `total input tokens = inputTokens + cacheReadInputTokens +
+    // cacheWriteInputTokens`).
+    let input_tokens = fold_native_usage_categories(
+        resp.get("usage"),
+        input_tokens,
+        &["cacheReadInputTokens", "cacheWriteInputTokens"],
+        false,
+        "Bedrock",
+    )?;
+    let floor = native_usage_floor(
+        resp.get("usage"),
+        &[
+            "inputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheWriteInputTokens",
+        ],
+        "Bedrock",
+    )?;
+    let total = clamped_reported_total(
+        resp["usage"]["totalTokens"].as_u64(),
+        input_tokens,
+        output_tokens,
+        floor,
+        "Bedrock",
+    )?;
 
     if resp
         .get("usage")
         .and_then(|usage| usage.get("totalTokens"))
-        .is_some_and(|value| !value.is_u64())
+        .is_some_and(|value| !value.is_null() && !value.is_u64())
     {
         return Err("ai_federation: Bedrock usage.totalTokens must be an integer".to_string());
     }

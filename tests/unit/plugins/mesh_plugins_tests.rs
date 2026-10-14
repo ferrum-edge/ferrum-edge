@@ -8514,6 +8514,7 @@ fn workload_metrics_accepts_every_allowlisted_key() {
         "buffer_max_bytes": 1048576,
         "max_retries": 2,
         "retry_delay_ms": 250,
+        "allow_plaintext": false,
     });
     let configured: std::collections::BTreeSet<&str> = config
         .as_object()

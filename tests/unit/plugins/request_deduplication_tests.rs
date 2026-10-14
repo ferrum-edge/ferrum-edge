@@ -3836,6 +3836,7 @@ async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
         &json!({
             "provider": "azure_functions",
             "function_url": "http://169.254.169.254/invoke",
+            "allow_plaintext": true,
             "mode": "terminate"
         }),
         PluginHttpClient::default_with_backend_allow_ips(policy),
@@ -7104,6 +7105,22 @@ impl ScriptedDedupRedisState {
                 Some(value) => resp_bulk(value),
                 None => b"$-1\r\n".to_vec(),
             },
+            // The bounded record read and ownership compare (issue #6622).
+            "EXISTS" => format!(":{}\r\n", usize::from(values.contains_key(&args[1]))).into_bytes(),
+            "STRLEN" => {
+                format!(":{}\r\n", values.get(&args[1]).map_or(0, String::len)).into_bytes()
+            }
+            "GETRANGE" => {
+                let value = values.get(&args[1]).cloned().unwrap_or_default();
+                let start: usize = args[2].parse().unwrap_or(0);
+                let end: usize = args[3].parse().unwrap_or(0);
+                let end = end.min(value.len().saturating_sub(1));
+                if value.is_empty() || start > end {
+                    resp_bulk("")
+                } else {
+                    resp_bulk(&value[start..=end])
+                }
+            }
             "SET" => {
                 let nx = args[3..]
                     .iter()

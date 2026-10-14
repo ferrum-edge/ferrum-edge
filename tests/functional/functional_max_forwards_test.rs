@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 const ORIGIN: &str = "https://app.example";
-const API_KEY: &str = "hop-budget-key";
+const API_KEY: &str = "hop-budget-key-0123456789";
 const PROTOCOL_LEVEL_ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
 

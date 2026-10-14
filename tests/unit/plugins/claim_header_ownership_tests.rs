@@ -324,6 +324,52 @@ fn a_later_instance_does_not_erase_a_shared_destination_already_installed() {
     );
 }
 
+/// Two instances owning backend-equivalent spellings (`X-Tenant-Id` and
+/// `X_Tenant_Id`) claim one destination: whichever runs first strips every
+/// client copy, and the other never erases the verified value. Both orders.
+#[test]
+fn backend_equivalent_destinations_across_instances_are_claimed_once() {
+    let owner = mappings(&json!({"claim_headers": {"tenant": "X-Tenant-Id"}}));
+    let owner_destinations =
+        ClaimHeaderDestinations::from_mapping_groups(std::iter::once(owner.as_slice()));
+    let sibling = mappings(&json!({"claim_headers": {"role": "X_Tenant_Id"}}));
+    let sibling_destinations =
+        ClaimHeaderDestinations::from_mapping_groups(std::iter::once(sibling.as_slice()));
+
+    for owner_first in [true, false] {
+        let mut ctx = ctx();
+        let mut attempt = AuthenticationAttempt::new();
+        emit_claim_headers_to_attempt(&mut attempt, &json!({"tenant": "acme"}), &owner, ",");
+        commit_authentication_attempt(
+            &mut ctx,
+            attempt,
+            VerifyOutcome::success(None, Some("alice@example.test".to_string()), None),
+            "test_auth",
+            true,
+        )
+        .expect("attempt commits");
+
+        let mut headers = HashMap::from([
+            ("X-Tenant-Id".to_string(), "attacker".to_string()),
+            ("X_Tenant_Id".to_string(), "attacker".to_string()),
+        ]);
+        let order = if owner_first {
+            [&owner_destinations, &sibling_destinations]
+        } else {
+            [&sibling_destinations, &owner_destinations]
+        };
+        for destinations in order {
+            apply_claim_headers_from_context(&mut ctx, &mut headers, destinations);
+        }
+
+        assert_eq!(
+            headers,
+            HashMap::from([("x-tenant-id".to_string(), "acme".to_string())]),
+            "owner_first={owner_first}: only the verified value may remain"
+        );
+    }
+}
+
 #[test]
 fn an_instance_never_installs_a_destination_owned_by_another_instance() {
     // Two instances of the same plugin type: they share the `claim_headers`

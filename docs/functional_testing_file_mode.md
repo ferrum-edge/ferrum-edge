@@ -207,7 +207,7 @@ consumers:
     custom_id: "alice-001"
     credentials:
       keyauth:
-        - key: "api-key-value"
+        - key: "api-key-value-0123456789"
       jwt:
         - secret: "jwt-secret-at-least-32-characters"
       basicauth:

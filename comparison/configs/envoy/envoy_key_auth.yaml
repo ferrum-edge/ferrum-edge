@@ -42,7 +42,7 @@ static_resources:
                             local path = request_handle:headers():get(":path")
                             if path and path:sub(1, 14) == "/api/echo-auth" then
                               local key = request_handle:headers():get("apikey")
-                              if key ~= "test-api-key" then
+                              if key ~= "comparison-key-auth-0001" then
                                 request_handle:respond(
                                   {[":status"] = "401", ["content-type"] = "application/json"},
                                   '{"error":"Invalid API key"}'
