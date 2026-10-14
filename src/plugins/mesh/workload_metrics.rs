@@ -1984,7 +1984,7 @@ fn validate_custom_tags(
             })?;
         // Judge the configured spelling as well as the normalized one:
         // normalization lowercases away camelCase boundaries (`x-projectPin`).
-        if is_sensitive_header_name(header) || is_sensitive_header_name(header_name.as_str()) {
+        if is_sensitive_header_name(&header) || is_sensitive_header_name(header_name.as_str()) {
             return Err(format!(
                 "workload_metrics: custom tag {name:?} cannot copy sensitive header {header:?}"
             ));

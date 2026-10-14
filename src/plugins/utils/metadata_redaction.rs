@@ -763,11 +763,24 @@ fn is_credential_class_name(key: &str) -> bool {
 /// as `signalStrength` or `pinnedVersion` do not turn into compounds.
 fn folded_runs_name_credential_words(folded: &str) -> bool {
     let mut in_key_context = false;
+    let mut in_mfa_context = false;
+    let mut previous_is_pass = false;
     folded
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|run| !run.is_empty())
         .any(|run| {
-            let sensitive = CREDENTIAL_CLASS_SEGMENTS.contains(&run)
+            let plural_class = run.strip_suffix('s').is_some_and(|singular| {
+                QUALIFIED_SHORT_CLASSES
+                    .iter()
+                    .any(|(class, _)| *class == singular)
+            });
+            let sensitive = plural_class
+                || (previous_is_pass
+                    && ["phrase", "code", "word", "wd", "key"]
+                        .iter()
+                        .any(|word| run.starts_with(word)))
+                || (in_mfa_context && names_mfa_material(run))
+                || CREDENTIAL_CLASS_SEGMENTS.contains(&run)
                 || CREDENTIAL_CLASS_STEMS.iter().any(|stem| run.contains(stem))
                 || run == "token"
                 || (run.len() > "token".len() && run.ends_with("token"))
@@ -775,6 +788,8 @@ fn folded_runs_name_credential_words(folded: &str) -> bool {
                 || has_inline_key_material(run)
                 || (in_key_context && names_key_material(run));
             in_key_context |= opens_key_context(run);
+            in_mfa_context |= run.contains("mfa");
+            previous_is_pass = run == "pass";
             sensitive
         })
 }
