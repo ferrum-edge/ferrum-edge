@@ -722,6 +722,8 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "access_opaque_tokens",
     "refreshOpaqueTokens",
     "refreshopaquetokens",
+    "oauth2_tokens",
+    "refreshopaque_v2_tokens",
     "crypto_key",
     "cryptokey",
     "mesh.crypto_key",

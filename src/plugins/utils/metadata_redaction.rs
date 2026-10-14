@@ -454,6 +454,19 @@ fn is_credential_token_plural(lower: &str, in_token_credential_context: bool) ->
     })
 }
 
+/// Whether a segment opens the credential-token context: an exact qualifier,
+/// a qualifier decorated with digits (`oauth2`), or a segment containing a
+/// qualifier of four or more characters (`refreshopaque`).
+fn opens_token_credential_context(lower: &str) -> bool {
+    CREDENTIAL_TOKEN_QUALIFIERS.iter().any(|qualifier| {
+        lower == *qualifier
+            || lower.strip_prefix(qualifier).is_some_and(|rest| {
+                !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            || (qualifier.len() >= 4 && lower.contains(qualifier))
+    })
+}
+
 fn has_token_compound(lower: &str) -> bool {
     // Any singular `token` that continues inside the segment fails closed
     // for unknown representations (`tokenopaque`, `vendortokensigned`),
@@ -822,7 +835,7 @@ fn classify_credential_class_segments(key: &str) -> bool {
                 .find("mfa")
                 .is_some_and(|offset| names_mfa_material(&lower[offset + "mfa".len()..]));
         sensitive = sensitive || is_credential_token_plural(lower, in_token_credential_context);
-        in_token_credential_context |= CREDENTIAL_TOKEN_QUALIFIERS.contains(&lower);
+        in_token_credential_context |= opens_token_credential_context(lower);
         previous_is_pass = lower == "pass";
         in_mfa_context |= lower.contains("mfa");
         // Once a qualifier appears, the context stays open for the rest of

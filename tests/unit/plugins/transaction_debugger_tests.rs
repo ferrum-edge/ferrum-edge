@@ -2385,3 +2385,20 @@ fn test_text_body_assignment_parsing_handles_utf8_and_quotes() {
         text.rendered
     );
 }
+
+/// Quoted field names are classified whole (spaces, brackets, escapes).
+#[test]
+fn test_text_body_quoted_field_names_are_classified_whole() {
+    let plugin = capture_plugin();
+    let body = "\"totp seed\": \"482917\"\n\"hsm_pin[]\": \"735106\"\n\"display name\": \"visible-name\"\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in ["482917", "735106"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(text.rendered.contains("visible-name"), "{}", text.rendered);
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}
