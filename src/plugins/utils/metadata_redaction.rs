@@ -332,6 +332,7 @@ const CREDENTIAL_CLASS_STEMS: &[&str] = &[
 /// A bare `key` stays visible so `cache_key` and `routing_key` remain
 /// observable.
 const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
+    "api",
     "private",
     "access",
     "secret",
@@ -381,6 +382,16 @@ const KEY_MATERIAL_TRAILERS: &[&str] = &[
     "id", "ids", "pem", "der", "data", "value", "values", "file", "path", "bytes", "b64", "base64",
     "hex", "json", "material", "pair", "raw", "blob", "bin", "string", "secret",
 ];
+
+/// A singular `token` followed by digits or a representation trailer inside
+/// one segment (`vendortokenvalue`, `token1`, `accesstokenhash`). A plural
+/// `tokens` names a usage count and stays visible (`ai_total_tokens`).
+fn has_token_compound(lower: &str) -> bool {
+    lower.match_indices("token").any(|(offset, _)| {
+        let rest = &lower[offset + "token".len()..];
+        !rest.is_empty() && !rest.starts_with('s') && is_credential_suffix(rest)
+    })
+}
 
 /// Shared suffix policy for both compound classifiers: optional digits
 /// (`pin1`, `signingkey1`), then nothing or text that starts with a listed
@@ -582,7 +593,13 @@ fn has_qualified_short_class(lower: &str) -> bool {
             let rest = &lower[offset + class.len()..];
             // A real trailer word makes it a compound whatever precedes it;
             // the bare plural `s` only counts after a full qualifier.
-            if !rest.is_empty() && is_credential_suffix(rest) {
+            // Also after a grammatical plural (`credsvalue`, `pinshash`).
+            if !rest.is_empty()
+                && (is_credential_suffix(rest)
+                    || rest
+                        .strip_prefix('s')
+                        .is_some_and(|plural| !plural.is_empty() && is_credential_suffix(plural)))
+            {
                 return true;
             }
             !prefix.is_empty() && prefix.len() >= *min_prefix && (rest.is_empty() || rest == "s")
@@ -595,6 +612,7 @@ fn has_qualified_short_class(lower: &str) -> bool {
 fn lowered_segment_is_credential(lower: &str, in_key_context: bool) -> bool {
     CREDENTIAL_CLASS_SEGMENTS.contains(&lower)
         || (lower.len() > "token".len() && lower.ends_with("token"))
+        || has_token_compound(lower)
         || CREDENTIAL_CLASS_STEMS
             .iter()
             .any(|stem| lower.contains(stem))
