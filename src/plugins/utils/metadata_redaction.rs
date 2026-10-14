@@ -748,6 +748,29 @@ pub fn is_sensitive_header_name(name: &str) -> bool {
 
 /// The credential-class classifier without any exemption.
 fn is_credential_class_name(key: &str) -> bool {
+    // CamelCase splitting runs before case folding, so an irregular mix
+    // (`JwT`, `HSM_PiN`) would split inside a credential word. Judge the
+    // delimiter-only (fully lowercased) spelling too; it only allocates when
+    // the key has an uppercase letter.
+    classify_credential_class_segments(key)
+        || (key.bytes().any(|byte| byte.is_ascii_uppercase())
+            && folded_runs_name_credential_words(&key.to_ascii_lowercase()))
+}
+
+/// For the case-folded spelling, only whole credential words and stems count
+/// (not the compound heuristics), so ordinary camelCase names such as
+/// `signalStrength` or `pinnedVersion` do not turn into compounds.
+fn folded_runs_name_credential_words(folded: &str) -> bool {
+    folded
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|run| !run.is_empty())
+        .any(|run| {
+            CREDENTIAL_CLASS_SEGMENTS.contains(&run)
+                || CREDENTIAL_CLASS_STEMS.iter().any(|stem| run.contains(stem))
+        })
+}
+
+fn classify_credential_class_segments(key: &str) -> bool {
     let mut sensitive = false;
     let mut in_key_context = false;
     let mut previous_is_pass = false;

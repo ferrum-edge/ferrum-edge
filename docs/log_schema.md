@@ -339,7 +339,9 @@ contains `jws`/`jwe`, contains a short class (`pin`, `sid`, `otp`, `sig`, `cred`
 inside a qualified compound, meaning followed by a listed trailer word
 (`value`, `code`, `id`, `hash`, `base64`, `hex`, `pem`, …, including composed
 trailers such as `valuehex` or `base64url`) or ending the segment after a
-qualifier of at least two letters (`dbpin`, `dbpinvalue`, `usersid`,
+qualifier of at least one letter, or any representation after an owner word
+such as `db`, `vendor`, `user`, `tenant` or `client` (`xpin`, `dbpin`,
+`dbpinvalue`, `dbpincleartext`, `usersid`,
 `smsotpcode`, `sigbase64`, `vendorcred`; ordinary words such as `spin`,
 `hairpin`, `inside`, `design`, `footprint`, `signal`, `credit`, `sacred` and
 `sidecar` stay visible), or ends in `token` after a qualifier (`accesstoken`). Matching is
@@ -357,9 +359,13 @@ classification (an HTTP header name such as `x-hsmpin`) is still caught for
 every rule above. One residual is documented rather than closed: a
 delimiter-free lowercase name that joins an unlisted owner word, a short class
 (`pin`, `sid`, `otp`, `sig`, `cred`) and an unlisted representation (for
-example `tenantpinopaque`) cannot be told apart from ordinary words such as
+example `projectpinopaque`) cannot be told apart from ordinary words such as
 `mapping` or `inside` without a dictionary. Delimit or camel-case such names,
-or add them to `FERRUM_LOG_REDACT_METADATA_KEYS`. The
+or add them to `FERRUM_LOG_REDACT_METADATA_KEYS`. Header names are lowercased
+by HTTP, so camelCase only helps where the configured spelling is also
+judged: `workload_metrics` header-tag admission checks both the configured
+and the normalized header name. Mixed-case irregular spellings (`JwT`,
+`HSM_PiN`) are classified as if fully lowercased as well. The
 only exemption is the complete documented outcome key
 `mesh_authz.ignored_baggage.assertion_out_of_scope`. Any other key, including
 one that merely ends the same way, is classified normally. Ordinary dimensions such as `cache_key`, `routing_key` and

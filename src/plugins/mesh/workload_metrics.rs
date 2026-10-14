@@ -1982,7 +1982,9 @@ fn validate_custom_tags(
             http::header::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                 format!("workload_metrics: custom tag {name:?} has invalid header name {header:?}")
             })?;
-        if is_sensitive_header_name(header_name.as_str()) {
+        // Judge the configured spelling as well as the normalized one:
+        // normalization lowercases away camelCase boundaries (`x-projectPin`).
+        if is_sensitive_header_name(header) || is_sensitive_header_name(header_name.as_str()) {
             return Err(format!(
                 "workload_metrics: custom tag {name:?} cannot copy sensitive header {header:?}"
             ));
