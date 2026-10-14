@@ -769,10 +769,10 @@ enum CategoryFamily {
     /// `input_tokens` + `cache_creation_input_tokens` +
     /// `cache_read_input_tokens`; `output_tokens`.
     Anthropic,
-    /// `promptTokenCount` + `toolUsePromptTokenCount`; `candidatesTokenCount`
-    /// + `thoughtsTokenCount`; `totalTokenCount`. proto3 JSON omits zero
-    /// counters, so an omitted base is zero when a sibling on its side is
-    /// reported.
+    /// `promptTokenCount` plus `toolUsePromptTokenCount`;
+    /// `candidatesTokenCount` plus `thoughtsTokenCount`; `totalTokenCount`.
+    /// proto3 JSON omits zero counters, so an omitted base is zero when a
+    /// sibling on its side is reported.
     Gemini,
     /// `inputTokens` + `cacheReadInputTokens` + `cacheWriteInputTokens`;
     /// `outputTokens`; `totalTokens`.
@@ -784,12 +784,13 @@ enum CategoryFamily {
 /// The billed input of an Anthropic Messages or Bedrock Converse request is
 /// the uncached input PLUS prompt-cache writes and reads, which those
 /// providers report beside the base counter rather than inside it (Anthropic:
-/// `total_input_tokens = cache_read_input_tokens + cache_creation_input_tokens
-/// + input_tokens`; AWS: `inputTokens + cacheReadInputTokens +
-/// cacheWriteInputTokens`). Gemini bills `toolUsePromptTokenCount` as input
+/// total input is `cache_read_input_tokens` plus `cache_creation_input_tokens`
+/// plus `input_tokens`; AWS: `inputTokens` plus `cacheReadInputTokens` plus
+/// `cacheWriteInputTokens`). Gemini bills `toolUsePromptTokenCount` as input
 /// and `thoughtsTokenCount` as output outside `candidatesTokenCount`, and
-/// documents `totalTokenCount` as prompt + tool-use prompt + thoughts +
-/// candidates. Folding here is the single rule every metering surface uses.
+/// documents `totalTokenCount` as prompt plus tool-use prompt plus thoughts
+/// plus candidates. Folding here is the single rule every metering surface
+/// uses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageCategories {
     family: Option<CategoryFamily>,
