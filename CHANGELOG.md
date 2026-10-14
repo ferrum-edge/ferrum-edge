@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   challenge check can echo. The `Secret Backends` Azure fake now serves TLS
   with a per-test CA. Dependabot groups the Azure SDK crates so they move
   together.
+- **Reproducible release builds and no persisted checkout tokens** (issues
+  #6574, #6581). The production `Dockerfile` builds its eBPF ELF with a dated
+  nightly (`EBPF_NIGHTLY_TOOLCHAIN`, currently `nightly-2026-09-30`) instead
+  of the floating `nightly` channel. The `Dockerfile` builds, the native
+  release builds, and the x86_64 GNU sysroot builder pass `cargo build
+  --locked`, so a stale `Cargo.lock` fails the build instead of being
+  re-resolved. Non-pushing `actions/checkout` steps set
+  `persist-credentials: false`, and `verify_workflow_permissions.py` rejects
+  a checkout that omits it. Jobs frozen by the trusted Cross policy are listed
+  and wait for a policy migration.
 - **BREAKING — HTTP/3 always percent-decodes `ctx.query_params`** (issue
   #6580). HTTP/3 used to materialize the raw form (`%2Fadmin`) unless an
   active plugin opted in through `requires_decoded_query_params()`, while
