@@ -401,12 +401,44 @@ fn is_credential_suffix(rest: &str) -> bool {
 /// or is followed by a key-material trailer (`key`, `rsakey`, `keypem`,
 /// `p256keyid`, `keybase64url`, `key1`).
 fn names_key_material(text: &str) -> bool {
+    if BENIGN_KEY_WORDS.contains(&text) {
+        return false;
+    }
     text.match_indices("key").any(|(offset, _)| {
-        let rest = &text[offset + "key".len()..];
-        let rest = rest.strip_prefix('s').unwrap_or(rest);
-        rest.is_empty() || is_credential_suffix(rest)
+        let from_key = &text[offset..];
+        // Fail closed: after a key-material qualifier, `key` followed by any
+        // representation (`keyjwk`, `keystring`, `keyseed`) is key material,
+        // unless it starts an ordinary word (`keyboard`, `keyword`).
+        !BENIGN_KEY_WORD_PREFIXES
+            .iter()
+            .any(|word| from_key.starts_with(word))
     })
 }
+
+/// Whole segments that contain `key` without naming key material.
+const BENIGN_KEY_WORDS: &[&str] = &[
+    "monkey", "donkey", "turkey", "hockey", "jockey", "whiskey", "monkeys", "donkeys", "turkeys",
+];
+
+/// Ordinary words that start with `key`.
+const BENIGN_KEY_WORD_PREFIXES: &[&str] = &[
+    "keyboard",
+    "keyword",
+    "keyspace",
+    "keystroke",
+    "keynote",
+    "keypad",
+    "keyhole",
+    "keyframe",
+    "keydown",
+    "keyup",
+    "keyless",
+    "keystone",
+    "keychain",
+    "keycap",
+    "keylogger",
+    "keypress",
+];
 
 /// Whether a segment opens a key-material context for the following
 /// segments: it contains a qualifier (`private`, `awsaccess`, `signingrsa`).
@@ -436,6 +468,50 @@ const BENIGN_SHORT_CLASS_SEGMENTS: &[&str] = &[
     "lupins",
 ];
 
+/// Ordinary words (or word stems) that begin with a short credential class.
+const BENIGN_LEADING_SHORT_CLASS_WORDS: &[&str] = &[
+    "pinned",
+    "pinning",
+    "pinpoint",
+    "pine",
+    "pink",
+    "pint",
+    "pinch",
+    "pinyin",
+    "pinout",
+    "pinball",
+    "pinhole",
+    "pinwheel",
+    "pinata",
+    "pinion",
+    "signal",
+    "signed",
+    "signer",
+    "signing",
+    "signup",
+    "signin",
+    "signoff",
+    "signpost",
+    "signs",
+    "signage",
+    "signet",
+    "signif",
+    "sidebar",
+    "sidecar",
+    "side",
+    "sidle",
+    "sidekick",
+    "sideload",
+    "siding",
+    "credit",
+    "credib",
+    "credo",
+    "credence",
+    "credulous",
+    "credential",
+    "otpauth",
+];
+
 /// Words that may follow a short credential class inside one segment
 /// (`pinvalue`, `vendorpincode`, `usersidhash`, `smsotpcode`).
 const SHORT_CLASS_TRAILERS: &[&str] = &[
@@ -459,6 +535,19 @@ const QUALIFIED_SHORT_CLASSES: &[(&str, usize)] =
 fn has_qualified_short_class(lower: &str) -> bool {
     if BENIGN_SHORT_CLASS_SEGMENTS.contains(&lower) {
         return false;
+    }
+    // A segment that STARTS with a short class and continues is a credential
+    // compound (`pincleartext`, `sidvalue`, `otpseed`) unless it is a listed
+    // ordinary word (`pinned`, `signal`, `sidecar`, `credit`): unrecognized
+    // representations fail closed.
+    if QUALIFIED_SHORT_CLASSES
+        .iter()
+        .any(|(class, _)| lower.len() > class.len() && lower.starts_with(class))
+        && !BENIGN_LEADING_SHORT_CLASS_WORDS
+            .iter()
+            .any(|word| lower.starts_with(word))
+    {
+        return true;
     }
     QUALIFIED_SHORT_CLASSES.iter().any(|(class, min_prefix)| {
         lower.match_indices(class).any(|(offset, _)| {
