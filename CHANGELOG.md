@@ -9,30 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `waf` tightens exemption and body-scope defaults** (issue n/a,
-  PR #6646).
-  - `global_exemptions.header_present` values must now be shared secrets of at
-    least 16 characters, compared in constant time. Presence-only (`null`)
-    entries are rejected at admission, because clients choose their own headers.
-  - `global_exemptions` criteria (`paths`, `methods`, `ips`, `consumers`) now
-    combine with AND by default (`match: all`), so adding a criterion narrows an
-    exemption. `match: any` restores the previous OR behavior.
-  - `on_unlisted_content_type` now defaults to `fail_closed`. A non-empty
-    request body whose `Content-Type` is outside the scan scope is refused when
-    an enforcing request-body policy applies; monitor-only deployments are
-    unaffected. Set `allow` to keep the previous behavior.
-  - New `on_unlisted_response_content_type` (`allow` / `fail_closed` /
-    `block`, default `fail_closed`) gives response bodies the same control,
-    so an origin cannot stream a disclosure past an enforcing response-body
-    rule by labelling it with an unscanned type. Unlisted bodies now record
-    `waf.body_uninspected_target`.
-  - A body rule that neither enforces nor adds to the anomaly score (for
-    example `score: 0`) no longer makes a body policy "enforcing" for the
-    fail-closed size, timeout, and content-type decisions.
-  - `global_exemptions.header_present` values are redacted from non-admin
-    config reads, audit records, and exports, and the named headers are
-    redacted from transaction debugging and policy inputs.
-  - `body_methods` now defaults to `POST`, `PUT`, `PATCH`, and `DELETE`.
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
