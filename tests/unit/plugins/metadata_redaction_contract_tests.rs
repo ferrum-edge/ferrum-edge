@@ -606,6 +606,12 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "x-awsaccess-key",
     "private_rsapem_key",
     "x-private-rsapem-key",
+    "x-vendorPinValue",
+    "x-userSid",
+    "idJws",
+    "idJwe",
+    "pinvalue",
+    "smsOtpCode",
     // The outcome-signal exemption covers only its complete key.
     "session_id.assertion_out_of_scope",
     "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
@@ -694,4 +700,24 @@ fn credential_class_names_are_rejected_as_log_schema_field_names() {
             "{name} would always be redacted, so a schema must not emit it"
         );
     }
+}
+
+/// Key-material matching is linear in the name: overlapping algorithm words
+/// (`ecdsa` = `ec` + `dsa`) must not drive exponential search on a
+/// client-chosen header name (the transaction debugger classifies those).
+#[test]
+fn credential_class_classification_is_linear_on_overlapping_algorithm_words() {
+    let extras: Vec<String> = Vec::new();
+    let started = std::time::Instant::now();
+    let miss = format!("x-private{}z", "ecdsa".repeat(4_000));
+    let hit = format!("x-private{}key", "ecdsa".repeat(4_000));
+    for _ in 0..10 {
+        assert!(!is_sensitive_metadata_key_with_extras(&miss, &extras));
+        assert!(is_sensitive_metadata_key_with_extras(&hit, &extras));
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "classification took {:?}",
+        started.elapsed()
+    );
 }

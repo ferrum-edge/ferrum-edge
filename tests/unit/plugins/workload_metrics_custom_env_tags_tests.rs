@@ -201,6 +201,9 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "PRIVATEPKCS12KEY",
         "AWSACCESS_KEY",
         "VENDORPIN",
+        "VENDORPINVALUE",
+        "USERSID",
+        "IDJWS",
     ];
 
     for env_var in cases {
@@ -328,6 +331,9 @@ fn custom_header_tags_reject_credential_class_header_names() {
         "x-awsaccess-key",
         "x-private-rsapem-key",
         "x-privateecckey",
+        "x-vendorPinValue",
+        "x-userSid",
+        "x-idJws",
     ] {
         let error = workload_metrics_new_with_env_lookup_for_test(
             &json!({

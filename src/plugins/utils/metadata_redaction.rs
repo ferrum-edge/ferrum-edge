@@ -300,6 +300,8 @@ const CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "pwd",
     "credential",
     "jwt",
+    "jws",
+    "jwe",
     "signature",
     "assertion",
     "csrf",
@@ -365,42 +367,48 @@ const NON_SECRET_ASSERTION_SIGNAL_KEYS: &[&str] =
 /// Longest segment lowercased on the stack; longer segments (rare) allocate.
 const CLASSIFIER_STACK_SEGMENT_BYTES: usize = 64;
 
-/// Whether `rest` (what follows a qualifier) reaches `key` after skipping
-/// algorithm / encoding words (`key`, `rsakey`, `ecckey`, `pkcs12key`).
-/// Backtracks over overlapping words (`ec`/`ecc`, `pkcs1`/`pkcs12`); every
-/// step consumes at least two bytes, so the search is bounded by the segment.
-fn reaches_key_after_intervening_words(rest: &str) -> bool {
-    rest.starts_with("key")
-        || KEY_MATERIAL_INTERVENING_WORDS.iter().any(|word| {
-            rest.strip_prefix(word)
-                .is_some_and(reaches_key_after_intervening_words)
-        })
+/// Fill the per-position key-material tables for one lowercased segment, in
+/// one right-to-left pass (dynamic programming, no backtracking):
+///
+/// * `reaches_key[i]`: from byte `i`, zero or more algorithm / encoding words
+///   lead to `key` (`key`, `rsakey`, `ecckey`, `pkcs12key`);
+/// * `consumed[i]`: from byte `i` to the end is entirely such words (`rsapem`),
+///   with `consumed[len] = true`.
+///
+/// Overlapping words (`ec`/`ecc`/`ecdsa`, `pkcs1`/`pkcs12`) are all
+/// considered, and the work is `O(len × words)` however the words overlap, so
+/// a client-chosen header name cannot drive exponential search.
+fn fill_key_material_tables(lower: &str, reaches_key: &mut [bool], consumed: &mut [bool]) {
+    let len = lower.len();
+    reaches_key[len] = false;
+    consumed[len] = true;
+    for index in (0..len).rev() {
+        let rest = &lower[index..];
+        let mut reaches = rest.starts_with("key");
+        let mut all_words = false;
+        for word in KEY_MATERIAL_INTERVENING_WORDS {
+            if rest.starts_with(word) {
+                let next = index + word.len();
+                reaches |= reaches_key[next];
+                all_words |= consumed[next];
+            }
+        }
+        reaches_key[index] = reaches;
+        consumed[index] = all_words;
+    }
 }
 
-/// Whether `rest` consists entirely of algorithm / encoding words (`rsapem`).
-fn consumed_by_intervening_words(rest: &str) -> bool {
-    rest.is_empty()
-        || KEY_MATERIAL_INTERVENING_WORDS.iter().any(|word| {
-            rest.strip_prefix(word)
-                .is_some_and(consumed_by_intervening_words)
-        })
+/// Byte offsets just past every key-material qualifier inside `lower`.
+fn qualifier_ends(lower: &str) -> impl Iterator<Item = usize> + '_ {
+    CREDENTIAL_KEY_QUALIFIERS.iter().flat_map(move |qualifier| {
+        lower
+            .match_indices(qualifier)
+            .map(move |(offset, _)| offset + qualifier.len())
+    })
 }
 
-/// Whether a segment leaves a key-material context open for the NEXT
-/// segment: it ends in a qualifier, optionally followed by algorithm /
-/// encoding words (`private`, `awsaccess`, `privatersa`), or it continues an
-/// open context with only such words (`rsapem` after `private`).
-fn opens_or_continues_key_context(lower: &str, in_key_context: bool) -> bool {
-    (in_key_context && consumed_by_intervening_words(lower))
-        || CREDENTIAL_KEY_QUALIFIERS.iter().any(|qualifier| {
-            lower.match_indices(qualifier).any(|(offset, _)| {
-                consumed_by_intervening_words(&lower[offset + qualifier.len()..])
-            })
-        })
-}
-
-/// Whole segments that end in `pin` / `pins` without naming a PIN.
-const BENIGN_PIN_SUFFIX_SEGMENTS: &[&str] = &[
+/// Whole segments that contain a short credential class without naming one.
+const BENIGN_SHORT_CLASS_SEGMENTS: &[&str] = &[
     "spin",
     "spins",
     "hairpin",
@@ -416,42 +424,62 @@ const BENIGN_PIN_SUFFIX_SEGMENTS: &[&str] = &[
     "clothespin",
 ];
 
-/// Qualified short-class compounds that survive lowercasing (`vendorpin`,
-/// `userpins`, `smsotp`). A qualifier of at least three bytes keeps short
-/// ordinary words (`spin`) out; listed words keep the rest out.
-fn has_qualified_short_class_suffix(lower: &str) -> bool {
-    let pin_prefix = lower
-        .strip_suffix("pins")
-        .or_else(|| lower.strip_suffix("pin"));
-    if let Some(prefix) = pin_prefix
-        && prefix.len() >= 3
-        && !BENIGN_PIN_SUFFIX_SEGMENTS.contains(&lower)
-    {
-        return true;
+/// Words that may follow a short credential class inside one segment
+/// (`pinvalue`, `vendorpincode`, `usersidhash`, `smsotpcode`).
+const SHORT_CLASS_TRAILERS: &[&str] = &[
+    "s", "value", "values", "code", "codes", "id", "ids", "number", "num", "hash", "data",
+    "string", "str", "secret", "seed", "key", "token", "block",
+];
+
+/// Short credential classes that only count inside a qualified compound,
+/// with the minimum qualifier length in front of them.
+const QUALIFIED_SHORT_CLASSES: &[(&str, usize)] = &[("pin", 3), ("sid", 3), ("otp", 2)];
+
+/// Qualified short-class compounds that survive lowercasing: a short class
+/// preceded by a qualifier of the minimum length and/or followed by a listed
+/// trailer (`vendorpin`, `vendorpinvalue`, `pinnumber`, `usersid`, `smsotp`,
+/// `otpcode`). Ordinary words fail one of the bounds (`spin`, `inside`,
+/// `president`, `footprint`) or are listed (`hairpin`).
+fn has_qualified_short_class(lower: &str) -> bool {
+    if BENIGN_SHORT_CLASS_SEGMENTS.contains(&lower) {
+        return false;
     }
-    lower
-        .strip_suffix("otp")
-        .is_some_and(|prefix| prefix.len() >= 2)
+    QUALIFIED_SHORT_CLASSES.iter().any(|(class, min_prefix)| {
+        lower.match_indices(class).any(|(offset, _)| {
+            let prefix = &lower[..offset];
+            let rest = &lower[offset + class.len()..];
+            let trailer = SHORT_CLASS_TRAILERS.contains(&rest);
+            if prefix.is_empty() {
+                // The bare class is a class segment already; a leading class
+                // needs a trailer (`pinvalue`, not `pinned`).
+                trailer
+            } else {
+                prefix.len() >= *min_prefix && (rest.is_empty() || trailer)
+            }
+        })
+    })
 }
 
-/// Judge one lowercased segment given whether the preceding segments left a
-/// key-material context open.
-fn lowered_segment_is_credential(lower: &str, in_key_context: bool) -> bool {
-    if CREDENTIAL_CLASS_SEGMENTS.contains(&lower)
+/// Judge one lowercased segment. `reaches_key` is the segment's table from
+/// [`fill_key_material_tables`]; `in_key_context` says whether the preceding
+/// segments left a key-material context open.
+fn lowered_segment_is_credential(lower: &str, reaches_key: &[bool], in_key_context: bool) -> bool {
+    CREDENTIAL_CLASS_SEGMENTS.contains(&lower)
         || (lower.len() > "token".len() && lower.ends_with("token"))
         || CREDENTIAL_CLASS_STEMS
             .iter()
             .any(|stem| lower.contains(stem))
-        || has_qualified_short_class_suffix(lower)
-        || (in_key_context && reaches_key_after_intervening_words(lower))
-    {
-        return true;
-    }
-    CREDENTIAL_KEY_QUALIFIERS.iter().any(|qualifier| {
-        lower.match_indices(qualifier).any(|(offset, _)| {
-            reaches_key_after_intervening_words(&lower[offset + qualifier.len()..])
-        })
-    })
+        || has_qualified_short_class(lower)
+        || (in_key_context && reaches_key[0])
+        || qualifier_ends(lower).any(|end| reaches_key[end])
+}
+
+/// Whether a segment leaves a key-material context open for the NEXT
+/// segment: it ends in a qualifier, optionally followed by algorithm /
+/// encoding words (`private`, `awsaccess`, `privatersa`), or it continues an
+/// open context with only such words (`rsapem` after `private`).
+fn opens_or_continues_key_context(lower: &str, consumed: &[bool], in_key_context: bool) -> bool {
+    (in_key_context && consumed[0]) || qualifier_ends(lower).any(|end| consumed[end])
 }
 
 /// Credential-class classifier for metadata keys (issue #6619).
@@ -508,11 +536,27 @@ pub fn is_credential_class_metadata_key(key: &str) -> bool {
             heap = segment.to_ascii_lowercase();
             heap.as_str()
         };
-        sensitive = lowered_segment_is_credential(lower, in_key_context);
+        let mut reaches_stack = [false; CLASSIFIER_STACK_SEGMENT_BYTES + 1];
+        let mut consumed_stack = [false; CLASSIFIER_STACK_SEGMENT_BYTES + 1];
+        let mut reaches_heap;
+        let mut consumed_heap;
+        let (reaches_key, consumed): (&mut [bool], &mut [bool]) =
+            if lower.len() <= CLASSIFIER_STACK_SEGMENT_BYTES {
+                (
+                    &mut reaches_stack[..=lower.len()],
+                    &mut consumed_stack[..=lower.len()],
+                )
+            } else {
+                reaches_heap = vec![false; lower.len() + 1];
+                consumed_heap = vec![false; lower.len() + 1];
+                (&mut reaches_heap[..], &mut consumed_heap[..])
+            };
+        fill_key_material_tables(lower, reaches_key, consumed);
+        sensitive = lowered_segment_is_credential(lower, reaches_key, in_key_context);
         // A qualifier (alone or as a segment suffix) opens the key-material
         // context; algorithm / encoding words keep it open; anything else
         // closes it.
-        in_key_context = opens_or_continues_key_context(lower, in_key_context);
+        in_key_context = opens_or_continues_key_context(lower, consumed, in_key_context);
     });
     sensitive
 }

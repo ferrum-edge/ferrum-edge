@@ -335,10 +335,13 @@ credential-class word (`session`, `sessions`, `sess`, `sessid`, `sessionid`,
 credential stem or a qualified compound (`usersession`, `dbpassword`,
 `dbpwd`, `gpgpassphrase`, `idjwt`, `requestsignature`, `assertion`,
 `clientassertion`, `csrfvalue`, `totpseed`, `hsmpin`, `otpcode`, `mfasecret`),
-ends in `pin`/`pins` after a qualifier of at least three letters (`vendorpin`;
-ordinary words such as `spin` and `hairpin` stay visible), ends in `otp`
-after a qualifier (`smsotp`), or ends in `token` after a qualifier
-(`accesstoken`). Key material counts when a
+contains `jws`/`jwe`, contains a short class (`pin`, `sid`, `otp`) inside a
+qualified compound, meaning after a qualifier of at least three letters (two
+for `otp`) and/or before a listed trailer such as `value`, `code`, `id` or
+`hash` (`vendorpin`, `vendorpinvalue`, `pinnumber`, `usersid`, `smsotpcode`;
+ordinary words such as `spin`, `hairpin`, `inside` and `footprint` stay
+visible), or ends in `token` after a qualifier (`accesstoken`). Matching is
+linear in the key length. Key material counts when a
 key-material qualifier (`private`, `access`, `secret`, `signing`, `session`,
 `client`, `master`, `encryption`, `decryption`, `ssh`, `pgp`, `gpg`, `hmac`,
 `jwt`) reaches `key`/`keys`. Algorithm or encoding words such as `rsa`,
