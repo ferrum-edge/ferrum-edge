@@ -1314,6 +1314,10 @@ enum McpSessionQuotaKey {
     Anonymous(String),
 }
 
+/// A session's catalog and its refresh lock, projected together so callers can
+/// await without holding the session store's shard guard.
+type SessionCatalogLocks = (Arc<RwLock<McpCatalog>>, Arc<Mutex<()>>);
+
 #[derive(Clone)]
 struct DownstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
@@ -1828,13 +1832,12 @@ impl McpGateway {
     }
 
     fn upstream_session_id(&self, downstream_id: &str, server_id: &str) -> Option<String> {
-        self.downstream_session_clone(downstream_id)
-            .and_then(|session| {
-                session
-                    .upstream_sessions
-                    .get(server_id)
-                    .and_then(|upstream| upstream.upstream_session_id.clone())
-            })
+        self.session_store.get(downstream_id).and_then(|session| {
+            session
+                .upstream_sessions
+                .get(server_id)
+                .and_then(|upstream| upstream.upstream_session_id.clone())
+        })
     }
 
     fn set_route_to_server(
@@ -2531,9 +2534,25 @@ impl McpGateway {
             .map(|session| session.clone())
     }
 
+    /// The session's catalog and its refresh lock, cloned as two `Arc`s under
+    /// the shard guard so callers can await without deep-cloning the session.
+    fn session_catalog_locks(&self, downstream_session_id: &str) -> Option<SessionCatalogLocks> {
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| {
+                (
+                    Arc::clone(&session.catalog),
+                    Arc::clone(&session.catalog_refresh_lock),
+                )
+            })
+    }
+
     fn catalog_for_session(&self, downstream_session_id: &str) -> Option<Arc<RwLock<McpCatalog>>> {
-        self.downstream_session_clone(downstream_session_id)
-            .map(|session| session.catalog)
+        // Project the one field under the shard guard instead of deep-cloning
+        // the whole session (upstream-session map, client info) per call.
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| Arc::clone(&session.catalog))
     }
 
     async fn require_live_downstream_session(
@@ -2712,7 +2731,8 @@ impl McpGateway {
         // here, so concurrent first-touch of different sessions/servers proceeds
         // in parallel and a slow upstream does not block unrelated initializes.
         let init_lock = self
-            .downstream_session_clone(downstream_session_id)
+            .session_store
+            .get(downstream_session_id)
             .and_then(|session| {
                 session
                     .upstream_sessions
@@ -2721,15 +2741,16 @@ impl McpGateway {
             })
             .ok_or_else(|| "downstream MCP session is not initialized".to_string())?;
         let _guard = init_lock.lock().await;
-        if let Some(upstream_session_id) = self
-            .downstream_session_clone(downstream_session_id)
-            .and_then(|session| {
-                session
-                    .upstream_sessions
-                    .get(server_id)
-                    .filter(|upstream| upstream.initialized)
-                    .map(|upstream| upstream.upstream_session_id.clone())
-            })
+        if let Some(upstream_session_id) =
+            self.session_store
+                .get(downstream_session_id)
+                .and_then(|session| {
+                    session
+                        .upstream_sessions
+                        .get(server_id)
+                        .filter(|upstream| upstream.initialized)
+                        .map(|upstream| upstream.upstream_session_id.clone())
+                })
         {
             return Ok(upstream_session_id);
         }
@@ -2944,7 +2965,8 @@ impl McpGateway {
     }
 
     fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
-        self.downstream_session_clone(downstream_session_id)
+        self.session_store
+            .get(downstream_session_id)
             .map(|session| session.protocol_version.clone())
             .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
@@ -2954,13 +2976,14 @@ impl McpGateway {
         downstream_session_id: &str,
         server_id: &str,
     ) -> String {
-        self.downstream_session_clone(downstream_session_id)
+        self.session_store
+            .get(downstream_session_id)
             .and_then(|session| {
                 session
                     .upstream_sessions
                     .get(server_id)
                     .and_then(|upstream| upstream.protocol_version.clone())
-                    .or(Some(session.protocol_version))
+                    .or_else(|| Some(session.protocol_version.clone()))
             })
             .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
@@ -3719,17 +3742,17 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let session = self
-            .downstream_session_clone(downstream_session_id)
+        let (catalog_lock, refresh_lock) = self
+            .session_catalog_locks(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
-        let catalog_lock = &session.catalog;
+        let catalog_lock = &catalog_lock;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.is_stale(self.discovery.cache_ttl) {
@@ -3746,17 +3769,17 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
     ) -> Result<(), McpCatalogError> {
-        let session = self
-            .downstream_session_clone(downstream_session_id)
+        let (catalog_lock, refresh_lock) = self
+            .session_catalog_locks(downstream_session_id)
             .ok_or(McpCatalogError::SessionNotFound)?;
-        let catalog_lock = &session.catalog;
+        let catalog_lock = &catalog_lock;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
                 return Ok(());
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
             let catalog = catalog_lock.read().await;
             if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
@@ -3777,11 +3800,12 @@ impl McpGateway {
         if !self.resource_response_rewrite_possible(server_id) {
             return;
         }
-        let Some(session) = self.downstream_session_clone(downstream_session_id) else {
+        let Some((catalog_lock, refresh_lock)) = self.session_catalog_locks(downstream_session_id)
+        else {
             return;
         };
         {
-            let catalog = session.catalog.read().await;
+            let catalog = catalog_lock.read().await;
             if catalog
                 .resource_templates_last_attempted_at
                 .get(server_id)
@@ -3790,9 +3814,9 @@ impl McpGateway {
                 return;
             }
         }
-        let _guard = session.catalog_refresh_lock.lock().await;
+        let _guard = refresh_lock.lock().await;
         {
-            let mut catalog = session.catalog.write().await;
+            let mut catalog = catalog_lock.write().await;
             if catalog
                 .resource_templates_last_attempted_at
                 .get(server_id)
@@ -3813,7 +3837,7 @@ impl McpGateway {
                 ctx,
                 downstream_session_id,
                 server_id,
-                &session.catalog,
+                &catalog_lock,
             )
             .await
         {

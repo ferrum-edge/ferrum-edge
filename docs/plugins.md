@@ -2459,7 +2459,7 @@ With tracing absent, the request unsampled, or propagation-only mode, every atte
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode. Must be an `http`/`https` URL with a non-empty host. URL userinfo is rejected; diagnostics redact path/query |
+| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode. Must be an `http`/`https` URL with a non-empty host. URL userinfo is rejected; diagnostics redact path/query. `http://` is accepted without an opt-in because collectors usually run as a local or mesh-encrypted sidecar; span attributes and any `authorization`/`headers` value then travel in clear, so use `https://` for a collector across an untrusted network |
 | `service_name` | String | `ferrum-edge` | Service name in spans and resource attributes. Retained as configured; not bounded by `max_attribute_bytes` |
 | `deployment_environment` | String | _(none)_ | `deployment.environment` resource attribute. Retained as configured; not bounded by `max_attribute_bytes` |
 | `generate_trace_id` | Boolean | `true` | Generate trace IDs when no usable incoming context exists |
@@ -3988,7 +3988,7 @@ Delegates HTTP-family request authorization to [Open Policy Agent](https://www.o
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. |
+| `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. URL credentials, a query string, and a fragment are rejected; use `headers` for OPA auth. A base path is accepted and is prepended to `/v1/data/{policy_path}`. `http://` is accepted without an opt-in for the usual co-located OPA sidecar; the `input` document and any `headers` credential then travel in clear, so use `https://` for an OPA reached over an untrusted network. |
 | `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, a backslash, a space, or an ASCII control character, or contain empty, `.`, or `..` path segments. The normalized decision URL must still address the path under `{opa_host}/v1/data/`. |
 | `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured, nor can the gateway-owned `X-Ferrum-Hops` (any case, `_` or `-`), which the decision request carries itself. |
 | `timeout_ms` | Integer | `1000` | Requested per-decision timeout. Every positive value is accepted; the effective timeout is capped at `30000` ms. |
@@ -4792,7 +4792,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"azure_functions"` |
-| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections. An `http://` URL sends the request payload and any function key in clear; use it only for a local or otherwise protected function runtime |
 | `azure_function_key` | String | — | Function key for auth. Falls back to the `FERRUM_PLUGIN_SECRET_AZURE_FUNCTIONS_KEY` env var (never the ambient `AZURE_FUNCTIONS_KEY`, because the key is sent to the config-chosen `function_url`). The effective value is parsed into the `x-functions-key` field value at config load, so a credential that cannot form an HTTP field value (NUL, CR, LF, or any other control byte except horizontal tab) is rejected at admission instead of failing every invocation |
 
 **GCP Cloud Functions** — calls the HTTPS trigger URL:
@@ -4800,7 +4800,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"gcp_cloud_functions"` |
-| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections. An `http://` URL sends the request payload and any function key in clear; use it only for a local or otherwise protected function runtime |
 | `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to the `FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var (never the ambient `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN`). The assembled `Authorization: Bearer <token>` field value is parsed at config load under the same rule as `azure_function_key` |
 
 #### Common Parameters
@@ -7448,6 +7448,7 @@ Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy 
 | `provider.model` | string | optional | Embedding model name |
 | `provider.api_key_env` | string | optional | Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Any other variable (including every other `FERRUM_*` setting) is refused at admission. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
 | `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
+| `provider.allow_plaintext` | bool | `false` | Admit a cleartext `http://` `provider.endpoint` whose host is not a loopback IP literal. Without it, `http://` is accepted only for a loopback literal written as a dotted-quad `127.d.d.d` or `[::1]` (not the name `localhost`, which DNS overrides can repoint, and not shortened or expanded spellings), because the embedding call carries the provider API key. |
 | `builtins.*` | bool/object | all enabled when `builtins` is omitted | Built-in packs. Boolean shorthand enables/disables a pack; object form supports `enabled`, `examples_mode`, and `examples` |
 | `extraction.request_json_paths` | string[] | all supported request paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported request paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected request fields |
 | `extraction.response_json_paths` | string[] | all supported response paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported response paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected response fields |
@@ -7601,7 +7602,7 @@ config:
   on_error: reject
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
     api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
     request_timeout_ms: 5000
@@ -7616,7 +7617,7 @@ config:
   on_error: warn
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
     api_key_env: FERRUM_PLUGIN_SECRET_EMBEDDING_API_KEY
 ```
@@ -7631,7 +7632,7 @@ config:
     response: false
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   builtins:
     prompt_injection: false
@@ -7661,7 +7662,7 @@ config:
     response: false
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   builtins:
     indirect_prompt_injection: true
@@ -7674,7 +7675,7 @@ plugin_name: ai_semantic_firewall
 config:
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   builtins:
     prompt_injection:
@@ -7692,7 +7693,7 @@ plugin_name: ai_semantic_firewall
 config:
   provider:
     type: openai_compatible_embeddings
-    endpoint: http://localhost:8081/v1/embeddings
+    endpoint: http://127.0.0.1:8081/v1/embeddings
     model: text-embedding-3-small
   custom_rules:
     - id: block-project-falcon
@@ -7734,6 +7735,7 @@ Caches LLM responses keyed by family-correct prompts across Ferrum's recognized 
 | `semantic_embedding_api_key` | String (optional) | -- | Nonblank API key for the embedding endpoint. The final authorization header is validated at admission, retained as sensitive, and reused on requests. Invalid characters in either key or scheme fail admission with a value-redacted field error. Sent in `semantic_embedding_auth_header` with `semantic_embedding_auth_scheme` when configured. |
 | `semantic_embedding_auth_header` | String | provider default | Valid HTTP header name used for `semantic_embedding_api_key`. Defaults to `Authorization`, except Azure OpenAI uses `api-key` and Google Gemini uses `x-goog-api-key`. Must not be the gateway-owned `X-Ferrum-Hops` (any case, `_` or `-`), which the embedding call carries itself. |
 | `semantic_embedding_auth_scheme` | String | provider default | Valid HTTP header value prefix for the API key. Defaults to `Bearer`, except Azure OpenAI and Google Gemini send the raw key. Set to an empty string to send the raw key. |
+| `semantic_embedding_allow_plaintext` | Boolean | `false` | Admit a cleartext `http://` `semantic_embedding_endpoint` whose host is not a loopback IP literal. Without it, `http://` is accepted only for a loopback literal written as a dotted-quad `127.d.d.d` or `[::1]` (not the name `localhost`, which DNS overrides can repoint, and not shortened or expanded spellings), because the embedding call carries the API key. |
 | `semantic_similarity_threshold` | number | `0.95` | Minimum cosine similarity for a semantic cache hit. Must be > 0 and <= 1. |
 | `semantic_vector_max_candidates` | u64 | `16` | Number of nearest HNSW candidates to inspect (`ef_search` / `ef_construction`). Increase when semantic entries span many scopes. Must be positive. Hard maximum 1024. |
 | `semantic_embedding_timeout_ms` | u64 | `5000` | Positive per-request timeout in milliseconds for embedding calls. Embedding failures fall back to a normal cache miss. Also derives the bounded wait for outbound-embedding admission and singleflight coalescing (twice this value, capped at 30s), so a saturated or stalled embedding lane cannot stall a proxied request far past the budget configured here. |
@@ -8361,7 +8363,7 @@ plugins:
     config:
       provider:
         type: openai_compatible_embeddings
-        endpoint: http://localhost:8081/v1/embeddings
+        endpoint: http://127.0.0.1:8081/v1/embeddings
         model: text-embedding-3-small
   - plugin_name: ai_request_guard
     config:

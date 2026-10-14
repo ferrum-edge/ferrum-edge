@@ -19066,3 +19066,92 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
     ));
     assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
 }
+
+/// Cleartext embedding endpoints need the explicit opt-in unless the host is a
+/// loopback IP literal; the published schemas and runtime admission agree.
+#[test]
+fn ai_embedding_plaintext_opt_in_matches_schema_and_runtime() {
+    let yaml: Value = serde_yaml::from_str(include_str!("../../openapi.yaml"))
+        .expect("openapi.yaml parses without duplicate mapping keys");
+    let spec = serde_json::to_value(yaml).expect("openapi.yaml is JSON-compatible");
+
+    let cache = |endpoint: &str, opt_in: Option<bool>| {
+        let mut config = json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": endpoint,
+        });
+        if let Some(flag) = opt_in {
+            config["semantic_embedding_allow_plaintext"] = json!(flag);
+        }
+        config
+    };
+    let firewall = |endpoint: &str, opt_in: Option<bool>| {
+        let mut provider = json!({
+            "type": "openai_compatible_embeddings",
+            "endpoint": endpoint,
+        });
+        if let Some(flag) = opt_in {
+            provider["allow_plaintext"] = json!(flag);
+        }
+        json!({ "provider": provider })
+    };
+
+    // `http:` without `//` still parses as a remote http URL. The firewall's
+    // `endpoint` is a plain URI, so the plaintext rule alone decides it; the
+    // cache's enabled-mode endpoint pattern already requires `scheme://`.
+    for (endpoint, opt_in, valid) in [
+        ("http:embeddings.example.com/v1", None, false),
+        ("http:embeddings.example.com/v1", Some(false), false),
+        ("http:embeddings.example.com/v1", Some(true), true),
+        ("http:/embeddings.example.com/v1", None, false),
+        ("http:/embeddings.example.com/v1", Some(false), false),
+        ("http:/embeddings.example.com/v1", Some(true), true),
+        // Whitespace and control characters are refused outright, never
+        // trimmed or stripped into a different URL.
+        (" http://embeddings.example.com/v1", None, false),
+        (" http://embeddings.example.com/v1", Some(true), false),
+        ("ht\ttp://embeddings.example.com/v1", Some(true), false),
+        ("https://embeddings.example.com/v1\n", None, false),
+        (" https://embeddings.example.com/v1", None, false),
+    ] {
+        let config = firewall(endpoint, opt_in);
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", &config, valid);
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
+            valid,
+            "ai_semantic_firewall runtime admission for {config}"
+        );
+    }
+
+    let cases: [(&str, Option<bool>, bool); 11] = [
+        ("https://embeddings.example.com/v1", None, true),
+        ("http://127.0.0.1:9/v1", None, true),
+        ("http://127.0.0.1", None, true),
+        ("http://[::1]:9/v1", None, true),
+        // Loopback, but not the canonical literal spelling the schema names:
+        // both sides refuse it without the opt-in.
+        ("http://[0:0:0:0:0:0:0:1]:9/v1", None, false),
+        ("http://127.1:9/v1", None, false),
+        ("http://127.1:9/v1", Some(true), true),
+        ("http://embeddings.example.com/v1", Some(true), true),
+        ("http://embeddings.example.com/v1", None, false),
+        ("http://embeddings.example.com/v1", Some(false), false),
+        ("http://localhost:9/v1", None, false),
+    ];
+    for (endpoint, opt_in, valid) in cases {
+        let config = cache(endpoint, opt_in);
+        assert_component_validity(&spec, "AiSemanticCacheConfig", &config, valid);
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_cache", &config).is_ok(),
+            valid,
+            "ai_semantic_cache runtime admission for {config}"
+        );
+        let config = firewall(endpoint, opt_in);
+        assert_component_validity(&spec, "AiSemanticFirewallConfig", &config, valid);
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
+            valid,
+            "ai_semantic_firewall runtime admission for {config}"
+        );
+    }
+}
