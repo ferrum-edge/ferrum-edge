@@ -2352,3 +2352,19 @@ fn test_text_body_drops_credential_class_field_lines() {
         text.rendered
     );
 }
+
+/// Assignments with spacing, and debugger body-field names (`code`, `key`).
+#[test]
+fn test_text_body_drops_spaced_and_body_policy_field_lines() {
+    let plugin = capture_plugin();
+    let body = b"hsm_pin = 735103\ntotp_seed\t: 482914\nnote=fine code=482915\nkey=opaque-signing-material\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body, BodyKind::Text, 512);
+    for secret in ["735103", "482914", "482915", "opaque-signing-material"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}

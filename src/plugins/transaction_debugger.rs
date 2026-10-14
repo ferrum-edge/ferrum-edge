@@ -332,6 +332,21 @@ pub struct TransactionDebugger {
     schema: Option<Arc<SummarySchema>>,
 }
 
+/// The field name in front of every `=` / `:` on a text line, allowing
+/// whitespace around the delimiter (`hsm_pin = 1`, `totp_seed\t: 2`) and
+/// several assignments per line (`auth_method=jwt_auth hsm_pin=3`).
+fn assignment_field_names(line: &str) -> impl Iterator<Item = &str> {
+    line.match_indices(['=', ':'])
+        .filter_map(move |(offset, _)| {
+            let before = line[..offset].trim_end();
+            let start = before
+                .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+                .map_or(0, |index| index + 1);
+            let name = &before[start..];
+            (!name.is_empty()).then_some(name)
+        })
+}
+
 impl TransactionDebugger {
     pub fn new(config: &Value) -> Result<Self, String> {
         let object = config
@@ -769,10 +784,9 @@ impl TransactionDebugger {
             || is_sensitive_name_by_listed_rules(&lowered)
             // A `name=value` / `name: value` line whose field name is
             // credential-shaped (`hsm_pin=…`, `csrf: …`) is dropped too.
-            || line
-                .split(|ch: char| ch.is_whitespace() || matches!(ch, '&' | ';' | ','))
-                .filter_map(|field| field.split_once(['=', ':']))
-                .any(|(name, _)| !name.is_empty() && is_sensitive_header_name(name))
+            || assignment_field_names(line).any(|name| {
+                self.is_sensitive_body_key(name) || is_sensitive_header_name(name)
+            })
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
             || lowered.contains("eyj")
