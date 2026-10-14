@@ -50,10 +50,10 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
 
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
-/// Bounds below-cap full-map scans under high frame rates. Over-cap pressure
-/// still triggers an immediate idle-key reclaim (no cooldown), but live
-/// budgets are never force-evicted — hard cardinality is enforced by atomic
-/// admission reservation.
+/// Single-flights full-map idle sweeps, below and above the cap, to at most one
+/// per cooldown window under high frame rates. Over-cap capacity is still
+/// enforced on every frame: live budgets are never force-evicted, and hard
+/// cardinality is enforced by atomic admission reservation.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 
 pub struct WsRateLimiting {
@@ -381,12 +381,25 @@ impl WsRateLimiting {
         let tracked_keys = self.limiter.tracked_keys_count();
         let over_capacity = tracked_keys > MAX_STATE_ENTRIES;
 
-        // Over-cap pressure immediately reclaims idle keys (no sample/cooldown
-        // gate). Live budgets are never force-evicted; previously unseen keys
-        // fail closed via atomic admission reservation.
+        // Over-cap pressure reclaims idle keys, single-flighted by the same
+        // once-per-cooldown CAS gate `udp_rate_limiting` uses, so concurrent
+        // frames cannot each run a full retain while the map is over the cap.
+        // Live budgets are never force-evicted; previously unseen keys fail
+        // closed via atomic admission reservation, so a frame that loses the
+        // gate still sees the capacity pressure.
         if over_capacity {
-            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
-            return self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
+            let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+            let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
+                && self
+                    .last_periodic_sweep_secs
+                    .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+                return self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
+            }
+            return true;
         }
 
         let periodic =
