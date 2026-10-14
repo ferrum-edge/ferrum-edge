@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Reproducible release builds and no persisted checkout tokens** (issues
+  #6574, #6581). The production `Dockerfile` builds its eBPF ELF with a dated
+  nightly (`EBPF_NIGHTLY_TOOLCHAIN`, currently `nightly-2026-09-30`) instead
+  of the floating `nightly` channel. The `Dockerfile` builds, the native
+  release builds, and the x86_64 GNU sysroot builder pass `cargo build
+  --locked`, so a stale `Cargo.lock` fails the build instead of being
+  re-resolved. Non-pushing `actions/checkout` steps set
+  `persist-credentials: false`, and `verify_workflow_permissions.py` rejects
+  a checkout that omits it. Jobs frozen by the trusted Cross policy are listed
+  and wait for a policy migration.
+- **BREAKING — HTTP/3 always percent-decodes `ctx.query_params`** (issue
+  #6580). HTTP/3 used to materialize the raw form (`%2Fadmin`) unless an
+  active plugin opted in through `requires_decoded_query_params()`, while
+  HTTP/1.1 and HTTP/2 always decoded (`/admin`). Built-in query consumers
+  already opted in or read the canonical query view, but a custom plugin that
+  authenticated or authorized on `ctx.query_params` without opting in could
+  decide differently for the same URL over HTTP/3, and the representation
+  also flipped with whichever other plugins were attached to the route. Every
+  frontend now decodes the same way. The `NEEDS_DECODED_QUERY_PARAMS`
+  capability bit and `RequestContext::materialize_query_params_raw()` are
+  removed; `requires_decoded_query_params()` remains only as the
+  query-predicate hint early route-total planning reads.
+
 - **BREAKING — `jwks_auth` `emit_mesh_request_principal_metadata` no longer
   makes authentication optional** (issue n/a, PR #6596). The flag used to double as Istio's
   permissive `RequestAuthentication` mode: when that `jwks_auth` was the only
@@ -161,6 +184,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   official `mongo:9` image starts on the `ubuntu-26.04` runner kernel.
 
 ### Fixed
+
+- **Plugin instances with a `priority_override` or trigger keep every
+  capability declaration** (issue #6606). The cache wrapper did not forward
+  `admits_authenticated_stream_principal`, `cors_uses_strict_origin_policy`
+  or `rejects_with_origin_response`, so a wrapped `mtls_auth` or
+  `spiffe_identity` instance on a kTLS TCP listener was refused at relay time
+  instead of staying on the buffered path, a wrapped strict `cors` instance
+  skipped the WebSocket-origin warning, and a wrapped cache plugin's origin
+  responses were tagged as gateway rejections. A unit test now fails when any
+  `Plugin` trait method lacks a wrapper forward.
 
 - **The fuzz workspace now builds the vendored `sqlx-core`** (issue #6583).
   `fuzz/Cargo.toml` patched every vendored crate except `sqlx-core`, so the

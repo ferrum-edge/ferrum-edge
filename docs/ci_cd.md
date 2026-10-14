@@ -3730,6 +3730,28 @@ and `permissions: { id-token: write, packages: write }` only for release and
 permissions** must allow read/write access (including `packages: write`) for
 those per-job grants to take effect.
 
+Checkouts do not leave that token behind. Every `actions/checkout` step that
+does not push sets `persist-credentials: false`. The action's default writes `GITHUB_TOKEN` to a
+credentials file under `$RUNNER_TEMP` that the checkout's `.git/config`
+includes, where later build steps, build scripts, and tests could read it or
+use it through git (#6581). The repository is public, so plain `git fetch` from `origin` needs no
+credential. The only `persist-credentials: true` checkouts belong to the
+scheduled or manual jobs that push with that token (`base-image-digest-refresh.yml`
+and the branch-pruning jobs in `prune-stale-prs.yml`).
+`.github/scripts/verify_workflow_permissions.py`, which runs in the `Tests`
+aggregate, rejects a checkout that omits the key, in workflows and in local
+composite actions under `.github/actions/`. It admits `true` only in a
+workflow started solely by `schedule` or `workflow_dispatch`, and refuses
+YAML-escaped checkout references.
+
+One set of checkouts still uses the action default. The trusted Cross policy
+freezes the bytes of these jobs, so a pull request cannot add the key: the
+`create-release`, `docker`, and `docker-ebpf` jobs in `release.yml` (the ARM64
+publication dependency contract), the `changes` relevance jobs of the six
+kind-based live suites, and the `ambient-host-udp-live` execution job. The
+verifier lists them in `POLICY_FROZEN_CHECKOUT_JOBS`. They change only through
+a reviewed policy migration.
+
 ### Secret Usage in Workflows
 
 The Docker Hub login steps use:
