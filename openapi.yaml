@@ -35795,13 +35795,16 @@ components:
           description: Action when PII is detected
         patterns:
           type: array
+          uniqueItems: true
+          maxItems: 8
           items:
             type: string
             enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: [ssn, credit_card, api_key, aws_key]
-          description: "Built-in patterns: ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban"
+          description: "Built-in patterns: ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban. Each name at most once."
         custom_patterns:
           type: array
+          maxItems: 256
           items:
             type: object
             additionalProperties: false
@@ -35813,7 +35816,7 @@ components:
               regex:
                 type: string
           default: []
-          description: "Custom {name, regex} patterns. Each entry accepts exactly these two members; an unknown member is fatal at construction, like an unknown top-level field. `regex` must not match the empty string — a zero-width rule would insert the redaction placeholder at every position — and `name` is bounded (maxLength, in characters) because it is substituted into redaction_placeholder."
+          description: "Custom {name, regex} patterns. Each entry accepts exactly these two members; an unknown member is fatal at construction, like an unknown top-level field. `regex` must not match the empty string — a zero-width rule would insert the redaction placeholder at every position — and `name` is bounded (maxLength, in characters) because it is substituted into redaction_placeholder. At most 256 entries."
         scan_fields:
           type: string
           enum: [content, all, mcp_arguments]
@@ -35828,13 +35831,13 @@ components:
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
-          description: "Template for redacted text. `{type}` is substituted with the matched pattern name; the RENDERED result must be at most 512 UTF-8 bytes, since every match re-emits it. Redaction output is additionally charged against a per-request growth allowance of four times the request body size (minimum 65536, maximum 67108864 bytes); an expanding policy that exhausts it fails the request closed with 413 rather than forwarding a partially redacted body."
+          description: "Template for redacted text. `{type}` is substituted with the matched pattern name; the RENDERED result must be at most 512 UTF-8 bytes, since every match re-emits it. Redaction output is additionally charged against a per-request growth allowance of four times the request body size (minimum 65536, maximum 67108864 bytes), measured on the JSON-escaped form, with live intermediate buffers bounded by the same allowance; an expanding policy that exhausts it fails the request closed with 413 rather than forwarding a partially redacted body."
         max_scan_bytes:
           type: integer
           minimum: 1
-          maximum: 9007199254740991
+          maximum: 67108864
           default: 1048576
-          description: "Maximum body size to scan; enforcing actions reject larger bodies instead of bypassing inspection. The supported domain is 1 to 9007199254740991 (2^53-1), the largest integer every JSON number representation holds exactly, so this component and the constructor reach the same verdict for every input. A mathematically integral value is accepted however it is spelled (1024 and 1024.0 alike); a fractional, negative, zero, or out-of-range value is rejected at construction rather than truncated."
+          description: "Maximum body size to scan; enforcing actions reject larger bodies instead of bypassing inspection. Hard ceiling 67108864 (64 MiB). A mathematically integral value is accepted however it is spelled (1024 and 1024.0 alike); a fractional, negative, zero, or out-of-range value is rejected at construction rather than truncated."
 
     AiPromptCompressorConfig:
       type: object
@@ -35942,13 +35945,16 @@ components:
           description: "Action when a violation is detected in the response body. Buffered SSE is parsed and redacted by complete event; content spanning events that cannot be safely rewritten is rejected. Live SSE requests are never re-buffered by this plugin."
         pii_patterns:
           type: array
+          uniqueItems: true
+          maxItems: 8
           items:
             type: string
             enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: []
-          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban)"
+          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban). Each name at most once."
         custom_pii_patterns:
           type: array
+          maxItems: 256
           items:
             type: object
             additionalProperties: false
@@ -35957,22 +35963,25 @@ components:
               name:
                 type: string
                 minLength: 1
-                description: Pattern identifier used in redaction placeholders and violation reports
+                maxLength: 128
+                description: Pattern identifier used in redaction placeholders and violation reports (at most 128 characters)
               regex:
                 type: string
                 minLength: 1
-                description: Regular expression pattern to match
+                description: Regular expression pattern to match. Must not match the empty string; a zero-width rule is rejected at construction.
           default: []
-          description: "Custom PII {name, regex} patterns for domain-specific detection"
+          description: "Custom PII {name, regex} patterns for domain-specific detection. At most 256 entries. A regex that matches the empty string is rejected at construction, and a zero-width match produced at runtime (for example by a bare word-boundary assertion) makes redaction fail closed."
         blocked_phrases:
           type: array
+          maxItems: 1024
           items:
             type: string
             minLength: 1
           default: []
-          description: Exact phrases to block in response content (case-insensitive). Literal values are never exposed in placeholders, metadata, logs, or reject bodies; bounded positional rule IDs are used instead.
+          description: Exact phrases to block in response content (case-insensitive). Literal values are never exposed in placeholders, metadata, logs, or reject bodies; bounded positional rule IDs are used instead. At most 1024 entries.
         blocked_patterns:
           type: array
+          maxItems: 256
           items:
             type: object
             additionalProperties: false
@@ -35981,13 +35990,14 @@ components:
               name:
                 type: string
                 minLength: 1
-                description: Pattern identifier for violation reports
+                maxLength: 128
+                description: Pattern identifier for violation reports (at most 128 characters)
               regex:
                 type: string
                 minLength: 1
-                description: Regular expression pattern to match
+                description: Regular expression pattern to match. Must not match the empty string; a zero-width rule is rejected at construction.
           default: []
-          description: "Custom {name, regex} patterns for blocking arbitrary content in responses"
+          description: "Custom {name, regex} patterns for blocking arbitrary content in responses. At most 256 entries; the empty-match rule is the same as custom_pii_patterns."
         scan_fields:
           type: string
           enum: [content, all]
@@ -35996,14 +36006,16 @@ components:
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
-          description: "Template for redacted text. {type} is replaced with the pattern name"
+          description: "Template for redacted text. {type} is replaced with the pattern name; the RENDERED result must be at most 512 UTF-8 bytes, since every match re-emits it. Structured (JSON, SSE, gRPC) redaction output is additionally charged against a per-response growth allowance of four times the response body size (minimum 65536, maximum 67108864 bytes), never more than the room the response's retained-body ceiling leaves above the body. Growth is measured on the JSON-escaped form, and live intermediate buffers are bounded by the same allowance, so a rewrite can be refused even when its final net growth would fit; an expanding policy that exhausts it fails closed rather than delivering a partially redacted body."
         max_scan_bytes:
           type: integer
           minimum: 1
+          maximum: 67108864
           default: 1048576
           description: >-
             Maximum governed buffered response size, including the aggregate
-            decoded/decompressed native-gRPC payload across frames.
+            decoded/decompressed native-gRPC payload across frames. Hard
+            ceiling 67108864 (64 MiB).
             Reject/redact and structural rules fail closed above this limit;
             warn-only content rules record a bounded warning and pass through.
         require_json:
