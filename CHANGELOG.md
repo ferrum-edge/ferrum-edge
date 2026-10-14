@@ -180,23 +180,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — `ai_response_guard` and `ai_prompt_shield` bound their
-  pattern and scan configuration** (issue #6608). `ai_response_guard` now
-  refuses a `custom_pii_patterns` or `blocked_patterns` regex that matches
-  the empty string (parity with `ai_prompt_shield`), caps pattern names at
-  128 characters and each rendered `redaction_placeholder` at 512 bytes, and
-  charges structured (JSON, SSE, gRPC) redaction against a per-response
-  growth allowance, so sequential patterns that rewrite each other's
-  placeholders fail closed instead of compounding. A zero-width match
-  produced at run time also fails closed. Both plugins cap `max_scan_bytes`
-  at 64 MiB and custom regex lists at 256 entries (`blocked_phrases` at 1024).
-  Both refuse a repeated built-in pattern name. Re-serialized tool-argument
-  documents are charged against the same allowance, including JSON escaping
-  growth. Growth is charged on the JSON-escaped form of every rewritten
-  string, live intermediate buffers are bounded by the allowance, the
-  allowance never exceeds the room the response's retained-body window leaves,
-  and a refused SSE rewrite fails closed instead of being treated as a no-op.
-
 - **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
   `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
   clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging

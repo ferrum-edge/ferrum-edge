@@ -50,19 +50,6 @@ side of each collision, either through the Admin API of a still-running
 
 Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
 
-### AI guard pattern and scan bounds (#6608, PR #6640)
-
-`ai_response_guard` and `ai_prompt_shield` now refuse at admission:
-- a custom regex that matches the empty string;
-- a pattern `name` over 128 characters;
-- a rendered `redaction_placeholder` over 512 bytes;
-- a repeated built-in pattern name;
-- more than 256 custom regex patterns per list (1024 `blocked_phrases`);
-- a `max_scan_bytes` above 67108864 (64 MiB).
-
-Structured redaction that would grow a response past its allowance now fails closed (`502` for the response guard, `413` for the prompt shield) instead of delivering an oversized rewrite. Adjust configs that exceed these bounds before upgrading.
-
-
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
