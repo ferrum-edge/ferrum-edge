@@ -2107,3 +2107,77 @@ fn wss_source_diagnostics_distinguish_io_invalid_source_and_size() {
         }
     }
 }
+
+/// Issue #6613: a failed connection is charged exactly one `reconnect_delay`
+/// before the next attempt (not `reconnect_delay` + `retry_delay`), and nothing
+/// after the final attempt. `127.0.0.1:1` refuses immediately, so the time to
+/// the discard is the back-off ladder alone.
+#[tokio::test]
+async fn ws_logging_connect_failures_charge_one_backoff_and_none_after_the_last_attempt() {
+    let _ws_bucket = ws_bucket_guard().await;
+
+    // max_retries 0: a single doomed attempt must be discarded without any
+    // trailing reconnect sleep (previously a full `reconnect_delay_ms`).
+    let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 600000,
+            "max_retries": 0,
+            "reconnect_delay_ms": 4000,
+            "connect_timeout_ms": 100,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let started = std::time::Instant::now();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_ws_sink_loss(SinkLossReason::BatchDiscard, discarded_before + 1).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "no back-off may follow the final attempt; discard took {elapsed:?}"
+    );
+    drop(plugin);
+
+    // max_retries 1: exactly one reconnect back-off between the two attempts.
+    // The old ladder slept reconnect_delay inside connect() on BOTH attempts
+    // and retry_delay on top (~7.0 s here), and a fix that only dropped the
+    // trailing sleep would still take ~5.5 s; the fixed ladder takes ~1.5 s.
+    // The 100 ms connect timeout keeps the bound valid on hosts that drop,
+    // rather than refuse, connections to port 1.
+    let discarded_before = dropped_total("ws_logging", SinkLossReason::BatchDiscard);
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 600000,
+            "max_retries": 1,
+            "retry_delay_ms": 4000,
+            "reconnect_delay_ms": 1500,
+            "connect_timeout_ms": 100,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let started = std::time::Instant::now();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_ws_sink_loss(SinkLossReason::BatchDiscard, discarded_before + 1).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1400),
+        "the reconnect back-off between attempts must still be honored; discard took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2900),
+        "reconnect and retry delays must not both be charged; discard took {elapsed:?}"
+    );
+    drop(plugin);
+}
