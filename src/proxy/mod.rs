@@ -12981,6 +12981,12 @@ impl ProxyState {
         if let Err(errs) = config.validate_unique_mtls_dns_identities() {
             errors.extend(errs);
         }
+        // `ConsumerIndex` resolves a shared keyauth key, basicauth username,
+        // or exact mTLS identity last-wins; refuse the snapshot or delta
+        // instead of authenticating it as the wrong Consumer (issue #6572).
+        if let Err(errs) = config.validate_unique_consumer_auth_credentials() {
+            errors.extend(errs);
+        }
         if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
             errors.extend(errs);
         }
