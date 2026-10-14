@@ -2341,9 +2341,9 @@ async fn test_transaction_debugger_redacts_credential_class_headers_in_both_dire
 #[test]
 fn test_text_body_drops_credential_class_field_lines() {
     let plugin = capture_plugin();
-    let body = b"hsm_pin=735102\ntotp_seed=482913\ncsrf: opaque-value\nauth_method=jwt_auth\n";
+    let body = b"hsm_pin=735102\ntotp_seed=482913\ncsrf: opaque-value\nauth_method=jwt_auth hsm_pin=600114\nauth_method=jwt_auth\n";
     let text = plugin.render_captured_body(body, BodyKind::Text, 512);
-    for secret in ["735102", "482913", "opaque-value"] {
+    for secret in ["735102", "482913", "opaque-value", "600114"] {
         assert!(!text.rendered.contains(secret), "{}", text.rendered);
     }
     assert!(

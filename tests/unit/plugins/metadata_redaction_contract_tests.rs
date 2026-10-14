@@ -718,6 +718,8 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "access_tokens",
     "refreshTokens",
     "x-access-tokens",
+    "refresh_v2_tokens",
+    "access_opaque_tokens",
     "mesh.signingkeybase64url",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",

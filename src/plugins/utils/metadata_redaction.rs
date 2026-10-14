@@ -437,17 +437,14 @@ const CREDENTIAL_TOKEN_QUALIFIERS: &[&str] = &[
     "security", "secret", "client", "service", "personal",
 ];
 
-/// A plural `tokens` naming credentials: a credential qualifier directly in
-/// front of it, in the same segment or as the previous segment.
-fn is_credential_token_plural(lower: &str, previous: &str) -> bool {
+/// A plural `tokens` naming credentials: a credential qualifier earlier in
+/// the key (`refresh_v2_tokens`) or joined in front of it (`accesstokens`).
+fn is_credential_token_plural(lower: &str, in_token_credential_context: bool) -> bool {
     lower.strip_suffix("tokens").is_some_and(|prefix| {
-        if prefix.is_empty() {
-            CREDENTIAL_TOKEN_QUALIFIERS.contains(&previous)
-        } else {
-            CREDENTIAL_TOKEN_QUALIFIERS
+        in_token_credential_context
+            || CREDENTIAL_TOKEN_QUALIFIERS
                 .iter()
-                .any(|qualifier| prefix.ends_with(qualifier))
-        }
+                .any(|qualifier| !prefix.is_empty() && prefix.ends_with(qualifier))
     })
 }
 
@@ -785,7 +782,7 @@ fn classify_credential_class_segments(key: &str) -> bool {
     let mut in_key_context = false;
     let mut previous_is_pass = false;
     let mut in_mfa_context = false;
-    let mut previous_lower = String::new();
+    let mut in_token_credential_context = false;
     for_each_metadata_key_segment(key, |segment| {
         if sensitive {
             return;
@@ -818,9 +815,8 @@ fn classify_credential_class_segments(key: &str) -> bool {
             || lower
                 .find("mfa")
                 .is_some_and(|offset| names_mfa_material(&lower[offset + "mfa".len()..]));
-        sensitive = sensitive || is_credential_token_plural(lower, previous_lower.as_str());
-        previous_lower.clear();
-        previous_lower.push_str(lower);
+        sensitive = sensitive || is_credential_token_plural(lower, in_token_credential_context);
+        in_token_credential_context |= CREDENTIAL_TOKEN_QUALIFIERS.contains(&lower);
         previous_is_pass = lower == "pass";
         in_mfa_context |= lower.contains("mfa");
         // Once a qualifier appears, the context stays open for the rest of

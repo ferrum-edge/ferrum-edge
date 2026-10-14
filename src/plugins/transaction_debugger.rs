@@ -770,8 +770,9 @@ impl TransactionDebugger {
             // A `name=value` / `name: value` line whose field name is
             // credential-shaped (`hsm_pin=…`, `csrf: …`) is dropped too.
             || line
-                .split_once(['=', ':'])
-                .is_some_and(|(name, _)| is_sensitive_header_name(name.trim()))
+                .split(|ch: char| ch.is_whitespace() || matches!(ch, '&' | ';' | ','))
+                .filter_map(|field| field.split_once(['=', ':']))
+                .any(|(name, _)| !name.is_empty() && is_sensitive_header_name(name))
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
             || lowered.contains("eyj")
