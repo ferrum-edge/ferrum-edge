@@ -15,7 +15,7 @@ fn new_otel(config: &serde_json::Value) -> OtelTracing {
     let mut merged = config.clone();
     if merged.get("endpoint").is_none() {
         merged["endpoint"] =
-            serde_json::Value::String("http://localhost:4318/v1/traces".to_string());
+            serde_json::Value::String("http://127.0.0.1:4318/v1/traces".to_string());
     }
     OtelTracing::new_with_http_client(&merged, PluginHttpClient::default()).unwrap()
 }
@@ -289,7 +289,7 @@ async fn test_otel_tracing_rejects_non_bool_generate_trace_id() {
 async fn test_otel_tracing_rejects_invalid_custom_header_name() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "headers": {
                 "bad header": "value"
             }
@@ -306,7 +306,7 @@ async fn test_otel_tracing_rejects_invalid_custom_header_name() {
 async fn test_otel_tracing_rejects_non_string_custom_header_value() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "headers": {
                 "x-tenant-id": 42
             }
@@ -1308,7 +1308,7 @@ async fn test_otel_tracing_deployment_environment() {
 async fn test_otel_tracing_rejects_unknown_config_keys() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "buffer_capcity": 1
         }),
         PluginHttpClient::default(),
@@ -1338,7 +1338,7 @@ async fn test_otel_tracing_rejects_explicit_null_properties() {
         "root_sampling",
         "include_url_path",
     ] {
-        let mut config = json!({"endpoint": "http://localhost:4318/v1/traces"});
+        let mut config = json!({"endpoint": "http://127.0.0.1:4318/v1/traces"});
         config
             .as_object_mut()
             .expect("config object")
@@ -1383,7 +1383,7 @@ async fn test_otel_tracing_validates_exporter_controls_without_an_endpoint() {
 async fn test_otel_tracing_rejects_out_of_range_batch_size() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "batch_size": 0
         }),
         PluginHttpClient::default(),
@@ -2230,7 +2230,7 @@ async fn test_workload_metrics_zipkin_sets_error_tag_on_failure() {
 async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling_ratio": 0.01
         }),
         PluginHttpClient::default(),
@@ -2244,7 +2244,7 @@ async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
 
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling": "always_off",
             "root_sampling_ratio": 0.5
         }),
@@ -2259,7 +2259,7 @@ async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
 
     OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling": "ratio",
             "root_sampling_ratio": 0.01
         }),
@@ -2269,7 +2269,7 @@ async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
 
     OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling": "always_on"
         }),
         PluginHttpClient::default(),
@@ -2505,7 +2505,7 @@ async fn test_otel_tracing_rejects_unusable_authorization_header_values() {
         "Bearer bad\u{0}value",
     ] {
         let error = OtelTracing::new_with_http_client(
-            &json!({"endpoint": "http://localhost:4318/v1/traces", "authorization": value}),
+            &json!({"endpoint": "http://127.0.0.1:4318/v1/traces", "authorization": value}),
             PluginHttpClient::default(),
         )
         .err()
@@ -2529,7 +2529,7 @@ async fn test_otel_tracing_rejects_unusable_authorization_header_values() {
 
     // Ordinary bearer values stay admitted.
     OtelTracing::new_with_http_client(
-        &json!({"endpoint": "http://localhost:4318/v1/traces", "authorization": "Bearer abc.def"}),
+        &json!({"endpoint": "http://127.0.0.1:4318/v1/traces", "authorization": "Bearer abc.def"}),
         PluginHttpClient::default(),
     )
     .expect("a valid bearer value stays admitted");
@@ -2797,7 +2797,7 @@ fn startup_diagnostics_withhold_sampling_values_and_header_keys() {
             "diagnostic-secret-5594",
         ),
     ] {
-        let mut config = json!({"endpoint": "http://localhost:4318/v1/traces"});
+        let mut config = json!({"endpoint": "http://127.0.0.1:4318/v1/traces"});
         config
             .as_object_mut()
             .unwrap()
@@ -2810,5 +2810,29 @@ fn startup_diagnostics_withhold_sampling_values_and_header_keys() {
         assert!(rendered.contains(field), "{rendered}");
         assert!(!rendered.contains(hidden), "{rendered}");
         assert!(!rendered.contains("987654321"), "{rendered}");
+    }
+}
+
+#[tokio::test]
+async fn test_otel_tracing_cleartext_endpoint_needs_opt_in_off_loopback() {
+    let build =
+        |config: Value| OtelTracing::new_with_http_client(&config, PluginHttpClient::default());
+
+    let err = build(json!({"endpoint": "http://collector.internal:4318/v1/traces"}))
+        .err()
+        .expect("non-loopback http:// must be refused without the opt-in");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+    let err = build(json!({"endpoint": "http://localhost:4318/v1/traces"}))
+        .err()
+        .expect("a hostname is never a loopback literal");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+
+    for config in [
+        json!({"endpoint": "http://collector.internal:4318/v1/traces", "allow_plaintext": true}),
+        json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
+        json!({"endpoint": "http://[::1]:4318/v1/traces"}),
+        json!({"endpoint": "https://collector.internal/v1/traces"}),
+    ] {
+        assert!(build(config.clone()).is_ok(), "{config} must be admitted");
     }
 }

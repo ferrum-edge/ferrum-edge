@@ -115,6 +115,7 @@ use super::utils::query::{QueryAmbiguity, canonical_query_for_policy, has_valid_
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const ALLOWED_CONFIG_FIELDS: &[&str] = &[
@@ -138,6 +139,7 @@ const ALLOWED_CONFIG_FIELDS: &[&str] = &[
     "max_response_body_bytes",
     "on_error",
     "error_status_code",
+    "allow_plaintext",
 ];
 
 /// Recognized string-typed provider fields.
@@ -628,6 +630,7 @@ impl ServerlessFunction {
         let configured_function_url = match config.get("function_url") {
             Some(Value::String(url)) => {
                 validate_function_url(url)?;
+                screen_configured_plaintext(config, "function_url", url)?;
                 Some(url.clone())
             }
             None => None,
@@ -1412,6 +1415,8 @@ const MAX_AWS_QUALIFIER_CHARS: usize = 128;
 /// cannot form an HTTP header (issue #5189) is a deterministic operator error
 /// whichever provider is active.
 fn validate_supplied_provider_fields(config: &Value) -> Result<(), String> {
+    // Typed whenever supplied, even when no configured URL uses it.
+    allow_plaintext_config(config)?;
     for field in PROVIDER_STRING_CONFIG_FIELDS {
         if let Some(value) = config.get(*field)
             && !value.is_string()
@@ -1421,6 +1426,7 @@ fn validate_supplied_provider_fields(config: &Value) -> Result<(), String> {
     }
     if let Some(endpoint) = optional_config_string(config, "aws_endpoint_url")? {
         validate_aws_endpoint_url(&endpoint)?;
+        screen_configured_plaintext(config, "aws_endpoint_url", &endpoint)?;
     }
     if let Some(function_name) = optional_config_string(config, "aws_function_name")? {
         validate_aws_function_name(&function_name)?;
@@ -1558,6 +1564,37 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Refuse a configured cleartext `function_url` / `aws_endpoint_url` unless its
+/// host is a loopback IP literal or the config sets `allow_plaintext: true`.
+/// The invocation carries the request payload and the provider credential
+/// (function key, bearer token, or SigV4 signature). The trusted
+/// `AWS_LAMBDA_ENDPOINT_URL` environment fallback is not screened here.
+fn screen_configured_plaintext(config: &Value, field: &str, url: &str) -> Result<(), String> {
+    let allow_plaintext = allow_plaintext_config(config)?;
+    let Ok(parsed) = Url::parse(url) else {
+        return Ok(());
+    };
+    if parsed.scheme() == "http"
+        && !allow_plaintext
+        && !is_loopback_ip_literal_endpoint(url, parsed.host())
+    {
+        return Err(format!(
+            "serverless_function: `{field}` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `allow_plaintext: true`"
+        ));
+    }
+    Ok(())
+}
+
+/// `allow_plaintext`: omitted means `false`; any non-boolean is refused (an
+/// explicit `null` never reaches here — the constructor refuses nulls first).
+fn allow_plaintext_config(config: &Value) -> Result<bool, String> {
+    match config.get("allow_plaintext") {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err("serverless_function: `allow_plaintext` must be a boolean".to_string()),
+    }
 }
 
 fn validate_aws_endpoint_url(url: &str) -> Result<(), String> {

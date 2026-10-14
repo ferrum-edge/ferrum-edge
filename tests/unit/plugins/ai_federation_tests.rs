@@ -9554,3 +9554,282 @@ async fn provider_call_carries_the_proxy_hop_count() {
         assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
     }
 }
+
+/// Issue #6623: federation normalizes provider usage with the same token
+/// categories the native metering paths count.
+#[test]
+fn test_normalized_usage_includes_cache_thinking_and_tool_use_tokens() {
+    let anthropic = json!({
+        "id": "msg_cache",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "cached"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 12,
+            "cache_creation_input_tokens": 8,
+            "cache_read_input_tokens": 80,
+            "output_tokens": 20
+        }
+    });
+    let (normalized, prompt, completion, total) = test_helpers::normalize_response_test(
+        "anthropic",
+        200,
+        &serde_json::to_vec(&anthropic).unwrap(),
+        "claude-sonnet-4-20250514",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (100, 20, 120));
+    assert_eq!(normalized["usage"]["prompt_tokens"], 100);
+
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "thought"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": 3,
+            "totalTokenCount": 58
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (13, 45, 58));
+
+    let bedrock = json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+        "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 5,
+            "outputTokens": 6,
+            "cacheReadInputTokens": 400,
+            "cacheWriteInputTokens": 30,
+            "totalTokens": 441
+        }
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "aws_bedrock",
+        200,
+        &serde_json::to_vec(&bedrock).unwrap(),
+        "anthropic.claude-3-sonnet",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (435, 6, 441));
+
+    // A malformed category is refused like a malformed base count.
+    let mut malformed = anthropic.clone();
+    malformed["usage"]["cache_read_input_tokens"] = json!("lots");
+    assert!(
+        test_helpers::normalize_response_test(
+            "anthropic",
+            200,
+            &serde_json::to_vec(&malformed).unwrap(),
+            "claude-sonnet-4-20250514",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn test_normalized_usage_nullable_cache_and_zero_omitted_gemini_base() {
+    let anthropic = json!({
+        "id": "msg_null",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 12,
+            "cache_creation_input_tokens": null,
+            "cache_read_input_tokens": null,
+            "output_tokens": 20
+        }
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "anthropic",
+        200,
+        &serde_json::to_vec(&anthropic).unwrap(),
+        "claude-sonnet-4-20250514",
+    )
+    .expect("nullable cache counters are absence, not a malformed response");
+    assert_eq!((prompt, completion, total), (12, 20, 32));
+
+    // A thinking-only completion omits the zero `candidatesTokenCount`.
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 50
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (10, 40, 50));
+}
+
+#[test]
+fn test_normalized_usage_clamps_one_sided_low_totals() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "toolUsePromptTokenCount": 1000,
+            "totalTokenCount": 1
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (normalized, prompt, _, _) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    // The low provider total is inconsistent with the reported prompt while the
+    // completion side is unknown, so no complete total is published.
+    assert_eq!(prompt, 1010);
+    assert!(normalized["usage"].get("total_tokens").is_none());
+}
+
+#[test]
+fn test_normalized_bedrock_rejects_categories_without_base() {
+    let bedrock = json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+        "stopReason": "end_turn",
+        "usage": {"cacheReadInputTokens": 1000, "outputTokens": 5, "totalTokens": 5}
+    });
+    assert!(
+        test_helpers::normalize_response_test(
+            "aws_bedrock",
+            200,
+            &serde_json::to_vec(&bedrock).unwrap(),
+            "anthropic.claude-3-sonnet",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn test_normalized_gemini_nullable_counters_are_absence() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": null,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": null,
+            "totalTokenCount": 50
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .expect("null counters are unset, not malformed");
+    assert_eq!((prompt, completion, total), (10, 40, 50));
+}
+
+#[test]
+fn test_normalized_gemini_accepts_the_completion_alternate() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "completionTokenCount": 5,
+            "thoughtsTokenCount": 40
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (10, 45, 55));
+}
+
+#[test]
+fn test_normalized_gemini_rejects_a_malformed_completion_alternate() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "completionTokenCount": "bad"
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    assert!(
+        test_helpers::normalize_response_test(
+            "google_gemini",
+            200,
+            &serde_json::to_vec(&gemini).unwrap(),
+            "gemini-2.0-flash",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn test_normalized_anthropic_rejects_overflow_without_an_input_base() {
+    let anthropic = json!({
+        "id": "msg_overflow",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "x"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "cache_creation_input_tokens": u64::MAX,
+            "cache_read_input_tokens": 1,
+            "output_tokens": 5
+        }
+    });
+    assert!(
+        test_helpers::normalize_response_test(
+            "anthropic",
+            200,
+            &serde_json::to_vec(&anthropic).unwrap(),
+            "claude-sonnet-4-20250514",
+        )
+        .is_err()
+    );
+}

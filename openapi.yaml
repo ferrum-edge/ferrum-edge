@@ -23185,6 +23185,19 @@ components:
                 pattern: '^\s*[Rr][Aa][Tt][Ii][Oo]\s*$'
           then:
             required: [root_sampling_ratio]
+        # Cleartext to anything but a loopback IP literal needs the opt-in.
+        - if:
+            required: [endpoint]
+            properties:
+              endpoint:
+                pattern: '^\s*[hH][tT][tT][pP]:'
+                not:
+                  pattern: '^\s*[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|\s*$)'
+          then:
+            required: [allow_plaintext]
+            properties:
+              allow_plaintext:
+                const: true
       properties:
         endpoint:
           type: string
@@ -23193,7 +23206,16 @@ components:
           description: >-
             OTLP/HTTP collector endpoint. Omit for propagation-only mode. Must be an
             http or https URL with a non-empty host. URL userinfo is rejected;
-            path/query credentials are redacted in diagnostics.
+            path/query credentials are redacted in diagnostics. An http:// URL is
+            admitted only to a loopback IP literal written as a dotted-quad
+            127.d.d.d or [::1] unless allow_plaintext is true.
+        allow_plaintext:
+          type: boolean
+          default: false
+          description: >-
+            Admit an http:// endpoint whose host is not a loopback IP literal.
+            Spans and any `authorization` / `headers` credential then cross the
+            network in clear.
         service_name:
           type: string
           minLength: 1
@@ -26837,6 +26859,19 @@ components:
                   - type: "null"
                   - $ref: '#/components/schemas/WorkloadMetricsConfig/$defs/provider'
       properties:
+        allow_plaintext:
+          type: boolean
+          default: false
+          description: >-
+            Admit a cleartext http:// tracing provider URL (Zipkin url, Datadog
+            agent_url, Lightstep collector_url, OpenTelemetry endpoint) whose
+            host is not a loopback IP literal written as a dotted-quad
+            127.d.d.d or [::1]. Without it, such a provider fails construction
+            when its exporter is built. Mesh injection writes `true` whenever a
+            translated Istio Telemetry / MeshConfig provider uses http://, so
+            in-cluster collectors keep working and the cleartext posture stays
+            visible in the injected config. This cross-field rule is enforced
+            at construction only.
         node_id:
           type: string
           description: Mesh node identifier attached to workload metadata.
@@ -28475,6 +28510,19 @@ components:
       required: [opa_host, policy_path]
       not:
         required: [fail_open, fail_closed]
+      # Cleartext to anything but a loopback IP literal needs the opt-in.
+      if:
+        required: [opa_host]
+        properties:
+          opa_host:
+            pattern: '^[hH][tT][tT][pP]:'
+            not:
+              pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+      then:
+        required: [allow_plaintext]
+        properties:
+          allow_plaintext:
+            const: true
       description: |
         Plugin: opa — Delegates HTTP request authorization to Open Policy
         Agent's Data API in the `authorize` phase. The gateway POSTs
@@ -28496,7 +28544,18 @@ components:
             fragment is rejected; a base path is accepted and is prepended to
             /v1/data/{policy_path}. Operational diagnostics record only the
             endpoint origin (scheme, host, port), never the configured path.
-          example: "http://opa.opa-system.svc.cluster.local:8181"
+            An http:// URL is admitted only to a loopback IP literal written
+            as a dotted-quad 127.d.d.d or [::1] unless allow_plaintext is
+            true, because the decision and any `headers` credential travel
+            on this call.
+          example: "https://opa.opa-system.svc.cluster.local:8181"
+        allow_plaintext:
+          type: boolean
+          default: false
+          description: >-
+            Admit an http:// opa_host whose host is not a loopback IP literal.
+            The authorization input, the decision, and any `headers` credential
+            then cross the network in clear.
         policy_path:
           type: string
           minLength: 1
@@ -33389,6 +33448,10 @@ components:
           maximum: 599
           default: 502
           description: "Final HTTP error status when rejecting an invocation or pre_proxy non-2xx response. Must be in range 400-599."
+        allow_plaintext:
+          type: boolean
+          default: false
+          description: "Admit an http:// function_url or aws_endpoint_url whose host is not a loopback IP literal written as a dotted-quad 127.d.d.d or [::1]. The invocation payload and the provider credential (function key, bearer token, or SigV4 signature) then cross the network in clear. The AWS_LAMBDA_ENDPOINT_URL environment fallback is operator-controlled and is not screened. Omit for false; an explicit null is rejected like every other optional field."
       allOf:
         - if:
             required: [provider]
@@ -33400,6 +33463,32 @@ components:
             properties:
               function_url:
                 type: string
+        # Cleartext to anything but a loopback IP literal needs the opt-in.
+        - if:
+            required: [function_url]
+            properties:
+              function_url:
+                pattern: '^[hH][tT][tT][pP]:'
+                not:
+                  pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+          then:
+            required: [allow_plaintext]
+            properties:
+              allow_plaintext:
+                const: true
+        # Cleartext to anything but a loopback IP literal needs the opt-in.
+        - if:
+            required: [aws_endpoint_url]
+            properties:
+              aws_endpoint_url:
+                pattern: '^[hH][tT][tT][pP]:'
+                not:
+                  pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+          then:
+            required: [allow_plaintext]
+            properties:
+              allow_plaintext:
+                const: true
 
     ResponseCachingConfig:
       type: object

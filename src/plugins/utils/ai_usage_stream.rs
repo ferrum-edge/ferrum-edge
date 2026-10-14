@@ -38,7 +38,9 @@
 use base64::Engine;
 use serde_json::Value;
 
-use super::ai_providers::{AiProvider, AiTokenUsage, detect_sse_provider, extract_response_usage};
+use super::ai_providers::{
+    AiProvider, AiTokenUsage, UsageCategories, detect_sse_provider, extract_response_usage,
+};
 use super::sse::{sse_line_end, strip_sse_boms};
 
 /// Media type AWS Bedrock uses for `InvokeModelWithResponseStream` and
@@ -99,6 +101,9 @@ pub struct UsageAccumulator {
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     observed: bool,
+    /// Raw provider categories seen so far, merged field by field, so an event
+    /// that restates only some categories cannot erase the others.
+    categories: UsageCategories,
 }
 
 impl UsageAccumulator {
@@ -122,6 +127,7 @@ impl UsageAccumulator {
             total_tokens: self.total_tokens,
             model: None,
             provider: None,
+            categories: UsageCategories::default(),
         }
     }
 
@@ -139,6 +145,26 @@ impl UsageAccumulator {
     }
 
     fn record(&mut self, usage: &AiTokenUsage) {
+        let has_categories = usage.categories != UsageCategories::default();
+        let folded = self.categories.absorb(usage.clone());
+        if has_categories {
+            // The merged categories hold the whole cumulative history, so
+            // their fold IS the current usage: assign it directly, `None`
+            // included. A malformed, overflowing or inconsistent update then
+            // clears a stale count instead of leaving it complete.
+            let (prompt_invalid, completion_invalid) = self.categories.invalid_sides();
+            let reported = folded.prompt_tokens.is_some()
+                || folded.completion_tokens.is_some()
+                || folded.total_tokens.is_some();
+            if reported || prompt_invalid || completion_invalid {
+                self.prompt_tokens = folded.prompt_tokens;
+                self.completion_tokens = folded.completion_tokens;
+                self.total_tokens = folded.total_tokens;
+                self.observed = true;
+            }
+            return;
+        }
+        let usage = &folded;
         if usage.prompt_tokens.is_none()
             && usage.completion_tokens.is_none()
             && usage.total_tokens.is_none()
@@ -256,37 +282,42 @@ impl UsageAccumulator {
             // policy, which would otherwise release the reservation).
             let provider = detect_sse_provider(json)
                 .or(configured)
+                .or_else(|| self.categories.family_provider())
                 .unwrap_or(AiProvider::OpenAi);
+            self.record(&extract_response_usage(json, provider));
+        }
+        // A present, non-null `usage` that is not an object is a malformed
+        // report, not an omission: route it to invalidation under the
+        // detected, configured, or previously identified provider so a stale
+        // complete count cannot survive it.
+        else if json
+            .get("usage")
+            .is_some_and(|usage| !usage.is_null() && !usage.is_object())
+            && let Some(provider) = detect_sse_provider(json)
+                .or(configured)
+                .or_else(|| self.categories.family_provider())
+        {
             self.record(&extract_response_usage(json, provider));
         }
 
         match json.get("type").and_then(Value::as_str) {
-            // Anthropic streams input tokens once, up front.
+            // Anthropic streams its input (with prompt-cache writes and reads
+            // reported beside `input_tokens`) up front, and cumulative output —
+            // sometimes restating cumulative input categories — on the terminal
+            // delta. Categories merge field by field in `record`.
             Some("message_start") => {
-                if let Some(prompt) = json
-                    .get("message")
-                    .and_then(|message| message.get("usage"))
-                    .and_then(|usage| usage.get("input_tokens"))
-                    .and_then(Value::as_u64)
-                {
-                    self.record(&AiTokenUsage {
-                        prompt_tokens: Some(prompt),
-                        ..Default::default()
-                    });
+                // Only the input side is authoritative here: `output_tokens`
+                // on `message_start` is an initial placeholder (commonly 1),
+                // and the cumulative output arrives on `message_delta`.
+                // Recording it would make an interrupted stream look complete
+                // at almost no output and release the reservation.
+                if let Some(message) = json.get("message") {
+                    let carrier = super::ai_providers::anthropic_message_start_usage(message);
+                    self.record(&extract_response_usage(&carrier, AiProvider::Anthropic));
                 }
             }
-            // ... and the cumulative output tokens on the terminal delta.
             Some("message_delta") => {
-                if let Some(completion) = json
-                    .get("usage")
-                    .and_then(|usage| usage.get("output_tokens"))
-                    .and_then(Value::as_u64)
-                {
-                    self.record(&AiTokenUsage {
-                        completion_tokens: Some(completion),
-                        ..Default::default()
-                    });
-                }
+                self.record(&extract_response_usage(json, AiProvider::Anthropic));
             }
             // Cohere v2 nests counts under `delta.usage.tokens.*`.
             Some("message-end") => {
@@ -312,8 +343,10 @@ impl UsageAccumulator {
         }
 
         // Bedrock `InvokeModelWithResponseStream` terminal chunk metrics.
-        if json.get("amazon-bedrock-invocationMetrics").is_some() {
-            self.record(&extract_response_usage(json, AiProvider::Bedrock));
+        // Read independently of any native `usage` in the same event, which
+        // the arms above already recorded.
+        if let Some(metrics) = super::ai_providers::extract_bedrock_invocation_metrics(json) {
+            self.record(&metrics);
         }
     }
 }
