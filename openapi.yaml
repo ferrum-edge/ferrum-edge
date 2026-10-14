@@ -23383,12 +23383,18 @@ components:
         Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based
         authorization. JWT header kid is required and binding: a missing, empty,
         or unknown kid is rejected with a generic 401. There is no all-keys
-        fallback; a known kid selects only that trusted key.
+        fallback; a known kid selects only that trusted key. A token is
+        verified only against providers whose issuer equals its unverified
+        iss claim, then providers that configure no issuer; providers pinning
+        a different issuer are never tried. At most 64 providers are allowed,
+        and for every issuer the providers sharing it plus the providers
+        without an issuer must total at most 8 (at most 8 may omit issuer).
       required: [providers]
       properties:
         providers:
           type: array
           minItems: 1
+          maxItems: 64
           items:
             type: object
             additionalProperties: false

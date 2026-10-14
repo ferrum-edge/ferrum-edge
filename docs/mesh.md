@@ -1368,6 +1368,8 @@ Per-workload mTLS mode with optional per-port overrides.
 
 Declares valid JWTs for a workload scope. Permissive by default (see [RequestAuthentication](#requestauthentication)).
 
+All applicable resources for a workload are combined into one `jwks_auth` instance, and identical rules are installed once. That instance is subject to the `jwks_auth` per-token verification bound: at most 64 rules in total, and at most 8 rules sharing one issuer. A combination past the bound fails plugin construction, so the data plane keeps its last accepted configuration rather than dropping any rule or its extraction locations.
+
 ### MeshTelemetryResource
 
 Per-scope telemetry configuration for tracing, metrics, and access logging (see [Observability](#observability)).

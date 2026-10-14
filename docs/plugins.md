@@ -2634,7 +2634,7 @@ When a provider sets `require_dpop`, the access token may be presented either as
 
 | Parameter | Type | Description |
 |---|---|---|
-| `providers` | Array | Array of identity provider configurations (required) |
+| `providers` | Array | Array of identity provider configurations (required, at most 64). A token is verified only against the providers whose `issuer` equals its unverified `iss`, then the providers that set no `issuer`; a provider pinning a different issuer is never tried. For every issuer, the providers sharing it plus the providers without an `issuer` must total at most 8 (and at most 8 may omit `issuer`), so one token costs at most 8 signature verifications |
 | `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or `localhost`; URL userinfo is rejected |
 | `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). HTTPS is required except for literal loopback or `localhost`, and URL userinfo is rejected. SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
