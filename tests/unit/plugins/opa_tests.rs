@@ -576,6 +576,26 @@ async fn opa_delegate_mode_redacts_form_decoded_semicolon_names() {
 }
 
 #[tokio::test]
+async fn opa_delegate_mode_redacts_an_ordinary_form_decoded_alias() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({"query_ambiguity_policy": "delegate", "redact_query_keys": ["private key"]}),
+    );
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("private+key=alias-secret&private%2Bkey=literal&page=1".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let rendered = serde_json::to_string(&payload).unwrap();
+    assert!(!rendered.contains("alias-secret"), "{rendered}");
+    // `%2B` decodes to a literal `+`; `private+key` is not the redacted name.
+    assert!(rendered.contains("literal"), "{rendered}");
+}
+
+#[tokio::test]
 async fn opa_keeps_a_value_with_an_encoded_semicolon() {
     // `%3B` is content, not a separator: the query is unambiguous, and the
     // whole `action` value must reach the policy so a denial on it holds.

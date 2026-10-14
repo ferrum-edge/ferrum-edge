@@ -52673,6 +52673,9 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
         // `api_key` parameter, so the whole `&` segment goes (issue #6579).
         if strip_names.contains(raw_name)
             || strip_names.contains(decoded_name.as_ref())
+            || crate::plugins::utils::query::query_name_decodings(raw_name)
+                .iter()
+                .any(|name| strip_names.contains(name.as_str()))
             || crate::plugins::utils::query::semicolon_sub_pair_names_any(pair, &strip_names)
         {
             removed_any = true;

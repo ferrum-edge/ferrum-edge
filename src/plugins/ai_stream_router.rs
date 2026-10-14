@@ -4263,29 +4263,10 @@ fn decoded_query_names(query: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let name = pair.split_once('=').map_or(pair, |(name, _)| name);
-        names.extend(query_name_decodings(name));
+        names.extend(super::utils::query::query_name_decodings(name));
         names.extend(super::utils::query::semicolon_sub_pair_names(pair));
     }
     names
-}
-
-/// A raw query name under RFC 3986 percent-decoding and, when it holds a raw
-/// `+`, under form decoding too (`+` converted to space before
-/// percent-decoding, so `%2B` stays a literal plus). A provider may read the
-/// name either way, so endpoint-owned names are protected under both.
-fn query_name_decodings(raw: &str) -> Vec<String> {
-    let rfc = percent_decode_str(raw).decode_utf8_lossy().into_owned();
-    if !raw.contains('+') {
-        return vec![rfc];
-    }
-    let form = percent_decode_str(&raw.replace('+', " "))
-        .decode_utf8_lossy()
-        .into_owned();
-    if form == rfc {
-        vec![rfc]
-    } else {
-        vec![rfc, form]
-    }
 }
 
 fn query_after_strip_markers(
@@ -4313,7 +4294,10 @@ fn query_after_strip_markers(
         // credential through nor override an endpoint-owned parameter.
         if strip_names.contains(raw_name)
             || strip_names.contains(decoded_name.as_ref())
-            || query_name_decodings(raw_name)
+            || super::utils::query::query_name_decodings(raw_name)
+                .iter()
+                .any(|name| strip_names.contains(name.as_str()))
+            || super::utils::query::query_name_decodings(raw_name)
                 .iter()
                 .any(|name| endpoint_query_names.contains(name))
             || super::utils::query::semicolon_sub_pair_names_any(pair, &strip_names)

@@ -526,6 +526,21 @@ fn credential_strip_matches_a_form_decoded_semicolon_name() {
 }
 
 #[test]
+fn credential_strip_matches_an_ordinary_form_decoded_alias() {
+    // `private+key` is `private key` to a form-decoding backend; `%2B` stays a
+    // literal plus and is not the credential.
+    let mut ctx = ctx_for("private%20key=token&private+key=token&private%2Bkey=kept&page=1");
+    ctx.metadata.insert(
+        "auth.strip_query_param.private key".to_string(),
+        "true".to_string(),
+    );
+    let query = canonical_query_for_policy(&ctx);
+    assert_eq!(query.get("private key"), None);
+    assert_eq!(query.get("private+key"), Some("kept"));
+    assert_eq!(query.get("page"), Some("1"));
+}
+
+#[test]
 fn ordered_query_credential_removal_drops_a_semicolon_smuggled_credential() {
     let names: HashSet<&str> = ["api_key"].into_iter().collect();
     let mut query = OrderedQuery::parse("carrier=;api_key=secret&x;api_key=s2&keep=a;b&page=1");

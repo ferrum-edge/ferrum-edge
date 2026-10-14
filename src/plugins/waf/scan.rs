@@ -196,9 +196,10 @@ impl Waf {
                 // must not hide `q` behind an excluded `html`. Split on the
                 // encoded bytes so `%3B` stays content.
                 if pair.contains(';') {
-                    // The first sub-pair is the pair's own name over a prefix
-                    // of the value just scanned, so it adds nothing.
-                    for sub_pair in pair.split(';').skip(1).filter(|sub| !sub.is_empty()) {
+                    // Every sub-pair, the first included: an anchored or
+                    // `equals` rule, or a suffix filter, can decide `role=admin`
+                    // differently from `role=admin;note=ok`.
+                    for sub_pair in pair.split(';').filter(|sub| !sub.is_empty()) {
                         let (sub_k, sub_v) = sub_pair.split_once('=').unwrap_or((sub_pair, ""));
                         let sub_name = if self.compiled.query_exclusions_active {
                             normalize::query_component_name(sub_k)
@@ -917,10 +918,16 @@ impl Waf {
                 })
             };
             if decode::has_conflicting_duplicate_among(raw_query.split('&').filter(kept)) {
+                // Filters see exactly the pairs conflict detection judged.
                 let judged = match exclusions {
-                    Some(exclusions) => {
-                        Cow::Owned(query_without_excluded_params(raw_query, exclusions))
-                    }
+                    Some(_) => Cow::Owned(
+                        raw_query
+                            .split('&')
+                            .filter(|pair| !pair.is_empty())
+                            .filter(kept)
+                            .collect::<Vec<_>>()
+                            .join("&"),
+                    ),
                     None => Cow::Borrowed(raw_query),
                 };
                 if self.special_hit_allowed(rule_index, &judged, subject) {

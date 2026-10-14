@@ -837,6 +837,22 @@ async fn hpp_false_positive_filters_are_judged_per_separator_convention() {
 }
 
 #[tokio::test]
+async fn hpp_filters_see_exactly_the_pairs_conflict_detection_judged() {
+    // The `&` reading has conflicting `id` values; the filter must judge that
+    // reading's retained pairs, not a rebuild that resurrects `;safe=1` from
+    // the excluded `ignore` pair.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": {
+            "exclude": { "query_params": ["ignore"] },
+            "fp_filters": ["^id=1;v=x&id=1&safe=1$"]
+        }
+    }));
+    let (result, request) = query(&plugin, "id=1;v=x&id=1&ignore=;safe=1").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
 async fn excluded_headers_match_case_insensitively() {
     let plugin = recommended_with_overrides(json!({
         "FE-JNDI-001-H": { "exclude": { "headers": ["X-Template-Preview"] } }

@@ -346,6 +346,44 @@ async fn consumer_scoped_request_rule_uses_authenticated_identity() {
 }
 
 #[tokio::test]
+async fn equals_rule_sees_the_first_semicolon_sub_pair() {
+    // Issue #6579: a `;`-splitting backend receives `role=admin` from
+    // `role=admin;note=ok`, so an exact-value rule must see it too.
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-ROLE-ADMIN",
+            "name": "exact admin role",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "equals",
+            "pattern": "admin",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    for query in ["role=admin", "role=admin;note=ok"] {
+        let mut request = ctx("GET", "/api");
+        request.set_raw_query_string(query.into());
+        assert!(
+            matches!(
+                plugin.authorize(&mut request).await,
+                PluginResult::Reject { .. }
+            ),
+            "{query}"
+        );
+    }
+    // `%3B` is content: the value is `admin;note=ok`, not `admin`.
+    let mut encoded = ctx("GET", "/api");
+    encoded.set_raw_query_string("role=admin%3Bnote%3Dok".into());
+    assert!(matches!(
+        plugin.authorize(&mut encoded).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex() {
     let exact_plugin = waf(json!({
         "include_default_rules": false,

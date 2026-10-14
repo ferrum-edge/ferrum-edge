@@ -169,6 +169,10 @@ pub struct CanonicalQueryParam {
     /// credential redaction must consult them; a `%3B` is content and never
     /// produces an entry.
     pub semicolon_sub_names: Vec<String>,
+    /// The name under form decoding (`+` as space), when the raw name has a
+    /// `+` and that reading differs from [`Self::name`]. A form-decoding
+    /// backend reads the parameter under this name, so redaction consults it.
+    pub form_name: Option<String>,
 }
 
 /// Ordered, occurrence-complete, explicitly ambiguity-classified view of a
@@ -271,11 +275,13 @@ impl CanonicalQuery {
                 }
             };
             let semicolon_sub_names = semicolon_sub_pair_names(pair);
+            let form_name = query_name_decodings(raw_name).into_iter().nth(1);
             params.push(CanonicalQueryParam {
                 name,
                 value,
                 bare,
                 semicolon_sub_names,
+                form_name,
             });
         }
 
@@ -356,6 +362,26 @@ pub fn canonical_query_for_policy(ctx: &crate::plugins::RequestContext) -> Canon
     CanonicalQuery::parse(&crate::proxy::effective_backend_query_string(ctx))
 }
 
+/// A raw query name under RFC 3986 percent-decoding and, when it holds a raw
+/// `+`, under form decoding too (`+` converted to space before
+/// percent-decoding, so `%2B` stays a literal plus). Ferrum and the backend
+/// may read a name either way, so credential stripping, redaction, and
+/// endpoint-parameter protection compare every decoding (issue #6579).
+pub fn query_name_decodings(raw: &str) -> Vec<String> {
+    let rfc = percent_decode_str(raw).decode_utf8_lossy().into_owned();
+    if !raw.contains('+') {
+        return vec![rfc];
+    }
+    let form = percent_decode_str(&raw.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned();
+    if form == rfc {
+        vec![rfc]
+    } else {
+        vec![rfc, form]
+    }
+}
+
 /// Decoded names of a still-encoded `&`-separated pair's `;`-separated
 /// sub-pairs (issue #6579), or nothing when the pair carries no raw `;`.
 ///
@@ -369,21 +395,12 @@ pub fn semicolon_sub_pair_names(segment: &str) -> Vec<String> {
     if !segment.contains(';') {
         return Vec::new();
     }
-    let mut names = Vec::new();
-    for sub_pair in segment.split(';') {
-        let raw = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
-        let rfc = percent_decode_str(raw).decode_utf8_lossy().into_owned();
-        if raw.contains('+') {
-            let form = percent_decode_str(&raw.replace('+', " "))
-                .decode_utf8_lossy()
-                .into_owned();
-            if form != rfc {
-                names.push(form);
-            }
-        }
-        names.push(rfc);
-    }
-    names
+    segment
+        .split(';')
+        .flat_map(|sub_pair| {
+            query_name_decodings(sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
+        })
+        .collect()
 }
 
 /// Whether a still-encoded `&`-separated query pair carries a parameter in
@@ -598,7 +615,11 @@ impl OrderedQuery {
         }
         let before = self.pairs.len();
         self.pairs.retain(|pair| {
-            if names.contains(pair.raw_name.as_str()) || names.contains(pair.decoded_name.as_str())
+            if names.contains(pair.raw_name.as_str())
+                || names.contains(pair.decoded_name.as_str())
+                || query_name_decodings(&pair.raw_name)
+                    .iter()
+                    .any(|name| names.contains(name.as_str()))
             {
                 return false;
             }

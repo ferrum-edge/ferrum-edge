@@ -379,6 +379,10 @@ impl Opa {
     fn query_param_is_redacted(&self, ctx: &RequestContext, param: &CanonicalQueryParam) -> bool {
         self.query_key_is_redacted(ctx, &param.name)
             || param
+                .form_name
+                .as_deref()
+                .is_some_and(|name| self.query_key_is_redacted(ctx, name))
+            || param
                 .semicolon_sub_names
                 .iter()
                 .any(|name| self.query_key_is_redacted(ctx, name))
