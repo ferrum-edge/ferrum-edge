@@ -32568,8 +32568,16 @@ components:
         Proxy-Authenticate, WWW-Authenticate, X-Api-Key, …), contains a built-in
         credential substring
         (so vendor variants like x-openai-api-key / x-amz-security-token are also
-        caught), or matches a configured sensitive_header_patterns entry is
-        stripped before the distinct mirror origin. Native gRPC metadata travels
+        caught), is credential-shaped (any separator-delimited segment is a
+        credential-class word such as auth, jwt, session, sid, key, pass, pwd,
+        ticket, otp, or contains a credential stem such as session, sessid,
+        token, secret, auth, pwd, otp, verifier, or contains key or pass other
+        than ordinary words such as keyword or passenger; the whole name code
+        is denied too; continuation cursors like
+        x-continuation-token, authorship/authority names, and Idempotency-Key
+        are not), or matches a configured
+        sensitive_header_patterns entry is stripped before the distinct mirror
+        origin. Native gRPC metadata travels
         as HTTP/2 headers, so the same predicate covers gRPC credential metadata.
         Forwarding any denied header requires the fail-closed pair
         forward_sensitive_headers=true plus a non-empty exact-name
@@ -32617,7 +32625,10 @@ components:
         residual valid %XX, malformed, or control-bearing names fail closed).
         Built-in token/sig/signature matching is delimiter-bounded (oauth_token,
         x-amz-signature, x-goog-signature denied; continuation_token and signal
-        retained). Delimiter variants of api_key are denied, and raw semicolon-
+        retained). The same credential-shaped rule as headers applies to the
+        decoded name (session_id, jwt, access_key, private_key, key, sid, …
+        denied; continuation_token retained).
+        Delimiter variants of api_key are denied, and raw semicolon-
         bearing segments fail closed because backend query parsers disagree on
         whether they contain additional pairs. Retained pairs keep raw encoding,
         order, flags, empty values, +, percent escapes, and non-ASCII encoded
@@ -32813,10 +32824,13 @@ components:
             type: string
             minLength: 1
             maxLength: 256
-            pattern: "\\S"
+            pattern: '^[!"$''()*,.0-9:<>A-Z\[\\\]^_`a-z{|}~-]+$(?![\s\S])'
           description: >-
             Lowercased exact allowlist of denied sensitive query parameter names
-            to forward when forward_sensitive_query is true. Each entry is matched
+            to forward when forward_sensitive_query is true. Entries are
+            visible ASCII without whitespace; brackets such as filter[key] are
+            allowed, while % + = & ? # / @ ; are refused because entries match
+            the decoded name. Each entry is matched
             against the fully percent-decoded (bounded staged decode)
             ASCII-lowercased name (at most 256 bytes) that the deny-by-default
             policy actually strips (a built-in credential or a
