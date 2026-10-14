@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshConfig, PolicyScope};
@@ -549,4 +550,118 @@ fn legacy_consecutive_errors_alias_is_preserved_for_overlay() {
             .and_then(|outlier| outlier.consecutive_errors),
         Some(9)
     );
+}
+
+// ── #6656 refused RequestAuthentication fails closed ──────────────────────
+
+/// A RequestAuthentication that translation refuses is still reported as
+/// rejected, but it is published as a rule-less `refused` marker with its own
+/// selector scope instead of being dropped, so the workloads it selects do not
+/// silently lose JWT validation.
+#[test]
+fn refused_request_authentication_is_carried_as_a_fail_closed_marker() {
+    let refused = request_authentication(
+        "default",
+        json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks",
+                "outputClaimToHeaders": [
+                    {"header": "x-claim", "claim": "sub"},
+                    {"header": "X-Claim", "claim": "email"},
+                ],
+            }]
+        }),
+    );
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(&[refused], options("default"))
+            .expect("translation completes with the resource skipped");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "the resource is still reported as rejected"
+    );
+    assert!(
+        skipped
+            .keys()
+            .any(|key| key.kind == "RequestAuthentication" && key.name == "ra")
+    );
+
+    let mesh = translation.config.mesh.expect("refused marker published");
+    assert_eq!(mesh.request_authentications.len(), 1);
+    let marker = &mesh.request_authentications[0];
+    assert!(marker.refused);
+    assert!(marker.jwt_rules.is_empty());
+    match &marker.scope {
+        PolicyScope::WorkloadSelector { selector } => {
+            assert_eq!(selector.labels.get("app").map(String::as_str), Some("api"));
+            assert_eq!(selector.namespace.as_deref(), Some("default"));
+        }
+        other => panic!("refusal must keep the selector scope, got {other:?}"),
+    }
+}
+
+/// A valid RequestAuthentication is never marked refused.
+#[test]
+fn accepted_request_authentication_is_not_marked_refused() {
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(
+        &[request_authentication(
+            "default",
+            json!({
+                "jwtRules": [{
+                    "issuer": "https://issuer.example.com",
+                    "jwksUri": "https://issuer.example.com/jwks",
+                }]
+            }),
+        )],
+        options("default"),
+    )
+    .expect("translation completes");
+    assert!(skipped.is_empty());
+    let mesh = translation.config.mesh.expect("mesh present");
+    assert!(!mesh.request_authentications[0].refused);
+}
+
+/// Backend-equivalent spellings are one destination (`X_Tenant_Id` reaches a
+/// CGI-style backend as `X-Tenant-Id`), and underscore spellings of reserved
+/// destinations are reserved, in translation and native mesh admission alike.
+#[test]
+fn underscore_equivalent_output_claim_destinations_are_rejected() {
+    for headers in [
+        json!([
+            {"header": "X-Tenant-Id", "claim": "tenant"},
+            {"header": "X_Tenant_Id", "claim": "role"},
+        ]),
+        json!([{"header": "X_Real_IP", "claim": "sub"}]),
+    ] {
+        let error = translate_in(
+            "default",
+            &[request_authentication(
+                "default",
+                json!({
+                    "jwtRules": [{
+                        "issuer": "https://issuer.example.com",
+                        "jwksUri": "https://issuer.example.com/jwks",
+                        "outputClaimToHeaders": headers,
+                    }]
+                }),
+            )],
+        )
+        .expect_err("backend-equivalent destination must be refused");
+        assert!(error.contains("outputClaimToHeaders"), "{error}");
+    }
+
+    let native = ferrum_edge::modes::mesh::config::validate_mesh_jwt_output_claim_headers(&[
+        ferrum_edge::modes::mesh::config::MeshJwtClaimHeader {
+            header: "x-tenant-id".to_string(),
+            claim: "tenant".to_string(),
+        },
+        ferrum_edge::modes::mesh::config::MeshJwtClaimHeader {
+            header: "x_tenant_id".to_string(),
+            claim: "role".to_string(),
+        },
+    ])
+    .expect_err("native mesh admission must agree with translation");
+    assert!(native.contains("more than once"), "{native}");
 }

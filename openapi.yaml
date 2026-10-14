@@ -23582,11 +23582,10 @@ components:
                   two mappings may not name the same header. Framing, provenance,
                   credential-bearing and gateway-reserved destinations (including
                   cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-                  x-ferrum-*) are rejected, as for output_claim_headers. Unlike
-                  output_claim_headers, reserved names and duplicates are matched
-                  case-insensitively with _ treated as - (X_Real_IP is reserved,
-                  X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
-                  output_claim_headers). A claim value
+                  x-ferrum-*) are rejected, as for output_claim_headers. In both forms
+                  reserved names and duplicates are matched case-insensitively with _
+                  treated as - (X_Real_IP is reserved, X_Tenant_Id duplicates X-Tenant-Id,
+                  including across jwks_auth claim_headers and output_claim_headers). A claim value
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.
@@ -23626,7 +23625,8 @@ components:
                   only from a validated claim, so an unauthenticated or invalid
                   request can never forge one. Duplicate destination headers,
                   reserved/credential-bearing destinations, and invalid header names
-                  are rejected at config load. Only nonblank string, integer, and
+                  are rejected at config load; names are compared with _ treated as -
+                  (X_Tenant_Id duplicates X-Tenant-Id, X_Real_IP is reserved). Only nonblank string, integer, and
                   boolean claims are published (Istio ClaimToHeader does not support
                   arrays, objects, null, or floating-point numbers); anything else
                   or a header-illegal value leaves the destination absent. A rendered
@@ -23749,11 +23749,10 @@ components:
             two mappings may not name the same header. Framing, provenance,
             credential-bearing and gateway-reserved destinations (including
             cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-            x-ferrum-*) are rejected, as for output_claim_headers. Unlike
-            output_claim_headers, reserved names and duplicates are matched
-            case-insensitively with _ treated as - (X_Real_IP is reserved,
-            X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
-            output_claim_headers). A claim value
+            x-ferrum-*) are rejected, as for output_claim_headers. In both forms
+            reserved names and duplicates are matched case-insensitively with _
+            treated as - (X_Real_IP is reserved, X_Tenant_Id duplicates X-Tenant-Id,
+            including across jwks_auth claim_headers and output_claim_headers). A claim value
             that is not a valid header value (for example one containing CR or LF)
             or that renders to more than 8192 bytes, including a joined array,
             leaves the destination absent.
@@ -24179,11 +24178,10 @@ components:
                   two mappings may not name the same header. Framing, provenance,
                   credential-bearing and gateway-reserved destinations (including
                   cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-                  x-ferrum-*) are rejected, as for output_claim_headers. Unlike
-                  output_claim_headers, reserved names and duplicates are matched
-                  case-insensitively with _ treated as - (X_Real_IP is reserved,
-                  X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
-                  output_claim_headers). A claim value
+                  x-ferrum-*) are rejected, as for output_claim_headers. In both forms
+                  reserved names and duplicates are matched case-insensitively with _
+                  treated as - (X_Real_IP is reserved, X_Tenant_Id duplicates X-Tenant-Id,
+                  including across jwks_auth claim_headers and output_claim_headers). A claim value
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.
@@ -24400,11 +24398,10 @@ components:
                   two mappings may not name the same header. Framing, provenance,
                   credential-bearing and gateway-reserved destinations (including
                   cookie, content-length, forwarded, via, x-real-ip, x-forwarded-* and
-                  x-ferrum-*) are rejected, as for output_claim_headers. Unlike
-                  output_claim_headers, reserved names and duplicates are matched
-                  case-insensitively with _ treated as - (X_Real_IP is reserved,
-                  X_Tenant_Id duplicates X-Tenant-Id, including against jwks_auth
-                  output_claim_headers). A claim value
+                  x-ferrum-*) are rejected, as for output_claim_headers. In both forms
+                  reserved names and duplicates are matched case-insensitively with _
+                  treated as - (X_Real_IP is reserved, X_Tenant_Id duplicates X-Tenant-Id,
+                  including across jwks_auth claim_headers and output_claim_headers). A claim value
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.

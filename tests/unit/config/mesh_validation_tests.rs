@@ -1046,6 +1046,7 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
 #[test]
 fn request_authentication_accepts_inline_jwks_multi_audience_and_custom_locations() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "jwt".into(),
         namespace: "default".into(),
         scope: PolicyScope::MeshWide,

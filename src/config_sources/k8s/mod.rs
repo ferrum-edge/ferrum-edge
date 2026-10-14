@@ -2383,7 +2383,15 @@ pub fn translate_k8s_objects_collecting_skips(
         });
 
         match translation {
-            Ok(translation) => return Some((translation, skipped)),
+            Ok(mut translation) => {
+                carry_refused_request_authentications(
+                    &mut translation,
+                    objects,
+                    &options,
+                    &skipped,
+                );
+                return Some((translation, skipped));
+            }
             Err(error) => {
                 let key = objects
                     .iter()
@@ -2421,6 +2429,46 @@ pub fn translate_k8s_objects_collecting_skips(
             }
         }
     }
+}
+
+/// Publish every refused RequestAuthentication as a fail-closed marker
+/// instead of dropping it (issue #6656). Dropping it would remove JWT
+/// validation from the workloads it selects; see
+/// [`istio::refused_request_authentication`]. The skip map still carries the
+/// translation error, so status keeps reporting the resource as rejected.
+fn carry_refused_request_authentications(
+    translation: &mut K8sTranslation,
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+    skipped: &std::collections::HashMap<K8sResourceKey, K8sTranslateError>,
+) {
+    let mut refused = Vec::new();
+    for key in skipped.keys() {
+        if key.kind != "RequestAuthentication" {
+            continue;
+        }
+        let Some(object) = objects.iter().find(|object| {
+            object.kind == key.kind
+                && object.metadata.namespace == key.namespace
+                && object.metadata.name == key.name
+                && (key.api_version.is_empty() || object.api_version == key.api_version)
+        }) else {
+            continue;
+        };
+        refused.push(istio::refused_request_authentication(options, object));
+    }
+    if refused.is_empty() {
+        return;
+    }
+    // Deterministic order regardless of HashMap iteration.
+    refused
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    translation
+        .config
+        .mesh
+        .get_or_insert_with(|| Box::new(MeshConfig::default()))
+        .request_authentications
+        .extend(refused);
 }
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {

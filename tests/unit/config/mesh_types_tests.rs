@@ -674,6 +674,7 @@ fn app_protocol_default_is_unknown() {
 #[test]
 fn request_authentication_round_trips_through_serde() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "jwt-auth".to_string(),
         namespace: "default".to_string(),
         scope: PolicyScope::WorkloadSelector {
@@ -711,6 +712,7 @@ fn request_authentication_round_trips_through_serde() {
 #[test]
 fn request_authentication_empty_jwt_rules_round_trips() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "no-rules".to_string(),
         namespace: "default".to_string(),
         scope: PolicyScope::Namespace {
@@ -754,6 +756,7 @@ fn request_authentication_optional_fields_omitted_when_default() {
 #[test]
 fn request_authentication_meshwide_scope() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "global-jwt".to_string(),
         namespace: "istio-system".to_string(),
         scope: PolicyScope::MeshWide,
@@ -779,6 +782,7 @@ fn mesh_config_with_request_authentications_round_trips() {
     let cfg = GatewayConfig {
         mesh: Some(Box::new(MeshConfig {
             request_authentications: vec![MeshRequestAuthentication {
+                refused: false,
                 name: "test-ra".to_string(),
                 namespace: "default".to_string(),
                 scope: PolicyScope::Namespace {

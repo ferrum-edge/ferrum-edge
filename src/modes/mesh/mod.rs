@@ -120,6 +120,12 @@ pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
 pub const MESH_WORKLOAD_METRICS_PLUGIN_ID: &str = "__mesh_workload_metrics";
 pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
+/// Reserved id of the `request_termination` instance that refuses every HTTP
+/// request to a workload selected by a RequestAuthentication Ferrum refused
+/// (issue #6656).
+pub const MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID: &str = "__mesh_request_auth_refused";
+/// Body of the fail-closed refusal. Fixed text: it names no resource.
+const MESH_REQUEST_AUTH_REFUSED_MESSAGE: &str = "RequestAuthentication for this workload was rejected by the gateway; requests are refused until it is fixed";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
 pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 pub const MESH_BPF_METRICS_PLUGIN_ID: &str = "__mesh_bpf_metrics";
@@ -14156,6 +14162,39 @@ fn inject_mesh_request_auth_plugin(
              installing its JWT provider(s) (fail closed) so forged tokens cannot bypass \
              validation. Set FERRUM_MESH_WORKLOAD_LABELS / mesh_slice.labels to pin this \
              workload's identity for deterministic resolution"
+        );
+    }
+
+    // FAIL CLOSED on a refused RequestAuthentication (issue #6656). Kubernetes
+    // translation publishes a resource it could not translate as a rule-less
+    // `refused` marker instead of dropping it, because dropping it would leave
+    // this workload with no JWT validation, no token stripping and no
+    // gateway-owned claim headers. Its intended providers are unknown, so the
+    // only safe answer is to refuse every HTTP request until it is fixed. The
+    // refusal is forced over any operator `request_termination` global, which
+    // would otherwise suppress a non-forced mesh-managed instance.
+    if applicable.iter().any(|ra| ra.refused) {
+        warn!(
+            "mesh RequestAuthentication: a RequestAuthentication selecting this workload was \
+             rejected by translation; refusing every HTTP request to this workload (fail \
+             closed) until it is fixed. See the resource's FerrumAccepted status"
+        );
+        force_ensure_global_plugin(
+            config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({
+                "status_code": 503,
+                "content_type": "application/json",
+                "message": MESH_REQUEST_AUTH_REFUSED_MESSAGE,
+            }),
+            &runtime.namespace,
+        );
+    } else {
+        remove_mesh_managed_plugin(
+            config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            &runtime.namespace,
         );
     }
 
@@ -35798,6 +35837,7 @@ mod tests {
 
     fn test_request_authentication(name: &str, scope: PolicyScope) -> MeshRequestAuthentication {
         MeshRequestAuthentication {
+            refused: false,
             name: name.to_string(),
             namespace: "default".to_string(),
             scope,
@@ -35854,6 +35894,103 @@ mod tests {
         assert_eq!(
             providers[0].get("issuer").and_then(|v| v.as_str()),
             Some("https://api-jwt.example.com")
+        );
+    }
+
+    /// Issue #6656: a RequestAuthentication that translation refused is
+    /// carried as a rule-less `refused` marker; the workloads it selects get a
+    /// forced refusal plugin instead of silently losing JWT validation.
+    #[test]
+    fn refused_request_authentication_refuses_every_request_to_the_workload() {
+        let runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let mut refused = test_request_authentication(
+            "broken-jwt",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
+        );
+        refused.jwt_rules.clear();
+        refused.refused = true;
+        // An operator-managed global of the same type must not suppress it.
+        let now = chrono::Utc::now();
+        let operator_termination = crate::config::types::PluginConfig {
+            labels: Default::default(),
+            id: "operator-termination".to_string(),
+            plugin_name: "request_termination".to_string(),
+            namespace: runtime.namespace.clone(),
+            config: serde_json::json!({
+                "status_code": 404,
+                "trigger": {"path_prefix": "/never-matched"}
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                request_authentications: vec![refused],
+                ..MeshConfig::default()
+            })),
+            plugin_configs: vec![operator_termination],
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let refusal = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+            .expect("refusal plugin injected");
+        assert_eq!(refusal.plugin_name, "request_termination");
+        assert_eq!(refusal.scope, PluginScope::Global);
+        assert!(refusal.enabled);
+        assert_eq!(refusal.config["status_code"], 503);
+        crate::plugins::validate_plugin_config("request_termination", &refusal.config)
+            .expect("refusal config must construct");
+
+        // A workload the refused resource does not select is unaffected.
+        let other_runtime = MeshRuntimeConfig {
+            workload_labels: HashMap::from([("app".to_string(), "web".to_string())]),
+            ..test_mesh_runtime_config()
+        };
+        let mut other = test_request_authentication(
+            "broken-jwt",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
+        );
+        other.jwt_rules.clear();
+        other.refused = true;
+        let unaffected = prepare_gateway_config_for_mesh(
+            GatewayConfig {
+                mesh: Some(Box::new(MeshConfig {
+                    request_authentications: vec![other],
+                    ..MeshConfig::default()
+                })),
+                ..GatewayConfig::default()
+            },
+            &other_runtime,
+        )
+        .expect("mesh config");
+        assert!(
+            unaffected
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
         );
     }
 
@@ -36167,6 +36304,7 @@ mod tests {
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "empty".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -36193,6 +36331,7 @@ mod tests {
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "with-aud".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -36241,6 +36380,7 @@ mod tests {
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "with-inline".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,
@@ -36304,6 +36444,7 @@ mod tests {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "exp-test".to_string(),
                     namespace: "default".to_string(),
                     scope: PolicyScope::MeshWide,

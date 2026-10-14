@@ -1689,12 +1689,19 @@ fn request_authentication_status(
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this RequestAuthentication: {error}");
+            // Issue #6656: the rejected resource is published as a fail-closed
+            // marker, so the workloads it selects refuse every HTTP request
+            // rather than running without JWT validation.
+            let message = format!(
+                "Ferrum rejected this RequestAuthentication: {error}; HTTP requests to the \
+                 workloads it selects are refused until it is fixed (fail closed)"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "jwt_rules": jwt_rule_count,
                     "target_refs_declared": declared_target_refs,
+                    "enforcement": "refuse_all",
                     "error": format!("{error}"),
                 }
             });
@@ -4135,6 +4142,13 @@ mod tests {
         );
         assert_eq!(c["status"].as_str(), Some("False"));
         assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        // Issue #6656: the status states the fail-closed consequence.
+        assert!(c["message"].as_str().unwrap().contains("fail closed"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["enforcement"].as_str(),
+            Some("refuse_all")
+        );
     }
 
     // ── WorkloadEntry ─────────────────────────────────────────────────────────

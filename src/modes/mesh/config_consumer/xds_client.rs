@@ -5955,6 +5955,7 @@ mod tests {
                 port_overrides: HashMap::new(),
             }],
             request_authentications: vec![MeshRequestAuthentication {
+                refused: false,
                 name: "jwt".to_string(),
                 namespace: "default".to_string(),
                 scope: PolicyScope::Namespace {

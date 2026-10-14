@@ -1327,6 +1327,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             workload_selector: None,
         }],
         request_authentications: vec![MeshRequestAuthentication {
+            refused: false,
             name: name("request-auth"),
             namespace: "shared".to_string(),
             scope: scope.clone(),
