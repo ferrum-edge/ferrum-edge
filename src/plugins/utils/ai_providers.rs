@@ -182,11 +182,17 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         return Some(AiProvider::OpenAi);
     }
 
-    if json
-        .get("usage")
-        .and_then(|usage| usage.get("input_tokens"))
-        .is_some()
-    {
+    // Anthropic's prompt-cache counters are discriminators too: a cache-only
+    // (or malformed cache-only) update must still reach the Anthropic fold.
+    if json.get("usage").is_some_and(|usage| {
+        [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .any(|field| usage.get(field).is_some())
+    }) {
         return Some(AiProvider::Anthropic);
     }
 

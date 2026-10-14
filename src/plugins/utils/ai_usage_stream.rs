@@ -282,6 +282,7 @@ impl UsageAccumulator {
             // policy, which would otherwise release the reservation).
             let provider = detect_sse_provider(json)
                 .or(configured)
+                .or_else(|| self.categories.family_provider())
                 .unwrap_or(AiProvider::OpenAi);
             self.record(&extract_response_usage(json, provider));
         }

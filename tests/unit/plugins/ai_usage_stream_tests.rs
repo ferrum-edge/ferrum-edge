@@ -1611,3 +1611,25 @@ fn titan_counters_survive_a_later_metrics_only_chunk() {
         (Some(21), Some(60), Some(81))
     );
 }
+
+#[test]
+fn untyped_cache_only_updates_reach_the_anthropic_fold() {
+    let start = json!({"usage": {"input_tokens": 10, "output_tokens": 5}});
+    let valid = sse(&[
+        &start.to_string(),
+        &json!({"usage": {"cache_read_input_tokens": 1000}}).to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&valid], "total_tokens"),
+        Some(1015)
+    );
+
+    let malformed = sse(&[
+        &start.to_string(),
+        &json!({"usage": {"cache_read_input_tokens": "bad"}}).to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&malformed);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+}

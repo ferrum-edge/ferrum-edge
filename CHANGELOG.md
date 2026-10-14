@@ -207,7 +207,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A Gemini or Bedrock provider total is never published below its own
   reported counters.
   Categories merge field by field across streamed events, and a malformed
-  counter leaves its side unmetered instead of partially counted.
+  counter leaves the whole usage unmetered instead of partially counted.
 - **Equal-priority plugins now run in a deterministic order** (issue #6614).
   Ties used to follow config iteration order, which a database (unordered
   `proxy_plugins` association rows), a reordered config file, or an
