@@ -148,20 +148,21 @@ impl UsageAccumulator {
         let has_categories = usage.categories != UsageCategories::default();
         let folded = self.categories.absorb(usage.clone());
         if has_categories {
-            // A malformed or overflowing side (even in an event that carries
-            // nothing else) invalidates the stale count and its dependent
-            // total instead of leaving them complete.
+            // The merged categories hold the whole cumulative history, so
+            // their fold IS the current usage: assign it directly, `None`
+            // included. A malformed, overflowing or inconsistent update then
+            // clears a stale count instead of leaving it complete.
             let (prompt_invalid, completion_invalid) = self.categories.invalid_sides();
-            if prompt_invalid || completion_invalid {
-                if prompt_invalid {
-                    self.prompt_tokens = None;
-                }
-                if completion_invalid {
-                    self.completion_tokens = None;
-                }
-                self.total_tokens = None;
+            let reported = folded.prompt_tokens.is_some()
+                || folded.completion_tokens.is_some()
+                || folded.total_tokens.is_some();
+            if reported || prompt_invalid || completion_invalid {
+                self.prompt_tokens = folded.prompt_tokens;
+                self.completion_tokens = folded.completion_tokens;
+                self.total_tokens = folded.total_tokens;
                 self.observed = true;
             }
+            return;
         }
         let usage = &folded;
         if usage.prompt_tokens.is_none()

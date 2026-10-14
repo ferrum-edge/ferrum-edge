@@ -62,18 +62,20 @@ impl AiTokenUsage {
         let has_categories = newer.categories.family.is_some();
         let newer = self.categories.absorb(newer);
         if has_categories {
-            // A malformed or overflowing side invalidates the stale count and
-            // the total that depended on it, instead of keeping them complete.
-            let (prompt_invalid, completion_invalid) = self.categories.invalid_sides();
-            if prompt_invalid {
-                self.prompt_tokens = None;
+            // The merged categories hold the whole cumulative history, so their
+            // fold IS the current usage: assign it directly, `None` included,
+            // so a malformed, overflowing or inconsistent update clears a stale
+            // count instead of leaving it complete.
+            self.prompt_tokens = newer.prompt_tokens;
+            self.completion_tokens = newer.completion_tokens;
+            self.total_tokens = newer.total_tokens;
+            if newer.model.is_some() {
+                self.model = newer.model;
             }
-            if completion_invalid {
-                self.completion_tokens = None;
+            if newer.provider.is_some() {
+                self.provider = newer.provider;
             }
-            if prompt_invalid || completion_invalid {
-                self.total_tokens = None;
-            }
+            return;
         }
 
         let component_updated = newer.prompt_tokens.is_some() || newer.completion_tokens.is_some();

@@ -6459,11 +6459,15 @@ struct GeminiUsageCounters {
 
 impl GeminiUsageCounters {
     /// Render the terminal OpenAI-shaped `usage` object, or `None` when the
-    /// provider never reported both sides.
+    /// provider reported no counter at all.
     ///
-    /// An omitted counter is never charged as zero: prompt and candidate counts
-    /// must both have been reported before any usage is published at all, and
-    /// the optional categories only ever add to what the provider stated.
+    /// Each side is published when reported. proto3 JSON omits zero counters,
+    /// so an omitted base is zero when a sibling category on its side
+    /// (tool-use prompt, thoughts) was reported; a side with nothing reported
+    /// stays absent rather than charged as zero. A provider total is
+    /// published when it is at least the reported components, raised to them
+    /// when both sides are known, and otherwise withheld as inconsistent;
+    /// without a provider total, only both sides make a complete one.
     fn to_openai_usage(&self) -> Result<Option<Value>, &'static str> {
         // proto3 JSON omits zero counters, so an omitted base is zero when a
         // sibling on its side was reported (same rule as the shared

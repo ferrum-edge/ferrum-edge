@@ -1560,3 +1560,28 @@ fn co_located_invocation_metrics_merge_beside_native_usage() {
     );
     assert_eq!(buffered.total_tokens, Some(1015));
 }
+
+#[test]
+fn inconsistent_partial_update_clears_an_earlier_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let total_only = json!({"usageMetadata": {"totalTokenCount": 5}});
+    let larger_prompt =
+        json!({"usageMetadata": {"promptTokenCount": 10, "toolUsePromptTokenCount": 1000}});
+
+    let body = sse(&[&total_only.to_string(), &larger_prompt.to_string()]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert_eq!(
+        extractor.usage().total_for_mode("prompt_tokens"),
+        Some(1010)
+    );
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+
+    let mut merged = extract_response_usage(&total_only, AiProvider::Google);
+    merged.merge_cumulative(extract_response_usage(&larger_prompt, AiProvider::Google));
+    assert_eq!(merged.prompt_tokens, Some(1010));
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+}
