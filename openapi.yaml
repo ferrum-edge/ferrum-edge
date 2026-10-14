@@ -20594,7 +20594,9 @@ components:
         keys must be unique; `order` must list every non-extension output key
         unless it contains `"*"`; and `rename` targets, `static_fields` keys
         (including nested keys) and `derived_fields` names may not match a
-        sensitive-data substring, while a `static_fields` string value that
+        sensitive-data substring or a credential-class name (for example
+        `session_id`, `client_assertion`, `gpg_passphrase`, `private_rsa_key`;
+        see docs/log_schema.md), while a `static_fields` string value that
         looks like a literal HTTP auth credential is refused.
         See docs/log_schema.md.
       additionalProperties: false
@@ -20632,8 +20634,8 @@ components:
             not: { type: "null" }
           description: >-
             Literal JSON values injected at top level. Keys / nested
-            keys matching sensitive substrings are rejected at
-            compile time. A `null` value is rejected — use `omit`
+            keys matching sensitive substrings or credential-class names
+            (for example `session_id`) are rejected at compile time. A `null` value is rejected — use `omit`
             to drop a field.
         derived_fields:
           type: array
@@ -26870,8 +26872,11 @@ components:
             present UTF-8 value overrides any matching `custom_tags` default;
             a missing variable keeps that default when present and otherwise
             omits the tag. Credential-bearing environment variable names
-            (including secret/password/token/key/credential names, database
-            connection locations, client credential identifiers, and
+            (including secret/password/token/key/credential names, the
+            metadata redactor's credential classes such as session
+            identifiers, passphrases/passcodes, PINs and one-time codes, JWTs,
+            signatures, private/signing key material and bearer assertions,
+            database connection locations, client credential identifiers, and
             operator-configured sensitive metadata names) are rejected.
             Non-UTF-8 or >1024-byte values fail construction closed. Selected
             values are deliberately emitted as custom transaction and trace
