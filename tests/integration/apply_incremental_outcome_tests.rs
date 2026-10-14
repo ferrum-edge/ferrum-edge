@@ -3064,10 +3064,11 @@ async fn ai_rate_limiter_is_never_installed_on_native_grpc_across_config_paths()
     assert_ai_rate_limiter_http_only(&dp_state, "ai-proxy", "data plane incremental apply");
 }
 
-/// With duplicate API keys already stored (full loads only warn), a consumer
-/// delta must leave every key on the consumer a full rebuild of the same
-/// snapshot would choose, both when the shadowed consumer changes unrelated
-/// metadata and when the current winner is deleted.
+/// A live snapshot that still holds a duplicate API key (built directly here;
+/// production loads now refuse one, issue #6572) cannot be patched while the
+/// collision remains: a metadata-only delta is rejected and changes nothing.
+/// A deletion that resolves the collision applies and leaves the key on the
+/// remaining consumer.
 #[tokio::test]
 async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
     let keyed = |id: &str| {
@@ -3110,12 +3111,21 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
     relabeled.updated_at = Utc::now() + chrono::Duration::seconds(1);
     let mut delta = empty_delta_at(Utc::now());
     delta.added_or_modified_consumers = vec![relabeled];
-    let _ = state.apply_incremental(delta).await;
-    assert_eq!(
-        live_winner(&state),
-        full_build_winner(&state),
-        "a metadata-only update must not move a shared API key"
+    let outcome = state.apply_incremental(delta).await;
+    assert!(
+        matches!(outcome, ConfigApplyOutcome::Rejected { .. }),
+        "a delta that keeps a shared API key must be rejected, got {outcome:?}"
     );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| !consumer.labels.contains_key("tier")),
+        "the rejected metadata update must not publish"
+    );
+    assert_eq!(live_winner(&state), full_build_winner(&state));
 
     // Deleting the current winner hands the key to the remaining consumer.
     let winner = live_winner(&state).expect("winner");
@@ -3124,7 +3134,71 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
         ferrum_edge::config::types::default_namespace(),
         winner.clone(),
     )];
-    let _ = state.apply_incremental(delta).await;
+    assert_eq!(
+        state.apply_incremental(delta).await,
+        ConfigApplyOutcome::Applied,
+        "deleting one side resolves the collision"
+    );
     assert_eq!(live_winner(&state), full_build_winner(&state));
     assert!(live_winner(&state).is_some_and(|id| id != winner));
+}
+
+/// A delta that would make two consumers share an API key is rejected (issue
+/// #6572): `ConsumerIndex` would otherwise resolve the key last-wins. The
+/// last-known-good config stays live.
+#[tokio::test]
+async fn consumer_delta_introducing_shared_api_key_is_rejected() {
+    let keyed = |id: &str, key: &str| {
+        let mut consumer = test_consumer(id, &format!("user-{id}"));
+        consumer
+            .credentials
+            .insert("keyauth".to_string(), serde_json::json!([{ "key": key }]));
+        consumer
+    };
+    let mut config = GatewayConfig {
+        consumers: vec![keyed("c-z", "zulu-api-key-0123456789")],
+        ..Default::default()
+    };
+    config.normalize_fields();
+    let state = proxy_state_with_config(config);
+    let owner = |state: &ProxyState, key: &str| {
+        state
+            .consumer_index
+            .find_by_api_key(key)
+            .map(|consumer| consumer.id.clone())
+    };
+
+    // The delta must not publish at all, whichever id sorts first.
+    let mut delta = empty_delta_at(Utc::now());
+    delta.added_or_modified_consumers = vec![keyed("c-a", "zulu-api-key-0123456789")];
+    let outcome = state.apply_incremental(delta).await;
+    assert!(
+        matches!(outcome, ConfigApplyOutcome::Rejected { .. }),
+        "a colliding delta must be rejected, got {outcome:?}"
+    );
+    assert_eq!(
+        owner(&state, "zulu-api-key-0123456789").as_deref(),
+        Some("c-z")
+    );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| consumer.id != "c-a"),
+        "the rejected delta must leave the previous config live"
+    );
+
+    // A non-colliding delta still applies.
+    let mut delta = empty_delta_at(Utc::now() + chrono::Duration::seconds(1));
+    delta.added_or_modified_consumers = vec![keyed("c-a", "alpha-api-key-0123456789")];
+    assert_eq!(
+        state.apply_incremental(delta).await,
+        ConfigApplyOutcome::Applied
+    );
+    assert_eq!(
+        owner(&state, "alpha-api-key-0123456789").as_deref(),
+        Some("c-a")
+    );
 }
