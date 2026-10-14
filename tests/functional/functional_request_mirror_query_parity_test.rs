@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 
 /// Raw query covering #2444 acceptance cases in one request-target.
 const RAW_QUERY: &str =
-    "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&key=a%2Fb&name=%E2%9C%93";
+    "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&dir=a%2Fb&name=%E2%9C%93";
 
 #[ignore]
 #[tokio::test]

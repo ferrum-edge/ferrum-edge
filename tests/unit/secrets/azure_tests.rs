@@ -103,13 +103,44 @@ fn parse_rejects_empty_interior_version_segment() {
 #[test]
 fn parse_preserves_explicit_port() {
     let (vault, name, version) = azure_parse_keyvault_reference(
-        "http://127.0.0.1:12345/secrets/admin-jwt/v9",
+        "https://127.0.0.1:12345/secrets/admin-jwt/v9",
         "FERRUM_TEST",
     )
     .expect("ported URL should parse");
-    assert_eq!(vault, "http://127.0.0.1:12345");
+    assert_eq!(vault, "https://127.0.0.1:12345");
     assert_eq!(name, "admin-jwt");
     assert_eq!(version.as_deref(), Some("v9"));
+}
+
+#[test]
+fn parse_rejects_non_https_vault_urls() {
+    for reference in [
+        "http://127.0.0.1:12345/secrets/admin-jwt",
+        "http://myvault.vault.azure.net/secrets/admin-jwt/v1",
+        "ftp://myvault.vault.azure.net/secrets/admin-jwt",
+    ] {
+        let err = azure_parse_keyvault_reference(reference, "FERRUM_TEST")
+            .expect_err("non-https vault URL must be refused");
+        assert!(
+            err.contains("must use https://") && err.contains("FERRUM_TEST"),
+            "expected an https-required error, got: {err}"
+        );
+        assert!(
+            !err.contains("myvault") && !err.contains("127.0.0.1") && !err.contains("admin-jwt"),
+            "the refusal must not echo the source reference: {err}"
+        );
+    }
+}
+
+#[test]
+fn tls_version_option_rejects_http_reference() {
+    let err = azure_apply_tls_version_option(
+        "http://myvault.vault.azure.net/secrets/admin-jwt",
+        Some("v1"),
+        "TLS cert material",
+    )
+    .expect_err("typed azure:// sources must also require https");
+    assert!(err.contains("must use https://"), "got: {err}");
 }
 
 #[test]

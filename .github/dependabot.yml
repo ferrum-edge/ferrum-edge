@@ -27,6 +27,14 @@ updates:
       - dependency-name: "hyper-util"
       - dependency-name: "h2"
     groups:
+      # The Azure SDK crates share `azure_core`'s `TokenCredential` trait, so
+      # they only compile when they move together (a lone `azure_core` major
+      # bump broke the build in #6559). This group comes first so it claims
+      # them, majors included, before the catch-all group below.
+      azure-sdk:
+        patterns:
+          - "azure_*"
+          - "typespec*"
       # One weekly PR per directory for every compatible update; a
       # semver-major update gets its own PR and a maintainer.
       cargo-minor-patch:

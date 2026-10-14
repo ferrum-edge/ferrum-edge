@@ -1284,6 +1284,9 @@ impl RedactionPlan {
 // pre-acquired bearer token (no Entra ID round trip). `AzureCredentials`
 // carries `from_static_token()` for that injection.
 #[cfg(feature = "secrets-azure")]
+#[doc(hidden)]
+pub use azure::hold_ca_bundle_reader_permit_for_test as azure_hold_ca_bundle_reader_permit_for_test;
+#[cfg(feature = "secrets-azure")]
 pub use azure::{
     AzureCredentials, AzureSecret, apply_tls_version_option as azure_apply_tls_version_option,
     parse_keyvault_reference as azure_parse_keyvault_reference,

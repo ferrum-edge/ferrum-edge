@@ -252,7 +252,15 @@ fn ensure_trust_health_hook() {
 
 fn global_cache() -> &'static Arc<DashMap<String, JwksCacheEntry>> {
     ensure_trust_health_hook();
-    JWKS_CACHE.get_or_init(|| Arc::new(DashMap::new()))
+    // Process-global JWKS store registry (store acquisition and lifecycle;
+    // token verification itself reads each provider's retained store). Built
+    // before `EnvConfig` is consulted, so it uses the auto-sized shard formula
+    // (`FERRUM_POOL_SHARD_AMOUNT=0`).
+    JWKS_CACHE.get_or_init(|| {
+        Arc::new(DashMap::with_shard_amount(
+            crate::util::sharding::pool_shard_amount(0),
+        ))
+    })
 }
 
 fn discovered_jwks_uris() -> &'static DashMap<String, String> {

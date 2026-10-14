@@ -12042,7 +12042,7 @@ components:
         keyauth:
           type: array
           items:
-            $ref: "#/components/schemas/KeyAuthCredentialBackup"
+            $ref: "#/components/schemas/KeyAuthCredential"
           minItems: 1
           description: Multiple API key entries for zero-downtime rotation, unredacted.
         basicauth:
@@ -12116,17 +12116,17 @@ components:
       properties:
         key:
           type: string
-          minLength: 1
+          minLength: 16
           maxLength: 4096
           allOf:
-            - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+            - pattern: '^(?:[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]){16}'
             - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           not:
             const: "[REDACTED]"
           description: >-
-            API key value. Must be non-empty after trimming, no more than 4096
-            characters, free of disallowed ASCII control bytes, and globally
-            unique across all consumers. The exact string `[REDACTED]` is
+            API key value. Must contain at least 16 non-whitespace characters
+            and no more than 4096 characters, be free of disallowed ASCII
+            control bytes, and be globally unique across all consumers. The exact string `[REDACTED]` is
             reserved as the response redaction placeholder and is rejected as a
             stored key on every write surface; `jwt` and `hmac_auth` secrets
             exclude it implicitly through their 32-character minimum.
@@ -12347,12 +12347,14 @@ components:
           description: >-
             Canonical stored API key (1-4096 characters, non-whitespace and
             free of disallowed ASCII control bytes), carried unredacted in
-            backup and restore payloads. The exact string `[REDACTED]` is
+            `GET /backup` exports. A key stored before the 16-character floor
+            is exported as-is; `POST /restore` admits only `KeyAuthCredential`
+            values (16+ non-whitespace characters). The exact string `[REDACTED]` is
             reserved as the ordinary-response redaction placeholder and is
             rejected by runtime `Consumer::validate_fields()` on restore,
             create, and update — matching `KeyAuthCredential`.
       description: >-
-        `keyauth` entry in backup/restore payloads: the canonical unredacted
+        `keyauth` entry in `GET /backup` exports: the canonical unredacted
         stored API key. The reserved `[REDACTED]` marker is excluded here and
         accepted only by the explicit redacted/update-marker alternatives.
 
@@ -24561,8 +24563,9 @@ components:
             minLength: 1
             pattern: "\\S"
           description: >-
-            Accepted aud claims; audience validation is disabled when empty and
-            no entry may be blank
+            Accepted aud claims (OR-matched); no entry may be blank. When
+            non-empty, the token must carry a matching aud. When empty, a token
+            without aud is accepted and a token that carries aud is rejected.
         require_exp:
           type: boolean
           default: true
@@ -26057,8 +26060,9 @@ components:
                       be decoded to one value is rejected with 400 before any
                       rule is evaluated: a repeated or percent-encoded duplicate
                       name, a literal '+' (RFC 3986 plus vs form-urlencoded
-                      space), malformed percent-encoding, or a non-UTF-8
-                      decoding.
+                      space), an unencoded ';' (a pair separator for backends
+                      that also split on ';'; '%3B' is unambiguous), malformed
+                      percent-encoding, or a non-UTF-8 decoding.
                   uri:
                     description: |
                       Optional URI predicate (Istio `StringMatch` shape).
@@ -28311,7 +28315,16 @@ components:
             matching is an unbounded starts_with; a regex must not match `null`
             or every origin of a scheme (universality is probed against
             reserved DNS-shaped origins, so a hostname-character-class pattern
-            such as `https://[\w.-]+` is effectively universal).
+            such as `https://[\w.-]+` is effectively universal), and must
+            provably pin the host: every literal suffix of the pattern must be
+            a complete origin, contain the literal authority, or end in a fixed
+            non-public domain after its first dot (optionally with a literal
+            port, after a trailing :[0-9]+ or optional (?::[0-9]+)? port is
+            set aside), or every match must start with a literal
+            scheme://host:. Numeric (IP-literal) suffixes never count. A native `*.suffix` wildcard is refused with credentials
+            when the suffix is a single label, a public suffix, or has a
+            Public Suffix List rule beneath it (`*.com`, `*.co.uk`,
+            `*.github.io`, `*.run.app`, `*.amazonaws.com`).
         max_age:
           type: integer
           format: uint64
@@ -28564,8 +28577,10 @@ components:
             guaranteed to read identically: a duplicate decoded parameter name
             (including a percent-encoded alias such as a=1&%61=2 or a bare/valued
             pair such as flag&flag=1), a literal '+' (RFC 3986 plus vs
-            form-urlencoded space), malformed percent-encoding, or a non-UTF-8
-            decoding. 'reject' denies the request with the configured deny_status
+            form-urlencoded space), an unencoded ';' (a pair separator for
+            backends that also split on ';'; reported as semicolon_separator,
+            while '%3B' is unambiguous), malformed percent-encoding, or a
+            non-UTF-8 decoding. 'reject' denies the request with the configured deny_status
             and deny_body before calling OPA. 'delegate' calls OPA anyway and
             lets the policy decide from the ordered, occurrence-complete
             input.query_pairs array and the input.query_ambiguity
@@ -28621,8 +28636,10 @@ components:
         (consumer username → group) then allow (consumer username → group).
         Deny always overrides allow. At least one of `allowed_consumers`,
         `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or
-        `allow_authenticated_identity=true` must be configured. Unknown config
-        keys are rejected. `allow_authenticated_identity=true` cannot be combined
+        `allow_authenticated_identity=true` must be configured, and an allow-list
+        (`allowed_consumers`/`allowed_groups`) that is present must be non-empty:
+        omit it for no allow restriction. Unknown config keys are rejected.
+        `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
         ip_restriction for IP/CIDR rules. Rule entries match principal values
@@ -28669,16 +28686,17 @@ components:
       properties:
         allowed_consumers:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             maxLength: 255
             pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
-          default: []
           description: >-
-            Consumer usernames that are explicitly allowed. Empty list disables
-            the username allow check (other allow rules still apply). Each
-            entry is at most 255 Unicode characters.
+            Consumer usernames that are explicitly allowed. Omit the key for no
+            username allow check (other allow rules still apply). An explicitly
+            empty array is rejected rather than read as allow-all or deny-all.
+            Each entry is at most 255 Unicode characters.
         disallowed_consumers:
           type: array
           items:
@@ -28696,16 +28714,17 @@ components:
             external identities fail closed at runtime.
         allowed_groups:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             maxLength: 255
             pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
-          default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
-            any of the consumer's `acl_groups` appears in this list. Each
-            entry is at most 255 Unicode characters.
+            any of the consumer's `acl_groups` appears in this list. Omit the
+            key for no group allow check; an explicitly empty array is
+            rejected. Each entry is at most 255 Unicode characters.
         disallowed_groups:
           type: array
           items:
@@ -28930,12 +28949,15 @@ components:
           type: string
           enum: [allow_first, deny_first]
           default: allow_first
+          deprecated: true
           description: >-
-            Order of list evaluation for non-overlapping rules. `allow_first`
-            (default) reject when an allow list is configured but the IP is not
-            in it, otherwise check deny. `deny_first` rejects on any deny match
-            first, then enforces the allow list. When the same IP matches both
-            lists, deny always wins regardless of mode.
+            Deprecated and decision-neutral: `mode` never changes whether a
+            request is admitted. A deny match always rejects, and a non-empty
+            allow list always rejects addresses outside it, in either mode. The
+            only effect is which rejection an address that is both outside the
+            allow list and on the deny list receives: `allow_first` (default)
+            reports "IP address not allowed", `deny_first` reports "IP address
+            denied". An allow entry never overrides a deny entry.
 
     BotDetectionConfig:
       type: object
@@ -32571,8 +32593,16 @@ components:
         Proxy-Authenticate, WWW-Authenticate, X-Api-Key, …), contains a built-in
         credential substring
         (so vendor variants like x-openai-api-key / x-amz-security-token are also
-        caught), or matches a configured sensitive_header_patterns entry is
-        stripped before the distinct mirror origin. Native gRPC metadata travels
+        caught), is credential-shaped (any separator-delimited segment is a
+        credential-class word such as auth, jwt, session, sid, key, pass, pwd,
+        ticket, otp, or contains a credential stem such as session, sessid,
+        token, secret, auth, pwd, otp, verifier, or contains key or pass other
+        than ordinary words such as keyword or passenger; the whole name code
+        is denied too; continuation cursors like
+        x-continuation-token, authorship/authority names, and Idempotency-Key
+        are not), or matches a configured
+        sensitive_header_patterns entry is stripped before the distinct mirror
+        origin. Native gRPC metadata travels
         as HTTP/2 headers, so the same predicate covers gRPC credential metadata.
         Forwarding any denied header requires the fail-closed pair
         forward_sensitive_headers=true plus a non-empty exact-name
@@ -32620,7 +32650,10 @@ components:
         residual valid %XX, malformed, or control-bearing names fail closed).
         Built-in token/sig/signature matching is delimiter-bounded (oauth_token,
         x-amz-signature, x-goog-signature denied; continuation_token and signal
-        retained). Delimiter variants of api_key are denied, and raw semicolon-
+        retained). The same credential-shaped rule as headers applies to the
+        decoded name (session_id, jwt, access_key, private_key, key, sid, …
+        denied; continuation_token retained).
+        Delimiter variants of api_key are denied, and raw semicolon-
         bearing segments fail closed because backend query parsers disagree on
         whether they contain additional pairs. Retained pairs keep raw encoding,
         order, flags, empty values, +, percent escapes, and non-ASCII encoded
@@ -32816,10 +32849,13 @@ components:
             type: string
             minLength: 1
             maxLength: 256
-            pattern: "\\S"
+            pattern: '^[!"$''()*,.0-9:<>A-Z\[\\\]^_`a-z{|}~-]+$(?![\s\S])'
           description: >-
             Lowercased exact allowlist of denied sensitive query parameter names
-            to forward when forward_sensitive_query is true. Each entry is matched
+            to forward when forward_sensitive_query is true. Entries are
+            visible ASCII without whitespace; brackets such as filter[key] are
+            allowed, while % + = & ? # / @ ; are refused because entries match
+            the decoded name. Each entry is matched
             against the fully percent-decoded (bounded staged decode)
             ASCII-lowercased name (at most 256 bytes) that the deny-by-default
             policy actually strips (a built-in credential or a
@@ -33163,7 +33199,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include decoded query parameters from the shared canonical backend-bound query view in the function payload, after omitting credentials that an earlier auth plugin marked for backend stripping. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3 and includes any earlier ordered query transform. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal '+', malformed percent-encoding, non-UTF-8 decodings, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
+          description: "Include decoded query parameters from the shared canonical backend-bound query view in the function payload, after omitting credentials that an earlier auth plugin marked for backend stripping. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3 and includes any earlier ordered query transform. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal '+', an unencoded ';' ('%3B' is unambiguous), malformed percent-encoding, non-UTF-8 decodings, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
@@ -34734,6 +34770,19 @@ components:
           type: object
           additionalProperties: false
           required: [type, endpoint]
+          # Cleartext to anything but a loopback IP literal needs the opt-in.
+          if:
+            required: [endpoint]
+            properties:
+              endpoint:
+                pattern: '^[hH][tT][tT][pP]:'
+                not:
+                  pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+          then:
+            required: [allow_plaintext]
+            properties:
+              allow_plaintext:
+                const: true
           properties:
             type:
               type: string
@@ -34742,7 +34791,12 @@ components:
             endpoint:
               type: string
               format: uri
-              description: Embeddings endpoint URL. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time.
+              pattern: '^[^\s\u0000-\u001f\u007f-\u009f\ufeff]+$'
+              description: Embeddings endpoint URL, with no whitespace or control characters anywhere. Literal IP hosts are checked against FERRUM_BACKEND_ALLOW_IPS; hostname resolution is checked by the shared plugin HTTP client at request time. A cleartext http:// URL is admitted only to a loopback IP literal written as a dotted-quad 127.d.d.d or [::1] (other spellings and the name localhost do not qualify) unless provider.allow_plaintext is true.
+            allow_plaintext:
+              type: [boolean, "null"]
+              default: false
+              description: Admit a cleartext http:// endpoint whose host is not a loopback IP literal. The provider API key then crosses the network in clear. Omit or null means false.
             model:
               type: string
               description: Embedding model sent in the request body.
@@ -35089,6 +35143,21 @@ components:
             properties:
               semantic_embedding_endpoint:
                 pattern: '^[hH][tT][tT][pP][sS]?://[^/?#@\s]+(?:[/?#][\s\S]*)?(?![\s\S])'
+        # Cleartext to anything but a loopback IP literal needs the opt-in.
+        - if:
+            required: [semantic_similarity_enabled, semantic_embedding_endpoint]
+            properties:
+              semantic_similarity_enabled:
+                const: true
+              semantic_embedding_endpoint:
+                pattern: '^[hH][tT][tT][pP]:'
+                not:
+                  pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+          then:
+            required: [semantic_embedding_allow_plaintext]
+            properties:
+              semantic_embedding_allow_plaintext:
+                const: true
         - if:
             required: [sync_mode]
             properties:
@@ -35170,7 +35239,7 @@ components:
         semantic_embedding_endpoint:
           type: string
           pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
-          description: Nonblank embedding endpoint. Required and validated as an HTTP(S) URL when semantic_similarity_enabled is true; disabled semantic mode only checks that the supplied string is nonblank. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
+          description: Nonblank embedding endpoint. Required and validated as an HTTP(S) URL when semantic_similarity_enabled is true; disabled semantic mode only checks that the supplied string is nonblank. A cleartext http:// URL is admitted only to a loopback IP literal written as a dotted-quad 127.d.d.d or [::1] (other spellings and the name localhost do not qualify) unless semantic_embedding_allow_plaintext is true. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
         semantic_embedding_model:
           type: string
           pattern: '[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]'
@@ -35198,6 +35267,10 @@ components:
           not:
             pattern: '^[Xx][-_][Ff][Ee][Rr][Rr][Uu][Mm][-_][Hh][Oo][Pp][Ss](?![\s\S])'
           description: HTTP header used for semantic_embedding_api_key. Defaults to Authorization, except Azure OpenAI uses api-key and Google Gemini uses x-goog-api-key. Must not be the gateway-owned X-Ferrum-Hops proxy hop count (any case, `_` or `-`), which the embedding call carries itself.
+        semantic_embedding_allow_plaintext:
+          type: boolean
+          default: false
+          description: Admit a cleartext http:// semantic_embedding_endpoint whose host is not a loopback IP literal. The embedding API key then crosses the network in clear.
         semantic_embedding_auth_scheme:
           type: string
           pattern: '^[^\u0000-\u0008\u000a-\u001f\u007f]*(?![\s\S])'
