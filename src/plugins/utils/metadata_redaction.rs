@@ -534,6 +534,9 @@ const BENIGN_SHORT_CLASS_SEGMENTS: &[&str] = &[
     "tenpins",
     "clothespin",
     "sacred",
+    "assess",
+    "obsess",
+    "reassess",
     "lupin",
     "lupins",
 ];
@@ -610,7 +613,8 @@ const BENIGN_LEADING_SHORT_CLASS_WORDS: &[&str] = &[
 const SHORT_CLASS_OWNER_QUALIFIERS: &[&str] = &[
     "db", "vendor", "user", "admin", "hsm", "sim", "card", "device", "master", "client", "api",
     "app", "service", "root", "account", "login", "auth", "sms", "email", "totp", "hmac", "jwt",
-    "gpg", "pgp", "ssh", "tls", "door", "atm", "bank", "wallet", "puk",
+    "gpg", "pgp", "ssh", "tls", "door", "atm", "bank", "wallet", "puk", "tenant", "customer",
+    "merchant", "partner", "org", "team", "owner", "operator", "consumer", "member",
 ];
 
 /// Words that may follow a short credential class inside one segment
@@ -624,12 +628,12 @@ const SHORT_CLASS_TRAILERS: &[&str] = &[
 /// Short credential classes that only count inside a qualified compound,
 /// with the minimum qualifier length in front of them when nothing follows.
 const QUALIFIED_SHORT_CLASSES: &[(&str, usize)] = &[
-    ("pin", 2),
-    ("sid", 2),
-    ("otp", 2),
-    ("sig", 2),
-    ("cred", 2),
-    ("sess", 2),
+    ("pin", 1),
+    ("sid", 1),
+    ("otp", 1),
+    ("sig", 1),
+    ("cred", 1),
+    ("sess", 1),
 ];
 
 /// Qualified short-class compounds that survive lowercasing: a short class

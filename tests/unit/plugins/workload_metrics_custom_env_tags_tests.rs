@@ -242,6 +242,8 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "VENDORTOKENOPAQUE",
         "MFA_RECOVERY_CODE",
         "DBPINCLEARTEXT",
+        "XPIN",
+        "TENANTPINOPAQUE",
         "SIGNINGKEYUTF8",
         "signingkey1base64url",
         "PRIVATE_EC_P256_PKCS8_PEM_KEY",

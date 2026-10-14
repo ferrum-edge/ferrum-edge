@@ -353,7 +353,13 @@ descriptors in between never close the context (`private_key`,
 `private_rsa_2048_key`, `private_ec_p256_key`, `signing_rsa_pss_key`,
 `private_ec_p256_pkcs8_pem_key`), while `cache_key` and `routing_key` stay visible. Lowercase compounds are
 recognized as well as camelCase ones, so a name normalized before
-classification (an HTTP header name such as `x-hsmpin`) is still caught. The
+classification (an HTTP header name such as `x-hsmpin`) is still caught for
+every rule above. One residual is documented rather than closed: a
+delimiter-free lowercase name that joins an unlisted owner word, a short class
+(`pin`, `sid`, `otp`, `sig`, `cred`) and an unlisted representation (for
+example `tenantpinopaque`) cannot be told apart from ordinary words such as
+`mapping` or `inside` without a dictionary. Delimit or camel-case such names,
+or add them to `FERRUM_LOG_REDACT_METADATA_KEYS`. The
 only exemption is the complete documented outcome key
 `mesh_authz.ignored_baggage.assertion_out_of_scope`. Any other key, including
 one that merely ends the same way, is classified normally. Ordinary dimensions such as `cache_key`, `routing_key` and

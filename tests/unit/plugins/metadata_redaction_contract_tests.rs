@@ -697,6 +697,11 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "vendorSigHeader",
     "privateKeyWordsBase64",
     "privatekeychainpem",
+    "XPin",
+    "XSig",
+    "XCred",
+    "XOtp",
+    "tenantPinOpaque",
     "mesh.signingkeybase64url",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",
@@ -741,6 +746,7 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "tokens_per_second",
     "tokenspersecond",
     "integrity_status",
+    "assess_score",
 ];
 
 #[test]
