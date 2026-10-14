@@ -965,13 +965,14 @@ impl UsageCategories {
     /// longer be trusted to rebuild a complete total, so the usage is
     /// unmetered as a whole rather than resynthesized from them.
     pub(crate) fn invalid_sides(&self) -> (bool, bool) {
-        if self.reported_total == Counter::Invalid || self.reported_floor().is_none() {
-            return (true, true);
-        }
-        (
-            self.side(self.prompt_base, &self.prompt_extras) == Counter::Invalid,
-            self.side(self.completion_base, &[self.completion_extra]) == Counter::Invalid,
-        )
+        // Any malformed or overflowing counter unmeters the whole usage, so
+        // the consumer's unmetered-response policy decides, rather than a
+        // surviving side being read as a partial lower bound.
+        let any_invalid = self.reported_total == Counter::Invalid
+            || self.reported_floor().is_none()
+            || self.side(self.prompt_base, &self.prompt_extras) == Counter::Invalid
+            || self.side(self.completion_base, &[self.completion_extra]) == Counter::Invalid;
+        (any_invalid, any_invalid)
     }
 
     /// Checked sum of every counter this usage reported, base or category,
@@ -1007,7 +1008,7 @@ impl UsageCategories {
             return (None, None, None);
         }
         if prompt == Counter::Invalid || completion == Counter::Invalid {
-            return (value(prompt), value(completion), None);
+            return (None, None, None);
         }
         let (prompt, completion) = (value(prompt), value(completion));
         let total = match self.reported_total {

@@ -990,9 +990,11 @@ fn malformed_counters_are_unmetered_not_partial() {
         }}),
         AiProvider::Google,
     );
+    // The whole usage is unmetered, so the consumer's policy decides.
     assert_eq!(bad_base.prompt_tokens, None);
     assert!(!bad_base.is_complete_for_mode("prompt_tokens"));
-    assert_eq!(bad_base.completion_tokens, Some(5));
+    assert_eq!(bad_base.completion_tokens, None);
+    assert_eq!(bad_base.total_for_mode("total_tokens"), None);
 
     // Valid base, malformed extra: the side is unmetered, not the base alone.
     let bad_extra = extract_response_usage(
@@ -1006,6 +1008,10 @@ fn malformed_counters_are_unmetered_not_partial() {
     assert_eq!(bad_extra.prompt_tokens, None);
     assert!(!bad_extra.is_complete_for_mode("prompt_tokens"));
     assert!(!bad_extra.is_complete_for_mode("total_tokens"));
+    // No surviving side is offered as a partial lower bound: the configured
+    // unmetered-response policy applies.
+    assert_eq!(bad_extra.total_for_mode("total_tokens"), None);
+    assert_eq!(bad_extra.total_for_mode("completion_tokens"), None);
 
     // `null` is absence (Anthropic types its cache counters as nullable).
     let nullable = extract_response_usage(

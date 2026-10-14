@@ -315,6 +315,17 @@ impl AiTokenMetrics {
                 metrics.provider = Some(provider);
                 snapshots.push(metrics);
             }
+            // A standalone invocation-metrics event detects as Bedrock, but it
+            // continues the stream already identified; keep that identity so
+            // `merge_cumulative` merges it (same category layout).
+            if fixed_provider.is_none()
+                && payload.get("amazon-bedrock-invocationMetrics").is_some()
+                && let Some(established) = final_usage.as_ref().and_then(|usage| usage.provider)
+            {
+                for snapshot in &mut snapshots {
+                    snapshot.provider = Some(established);
+                }
+            }
             // The wire parser follows the event's shape, but the exported
             // identity follows an explicit configuration: wrapped events under
             // `provider: bedrock` stay labelled Bedrock.

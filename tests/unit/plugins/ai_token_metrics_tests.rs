@@ -1912,3 +1912,29 @@ async fn co_located_invocation_metrics_supply_their_own_categories() {
     let ctx = run("{\"inputTokenCount\":10,\"cacheReadInputTokenCount\":\"bad\"}").await;
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
 }
+
+/// A standalone invocation-metrics event (detected as Bedrock under `auto`)
+/// continues the Anthropic stream it terminates and merges into it.
+#[tokio::test]
+async fn standalone_invocation_metrics_event_merges_under_auto_detection() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: {\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("anthropic")
+    );
+}
