@@ -704,7 +704,7 @@ async fn literal_path_beats_parameter_path() {
 async fn bypass_header_skips_buffering_and_validation() {
     let config = json!({
         "schema_draft": "draft7",
-        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "bypass": {"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}},
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -714,8 +714,10 @@ async fn bypass_header_skips_buffering_and_validation() {
     });
     let plugin = OpenapiValidator::new(&config).unwrap();
     let mut ctx = post_ctx("/items");
-    ctx.headers
-        .insert("x-bypass-validator".to_string(), "1".to_string());
+    ctx.headers.insert(
+        "x-bypass-validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut headers = ctx.headers.clone();
 
     assert!(!plugin.should_buffer_request_body(&ctx));
@@ -739,7 +741,7 @@ async fn bypass_header_skips_buffering_and_validation() {
 async fn bypass_header_uses_before_proxy_headers_when_ctx_headers_are_moved() {
     let config = json!({
         "schema_draft": "draft7",
-        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "bypass": {"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}},
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -750,8 +752,10 @@ async fn bypass_header_uses_before_proxy_headers_when_ctx_headers_are_moved() {
     });
     let plugin = OpenapiValidator::new(&config).unwrap();
     let mut ctx = post_ctx("/missing");
-    ctx.headers
-        .insert("x-bypass-validator".to_string(), "1".to_string());
+    ctx.headers.insert(
+        "x-bypass-validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut headers = std::mem::take(&mut ctx.headers);
 
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
@@ -7868,7 +7872,7 @@ fn case_equivalent_duplicate_bypass_headers_are_rejected() {
     let error = config_error(json!({
         "bypass": {
             "header_present": {
-                "X-Policy": "strict-token",
+                "X-Policy": "strict-token-0123456789",
                 "x-policy": null
             }
         },
@@ -7930,7 +7934,7 @@ fn case_equivalent_duplicate_multipart_encoding_headers_are_rejected() {
 #[tokio::test]
 async fn bypass_header_matching_remains_case_insensitive() {
     let plugin = OpenapiValidator::new(&json!({
-        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "bypass": {"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}},
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -7944,8 +7948,10 @@ async fn bypass_header_matching_remains_case_insensitive() {
     .unwrap();
 
     let mut ctx = post_ctx("/items");
-    ctx.headers
-        .insert("X-Bypass-Validator".to_string(), "any-value".to_string());
+    ctx.headers.insert(
+        "X-Bypass-Validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut headers = ctx.headers.clone();
 
     assert!(!plugin.should_buffer_request_body(&ctx));
@@ -7955,6 +7961,140 @@ async fn bypass_header_matching_remains_case_insensitive() {
             .get("openapi_validator.skip_reason")
             .map(String::as_str),
         Some("bypass_header")
+    );
+}
+
+fn bypass_header_config(value: Value) -> Value {
+    json!({
+        "bypass": {"header_present": {"x-bypass-validator": value}},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {"application/json": {"type": "object"}}
+            },
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    })
+}
+
+#[test]
+fn bypass_header_requires_a_secret_value() {
+    // Presence alone is never a bypass: any client can send any header name.
+    let error = config_error(bypass_header_config(Value::Null));
+    assert!(
+        error.contains("bypass.header_present") && error.contains("secret string"),
+        "presence-only bypass must be rejected: {error}"
+    );
+    let error = config_error(bypass_header_config(json!("1")));
+    assert!(
+        error.contains("at least 16 bytes"),
+        "a short bypass secret must be rejected: {error}"
+    );
+    for invalid in [
+        " bypass-secret-0123456789",
+        "bypass-secret 0123456789",
+        "bypass-secret-0123456789\r\n",
+        "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+    ] {
+        let error = config_error(bypass_header_config(json!(invalid)));
+        assert!(
+            error.contains("visible ASCII"),
+            "bypass secret {invalid:?} must be rejected: {error}"
+        );
+    }
+    let error = config_error(bypass_header_config(json!("x".repeat(4097))));
+    assert!(
+        error.contains("at most 4096 bytes"),
+        "an oversized bypass secret must be rejected: {error}"
+    );
+}
+
+#[tokio::test]
+async fn bypass_header_with_wrong_value_does_not_skip_validation() {
+    const SECRET: &str = "bypass-secret-0123456789";
+    let mut config = attestation_config("block");
+    config["bypass"] = json!({"header_present": {"x-bypass-validator": SECRET}});
+    let plugin = OpenapiValidator::new(&config).unwrap();
+    // Missing `client_attestation`: violates the contract.
+    let invalid_body: &[u8] = br#"{"id":"a"}"#;
+
+    for presented in [
+        "1",
+        "",
+        "bypass-secret-012345678",
+        "bypass-secret-0123456780",
+        "bypass-secret-01234567890",
+        "BYPASS-SECRET-0123456789",
+    ] {
+        let mut headers = json_headers();
+        headers.insert("x-bypass-validator".to_string(), presented.to_string());
+
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "value {presented:?} must not skip request buffering"
+        );
+        assert_reject(
+            plugin
+                .validate_client_request_body_contract(&mut ctx, &headers, invalid_body)
+                .await,
+            Some(400),
+        );
+        assert_ne!(skip_reason(&ctx), Some("bypass_header"));
+
+        // The backend-final phase does not bypass on a wrong value either.
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, invalid_body)
+                .await,
+            None,
+        );
+        assert_ne!(skip_reason(&ctx), Some("bypass_header"));
+    }
+
+    // The configured secret skips both phases.
+    let mut headers = json_headers();
+    headers.insert("x-bypass-validator".to_string(), SECRET.to_string());
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, invalid_body)
+            .await,
+    );
+    assert_eq!(skip_reason(&ctx), Some("bypass_header"));
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, invalid_body)
+            .await,
+    );
+}
+
+#[test]
+fn bypass_header_names_are_redacted() {
+    let plugin = OpenapiValidator::new(&json!({
+        "bypass": {"header_present": {
+            "X-Bypass-Validator": "bypass-secret-0123456789",
+            "x-alt-bypass": "another-secret-0123456789"
+        }},
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }))
+    .unwrap();
+    assert_eq!(
+        plugin.request_headers_to_redact(),
+        &["x-alt-bypass", "x-bypass-validator"]
     );
 }
 
@@ -9540,10 +9680,14 @@ async fn disabled_mode_never_enters_the_client_phase() {
 #[tokio::test]
 async fn bypass_still_short_circuits_the_client_phase() {
     let mut config = attestation_config("block");
-    config["bypass"] = json!({"header_present": {"x-bypass-validator": null}});
+    config["bypass"] =
+        json!({"header_present": {"x-bypass-validator": "bypass-secret-0123456789"}});
     let plugin = OpenapiValidator::new(&config).unwrap();
     let mut headers = json_headers();
-    headers.insert("x-bypass-validator".to_string(), "1".to_string());
+    headers.insert(
+        "x-bypass-validator".to_string(),
+        "bypass-secret-0123456789".to_string(),
+    );
     let mut ctx = orders_ctx();
     ctx.headers = headers.clone();
     assert!(!plugin.should_buffer_request_body(&ctx));
