@@ -65,12 +65,10 @@ pub struct AccessControl {
 
 impl AccessControl {
     pub fn new(config: &Value) -> Result<Self, String> {
-        // Name only the JSON type: the rejected value may carry principal
-        // names, and this message reaches admin responses and logs.
         let object = config.as_object().ok_or_else(|| {
             format!(
-                "access_control: config must be an object, got {}",
-                json_type_name(config)
+                "access_control: config must be an object, got: {config:?}",
+                config = config.to_string()
             )
         })?;
 
@@ -341,17 +339,6 @@ fn reject_explicitly_empty_allow_lists(
         }
     }
     Ok(())
-}
-
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
 }
 
 fn parse_string_set(

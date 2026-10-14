@@ -152,8 +152,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "no allow restriction", so emptying the list to lock a route down admitted
   every consumer the deny side did not name. A present but empty allow-list is
   now a config validation error (`minItems: 1` in `openapi.yaml`); omit the key
-  for no allow restriction. A non-object config error no longer echoes the
-  rejected value.
+  for no allow restriction.
 - **`ip_restriction` `mode` is deprecated and documented as
   decision-neutral** (issue #6610). `allow_first` and `deny_first` never
   changed whether a request is admitted: a deny match always rejects and a

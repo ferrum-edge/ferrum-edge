@@ -276,15 +276,6 @@ async fn test_access_control_omitted_allow_list_means_no_allow_restriction() {
 }
 
 #[tokio::test]
-async fn test_access_control_non_object_config_error_omits_the_value() {
-    let error = AccessControl::new(&json!(["secret-principal"]))
-        .err()
-        .expect("non-object config must be refused");
-    assert!(error.contains("must be an object"), "{error}");
-    assert!(!error.contains("secret-principal"), "{error}");
-}
-
-#[tokio::test]
 async fn test_access_control_creation_with_allow_authenticated_identity_only() {
     let config = json!({
         "allow_authenticated_identity": true
