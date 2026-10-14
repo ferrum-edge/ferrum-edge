@@ -446,7 +446,13 @@ async fn anthropic_missing_delta_retains_usage_and_errors_never_finish_successfu
     overflow["message"]["usage"]["input_tokens"] = json!(u64::MAX);
     let out = drive(
         &mut *inspector,
-        &sse(&[overflow, json!({"type": "message_stop"})]),
+        // The start's `output_tokens` is a placeholder, so the overflow comes
+        // from the cumulative output the terminal delta reports.
+        &sse(&[
+            overflow,
+            json!({"type": "message_delta", "usage": {"output_tokens": 1}}),
+            json!({"type": "message_stop"}),
+        ]),
         7,
     )
     .await;

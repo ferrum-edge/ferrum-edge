@@ -4804,7 +4804,7 @@ impl AnthropicSseNormalizer {
                     super::utils::ai_providers::anthropic_message_start_usage(message);
                 if !self.absorb_anthropic_usage(&start_usage) {
                     self.fail_bound(
-                        "upstream provider sent malformed Anthropic usage; stream terminated",
+                        "upstream provider sent malformed or overflowing Anthropic usage; stream terminated",
                         out,
                     );
                     return true;
@@ -4935,7 +4935,7 @@ impl AnthropicSseNormalizer {
                 }
                 if !self.absorb_anthropic_usage(event) {
                     self.fail_bound(
-                        "upstream provider sent malformed Anthropic usage; stream terminated",
+                        "upstream provider sent malformed or overflowing Anthropic usage; stream terminated",
                         out,
                     );
                     return true;

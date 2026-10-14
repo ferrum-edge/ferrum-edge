@@ -10497,7 +10497,10 @@ async fn test_anthropic_normalizer_fails_closed_on_malformed_usage() {
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
 
-    assert!(out.contains("malformed Anthropic usage"), "{out}");
+    assert!(
+        out.contains("malformed or overflowing Anthropic usage"),
+        "{out}"
+    );
     assert!(!out.contains("\"prompt_tokens\""), "{out}");
 }
 
