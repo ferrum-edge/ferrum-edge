@@ -24,8 +24,8 @@ drift-manifest hash, so the observed crate is the h2 the gateway ships. It then
 verifies every observer preimage, applies the reviewed observer patch without
 fuzz, verifies postimages and injected assets, and selects the result only in
 that copy by replacing the vendored `h2` entry in `[patch.crates-io]`. The
-lint baseline is the shipped crate, so the comparison isolates the observer. The generated Dockerfile
-retains the ordinary stages/features and adds `--locked` to its Cargo builds.
+lint baseline is the shipped crate, so the comparison isolates the observer. The generated context
+uses the ordinary Dockerfile unchanged; its Cargo builds already pass `--locked`.
 The manual job loads its image locally and does not publish it or export its
 cache. Graph verification requires both transport paths to select the patched
 crate. `source.json` is the exact source, patch and asset identity record.
