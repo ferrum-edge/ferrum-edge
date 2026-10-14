@@ -221,19 +221,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **AI token metering counts prompt-cache, thinking and tool-use tokens**
-  (issue #6623). Anthropic `cache_creation_input_tokens` and
-  `cache_read_input_tokens` and Bedrock Converse `cacheReadInputTokens` and
-  `cacheWriteInputTokens` are now part of the prompt count. Gemini
-  `thoughtsTokenCount` is part of the completion count and
-  `toolUsePromptTokenCount` part of the prompt. This applies to buffered and
-  streamed extraction (`ai_rate_limiter`, `ai_token_metrics`) and to the
-  `ai_stream_router` and `ai_federation` normalizers, so token budgets no
-  longer undercharge cached or thinking requests and every surface agrees.
-  A Gemini or Bedrock provider total is never published below its own
-  reported counters.
-  Categories merge field by field across streamed events, and a malformed
-  counter leaves the whole usage unmetered instead of partially counted.
 - **`ws_logging` charges one back-off per failed attempt and none after the
   last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
   failure, including after the final attempt, and `send_batch` added
