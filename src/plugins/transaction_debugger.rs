@@ -559,6 +559,13 @@ impl TransactionDebugger {
                 .iter()
                 .any(|h| header_name.eq_ignore_ascii_case(h))
             || ctx.request_header_requires_redaction(header_name)
+            // Class-based fallback: a header whose NAME looks like a credential
+            // (`*token*`, `*secret*`, `*password*`, `*authorization*`,
+            // `*cookie*`, API-key spellings, operator
+            // `FERRUM_LOG_REDACT_METADATA_KEYS` extras) is redacted even when
+            // it is not on the fixed list, so a novel credential header does
+            // not reach DEBUG output in clear.
+            || crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key(header_name)
     }
 
     /// Create a redacted copy of headers for safe logging.

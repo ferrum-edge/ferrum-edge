@@ -339,6 +339,19 @@ fn test_zero_cache_size_config_rejected() {
 }
 
 #[test]
+fn test_max_entries_has_a_hard_admission_ceiling() {
+    // Issue #6612: a huge integer used to reach a capacity preallocation and
+    // could abort the process during a reload instead of failing validation.
+    assert!(ResponseCaching::new(&json!({"max_entries": 10_000_000})).is_ok());
+    for value in [10_000_001_u64, u64::MAX / 4, u64::MAX] {
+        let err = ResponseCaching::new(&json!({"max_entries": value}))
+            .err()
+            .unwrap_or_else(|| panic!("max_entries={value} must be rejected"));
+        assert!(err.contains("max_entries"), "got: {err}");
+    }
+}
+
+#[test]
 fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
     assert_eq!(
         plugin_failure_policy("response_caching"),

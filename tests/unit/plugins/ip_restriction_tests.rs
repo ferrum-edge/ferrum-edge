@@ -1,6 +1,6 @@
 use ferrum_edge::plugins::ip_restriction::IpRestriction;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
+    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamConnectionContext, priority,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr};
@@ -245,7 +245,7 @@ async fn default_config_rejects_creation_for_any_ip() {
     assert!(result.is_err());
 }
 
-// ── Both allow and deny lists (deny takes precedence in allow_first) ──
+// ── Both allow and deny lists (deny takes precedence in every mode) ──
 
 #[tokio::test]
 async fn allow_first_deny_takes_precedence_when_ip_in_both_lists() {
@@ -331,6 +331,74 @@ async fn deny_first_with_both_lists_ip_in_neither() {
     let mut ctx = create_context_with_ip("172.16.0.1");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
+}
+
+// ── `mode` is decision-neutral (issue #6610) ─────────────────────────
+
+/// `mode` never changes whether an address is admitted: deny always wins and a
+/// non-empty allow list always has to match. Pin that across every membership
+/// combination so a future change to `mode` semantics cannot loosen the policy
+/// unnoticed.
+#[tokio::test]
+async fn mode_never_changes_the_admission_decision() {
+    let lists = [
+        json!({"allow": ["10.0.0.0/8"], "deny": ["10.0.0.5"]}),
+        json!({"allow": ["10.0.0.0/8"]}),
+        json!({"deny": ["10.0.0.5"]}),
+    ];
+    for base in lists {
+        let mut allow_first = base.clone();
+        allow_first["mode"] = json!("allow_first");
+        let mut deny_first = base.clone();
+        deny_first["mode"] = json!("deny_first");
+        let plugins = [
+            IpRestriction::new(&base).unwrap(),
+            IpRestriction::new(&allow_first).unwrap(),
+            IpRestriction::new(&deny_first).unwrap(),
+        ];
+        // In allow and deny, allow only, deny only (outside allow), neither.
+        for ip in ["10.0.0.5", "10.0.0.6", "192.168.1.1"] {
+            let mut decisions = Vec::new();
+            for plugin in &plugins {
+                let mut ctx = create_context_with_ip(ip);
+                decisions.push(matches!(
+                    plugin.on_request_received(&mut ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+            assert!(
+                decisions.windows(2).all(|pair| pair[0] == pair[1]),
+                "mode changed the decision for {ip} under {base}: {decisions:?}"
+            );
+        }
+    }
+}
+
+/// The one observable effect of `mode`: which rejection an address that is
+/// both outside the allow list and on the deny list receives.
+#[tokio::test]
+async fn mode_only_selects_the_rejection_reason_for_an_address_failing_both_checks() {
+    for (mode, expected_body) in [
+        ("allow_first", r#"{"error":"IP address not allowed"}"#),
+        ("deny_first", r#"{"error":"IP address denied"}"#),
+    ] {
+        let plugin = IpRestriction::new(&json!({
+            "allow": ["10.0.0.0/8"],
+            "deny": ["192.168.1.1"],
+            "mode": mode
+        }))
+        .unwrap();
+        let mut ctx = create_context_with_ip("192.168.1.1");
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 403, "{mode}");
+                assert_eq!(body, expected_body, "{mode}");
+            }
+            other => panic!("{mode} must reject, got {other:?}"),
+        }
+    }
 }
 
 // ── Custom status code ──────────────────────────────────────────────

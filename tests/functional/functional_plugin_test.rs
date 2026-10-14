@@ -2219,6 +2219,9 @@ mod waf_wide_charset {
                     "proxy_id": "wide", "enabled": true,
                     "config": {
                         "include_default_rules": false,
+                        // Excluded media must stay releasable below; the
+                        // unlisted-type refusal is covered by its own tests.
+                        "on_unlisted_response_content_type": "allow",
                         "response_inspection": true, "response_body_inspection": true,
                         "custom_rules": [
                             {

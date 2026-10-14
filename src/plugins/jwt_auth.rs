@@ -25,7 +25,7 @@ use crate::consumer_index::ConsumerIndex;
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
-use super::utils::jwt_verifier::issuer_claim_is_single_string;
+use super::utils::jwt_verifier::{audience_claim_is_acceptable, issuer_claim_is_single_string};
 use super::utils::token_extract::bearer_credential_from_authorization_value;
 use super::{RequestContext, strip_auth_scheme};
 
@@ -43,6 +43,7 @@ pub struct JwtAuth {
     consumer_claim_field: String,
     validation: Validation,
     require_nbf: bool,
+    audiences_configured: bool,
 }
 
 enum TokenLookup {
@@ -109,9 +110,13 @@ impl JwtAuth {
         if !audiences.is_empty() {
             validation.set_audience(&audiences);
             required.insert("aud".to_string());
-        } else {
-            validation.validate_aud = false;
         }
+        // With no audiences configured, keep jsonwebtoken's strict
+        // `validate_aud = true` default (same contract as `jwt_verifier.rs` and
+        // the admin verifier): a token without `aud` still passes, but a token
+        // that carries `aud` is rejected because no acceptable audience is
+        // configured (RFC 7519 §4.1.3). Disabling it would let a token minted
+        // for another service with the same consumer secret authenticate here.
         validation.required_spec_claims = required;
 
         let request_headers_to_redact = match &token_lookup {
@@ -125,6 +130,7 @@ impl JwtAuth {
             consumer_claim_field,
             validation,
             require_nbf,
+            audiences_configured: !audiences.is_empty(),
         })
     }
 
@@ -261,6 +267,11 @@ impl AuthMechanism for JwtAuth {
                     // allows exactly one `StringOrURI` (issue #5522).
                     if !issuer_claim_is_single_string(&token_data.claims) {
                         debug!("jwt_auth: JWT 'iss' claim is not a single string");
+                        return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
+                    }
+                    if !audience_claim_is_acceptable(&token_data.claims, self.audiences_configured)
+                    {
+                        debug!("jwt_auth: JWT 'aud' claim is malformed or unexpected");
                         return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
                     }
                     if self.require_nbf && token_data.claims.get("nbf").is_none() {

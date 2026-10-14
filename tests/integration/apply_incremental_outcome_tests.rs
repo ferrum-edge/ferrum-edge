@@ -3075,7 +3075,7 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
         let mut consumer = test_consumer(id, &format!("user-{id}"));
         consumer.credentials.insert(
             "keyauth".to_string(),
-            serde_json::json!([{ "key": "shared-key" }]),
+            serde_json::json!([{ "key": "shared-key-0123456789" }]),
         );
         consumer
     };
@@ -3087,13 +3087,13 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
     let state = proxy_state_with_config(config);
     let full_build_winner = |state: &ProxyState| {
         ferrum_edge::ConsumerIndex::new(&state.config.load().consumers)
-            .find_by_api_key("shared-key")
+            .find_by_api_key("shared-key-0123456789")
             .map(|consumer| consumer.id.clone())
     };
     let live_winner = |state: &ProxyState| {
         state
             .consumer_index
-            .find_by_api_key("shared-key")
+            .find_by_api_key("shared-key-0123456789")
             .map(|consumer| consumer.id.clone())
     };
     assert_eq!(live_winner(&state), full_build_winner(&state));

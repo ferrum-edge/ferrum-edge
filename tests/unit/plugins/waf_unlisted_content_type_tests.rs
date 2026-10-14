@@ -5,9 +5,12 @@
 //! The declared media type is attacker-controlled and many backends parse the
 //! body without consulting it, so relabelling a JSON injection payload as
 //! `application/octet-stream` (or dropping the header) used to skip every body
-//! rule. `allow` keeps that behavior; `fail_closed` refuses a non-empty
-//! unlisted body when an enforcing request-body policy applies; `block` refuses
-//! every non-empty unlisted body while globally enforcing.
+//! rule. `allow` keeps that behavior; `fail_closed` (the default) refuses a
+//! non-empty unlisted body when an enforcing request-body policy applies;
+//! `block` refuses every non-empty unlisted body while globally enforcing.
+//!
+//! `on_unlisted_response_content_type` is the response-side counterpart
+//! (default `fail_closed`).
 
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -82,7 +85,7 @@ fn is_reject(result: &PluginResult) -> bool {
 }
 
 #[tokio::test]
-async fn default_allow_leaves_unlisted_bodies_uninspected() {
+async fn allow_leaves_unlisted_bodies_uninspected() {
     let plugin = recommended("allow");
     for content_type in [
         Some("application/octet-stream"),
@@ -541,4 +544,361 @@ fn invalid_values_are_rejected() {
         error.contains("`on_unlisted_content_type` must be allow, fail_closed, or block"),
         "{error}"
     );
+}
+
+// ── Defaults ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn request_default_is_fail_closed_under_an_enforcing_body_policy() {
+    let plugin = waf(json!({ "mode": "enforce", "default_rule_action": "enforce" })).unwrap();
+    for content_type in [Some("application/octet-stream"), Some("text/csv"), None] {
+        let (buffers, result, ctx) = post(&plugin, content_type, SQLI_JSON).await;
+        assert!(buffers, "{content_type:?}");
+        assert!(is_reject(&result), "{content_type:?}");
+        assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+        assert_eq!(
+            meta(&ctx, "waf.body_uninspected_target"),
+            Some("request_body")
+        );
+    }
+    // An empty unlisted body still passes.
+    let (_, result, _) = post(&plugin, Some("application/octet-stream"), b"").await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn request_default_never_blocks_a_monitor_only_deployment() {
+    let plugin = waf(json!({ "mode": "monitor", "default_rule_action": "enforce" })).unwrap();
+    let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), SQLI_JSON).await;
+    assert!(!buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn delete_bodies_are_scanned_by_default() {
+    let plugin = recommended("fail_closed");
+    let mut ctx = request("DELETE", "/api/items", Some("application/json"));
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let headers = ctx.headers.clone();
+    let result = final_body(&plugin, &mut ctx, &headers, SQLI_JSON).await;
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"));
+
+    // An explicit list still replaces the default.
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "body_methods": ["POST"]
+    }))
+    .unwrap();
+    let ctx = request("DELETE", "/api/items", Some("application/json"));
+    assert!(!plugin.should_buffer_request_body(&ctx));
+}
+
+// ── Responses: on_unlisted_response_content_type ───────────────────────────
+
+/// An enforce-mode WAF whose only response-body rule is `response_action`.
+/// An enforcing query rule keeps `mode: enforce` admissible either way.
+fn response_waf(response_action: &str, on_unlisted: Option<&str>) -> Waf {
+    let mut config = json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [
+            {
+                "id": "LEAK", "category": "custom", "target": "response_body",
+                "match_kind": "contains", "pattern": "leak-marker",
+                "action": response_action
+            },
+            {
+                "id": "QUERY", "category": "custom", "target": "query_values",
+                "match_kind": "contains", "pattern": "query-marker",
+                "action": "enforce"
+            }
+        ]
+    });
+    if let Some(value) = on_unlisted {
+        config["on_unlisted_response_content_type"] = json!(value);
+    }
+    waf(config).unwrap()
+}
+
+async fn respond(
+    plugin: &Waf,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> (bool, PluginResult, RequestContext) {
+    let mut ctx = request("GET", "/api/items", None);
+    let mut headers = HashMap::new();
+    if let Some(content_type) = content_type {
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
+    let buffers =
+        plugin.should_buffer_response_body_for_content_type(&ctx, content_type, 200, &headers);
+    let result = plugin
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
+        .await;
+    (buffers, result, ctx)
+}
+
+#[tokio::test]
+async fn response_allow_streams_and_records_unlisted_bodies() {
+    let plugin = response_waf("enforce", Some("allow"));
+    let (buffers, result, ctx) =
+        respond(&plugin, Some("application/octet-stream"), b"leak-marker").await;
+    assert!(!buffers, "allow keeps the streaming path");
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.body_uninspected"), Some("content_type"));
+    assert_eq!(
+        meta(&ctx, "waf.body_uninspected_target"),
+        Some("response_body")
+    );
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn response_default_is_fail_closed_under_an_enforcing_rule() {
+    let plugin = response_waf("enforce", None);
+    let (buffers, result, ctx) = respond(
+        &plugin,
+        Some("application/octet-stream"),
+        b"<?php echo 1; ?>",
+    )
+    .await;
+    assert!(buffers);
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+    // The refusing disposition is part of the pre-content-type capability, so
+    // gateway-header provenance is retained for the rejection.
+    let ctx = request("GET", "/api/items", None);
+    assert!(plugin.may_enforce_response_body_policy(&ctx));
+}
+
+#[tokio::test]
+async fn response_fail_closed_refuses_unlisted_bodies_under_an_enforcing_rule() {
+    let plugin = response_waf("enforce", Some("fail_closed"));
+    for content_type in [Some("application/octet-stream"), Some("image/png"), None] {
+        let (buffers, result, ctx) = respond(&plugin, content_type, b"anything").await;
+        assert!(
+            buffers,
+            "{content_type:?} must be buffered so the bytes decide"
+        );
+        assert!(is_reject(&result), "{content_type:?}");
+        assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+        assert_eq!(meta(&ctx, "waf.action"), Some("blocked"));
+        assert_eq!(
+            meta(&ctx, "waf.body_uninspected_target"),
+            Some("response_body")
+        );
+    }
+
+    // Empty bodies pass, listed types are scanned rather than refused, and
+    // event streams are never buffered.
+    let (_, result, ctx) = respond(&plugin, Some("application/octet-stream"), b"").await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.body_uninspected"), None);
+    let (_, result, ctx) = respond(&plugin, Some("application/json"), br#"{"ok":1}"#).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.body_uninspected"), None);
+    let (_, result, ctx) = respond(&plugin, Some("text/plain"), b"leak-marker").await;
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"));
+    let (buffers, _, _) = respond(&plugin, Some("text/event-stream"), b"data: x\n\n").await;
+    assert!(!buffers);
+}
+
+#[tokio::test]
+async fn response_fail_closed_needs_an_enforcing_response_rule_but_block_does_not() {
+    let fail_closed = response_waf("monitor", Some("fail_closed"));
+    let (buffers, result, ctx) =
+        respond(&fail_closed, Some("application/octet-stream"), b"anything").await;
+    assert!(!buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+
+    let ctx = request("GET", "/api/items", None);
+    assert!(!fail_closed.may_enforce_response_body_policy(&ctx));
+
+    let block = response_waf("monitor", Some("block"));
+    assert!(
+        block.may_enforce_response_body_policy(&ctx),
+        "a refusing unlisted disposition must be reported as a capability"
+    );
+    let (buffers, result, ctx) =
+        respond(&block, Some("application/octet-stream"), b"anything").await;
+    assert!(buffers);
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+}
+
+#[tokio::test]
+async fn response_policy_does_not_govern_exempt_or_bodiless_responses() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "on_unlisted_response_content_type": "block",
+        "global_exemptions": { "paths": ["/downloads/*"] },
+        "custom_rules": [{
+            "id": "LEAK", "category": "custom", "target": "response_body",
+            "match_kind": "contains", "pattern": "leak-marker", "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    )]);
+
+    let mut exempt = request("GET", "/downloads/file.bin", None);
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &exempt,
+        Some("application/octet-stream"),
+        200,
+        &headers
+    ));
+    let result = plugin
+        .finalize_client_visible_response_body(&mut exempt, 200, &headers, b"bytes")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let head = request("HEAD", "/api/items", None);
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &head,
+        Some("application/octet-stream"),
+        200,
+        &headers
+    ));
+    let no_content = request("GET", "/api/items", None);
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &no_content,
+        Some("application/octet-stream"),
+        204,
+        &headers
+    ));
+}
+
+#[test]
+fn invalid_response_values_are_rejected() {
+    let error = waf(json!({
+        "mode": "monitor",
+        "on_unlisted_response_content_type": "deny"
+    }))
+    .unwrap_err();
+    assert!(
+        error.contains("`on_unlisted_response_content_type` must be allow, fail_closed, or block"),
+        "{error}"
+    );
+}
+
+// ── Zero-contribution scoring does not make a body policy enforcing ────────
+
+#[tokio::test]
+async fn a_zero_score_monitor_body_rule_does_not_make_unlisted_bodies_refusable() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "custom_rules": [
+            {
+                "id": "QUERY", "category": "custom", "target": "query_values",
+                "match_kind": "contains", "pattern": "query-marker", "action": "enforce"
+            },
+            {
+                "id": "BODY-ZERO", "category": "custom", "target": "body_text",
+                "match_kind": "contains", "pattern": "noted", "action": "monitor", "score": 0
+            },
+            {
+                "id": "RESP-ZERO", "category": "custom", "target": "response_body",
+                "match_kind": "contains", "pattern": "noted", "action": "monitor", "score": 0
+            }
+        ]
+    }))
+    .unwrap();
+
+    let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), b"x").await;
+    assert!(!buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+
+    let (buffers, result, ctx) = respond(&plugin, Some("application/octet-stream"), b"x").await;
+    assert!(!buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn a_scoring_body_rule_with_a_positive_score_still_makes_them_refusable() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "custom_rules": [{
+            "id": "BODY-SCORED", "category": "custom", "target": "body_text",
+            "match_kind": "contains", "pattern": "noted", "action": "monitor", "score": 5
+        }]
+    }))
+    .unwrap();
+    let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), b"x").await;
+    assert!(buffers);
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+}
+
+// ── header_present secrets stay out of diagnostics ─────────────────────────
+
+#[test]
+fn header_present_names_are_redacted_from_diagnostics() {
+    let plugin = waf(json!({
+        "mode": "monitor",
+        "global_exemptions": {
+            "header_present": {
+                "X-Waf-Bypass": "trusted-hop-shared-secret",
+                "x-scanner": "another-shared-secret-value"
+            }
+        }
+    }))
+    .unwrap();
+    let mut names = plugin.request_headers_to_redact().to_vec();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["x-scanner".to_string(), "x-waf-bypass".to_string()]
+    );
+
+    let plain = waf(json!({ "mode": "monitor" })).unwrap();
+    assert!(plain.request_headers_to_redact().is_empty());
+}
+
+/// On responses `inspect_binary_body` brings every type, multipart included,
+/// into the scan scope, so such a body is scanned by the rules rather than
+/// being unlisted: a hit still blocks for the rule.
+#[tokio::test]
+async fn binary_response_inspection_scans_multipart_instead_of_refusing_it() {
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "inspect_binary_body": true,
+        "on_unlisted_response_content_type": "block",
+        "custom_rules": [{
+            "id": "LEAK", "category": "custom", "target": "response_body",
+            "match_kind": "contains", "pattern": "leak-marker", "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let multipart = Some("multipart/mixed; boundary=b");
+    let (buffers, result, ctx) = respond(&plugin, multipart, b"--b\r\nclean\r\n--b--").await;
+    assert!(buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.body_uninspected"), None);
+    let (_, result, ctx) = respond(&plugin, multipart, b"--b\r\nleak-marker\r\n--b--").await;
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"));
 }
