@@ -316,6 +316,10 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = config.validate_unique_mtls_dns_identities() {
         errors.extend(found);
     }
+    // One credential must never map to two Consumers (issue #6572).
+    if let Err(found) = config.validate_unique_consumer_auth_credentials() {
+        errors.extend(found);
+    }
     if let Err(found) = crate::proxy::validate_mesh_route_dispatch_upstream_references(config) {
         errors.extend(found);
     }
