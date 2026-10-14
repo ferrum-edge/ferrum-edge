@@ -898,10 +898,10 @@ fn token_extract_non_materialized_custom_header_is_invalid_not_missing() {
 
 // --- H1/H2/H3 parity.
 //
-// H1/H2 call `materialize_query_params` (percent-decoded) while H3 calls
-// `materialize_query_params_raw` (percent-escaped) unless a plugin opts in.
-// The canonical policy view must be identical either way, because it decodes
-// the forwarded query directly instead of reading that protocol-dependent map.
+// Every frontend calls `materialize_query_params` (percent-decoded), so the
+// shared map is identical on H1/H2/H3 (#6580). Security consumers still decide
+// on the canonical view, which decodes the forwarded query directly instead of
+// reading that lossy single-value map.
 
 fn ctx_for(raw_query: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
@@ -914,54 +914,53 @@ fn ctx_for(raw_query: &str) -> RequestContext {
 }
 
 #[test]
-fn canonical_policy_view_is_identical_across_h1_h2_and_h3_materialization() {
-    for raw_query in [
-        "resource=%2Fadmin",
-        "action=delete%20record",
-        "sign=a%2Bb",
-        "tenant=victim&tenant=admin",
-        "action=delete+record",
-        "flag&empty=",
-        "&a=1&&b=2&",
-        "name=%FF",
-        "name=%zz",
-    ] {
-        let mut h1 = ctx_for(raw_query);
-        h1.materialize_query_params();
-        let mut h3 = ctx_for(raw_query);
-        h3.materialize_query_params_raw();
+fn http3_materializes_decoded_query_params_unconditionally() {
+    // Issue #6580: native H3 used to call `materialize_query_params_raw()`
+    // unless a configured plugin set the decoded-query capability bit, so a
+    // custom plugin that never opted in saw `%2Fadmin` over HTTP/3 and
+    // `/admin` over HTTP/1.1 and HTTP/2. Guard the dispatch selection itself,
+    // not just the decoder: the H3 materialization must be the decoded one,
+    // must not depend on any capability, and the raw variant must not return.
+    let server = include_str!("../../../src/http3/server.rs");
+    let start = server
+        .find("// Materialize query params before authentication.")
+        .expect("native H3 query materialization marker");
+    let call = server[start..]
+        .find("ctx.materialize_query_params();")
+        .map(|offset| start + offset)
+        .expect("native H3 must materialize decoded query params");
+    let between = &server[start..call];
+    assert!(
+        !between.contains("capabilities.has(") && !between.contains("if "),
+        "native H3 query decoding must not be conditional"
+    );
+    assert!(!server.contains("materialize_query_params_raw"));
 
-        assert_eq!(
-            canonical_query_for_policy(&h1),
-            canonical_query_for_policy(&h3),
-            "query {raw_query} must yield one policy view on every frontend protocol"
-        );
-    }
+    let context = include_str!("../../../src/plugins/mod.rs");
+    assert!(
+        !context.contains("pub fn materialize_query_params_raw"),
+        "the raw H3 query materializer must stay removed"
+    );
+    let cache = include_str!("../../../src/plugin_cache.rs");
+    assert!(
+        !cache.contains("pub const NEEDS_DECODED_QUERY_PARAMS"),
+        "no capability may switch a frontend back to raw query params"
+    );
 }
 
 #[test]
-fn canonical_policy_view_ignores_a_divergent_materialized_map() {
-    // `%2Fadmin` is the advisory's cross-protocol case: H1/H2 put `/admin` in
-    // the shared map and H3 puts `%2Fadmin`. Neither reaches policy.
-    let mut h1 = ctx_for("resource=%2Fadmin");
-    h1.materialize_query_params();
+fn materialized_map_and_canonical_view_agree_on_a_percent_encoded_value() {
+    // `%2Fadmin` was the advisory's cross-protocol case: H3 used to put
+    // `%2Fadmin` in the shared map while H1/H2 put `/admin`.
+    let mut ctx = ctx_for("resource=%2Fadmin");
+    ctx.materialize_query_params();
     assert_eq!(
-        h1.query_params.get("resource").map(String::as_str),
+        ctx.query_params.get("resource").map(String::as_str),
         Some("/admin")
     );
-
-    let mut h3 = ctx_for("resource=%2Fadmin");
-    h3.materialize_query_params_raw();
-    assert_eq!(
-        h3.query_params.get("resource").map(String::as_str),
-        Some("%2Fadmin")
-    );
-
-    for ctx in [&h1, &h3] {
-        let query = canonical_query_for_policy(ctx);
-        assert!(query.is_unambiguous());
-        assert_eq!(query.get("resource"), Some("/admin"));
-    }
+    let query = canonical_query_for_policy(&ctx);
+    assert!(query.is_unambiguous());
+    assert_eq!(query.get("resource"), Some("/admin"));
 }
 
 #[test]
