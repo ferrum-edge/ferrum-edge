@@ -40,6 +40,29 @@ fn pool_entry_is_idle(now_tick_ms: u64, last_used_tick_ms: u64, idle_timeout_ms:
     now_tick_ms.saturating_sub(last_used_tick_ms) > idle_timeout_ms
 }
 
+/// How stale a hot-path `last_used_tick_ms` stamp may get before a hit
+/// refreshes it (issue #6676). Storing the stamp on every hit puts a
+/// contended atomic store on the request path for every pooled checkout;
+/// sampling bounds stamp staleness to this window instead. The window is
+/// at most half the idle timeout (and at most 1s), and the cleanup sweep
+/// adds it back to its eviction threshold, so an entry can never be
+/// evicted before `idle_timeout_ms` of *true* idleness — eviction can
+/// only ever be delayed by up to this window. A zero idle timeout samples
+/// at 0, which degenerates to refresh-on-every-hit (the exact legacy
+/// behaviour).
+#[inline]
+fn last_used_sample_ms(idle_timeout_ms: u64) -> u64 {
+    (idle_timeout_ms / 2).min(1_000)
+}
+
+/// Whether a stamp sampled at `prev_tick_ms` is old enough at `now_tick_ms`
+/// to be worth the atomic store. Pure for the same reason as
+/// [`pool_entry_is_idle`].
+#[inline]
+fn should_refresh_last_used(now_tick_ms: u64, prev_tick_ms: u64, sample_ms: u64) -> bool {
+    now_tick_ms.saturating_sub(prev_tick_ms) >= sample_ms
+}
+
 /// Structural + classification tag retained when a pool create failure is
 /// broadcast to coalesced waiters.
 ///
@@ -356,6 +379,20 @@ impl<C> PoolEntry<C> {
         Self {
             conn,
             last_used_tick_ms: AtomicU64::new(now_tick_ms()),
+        }
+    }
+
+    /// Hot-path stamp refresh: relaxed-load the current stamp and store
+    /// only once it is at least `sample_ms` old, so a hot entry under
+    /// many-core checkout pays a shared-cache-line load per hit instead of
+    /// a contended store (issue #6676). Create/replace paths keep exact
+    /// stores; they are not hot.
+    #[inline]
+    fn touch_sampled(&self, sample_ms: u64) {
+        let prev = self.last_used_tick_ms.load(Ordering::Relaxed);
+        let now = now_tick_ms();
+        if should_refresh_last_used(now, prev, sample_ms) {
+            self.last_used_tick_ms.store(now, Ordering::Relaxed);
         }
     }
 }
@@ -835,6 +872,9 @@ pub struct GenericPool<M: PoolManager> {
     manager: Arc<M>,
     entries: Arc<DashMap<String, PoolEntry<M::Connection>>>,
     cfg: Arc<PoolConfig>,
+    /// Stamp-sampling window derived once from the idle timeout
+    /// ([`last_used_sample_ms`]); read on every hot hit.
+    last_used_sample_ms: u64,
     cleanup_interval: Duration,
     inflight: Arc<Semaphore>,
     /// Budget for speculative background creates, separate from `inflight`:
@@ -879,10 +919,13 @@ impl<M: PoolManager> GenericPool<M> {
         // Background creates get a small budget of their own, at most a
         // quarter of the request-path one and never more than 4.
         let background_limit = (inflight_limit / 4).clamp(1, 4);
+        let last_used_sample_ms =
+            last_used_sample_ms(cfg.idle_timeout_seconds.saturating_mul(1000));
         let pool = Arc::new(Self {
             manager,
             entries: Arc::new(DashMap::with_shard_amount(shards)),
             cfg: Arc::new(cfg),
+            last_used_sample_ms,
             cleanup_interval,
             inflight: Arc::new(Semaphore::new(inflight_limit)),
             background_inflight: Arc::new(Semaphore::new(background_limit)),
@@ -995,9 +1038,7 @@ impl<M: PoolManager> GenericPool<M> {
             let conn = entry.conn.clone();
             crate::profile_pool_event!(SenderClone);
             if self.manager.is_healthy(&conn) {
-                entry
-                    .last_used_tick_ms
-                    .store(now_tick_ms(), Ordering::Relaxed);
+                entry.touch_sampled(self.last_used_sample_ms);
                 Some(conn)
             } else {
                 crate::profile_pool_event!(Unhealthy);
@@ -1416,9 +1457,7 @@ impl<M: PoolManager> GenericPool<M> {
             if let Some(entry) = self.entries.get(&*buf) {
                 let conn = entry.conn.clone();
                 if self.manager.is_healthy(&conn) {
-                    entry
-                        .last_used_tick_ms
-                        .store(now_tick_ms(), Ordering::Relaxed);
+                    entry.touch_sampled(self.last_used_sample_ms);
                     LookupOutcome::Hit(conn)
                 } else {
                     LookupOutcome::Unhealthy(buf.to_string())
@@ -1432,7 +1471,15 @@ impl<M: PoolManager> GenericPool<M> {
     fn spawn_cleanup(self: Arc<Self>) {
         let entries = Arc::clone(&self.entries);
         let manager = Arc::clone(&self.manager);
-        let idle_timeout_ms = self.cfg.idle_timeout_seconds.saturating_mul(1000);
+        // The sweep threshold carries the stamp-sampling slack: a stamp
+        // may lag true last use by up to `last_used_sample_ms`, so judging
+        // against timeout + sample preserves "never evict before the
+        // configured timeout of true idleness" (issue #6676).
+        let idle_timeout_ms = self
+            .cfg
+            .idle_timeout_seconds
+            .saturating_mul(1000)
+            .saturating_add(self.last_used_sample_ms);
         let interval = self.cleanup_interval;
 
         tokio::spawn(async move {
@@ -2044,6 +2091,45 @@ mod tests {
         // Strict `>`: exactly the timeout survives one more sweep.
         assert!(!pool_entry_is_idle(160_000, 100_000, timeout_ms));
         assert!(pool_entry_is_idle(160_001, 100_000, timeout_ms));
+    }
+
+    #[test]
+    fn last_used_sampling_never_evicts_before_true_idle_timeout() {
+        // Derivation contract: capped at 1s, at most half the timeout, and
+        // a zero timeout degenerates to exact per-hit stamping.
+        assert_eq!(last_used_sample_ms(0), 0);
+        assert_eq!(last_used_sample_ms(1_000), 500);
+        assert_eq!(last_used_sample_ms(90_000), 1_000);
+        assert_eq!(last_used_sample_ms(u64::MAX), 1_000);
+
+        // Refresh decision: boundary is inclusive, a future stamp never
+        // refreshes early, and sample=0 refreshes unconditionally.
+        assert!(should_refresh_last_used(2_000, 1_000, 1_000));
+        assert!(!should_refresh_last_used(1_999, 1_000, 1_000));
+        assert!(!should_refresh_last_used(1_000, 2_000, 1_000));
+        assert!(should_refresh_last_used(1_000, 1_000, 0));
+
+        // Eviction bound: for every stamp staleness the sampler can
+        // produce (true last use anywhere in [stamp, stamp + sample]),
+        // the sweep threshold timeout + sample must not evict while true
+        // idleness is still <= timeout — and must evict once even the
+        // freshest possible true last use is past it.
+        let timeout_ms = 60_000u64;
+        let sample = last_used_sample_ms(timeout_ms);
+        let stamp = 100_000u64;
+        for staleness in [0, sample / 2, sample] {
+            let true_last = stamp + staleness;
+            let now_at_true_timeout = true_last + timeout_ms;
+            assert!(
+                !pool_entry_is_idle(now_at_true_timeout, stamp, timeout_ms + sample),
+                "staleness {staleness}: evicted at exactly the true timeout"
+            );
+        }
+        assert!(pool_entry_is_idle(
+            stamp + sample + timeout_ms + 1,
+            stamp,
+            timeout_ms + sample
+        ));
     }
 
     #[test]
