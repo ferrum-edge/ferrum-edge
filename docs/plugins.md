@@ -936,8 +936,8 @@ leave the sink disconnected).
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (1–60000) |
-| `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure (1–60000) |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds before the next attempt after a failed send or write timeout (1–60000) |
+| `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before the next attempt after a failed connection (1–60000). Charged instead of, not in addition to, `retry_delay_ms` |
 | `connect_timeout_ms` | Integer | `5000` | Bound covering DNS, TCP, TLS, and WebSocket Upgrade establishment (100–60000). On timeout the partial transport is dropped and retry/reconnect advances. |
 | `write_timeout_ms` | Integer | `5000` | Bound covering batch write/flush progress on an established socket (100–60000). On timeout the complete connection (writer + drain task) is invalidated before retry/reconnect. Delivery is at-least-once: a timeout after partial progress may duplicate a batch on the next attempt. |
 | `buffer_capacity` | Integer | `10000` | Channel slot capacity (1–1000000). Hot-path hooks reserve a slot before serialization; when full, new entries are dropped with a rate-limited warning. |
@@ -965,7 +965,7 @@ config:
   write_timeout_ms: 5000
 ```
 
-**Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush, bounded by `connect_timeout_ms`. If the connection drops, write/flush stalls past `write_timeout_ms`, or the read-side drain observes unexpected application frames / Close / read errors, the complete connection (writer + drain task) is invalidated and the plugin reconnects on the next send attempt. Failed batches are retried up to `max_retries` times with `retry_delay_ms` between attempts. After exhausting retries, the batch is discarded and a warning is logged. The plugin is write-only: collectors that send Text/Binary acknowledgements cause immediate connection invalidation so Ping/Pong and Close handling are not abandoned on a stale socket.
+**Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush, bounded by `connect_timeout_ms`. If the connection drops, write/flush stalls past `write_timeout_ms`, or the read-side drain observes unexpected application frames / Close / read errors, the complete connection (writer + drain task) is invalidated and the plugin reconnects on the next send attempt. Failed batches are retried up to `max_retries` times. Exactly one back-off separates two attempts — `reconnect_delay_ms` when the previous attempt could not connect, `retry_delay_ms` when it connected but the send failed or timed out — and none follows the final attempt. After exhausting retries, the batch is discarded and a warning is logged. Per-attempt connection and send warnings are sampled. Because one worker ships every batch, the longest a single doomed batch can hold it is `(max_retries + 1) × (connect_timeout_ms + write_timeout_ms) + max_retries × max(retry_delay_ms, reconnect_delay_ms)`; at the defaults an unreachable collector (every connect timing out) costs `4 × 5 s + 3 × 5 s = 35 s` per batch, during which new records queue up to `buffer_capacity`. The plugin is write-only: collectors that send Text/Binary acknowledgements cause immediate connection invalidation so Ping/Pong and Close handling are not abandoned on a stale socket.
 
 ### `tcp_logging`
 
