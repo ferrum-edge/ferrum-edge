@@ -382,6 +382,21 @@ const KEY_MATERIAL_TRAILERS: &[&str] = &[
     "hex", "json", "material", "pair", "raw", "blob", "bin", "string", "secret",
 ];
 
+/// Shared suffix policy for both compound classifiers: optional digits
+/// (`pin1`, `signingkey1`), then nothing or text that starts with a listed
+/// representation trailer, including composed ones (`base64url`,
+/// `valuehex`, `1value`, `encoded`, `utf8`).
+fn is_credential_suffix(rest: &str) -> bool {
+    let after_digits = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if after_digits.len() < rest.len() && after_digits.is_empty() {
+        return true;
+    }
+    SHORT_CLASS_TRAILERS
+        .iter()
+        .chain(KEY_MATERIAL_TRAILERS)
+        .any(|trailer| trailer.len() >= 2 && after_digits.starts_with(trailer))
+}
+
 /// Whether `text` contains `key` / `keys` that ends it, is followed by digits,
 /// or is followed by a key-material trailer (`key`, `rsakey`, `keypem`,
 /// `p256keyid`, `keybase64url`, `key1`).
@@ -389,13 +404,7 @@ fn names_key_material(text: &str) -> bool {
     text.match_indices("key").any(|(offset, _)| {
         let rest = &text[offset + "key".len()..];
         let rest = rest.strip_prefix('s').unwrap_or(rest);
-        // Empty, numbered (`signingkey1`), or starting with a material trailer,
-        // including composed ones (`keybase64url`, `keypemfile`).
-        rest.is_empty()
-            || rest.bytes().all(|byte| byte.is_ascii_digit())
-            || KEY_MATERIAL_TRAILERS
-                .iter()
-                .any(|trailer| rest.starts_with(trailer))
+        rest.is_empty() || is_credential_suffix(rest)
     })
 }
 
@@ -457,14 +466,7 @@ fn has_qualified_short_class(lower: &str) -> bool {
             let rest = &lower[offset + class.len()..];
             // A real trailer word makes it a compound whatever precedes it;
             // the bare plural `s` only counts after a full qualifier.
-            if SHORT_CLASS_TRAILERS
-                .iter()
-                .any(|trailer| trailer.len() >= 2 && rest.starts_with(trailer))
-            {
-                return true;
-            }
-            // Numbered variants (`pin1`, `sid2`, `dbpin2`).
-            if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) {
+            if !rest.is_empty() && is_credential_suffix(rest) {
                 return true;
             }
             !prefix.is_empty() && prefix.len() >= *min_prefix && (rest.is_empty() || rest == "s")
