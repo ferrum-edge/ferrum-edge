@@ -4998,6 +4998,75 @@ impl GatewayConfig {
         messages
     }
 
+    /// Reject a runtime snapshot in which one keyauth key, basicauth username,
+    /// or exact mTLS identity belongs to two Consumers of the same namespace
+    /// (issue #6572).
+    ///
+    /// `ConsumerIndex` maps each of these to exactly one Consumer, last
+    /// inserted wins, so publishing such a snapshot would authenticate the
+    /// shared credential as whichever Consumer happened to be indexed last.
+    /// File mode already refuses these configs; this check makes database
+    /// full loads, CP snapshots and deltas, and every runtime swap refuse them
+    /// too, the same way the case-folded DNS check
+    /// ([`Self::validate_unique_mtls_dns_identities`]) does. Persistence
+    /// (`consumer_credential_index`, `consumer_identity_index`) and admin
+    /// write-time validation block new collisions; this covers pre-existing
+    /// or out-of-band rows. Repeated values inside one Consumer (rotation
+    /// entries) are allowed, and the same value may be reused in another
+    /// namespace. Messages name only consumer ids and the namespace, never
+    /// the key, username, or identity value.
+    pub fn validate_unique_consumer_auth_credentials(&self) -> Result<(), Vec<String>> {
+        let mut keyauth: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut basicauth: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut mtls: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut errors = Vec::new();
+
+        for consumer in &self.consumers {
+            let namespace = consumer.namespace.as_str();
+            let id = consumer.id.as_str();
+            for entry in consumer.credential_entries("keyauth") {
+                if let Some(key) = entry.get("key").and_then(|value| value.as_str())
+                    && let Some(owner) = keyauth.insert((namespace, key), id)
+                    && owner != id
+                {
+                    errors.push(format!(
+                        "Consumer {:?} shares a keyauth API key with consumer {:?} in namespace \
+                         {:?}; rotate one of the keys",
+                        id, owner, namespace
+                    ));
+                }
+            }
+            if consumer.has_credential("basicauth")
+                && let Some(owner) = basicauth.insert((namespace, consumer.username.as_str()), id)
+                && owner != id
+            {
+                errors.push(format!(
+                    "Consumer {:?} shares its basicauth username with consumer {:?} in \
+                     namespace {:?}",
+                    id, owner, namespace
+                ));
+            }
+            for entry in consumer.credential_entries("mtls_auth") {
+                if let Some(identity) = entry.get("identity").and_then(|value| value.as_str())
+                    && let Some(owner) = mtls.insert((namespace, identity), id)
+                    && owner != id
+                {
+                    errors.push(format!(
+                        "Consumer {:?} shares an mtls_auth identity with consumer {:?} in \
+                         namespace {:?}",
+                        id, owner, namespace
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Validate only the exact and effective-DNS mTLS identity constraints.
     /// Admin candidate checks use this narrower surface so unrelated legacy
     /// keyauth/basicauth collisions do not block mTLS configuration repairs.
