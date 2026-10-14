@@ -933,12 +933,20 @@ def report_diagnostic(directory):
             state_issues = diagnostic_issues(diagnostic)
             issues.extend(state_issues)
             client = phases["client_usage"]
-            fields(client, "pid role complete_bracket cpu_seconds peak_rss_bytes rss_scope bracket_secs boundary_slack_secs")
+            fields(client, "pid role complete_bracket cpu_seconds user_cpu_seconds system_cpu_seconds "
+                   "voluntary_ctxt_switches nonvoluntary_ctxt_switches peak_rss_bytes rss_scope "
+                   "bracket_secs boundary_slack_secs")
             uint(client["pid"], True)
             uint(client["peak_rss_bytes"])
+            uint(client["voluntary_ctxt_switches"])
+            uint(client["nonvoluntary_ctxt_switches"])
             uint(sample["total_bytes"])
-            for key in ("cpu_seconds", "bracket_secs", "boundary_slack_secs"):
+            for key in ("cpu_seconds", "user_cpu_seconds", "system_cpu_seconds",
+                        "bracket_secs", "boundary_slack_secs"):
                 number(client[key])
+            require(abs(client["cpu_seconds"]
+                        - (client["user_cpu_seconds"] + client["system_cpu_seconds"])) < 0.000001,
+                    "client cpu_seconds is not the user+system bracket delta")
             require(client["rss_scope"] == "process lifetime high-water mark at measurement end"
                     and 30 <= client["bracket_secs"] <= 31.5
                     and abs(client["boundary_slack_secs"] - (client["bracket_secs"] - 30)) < 0.000001,

@@ -370,6 +370,8 @@ def diagnostic_campaign(root):
             identity = profile.gateway_identity(runtime)
         sample = traffic_sample(gateway, 1, 5242880, identity["host_pid"] if identity else 31)
         client = dict(pid=1000 + position, role="client", complete_bracket=True, cpu_seconds=1.0,
+                      user_cpu_seconds=0.6, system_cpu_seconds=0.4,
+                      voluntary_ctxt_switches=10, nonvoluntary_ctxt_switches=2,
                       peak_rss_bytes=1024, rss_scope="process lifetime high-water mark at measurement end",
                       bracket_secs=30.001, boundary_slack_secs=0.001)
         sample.update(duration_secs=30, rps=100 / 30, drain_requests=0)
