@@ -758,7 +758,9 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     let cutoff = rfc3339_millis(now - chrono::Duration::days(30));
     let live_ts = |offset_ms: i64| rfc3339_millis(now + chrono::Duration::milliseconds(offset_ms));
 
-    let metadata_prefix = "k".repeat(128);
+    // An allowlisted namespace, so the values survive the fail-closed
+    // metadata gate and the truncation-collision rule stays observable.
+    let metadata_prefix = format!("mesh.{}", "k".repeat(123));
     plugin
         .log(&TransactionSummary {
             timestamp_received: live_ts(0),

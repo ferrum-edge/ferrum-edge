@@ -30,6 +30,18 @@
 //! spellings such as `userSessionIdentifier`, `x-session-id`, `GPG_PASSPHRASE`
 //! or `clientAssertion` instead of relying on an exact-name list.
 //!
+//! **Fail-closed allowlist (issue #6619).** The rules above are a DENY layer.
+//! The primary gate is an allowlist: a metadata VALUE is emitted only when its
+//! key is a known-safe name, and every other value serializes as
+//! `[REDACTED]`. Known-safe names are the gateway's own metadata namespaces and
+//! flat keys ([`BUILTIN_SAFE_METADATA_NAMESPACES`],
+//! [`BUILTIN_SAFE_METADATA_KEYS`]) plus the operator allowlist
+//! `FERRUM_LOG_SAFE_METADATA_KEYS` (exact names, or `prefix*` entries). The deny
+//! layer still wins over the allowlist, and an operator entry the deny layer
+//! classifies as credential-shaped is ignored with a startup warning. Because
+//! unknown names are redacted by default, a credential spelling the classifier
+//! does not recognize no longer reaches a sink.
+//!
 //! Request-private lifecycle keys in the `_dedup_*` namespace (case, delimiter,
 //! and camelCase spellings under a leading `_` + first segment `dedup`) are
 //! removed before an in-process transaction summary is built and are also
@@ -113,6 +125,199 @@ pub const REDACTED_QUERY_PLACEHOLDER: &str = "[REDACTED_QUERY]";
 
 /// Placeholder substituted for a URL fragment that may carry credentials.
 pub const REDACTED_FRAGMENT_PLACEHOLDER: &str = "[REDACTED_FRAGMENT]";
+
+/// Metadata namespaces owned by the gateway and its built-in plugins. A key is
+/// built-in when it equals a namespace or continues it with `.`, `:` or `_`
+/// (`mesh.source.workload`, `compression:algorithm`, `grpc_web_mode`).
+/// Values under these names are emitted unless the deny layer matches the key.
+pub const BUILTIN_SAFE_METADATA_NAMESPACES: &[&str] = &[
+    "a2a",
+    "access_control",
+    "adaptive_concurrency",
+    "ai",
+    "ambient",
+    "api_chargeback",
+    "auth",
+    "authorization",
+    "backend",
+    "basic_auth",
+    "body_validator",
+    "bot_detection",
+    "cache",
+    "compression",
+    "connection",
+    "consumer",
+    "correlation_id",
+    "cors",
+    "direction",
+    "error_class",
+    "external_operation",
+    "fault",
+    "ferrum",
+    "geo_restriction",
+    "graphql",
+    "grpc",
+    "hbone",
+    "hmac_auth",
+    "http",
+    "io_side",
+    "ip_restriction",
+    "jwks_auth",
+    "jwt_auth",
+    "key_auth",
+    "ldap_auth",
+    "mcp",
+    "mesh",
+    "mesh_authz",
+    "mesh_request_auth",
+    "mirror",
+    "mtls_auth",
+    "node_waypoint",
+    "oauth2_introspection",
+    "oidc_rp",
+    "opa",
+    "openapi_validator",
+    "original_response",
+    "otel",
+    "parent_span_id",
+    "peer_spiffe_id",
+    "prometheus",
+    "rate_limiting",
+    "ratelimit",
+    "rejection",
+    "request",
+    "response",
+    "route",
+    "serverless_function",
+    "soap_ws_security",
+    "span_id",
+    "sse",
+    "streaming",
+    "synthetic",
+    "trace",
+    "traceparent",
+    "tracestate",
+    "upstream",
+    "websocket",
+    "workload",
+    "workload_metrics",
+    "waf",
+    "ws",
+];
+
+/// Built-in names under an allowed namespace that carry payloads rather than
+/// bounded observability values; never emitted.
+const BUILTIN_PAYLOAD_METADATA_KEYS: &[&str] = &["request_body", "response_body"];
+
+/// Flat built-in metadata keys outside the namespaces above.
+pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &["namespace"];
+
+/// Operator-supplied safe names parsed once from `FERRUM_LOG_SAFE_METADATA_KEYS`.
+static SAFE_METADATA_KEYS: OnceLock<Vec<String>> = OnceLock::new();
+
+fn operator_safe_metadata_keys() -> &'static [String] {
+    SAFE_METADATA_KEYS.get_or_init(|| {
+        let parsed = parse_safe_metadata_keys(crate::config::conf_file::resolve_ferrum_var(
+            "FERRUM_LOG_SAFE_METADATA_KEYS",
+        ));
+        for rejected in &parsed.rejected {
+            tracing::warn!(
+                entry = %rejected,
+                "FERRUM_LOG_SAFE_METADATA_KEYS entry is credential-shaped and is ignored; its values stay redacted"
+            );
+        }
+        parsed.accepted
+    })
+}
+
+/// `FERRUM_LOG_SAFE_METADATA_KEYS` split into usable entries and entries the
+/// deny layer refuses (credential-shaped names cannot be allowlisted).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ParsedSafeMetadataKeys {
+    /// Lowercased exact names, or prefixes ending in `*`.
+    pub accepted: Vec<String>,
+    /// Entries ignored because the deny layer matches them.
+    pub rejected: Vec<String>,
+}
+
+/// Parse an already-resolved `FERRUM_LOG_SAFE_METADATA_KEYS` value
+/// (comma-separated). An entry ending in `*` allows that prefix; any other
+/// entry is an exact, case-insensitive name. Entries the deny layer matches
+/// are returned in `rejected`.
+pub fn parse_safe_metadata_keys(resolved: Option<String>) -> ParsedSafeMetadataKeys {
+    let mut parsed = ParsedSafeMetadataKeys::default();
+    let Some(raw) = resolved else {
+        return parsed;
+    };
+    for entry in raw.split(',') {
+        let entry = entry.trim().to_ascii_lowercase();
+        let name = entry.strip_suffix('*').unwrap_or(&entry);
+        if name.is_empty() {
+            continue;
+        }
+        if is_sensitive_metadata_key(name) {
+            parsed.rejected.push(entry);
+        } else {
+            parsed.accepted.push(entry);
+        }
+    }
+    parsed
+}
+
+/// Whether `key` is a built-in metadata name (namespace or flat key).
+pub fn is_builtin_safe_metadata_name(key: &str) -> bool {
+    if BUILTIN_PAYLOAD_METADATA_KEYS
+        .iter()
+        .any(|payload| key.eq_ignore_ascii_case(payload))
+    {
+        return false;
+    }
+    BUILTIN_SAFE_METADATA_KEYS
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+        || BUILTIN_SAFE_METADATA_NAMESPACES.iter().any(|namespace| {
+            key.len() >= namespace.len()
+                && key.as_bytes()[..namespace.len()].eq_ignore_ascii_case(namespace.as_bytes())
+                && matches!(
+                    key.as_bytes().get(namespace.len()),
+                    None | Some(b'.' | b':' | b'_')
+                )
+        })
+}
+
+/// Whether `key` matches an operator allowlist entry (exact or `prefix*`).
+pub fn matches_safe_metadata_entries(key: &str, entries: &[String]) -> bool {
+    entries.iter().any(|entry| match entry.strip_suffix('*') {
+        Some(prefix) => {
+            key.len() >= prefix.len()
+                && key.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        }
+        None => key.eq_ignore_ascii_case(entry),
+    })
+}
+
+/// The primary metadata gate with explicit operator lists (tests): a value is
+/// emitted only when the key is allowlisted (built-in or `safe_entries`) and
+/// the deny layer (`redact_extras` included) does not match it.
+pub fn metadata_value_is_redacted_with(
+    key: &str,
+    safe_entries: &[String],
+    redact_extras: &[String],
+) -> bool {
+    is_sensitive_metadata_key_with_extras(key, redact_extras)
+        || !(is_builtin_safe_metadata_name(key) || matches_safe_metadata_entries(key, safe_entries))
+}
+
+/// The primary metadata gate: `true` unless the key is allowlisted and the
+/// deny layer does not match it. Every sink that emits metadata VALUES
+/// (transaction logs, schema projections, audit records, trace attributes)
+/// uses this; name-shape checks for operator-chosen output names use
+/// [`is_sensitive_metadata_key`].
+pub fn metadata_value_is_redacted(key: &str) -> bool {
+    is_sensitive_metadata_key(key)
+        || !(is_builtin_safe_metadata_name(key)
+            || matches_safe_metadata_entries(key, operator_safe_metadata_keys()))
+}
 
 /// Operator-supplied extras parsed once from `FERRUM_LOG_REDACT_METADATA_KEYS`.
 ///
@@ -1072,7 +1277,8 @@ pub(crate) fn is_operator_sensitive_metadata_key(key: &str) -> bool {
 
 /// Serde `serialize_with` adapter for `HashMap<String, String>` metadata
 /// fields on log summary structs. Replaces the value with
-/// `REDACTED_PLACEHOLDER` for any key that matches a sensitive substring.
+/// `REDACTED_PLACEHOLDER` for any key that is not allowlisted or that the
+/// deny layer matches ([`metadata_value_is_redacted`]).
 /// Internal-only lifecycle keys are omitted entirely. Non-sensitive keys pass
 /// through unchanged.
 ///
@@ -1109,7 +1315,7 @@ impl Serialize for RedactedMetadata<'_> {
             if is_internal_only_metadata_key(key) {
                 continue;
             }
-            if is_sensitive_metadata_key(key) {
+            if metadata_value_is_redacted(key) {
                 map.serialize_entry(key, REDACTED_PLACEHOLDER)?;
             } else {
                 map.serialize_entry(key, value)?;
@@ -1784,7 +1990,8 @@ mod tests {
         metadata.insert("authorization".to_string(), "Bearer secret-1".to_string());
         metadata.insert("cookie".to_string(), "sid=abc".to_string());
         metadata.insert("password".to_string(), "hunter2".to_string());
-        metadata.insert("safe_key".to_string(), "visible".to_string());
+        metadata.insert("request_id".to_string(), "visible".to_string());
+        metadata.insert("safe_key".to_string(), "unlisted".to_string());
 
         let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1792,7 +1999,9 @@ mod tests {
         assert_eq!(parsed["authorization"], "[REDACTED]");
         assert_eq!(parsed["cookie"], "[REDACTED]");
         assert_eq!(parsed["password"], "[REDACTED]");
-        assert_eq!(parsed["safe_key"], "visible");
+        assert_eq!(parsed["request_id"], "visible");
+        // Not allowlisted: redacted by default (issue #6619).
+        assert_eq!(parsed["safe_key"], "[REDACTED]");
 
         for leaked in ["secret-1", "sid=abc", "hunter2"] {
             assert!(
@@ -1800,6 +2009,88 @@ mod tests {
                 "sensitive value {leaked:?} leaked: {json}"
             );
         }
+    }
+
+    // ── fail-closed allowlist (issue #6619) ──────────────────────────────
+
+    #[test]
+    fn builtin_namespaces_match_only_at_a_boundary() {
+        for key in [
+            "mesh.source.workload",
+            "grpc_web_mode",
+            "compression:algorithm",
+            "request_id",
+            "ai_total_tokens",
+            "trace_id",
+            "namespace",
+            "waf.action",
+        ] {
+            assert!(is_builtin_safe_metadata_name(key), "{key}");
+        }
+        for key in [
+            "meshy",
+            "requested",
+            "request_body",
+            "RESPONSE_BODY",
+            "custom_field",
+            "gpgpass_phrase",
+            "key_private",
+            "vault_blob",
+        ] {
+            assert!(!is_builtin_safe_metadata_name(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn unknown_names_are_redacted_by_default_and_deny_beats_allow() {
+        let none: Vec<String> = Vec::new();
+        // Adversarial spellings the classifier has missed in review rounds:
+        // all redacted by default because they are not allowlisted.
+        for key in [
+            "gpgpass_phrase",
+            "key_private",
+            "privateKeY",
+            "hsm_pin\u{e9}",
+            "vault_blob",
+            "x-key-private",
+        ] {
+            assert!(metadata_value_is_redacted_with(key, &none, &none), "{key}");
+        }
+        assert!(!metadata_value_is_redacted_with("request_id", &none, &none));
+
+        let parsed = parse_safe_metadata_keys(Some(
+            "tenant_tier, Tenant.*, session_id, key_private".into(),
+        ));
+        assert_eq!(parsed.accepted, vec!["tenant_tier", "tenant.*"]);
+        assert_eq!(parsed.rejected, vec!["session_id", "key_private"]);
+        assert!(!metadata_value_is_redacted_with(
+            "TENANT_TIER",
+            &parsed.accepted,
+            &none
+        ));
+        assert!(!metadata_value_is_redacted_with(
+            "tenant.region",
+            &parsed.accepted,
+            &none
+        ));
+        assert!(metadata_value_is_redacted_with(
+            "tenant_region",
+            &parsed.accepted,
+            &none
+        ));
+        // A built-in or allowlisted name the deny layer matches stays redacted.
+        let session = vec!["mesh.session_id".to_string()];
+        assert!(metadata_value_is_redacted_with(
+            "mesh.session_id",
+            &session,
+            &none
+        ));
+        let extras = vec!["tier".to_string()];
+        assert!(metadata_value_is_redacted_with(
+            "tenant_tier",
+            &parsed.accepted,
+            &extras
+        ));
     }
 
     // ── serialization: empty metadata map ────────────────────────────────

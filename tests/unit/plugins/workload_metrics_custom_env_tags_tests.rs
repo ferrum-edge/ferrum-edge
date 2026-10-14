@@ -28,7 +28,8 @@ async fn custom_env_tags_present_overrides_literal_default() {
     let plugin = workload_metrics_new_with_env_lookup_for_test(
         &json!({
             "custom_tags": {"cluster": "fallback"},
-            "custom_env_tags": {"cluster": ENV_VAR}
+            "custom_env_tags": {"cluster": ENV_VAR},
+            "safe_tag_sources": [ENV_VAR]
         }),
         |name| {
             if name == ENV_VAR {
@@ -78,7 +79,8 @@ async fn custom_env_tags_empty_present_is_resolved_value() {
     let plugin = workload_metrics_new_with_env_lookup_for_test(
         &json!({
             "custom_tags": {"cluster": "fallback"},
-            "custom_env_tags": {"cluster": ENV_VAR}
+            "custom_env_tags": {"cluster": ENV_VAR},
+            "safe_tag_sources": [ENV_VAR]
         }),
         |name| {
             if name == ENV_VAR {
@@ -481,4 +483,23 @@ fn ordinary_dimension_tag_names_remain_admitted() {
         )
         .unwrap_or_else(|error| panic!("tag name {tag} must be admitted, got {error}"));
     }
+}
+
+/// Issue #6619: an environment source the operator has not declared in
+/// `safe_tag_sources` is copied as the redaction marker even when no name
+/// heuristic recognizes it as credential-bearing.
+#[tokio::test]
+async fn undeclared_env_sources_are_redacted_by_default() {
+    let plugin = workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_env_tags": {"cluster": "VAULT_UNSEAL_BLOB"}
+        }),
+        |_| Ok("unseal-sentinel".to_string()),
+    )
+    .expect("undeclared source constructs");
+    let metadata = metadata_after_before_proxy(&plugin).await;
+    assert_eq!(
+        metadata.get("cluster").map(String::as_str),
+        Some("[REDACTED]")
+    );
 }

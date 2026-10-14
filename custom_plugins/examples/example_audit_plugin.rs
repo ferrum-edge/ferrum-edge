@@ -439,10 +439,7 @@ impl ExampleAuditPlugin {
             timestamp: canonical_timestamp(&summary.timestamp_received),
             client_ip: truncate_chars(&summary.client_ip, MAX_CLIENT_IP_CHARS),
             protocol: classify_http_audit_protocol(summary),
-            http_method: Some(truncate_chars(
-                &summary.http_method,
-                MAX_HTTP_METHOD_CHARS,
-            )),
+            http_method: Some(truncate_chars(&summary.http_method, MAX_HTTP_METHOD_CHARS)),
             request_path: Some(truncate_chars(&summary.request_path, 2048)),
             response_status: Some(i32::from(summary.response_status_code)),
             grpc_status,
@@ -460,12 +457,7 @@ impl ExampleAuditPlugin {
                 .error_class
                 .as_ref()
                 .map(|c| format!("{c:?}"))
-                .or_else(|| {
-                    summary
-                        .body_error_class
-                        .as_ref()
-                        .map(|c| format!("{c:?}"))
-                })
+                .or_else(|| summary.body_error_class.as_ref().map(|c| format!("{c:?}")))
                 .map(|error| truncate_chars(&error, MAX_CONNECTION_ERROR_CHARS)),
         }
     }
@@ -557,7 +549,7 @@ pub fn classify_stream_audit_protocol(summary: &StreamTransactionSummary) -> Str
 /// bounds are hard caps; truncation collisions and omitted entries are marked.
 pub fn bounded_redacted_metadata(metadata: &std::collections::HashMap<String, String>) -> Value {
     use crate::plugins::utils::metadata_redaction::{
-        REDACTED_PLACEHOLDER, is_sensitive_metadata_key,
+        REDACTED_PLACEHOLDER, metadata_value_is_redacted,
     };
 
     let mut keys: Vec<&str> = metadata.keys().map(String::as_str).collect();
@@ -569,7 +561,9 @@ pub fn bounded_redacted_metadata(metadata: &std::collections::HashMap<String, St
     let mut bounded = serde_json::Map::new();
     let mut collision_count = 0u64;
     for key in selected {
-        let value = if is_sensitive_metadata_key(key) {
+        // Fail closed (issue #6619): only allowlisted, non-sensitive names keep
+        // their values.
+        let value = if metadata_value_is_redacted(key) {
             REDACTED_PLACEHOLDER.to_string()
         } else {
             truncate_chars(

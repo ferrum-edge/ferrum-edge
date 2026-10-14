@@ -22086,7 +22086,10 @@ components:
         with the fixed empty_body reason rather than as a malformed structured
         body. Samples are redacted before rendering
         (JSON/form per field, text/plain per line as a coarse
-        operator opt-in, plus credential-shaped values anywhere), a malformed
+        operator opt-in, plus credential-shaped values anywhere). In
+        text/plain bodies every `name=value` / `name: value` line is dropped
+        unless each field name parses cleanly and is declared in
+        safe_text_fields (fail closed), a malformed
         JSON body renders as a fixed content-free marker instead of a partial
         rendering, control and bidi characters are escaped, non-UTF-8 bodies
         (including an incomplete multibyte tail) render as a fixed marker, and
@@ -22113,6 +22116,22 @@ components:
             required: [redacted_body_fields]
             properties:
               redacted_body_fields:
+                type: array
+                minItems: 1
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [safe_text_fields]
+            properties:
+              safe_text_fields:
                 type: array
                 minItems: 1
           then:
@@ -22187,6 +22206,21 @@ components:
             number, boolean, or null) is still traversed with the same
             member-name and credential-shaped-string rules as the rest of the
             body.
+        safe_text_fields:
+          type: array
+          items:
+            type: string
+            minLength: 1
+            pattern: '^\s*[A-Za-z0-9_.-]{1,128}\s*$'
+          description: >-
+            Field names (compared case-insensitively) whose `name=value` /
+            `name: value` lines may be rendered in captured text/plain bodies.
+            Every other assignment line, including one whose field name does
+            not parse as plain ASCII letters, digits, `_`, `-` or `.`, is
+            dropped. Entries that the credential classifier or the sensitive
+            body-field rules match are rejected: a credential-shaped name
+            cannot be declared safe. Requires log_request_body or
+            log_response_body true when the array is nonempty.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -26853,8 +26887,10 @@ components:
             Custom tags populated from request headers (`tag_name ->
             header_name`). Credential-bearing source headers and reserved or
             sensitive destination names are rejected; runtime values over 1024
-            bytes are omitted. This map, `custom_tags`, and `custom_env_tags`
-            may contain at most 32 distinct tag names combined.
+            bytes are omitted. Fail closed: a source header not declared in
+            `safe_tag_sources` is copied as `[REDACTED]`, never verbatim. This
+            map, `custom_tags`, and `custom_env_tags` may contain at most 32
+            distinct tag names combined.
         custom_env_tags:
           type: object
           maxProperties: 32
@@ -26878,12 +26914,28 @@ components:
             signatures, private/signing key material and bearer assertions,
             database connection locations, client credential identifiers, and
             operator-configured sensitive metadata names) are rejected.
-            Non-UTF-8 or >1024-byte values fail construction closed. Selected
-            values are deliberately emitted as custom transaction and trace
-            metadata; diagnostics never include resolved values or rejected
-            credential-bearing variable names. This map, `custom_tags`, and
-            `custom_header_tags` may contain at most 32 distinct tag names
-            combined.
+            Non-UTF-8 or >1024-byte values fail construction closed. Values of
+            variables declared in `safe_tag_sources` are emitted as custom
+            transaction and trace metadata; any other variable is emitted as
+            `[REDACTED]` (fail closed). Diagnostics never include resolved
+            values or rejected credential-bearing variable names. This map,
+            `custom_tags`, and `custom_header_tags` may contain at most 32
+            distinct tag names combined.
+        safe_tag_sources:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: |
+            Header names (case-insensitive) and environment variable names
+            (case-sensitive) whose values `custom_header_tags` and
+            `custom_env_tags` may copy verbatim. Every undeclared source is
+            copied as `[REDACTED]`. An entry that the credential classifiers
+            match (for example `x-session-id`, `GPG_PASSPHRASE`, `x-key-private`)
+            is rejected: a credential-shaped source cannot be declared safe.
+            Diagnostics name the entry index only.
         metrics:
           type: object
           description: |

@@ -7132,6 +7132,7 @@ fn telemetry(
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
                 custom_env_tags: HashMap::new(),
+                safe_tag_sources: Vec::new(),
                 providers: Vec::new(),
             };
             let mut emits_server = false;

@@ -10,7 +10,8 @@ use ferrum_edge::plugins::utils::log_schema::{SchemaCapabilities, SchemaView, Su
 use ferrum_edge::plugins::utils::metadata_redaction::{
     INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_dedup_internal_metadata_key,
     is_internal_only_metadata_key, is_mesh_metrics_internal_metadata_key, is_sensitive_header_name,
-    is_sensitive_metadata_key_with_extras, parse_extras_list, strip_dedup_internal_metadata,
+    is_sensitive_metadata_key_with_extras, metadata_value_is_redacted, parse_extras_list,
+    strip_dedup_internal_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
 use serde_json::{Map, Value, json};
@@ -49,7 +50,7 @@ const NON_SECRET_COUNTERS: &[&str] = &[
     "ai_prompt_tokens",
     "ai_completion_tokens",
     "cache_key",
-    "routing_key",
+    "request_dedup_key",
 ];
 
 const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
@@ -900,4 +901,69 @@ fn header_names_never_take_the_metadata_outcome_exemption() {
     ] {
         assert!(is_sensitive_header_name(header), "{header}");
     }
+}
+
+/// Issue #6619 redesign: metadata values are redacted by default. Names that
+/// slipped past successive classifier rounds, and names no classifier could
+/// recognize, never reach any sink unless they are allowlisted; built-in
+/// gateway names stay visible.
+#[test]
+fn unlisted_metadata_names_are_redacted_by_default_on_every_projection() {
+    const ADVERSARIAL: &[&str] = &[
+        "gpgpass_phrase",
+        "GPGPASS_PHRASE",
+        "x-gpgpass-phrase",
+        "key_private",
+        "keyPrivate",
+        "privateKeY",
+        "hsm_pin\u{e9}",
+        "hsm_pin/opaque",
+        "vault_blob",
+        "custom_plugin_value",
+    ];
+    let mut metadata = HashMap::new();
+    for (index, key) in ADVERSARIAL.iter().enumerate() {
+        metadata.insert((*key).to_string(), format!("default-deny-sentinel-{index}"));
+    }
+    metadata.insert("mesh.source.workload".to_string(), "frontend".to_string());
+    metadata.insert("request_id".to_string(), "visible-request-id".to_string());
+    let summary = summary_with(metadata);
+
+    let native = serialize_native(&summary);
+    let nested = serialize_schema(&summary, json!({ "summary_type": "http" }));
+    let flattened = serialize_schema(
+        &summary,
+        json!({
+            "summary_type": "http",
+            "metadata": { "mode": "flatten", "prefix": "meta_" }
+        }),
+    );
+    for projection in [&native, &nested, &flattened] {
+        let json = projection.to_string();
+        assert!(
+            !json.contains("default-deny-sentinel"),
+            "unlisted metadata value leaked: {json}"
+        );
+        assert!(json.contains("visible-request-id"), "{json}");
+        assert!(json.contains("frontend"), "{json}");
+    }
+    for key in ADVERSARIAL {
+        assert!(metadata_value_is_redacted(key), "{key}");
+    }
+
+    // `mesh.*` trace attributes take the same gate.
+    let attributes = ferrum_edge::plugins::mesh::mesh_trace_attributes(&HashMap::from([
+        (
+            "mesh.key_private".to_string(),
+            "mesh-key-sentinel".to_string(),
+        ),
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+    ]));
+    assert!(
+        attributes
+            .iter()
+            .all(|(_, value)| value != "mesh-key-sentinel"),
+        "{attributes:?}"
+    );
+    assert!(attributes.contains(&("mesh.source.workload".to_string(), "frontend".to_string())));
 }

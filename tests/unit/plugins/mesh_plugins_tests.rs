@@ -7496,7 +7496,8 @@ async fn workload_metrics_rebuilds_custom_header_tags_from_final_headers() {
         "custom_header_tags": {
             "tenant": "x-tenant",
             "fallback": "x-fallback"
-        }
+        },
+        "safe_tag_sources": ["x-tenant", "x-fallback"]
     }))
     .expect("custom header tag config");
     let remover = RequestTransformer::new(&json!({
@@ -8499,6 +8500,7 @@ fn workload_metrics_accepts_every_allowlisted_key() {
         "custom_tags": { "team": "payments" },
         "custom_header_tags": { "ua": "user-agent" },
         "custom_env_tags": {},
+        "safe_tag_sources": ["user-agent"],
         "metrics": {},
         "tracing_provider": serde_json::Value::Null,
         "tracing_providers": [],

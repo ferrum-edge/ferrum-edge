@@ -2576,6 +2576,13 @@ pub struct MeshTracingConfig {
     /// default omits the tag (Istio/Envoy semantics).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_env_tags: HashMap<String, String>,
+    /// Header and environment-variable names whose values header / env custom
+    /// tags may copy verbatim. A source not listed here is emitted as
+    /// `[REDACTED]` (fail closed, issue #6619); credential-shaped names are
+    /// rejected. A more specific Telemetry resource with a non-empty list
+    /// replaces the inherited one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_tag_sources: Vec<String>,
     /// Provider-specific tracing backends (Zipkin / Datadog / Lightstep / OpenTelemetry).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<TracingProvider>,

@@ -3056,6 +3056,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
                     custom_env_tags: HashMap::new(),
+                    safe_tag_sources: Vec::new(),
                     providers: Vec::new(),
                 }),
                 ..MeshTelemetryConfig::default()

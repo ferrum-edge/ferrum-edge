@@ -96,7 +96,7 @@ use crate::plugins::utils::log_schema::{
 };
 use crate::plugins::utils::metadata_redaction::{
     REDACTED_PLACEHOLDER, is_sensitive_header_name, is_sensitive_metadata_key,
-    is_sensitive_name_by_listed_rules,
+    is_sensitive_name_by_listed_rules, metadata_value_is_redacted,
 };
 use crate::proxy::tcp_proxy::StreamIoSide;
 
@@ -129,6 +129,7 @@ pub const TRANSACTION_DEBUGGER_CONFIG_KEYS: &[&str] = &[
     "max_response_body_bytes",
     "redacted_body_fields",
     "redacted_headers",
+    "safe_text_fields",
     "schema",
     "schema_ref",
 ];
@@ -322,6 +323,10 @@ pub struct TransactionDebugger {
     extra_redacted_headers: Vec<String>,
     /// Additional body field names (lowercase) to redact.
     redacted_body_fields: Vec<String>,
+    /// Field names (lowercase) whose `name=value` / `name: value` lines may be
+    /// rendered in `text/plain` bodies. Every other assignment line is
+    /// dropped (fail closed, issue #6619).
+    safe_text_fields: Vec<String>,
     log_request_body: bool,
     log_response_body: bool,
     max_request_body_bytes: usize,
@@ -338,25 +343,15 @@ pub struct TransactionDebugger {
 fn assignment_field_names(line: &str) -> impl Iterator<Item = &str> {
     line.match_indices(['=', ':'])
         .filter_map(move |(offset, _)| assignment_field_name(line, offset))
-        .flat_map(|name| {
-            // Judge the whole token, and also its trailing identifier run, so
-            // exact-name policies (`redacted_body_fields`, listed headers)
-            // still match after a prefix such as `/callback?code`.
-            let tail_start = name
-                .char_indices()
-                .rev()
-                .find(|(_, ch)| {
-                    !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '[' | ']'))
-                })
-                .map_or(0, |(index, ch)| index + ch.len_utf8());
-            let tail = &name[tail_start..];
-            [
-                Some(name),
-                (tail_start > 0 && !tail.is_empty()).then_some(tail),
-            ]
-            .into_iter()
-            .flatten()
-        })
+}
+
+/// A field name the text parser can judge: non-empty ASCII letters, digits,
+/// `_`, `-` and `.` only.
+fn is_clean_text_field_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 /// The field name assigned at `offset` (an `=` / `:` in `line`).
@@ -378,7 +373,8 @@ fn assignment_field_name(line: &str, offset: usize) -> Option<&str> {
     }
     // An unquoted name is the whole token back to the previous
     // assignment / prose separator, Unicode and punctuation included
-    // (`hsm_piné`, `hsm_pin/opaque`); the shared segmenter judges it.
+    // (`hsm_piné`, `hsm_pin/opaque`), so such a name is judged unclean and
+    // its line is dropped rather than cut down to a benign-looking tail.
     // `char_indices` keeps the start on a character boundary.
     let start = before
         .char_indices()
@@ -438,14 +434,43 @@ impl TransactionDebugger {
             );
         }
 
-        Ok(Self {
+        let safe_text_fields =
+            optional_body_field_names(config, "safe_text_fields")?.unwrap_or_default();
+        if !safe_text_fields.is_empty() && !(log_request_body || log_response_body) {
+            return Err(
+                "transaction_debugger: `safe_text_fields` requires `log_request_body` or \
+                 `log_response_body` to be true"
+                    .to_string(),
+            );
+        }
+
+        let plugin = Self {
             extra_redacted_headers,
             redacted_body_fields,
+            safe_text_fields: Vec::new(),
             log_request_body,
             log_response_body,
             max_request_body_bytes,
             max_response_body_bytes,
             schema,
+        };
+        // Deny layer: a credential-shaped or unparseable name cannot be
+        // declared safe.
+        for (idx, name) in safe_text_fields.iter().enumerate() {
+            if !is_clean_text_field_name(name) {
+                return Err(format!(
+                    "transaction_debugger: `safe_text_fields[{idx}]` must contain only ASCII letters, digits, `_`, `-` and `.`"
+                ));
+            }
+            if plugin.is_sensitive_body_key(name) || is_sensitive_header_name(name) {
+                return Err(format!(
+                    "transaction_debugger: `safe_text_fields[{idx}]` names a credential-bearing field and cannot be declared safe"
+                ));
+            }
+        }
+        Ok(Self {
+            safe_text_fields,
+            ..plugin
         })
     }
 
@@ -808,6 +833,19 @@ impl TransactionDebugger {
             || is_sensitive_metadata_key(&lowered)
     }
 
+    /// Whether a parsed `text/plain` field name may keep its line: a clean
+    /// ASCII name declared in `safe_text_fields` that the deny layer does not
+    /// match.
+    fn is_safe_text_field(&self, name: &str) -> bool {
+        is_clean_text_field_name(name)
+            && self
+                .safe_text_fields
+                .iter()
+                .any(|safe| name.eq_ignore_ascii_case(safe))
+            && !self.is_sensitive_body_key(name)
+            && !is_sensitive_header_name(name)
+    }
+
     /// Whether an unstructured line carries any sensitive marker. Line-level
     /// matching is deliberately coarse: unstructured text has no field grammar,
     /// so a line that mentions a credential marker is dropped wholesale.
@@ -830,11 +868,12 @@ impl TransactionDebugger {
             // classifier is for key names and would drop prose such as
             // `auth_method=jwt_auth` (issue #6619).
             || is_sensitive_name_by_listed_rules(&lowered)
-            // A `name=value` / `name: value` line whose field name is
-            // credential-shaped (`hsm_pin=…`, `csrf: …`) is dropped too.
-            || assignment_field_names(line).any(|name| {
-                self.is_sensitive_body_key(name) || is_sensitive_header_name(name)
-            })
+            // Fail closed: a `name=value` / `name: value` line is rendered
+            // only when every field name parses cleanly and is declared in
+            // `safe_text_fields` (issue #6619). Unknown, unparseable, or
+            // credential-shaped names (`hsm_piné=…`, `key_private=…`) drop
+            // the line.
+            || assignment_field_names(line).any(|name| !self.is_safe_text_field(name))
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
             || lowered.contains("eyj")
@@ -1886,7 +1925,7 @@ fn selected_metadata_value<'a>(
     key: &str,
 ) -> Option<&'a str> {
     metadata.get(key).map(|value| {
-        if is_sensitive_metadata_key(key) {
+        if metadata_value_is_redacted(key) {
             REDACTED_PLACEHOLDER
         } else {
             value.as_str()

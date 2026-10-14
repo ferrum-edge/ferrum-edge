@@ -2336,11 +2336,22 @@ async fn test_transaction_debugger_redacts_credential_class_headers_in_both_dire
     assert!(logs.contains("safe-response-value"), "{logs}");
 }
 
+fn text_capture_plugin(safe_text_fields: &[&str]) -> TransactionDebugger {
+    TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "log_response_body": true,
+        "max_request_body_bytes": 512,
+        "max_response_body_bytes": 512,
+        "safe_text_fields": safe_text_fields,
+    }))
+    .unwrap()
+}
+
 /// Issue #6619: text bodies drop `name=value` / `name: value` lines whose
-/// field name is credential-shaped, keeping ordinary prose lines.
+/// field name is credential-shaped, keeping declared-safe assignment lines.
 #[test]
 fn test_text_body_drops_credential_class_field_lines() {
-    let plugin = capture_plugin();
+    let plugin = text_capture_plugin(&["auth_method"]);
     let body = b"hsm_pin=735102\ntotp_seed=482913\ncsrf: opaque-value\nauth_method=jwt_auth hsm_pin=600114\nauth_method=jwt_auth\n";
     let text = plugin.render_captured_body(body, BodyKind::Text, 512);
     for secret in ["735102", "482913", "opaque-value", "600114"] {
@@ -2356,7 +2367,7 @@ fn test_text_body_drops_credential_class_field_lines() {
 /// Assignments with spacing, and debugger body-field names (`code`, `key`).
 #[test]
 fn test_text_body_drops_spaced_and_body_policy_field_lines() {
-    let plugin = capture_plugin();
+    let plugin = text_capture_plugin(&["auth_method", "note"]);
     let body = b"hsm_pin = 735103\ntotp_seed\t: 482914\nnote=fine code=482915\nkey=opaque-signing-material\nauth_method=jwt_auth\n";
     let text = plugin.render_captured_body(body, BodyKind::Text, 512);
     for secret in ["735103", "482914", "482915", "opaque-signing-material"] {
@@ -2370,13 +2381,13 @@ fn test_text_body_drops_spaced_and_body_policy_field_lines() {
 }
 
 /// Multi-byte characters around assignments never split a character, and
-/// quoted field names are judged like bare ones.
+/// quoted or non-ASCII names fail closed.
 #[test]
 fn test_text_body_assignment_parsing_handles_utf8_and_quotes() {
-    let plugin = capture_plugin();
-    let body = "café=1\n🔑hsm_pin=735104\nnote=été\n\"hsm_pin\": \"735105\"\n'totp_seed' = 482916\nauth_method=jwt_auth\n";
+    let plugin = text_capture_plugin(&["auth_method", "note"]);
+    let body = "caf\u{e9}=cafe-sentinel\n\u{1f511}hsm_pin=735104\nnote=\u{e9}t\u{e9}\n\"hsm_pin\": \"735105\"\n'totp_seed' = 482916\nauth_method=jwt_auth\n";
     let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
-    for secret in ["735104", "735105", "482916"] {
+    for secret in ["735104", "735105", "482916", "cafe-sentinel"] {
         assert!(!text.rendered.contains(secret), "{}", text.rendered);
     }
     assert!(
@@ -2386,34 +2397,67 @@ fn test_text_body_assignment_parsing_handles_utf8_and_quotes() {
     );
 }
 
-/// Unquoted field names are kept whole up to a separator, so a Unicode or
-/// punctuation suffix cannot cut the credential segment off the name.
+/// Issue #6619: assignment lines fail closed. Names the classifier does not
+/// recognize, names that do not parse cleanly (Unicode or punctuation), and
+/// names that are simply not declared are all dropped; only declared names
+/// survive.
 #[test]
-fn test_text_body_unquoted_field_names_keep_unicode_and_punctuation() {
-    let plugin = capture_plugin();
-    let body = "hsm_pin\u{e9}=735107\nhsm_pin/opaque=735108\nnote x-key-private=735109\n/cb?code=735110\ncaf\u{e9}=visible-cafe\nauth_method=jwt_auth\n";
+fn test_text_body_assignment_lines_fail_closed_unless_declared_safe() {
+    let plugin = text_capture_plugin(&["note"]);
+    let body = "hsm_pin\u{e9}=735107\nhsm_pin/opaque=735108\nx-key-private=735109\n/cb?code=735110\ngpgpass_phrase=735111\nkey_private=735112\nprivateKeY=735113\nvault_blob=735114\nnote=visible-note\nline without assignment\n";
     let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
-    for secret in ["735107", "735108", "735109", "735110"] {
+    for secret in [
+        "735107", "735108", "735109", "735110", "735111", "735112", "735113", "735114",
+    ] {
         assert!(!text.rendered.contains(secret), "{}", text.rendered);
     }
-    assert!(text.rendered.contains("visible-cafe"), "{}", text.rendered);
     assert!(
-        text.rendered.contains("auth_method=jwt_auth"),
+        text.rendered.contains("note=visible-note"),
+        "{}",
+        text.rendered
+    );
+    assert!(
+        text.rendered.contains("line without assignment"),
         "{}",
         text.rendered
     );
 }
 
-/// Quoted field names are classified whole (spaces, brackets, escapes).
+/// A credential-shaped or unparseable name cannot be declared safe.
+#[test]
+fn test_safe_text_fields_reject_credential_and_unclean_names() {
+    for name in [
+        "hsm_pin",
+        "key_private",
+        "gpgpass_phrase",
+        "session_id",
+        "caf\u{e9}",
+        "a b",
+    ] {
+        let error = TransactionDebugger::new(&json!({
+            "log_request_body": true,
+            "safe_text_fields": [name],
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("{name} must be rejected"));
+        assert!(error.contains("safe_text_fields[0]"), "{error}");
+    }
+    let error = TransactionDebugger::new(&json!({ "safe_text_fields": ["note"] }))
+        .err()
+        .expect("inert safe_text_fields rejected");
+    assert!(error.contains("requires"), "{error}");
+}
+
+/// Quoted field names are never declared safe, so their lines are dropped
+/// whole (spaces, brackets, escapes).
 #[test]
 fn test_text_body_quoted_field_names_are_classified_whole() {
-    let plugin = capture_plugin();
-    let body = "\"totp seed\": \"482917\"\n\"hsm_pin[]\": \"735106\"\n\"display name\": \"visible-name\"\nauth_method=jwt_auth\n";
+    let plugin = text_capture_plugin(&["auth_method"]);
+    let body = "\"totp seed\": \"482917\"\n\"hsm_pin[]\": \"735106\"\n\"display name\": \"display-sentinel\"\nauth_method=jwt_auth\n";
     let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
-    for secret in ["482917", "735106"] {
+    for secret in ["482917", "735106", "display-sentinel"] {
         assert!(!text.rendered.contains(secret), "{}", text.rendered);
     }
-    assert!(text.rendered.contains("visible-name"), "{}", text.rendered);
     assert!(
         text.rendered.contains("auth_method=jwt_auth"),
         "{}",

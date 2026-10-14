@@ -274,6 +274,42 @@ under the `_dedup_` prefix, and the gRPC-Web request-trailer staging container
 `grpc_web.request_trailers`, are **omitted entirely** (not redacted) from every
 summary projection.
 
+### Fail-closed metadata allowlist
+
+Metadata VALUES are redacted by default (issue #6619). Every sink that emits
+metadata (native summaries, nested and flattened schema metadata, the
+transaction debugger's selected metadata, `ai_transcript_audit` records and
+`mesh.*` trace attributes) serializes a value only when its key is on the
+allowlist **and** the deny rules below do not match it. Every other value is
+written as `[REDACTED]`; the key itself stays visible.
+
+The allowlist is:
+
+- the gateway's own metadata namespaces: a key that equals, or continues with
+  `.`, `:` or `_`, a built-in namespace such as `mesh`, `mesh_authz`,
+  `workload_metrics`, `grpc_web`, `grpc`, `ai`, `mcp`, `a2a`, `sse`,
+  `compression`, `ferrum`, `hbone`, `request`, `response`, `trace`, `span_id`,
+  `route`, `cache`, `auth` and the other built-in plugin names (the complete
+  list is `BUILTIN_SAFE_METADATA_NAMESPACES` in
+  `src/plugins/utils/metadata_redaction.rs`). `request_body` and
+  `response_body` are payloads and are never emitted;
+- the operator allowlist `FERRUM_LOG_SAFE_METADATA_KEYS`: comma-separated exact
+  names (case-insensitive) or prefixes ending in `*` (`tenant.*`). Add the
+  names a custom plugin writes, `workload_metrics` custom tag names, and any
+  operator-configured metadata key (for example a custom `model_key`) here to
+  log their values.
+
+The deny rules always win. An allowlist entry they match (for example
+`session_id` or `key_private`) is ignored and logged as a startup warning, so a
+credential-shaped name cannot be allowlisted. Because unknown names are
+redacted by default, a credential spelling that the classifiers below do not
+recognize (`gpgpass_phrase`, `key_private`, `hsm_piné`) still never reaches a
+sink: the classifiers are now a second line of defense, not the primary gate.
+
+Operator-chosen OUTPUT names (`static_fields`, `derived_fields`, `rename`
+targets, `workload_metrics` custom tag names) are not values copied from
+metadata, so they are checked only against the deny rules below.
+
 ### Sensitive substrings
 
 The full canonical list (`DEFAULT_SENSITIVE_METADATA_KEYS` in
@@ -326,8 +362,8 @@ outer metadata fields, and explicitly selected `static_fields`:
 | API key | `api_key`, `api-key`, `apikey`, `APIKey`, `x-api-key`, `openai_api_key` | `cache_key`, `routing_key`, `api_response_count`, `ai_total_tokens` |
 | Credential class | `session_id`, `x-session-id`, `userSessionIdentifier`, `sid`, `passwd`, `db_pwd`, `GPG_PASSPHRASE`, `doorPasscode`, `hsm_pin`, `totp_seed`, `credential`, `client_credentials`, `jwt`, `request_signature`, `private_key`, `awsAccessKey`, `signing_key`, `client_assertion`, `samlAssertion`, `x-csrf`, `accesstoken` | `request_id`, `cache_key`, `keyboard_layout`, `spin_count`, `pinned_version`, `auth_method`, `mesh_authz.ignored_baggage.assertion_out_of_scope` |
 
-The credential-class classifier fails closed on spellings that appear in no
-list (issue #6619). A key is credential-shaped when one of its segments is a
+The credential-class classifier is the deny layer on top of the allowlist
+above. It fails closed on spellings that appear in no list (issue #6619). A key is credential-shaped when one of its segments is a
 credential-class word (`session`, `sessions`, `sess`, `sessid`, `sessionid`,
 `sid`, `jwt`, `jws`, `jwe`, `passwd`, `pwd`, `passphrase`, `passcode`, `pin`,
 `otp`, `totp`, `hotp`, `credential(s)`, `cred(s)`, `signature(s)`, `sig`,
@@ -353,10 +389,15 @@ segment contains a key-material qualifier (`private`, `access`, `secret`,
 of the key contains `key`. Any algorithm, curve, size, encoding or mode
 descriptors in between never close the context (`private_key`,
 `private_rsa_2048_key`, `private_ec_p256_key`, `signing_rsa_pss_key`,
-`private_ec_p256_pkcs8_pem_key`), while `cache_key` and `routing_key` stay visible. Lowercase compounds are
+`private_ec_p256_pkcs8_pem_key`), and so does the reverse order (`key_private`,
+`keyPrivate`, `x-key-signing`), while `cache_key` and `routing_key` stay visible. Lowercase compounds are
 recognized as well as camelCase ones, so a name normalized before
 classification (an HTTP header name such as `x-hsmpin`) is still caught for
-every rule above. One residual is documented rather than closed: a
+every rule above. An owner word joined to `pass` before a split `phrase`,
+`code` or `word` segment counts too (`gpgpass_phrase`, `x-gpgpass-phrase`),
+while `bypass_code` stays visible. One residual of the classifier is
+documented rather than closed (the allowlist still redacts such values unless
+an operator allowlists the name): a
 delimiter-free lowercase name that joins an unlisted owner word, a short class
 (`pin`, `sid`, `otp`, `sig`, `cred`) and an unlisted representation (for
 example `projectpinopaque`) cannot be told apart from ordinary words such as

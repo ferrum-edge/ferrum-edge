@@ -24,17 +24,18 @@ fn observability_shard_amount() -> usize {
 /// Extract mesh-prefixed metadata entries as OpenTelemetry attribute pairs,
 /// sorted by key for deterministic span output.
 ///
-/// Both branches apply the shared metadata sensitivity decision, so a
-/// `mesh.*` key that names a credential (`mesh.session_id`,
-/// `mesh.private_key`) is never exported to a trace even though it carries
-/// the mesh prefix (issue #6619).
+/// `mesh.*` keys go through the primary metadata gate, so a `mesh.*` key that
+/// names a credential (`mesh.session_id`, `mesh.private_key`) is never
+/// exported to a trace even though it carries the mesh prefix (issue #6619).
+/// Custom attribute names are an explicit operator declaration in
+/// `workload_metrics` config, so they take only the deny layer.
 pub fn mesh_trace_attributes(metadata: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut attributes: Vec<_> = metadata
         .iter()
         .filter(|(key, _)| {
             key.starts_with("mesh.")
                 && !key.starts_with("mesh.metrics.")
-                && !crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key(key)
+                && !crate::plugins::utils::metadata_redaction::metadata_value_is_redacted(key)
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
