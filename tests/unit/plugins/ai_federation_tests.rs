@@ -9711,3 +9711,20 @@ fn test_normalized_usage_clamps_one_sided_low_totals() {
     .unwrap();
     assert_eq!((prompt, total), (1010, 1010));
 }
+
+#[test]
+fn test_normalized_bedrock_total_is_floored_by_categories_without_base() {
+    let bedrock = json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+        "stopReason": "end_turn",
+        "usage": {"cacheReadInputTokens": 1000, "outputTokens": 5, "totalTokens": 5}
+    });
+    let (_, _, completion, total) = test_helpers::normalize_response_test(
+        "aws_bedrock",
+        200,
+        &serde_json::to_vec(&bedrock).unwrap(),
+        "anthropic.claude-3-sonnet",
+    )
+    .unwrap();
+    assert_eq!((completion, total), (5, 1005));
+}

@@ -153,11 +153,20 @@ pub fn parse_ai_provider(provider: &str) -> Option<AiProvider> {
 }
 
 pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
-    if json
-        .get("usageMetadata")
-        .and_then(|usage| usage.get("promptTokenCount"))
-        .is_some()
-    {
+    // Any modeled Gemini counter identifies the format: proto3 JSON omits zero
+    // counters, so a usage block may legitimately lack `promptTokenCount`.
+    if json.get("usageMetadata").is_some_and(|usage| {
+        [
+            "promptTokenCount",
+            "candidatesTokenCount",
+            "completionTokenCount",
+            "thoughtsTokenCount",
+            "toolUsePromptTokenCount",
+            "totalTokenCount",
+        ]
+        .iter()
+        .any(|field| usage.get(field).is_some())
+    }) {
         return Some(AiProvider::Google);
     }
 
@@ -864,6 +873,24 @@ impl UsageCategories {
         )
     }
 
+    /// Checked sum of every counter this usage reported, base or category,
+    /// whether or not its side folds to a complete value.
+    fn reported_floor(&self) -> Option<u64> {
+        let counters = [
+            self.prompt_base,
+            self.prompt_extras[0],
+            self.prompt_extras[1],
+            self.completion_base,
+            self.completion_extra,
+        ];
+        counters
+            .iter()
+            .try_fold(0u64, |sum, counter| match counter {
+                Counter::Value(value) => sum.checked_add(*value),
+                _ => Some(sum),
+            })
+    }
+
     /// Both sides fit individually but their sum does not: no complete total
     /// can be stated, and a previously recorded one is stale.
     fn total_overflows(&self) -> bool {
@@ -897,13 +924,11 @@ impl UsageCategories {
             // The provider total stays authoritative (it may cover a category
             // this parser does not model) but never below the components the
             // same usage reports, even when only one side is present.
-            Counter::Value(reported) => {
-                let known = match (prompt, completion) {
-                    (None, None) => Some(0),
-                    (p, c) => p.unwrap_or(0).checked_add(c.unwrap_or(0)),
-                };
-                known.map(|known| reported.max(known))
-            }
+            // The floor counts EVERY reported counter, so a category reported
+            // without its base (cache reads beside an omitted input count)
+            // still keeps a low total from standing; an overflowing floor
+            // leaves the total unstated.
+            Counter::Value(reported) => self.reported_floor().map(|floor| reported.max(floor)),
             // Without a provider total, only both sides make a complete one.
             _ => match (prompt, completion) {
                 (Some(p), Some(c)) => p.checked_add(c),

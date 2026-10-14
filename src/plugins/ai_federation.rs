@@ -4656,12 +4656,14 @@ fn fold_native_usage_categories(
     Ok(folded)
 }
 
-/// A reported provider total, never below the sum of whichever components the
-/// same response reports; without one, only both components make a total.
+/// A reported provider total, never below the sum of every counter the same
+/// response reports (`floor`, which includes categories whose base was
+/// omitted); without one, only both components make a total.
 fn clamped_reported_total(
     reported: Option<u64>,
     input: Option<u64>,
     output: Option<u64>,
+    floor: u64,
     provider: &str,
 ) -> Result<Option<u64>, String> {
     let Some(reported) = reported else {
@@ -4671,7 +4673,31 @@ fn clamped_reported_total(
         .unwrap_or(0)
         .checked_add(output.unwrap_or(0))
         .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed"))?;
-    Ok(Some(reported.max(known)))
+    Ok(Some(reported.max(known).max(floor)))
+}
+
+/// Checked sum of every listed counter present in `usage` (absent and `null`
+/// contribute nothing; anything else must be a non-negative integer).
+fn native_usage_floor(
+    usage: Option<&Value>,
+    fields: &[&str],
+    provider: &str,
+) -> Result<u64, String> {
+    let usage = usage.and_then(Value::as_object);
+    let mut floor = 0u64;
+    for key in fields {
+        let value = match usage.and_then(|usage| usage.get(*key)) {
+            None | Some(Value::Null) => continue,
+            Some(value) => value,
+        };
+        let count = value.as_u64().ok_or_else(|| {
+            format!("ai_federation: {provider} usage.{key} must be a non-negative integer")
+        })?;
+        floor = floor
+            .checked_add(count)
+            .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed"))?;
+    }
+    Ok(floor)
 }
 
 fn summed_usage(
@@ -5041,10 +5067,21 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
     )?;
     // The provider total stays authoritative but never below the components
     // it reports, even when only one side is present.
+    let floor = native_usage_floor(
+        resp.get("usageMetadata"),
+        &[
+            "promptTokenCount",
+            "candidatesTokenCount",
+            "toolUsePromptTokenCount",
+            "thoughtsTokenCount",
+        ],
+        "Gemini",
+    )?;
     let total = clamped_reported_total(
         resp["usageMetadata"]["totalTokenCount"].as_u64(),
         prompt_tokens,
         completion_tokens,
+        floor,
         "Gemini",
     )?;
 
@@ -5172,10 +5209,21 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
         false,
         "Bedrock",
     )?;
+    let floor = native_usage_floor(
+        resp.get("usage"),
+        &[
+            "inputTokens",
+            "outputTokens",
+            "cacheReadInputTokens",
+            "cacheWriteInputTokens",
+        ],
+        "Bedrock",
+    )?;
     let total = clamped_reported_total(
         resp["usage"]["totalTokens"].as_u64(),
         input_tokens,
         output_tokens,
+        floor,
         "Bedrock",
     )?;
 

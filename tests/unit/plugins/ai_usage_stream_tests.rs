@@ -1280,3 +1280,31 @@ fn combined_overflow_clears_a_stale_total() {
     assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
     assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
 }
+
+#[test]
+fn categories_without_their_base_still_floor_a_reported_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({"usage": {"cacheReadInputTokens": 1000, "outputTokens": 5, "totalTokens": 5}}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(usage.prompt_tokens, None);
+    assert_eq!(usage.total_tokens, Some(1005));
+
+    // Streamed: a total-only snapshot followed by a cache-only update.
+    let usage_message = |usage: serde_json::Value| {
+        let payload = serde_json::to_vec(&json!({ "usage": usage })).unwrap();
+        event_stream_message(b"\x00\x00\x00\x00", &payload)
+    };
+    let mut stream = usage_message(json!({"totalTokens": 5}));
+    stream.extend_from_slice(&usage_message(json!({"cacheReadInputTokens": 1000})));
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(1000)
+    );
+}

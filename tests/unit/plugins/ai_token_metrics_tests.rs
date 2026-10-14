@@ -1751,3 +1751,65 @@ async fn anthropic_sse_category_only_updates_reach_the_merge() {
     assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
 }
+
+/// Gemini usage that omits a zero `promptTokenCount` is still detected under
+/// automatic provider selection and counted like an explicit `google` config.
+#[tokio::test]
+async fn gemini_usage_without_prompt_count_is_detected_automatically() {
+    let body = serde_json::to_vec(&json!({"usageMetadata": {
+        "toolUsePromptTokenCount": 3,
+        "candidatesTokenCount": 5,
+        "thoughtsTokenCount": 40,
+        "totalTokenCount": 48
+    }}))
+    .unwrap();
+    for config in [json!({}), json!({"provider": "google"})] {
+        let plugin = AiTokenMetrics::new(&config).unwrap();
+        let mut ctx = create_test_context();
+        let mut headers = json_headers();
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("3"),
+            "{config}"
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+            Some("45"),
+            "{config}"
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("48"),
+            "{config}"
+        );
+    }
+}
+
+/// Bedrock's terminal invocation metrics can carry the cache counters alone;
+/// the SSE metrics path must fold them into the Anthropic stream's usage.
+#[tokio::test]
+async fn bedrock_terminal_metrics_cache_counters_reach_sse_metrics() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("1010")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+}
