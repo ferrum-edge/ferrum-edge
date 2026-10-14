@@ -122,6 +122,21 @@ const HMAC_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const HMAC_SIGNING_VERSION_V1: &str = "ferrum-hmac-v1";
 const HMAC_SIGNING_VERSION_V2: &str = "ferrum-hmac-v2";
 
+/// Key for the padding MACs run in place of a missing credential entry. Its
+/// value never matters and it can never authenticate; only the work counts.
+const PADDING_HMAC_SECRET: [u8; 32] = [0u8; 32];
+
+/// Smallest serialized HMAC credential entry (`{"secret":"x"}`). Dividing the
+/// total credential-size cap by it bounds padding work even when
+/// `FERRUM_MAX_CREDENTIALS_PER_TYPE` is set absurdly high.
+const MIN_STORED_HMAC_CREDENTIAL_BYTES: usize = r#"{"secret":"x"}"#.len();
+const MAX_HMAC_VERIFICATION_ROUNDS: usize =
+    crate::config::types::MAX_CREDENTIALS_SIZE / MIN_STORED_HMAC_CREDENTIAL_BYTES;
+
+pub(crate) fn bounded_hmac_verification_rounds(configured_limit: usize) -> usize {
+    configured_limit.clamp(1, MAX_HMAC_VERIFICATION_ROUNDS)
+}
+
 /// Widest admissible `clock_skew_seconds`.
 ///
 /// Bounded because the fixed replay retention horizon must dominate the widest
@@ -855,6 +870,10 @@ pub struct HmacAuth {
     /// Ownership token for this instance's request-scoped prebuffer records.
     /// Precomputed at construction, so no request path hashes configuration.
     prebuffer_owner: HmacPrebufferOwner,
+    /// MAC rounds every signature check runs, whatever the username: the
+    /// configured per-type credential limit, so an unknown user, a user with
+    /// one secret, and a user mid-rotation all cost the same.
+    verification_rounds: usize,
 }
 
 impl HmacAuth {
@@ -1147,6 +1166,9 @@ impl HmacAuth {
             replay_domain,
             replay_authority,
             prebuffer_owner,
+            verification_rounds: bounded_hmac_verification_rounds(
+                crate::config::types::max_credentials_per_type(),
+            ),
         })
     }
 
@@ -1362,30 +1384,39 @@ impl HmacAuth {
             .decode(&credential.signature)
             .ok()
             .filter(|signature| signature.len() == expected_signature_len)?;
-        let consumer =
-            consumer_index.find_hmac_by_identity(&credential.namespace, &credential.username)?;
-        let hmac_entries = consumer.credential_entries("hmac_auth");
-        if hmac_entries.is_empty() {
-            return None;
-        }
-
         let signing_string = build_signing_string(credential, self.profile);
-        hmac_entries
-            .iter()
-            .any(|hmac_cred| {
-                hmac_cred
-                    .get("secret")
-                    .and_then(|secret| secret.as_str())
-                    .is_some_and(|secret| {
-                        Self::hmac_matches(
-                            secret.as_bytes(),
-                            signing_string.as_bytes(),
-                            &credential.algorithm,
-                            &expected_signature,
-                        )
-                    })
-            })
-            .then_some(consumer)
+        let consumer =
+            consumer_index.find_hmac_by_identity(&credential.namespace, &credential.username);
+        let mut matched = false;
+        // Run the same number of MAC rounds for every username: configured
+        // secrets first (by index, without collecting a username-dependent
+        // list), then padding with a throwaway key. Rounds never short-circuit,
+        // so neither an unknown username nor the number of rotated secrets
+        // shows in the response timing. Only a configured secret can match.
+        let rounds = consumer
+            .as_ref()
+            .and_then(|consumer| consumer.credentials.get("hmac_auth"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+            .max(self.verification_rounds);
+        for round in 0..rounds {
+            let configured_secret = consumer
+                .as_ref()
+                .and_then(|consumer| consumer.credentials.get("hmac_auth"))
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.get(round))
+                .filter(|entry| entry.is_object())
+                .and_then(|entry| entry.get("secret"))
+                .and_then(Value::as_str);
+            let round_matched = Self::hmac_matches(
+                configured_secret.map_or(&PADDING_HMAC_SECRET[..], str::as_bytes),
+                signing_string.as_bytes(),
+                &credential.algorithm,
+                &expected_signature,
+            );
+            matched |= configured_secret.is_some() & round_matched;
+        }
+        if matched { consumer } else { None }
     }
 
     fn cached_request_binding_matches(
@@ -1958,9 +1989,22 @@ mod tests {
     //! Inline tests for `pub(crate)` helpers. Public API tests live in
     //! `tests/unit/plugins/hmac_auth_tests.rs`.
 
-    use super::{DigestSyntax, HmacAuth, UNSUPPORTED_DIGEST_BODY, parse_body_digest_header};
+    use super::{
+        DigestSyntax, HmacAuth, MAX_HMAC_VERIFICATION_ROUNDS, UNSUPPORTED_DIGEST_BODY,
+        bounded_hmac_verification_rounds, parse_body_digest_header,
+    };
     use crate::fips::approved::{Sha256, Sha512};
     use base64::Engine as _;
+
+    #[test]
+    fn verification_rounds_follow_the_credential_limit_within_bounds() {
+        assert_eq!(bounded_hmac_verification_rounds(0), 1);
+        assert_eq!(bounded_hmac_verification_rounds(2), 2);
+        assert_eq!(
+            bounded_hmac_verification_rounds(usize::MAX),
+            MAX_HMAC_VERIFICATION_ROUNDS
+        );
+    }
 
     fn sha256_digest_header(body: &[u8]) -> String {
         let mut hasher = Sha256::new();
