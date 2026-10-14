@@ -517,7 +517,7 @@ fn extract_openai_usage(json: &Value, provider: AiProvider) -> AiTokenUsage {
 }
 
 fn extract_anthropic_usage(json: &Value) -> AiTokenUsage {
-    let categories = UsageCategories::anthropic(json.get("usage"));
+    let categories = UsageCategories::anthropic(json.get("usage")).with_carrier(json.get("usage"));
     let mut usage = AiTokenUsage {
         model: json
             .get("model")
@@ -531,7 +531,8 @@ fn extract_anthropic_usage(json: &Value) -> AiTokenUsage {
 }
 
 fn extract_google_usage(json: &Value) -> AiTokenUsage {
-    let categories = UsageCategories::gemini(json.get("usageMetadata"));
+    let categories =
+        UsageCategories::gemini(json.get("usageMetadata")).with_carrier(json.get("usageMetadata"));
     let mut usage = AiTokenUsage {
         model: json
             .get("modelVersion")
@@ -612,7 +613,8 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     // metrics (and no `results`), so each component falls back to the Titan
     // counter only where the metrics did not report it.
     if let Some(metrics) = json.get("amazon-bedrock-invocationMetrics") {
-        let mut categories = UsageCategories::bedrock_invocation_metrics(Some(metrics));
+        let mut categories =
+            UsageCategories::bedrock_invocation_metrics(Some(metrics)).with_carrier(Some(metrics));
         // Fill the RAW bases, so the fallback survives cumulative merging
         // (which re-folds categories) rather than living only in the fold.
         if categories.prompt_base == Counter::Absent
@@ -799,6 +801,10 @@ impl UsageCategories {
             completion_extra: Counter::Absent,
             reported_total: Counter::read(usage, "totalTokens"),
         };
+        let malformed_carrier = usage.is_some_and(|usage| !usage.is_null() && !usage.is_object());
+        if malformed_carrier {
+            return Some(categories.with_carrier(usage));
+        }
         let reported = categories.prompt_base.is_reported()
             || categories.prompt_extras.iter().any(|c| c.is_reported())
             || categories.completion_base.is_reported()
@@ -822,6 +828,16 @@ impl UsageCategories {
             completion_extra: Counter::Absent,
             reported_total: Counter::Absent,
         }
+    }
+
+    /// A present usage carrier that is not an object (or `null`) is malformed:
+    /// mark the whole snapshot invalid so it unmeters instead of being read as
+    /// "nothing reported" while a stale count stays complete.
+    fn with_carrier(mut self, carrier: Option<&Value>) -> Self {
+        if carrier.is_some_and(|carrier| !carrier.is_null() && !carrier.is_object()) {
+            self.reported_total = Counter::Invalid;
+        }
+        self
     }
 
     fn zero_omitted_base(&self) -> bool {

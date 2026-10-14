@@ -1438,3 +1438,22 @@ fn titan_fallback_survives_accumulation_and_merging() {
         (Some(21), Some(60), Some(81))
     );
 }
+
+#[test]
+fn malformed_usage_container_unmeters_instead_of_keeping_stale_counts() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let valid = json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}});
+    let malformed = json!({"usageMetadata": []});
+    let body = sse(&[&valid.to_string(), &malformed.to_string()]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
+
+    let mut merged = extract_response_usage(&valid, AiProvider::Google);
+    merged.merge_cumulative(extract_response_usage(&malformed, AiProvider::Google));
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+    assert_eq!(merged.total_for_mode("total_tokens"), None);
+}

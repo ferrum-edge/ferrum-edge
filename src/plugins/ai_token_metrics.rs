@@ -292,40 +292,48 @@ impl AiTokenMetrics {
 
             // `message_start` carries only the authoritative input side; its
             // `output_tokens` is a placeholder the terminal delta supersedes.
-            let mut extracted = if payload.get("amazon-bedrock-invocationMetrics").is_some() {
-                // Bedrock's terminal metrics fold in the same layout as the
-                // Anthropic events they follow; keep the stream's provider so
-                // `merge_cumulative` merges them instead of refusing the switch.
-                let mut metrics = extract_response_usage(payload, AiProvider::Bedrock);
-                metrics.provider = final_usage
-                    .as_ref()
-                    .and_then(|usage| usage.provider)
-                    .or(metrics.provider);
-                metrics
-            } else if event_type == Some("message_start") && provider == AiProvider::Anthropic {
+            // The event's own usage carrier first (with the `message_start`
+            // output placeholder dropped), then any co-located Bedrock
+            // invocation metrics, each merged independently exactly as the
+            // shared streaming accumulator does.
+            let native = if event_type == Some("message_start") && provider == AiProvider::Anthropic
+            {
                 let carrier =
                     crate::plugins::utils::ai_providers::anthropic_message_start_usage(payload);
                 extract_response_usage(&carrier, provider)
             } else {
                 extract_response_usage(payload, provider)
             };
-            // A category-bearing snapshot is merged even when it folds to no
-            // counter: a malformed (or cache-only) update must still reach
-            // `merge_cumulative` to invalidate (or extend) the running state.
-            if extracted.prompt_tokens.is_none()
-                && extracted.completion_tokens.is_none()
-                && extracted.total_tokens.is_none()
-                && extracted.categories
-                    == crate::plugins::utils::ai_providers::UsageCategories::default()
+            let mut snapshots = vec![native];
+            if provider != AiProvider::Bedrock
+                && payload.get("amazon-bedrock-invocationMetrics").is_some()
             {
-                continue;
+                // Bedrock's terminal metrics fold in the same layout as the
+                // Anthropic events they follow; keep the stream's provider so
+                // `merge_cumulative` merges them instead of refusing the switch.
+                let mut metrics = extract_response_usage(payload, AiProvider::Bedrock);
+                metrics.provider = Some(provider);
+                snapshots.push(metrics);
             }
-            if extracted.model.is_none() {
-                extracted.model = model.clone();
-            }
-            match &mut final_usage {
-                Some(current) => current.merge_cumulative(extracted),
-                None => final_usage = Some(extracted),
+            for mut extracted in snapshots {
+                // A category-bearing snapshot is merged even when it folds to no
+                // counter: a malformed (or cache-only) update must still reach
+                // `merge_cumulative` to invalidate (or extend) the running state.
+                if extracted.prompt_tokens.is_none()
+                    && extracted.completion_tokens.is_none()
+                    && extracted.total_tokens.is_none()
+                    && extracted.categories
+                        == crate::plugins::utils::ai_providers::UsageCategories::default()
+                {
+                    continue;
+                }
+                if extracted.model.is_none() {
+                    extracted.model = model.clone();
+                }
+                match &mut final_usage {
+                    Some(current) => current.merge_cumulative(extracted),
+                    None => final_usage = Some(extracted),
+                }
             }
         }
 
