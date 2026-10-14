@@ -1845,6 +1845,14 @@ run — stopping the scan at that DENY would have let scope order decide whether
 an operator's authorizer ever saw a request the scope it protects applied to
 (and would have hidden a two-provider conflict living in a later scope).
 
+Identical destination scopes are collapsed when the destination index is built
+at slice apply, keeping first-occurrence order. Replicas of one Deployment share
+an identity, namespace and labels, so a Service backed by hundreds of endpoints
+costs one scope evaluation per request, not one per endpoint. Repeating a scope
+cannot change the fold above (first DENY, first AUDIT, same-provider
+delegations coalesce), so the decision, reported policy and delegation are the
+same either way.
+
 **Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
 at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
 entries (case-insensitively unique), and the admitted provider set at 16 per
@@ -3971,7 +3979,7 @@ Labels include:
 
 ### Service Graph
 
-`GET /mesh/service-graph` exposes the same mesh identity labels as a node-local service graph. The graph is built by the auto-injected `workload_metrics` plugin at log time and aggregates HTTP-family traffic by `(source_principal, destination_principal)` with request count, error count, total duration, average duration, and last-seen timestamp. The admin endpoint is JWT-authenticated and reads an `ArcSwap` snapshot, so dashboard polling does not iterate the live `DashMap` counters.
+`GET /mesh/service-graph` exposes the same mesh identity labels as a node-local service graph. The graph is built by the auto-injected `workload_metrics` plugin at log time and aggregates HTTP-family traffic by `(source_principal, destination_principal)` with request count, error count, total duration, average duration, and last-seen timestamp. The admin endpoint is JWT-authenticated. Snapshots are built on demand: a read rebuilds the published `ArcSwap` snapshot only when it is at least one second old, so polling at any rate iterates the live `DashMap` at most once per second, and an unread graph costs only a background retention sweep every 30 seconds. Edges idle for five minutes are evicted. Each data plane tracks at most 10,000 live edges. Once the cap is reached, transactions for new edges are dropped (with a sampled warning) until retention frees a slot, and edges already tracked keep counting.
 
 The endpoint is intentionally node-local. In CP/DP or horizontally scaled mesh deployments, scrape every data-plane instance and aggregate source/destination edges in the observability backend.
 
