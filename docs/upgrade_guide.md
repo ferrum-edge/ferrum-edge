@@ -28,10 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `request_mirror` strips credential-shaped names (PR #6631)
+### Shared consumer credentials are refused (#6572)
 
-Cross-origin mirrors now drop any header or decoded query name that looks like a credential (for example `x-session-id`, `jwt`, `session_id`, `key`, `code`, `PHPSESSID`), in addition to the previous lists. If a mirror target legitimately needs one of these names, list it in `forward_sensitive_header_allowlist` or `forward_sensitive_query_allowlist` together with `forward_sensitive_headers` / `forward_sensitive_query: true`. Query allowlist entries may now contain brackets (`filter[key]`) but not `%`, `+` or query delimiters.
+Consumers whose `id`, `username` or `custom_id` collide are still quarantined
+as before: the later consumer is left out of the snapshot. Among the remaining
+consumers, a configuration in which two consumers of one namespace share a
+`keyauth` key, a `basicauth` username, or an exact `mtls_auth` identity is now
+refused by
+database full loads, control planes, data planes, and incremental applies; the
+previous configuration stays live on a running gateway. The Admin API already
+refused to create such collisions, so only rows written out of band or before
+that check can trigger it.
 
+At **startup** there is no previous configuration: a database-mode gateway
+whose initial load is refused falls back to a valid backup if one is configured,
+and otherwise exits before its Admin API binds. **Before upgrading**, look for
+`Credential collision` warnings in the gateway log and rotate or remove one
+side of each collision, either through the Admin API of a still-running
+(pre-upgrade) instance or directly in storage.
 ### `openapi_validator` bypass headers need a secret (PR #6634)
 
 Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.

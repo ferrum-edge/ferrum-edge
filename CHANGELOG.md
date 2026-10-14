@@ -9,20 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `request_mirror` strips credential-shaped header and query
-  names by class, not only by list.** (issue n/a, PR #6631) Cross-origin credential stripping
-  now splits each header name and decoded query name into alphanumeric
-  segments and denies any name with a credential-class word (`auth`, `jwt`,
-  `session`, `sid`, `key`, `pass`, `pwd`, `ticket`, `otp`, …), a credential
-  stem inside a segment (`session`, `sessid`, `token`, `secret`, `auth`,
-  `passw`, `pwd`, `otp`, `verifier`, …), or a segment containing `key` or
-  `pass` (other than ordinary words such as `keyword` or `passenger`). The
-  whole name `code` (OAuth authorization code) is denied too. Names such as
-  `x-session-id`, `jwt`, `x-access-key`, `x-private-key`, `session_id`,
-  `PHPSESSID` and `key` no longer reach the mirror origin. The exceptions
-  are continuation cursors (`x-continuation-token`, `continuation_token`),
-  `author`/`authority` names and `Idempotency-Key`. The exact `forward_sensitive_*_allowlist`
-  stays the only way to forward a denied name.
+- **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
+  refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
+  full loaders only warned when two consumers in one namespace, whose
+  identities did not collide, shared an API key or exact mTLS identity, and
+  the consumer index then authenticated
+  that credential as whichever consumer was indexed last. Database full loads,
+  CP snapshots and deltas, and every runtime swap (including DP snapshots and
+  incremental applies) now refuse such a config and keep the previous one,
+  the same way case-variant mTLS DNS identities were already refused and file
+  mode already failed. Identity collisions keep their existing quarantine
+  (#2121), which drops the later consumer. Admin writes were already blocked from creating these
+  collisions. On a running gateway, repair a pre-existing one through the Admin
+  API while the previous config stays live. An initial database load that is
+  refused has no previous config and needs a valid backup, so repair
+  collisions before upgrading.
 - **BREAKING — `openapi_validator` `bypass.header_present` requires a
   shared secret.** (issue n/a, PR #6634) Each entry now maps a header name to a secret of
   16–4096 visible ASCII characters, and a request skips validation only
@@ -179,6 +180,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
+  `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
+  clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging
+  sinks) verify servers through a rustls verifier that applies the shared CRL
+  policy, so a revoked certificate is refused there as on every other TLS
+  surface. They trust `FERRUM_TLS_CA_BUNDLE_PATH` exclusively or, without it,
+  the bundled webpki roots instead of the OS trust store, disable session
+  resumption, and follow the backend CRL generation that backend TLS live
+  reload publishes. A trust store or verifier that cannot be built fails
+  closed. `FERRUM_TLS_NO_VERIFY` still disables verification, and now logs a
+  warning when a CA bundle or CRL source is configured alongside it.
 - **`ldap_auth` re-checks `required_groups` on cached credentials** (issue
   #6609). With the opt-in credential cache, a hit used to skip the group
   search for the whole `cache_ttl_seconds` (up to 24 hours). A hit whose last
@@ -209,6 +221,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ws_logging` charges one back-off per failed attempt and none after the
+  last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
+  failure, including after the final attempt, and `send_batch` added
+  `retry_delay_ms` on top, so at the defaults a batch aimed at an
+  unreachable collector held the single delivery worker for about 44 s.
+  The retry ladder now owns the back-off. That is `reconnect_delay_ms` after
+  a failed connection and `retry_delay_ms` after a failed send, never both
+  and never after the final attempt, and per-attempt warnings are sampled.
+  The same change removes the unreachable empty-`endpoint_url` flush branch
+  and refuses a partially staged activation before consuming its config.
+  `ws_rate_limiting` single-flights its over-cap idle sweep behind the same
+  cooldown CAS gate `udp_rate_limiting` uses, as defense in depth.
 - **Equal-priority plugins now run in a deterministic order** (issue #6614).
   Ties used to follow config iteration order, which a database (unordered
   `proxy_plugins` association rows), a reordered config file, or an

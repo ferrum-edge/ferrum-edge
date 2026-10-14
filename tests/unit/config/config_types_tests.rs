@@ -2009,6 +2009,94 @@ fn test_unique_consumer_credentials_scopes_case_folding_to_san_dns() {
     assert!(errors[0].contains("ASCII case-insensitive"));
 }
 
+// ── Runtime refusal of shared auth credentials (issue #6572) ─────────────
+
+#[test]
+fn test_unique_consumer_auth_credentials_rejects_shared_keyauth_key() {
+    let key = "shared-api-key-value-0123456789abcdef";
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("keyauth".into(), serde_json::json!([{"key": key}]));
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "bob-own-key-0123456789"}, {"key": key}]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let errors = config
+        .validate_unique_consumer_auth_credentials()
+        .unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("\"c2\"") && errors[0].contains("\"c1\""));
+    assert!(!errors[0].contains(key), "the key must never be reported");
+}
+
+#[test]
+fn test_unique_consumer_auth_credentials_allows_rotation_and_other_namespaces() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "alice-key-0123456789"}, {"key": "alice-key-0123456789"}]),
+    );
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client.example.com"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.namespace = "tenant-b".to_string();
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "alice-key-0123456789"}]),
+    );
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client.example.com"}]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    assert!(config.validate_unique_consumer_auth_credentials().is_ok());
+}
+
+#[test]
+fn test_unique_consumer_auth_credentials_rejects_basicauth_and_mtls_collisions() {
+    let mut c1 = make_consumer("c1", "shared-user");
+    c1.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password_hash": "hash-one"}]),
+    );
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client.example.com"}]),
+    );
+    let mut c2 = make_consumer("c2", "shared-user");
+    c2.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password_hash": "hash-two"}]),
+    );
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client.example.com"}]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let errors = config
+        .validate_unique_consumer_auth_credentials()
+        .unwrap_err();
+    assert_eq!(errors.len(), 2);
+    assert!(errors.iter().any(|error| error.contains("basicauth")));
+    assert!(errors.iter().any(|error| error.contains("mtls_auth")));
+    assert!(
+        errors
+            .iter()
+            .all(|error| !error.contains("shared-user") && !error.contains("client.example.com")),
+        "diagnostics must not carry credential values: {errors:?}"
+    );
+}
+
 #[test]
 fn test_unique_mtls_dns_identities_include_global_fallback_without_proxies() {
     let mut c1 = make_consumer("c1", "alice");
