@@ -509,7 +509,9 @@ const BENIGN_LEADING_SHORT_CLASS_WORDS: &[&str] = &[
     "credence",
     "credulous",
     "credential",
-    "otpauth",
+    "sigma",
+    "sigh",
+    "sigil",
 ];
 
 /// Words that may follow a short credential class inside one segment
@@ -543,6 +545,7 @@ fn has_qualified_short_class(lower: &str) -> bool {
     if QUALIFIED_SHORT_CLASSES
         .iter()
         .any(|(class, _)| lower.len() > class.len() && lower.starts_with(class))
+        && lower != "sign"
         && !BENIGN_LEADING_SHORT_CLASS_WORDS
             .iter()
             .any(|word| lower.starts_with(word))

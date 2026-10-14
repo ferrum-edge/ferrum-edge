@@ -641,6 +641,11 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "x-signingKeyEncoded",
     "x-signingKeyUtf8",
     "mesh.signingkeyencoded",
+    "x-signingKeyString",
+    "signingkeyseed",
+    "x-signingKeyJwk",
+    "x-pinCleartext",
+    "pincleartext",
     "mesh.signingkeybase64url",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",
@@ -678,6 +683,9 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "client_keyboard_layout",
     "client_keyword",
     "client_keyspace",
+    "sign_count",
+    "signed_url",
+    "private_monkey_count",
 ];
 
 #[test]
