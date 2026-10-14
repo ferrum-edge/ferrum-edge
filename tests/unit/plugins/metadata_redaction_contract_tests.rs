@@ -49,8 +49,8 @@ const NON_SECRET_COUNTERS: &[&str] = &[
     "ai_total_tokens",
     "ai_prompt_tokens",
     "ai_completion_tokens",
-    "cache_key",
-    "request_dedup_key",
+    "grpc_status",
+    "route_request_timeout",
 ];
 
 const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
@@ -920,6 +920,14 @@ fn unlisted_metadata_names_are_redacted_by_default_on_every_projection() {
         "hsm_pin/opaque",
         "vault_blob",
         "custom_plugin_value",
+        // Unknown names beneath built-in prefixes are not allowlisted either.
+        "mesh.vault_blob",
+        "mesh.projectpinopaque",
+        "mcp.custom_blob",
+        "ai_semantic_cache.1.cache_key",
+        // Payloads are never emitted.
+        "request_body",
+        "response_body",
     ];
     let mut metadata = HashMap::new();
     for (index, key) in ADVERSARIAL.iter().enumerate() {
@@ -955,6 +963,14 @@ fn unlisted_metadata_names_are_redacted_by_default_on_every_projection() {
     let attributes = ferrum_edge::plugins::mesh::mesh_trace_attributes(&HashMap::from([
         (
             "mesh.key_private".to_string(),
+            "mesh-key-sentinel".to_string(),
+        ),
+        (
+            "mesh.vault_blob".to_string(),
+            "mesh-key-sentinel".to_string(),
+        ),
+        (
+            "mesh.projectpinopaque".to_string(),
             "mesh-key-sentinel".to_string(),
         ),
         ("mesh.source.workload".to_string(), "frontend".to_string()),

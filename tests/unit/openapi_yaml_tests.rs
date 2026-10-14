@@ -13870,10 +13870,16 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         body_field_items["pattern"],
         json!("^\\s*\\S(?:[\\s\\S]{0,126}\\S)?\\s*$")
     );
+    let safe_text_items = &schema["properties"]["safe_text_fields"]["items"];
+    assert_eq!(safe_text_items["minLength"], json!(1));
+    assert_eq!(
+        safe_text_items["pattern"],
+        json!("^\\s*[A-Za-z0-9_.-]{1,128}\\s*$")
+    );
     let admission_rules = schema["allOf"]
         .as_array()
         .expect("TransactionDebuggerConfig admission allOf");
-    assert_eq!(admission_rules.len(), 4);
+    assert_eq!(admission_rules.len(), 5);
 
     let description = schema["description"]
         .as_str()
@@ -13937,10 +13943,15 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         json!({"redacted_headers": []}),
         json!({"redacted_headers": ["x-internal-id"]}),
         json!({"redacted_body_fields": []}),
+        json!({"safe_text_fields": []}),
         json!({"schema": {}}),
         json!({
             "log_request_body": true,
             "redacted_body_fields": ["demo"]
+        }),
+        json!({
+            "log_request_body": true,
+            "safe_text_fields": ["demo"]
         }),
         json!({
             "log_request_body": true,
@@ -13969,6 +13980,7 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         json!({"max_request_body_bytes": 256}),
         json!({"log_response_body": false, "max_response_body_bytes": 256}),
         json!({"redacted_body_fields": ["demo"]}),
+        json!({"safe_text_fields": ["demo"]}),
         json!({"redacted_headers": [""]}),
         json!({"redacted_headers": ["invalid header"]}),
         json!({"schema": {}, "schema_ref": "absent"}),
@@ -13980,6 +13992,14 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
             "log_request_body": true,
             "redacted_body_fields": ["x".repeat(129)]
         }),
+        json!({
+            "log_request_body": true,
+            "safe_text_fields": ["x".repeat(129)]
+        }),
+        json!({
+            "log_request_body": true,
+            "safe_text_fields": ["bad name"]
+        }),
     ] {
         assert_component_validity(&spec, "TransactionDebuggerConfig", &invalid, false);
         assert!(
@@ -13987,6 +14007,18 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
+
+    // The credential deny layer is runtime-only (the schema pattern cannot
+    // express the classifier): a credential-shaped name passes the schema
+    // shape but must still be refused at construction.
+    assert!(
+        TransactionDebugger::new(&json!({
+            "log_request_body": true,
+            "safe_text_fields": ["password"]
+        }))
+        .is_err(),
+        "a credential-shaped safe_text_fields entry must be refused at runtime"
+    );
 }
 
 #[test]

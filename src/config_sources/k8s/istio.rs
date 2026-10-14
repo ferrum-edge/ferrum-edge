@@ -11187,7 +11187,7 @@ mod tests {
                 serde_json::json!({
                     "tracing": [{
                         "customTags": {
-                            "credential": {
+                            "env_tag": {
                                 "environment": {
                                     "name": "FERRUM_ADMIN_JWT_SECRET"
                                 }

@@ -33,9 +33,9 @@
 //! **Fail-closed allowlist (issue #6619).** The rules above are a DENY layer.
 //! The primary gate is an allowlist: a metadata VALUE is emitted only when its
 //! key is a known-safe name, and every other value serializes as
-//! `[REDACTED]`. Known-safe names are the gateway's own metadata namespaces and
-//! flat keys ([`BUILTIN_SAFE_METADATA_NAMESPACES`],
-//! [`BUILTIN_SAFE_METADATA_KEYS`]) plus the operator allowlist
+//! `[REDACTED]`. Known-safe names are the gateway's own reviewed metadata keys
+//! ([`BUILTIN_SAFE_METADATA_KEYS`], exact names, plus a few fixed-grammar
+//! per-instance families; never whole namespaces) plus the operator allowlist
 //! `FERRUM_LOG_SAFE_METADATA_KEYS` (exact names, or `prefix*` entries). The deny
 //! layer still wins over the allowlist, and an operator entry the deny layer
 //! classifies as credential-shaped is ignored with a startup warning. Because
@@ -126,91 +126,500 @@ pub const REDACTED_QUERY_PLACEHOLDER: &str = "[REDACTED_QUERY]";
 /// Placeholder substituted for a URL fragment that may carry credentials.
 pub const REDACTED_FRAGMENT_PLACEHOLDER: &str = "[REDACTED_FRAGMENT]";
 
-/// Metadata namespaces owned by the gateway and its built-in plugins. A key is
-/// built-in when it equals a namespace or continues it with `.`, `:` or `_`
-/// (`mesh.source.workload`, `compression:algorithm`, `grpc_web_mode`).
-/// Values under these names are emitted unless the deny layer matches the key.
-pub const BUILTIN_SAFE_METADATA_NAMESPACES: &[&str] = &[
-    "a2a",
-    "access_control",
-    "adaptive_concurrency",
-    "ai",
-    "ambient",
-    "api_chargeback",
-    "auth",
-    "authorization",
-    "backend",
-    "basic_auth",
-    "body_validator",
-    "bot_detection",
-    "cache",
-    "compression",
-    "connection",
-    "consumer",
+/// Reviewed metadata keys written by the gateway and its built-in plugins.
+///
+/// Exact names only (issue #6619): a namespace prefix proves nothing about a
+/// key a plugin invents beneath it (`mesh.vault_blob`), so unknown names under
+/// a built-in prefix stay redacted. Per-instance key families with a fixed
+/// grammar are matched by [`is_builtin_metadata_key_family`]. Values under
+/// these names are emitted unless the deny layer matches the key.
+pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
+    "a2a.binding",
+    "a2a.context_id",
+    "a2a.context_id.truncated",
+    "a2a.enabled",
+    "a2a.error",
+    "a2a.error.truncated",
+    "a2a.method",
+    "a2a.mode",
+    "a2a.payload.response",
+    "a2a.policy_decision",
+    "a2a.protocol_version",
+    "a2a.protocol_version.truncated",
+    "a2a.response_body_size",
+    "a2a.stream_events",
+    "a2a.streaming",
+    "a2a.task_id",
+    "a2a.task_id.truncated",
+    "a2a.task_state",
+    "a2a.task_state.truncated",
+    "a2a.task_state.unrecognized",
+    "a2a.ttfb_ms",
+    "ai_cache_match",
+    "ai_cache_similarity",
+    "ai_cache_status",
+    "ai_completion_tokens",
+    "ai_estimated_cost",
+    "ai_federation.streaming_claimed",
+    "ai_federation.streaming_outcome",
+    "ai_federation.streaming_provider_attempts",
+    "ai_federation.streaming_provider_type",
+    "ai_federation_circuit_half_open_probes",
+    "ai_federation_circuit_last_provider",
+    "ai_federation_circuit_last_state",
+    "ai_federation_circuit_open_skips",
+    "ai_federation_multimodal_dropped_parts",
+    "ai_federation_multimodal_dropped_roles",
+    "ai_federation_multimodal_dropped_types",
+    "ai_federation_multimodal_mode",
+    "ai_federation_multimodal_provider",
+    "ai_federation_provider",
+    "ai_federation_status",
+    "ai_model",
+    "ai_prompt_compressor.compressed_tokens",
+    "ai_prompt_compressor.fields_compressed",
+    "ai_prompt_compressor.original_tokens",
+    "ai_prompt_compressor.tokens_saved",
+    "ai_prompt_tokens",
+    "ai_provider",
+    "ai_ratelimit_backend_status",
+    "ai_ratelimit_limit",
+    "ai_ratelimit_remaining",
+    "ai_ratelimit_reserved_tokens",
+    "ai_ratelimit_usage",
+    "ai_ratelimit_window",
+    "ai_request_guard.uninspectable_body",
+    "ai_request_guard.uninspectable_body_action",
+    "ai_request_guard.uninspectable_body_reason",
+    "ai_request_streaming",
+    "ai_response_guard_detected",
+    "ai_response_guard_redacted",
+    "ai_response_guard_rejected",
+    "ai_response_guard_warning",
+    "ai_semantic_firewall.action",
+    "ai_semantic_firewall.decision",
+    "ai_semantic_firewall.enabled",
+    "ai_semantic_firewall.mode",
+    "ai_semantic_firewall.request.action",
+    "ai_semantic_firewall.request.decision",
+    "ai_semantic_firewall.request.uninspectable_body",
+    "ai_semantic_firewall.request.would_action",
+    "ai_semantic_firewall.response.action",
+    "ai_semantic_firewall.response.decision",
+    "ai_semantic_firewall.response.uninspectable_body",
+    "ai_semantic_firewall.response.would_action",
+    "ai_semantic_firewall.response_inspection",
+    "ai_semantic_firewall.response_inspection_skipped",
+    "ai_semantic_firewall.stream_buffer_requested",
+    "ai_semantic_firewall.stream_hold_timeout_action",
+    "ai_semantic_firewall.stream_hold_timeouts",
+    "ai_semantic_firewall.stream_inspect_requested",
+    "ai_semantic_firewall.stream_skip_requested",
+    "ai_semantic_firewall.uninspectable_body",
+    "ai_shield_redacted",
+    "ai_shield_rejected",
+    "ai_shield_warnings",
+    "ai_stream_router.claimed",
+    "ai_stream_router.enabled",
+    "ai_stream_router.model",
+    "ai_stream_router.normalized_response_stream",
+    "ai_stream_router.provider",
+    "ai_stream_router.provider_content_encoding",
+    "ai_stream_router.provider_type",
+    "ai_stream_router.request_translated",
+    "ai_stream_router.tool_choice_none",
+    "ai_stream_router_claimed",
+    "ai_stream_router_pass_through",
+    "ai_streaming",
+    "ai_tool_governor.approval_id",
+    "ai_tool_governor.arguments_hashes",
+    "ai_tool_governor.decision",
+    "ai_tool_governor.enabled",
+    "ai_tool_governor.mode",
+    "ai_tool_governor.observations_omitted",
+    "ai_tool_governor.policy_ids",
+    "ai_tool_governor.redacted_tools",
+    "ai_tool_governor.risk",
+    "ai_tool_governor.stream_model",
+    "ai_tool_governor.stream_requested",
+    "ai_tool_governor.tool_names",
+    "ai_tool_governor.uninspectable_reason",
+    "ai_total_tokens",
+    "ai_transcript_audit.candidate",
+    "ai_transcript_audit.final_req_seen",
+    "ai_transcript_audit.record_id",
+    "ai_transcript_audit.request_hash",
+    "ai_transcript_audit.response_hash",
+    "ai_transcript_audit.sample_hit",
+    "ai_transcript_audit.sampled",
+    "ai_transcript_audit.sink_status",
+    "ai_transcript_audit.stream_marker",
+    "ai_transcript_audit.stream_request",
+    "authorization.termination_reason",
+    "compression.codec",
+    "compression.level",
+    "compression.type",
+    "compression:accept_encoding",
+    "compression:algorithm",
+    "compression:request_decoded",
+    "compression:request_encoding",
+    "compression:request_no_transform",
+    "connection_security_policy",
+    "consumer_username",
     "correlation_id",
-    "cors",
+    "cors_origin",
     "direction",
     "error_class",
-    "external_operation",
-    "fault",
-    "ferrum",
-    "geo_restriction",
-    "graphql",
-    "grpc",
-    "hbone",
-    "hmac_auth",
-    "http",
+    "extended_connect_protocol",
+    "fault_abort_status",
+    "fault_delay_ms",
+    "fault_delay_outcome",
+    "fault_injected",
+    "fault_injection.route_applied",
+    "fault_type",
+    "ferrum.frontend_scheme",
+    "ferrum:external_operation_completed",
+    "ferrum:finalized_synthetic_response",
+    "ferrum:later_no_transform_response",
+    "ferrum:later_strong_etag_response",
+    "ferrum:no_transform_request",
+    "ferrum:no_transform_response",
+    "ferrum:origin_encoded_request",
+    "ferrum:origin_encoded_response",
+    "ferrum:origin_fragment_response",
+    "ferrum:original_response_content_length",
+    "ferrum:original_response_content_type",
+    "ferrum:original_response_metadata_stamped",
+    "ferrum:query_params_transformed",
+    "ferrum:range_response",
+    "ferrum:rejection_response",
+    "ferrum:release_dedup_inflight_on_commit",
+    "ferrum:replaceable_rejection_response",
+    "ferrum:representation_rejected",
+    "ferrum:request_representation_rejected",
+    "ferrum:retry_response_buffering",
+    "ferrum:spec_expose_head_response",
+    "ferrum:strong_etag_response",
+    "ferrum:synthetic_response_method_override",
+    "ferrum:synthetic_short_circuit",
+    "frontend_listen_port",
+    "graphql_complexity",
+    "graphql_depth",
+    "graphql_operation_name",
+    "graphql_operation_type",
+    "grpc_adjusted_deadline_ms",
+    "grpc_deadline.request_body_transform_timed_out",
+    "grpc_full_method",
+    "grpc_message",
+    "grpc_method",
+    "grpc_original_deadline_ms",
+    "grpc_service",
+    "grpc_status",
+    "grpc_status_unreadable",
+    "grpc_timeout_invalid",
+    "grpc_web.owner",
+    "grpc_web.request_decoded",
+    "grpc_web.request_trailer_error",
+    "grpc_web.response_translated",
+    "grpc_web.unframed_error_entity",
+    "grpc_web_accept_rejected",
+    "grpc_web_http_status",
+    "grpc_web_mode",
+    "grpc_web_original_ct",
+    "grpc_web_trailer_names",
+    "hbone.udp.termination_reason",
+    "hbone_datagram",
+    "http_method",
     "io_side",
-    "ip_restriction",
-    "jwks_auth",
-    "jwt_auth",
-    "key_auth",
-    "ldap_auth",
-    "mcp",
-    "mesh",
-    "mesh_authz",
-    "mesh_request_auth",
-    "mirror",
-    "mtls_auth",
-    "node_waypoint",
-    "oauth2_introspection",
-    "oidc_rp",
-    "opa",
-    "openapi_validator",
-    "original_response",
-    "otel",
+    "mcp.admission_violation",
+    "mcp.arguments",
+    "mcp.arguments_hash",
+    "mcp.arguments_truncated",
+    "mcp.batch",
+    "mcp.batch_size",
+    "mcp.bridge.gateway_error",
+    "mcp.bridge.operation",
+    "mcp.bridge.upstream_status",
+    "mcp.catalog_degraded",
+    "mcp.catalog_hit",
+    "mcp.catalog_version",
+    "mcp.enabled",
+    "mcp.input_schema_hash",
+    "mcp.item_name",
+    "mcp.item_type",
+    "mcp.jsonrpc",
+    "mcp.message.kind",
+    "mcp.method",
+    "mcp.mode",
+    "mcp.needs_request_rewrite",
+    "mcp.needs_response_rewrite",
+    "mcp.policy_decision",
+    "mcp.prompt_name",
+    "mcp.protocol_version",
+    "mcp.protocol_version_negotiated",
+    "mcp.public_tool_name",
+    "mcp.resource_uri",
+    "mcp.response_rewrite.catalog_version",
+    "mcp.response_rewrite.method",
+    "mcp.response_rewrite.server_id",
+    "mcp.response_rewrite.session",
+    "mcp.result_schema_validation",
+    "mcp.rewrite.method",
+    "mcp.rewrite.param",
+    "mcp.rewrite.public_value",
+    "mcp.rewrite.upstream_value",
+    "mcp.route_decision",
+    "mcp.schema_validation",
+    "mcp.server_id",
+    "mcp.session.downstream",
+    "mcp.sse.cancel",
+    "mcp.sse.delivery",
+    "mcp.sse.error",
+    "mcp.sse.resume_requested",
+    "mcp.sse.stream",
+    "mcp.tool_name",
+    "mcp.upstream_prompt_name",
+    "mcp.upstream_resource_uri",
+    "mcp.upstream_tool_name",
+    "mcp_gateway.discovery",
+    "mcp_gateway.initialize",
+    "mcp_gateway.initialized_notification",
+    "mcp_gateway.session_delete",
+    "mesh.cluster",
+    "mesh.connection_security_policy",
+    "mesh.cross_cluster",
+    "mesh.destination.app",
+    "mesh.destination.namespace",
+    "mesh.destination.principal",
+    "mesh.destination.service",
+    "mesh.destination.trust_domain",
+    "mesh.destination.workload",
+    "mesh.direction",
+    "mesh.eastwest_sni",
+    "mesh.gateway.transport",
+    "mesh.hbone",
+    "mesh.hbone_authority_host",
+    "mesh.hbone_dial_host",
+    "mesh.hbone_peer_spiffe_id",
+    "mesh.hbone_port",
+    "mesh.ignored_baggage",
+    "mesh.mtls",
+    "mesh.mtls_authority_host",
+    "mesh.mtls_authority_port",
+    "mesh.mtls_dial_host",
+    "mesh.mtls_port",
+    "mesh.namespace",
+    "mesh.network",
+    "mesh.node_id",
+    "mesh.port_name",
+    "mesh.protocol",
+    "mesh.relay.denial_reason",
+    "mesh.relay.denied_destination",
+    "mesh.relay.terminator_ip",
+    "mesh.remote",
+    "mesh.request_principal",
+    "mesh.request_protocol",
+    "mesh.response_code",
+    "mesh.response_flags",
+    "mesh.service",
+    "mesh.source.app",
+    "mesh.source.namespace",
+    "mesh.source.principal",
+    "mesh.source.service",
+    "mesh.source.service_account",
+    "mesh.source.trust_domain",
+    "mesh.source.workload",
+    "mesh.spiffe_id",
+    "mesh.topology",
+    "mesh.trust_domain",
+    "mesh.unix_socket",
+    "mesh.unix_socket_h2c",
+    "mesh_authz.audit_policy",
+    "mesh_authz.deny_policy",
+    "mesh_authz.destination_scope_missing",
+    "mesh_authz.ext_authz_outcome",
+    "mesh_authz.ignored_baggage",
+    "mesh_authz.ignored_baggage.assertion_out_of_scope",
+    "mesh_authz.ignored_baggage.trust_domain_mismatch",
+    "mesh_authz.ignored_baggage.unauthenticated",
+    "mesh_authz.ignored_baggage.untrusted_assertor",
+    "mesh_authz.ignored_udp_source_scope",
+    "mesh_authz.ingress_listener_port_missing",
+    "mesh_authz.node_waypoint_authorized_backend",
+    "mesh_authz.node_waypoint_authorized_backend_aliases",
+    "mesh_authz.node_waypoint_authorized_upstream_id",
+    "mesh_authz.node_waypoint_scoped_authz_active",
+    "mesh_authz.non_canonical_path",
+    "mesh_authz.reevaluation",
+    "mesh_authz.scope_missing",
+    "mesh_request_auth.permissive_missing_token",
+    "mirror_error",
+    "namespace",
+    "openapi_validator.action",
+    "openapi_validator.matched_operation",
+    "openapi_validator.mode",
+    "openapi_validator.request_contract_phase",
+    "openapi_validator.request_error",
+    "openapi_validator.response_error",
+    "openapi_validator.skip_reason",
     "parent_span_id",
     "peer_spiffe_id",
-    "prometheus",
-    "rate_limiting",
-    "ratelimit",
-    "rejection",
-    "request",
-    "response",
-    "route",
-    "serverless_function",
-    "soap_ws_security",
+    "ratelimit_authority",
+    "ratelimit_limit",
+    "ratelimit_local_fallback",
+    "ratelimit_mcp_tool_calls",
+    "ratelimit_mcp_uninspectable",
+    "ratelimit_remaining",
+    "ratelimit_window",
+    "rejection_phase",
+    "request_body_size_bytes",
+    "request_deduplication.publishing_external_operation_tombstone",
+    "request_deduplication.replayed",
+    "request_id",
+    "request_path",
+    "request_protocol",
+    "response_status_code",
+    "route_request_timeout",
+    "server_address",
+    "server_port",
+    "soap_ws_saml_subject",
+    "soap_ws_security.credential_strip_range",
+    "soap_ws_username",
     "span_id",
-    "sse",
-    "streaming",
-    "synthetic",
-    "trace",
+    "sse:leid_bytes",
+    "sse:leid_present",
+    "sse:relabeled_non_sse",
+    "sse:retry_ms",
+    "sse:wrap_non_sse",
+    "suppress_backend_consumer_identity_headers",
+    "trace_id",
+    "trace_sampled",
     "traceparent",
     "tracestate",
-    "upstream",
-    "websocket",
-    "workload",
-    "workload_metrics",
-    "waf",
-    "ws",
+    "waf.action",
+    "waf.block_reason",
+    "waf.body_too_large",
+    "waf.body_too_large_target",
+    "waf.body_uninspected",
+    "waf.body_uninspected_target",
+    "waf.detection_paranoia",
+    "waf.detection_rule_hits",
+    "waf.first_blocking_rule",
+    "waf.instance_scores",
+    "waf.paranoia",
+    "waf.response_stream_uninspectable",
+    "waf.rule_hits",
+    "waf.scan_timed_out",
+    "waf.scan_truncated",
+    "waf.score",
+    "waf.scoring_instance",
+    "waf.severity",
+    "waf.target",
+    "waf.would_block_reason",
+    "websocket.session.duration_ms",
+    "websocket.termination_reason",
+    "workload_metrics.captured_b3",
+    "workload_metrics.captured_traceparent",
+    "workload_metrics.captured_tracestate",
+    "workload_metrics.trace_attributes",
 ];
 
-/// Built-in names under an allowed namespace that carry payloads rather than
-/// bounded observability values; never emitted.
-const BUILTIN_PAYLOAD_METADATA_KEYS: &[&str] = &["request_body", "response_body"];
+/// Fixed suffixes of `ai_semantic_firewall` decision keys.
+const SEMANTIC_FIREWALL_SUFFIXES: &[&str] = &[
+    "action",
+    "decision",
+    "direction",
+    "json_paths",
+    "match_directions",
+    "matcher_type",
+    "max_score",
+    "max_severity",
+    "on_hold_timeout",
+    "provider_error",
+    "request_body_size_bytes",
+    "roles",
+    "rule_descriptions",
+    "rule_ids",
+    "rule_packs",
+    "segment_kinds",
+    "snippet_hashes",
+    "type",
+    "uninspectable_body",
+    "would_action",
+];
 
-/// Flat built-in metadata keys outside the namespaces above.
-pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &["namespace"];
+/// Base names of `ai_rate_limiter` per-instance keys (`<base>#<instance id>`).
+const AI_RATELIMIT_INSTANCE_BASES: &[&str] = &[
+    "ai_ratelimit_limit",
+    "ai_ratelimit_window",
+    "ai_ratelimit_remaining",
+    "ai_ratelimit_usage",
+    "ai_ratelimit_backend_status",
+    "ai_ratelimit_reserved_tokens",
+];
+
+fn is_decimal_instance_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_identifier_segment(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Built-in per-instance key families with an exact grammar: a fixed prefix,
+/// one bounded identifier segment, and a fixed suffix. Nothing else beneath
+/// these prefixes is allowlisted.
+fn is_builtin_metadata_key_family(key: &str) -> bool {
+    if let Some(rest) = key.strip_prefix("grpc_web.instance.") {
+        return ["mode", "native_ct"].iter().any(|suffix| {
+            rest.strip_suffix(suffix)
+                .and_then(|id| id.strip_suffix('.'))
+                .is_some_and(is_identifier_segment)
+        });
+    }
+    if let Some(header) = key.strip_prefix("correlation_id.instance.") {
+        return is_identifier_segment(header);
+    }
+    if let Some(rest) = key.strip_prefix("ai_semantic_firewall.") {
+        let suffix = rest
+            .strip_prefix("request.")
+            .or_else(|| rest.strip_prefix("response."))
+            .unwrap_or(rest);
+        return SEMANTIC_FIREWALL_SUFFIXES.contains(&suffix);
+    }
+    if let Some(rest) = key.strip_prefix("ai_semantic_cache.") {
+        return rest.split_once('.').is_some_and(|(id, suffix)| {
+            is_decimal_instance_id(id)
+                && matches!(suffix, "cache_status" | "cache_match" | "cache_similarity")
+        });
+    }
+    if let Some(rest) = key.strip_prefix("ai_prompt_compressor.instances.") {
+        return rest.split_once('.').is_some_and(|(id, suffix)| {
+            is_decimal_instance_id(id)
+                && matches!(
+                    suffix,
+                    "original_tokens" | "compressed_tokens" | "tokens_saved" | "fields_compressed"
+                )
+        });
+    }
+    key.split_once('#').is_some_and(|(base, id)| {
+        AI_RATELIMIT_INSTANCE_BASES.contains(&base) && is_decimal_instance_id(id)
+    })
+}
+
+/// Built-in names that carry payloads rather than bounded observability
+/// values. Never emitted, whatever any allowlist says.
+const PAYLOAD_METADATA_KEYS: &[&str] = &["request_body", "response_body"];
+
+fn is_payload_metadata_key(key: &str) -> bool {
+    PAYLOAD_METADATA_KEYS
+        .iter()
+        .any(|payload| key.eq_ignore_ascii_case(payload))
+}
 
 /// Operator-supplied safe names parsed once from `FERRUM_LOG_SAFE_METADATA_KEYS`.
 static SAFE_METADATA_KEYS: OnceLock<Vec<String>> = OnceLock::new();
@@ -255,7 +664,7 @@ pub fn parse_safe_metadata_keys(resolved: Option<String>) -> ParsedSafeMetadataK
         if name.is_empty() {
             continue;
         }
-        if is_sensitive_metadata_key(name) {
+        if is_sensitive_metadata_key(name) || is_payload_metadata_key(name) {
             parsed.rejected.push(entry);
         } else {
             parsed.accepted.push(entry);
@@ -264,25 +673,11 @@ pub fn parse_safe_metadata_keys(resolved: Option<String>) -> ParsedSafeMetadataK
     parsed
 }
 
-/// Whether `key` is a built-in metadata name (namespace or flat key).
+/// Whether `key` is a reviewed built-in metadata name: an exact built-in key
+/// or a member of a fixed-grammar per-instance family. Payload keys never are.
 pub fn is_builtin_safe_metadata_name(key: &str) -> bool {
-    if BUILTIN_PAYLOAD_METADATA_KEYS
-        .iter()
-        .any(|payload| key.eq_ignore_ascii_case(payload))
-    {
-        return false;
-    }
-    BUILTIN_SAFE_METADATA_KEYS
-        .iter()
-        .any(|name| key.eq_ignore_ascii_case(name))
-        || BUILTIN_SAFE_METADATA_NAMESPACES.iter().any(|namespace| {
-            key.len() >= namespace.len()
-                && key.as_bytes()[..namespace.len()].eq_ignore_ascii_case(namespace.as_bytes())
-                && matches!(
-                    key.as_bytes().get(namespace.len()),
-                    None | Some(b'.' | b':' | b'_')
-                )
-        })
+    !is_payload_metadata_key(key)
+        && (BUILTIN_SAFE_METADATA_KEYS.contains(&key) || is_builtin_metadata_key_family(key))
 }
 
 /// Whether `key` matches an operator allowlist entry (exact or `prefix*`).
@@ -304,7 +699,9 @@ pub fn metadata_value_is_redacted_with(
     safe_entries: &[String],
     redact_extras: &[String],
 ) -> bool {
-    is_sensitive_metadata_key_with_extras(key, redact_extras)
+    // Payload keys first: no allowlist, built-in or operator, can admit them.
+    is_payload_metadata_key(key)
+        || is_sensitive_metadata_key_with_extras(key, redact_extras)
         || !(is_builtin_safe_metadata_name(key) || matches_safe_metadata_entries(key, safe_entries))
 }
 
@@ -314,7 +711,9 @@ pub fn metadata_value_is_redacted_with(
 /// uses this; name-shape checks for operator-chosen output names use
 /// [`is_sensitive_metadata_key`].
 pub fn metadata_value_is_redacted(key: &str) -> bool {
-    is_sensitive_metadata_key(key)
+    // Payload keys first: no allowlist, built-in or operator, can admit them.
+    is_payload_metadata_key(key)
+        || is_sensitive_metadata_key(key)
         || !(is_builtin_safe_metadata_name(key)
             || matches_safe_metadata_entries(key, operator_safe_metadata_keys()))
 }
@@ -480,6 +879,10 @@ const CREDENTIAL_CLASS_SEGMENTS: &[&str] = &[
     "otp",
     "totp",
     "hotp",
+    // Singular `token` as a whole segment: the token classifier's rule,
+    // repeated here so the lowercased retry also catches spellings whose
+    // alternating case shatters the segment (`ToKeN` -> `To`/`Ke`/`N`).
+    "token",
     "credential",
     "credentials",
     "cred",
@@ -1534,15 +1937,20 @@ mod tests {
             "camel-redis-secret".to_string(),
         );
         metadata.insert("trace_id".to_string(), "abc-123".to_string());
+        // A reviewed built-in dedup-adjacent key (exact allowlist), so the
+        // control stays visible while `_dedup_*` lifecycle keys are omitted.
         metadata.insert(
-            "request_dedup_key".to_string(),
+            "request_deduplication.replayed".to_string(),
             "visible-control".to_string(),
         );
 
         let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["trace_id"], "abc-123");
-        assert_eq!(parsed["request_dedup_key"], "visible-control");
+        assert_eq!(
+            parsed["request_deduplication.replayed"],
+            "visible-control"
+        );
         for key in [
             "_dedup_key",
             "_dedup_fingerprint",
@@ -2014,7 +2422,7 @@ mod tests {
     // ── fail-closed allowlist (issue #6619) ──────────────────────────────
 
     #[test]
-    fn builtin_namespaces_match_only_at_a_boundary() {
+    fn builtin_allowlist_is_exact_keys_and_fixed_grammar_families() {
         for key in [
             "mesh.source.workload",
             "grpc_web_mode",
@@ -2024,20 +2432,50 @@ mod tests {
             "trace_id",
             "namespace",
             "waf.action",
+            "grpc_web.instance.7.mode",
+            "correlation_id.instance.x-request-id",
+            "ai_semantic_firewall.request.rule_ids",
+            "ai_semantic_cache.12.cache_status",
+            "ai_prompt_compressor.instances.3.tokens_saved",
+            "ai_ratelimit_remaining#42",
         ] {
             assert!(is_builtin_safe_metadata_name(key), "{key}");
         }
+        // Unknown names beneath a built-in prefix are not allowlisted.
         for key in [
-            "meshy",
-            "requested",
+            "mesh.vault_blob",
+            "mesh.projectpinopaque",
+            "mcp.custom_blob",
+            "grpc_web.instance.7.secret_blob",
+            "ai_semantic_cache.12.cache_key",
+            "ai_semantic_cache.x.cache_status",
+            "ai_ratelimit_remaining#x",
+            "correlation_id.instance.a.b",
             "request_body",
-            "RESPONSE_BODY",
+            "response_body",
             "custom_field",
             "gpgpass_phrase",
             "key_private",
             "vault_blob",
         ] {
             assert!(!is_builtin_safe_metadata_name(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn payload_keys_are_never_emitted_whatever_the_allowlist() {
+        let none: Vec<String> = Vec::new();
+        let parsed = parse_safe_metadata_keys(Some(
+            "request_body, response_body, request*, response*, *".into(),
+        ));
+        assert_eq!(parsed.rejected, vec!["request_body", "response_body"]);
+        for key in ["request_body", "response_body", "REQUEST_BODY"] {
+            assert!(
+                metadata_value_is_redacted_with(key, &parsed.accepted, &none),
+                "{key}"
+            );
+            let exact = vec![key.to_ascii_lowercase()];
+            assert!(metadata_value_is_redacted_with(key, &exact, &none), "{key}");
         }
     }
 

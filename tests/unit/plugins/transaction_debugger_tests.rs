@@ -2423,6 +2423,23 @@ fn test_text_body_assignment_lines_fail_closed_unless_declared_safe() {
     );
 }
 
+/// Every delimiter must follow a declared name: a missing, empty, or quoted
+/// name, or one valid assignment mixed with an invalid one, drops the line.
+#[test]
+fn test_text_body_unparseable_or_quoted_names_drop_the_line() {
+    let plugin = text_capture_plugin(&["note"]);
+    let body = "(hsm_pin): 600114\n\"note\": 600115\n\"\": 600116\nnote=ok (hsm_pin): 600117\nnote=ok :600118\nnote==600119\nnote=kept-line\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in ["600114", "600115", "600116", "600117", "600118", "600119"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("note=kept-line"),
+        "{}",
+        text.rendered
+    );
+}
+
 /// A credential-shaped or unparseable name cannot be declared safe.
 #[test]
 fn test_safe_text_fields_reject_credential_and_unclean_names() {

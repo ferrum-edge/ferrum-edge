@@ -2092,7 +2092,7 @@ fn validate_custom_tags(
     for (name, env_var) in custom_env_tags {
         validate_env_var_name(&name, &env_var)?;
         // Environment variable names are case-sensitive.
-        if !safe_tag_sources.iter().any(|safe| *safe == env_var) {
+        if !safe_tag_sources.contains(&env_var) {
             redacted_env_tags.insert(name.clone());
         }
         normalized_env_tags.insert(name, env_var);

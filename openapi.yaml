@@ -22217,9 +22217,9 @@ components:
           description: >-
             Field names (compared case-insensitively) whose `name=value` /
             `name: value` lines may be rendered in captured text/plain bodies.
-            Every other assignment line, including one whose field name does
-            not parse as plain ASCII letters, digits, `_`, `-` or `.`, is
-            dropped. Entries that the credential classifier or the sensitive
+            A line containing `=` or `:` is kept only when every delimiter
+            follows a declared name; a line with a missing, empty, quoted,
+            undeclared, or non-ASCII-identifier name is dropped. Entries that the credential classifier or the sensitive
             body-field rules match are rejected: a credential-shaped name
             cannot be declared safe. Requires log_request_body or
             log_response_body true when the array is nonempty.
@@ -26956,8 +26956,8 @@ components:
             sensitive destination names are rejected; runtime values over 1024
             bytes are omitted. Fail closed: a source header not declared in
             `safe_tag_sources` is copied as `[REDACTED]`, never verbatim. This
-            map, `custom_tags`, and `custom_env_tags` may contain at most 32
-            distinct tag names combined.
+            map, `custom_tags`, and `custom_env_tags` may contain at most
+            32 distinct tag names combined.
         custom_env_tags:
           type: object
           maxProperties: 32
@@ -26986,8 +26986,8 @@ components:
             transaction and trace metadata; any other variable is emitted as
             `[REDACTED]` (fail closed). Diagnostics never include resolved
             values or rejected credential-bearing variable names. This map,
-            `custom_tags`, and `custom_header_tags` may contain at most 32
-            distinct tag names combined.
+            `custom_tags`, and `custom_header_tags` may contain at most
+            32 distinct tag names combined.
         safe_tag_sources:
           type: array
           maxItems: 64

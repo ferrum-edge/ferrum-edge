@@ -285,20 +285,22 @@ written as `[REDACTED]`; the key itself stays visible.
 
 The allowlist is:
 
-- the gateway's own metadata namespaces: a key that equals, or continues with
-  `.`, `:` or `_`, a built-in namespace such as `mesh`, `mesh_authz`,
-  `workload_metrics`, `grpc_web`, `grpc`, `ai`, `mcp`, `a2a`, `sse`,
-  `compression`, `ferrum`, `hbone`, `request`, `response`, `trace`, `span_id`,
-  `route`, `cache`, `auth` and the other built-in plugin names (the complete
-  list is `BUILTIN_SAFE_METADATA_NAMESPACES` in
-  `src/plugins/utils/metadata_redaction.rs`). `request_body` and
-  `response_body` are payloads and are never emitted;
+- the gateway's own reviewed metadata keys: exact names such as
+  `mesh.source.workload`, `grpc_web_mode`, `request_id` or `ai_total_tokens`
+  (the complete list is `BUILTIN_SAFE_METADATA_KEYS` in
+  `src/plugins/utils/metadata_redaction.rs`), plus a few per-instance
+  families with a fixed grammar (`grpc_web.instance.<id>.mode`,
+  `ai_semantic_cache.<id>.cache_status`, `ai_ratelimit_remaining#<id>`, …).
+  Whole namespaces are never allowlisted: a name a plugin invents under a
+  built-in prefix (`mesh.vault_blob`) stays redacted;
 - the operator allowlist `FERRUM_LOG_SAFE_METADATA_KEYS`: comma-separated exact
   names (case-insensitive) or prefixes ending in `*` (`tenant.*`). Add the
   names a custom plugin writes, `workload_metrics` custom tag names, and any
   operator-configured metadata key (for example a custom `model_key`) here to
   log their values.
 
+`request_body` and `response_body` carry payloads and are never emitted,
+whatever any allowlist says; an operator entry naming them is ignored.
 The deny rules always win. An allowlist entry they match (for example
 `session_id` or `key_private`) is ignored and logged as a startup warning, so a
 credential-shaped name cannot be allowlisted. Because unknown names are

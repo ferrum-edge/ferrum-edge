@@ -337,12 +337,14 @@ pub struct TransactionDebugger {
     schema: Option<Arc<SummarySchema>>,
 }
 
-/// The field name in front of every `=` / `:` on a text line, allowing
-/// whitespace around the delimiter (`hsm_pin = 1`, `totp_seed\t: 2`) and
-/// several assignments per line (`auth_method=jwt_auth hsm_pin=3`).
-fn assignment_field_names(line: &str) -> impl Iterator<Item = &str> {
+/// Whether every `=` / `:` on a text line follows a field name the operator
+/// declared safe (issue #6619). Fails closed per delimiter: a missing, empty,
+/// quoted, or unparseable name (`(hsm_pin): 1`, `"note": 1`, `hsm_piné=1`)
+/// makes the whole line unsafe, as does any undeclared name. Whitespace around
+/// the delimiter is allowed (`note = 1`).
+fn assignment_names_all_safe(line: &str, is_safe: impl Fn(&str) -> bool) -> bool {
     line.match_indices(['=', ':'])
-        .filter_map(move |(offset, _)| assignment_field_name(line, offset))
+        .all(|(offset, _)| assignment_field_name(line, offset).is_some_and(&is_safe))
 }
 
 /// A field name the text parser can judge: non-empty ASCII letters, digits,
@@ -354,27 +356,15 @@ fn is_clean_text_field_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
-/// The field name assigned at `offset` (an `=` / `:` in `line`).
+/// The unquoted field name assigned at `offset` (an `=` / `:` in `line`):
+/// the whole token back to the previous whitespace or assignment / prose
+/// separator, Unicode and punctuation included. `None` when the name is empty
+/// or quoted; quoted names are never declared safe, so their lines drop.
 fn assignment_field_name(line: &str, offset: usize) -> Option<&str> {
     let before = line[..offset].trim_end();
-    // A quoted field name is taken whole, spaces and punctuation included
-    // (`"totp seed": …`, `"hsm_pin[]": …`, `'a \'b\'' = …`).
-    if let Some(quote) = before.chars().last().filter(|ch| matches!(ch, '"' | '\'')) {
-        let inner = &before[..before.len() - quote.len_utf8()];
-        let mut open = None;
-        for (index, ch) in inner.char_indices().rev() {
-            if ch == quote && !inner[..index].ends_with('\\') {
-                open = Some(index + ch.len_utf8());
-                break;
-            }
-        }
-        let name = &inner[open.unwrap_or(0)..];
-        return (!name.is_empty()).then_some(name);
+    if before.ends_with(['"', '\'']) {
+        return None;
     }
-    // An unquoted name is the whole token back to the previous
-    // assignment / prose separator, Unicode and punctuation included
-    // (`hsm_piné`, `hsm_pin/opaque`), so such a name is judged unclean and
-    // its line is dropped rather than cut down to a benign-looking tail.
     // `char_indices` keeps the start on a character boundary.
     let start = before
         .char_indices()
@@ -872,12 +862,12 @@ impl TransactionDebugger {
             // classifier is for key names and would drop prose such as
             // `auth_method=jwt_auth` (issue #6619).
             || is_sensitive_name_by_listed_rules(&lowered)
-            // Fail closed: a `name=value` / `name: value` line is rendered
-            // only when every field name parses cleanly and is declared in
-            // `safe_text_fields` (issue #6619). Unknown, unparseable, or
-            // credential-shaped names (`hsm_piné=…`, `key_private=…`) drop
-            // the line.
-            || assignment_field_names(line).any(|name| !self.is_safe_text_field(name))
+            // Fail closed: a line with any `=` / `:` is rendered only when
+            // every delimiter follows a clean field name declared in
+            // `safe_text_fields` (issue #6619). Missing, quoted, unknown,
+            // unparseable, or credential-shaped names (`(hsm_pin): …`,
+            // `"note": …`, `hsm_piné=…`, `key_private=…`) drop the line.
+            || !assignment_names_all_safe(line, |name| self.is_safe_text_field(name))
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
             || lowered.contains("eyj")
