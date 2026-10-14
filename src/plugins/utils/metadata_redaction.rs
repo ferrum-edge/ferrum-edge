@@ -336,6 +336,12 @@ const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "api",
     "mfa",
     "integrity",
+    "aes",
+    "rsa",
+    "ecdsa",
+    "ed25519",
+    "x25519",
+    "chacha",
     "private",
     "access",
     "secret",
@@ -425,22 +431,22 @@ fn is_token_count_shape(rest: &str) -> bool {
 /// one segment (`vendortokenvalue`, `token1`, `accesstokenhash`). A plural
 /// `tokens` names a usage count and stays visible (`ai_total_tokens`).
 fn has_token_compound(lower: &str) -> bool {
-    // A segment that STARTS with singular `token` and continues fails closed
-    // for unknown representations (`tokenopaque`), except plural counters
-    // (`tokens…`) and the tokenizer vocabulary.
-    if let Some(rest) = lower.strip_prefix("token")
-        && !rest.is_empty()
-        && !is_token_count_shape(rest)
-        && !rest.starts_with("iz")
-    {
-        return true;
-    }
+    // Any singular `token` that continues inside the segment fails closed
+    // for unknown representations (`tokenopaque`, `vendortokensigned`),
+    // except complete plural counter expressions (`tokens`, `tokensused`)
+    // and the tokenizer vocabulary.
     lower.match_indices("token").any(|(offset, _)| {
         let rest = &lower[offset + "token".len()..];
-        // Plural `tokens` fails the suffix policy on its own (`s` is no
-        // trailer), while `tokenstring` / `tokenseed` still match.
-        !rest.is_empty() && is_credential_suffix(rest)
+        !rest.is_empty() && !is_token_count_shape(rest) && !rest.starts_with("iz")
     })
+}
+
+/// MFA credential material named after an `mfa` qualifier, possibly through
+/// descriptors (`mfa_recovery_code`, `mfabackupcode`, `mfa_seed`).
+fn names_mfa_material(text: &str) -> bool {
+    ["code", "seed", "secret", "key", "token", "pin"]
+        .iter()
+        .any(|word| text.contains(word))
 }
 
 /// Shared suffix policy for both compound classifiers: optional digits
@@ -719,7 +725,7 @@ fn is_credential_class_name(key: &str) -> bool {
     let mut sensitive = false;
     let mut in_key_context = false;
     let mut previous_is_pass = false;
-    let mut previous_is_mfa = false;
+    let mut in_mfa_context = false;
     for_each_metadata_key_segment(key, |segment| {
         if sensitive {
             return;
@@ -748,12 +754,12 @@ fn is_credential_class_name(key: &str) -> bool {
                     .iter()
                     .any(|word| lower.starts_with(word)))
             // `mfa` + `code` / `seed` / … split across segments (`mfa_seed`).
-            || (previous_is_mfa
-                && ["code", "seed", "secret", "key", "token", "pin"]
-                    .iter()
-                    .any(|word| lower.starts_with(word)));
+            || (in_mfa_context && names_mfa_material(lower))
+            || lower
+                .find("mfa")
+                .is_some_and(|offset| names_mfa_material(&lower[offset + "mfa".len()..]));
         previous_is_pass = lower == "pass";
-        previous_is_mfa = lower == "mfa";
+        in_mfa_context |= lower.contains("mfa");
         // Once a qualifier appears, the context stays open for the rest of
         // the key: a later `key` segment is key material.
         in_key_context |= opens_key_context(lower);
