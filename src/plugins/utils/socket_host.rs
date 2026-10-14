@@ -96,6 +96,61 @@ impl SocketHost {
     }
 }
 
+/// `true` when a cleartext endpoint URL is written with a canonical loopback IP
+/// literal as its host: a dotted-quad `127.d.d.d` or `[::1]`, optionally with a
+/// port. Expanded or shortened spellings (`127.1`, `[0:0:0:0:0:0:0:1]`) and
+/// every hostname, `localhost` included, do not qualify.
+///
+/// Plugins that send a credential to a configured endpoint admit cleartext
+/// `http://` without an explicit opt-in only to such a host (a local sidecar).
+/// Only an address literal proves the request stays on this machine — DNS
+/// overrides and the resolver decide where a name connects. The check reads
+/// the configured spelling so it matches the published OpenAPI pattern
+/// exactly; the parsed host must also be loopback.
+pub fn is_loopback_ip_literal_endpoint(endpoint: &str, parsed_host: Option<Host<&str>>) -> bool {
+    let parsed_is_loopback = match parsed_host {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if !parsed_is_loopback {
+        return false;
+    }
+    let Some(rest) = endpoint
+        .get(.."http://".len())
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .map(|_| &endpoint["http://".len()..])
+    else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = if let Some(after) = authority.strip_prefix("[::1]") {
+        if !after.is_empty() && !after.starts_with(':') {
+            return false;
+        }
+        return after
+            .strip_prefix(':')
+            .is_none_or(|port| port.bytes().all(|byte| byte.is_ascii_digit()));
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => {
+                if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return false;
+                }
+                host
+            }
+            None => authority,
+        }
+    };
+    let mut octets = host.split('.');
+    octets.next() == Some("127")
+        && octets.clone().count() == 3
+        && octets.all(|octet| {
+            (1..=3).contains(&octet.len()) && octet.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 pub fn socket_addr_lookup_input(host: &str, port: u16) -> String {
     if host.parse::<Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")

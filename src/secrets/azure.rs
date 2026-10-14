@@ -18,13 +18,39 @@
 //! path version and `?version=` are present they must match; conflicts fail
 //! closed. The configured source identity (`CertSource` identifier + options)
 //! is never rewritten by fetch normalization.
+//!
+//! # TLS
+//!
+//! Vault URLs must use `https://`. The 1.x Azure SDK refuses to attach a
+//! bearer token to a non-TLS request and has no loopback exception, so a
+//! plain-`http://` reference is rejected here, at parse time, with a clear
+//! error instead of failing inside the SDK pipeline. To target an emulator,
+//! sidecar, or private endpoint whose certificate is not publicly trusted,
+//! point `FERRUM_TLS_CA_BUNDLE_PATH` at a PEM CA bundle: those roots are
+//! trusted for Key Vault data-plane calls **in addition to** the platform
+//! roots (the same additive rule the Vault backend uses), so public Key Vault
+//! endpoints keep working with the bundle set.
 
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use azure_core::credentials::{AccessToken, TokenCredential, TokenRequestOptions};
-use azure_security_keyvault_secrets::ResourceExt;
+use azure_core::http::{ClientOptions, Transport};
 use azure_security_keyvault_secrets::models::SecretClientGetSecretOptions;
+use azure_security_keyvault_secrets::{ResourceExt, SecretClientOptions};
+
+/// Environment variable naming an extra PEM CA bundle to trust for Key Vault
+/// data-plane TLS (shared with the Vault backend and the gateway's outbound
+/// TLS configuration).
+const CA_BUNDLE_PATH_ENV: &str = "FERRUM_TLS_CA_BUNDLE_PATH";
+
+/// Mirrors the Azure SDK's default `reqwest` transport timeouts
+/// (`typespec_client_core` 1.x) so a custom-CA transport behaves like the
+/// default one. The registry's `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` envelope
+/// still bounds every fetch as a whole.
+const KEYVAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const KEYVAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Check if the `{key}_AZURE` env var is set and non-empty.
 /// Returns the Azure Key Vault secret URL
@@ -47,12 +73,20 @@ pub struct AzureSecret {
 /// vault URLs, avoiding repeated OAuth token acquisition.
 pub struct AzureCredentials {
     credential: Arc<dyn TokenCredential>,
+    /// Key Vault transport. `None` uses the SDK's default `reqwest` client;
+    /// `Some` carries the extra `FERRUM_TLS_CA_BUNDLE_PATH` roots. Built once
+    /// per credential set so batch resolution shares one connection pool.
+    transport: Option<Transport>,
 }
 
 impl AzureCredentials {
     /// Create Azure credentials from standard env vars.
     ///
-    pub fn new() -> Result<Self, String> {
+    /// Also loads `FERRUM_TLS_CA_BUNDLE_PATH` (when set) for the Key Vault
+    /// transport; an unreadable or invalid bundle is an error rather than a
+    /// silent fallback to platform roots only. The bundle is read on a detached
+    /// thread, so callers bound construction with the secret fetch timeout.
+    pub async fn new() -> Result<Self, String> {
         let tenant_id = env::var("AZURE_TENANT_ID").map_err(|_| {
             "AZURE_TENANT_ID must be set to resolve secrets from Azure Key Vault".to_string()
         })?;
@@ -71,7 +105,10 @@ impl AzureCredentials {
         )
         .map_err(|e| format!("Failed to create Azure credentials: {}", e))?;
 
-        Ok(Self { credential })
+        Ok(Self {
+            credential,
+            transport: keyvault_transport().await?,
+        })
     }
 
     /// Build credentials from a pre-acquired bearer token instead of acquiring
@@ -83,22 +120,27 @@ impl AzureCredentials {
     /// needs to be made in-process. The credential performs no Entra ID round
     /// trip of its own; it simply replays the supplied token when the Key Vault
     /// pipeline requests one (including after an authentication challenge).
-    pub fn from_static_token(token: impl Into<String>) -> Self {
-        Self {
-            credential: Arc::new(StaticTokenCredential::new(token)),
-        }
+    ///
+    /// Like [`AzureCredentials::new`], this loads `FERRUM_TLS_CA_BUNDLE_PATH`
+    /// for the Key Vault transport and fails if the bundle is unusable.
+    pub async fn from_static_token(token: impl Into<String>) -> Result<Self, String> {
+        let credential: Arc<dyn TokenCredential> = Arc::new(StaticTokenCredential::new(token));
+        Ok(Self {
+            credential,
+            transport: keyvault_transport().await?,
+        })
     }
 
     /// Fetch a secret value from Azure Key Vault using these credentials.
     pub async fn fetch_secret(&self, reference: &str, key: &str) -> Result<AzureSecret, String> {
-        fetch_with_credential(&self.credential, reference, key).await
+        fetch_with_credential(&self.credential, self.transport.as_ref(), reference, key).await
     }
 }
 
 /// Fetch a single secret from Azure Key Vault (creates new credentials).
 /// For batch resolution, use `AzureCredentials`.
 pub async fn fetch_secret(reference: &str, key: &str) -> Result<AzureSecret, String> {
-    let creds = AzureCredentials::new()?;
+    let creds = AzureCredentials::new().await?;
     creds.fetch_secret(reference, key).await
 }
 
@@ -125,14 +167,158 @@ impl KeyVaultReference {
     }
 }
 
+/// Build the Key Vault transport from `FERRUM_TLS_CA_BUNDLE_PATH`.
+///
+/// Unset or empty: `Ok(None)`, so the SDK builds its default `reqwest` client.
+/// Set: a `reqwest` client with the SDK's default timeouts and redirect policy
+/// whose trust store is the platform roots **plus** the bundle's roots. The
+/// client is `https_only`, matching the vault-URL rule enforced at parse time.
+/// Errors name the variable and the failure class, never the path or bytes.
+async fn keyvault_transport() -> Result<Option<Transport>, String> {
+    let Some(path) = env::var_os(CA_BUNDLE_PATH_ENV).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let pem = read_ca_bundle_detached(path).await?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
+        format!("{CA_BUNDLE_PATH_ENV} is not a valid PEM CA bundle (Azure Key Vault TLS)")
+    })?;
+    if certs.is_empty() {
+        return Err(format!(
+            "{CA_BUNDLE_PATH_ENV} contains no certificates (Azure Key Vault TLS)"
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(KEYVAULT_CONNECT_TIMEOUT)
+        .read_timeout(KEYVAULT_READ_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .tls_certs_merge(certs)
+        .build()
+        .map_err(|_| {
+            format!("Failed to build the Azure Key Vault TLS client from {CA_BUNDLE_PATH_ENV}")
+        })?;
+    Ok(Some(Transport::new(Arc::new(client))))
+}
+
+/// Upper bound on the CA bundle, matching the default TLS material ceiling
+/// (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`).
+const CA_BUNDLE_MAX_BYTES: usize = crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES;
+
+/// Process-wide admission gate for CA bundle reader threads: at most one
+/// native reader exists at a time.
+static CA_READ_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+
+/// Test seam: hold the CA reader admission permit, as a stalled reader thread
+/// would. Not part of the supported API.
+#[doc(hidden)]
+pub async fn hold_ca_bundle_reader_permit_for_test() -> tokio::sync::OwnedSemaphorePermit {
+    CA_READ_PERMITS
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("the CA reader semaphore is never closed")
+}
+
+/// Read the CA bundle on a detached OS thread.
+///
+/// The open is non-blocking and the opened descriptor must be a regular file,
+/// so a FIFO, socket, or device fails at once instead of blocking. The read is
+/// capped at [`CA_BUNDLE_MAX_BYTES`]. A stalled mount can still hold the
+/// detached thread, but not a Tokio worker; the registry's fetch timeout
+/// bounds the caller (the same model as `credential_file`'s detached reader).
+///
+/// Admission is gated by [`CA_READ_PERMITS`]. The permit is acquired before
+/// the thread is spawned and moved into it, so a caller that times out and
+/// drops this future does not release capacity: the permit is returned only
+/// when the native read itself finishes. Repeated refreshes against a stalled
+/// filesystem therefore wait for admission (and time out) instead of piling up
+/// blocked threads and descriptors.
+async fn read_ca_bundle_detached(path: std::ffi::OsString) -> Result<Vec<u8>, String> {
+    let permit = CA_READ_PERMITS.clone().acquire_owned().await.map_err(|_| {
+        format!("The {CA_BUNDLE_PATH_ENV} reader for Azure Key Vault TLS is closed")
+    })?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ferrum-azure-ca-read".to_string())
+        .spawn(move || {
+            // Held until the native open/read returns, even if the caller is gone.
+            let _permit = permit;
+            let _ = tx.send(read_ca_bundle(std::path::Path::new(&path)));
+        })
+        .map_err(|_| {
+            format!("Failed to start the {CA_BUNDLE_PATH_ENV} reader for Azure Key Vault TLS")
+        })?;
+    rx.await.map_err(|_| {
+        format!("The {CA_BUNDLE_PATH_ENV} reader for Azure Key Vault TLS exited unexpectedly")
+    })?
+}
+
+fn read_ca_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let io_error = |e: std::io::Error| {
+        format!(
+            "Failed to read {CA_BUNDLE_PATH_ENV} for Azure Key Vault TLS: {}",
+            e.kind()
+        )
+    };
+    let not_regular =
+        || format!("{CA_BUNDLE_PATH_ENV} must name a regular file (Azure Key Vault TLS)");
+    let oversized = || {
+        format!(
+            "{CA_BUNDLE_PATH_ENV} exceeds the {CA_BUNDLE_MAX_BYTES}-byte limit (Azure Key Vault TLS)"
+        )
+    };
+
+    // Fast-reject a non-regular, non-symlink path before `open(2)`; a symlink
+    // (e.g. a projected Kubernetes secret) is typed after open instead.
+    let link_meta = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if !link_meta.file_type().is_symlink() && !link_meta.is_file() {
+        return Err(not_regular());
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(io_error)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).map_err(io_error)?;
+
+    let meta = file.metadata().map_err(io_error)?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    if meta.len() > CA_BUNDLE_MAX_BYTES as u64 {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    file.take(CA_BUNDLE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() > CA_BUNDLE_MAX_BYTES {
+        return Err(oversized());
+    }
+    Ok(bytes)
+}
+
 /// Parse a Key Vault secret reference URL into vault URL, secret name, and
 /// optional version.
 ///
+/// The reference must use `https://`: the Azure SDK only sends the Entra
+/// bearer token over TLS, so a plain-`http://` vault URL is refused here with
+/// an explicit error (fail closed, before any client is built).
+///
 /// The returned `vault_url` preserves the scheme, host **and port** of the
-/// reference. Dropping the port (the previous behavior) silently rewrote a URL
-/// like `http://127.0.0.1:12345/secrets/admin-jwt` to `http://127.0.0.1`, which
-/// breaks any vault served on a non-default port — including local fakes,
-/// emulators, and sidecar/proxy front ends.
+/// reference. Dropping the port silently rewrote a URL like
+/// `https://127.0.0.1:12345/secrets/admin-jwt` to `https://127.0.0.1`, which
+/// breaks any vault served on a non-default port — including local emulators
+/// and sidecar/proxy front ends.
 ///
 /// Path grammar:
 /// - `/secrets/<name>` — latest version (`version = None`)
@@ -154,6 +340,16 @@ pub fn parse_keyvault_reference_parts(
     let url = url::Url::parse(reference)
         .map_err(|e| format!("Invalid Azure Key Vault URL for {}: {}", key, e))?;
 
+    if url.scheme() != "https" {
+        // Name the scheme class only; the URL itself is the source reference.
+        return Err(format!(
+            "Invalid Azure Key Vault URL for {}: the vault URL must use https:// \
+             (plain http and other schemes are refused; the Azure SDK sends the \
+             bearer token only over TLS)",
+            key
+        ));
+    }
+
     let host = url
         .host_str()
         .ok_or_else(|| format!("Azure Key Vault URL for {} has no host", key))?;
@@ -163,7 +359,7 @@ pub fn parse_keyvault_reference_parts(
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     };
-    let vault_url = format!("{}://{}", url.scheme(), authority);
+    let vault_url = format!("https://{authority}");
 
     // Strip one leading slash. A single trailing slash on an otherwise valid
     // unversioned/versioned path is ignored so `/secrets/name/` keeps working
@@ -264,15 +460,23 @@ pub fn apply_tls_version_option(
 /// Shared fetch logic used by both single and batch paths.
 async fn fetch_with_credential(
     credential: &Arc<dyn TokenCredential>,
+    transport: Option<&Transport>,
     reference: &str,
     key: &str,
 ) -> Result<AzureSecret, String> {
     let parsed = parse_keyvault_reference_parts(reference, key)?;
 
+    let options = SecretClientOptions {
+        client_options: ClientOptions {
+            transport: transport.cloned(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let client = azure_security_keyvault_secrets::SecretClient::new(
         &parsed.vault_url,
         credential.clone(),
-        None,
+        Some(options),
     )
     .map_err(|e| format!("Failed to create Azure Key Vault client for {}: {}", key, e))?;
 

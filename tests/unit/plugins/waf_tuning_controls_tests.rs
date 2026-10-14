@@ -722,6 +722,33 @@ async fn excluded_query_parameter_is_skipped_by_that_rule_only() {
 }
 
 #[tokio::test]
+async fn excluded_parameters_cannot_carry_semicolon_hidden_payloads() {
+    // Issue #6579: a `;`-splitting backend reads `q` and `file` below as
+    // parameters of their own, so an excluded carrier must not hide them.
+    let xss = recommended_with_overrides(json!({
+        "FE-XSS-001": { "exclude": { "query_params": ["html"] } }
+    }));
+    let (result, request) = query(&xss, "html=ok;q=%3Cscript%3Ealert(1)").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
+    // `%3B` is content: the excluded `html` value stays excluded.
+    let (result, request) = query(&xss, "html=ok%3Bq%3D%3Cscript%3Ealert(1)").await;
+    assert!(
+        !listed(&request, "waf.rule_hits", "FE-XSS-001"),
+        "{:?} {:?}",
+        result,
+        meta(&request, "waf.rule_hits")
+    );
+
+    let traversal = recommended_with_overrides(json!({
+        "FE-PATHTRAV-001": { "exclude": { "query_params": ["relpath"] } }
+    }));
+    let (result, request) = query(&traversal, "relpath=../assets;file=../../etc/shadow").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-PATHTRAV-001"));
+}
+
+#[tokio::test]
 async fn whole_url_rules_recheck_the_url_without_excluded_pairs() {
     // FE-PATHTRAV-001 scans the whole URL, which cannot attribute a match to
     // one pair; with an exclusion it re-runs over the URL minus that pair.
@@ -762,6 +789,65 @@ async fn parameter_pollution_ignores_an_excluded_repeated_parameter() {
     );
 
     let (result, request) = query(&plugin, "ids=1&ids=2&role=user&role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
+async fn hpp_exclusions_apply_under_the_semicolon_separator_convention() {
+    // Issue #6579: a `;`-splitting backend reads `x=;tags=2` as a second `tags`.
+    // An excluded name may still repeat that way, while a conflicting
+    // non-excluded name smuggled behind `;` is still parameter pollution.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": { "exclude": { "query_params": ["tags"] } }
+    }));
+    let (result, request) = query(&plugin, "tags=1&x=;tags=2").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    let (result, request) = query(&plugin, "tags=1&role=user&x=;role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
+async fn hpp_false_positive_filters_are_judged_per_separator_convention() {
+    // Issue #6579: the `&`-only view of this query, with `tags` excluded, is
+    // exactly the permitted `role=read&role=write`. A `;`-splitting backend
+    // also receives `role=admin`, and that view is not covered by the filter.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": {
+            "exclude": { "query_params": ["tags"] },
+            "fp_filters": ["^role=read&role=write$"]
+        }
+    }));
+    let (result, request) = query(&plugin, "role=read&role=write").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+
+    let (result, request) = query(&plugin, "role=read&role=write&tags=x;role=admin").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
+}
+
+#[tokio::test]
+async fn hpp_filters_see_exactly_the_pairs_conflict_detection_judged() {
+    // The `&` reading has conflicting `id` values; the filter must judge that
+    // reading's retained pairs, not a rebuild that resurrects `;safe=1` from
+    // the excluded `ignore` pair.
+    let plugin = recommended_with_overrides(json!({
+        "FE-HPP-001": {
+            "exclude": { "query_params": ["ignore"] },
+            "fp_filters": ["^id=1;v=x&id=1&safe=1$"]
+        }
+    }));
+    let (result, request) = query(&plugin, "id=1;v=x&id=1&ignore=;safe=1").await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(listed(&request, "waf.rule_hits", "FE-HPP-001"));
 }

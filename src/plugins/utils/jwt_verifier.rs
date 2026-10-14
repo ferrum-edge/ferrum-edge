@@ -52,6 +52,31 @@ pub async fn verify_jwt_with_jwks(
         .ok()
         .map(|td| td.claims)
         .filter(issuer_claim_is_single_string)
+        .filter(|claims| audience_claim_is_acceptable(claims, !params.audiences.is_empty()))
+}
+
+/// Re-check the registered `aud` claim at Ferrum's verified-claims boundary.
+///
+/// `jsonwebtoken` rejects a parsed `aud` string or string array that does not
+/// match (or, with no audiences configured, any parsed `aud`), but it treats a
+/// malformed value — `null`, a number, an object, or an array with non-string
+/// members — as absent or unparsed and accepts the token. RFC 7519 §4.1.3
+/// defines `aud` as a `StringOrURI` or an array of them, so:
+///
+/// - an absent `aud` is acceptable (presence is enforced through
+///   `required_spec_claims` whenever audiences are configured);
+/// - with no audiences configured, any present `aud` (whatever its shape) is
+///   refused, because no acceptable audience exists;
+/// - with audiences configured, only a string or a non-empty array of strings
+///   is acceptable (matching is still `jsonwebtoken`'s job).
+pub fn audience_claim_is_acceptable(claims: &Value, audiences_configured: bool) -> bool {
+    match claims.get("aud") {
+        None => true,
+        Some(_) if !audiences_configured => false,
+        Some(Value::String(_)) => true,
+        Some(Value::Array(items)) => !items.is_empty() && items.iter().all(Value::is_string),
+        Some(_) => false,
+    }
 }
 
 /// Re-check the registered `iss` claim's shape at Ferrum's verified-claims

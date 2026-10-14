@@ -189,7 +189,11 @@ fn make_key_with_prices(
         ProtocolFamily::Stream => "stream",
     };
     format!(
-        "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        "{}.{}.{}.{}|{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        consumer.len(),
+        scope.namespace.len(),
+        proxy_id.len(),
+        scope.currency.len(),
         consumer,
         scope.namespace,
         proxy_id,
@@ -835,6 +839,42 @@ async fn test_global_plugin_qualifies_same_proxy_id_by_matched_namespace() {
 }
 
 // --- Registry tests ---
+
+/// Text dimensions that contain `|` must not merge into one registry entry.
+/// Consumer identities and currency labels may contain `|`, so without length
+/// prefixes these two admitted inputs concatenate to the same key bytes.
+#[test]
+fn test_registry_keys_do_not_collide_across_pipe_bearing_names() {
+    let registry = ChargebackRegistry::new();
+    let cases = [
+        ("a|ferrum|proxy-a|200|http|b", "c"),
+        ("a", "b|ferrum|proxy-a|200|http|c"),
+    ];
+    for (consumer, currency) in cases {
+        registry.record_http(
+            &scope_for(currency, "ferrum"),
+            consumer,
+            "proxy-a",
+            "My API",
+            200,
+            0.00001,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
+    assert_eq!(registry.entries.len(), 2);
+    for (consumer, currency) in cases {
+        let entry = registry
+            .entries
+            .iter()
+            .find(|entry| &*entry.consumer == consumer)
+            .expect("each consumer keeps its own entry");
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(&*entry.currency, currency);
+    }
+}
 
 #[test]
 fn test_registry_records_charge() {
