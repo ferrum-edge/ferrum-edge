@@ -220,6 +220,8 @@ jobs:
 
       - name: Checkout Ferrum Edge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -311,6 +313,8 @@ jobs:
       - name: Checkout validator
         if: steps.summarize.outputs.validate == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - name: Download emitted evidence
         if: steps.summarize.outputs.validate == 'true'
