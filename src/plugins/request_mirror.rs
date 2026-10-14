@@ -993,12 +993,15 @@ fn classify_mirror_query_name(
             };
             // The class rule runs once, on the fully decoded layer (see
             // `is_mirror_sensitive_query_name_staged`).
+            // Route credential names are compared at every decode layer: an
+            // auth plugin may match a name that still carries an escape
+            // (`proof%31`) after the single decode the request parser applies.
             if is_mirror_sensitive_query_name_staged(lower.as_ref(), operator_patterns)
+                || route_credentials
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(lower.as_ref()))
                 || (!name_has_valid_percent_escape(current.as_ref())
-                    && (name_has_credential_class(lower.as_ref())
-                        || route_credentials
-                            .iter()
-                            .any(|name| name.eq_ignore_ascii_case(lower.as_ref()))))
+                    && name_has_credential_class(lower.as_ref()))
             {
                 sensitive = true;
             }

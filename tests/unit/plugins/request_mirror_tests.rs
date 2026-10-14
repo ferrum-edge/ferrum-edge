@@ -6950,4 +6950,17 @@ async fn route_credential_locations_are_withheld_from_the_mirror() {
         "{request_line}"
     );
     assert_eq!(query_ctx.raw_query_string(), Some(RAW));
+
+    // A configured name that keeps a literal escape after one decode.
+    let mut escaped_ctx = make_ctx_with_proxy();
+    escaped_ctx.set_raw_query_string("proof%2531=live-api-key&x=1".to_string());
+    escaped_ctx.metadata.insert(
+        "auth.query_credential_param.proof%31".to_string(),
+        "true".to_string(),
+    );
+    let escaped_line = capture_mirror_request_line(&mut escaped_ctx).await;
+    assert!(
+        escaped_line.contains("?x=1 ") && !escaped_line.contains("live-api-key"),
+        "{escaped_line}"
+    );
 }
