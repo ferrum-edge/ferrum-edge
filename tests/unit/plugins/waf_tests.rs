@@ -346,6 +346,44 @@ async fn consumer_scoped_request_rule_uses_authenticated_identity() {
 }
 
 #[tokio::test]
+async fn equals_rule_sees_the_first_semicolon_sub_pair() {
+    // Issue #6579: a `;`-splitting backend receives `role=admin` from
+    // `role=admin;note=ok`, so an exact-value rule must see it too.
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-ROLE-ADMIN",
+            "name": "exact admin role",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "equals",
+            "pattern": "admin",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    for query in ["role=admin", "role=admin;note=ok"] {
+        let mut request = ctx("GET", "/api");
+        request.set_raw_query_string(query.into());
+        assert!(
+            matches!(
+                plugin.authorize(&mut request).await,
+                PluginResult::Reject { .. }
+            ),
+            "{query}"
+        );
+    }
+    // `%3B` is content: the value is `admin;note=ok`, not `admin`.
+    let mut encoded = ctx("GET", "/api");
+    encoded.set_raw_query_string("role=admin%3Bnote%3Dok".into());
+    assert!(matches!(
+        plugin.authorize(&mut encoded).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex() {
     let exact_plugin = waf(json!({
         "include_default_rules": false,
@@ -5465,6 +5503,31 @@ async fn hpp_rule_blocks_plus_and_percent_space_key_aliases() {
 
     let mut request = ctx("GET", "/search");
     request.set_raw_query_string("tenant+id=victim&tenant%20id=admin".into());
+    assert!(matches!(
+        plugin.authorize(&mut request).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        request
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-HPP-001")
+    );
+}
+
+#[tokio::test]
+async fn hpp_rule_blocks_a_conflicting_duplicate_smuggled_behind_a_semicolon() {
+    // Issue #6579: `tenant` occurs once under `&`-only parsing, twice with
+    // conflicting values for a backend that also splits on `;`.
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+
+    let mut request = ctx("GET", "/search");
+    request.set_raw_query_string("tenant=admin&x=;tenant=victim".into());
     assert!(matches!(
         plugin.authorize(&mut request).await,
         PluginResult::Reject { .. }

@@ -4255,13 +4255,18 @@ fn query_has_alt_sse(query_or_path: &str) -> bool {
     })
 }
 
+/// Decoded names of an endpoint-owned query, under `&`-only splitting and,
+/// for a pair with a raw `;`, each `;` sub-pair name too (RFC and form
+/// decodings; issue #6579), so a provider that splits on `;` cannot have an
+/// endpoint parameter overridden through either reading. `%3B` stays content.
 fn decoded_query_names(query: &str) -> HashSet<String> {
-    query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name))
-        .map(|name| percent_decode_str(name).decode_utf8_lossy().into_owned())
-        .collect()
+    let mut names = HashSet::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        names.extend(super::utils::query::query_name_decodings(name));
+        names.extend(super::utils::query::semicolon_sub_pair_names(pair));
+    }
+    names
 }
 
 fn query_after_strip_markers(
@@ -4284,9 +4289,21 @@ fn query_after_strip_markers(
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
         let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
+        // A `;` sub-pair is a parameter of its own to a provider that also
+        // splits on `;` (issue #6579): it must neither carry a stripped
+        // credential through nor override an endpoint-owned parameter.
         if strip_names.contains(raw_name)
             || strip_names.contains(decoded_name.as_ref())
-            || endpoint_query_names.contains(decoded_name.as_ref())
+            || super::utils::query::query_name_decodings(raw_name)
+                .iter()
+                .any(|name| strip_names.contains(name.as_str()))
+            || super::utils::query::query_name_decodings(raw_name)
+                .iter()
+                .any(|name| endpoint_query_names.contains(name))
+            || super::utils::query::semicolon_sub_pair_names_any(pair, &strip_names)
+            || super::utils::query::semicolon_sub_pair_names(pair)
+                .iter()
+                .any(|name| endpoint_query_names.contains(name))
         {
             continue;
         }
