@@ -275,7 +275,11 @@ impl CanonicalQuery {
                 }
             };
             let semicolon_sub_names = semicolon_sub_pair_names(pair);
-            let form_name = query_name_decodings(raw_name).into_iter().nth(1);
+            let form_name = if raw_name.contains('+') {
+                query_name_decodings(raw_name).into_iter().nth(1)
+            } else {
+                None
+            };
             params.push(CanonicalQueryParam {
                 name,
                 value,
