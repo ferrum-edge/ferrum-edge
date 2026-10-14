@@ -7527,18 +7527,20 @@ async fn tool_argument_serialization_growth_is_charged() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    // Control: one match (511 decoded bytes, ~3 KB serialized) redacts.
+    // Control: 18 matches. Leaf growth (~55 KB escaped) and the embedded
+    // argument string (~64.5 KB once escaped again) both fit the 64 KiB floor.
     assert!(
         plugin
-            .transform_response_body(&json_body(1), Some("application/json"), &headers)
+            .transform_response_body(&json_body(18), Some("application/json"), &headers)
             .await
             .is_some()
     );
-    // 128 matches: 65 408 decoded bytes fit the 64 KiB floor, but the
-    // escaped serialization (~384 KiB) does not.
+    // 20 matches: the leaves (~61 KB escaped) fit, but embedding the
+    // re-serialized argument document escapes it again (~71.7 KB), which only
+    // the argument-serialization charge catches.
     assert!(
         plugin
-            .transform_response_body(&json_body(128), Some("application/json"), &headers)
+            .transform_response_body(&json_body(20), Some("application/json"), &headers)
             .await
             .is_none(),
         "escaping growth of re-serialized arguments must be charged"
@@ -7553,13 +7555,13 @@ async fn tool_argument_serialization_growth_is_charged() {
     };
     assert!(
         plugin
-            .transform_response_body(&sse(1), Some("text/event-stream"), &sse_headers())
+            .transform_response_body(&sse(18), Some("text/event-stream"), &sse_headers())
             .await
             .is_some()
     );
     assert!(
         plugin
-            .transform_response_body(&sse(128), Some("text/event-stream"), &sse_headers())
+            .transform_response_body(&sse(20), Some("text/event-stream"), &sse_headers())
             .await
             .is_none(),
         "the SSE argument path charges the same serialization growth"
@@ -7776,4 +7778,41 @@ async fn grow_then_shrink_fits_a_tight_window() {
         .expect("intermediate plus result fit the window");
     let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
     assert_eq!(value["choices"][0]["message"]["content"], "x");
+}
+
+/// Protobuf strings are raw UTF-8, so a placeholder that is shorter once
+/// JSON-escaped than the control characters it replaces must still be charged
+/// its raw growth.
+#[tokio::test]
+async fn grpc_raw_growth_is_charged_even_when_escaped_size_shrinks() {
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [{"name": "x".repeat(128), "regex": "\\x00{86}"}],
+        "redaction_placeholder": "{type}{type}{type}{type}",
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let frame = || grpc_frame(&hello_response_bytes(&"\u{0}".repeat(860)));
+    let body: Vec<u8> = (0..20).flat_map(|_| frame()).collect();
+    // Each frame grows 10 x (512 - 86) = 4 260 raw bytes; twenty frames need
+    // ~85 KB against a ~70 KB allowance even though the escaped size shrinks.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &grpc_headers(),
+            )
+            .await
+            .is_none()
+    );
 }

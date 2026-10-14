@@ -355,7 +355,11 @@ fn redact_scalar_bounded<'p>(
         budget.fail();
         return text.to_string();
     };
-    let growth = json_escaped_len(&result).saturating_sub(json_escaped_len(text));
+    // JSON and SSE output is escaped, protobuf output is raw UTF-8: charge
+    // whichever representation grew more, so neither can outrun the allowance.
+    let raw_growth = result.len().saturating_sub(text.len());
+    let escaped_growth = json_escaped_len(&result).saturating_sub(json_escaped_len(text));
+    let growth = raw_growth.max(escaped_growth);
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }
