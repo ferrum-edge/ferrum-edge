@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — `ai_transcript_audit` `redaction.hash_secret` must be at least
-  32 characters** (was 16; issue #6617). The key protects small PII value
+  32 characters** (issue #6617). The floor was 16. The key protects small PII value
   spaces from offline guessing, so it now has the same floor as the OIDC
   session secret. Shorter values are rejected at construction and by the
   OpenAPI `minLength`.
