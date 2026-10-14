@@ -389,7 +389,9 @@ const KEY_MATERIAL_TRAILERS: &[&str] = &[
 fn has_token_compound(lower: &str) -> bool {
     lower.match_indices("token").any(|(offset, _)| {
         let rest = &lower[offset + "token".len()..];
-        !rest.is_empty() && !rest.starts_with('s') && is_credential_suffix(rest)
+        // Plural `tokens` fails the suffix policy on its own (`s` is no
+        // trailer), while `tokenstring` / `tokenseed` still match.
+        !rest.is_empty() && is_credential_suffix(rest)
     })
 }
 
@@ -668,6 +670,7 @@ pub fn is_sensitive_header_name(name: &str) -> bool {
 fn is_credential_class_name(key: &str) -> bool {
     let mut sensitive = false;
     let mut in_key_context = false;
+    let mut previous_is_pass = false;
     for_each_metadata_key_segment(key, |segment| {
         if sensitive {
             return;
@@ -688,7 +691,11 @@ fn is_credential_class_name(key: &str) -> bool {
             heap = segment.to_ascii_lowercase();
             heap.as_str()
         };
-        sensitive = lowered_segment_is_credential(lower, in_key_context);
+        // `pass` + `phrase` / `code` / `word` split across segments
+        // (`passPhrase`, `pass_code`); `pass_through` stays visible.
+        sensitive = lowered_segment_is_credential(lower, in_key_context)
+            || (previous_is_pass && matches!(lower, "phrase" | "code" | "word" | "wd" | "key"));
+        previous_is_pass = lower == "pass";
         // Once a qualifier appears, the context stays open for the rest of
         // the key: a later `key` segment is key material.
         in_key_context |= opens_key_context(lower);
