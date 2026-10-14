@@ -191,6 +191,23 @@ impl Waf {
                     Cow::Borrowed(raw_k)
                 };
                 self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, subject);
+                // A backend that also splits on `;` reads each `;` sub-pair as
+                // a parameter of its own (issue #6579), so `?html=ok;q=<x>`
+                // must not hide `q` behind an excluded `html`. Split on the
+                // encoded bytes so `%3B` stays content.
+                if pair.contains(';') {
+                    // The first sub-pair is the pair's own name over a prefix
+                    // of the value just scanned, so it adds nothing.
+                    for sub_pair in pair.split(';').skip(1).filter(|sub| !sub.is_empty()) {
+                        let (sub_k, sub_v) = sub_pair.split_once('=').unwrap_or((sub_pair, ""));
+                        let sub_name = if self.compiled.query_exclusions_active {
+                            normalize::query_component_name(sub_k)
+                        } else {
+                            Cow::Borrowed(sub_k)
+                        };
+                        self.scan_query_pair(&mut outcome, sub_k, sub_v, &sub_name, subject);
+                    }
+                }
             }
         } else {
             // Materialized keys are already decoded: they are the names as
@@ -1024,19 +1041,38 @@ fn cookie_name(crumb: &str) -> &str {
 
 /// `raw_query` without the pairs whose decoded name is excluded.
 fn query_without_excluded_params(raw_query: &str, exclusions: &FieldExclusions) -> String {
+    let excluded = |pair: &str| {
+        let raw_key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
+    };
     let mut kept = String::with_capacity(raw_query.len());
     for pair in raw_query.split('&') {
         if pair.is_empty() {
             continue;
         }
-        let raw_key = pair.split_once('=').map_or(pair, |(key, _)| key);
-        if exclusions.excludes_query_param(&normalize::query_component_name(raw_key)) {
+        // An excluded `&` pair may still carry non-excluded `;` sub-pairs that
+        // a `;`-splitting backend reads as parameters of their own (issue
+        // #6579); keep those so whole-URL rules still see them.
+        // A non-excluded pair is kept whole: under the `&` reading its value
+        // runs to the next `&`, `;` sub-pairs included.
+        let retained: Cow<'_, str> = if !excluded(pair) {
+            Cow::Borrowed(pair)
+        } else if pair.contains(';') {
+            let subs: Vec<&str> = pair
+                .split(';')
+                .filter(|sub| !sub.is_empty() && !excluded(sub))
+                .collect();
+            if subs.is_empty() {
+                continue;
+            }
+            Cow::Owned(subs.join(";"))
+        } else {
             continue;
-        }
+        };
         if !kept.is_empty() {
             kept.push('&');
         }
-        kept.push_str(pair);
+        kept.push_str(&retained);
     }
     kept
 }
