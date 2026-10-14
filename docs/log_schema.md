@@ -366,8 +366,9 @@ by HTTP, so camelCase only helps where the configured spelling is also
 judged: `workload_metrics` header-tag admission checks both the configured
 and the normalized header name. Mixed-case irregular spellings (`JwT`,
 `HSM_PiN`, `privateKeY`, `ToKeN`, `SIGNING_KeY`) are also judged fully
-lowercased against the whole-word, stem, singular-token and key-material
-rules (not the short-class compound rules). The
+lowercased with every rule. This fails closed, so a camelCase name whose
+joined lowercase form is a credential compound counts as one (prefer
+snake_case for ordinary dimensions such as `signal_strength`). The
 only exemption is the complete documented outcome key
 `mesh_authz.ignored_baggage.assertion_out_of_scope`. Any other key, including
 one that merely ends the same way, is classified normally. Ordinary dimensions such as `cache_key`, `routing_key` and

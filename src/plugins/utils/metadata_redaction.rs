@@ -749,49 +749,14 @@ pub fn is_sensitive_header_name(name: &str) -> bool {
 /// The credential-class classifier without any exemption.
 fn is_credential_class_name(key: &str) -> bool {
     // CamelCase splitting runs before case folding, so an irregular mix
-    // (`JwT`, `HSM_PiN`) would split inside a credential word. Judge the
-    // delimiter-only (fully lowercased) spelling too; it only allocates when
-    // the key has an uppercase letter.
+    // (`JwT`, `HSM_PiN`, `mFaRecoveryCode`) would split inside a credential
+    // word. Judge the delimiter-only (fully lowercased) spelling with every
+    // rule too, failing closed: a camelCase name whose joined lowercase form
+    // is a credential compound is treated as one. It only allocates when the
+    // key has an uppercase letter.
     classify_credential_class_segments(key)
         || (key.bytes().any(|byte| byte.is_ascii_uppercase())
-            && folded_runs_name_credential_words(&key.to_ascii_lowercase()))
-}
-
-/// For the case-folded spelling: whole credential words and stems, singular
-/// `token`, and key material (in-run and across runs). The short-class
-/// compound heuristics are NOT applied here, so ordinary camelCase names such
-/// as `signalStrength` or `pinnedVersion` do not turn into compounds.
-fn folded_runs_name_credential_words(folded: &str) -> bool {
-    let mut in_key_context = false;
-    let mut in_mfa_context = false;
-    let mut previous_is_pass = false;
-    folded
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|run| !run.is_empty())
-        .any(|run| {
-            let plural_class = run.strip_suffix('s').is_some_and(|singular| {
-                QUALIFIED_SHORT_CLASSES
-                    .iter()
-                    .any(|(class, _)| *class == singular)
-            });
-            let sensitive = plural_class
-                || (previous_is_pass
-                    && ["phrase", "code", "word", "wd", "key"]
-                        .iter()
-                        .any(|word| run.starts_with(word)))
-                || (in_mfa_context && names_mfa_material(run))
-                || CREDENTIAL_CLASS_SEGMENTS.contains(&run)
-                || CREDENTIAL_CLASS_STEMS.iter().any(|stem| run.contains(stem))
-                || run == "token"
-                || (run.len() > "token".len() && run.ends_with("token"))
-                || has_token_compound(run)
-                || has_inline_key_material(run)
-                || (in_key_context && names_key_material(run));
-            in_key_context |= opens_key_context(run);
-            in_mfa_context |= run.contains("mfa");
-            previous_is_pass = run == "pass";
-            sensitive
-        })
+            && classify_credential_class_segments(&key.to_ascii_lowercase()))
 }
 
 fn classify_credential_class_segments(key: &str) -> bool {
