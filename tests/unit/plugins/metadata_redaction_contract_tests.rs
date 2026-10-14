@@ -704,6 +704,10 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "tenantPinOpaque",
     "JwT",
     "HSM_PiN",
+    "privateKeY",
+    "mesh.privateKeY",
+    "ToKeN",
+    "SIGNING_KeY",
     "mesh.signingkeybase64url",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",
@@ -751,6 +755,8 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "assess_score",
     "signalStrength",
     "pinnedVersion",
+    "clientKeyboard",
+    "cacheKey",
 ];
 
 #[test]

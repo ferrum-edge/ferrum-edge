@@ -246,6 +246,8 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "TENANTPINOPAQUE",
         "HSM_PiN",
         "JwT",
+        "SIGNING_KeY",
+        "ToKeN",
         "SIGNINGKEYUTF8",
         "signingkey1base64url",
         "PRIVATE_EC_P256_PKCS8_PEM_KEY",
