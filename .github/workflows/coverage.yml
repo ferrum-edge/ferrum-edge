@@ -65,6 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Validate coverage planner examples
@@ -182,6 +183,8 @@ jobs:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
 
       - name: Extend runner swap for the aggregated unit_tests compile
         run: |
@@ -543,6 +546,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         if: needs.coverage-plan.outputs.mode != 'skip'
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-rust-ci

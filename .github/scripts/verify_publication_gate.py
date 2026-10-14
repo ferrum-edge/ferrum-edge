@@ -58,7 +58,7 @@ RELEASE_GATE_STEP_NAME = (
     "Require every publish-blocking check for the tag target"
 )
 RELEASE_GATE_CHECKOUT_FIELDS = ("uses", "with")
-RELEASE_GATE_CHECKOUT_WITH = (("fetch-depth", "0"),)
+RELEASE_GATE_CHECKOUT_WITH = (("persist-credentials", "false"), ("fetch-depth", "0"))
 RELEASE_GATE_PROOF_FIELDS = ("name", "env", "run")
 RELEASE_GATE_ENV = (
     ("GH_TOKEN", "${{ github.token }}"),
@@ -2049,6 +2049,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       # Issue #4302. The complete, repository-required product check set --
@@ -2888,6 +2889,7 @@ def self_test() -> list[str]:
     release_missing_checkout = _CONFORMING_RELEASE_JOB.replace(
         "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
         "        with:\n"
+        "          persist-credentials: false\n"
         "          fetch-depth: 0\n\n",
         "",
     )
