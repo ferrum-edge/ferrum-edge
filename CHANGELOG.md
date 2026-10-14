@@ -180,19 +180,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — `access_control` refuses an explicitly empty allow-list**
-  (issue #6607). `allowed_consumers: []` or `allowed_groups: []` used to mean
-  "no allow restriction", so emptying the list to lock a route down admitted
-  every consumer the deny side did not name. A present but empty allow-list is
-  now a config validation error (`minItems: 1` in `openapi.yaml`); omit the key
-  for no allow restriction.
-- **`ip_restriction` `mode` is deprecated and documented as
-  decision-neutral** (issue #6610). `allow_first` and `deny_first` never
-  changed whether a request is admitted: a deny match always rejects and a
-  non-empty `allow` list always rejects addresses outside it. The key only
-  selects the rejection reason for an address failing both checks. It still
-  loads, is marked `deprecated` in `openapi.yaml`, and a test pins the
-  decision across both modes.
+- **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
+  `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
+  clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging
+  sinks) verify servers through a rustls verifier that applies the shared CRL
+  policy, so a revoked certificate is refused there as on every other TLS
+  surface. They trust `FERRUM_TLS_CA_BUNDLE_PATH` exclusively or, without it,
+  the bundled webpki roots instead of the OS trust store, disable session
+  resumption, and follow the backend CRL generation that backend TLS live
+  reload publishes. A trust store or verifier that cannot be built fails
+  closed. `FERRUM_TLS_NO_VERIFY` still disables verification, and now logs a
+  warning when a CA bundle or CRL source is configured alongside it.
 - **`ldap_auth` re-checks `required_groups` on cached credentials** (issue
   #6609). With the opt-in credential cache, a hit used to skip the group
   search for the whole `cache_ttl_seconds` (up to 24 hours). A hit whose last
@@ -223,6 +221,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ws_logging` charges one back-off per failed attempt and none after the
+  last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
+  failure, including after the final attempt, and `send_batch` added
+  `retry_delay_ms` on top, so at the defaults a batch aimed at an
+  unreachable collector held the single delivery worker for about 44 s.
+  The retry ladder now owns the back-off. That is `reconnect_delay_ms` after
+  a failed connection and `retry_delay_ms` after a failed send, never both
+  and never after the final attempt, and per-attempt warnings are sampled.
+  The same change removes the unreachable empty-`endpoint_url` flush branch
+  and refuses a partially staged activation before consuming its config.
+  `ws_rate_limiting` single-flights its over-cap idle sweep behind the same
+  cooldown CAS gate `udp_rate_limiting` uses, as defense in depth.
 - **Equal-priority plugins now run in a deterministic order** (issue #6614).
   Ties used to follow config iteration order, which a database (unordered
   `proxy_plugins` association rows), a reordered config file, or an
