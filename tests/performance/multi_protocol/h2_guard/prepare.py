@@ -31,7 +31,9 @@ FERRUM_PATCHES = (
 VENDOR_MANIFEST = "vendor/VENDOR_INTEGRITY.sha256"
 VENDORED_H2 = 'h2 = { path = "' + FERRUM_VENDOR + '" }\n'
 LOCK_PIN = 'name = "h2"\nversion = "0.4.20"\ndependencies = [\n'
-DOCKER_CARGO = 'cargo build --features "${FEATURES}"'
+# The production Dockerfile itself builds with `--locked` (#6574), so the
+# observation build reuses its two Cargo calls unchanged.
+DOCKER_CARGO = 'cargo build --locked --features "${FEATURES}"'
 METRICS_ANCHOR = b"        let mut metrics_output = registry.render();\n"
 
 
@@ -142,15 +144,11 @@ def select_dependency(context, evidence, provenance):
     lock = (context / "Cargo.lock").read_text()
     if lock.count(LOCK_PIN) != 1:
         raise ValueError("root lock no longer pins one path-sourced h2 0.4.20")
-    # Keep the existing Docker stages/features/profile. Lock both Cargo calls in
-    # this generated copy; the ordinary Dockerfile is never rewritten.
+    # Keep the existing Docker stages/features/profile. Both Cargo calls are
+    # already `--locked` in the ordinary Dockerfile, which is never rewritten.
     docker = (context / "Dockerfile").read_text()
     if docker.count(DOCKER_CARGO) != 2:
         raise ValueError("Docker build recipe drift")
-    locked = docker.replace(DOCKER_CARGO, 'cargo build --locked --features "${FEATURES}"')
-    (context / "Dockerfile").write_text(locked)
-    diff += "".join(difflib.unified_diff(docker.splitlines(True), locked.splitlines(True),
-                                        fromfile="a/Dockerfile", tofile="b/Dockerfile"))
     # No shipping route/API change: insert the narrow authenticated snapshot
     # trigger only in this disposable build, with exact context identities.
     hook = (ASSETS / "metrics-hook.txt").read_bytes()
