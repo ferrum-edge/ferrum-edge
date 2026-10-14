@@ -468,50 +468,71 @@ const BENIGN_SHORT_CLASS_SEGMENTS: &[&str] = &[
     "lupins",
 ];
 
-/// Ordinary words (or word stems) that begin with a short credential class.
+/// Complete ordinary words that begin with a short credential class. Matched
+/// as WHOLE segments only, so a word never shields a longer compound
+/// (`pint` does not exempt `pintext`).
 const BENIGN_LEADING_SHORT_CLASS_WORDS: &[&str] = &[
     "pinned",
     "pinning",
     "pinpoint",
+    "pinpoints",
+    "pine",
+    "pines",
     "pineapple",
     "pink",
     "pint",
+    "pints",
     "pinch",
     "pinyin",
     "pinout",
+    "pinouts",
     "pinball",
     "pinhole",
     "pinwheel",
     "pinata",
     "pinion",
+    "sign",
+    "signs",
     "signal",
+    "signals",
+    "signaled",
+    "signaling",
+    "signalling",
     "signed",
     "signer",
+    "signers",
     "signing",
     "signup",
     "signin",
     "signoff",
     "signpost",
-    "signs",
     "signage",
     "signet",
-    "signif",
-    "sidebar",
-    "sidecar",
+    "significant",
+    "significance",
+    "sigma",
+    "sigh",
+    "sigil",
     "side",
+    "sides",
+    "sidebar",
+    "sidebars",
+    "sidecar",
+    "sidecars",
+    "sideways",
     "sidle",
     "sidekick",
     "sideload",
     "siding",
     "credit",
-    "credib",
+    "credits",
+    "credited",
+    "credible",
+    "credibility",
     "credo",
     "credence",
     "credulous",
-    "credential",
-    "sigma",
-    "sigh",
-    "sigil",
+    "sessile",
 ];
 
 /// Words that may follow a short credential class inside one segment
@@ -551,10 +572,7 @@ fn has_qualified_short_class(lower: &str) -> bool {
     if QUALIFIED_SHORT_CLASSES
         .iter()
         .any(|(class, _)| lower.len() > class.len() && lower.starts_with(class))
-        && !matches!(lower, "sign" | "pine" | "pines")
-        && !BENIGN_LEADING_SHORT_CLASS_WORDS
-            .iter()
-            .any(|word| lower.starts_with(word))
+        && !BENIGN_LEADING_SHORT_CLASS_WORDS.contains(&lower)
     {
         return true;
     }
