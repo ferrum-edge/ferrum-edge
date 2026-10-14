@@ -28307,7 +28307,16 @@ components:
             matching is an unbounded starts_with; a regex must not match `null`
             or every origin of a scheme (universality is probed against
             reserved DNS-shaped origins, so a hostname-character-class pattern
-            such as `https://[\w.-]+` is effectively universal).
+            such as `https://[\w.-]+` is effectively universal), and must
+            provably pin the host: every literal suffix of the pattern must be
+            a complete origin, contain the literal authority, or end in a fixed
+            non-public domain after its first dot (optionally with a literal
+            port, after a trailing :[0-9]+ or optional (?::[0-9]+)? port is
+            set aside), or every match must start with a literal
+            scheme://host:. Numeric (IP-literal) suffixes never count. A native `*.suffix` wildcard is refused with credentials
+            when the suffix is a single label, a public suffix, or has a
+            Public Suffix List rule beneath it (`*.com`, `*.co.uk`,
+            `*.github.io`, `*.run.app`, `*.amazonaws.com`).
         max_age:
           type: integer
           format: uint64

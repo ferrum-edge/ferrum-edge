@@ -2306,6 +2306,7 @@ dependencies = [
  "rdkafka",
  "redis",
  "regex",
+ "regex-syntax",
  "reqwest",
  "ring",
  "roxmltree",
