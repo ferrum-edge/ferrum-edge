@@ -964,6 +964,7 @@ enum MirrorQueryNameDecision {
 fn classify_mirror_query_name(
     raw_name: &str,
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) -> MirrorQueryNameDecision {
     if raw_name.len() > MAX_MIRROR_QUERY_NAME_CLASSIFY_BYTES {
         return MirrorQueryNameDecision::FailClosed;
@@ -994,7 +995,10 @@ fn classify_mirror_query_name(
             // `is_mirror_sensitive_query_name_staged`).
             if is_mirror_sensitive_query_name_staged(lower.as_ref(), operator_patterns)
                 || (!name_has_valid_percent_escape(current.as_ref())
-                    && name_has_credential_class(lower.as_ref()))
+                    && (name_has_credential_class(lower.as_ref())
+                        || route_credentials
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(lower.as_ref()))))
             {
                 sensitive = true;
             }
@@ -1104,6 +1108,30 @@ pub(crate) fn resolve_mirror_timeout_ms(
     raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
 }
 
+/// Query parameter names that an authentication plugin marked as credential
+/// locations on this request (whether or not it strips them from the primary
+/// request). Empty, without allocating, when none were marked.
+fn route_query_credential_names(ctx: &RequestContext) -> Vec<String> {
+    use crate::plugins::utils::token_extract::{
+        QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
+    };
+    let mut names: Vec<String> = ctx
+        .query_credential_partition_digests()
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    for key in ctx.metadata.keys() {
+        if let Some(name) = key
+            .strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX)
+            .or_else(|| key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX))
+            && !names.iter().any(|known| known == name)
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 /// Strip origin-bound credentials before a distinct mirror origin. Deny by
 /// default: a sensitive header survives only when `forward_sensitive_headers`
 /// is set and the exact lowercased name is in the fail-closed allowlist.
@@ -1112,10 +1140,15 @@ fn apply_mirror_credential_policy(
     forward_sensitive_headers: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) {
     headers.retain(|(name, _)| {
         let lower = name.to_ascii_lowercase();
-        if !is_mirror_sensitive_header(&lower, operator_patterns) {
+        if !is_mirror_sensitive_header(&lower, operator_patterns)
+            && !route_credentials
+                .iter()
+                .any(|credential| credential.eq_ignore_ascii_case(&lower))
+        {
             return true;
         }
         forward_sensitive_headers && allowlist.iter().any(|allowed| allowed == &lower)
@@ -1130,6 +1163,7 @@ fn mirror_query_pair_allowed(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) -> bool {
     // Some application query parsers still accept `;` as a parameter
     // separator. Ferrum's canonical query uses `&`, so forwarding a raw
@@ -1140,7 +1174,7 @@ fn mirror_query_pair_allowed(
         return false;
     }
     let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-    match classify_mirror_query_name(raw_name, operator_patterns) {
+    match classify_mirror_query_name(raw_name, operator_patterns, route_credentials) {
         MirrorQueryNameDecision::NonSensitive => true,
         MirrorQueryNameDecision::FailClosed => false,
         MirrorQueryNameDecision::Sensitive { decoded_lower } => {
@@ -1160,6 +1194,7 @@ fn apply_mirror_query_credential_policy<'a>(
     forward_sensitive_query: bool,
     allowlist: &[String],
     operator_patterns: &[String],
+    route_credentials: &[String],
 ) -> Cow<'a, str> {
     if query.is_empty() {
         return Cow::Borrowed(query);
@@ -1175,6 +1210,7 @@ fn apply_mirror_query_credential_policy<'a>(
                 forward_sensitive_query,
                 allowlist,
                 operator_patterns,
+                route_credentials,
             )
     });
     if !needs_strip {
@@ -1189,6 +1225,7 @@ fn apply_mirror_query_credential_policy<'a>(
                 forward_sensitive_query,
                 allowlist,
                 operator_patterns,
+                route_credentials,
             )
         {
             continue;
@@ -2184,6 +2221,7 @@ impl RequestMirror {
         original_path: &str,
         raw_query: Option<&str>,
         query_params: &HashMap<String, String>,
+        route_query_credentials: &[String],
     ) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
 
@@ -2206,6 +2244,7 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
+                route_query_credentials,
             );
             if !filtered.is_empty() {
                 url.push('?');
@@ -2218,6 +2257,7 @@ impl RequestMirror {
                 self.forward_sensitive_query,
                 &self.forward_sensitive_query_allowlist,
                 &self.sensitive_query_patterns,
+                route_query_credentials,
             );
             if !filtered.is_empty() {
                 url.push('?');
@@ -2843,8 +2883,15 @@ impl Plugin for RequestMirror {
             } else {
                 None
             };
-        let mirror_url =
-            self.build_mirror_url(mirror_path, effective_query.as_deref(), &ctx.query_params);
+        // Query names an auth plugin used as a credential location on this
+        // request are credentials whatever they are called.
+        let route_query_credentials = route_query_credential_names(ctx);
+        let mirror_url = self.build_mirror_url(
+            mirror_path,
+            effective_query.as_deref(),
+            &ctx.query_params,
+            &route_query_credentials,
+        );
         let method = ctx.method.clone();
 
         // Mirror destinations are an egress boundary just like the primary
@@ -2870,11 +2917,15 @@ impl Plugin for RequestMirror {
             ctx.forwarding_peer_trusted,
             &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
         );
+        // Header names configured as credential locations on this route
+        // (`key_auth` `header:x-proof`, custom JWT headers, ...) are
+        // credentials too, even when the authenticating plugin keeps them.
         apply_mirror_credential_policy(
             &mut mirror_headers,
             self.forward_sensitive_headers,
             &self.forward_sensitive_header_allowlist,
             &self.sensitive_header_patterns,
+            ctx.request_headers_requiring_redaction(),
         );
         if let Some(shadow_host) = mesh_shadow_host {
             // Keep the configured mirror URL as the dial/TLS identity. Only
@@ -3304,11 +3355,16 @@ mod tests {
         query_params.insert("page".to_string(), "1".to_string());
 
         assert_eq!(
-            plugin.build_mirror_url("/shadow", None, &query_params),
+            plugin.build_mirror_url("/shadow", None, &query_params, &[]),
             "https://[2001:db8::10]:8443/shadow?page=1"
         );
         assert_eq!(
-            plugin.build_mirror_url("/shadow", Some("tag=red&tag=blue&q=a+b"), &query_params),
+            plugin.build_mirror_url(
+                "/shadow",
+                Some("tag=red&tag=blue&q=a+b"),
+                &query_params,
+                &[]
+            ),
             "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
         );
     }
@@ -3334,7 +3390,7 @@ mod tests {
             "name=%E2%9C%93&q=%C3%A9",
             "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&dir=a%2Fb&name=%E2%9C%93",
         ] {
-            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed);
+            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed, &[]);
             assert!(
                 url.ends_with(&format!("?{raw}")),
                 "raw query must be preserved exactly: got {url}"

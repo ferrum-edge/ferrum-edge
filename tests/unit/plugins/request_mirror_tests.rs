@@ -6899,3 +6899,55 @@ fn credential_class_names_are_allowlistable() {
     .expect("non-credential name must be rejected");
     assert!(err.contains("not a recognized sensitive header"), "{err}");
 }
+
+/// Credential locations an auth plugin uses on this route are credentials at
+/// the mirror boundary whatever they are called: a `key_auth` header the
+/// primary keeps (`hide_credentials: false`) and a marked query credential
+/// are both withheld from the mirror while the primary request keeps them.
+#[tokio::test]
+async fn route_credential_locations_are_withheld_from_the_mirror() {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+
+    let key_auth = create_plugin(
+        "key_auth",
+        &json!({"key_location": "header:x-proof", "hide_credentials": false}),
+    )
+    .expect("key_auth config")
+    .expect("key_auth plugin");
+    let route_headers = key_auth.request_headers_to_redact().to_vec();
+    assert_eq!(route_headers, vec!["x-proof".to_string()]);
+
+    let mut ctx = make_ctx_with_proxy();
+    set_replay_credential_headers_for_test(&mut ctx, route_headers);
+    let mut headers = HashMap::new();
+    headers.insert("x-proof".to_string(), "live-api-key".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(!observed.contains_key("x-proof"), "{observed:?}");
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+    assert_eq!(
+        headers.get("x-proof").map(String::as_str),
+        Some("live-api-key"),
+        "the primary request keeps its credential"
+    );
+
+    let mut query_ctx = make_ctx_with_proxy();
+    const RAW: &str = "proof=live-api-key&x=1";
+    query_ctx.set_raw_query_string(RAW.to_string());
+    query_ctx
+        .query_params
+        .insert("proof".to_string(), "live-api-key".to_string());
+    query_ctx.metadata.insert(
+        "auth.query_credential_param.proof".to_string(),
+        "true".to_string(),
+    );
+    let request_line = capture_mirror_request_line(&mut query_ctx).await;
+    assert!(
+        request_line.contains("?x=1 ") && !request_line.contains("live-api-key"),
+        "{request_line}"
+    );
+    assert_eq!(query_ctx.raw_query_string(), Some(RAW));
+}
