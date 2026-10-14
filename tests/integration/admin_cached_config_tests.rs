@@ -7619,7 +7619,7 @@ async fn test_consumer_delete_referenced_by_access_control_returns_409() {
     let consumer = json!({
         "id": "acl-cs",
         "username": "acluser",
-        "credentials": {"keyauth": [{"key": "acl-key-1"}]}
+        "credentials": {"keyauth": [{"key": "acl-key-1-0123456789"}]}
     });
     let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
     assert_eq!(status, 201, "Create consumer failed: {:?}", body);

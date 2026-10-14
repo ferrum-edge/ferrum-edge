@@ -682,7 +682,7 @@ async fn provision_resources(
         let listen_path = format!("/svc/{}", i);
 
         let (credentials, entry) = if i < KEY_AUTH_END {
-            let api_key = format!("key-{}-{}", i, &Uuid::new_v4().to_string()[..8]);
+            let api_key = format!("key-{}-{}", i, Uuid::new_v4().as_simple());
             (
                 json!({ "keyauth": [{ "key": api_key.clone() }] }),
                 AuthEntry::KeyAuth {

@@ -1692,3 +1692,249 @@ fn every_unknown_root_config_key_is_rejected_with_allowed_key_list() {
         assert!(err.contains("metadata_prefix"), "got: {err}");
     }
 }
+
+/// Issue #6623: the `message_start` `output_tokens` placeholder is not a
+/// completion count; a stream interrupted before `message_delta` keeps only
+/// its authoritative input (with prompt-cache categories).
+#[tokio::test]
+async fn anthropic_sse_interrupted_after_message_start_reports_input_only() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"cache_read_input_tokens\":100,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("125")
+    );
+    assert!(!ctx.metadata.contains_key("ai_completion_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+/// A category-only update reaches the cumulative merge: a valid one extends
+/// the prompt, a malformed one invalidates the stale count.
+#[tokio::test]
+async fn anthropic_sse_category_only_updates_reach_the_merge() {
+    let run = |delta: &'static str| async move {
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+        let mut ctx = create_test_context();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+        let body = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-test\",\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":5}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"usage\":{delta}}}\n\n"
+        );
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+            .await;
+        ctx
+    };
+
+    let ctx = run("{\"cache_read_input_tokens\":100}").await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("110")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("115")
+    );
+
+    let ctx = run("{\"cache_read_input_tokens\":\"bad\"}").await;
+    assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+/// Gemini usage that omits a zero `promptTokenCount` is still detected under
+/// automatic provider selection and counted like an explicit `google` config.
+#[tokio::test]
+async fn gemini_usage_without_prompt_count_is_detected_automatically() {
+    let body = serde_json::to_vec(&json!({"usageMetadata": {
+        "toolUsePromptTokenCount": 3,
+        "candidatesTokenCount": 5,
+        "thoughtsTokenCount": 40,
+        "totalTokenCount": 48
+    }}))
+    .unwrap();
+    for config in [json!({}), json!({"provider": "google"})] {
+        let plugin = AiTokenMetrics::new(&config).unwrap();
+        let mut ctx = create_test_context();
+        let mut headers = json_headers();
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("3"),
+            "{config}"
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+            Some("45"),
+            "{config}"
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("48"),
+            "{config}"
+        );
+    }
+}
+
+/// Bedrock's terminal invocation metrics can carry the cache counters alone;
+/// the SSE metrics path must fold them into the Anthropic stream's usage.
+#[tokio::test]
+async fn bedrock_terminal_metrics_cache_counters_reach_sse_metrics() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("1010")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+}
+
+/// Under an explicit `bedrock` provider, the wrapped Anthropic events are still
+/// read by their own shape, so terminal metrics that omit the cache counters
+/// cannot drop the cache reads the start reported.
+#[tokio::test]
+async fn explicit_bedrock_keeps_wrapped_anthropic_cache_categories() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "provider": "bedrock",
+        "buffer_streaming_responses": true
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("1010")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("bedrock"),
+        "an explicit provider keeps the exported identity"
+    );
+}
+
+/// Native usage and Bedrock invocation metrics in the same event are merged
+/// independently, matching the shared streaming accumulator.
+#[tokio::test]
+async fn co_located_native_usage_and_invocation_metrics_both_merge() {
+    let run = |delta_usage: &'static str| async move {
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+        let mut ctx = create_test_context();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+        let body = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-test\",\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"usage\":{delta_usage},\"amazon-bedrock-invocationMetrics\":{{\"inputTokenCount\":10,\"outputTokenCount\":5}}}}\n\n"
+        );
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+            .await;
+        ctx
+    };
+
+    let ctx = run("{\"cache_read_input_tokens\":1000,\"output_tokens\":5}").await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("1010")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+
+    // A malformed native cache counter is not hidden by valid metrics.
+    let ctx = run("{\"cache_read_input_tokens\":\"bad\",\"output_tokens\":5}").await;
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+/// Cache counters supplied only by co-located invocation metrics are merged
+/// beside the native usage of the same event; malformed metrics invalidate.
+#[tokio::test]
+async fn co_located_invocation_metrics_supply_their_own_categories() {
+    let run = |metrics: &'static str| async move {
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+        let mut ctx = create_test_context();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+        let body = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-test\",\"usage\":{{\"input_tokens\":10}}}}}}\n\n\
+             data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":5}},\"amazon-bedrock-invocationMetrics\":{metrics}}}\n\n"
+        );
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+            .await;
+        ctx
+    };
+    let ctx =
+        run("{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}")
+            .await;
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+    let ctx = run("{\"inputTokenCount\":10,\"cacheReadInputTokenCount\":\"bad\"}").await;
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+/// A standalone invocation-metrics event (detected as Bedrock under `auto`)
+/// continues the Anthropic stream it terminates and merges into it.
+#[tokio::test]
+async fn standalone_invocation_metrics_event_merges_under_auto_detection() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: {\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("anthropic")
+    );
+}

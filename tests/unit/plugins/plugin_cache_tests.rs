@@ -10064,7 +10064,7 @@ fn test_request_conditional_unbounded_trailer_policy_follows_waf_exemptions() {
         vec![enforcing_response_header_waf(
             "waf1",
             "p1",
-            json!({ "paths": ["/internal/*"], "consumers": ["trusted-partner"] }),
+            json!({ "paths": ["/internal/*"], "consumers": ["trusted-partner"], "match": "any" }),
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
@@ -12316,7 +12316,7 @@ fn test_opa_body_buffering_is_deferred_until_after_authentication() {
         "ps1",
         "opa",
         json!({
-            "opa_host": "http://opa.internal:8181",
+            "opa_host": "https://opa.internal:8181",
             "policy_path": "ferrum/authz/allow",
             "include_body": true,
             "max_body_bytes": 4096
@@ -12358,7 +12358,7 @@ fn test_opa_is_cached_for_grpc_and_websocket_protocols() {
         "ps1",
         "opa",
         json!({
-            "opa_host": "http://opa.internal:8181",
+            "opa_host": "https://opa.internal:8181",
             "policy_path": "ferrum/authz/allow",
         }),
         PluginScope::Proxy,

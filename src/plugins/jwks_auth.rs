@@ -80,6 +80,13 @@ const MAX_DISCOVERED_JWKS_URI_BYTES: usize = 8 * 1024;
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "jwks_auth.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "jwks_auth.strip_header.";
 const CLAIM_HEADER_METADATA_PREFIX: &str = "jwks_auth.claim_header.";
+/// Maximum `providers` entries in one `jwks_auth` instance.
+pub const MAX_JWKS_PROVIDERS: usize = 64;
+/// Maximum providers a single token can be verified against: the providers
+/// pinning its exact `iss` plus every provider pinning no issuer. Enforced at
+/// admission so an unauthenticated token costs a bounded number of signature
+/// verifications.
+pub const MAX_JWKS_CANDIDATE_PROVIDERS: usize = 8;
 
 /// JWKS authentication plugin.
 ///
@@ -180,6 +187,32 @@ pub struct JwksAuth {
     /// Only a committed generation may contribute to readiness and metrics.
     discovery_owner_committed: Arc<AtomicBool>,
     discovery_publication_gate: Arc<Mutex<()>>,
+    /// Unit-test record of provider verifications; compiled out of builds.
+    #[cfg(test)]
+    verification_attempts: Mutex<Vec<usize>>,
+}
+
+/// Fixed-capacity, ordered list of providers one token is verified against.
+#[derive(Default)]
+struct CandidateProviders {
+    indices: [usize; MAX_JWKS_CANDIDATE_PROVIDERS],
+    len: usize,
+}
+
+impl CandidateProviders {
+    /// Append `idx`; returns `false` once the list is full.
+    fn push(&mut self, idx: usize) -> bool {
+        if self.len == self.indices.len() {
+            return false;
+        }
+        self.indices[self.len] = idx;
+        self.len += 1;
+        true
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        &self.indices[..self.len]
+    }
 }
 
 /// A single identity provider configuration.
@@ -559,6 +592,11 @@ impl JwksAuth {
         if providers_arr.is_empty() {
             return Err("jwks_auth: `providers` array must not be empty".to_string());
         }
+        if providers_arr.len() > MAX_JWKS_PROVIDERS {
+            return Err(format!(
+                "jwks_auth: `providers` supports at most {MAX_JWKS_PROVIDERS} entries"
+            ));
+        }
 
         let mut providers = Vec::with_capacity(providers_arr.len());
         let mut declared_dpop_scopes: Vec<ReplayScope> = Vec::new();
@@ -665,9 +703,12 @@ impl JwksAuth {
                 provider_claim_headers.as_slice()
             };
             if let Some(duplicate) = provider_output_claim_headers.iter().find(|output| {
-                effective_claim_headers
-                    .iter()
-                    .any(|mapping| mapping.destination_header == output.destination_header)
+                effective_claim_headers.iter().any(|mapping| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(
+                        &mapping.destination_header,
+                        &output.destination_header,
+                    )
+                })
             }) {
                 return Err(format!(
                     "jwks_auth: `provider[{idx}]` maps header {:?} through both \
@@ -884,6 +925,12 @@ impl JwksAuth {
             });
         }
 
+        if let Some(reason) =
+            jwks_provider_bound_error(providers.iter().map(|p| p.issuer.as_deref()))
+        {
+            return Err(format!("jwks_auth: {reason}"));
+        }
+
         // Scope/backend coherence is a plugin-level decision, not a per-provider
         // one: one Redis client backs every `shared` provider. `shared` without
         // a backend would silently be process-local — the exact "multi-replica
@@ -1002,6 +1049,8 @@ impl JwksAuth {
             discovery_owner_live: Arc::new(AtomicBool::new(true)),
             discovery_owner_committed: Arc::new(AtomicBool::new(false)),
             discovery_publication_gate: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            verification_attempts: Mutex::new(Vec::new()),
         })
     }
 
@@ -1144,41 +1193,83 @@ impl JwksAuth {
             .with_credential_deadline(credential_deadline_from_claims(claims, 0))
     }
 
+    /// Providers that may verify `token`, each listed once.
+    ///
+    /// A provider that pins an `issuer` rejects every token whose `iss` is not
+    /// exactly that string (presence is required and an array-valued `iss`
+    /// fails closed in `verify_jwt_with_jwks`), so trying it for any other
+    /// token only spends an asymmetric verification. Candidates are therefore
+    /// the pinned providers whose issuer equals the token's unverified `iss`,
+    /// then the providers that pin no issuer, both in configuration order.
+    /// Admission ([`jwks_provider_bound_error`]) bounds this list at
+    /// [`MAX_JWKS_CANDIDATE_PROVIDERS`] for every possible `iss`; the
+    /// fixed-capacity result also stops there defensively. Provider indices are
+    /// below [`MAX_JWKS_PROVIDERS`] (64), so a `u64` mask deduplicates them
+    /// without allocating.
+    fn candidate_provider_indices(
+        &self,
+        token: &str,
+        provider_indices: &[usize],
+    ) -> CandidateProviders {
+        let unverified_issuer = peek_unverified_issuer(token);
+        let mut candidates = CandidateProviders::default();
+        let mut seen: u64 = 0;
+        for pinned_pass in [true, false] {
+            for &idx in provider_indices {
+                let Some(bit) = u32::try_from(idx).ok().and_then(|i| 1u64.checked_shl(i)) else {
+                    continue;
+                };
+                if seen & bit != 0 {
+                    continue;
+                }
+                let Some(prov) = self.providers.get(idx) else {
+                    continue;
+                };
+                let take = match prov.issuer.as_deref() {
+                    Some(issuer) => pinned_pass && unverified_issuer.as_deref() == Some(issuer),
+                    None => !pinned_pass,
+                };
+                if take {
+                    seen |= bit;
+                    if !candidates.push(idx) {
+                        return candidates;
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Test-only view of [`Self::candidate_provider_indices`] over every
+    /// configured provider.
+    pub(crate) fn candidate_provider_indices_for_test(&self, token: &str) -> Vec<usize> {
+        let provider_indices: Vec<usize> = (0..self.providers.len()).collect();
+        self.candidate_provider_indices(token, &provider_indices)
+            .as_slice()
+            .to_vec()
+    }
+
     /// Try to validate a token against the allowed configured providers.
     ///
-    /// Returns `Ok((claims, provider_index))` on first successful validation,
-    /// or `Err(status_code, body)` if no provider validates the token.
+    /// Each candidate from [`Self::candidate_provider_indices`] is verified at
+    /// most once. Returns `Ok((claims, provider_index))` on the first
+    /// successful validation, or `Err(status_code, body)` if none validates it.
     async fn validate_token_for_providers(
         &self,
         token: &str,
         provider_indices: &[usize],
     ) -> Result<(Value, usize), (u16, &'static str)> {
-        if provider_indices.is_empty() {
-            return Err((401, r#"{"error":"Invalid or unrecognized JWT"}"#));
-        }
-
-        // Peek at the unverified issuer to try matching a specific provider first
-        let unverified_issuer = peek_unverified_issuer(token);
-
-        // If we have an issuer, try matching providers with that issuer first
-        if let Some(ref iss) = unverified_issuer {
-            for &idx in provider_indices {
-                let Some(prov) = self.providers.get(idx) else {
-                    continue;
-                };
-                if prov.issuer.as_deref() == Some(iss.as_str())
-                    && let Some(claims) = try_validate_with_provider(prov, token).await
-                {
-                    return Ok((claims, idx));
-                }
-            }
-        }
-
-        // Fall through: try all providers (handles no-issuer tokens or issuer mismatch)
-        for &idx in provider_indices {
+        let candidates = self.candidate_provider_indices(token, provider_indices);
+        for &idx in candidates.as_slice() {
             let Some(prov) = self.providers.get(idx) else {
                 continue;
             };
+            #[cfg(test)]
+            {
+                if let Ok(mut attempts) = self.verification_attempts.lock() {
+                    attempts.push(idx);
+                }
+            }
             if let Some(claims) = try_validate_with_provider(prov, token).await {
                 return Ok((claims, idx));
             }
@@ -2133,6 +2224,50 @@ fn spawn_discovery_task(
     })
 }
 
+/// Admission bound on how many providers one token can be verified against.
+///
+/// A token is a candidate for every provider pinning its exact `iss` plus
+/// every provider pinning none, so each issuer realm's count plus the
+/// issuer-less count must stay within [`MAX_JWKS_CANDIDATE_PROVIDERS`], and
+/// the total within [`MAX_JWKS_PROVIDERS`]. Returns the refusal reason.
+pub(crate) fn jwks_provider_bound_error<'a, I>(issuers: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<&'a str>>,
+{
+    let mut total = 0usize;
+    let mut open = 0usize;
+    let mut per_issuer: HashMap<&str, usize> = HashMap::new();
+    for issuer in issuers {
+        total += 1;
+        match issuer {
+            Some(issuer) => *per_issuer.entry(issuer).or_insert(0) += 1,
+            None => open += 1,
+        }
+    }
+    if total > MAX_JWKS_PROVIDERS {
+        return Some(format!(
+            "at most {MAX_JWKS_PROVIDERS} providers are supported in one instance"
+        ));
+    }
+    if open > MAX_JWKS_CANDIDATE_PROVIDERS {
+        return Some(format!(
+            "at most {MAX_JWKS_CANDIDATE_PROVIDERS} providers may omit `issuer`, because a token \
+             is verified against every provider without one"
+        ));
+    }
+    if per_issuer
+        .values()
+        .any(|count| count + open > MAX_JWKS_CANDIDATE_PROVIDERS)
+    {
+        return Some(format!(
+            "providers sharing one `issuer`, plus providers without an `issuer`, must total \
+             at most {MAX_JWKS_CANDIDATE_PROVIDERS}, because a token is verified against each \
+             of them"
+        ));
+    }
+    None
+}
+
 /// Try to validate a JWT against a single provider's current trusted JWKS.
 ///
 /// Key selection is the JWT header `kid` via [`verify_jwt_with_jwks`]: missing,
@@ -3043,4 +3178,83 @@ fn hostname_from_url(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
         .and_then(|u| hostname_from_parsed_url(&u))
+}
+
+#[cfg(test)]
+mod verification_bound_tests {
+    //! The per-token verification bound is observed on the real
+    //! authentication path; the recorder exists only in test builds.
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::json;
+
+    fn jwks() -> String {
+        // A syntactically valid 2048-bit RSA key; no token here is signed by
+        // it, so every attempted verification runs and fails.
+        json!({"keys": [{
+            "kty": "RSA",
+            "kid": "k1",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode([0xC3u8; 256]),
+            "e": "AQAB"
+        }]})
+        .to_string()
+    }
+
+    fn forged(payload: &Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"k1","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("{header}.{body}.c2lnbmF0dXJl")
+    }
+
+    #[tokio::test]
+    async fn each_candidate_is_verified_once_and_nothing_else() {
+        let jwks = jwks();
+        let shared = "https://shared.example.com";
+        let mut providers = Vec::new();
+        for _ in 0..6 {
+            providers.push(json!({"issuer": shared, "jwks": jwks}));
+        }
+        for i in 0..50 {
+            providers
+                .push(json!({"issuer": format!("https://other{i}.example.com"), "jwks": jwks}));
+        }
+        providers.push(json!({"jwks": jwks}));
+        providers.push(json!({"jwks": jwks}));
+        let plugin = JwksAuth::new(
+            &json!({"providers": providers}),
+            PluginHttpClient::default(),
+        )
+        .expect("valid config");
+        plugin.warmup_jwks().await;
+
+        let cases: Vec<(Value, Vec<usize>)> = vec![
+            (
+                json!({"iss": shared, "sub": "x"}),
+                vec![0, 1, 2, 3, 4, 5, 56, 57],
+            ),
+            (json!({"iss": "https://unknown.example.com"}), vec![56, 57]),
+            (json!({"sub": "x"}), vec![56, 57]),
+            (
+                json!({"iss": [shared, "https://other1.example.com"]}),
+                vec![56, 57],
+            ),
+            (json!({"iss": 42}), vec![56, 57]),
+        ];
+        let all: Vec<usize> = (0..plugin.providers.len()).collect();
+        for (payload, expected) in cases {
+            let token = forged(&payload);
+            assert!(
+                plugin
+                    .validate_token_for_providers(&token, &all)
+                    .await
+                    .is_err()
+            );
+            let attempts = std::mem::take(&mut *plugin.verification_attempts.lock().unwrap());
+            assert_eq!(attempts, expected, "payload {payload}");
+            assert!(attempts.len() <= MAX_JWKS_CANDIDATE_PROVIDERS);
+        }
+    }
 }

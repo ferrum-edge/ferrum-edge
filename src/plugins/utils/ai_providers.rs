@@ -40,6 +40,12 @@ pub struct AiTokenUsage {
     pub total_tokens: Option<u64>,
     pub model: Option<String>,
     pub provider: Option<AiProvider>,
+    /// Raw provider token categories behind `prompt_tokens` /
+    /// `completion_tokens`, for providers that report the billed input or
+    /// output as several separately omittable counters. Cumulative merging
+    /// combines these field by field before folding, so an update that omits
+    /// a category never erases one an earlier event reported.
+    pub categories: UsageCategories,
 }
 
 impl AiTokenUsage {
@@ -51,6 +57,24 @@ impl AiTokenUsage {
     /// is recomputed only with checked arithmetic when both components exist.
     pub fn merge_cumulative(&mut self, newer: Self) {
         if self.provider.is_some() && newer.provider.is_some() && self.provider != newer.provider {
+            return;
+        }
+        let has_categories = newer.categories.family.is_some();
+        let newer = self.categories.absorb(newer);
+        if has_categories {
+            // The merged categories hold the whole cumulative history, so their
+            // fold IS the current usage: assign it directly, `None` included,
+            // so a malformed, overflowing or inconsistent update clears a stale
+            // count instead of leaving it complete.
+            self.prompt_tokens = newer.prompt_tokens;
+            self.completion_tokens = newer.completion_tokens;
+            self.total_tokens = newer.total_tokens;
+            if newer.model.is_some() {
+                self.model = newer.model;
+            }
+            if newer.provider.is_some() {
+                self.provider = newer.provider;
+            }
             return;
         }
 
@@ -131,11 +155,20 @@ pub fn parse_ai_provider(provider: &str) -> Option<AiProvider> {
 }
 
 pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
-    if json
-        .get("usageMetadata")
-        .and_then(|usage| usage.get("promptTokenCount"))
-        .is_some()
-    {
+    // Any modeled Gemini counter identifies the format: proto3 JSON omits zero
+    // counters, so a usage block may legitimately lack `promptTokenCount`.
+    if json.get("usageMetadata").is_some_and(|usage| {
+        [
+            "promptTokenCount",
+            "candidatesTokenCount",
+            "completionTokenCount",
+            "thoughtsTokenCount",
+            "toolUsePromptTokenCount",
+            "totalTokenCount",
+        ]
+        .iter()
+        .any(|field| usage.get(field).is_some())
+    }) {
         return Some(AiProvider::Google);
     }
 
@@ -149,11 +182,17 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         return Some(AiProvider::OpenAi);
     }
 
-    if json
-        .get("usage")
-        .and_then(|usage| usage.get("input_tokens"))
-        .is_some()
-    {
+    // Anthropic's prompt-cache counters are discriminators too: a cache-only
+    // (or malformed cache-only) update must still reach the Anthropic fold.
+    if json.get("usage").is_some_and(|usage| {
+        [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .any(|field| usage.get(field).is_some())
+    }) {
         return Some(AiProvider::Anthropic);
     }
 
@@ -191,11 +230,20 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         return Some(AiProvider::Tgi);
     }
 
-    if json
-        .get("usage")
-        .and_then(|usage| usage.get("inputTokens"))
-        .is_some()
-    {
+    // Bedrock Converse `usage` uses camelCase counters no other supported
+    // provider shares; any one of them (a total-only or cache-only update
+    // included) identifies the format.
+    if json.get("usage").is_some_and(|usage| {
+        [
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "cacheReadInputTokens",
+            "cacheWriteInputTokens",
+        ]
+        .iter()
+        .any(|field| usage.get(field).is_some())
+    }) {
         return Some(AiProvider::Bedrock);
     }
 
@@ -472,50 +520,37 @@ fn extract_openai_usage(json: &Value, provider: AiProvider) -> AiTokenUsage {
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(provider),
+        ..Default::default()
     }
 }
 
 fn extract_anthropic_usage(json: &Value) -> AiTokenUsage {
-    let usage = json.get("usage");
-    let prompt = usage
-        .and_then(|value| value.get("input_tokens"))
-        .and_then(|value| value.as_u64());
-    let completion = usage
-        .and_then(|value| value.get("output_tokens"))
-        .and_then(|value| value.as_u64());
-    AiTokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: sum_pair(prompt, completion),
+    let categories = UsageCategories::anthropic(json.get("usage")).with_carrier(json.get("usage"));
+    let mut usage = AiTokenUsage {
         model: json
             .get("model")
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(AiProvider::Anthropic),
-    }
+        ..Default::default()
+    };
+    usage.apply_categories(categories);
+    usage
 }
 
 fn extract_google_usage(json: &Value) -> AiTokenUsage {
-    let usage = json.get("usageMetadata");
-    let prompt = usage
-        .and_then(|value| value.get("promptTokenCount"))
-        .and_then(|value| value.as_u64());
-    let completion = usage
-        .and_then(|value| value.get("candidatesTokenCount"))
-        .and_then(|value| value.as_u64());
-    AiTokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: usage
-            .and_then(|value| value.get("totalTokenCount"))
-            .and_then(|value| value.as_u64())
-            .or_else(|| sum_pair(prompt, completion)),
+    let categories =
+        UsageCategories::gemini(json.get("usageMetadata")).with_carrier(json.get("usageMetadata"));
+    let mut usage = AiTokenUsage {
         model: json
             .get("modelVersion")
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(AiProvider::Google),
-    }
+        ..Default::default()
+    };
+    usage.apply_categories(categories);
+    usage
 }
 
 fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
@@ -548,52 +583,112 @@ fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
             .and_then(|value| value.as_str())
             .map(String::from),
         provider: Some(AiProvider::Cohere),
+        ..Default::default()
     }
 }
 
 fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     let usage = json.get("usage");
-    let converse_prompt = usage
-        .and_then(|value| value.get("inputTokens"))
-        .and_then(|value| value.as_u64());
-    let converse_completion = usage
-        .and_then(|value| value.get("outputTokens"))
-        .and_then(|value| value.as_u64());
-    let titan_prompt = json
-        .get("inputTextTokenCount")
-        .and_then(|value| value.as_u64());
-    // Titan Text InvokeModel returns exactly one result for one invocation.
-    // More than one result is ambiguous, so do not sum it or select one.
-    let titan_completion = json
-        .get("results")
-        .and_then(|value| value.as_array())
+    // Converse reports uncached input separately from prompt-cache reads and
+    // writes; the billed input is their sum (AWS: `total input tokens =
+    // inputTokens + cacheReadInputTokens + cacheWriteInputTokens`).
+    if let Some(categories) = UsageCategories::bedrock_converse(usage) {
+        let mut converse = AiTokenUsage {
+            provider: Some(AiProvider::Bedrock),
+            ..Default::default()
+        };
+        converse.apply_categories(categories);
+        return converse;
+    }
+    // InvokeModel with a Claude model returns the native Anthropic Messages
+    // body (snake_case `input_tokens` / cache counters / `output_tokens`), so
+    // it folds with the Anthropic rule while keeping the Bedrock identity.
+    let native = usage
+        .is_some_and(|usage| {
+            [
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ]
+            .iter()
+            .any(|field| usage.get(field).is_some())
+        })
+        .then(|| {
+            let mut anthropic = extract_anthropic_usage(json);
+            anthropic.provider = Some(AiProvider::Bedrock);
+            anthropic
+        });
+    // Terminal invocation metrics co-located with that body are merged on top
+    // (same category layout), never dropped.
+    match (native, extract_bedrock_invocation_metrics(json)) {
+        (Some(mut native), Some(metrics)) => {
+            native.merge_cumulative(metrics);
+            return native;
+        }
+        (Some(native), None) => return native,
+        (None, Some(metrics)) => return metrics,
+        (None, None) => {}
+    }
+    // Titan counters live in the same raw layout as invocation metrics, so a
+    // later metrics-only chunk merges with them instead of erasing them.
+    let prompt = titan_prompt(json);
+    let completion = titan_completion(json);
+    let mut titan = AiTokenUsage {
+        provider: Some(AiProvider::Bedrock),
+        ..Default::default()
+    };
+    if prompt.is_some() || completion.is_some() {
+        titan.apply_categories(UsageCategories::bedrock_bases(prompt, completion));
+    }
+    titan
+}
+
+fn titan_prompt(json: &Value) -> Option<u64> {
+    json.get("inputTextTokenCount").and_then(Value::as_u64)
+}
+
+/// Titan Text InvokeModel returns exactly one result for one invocation. More
+/// than one result is ambiguous, so do not sum it or select one.
+fn titan_completion(json: &Value) -> Option<u64> {
+    json.get("results")
+        .and_then(Value::as_array)
         .filter(|results| results.len() == 1)
         .and_then(|results| results[0].get("tokenCount"))
-        .and_then(|value| value.as_u64());
-    // `InvokeModelWithResponseStream` terminal chunk. AWS documents these as the
-    // billed counts for the invocation, so they are authoritative for a native
-    // Bedrock event stream that carries no `usage` block at all.
-    let metrics = json.get("amazon-bedrock-invocationMetrics");
-    let metrics_prompt = metrics
-        .and_then(|value| value.get("inputTokenCount"))
-        .and_then(|value| value.as_u64());
-    let metrics_completion = metrics
-        .and_then(|value| value.get("outputTokenCount"))
-        .and_then(|value| value.as_u64());
-    let prompt = converse_prompt.or(titan_prompt).or(metrics_prompt);
-    let completion = converse_completion
-        .or(titan_completion)
-        .or(metrics_completion);
-    AiTokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: usage
-            .and_then(|value| value.get("totalTokens"))
-            .and_then(|value| value.as_u64())
-            .or_else(|| sum_pair(prompt, completion)),
-        model: None,
-        provider: Some(AiProvider::Bedrock),
+        .and_then(Value::as_u64)
+}
+
+/// `amazon-bedrock-invocationMetrics` of an `InvokeModelWithResponseStream`
+/// terminal chunk, independent of any native `usage` in the same event.
+///
+/// AWS documents these as the billed counts for the invocation. They may also
+/// carry `cacheReadInputTokenCount` / `cacheWriteInputTokenCount` beside an
+/// uncached `inputTokenCount`, the same layout as the Anthropic body the
+/// stream wraps, so they fold (and merge) as that layout. A streaming Titan
+/// chunk can carry `inputTextTokenCount` beside these metrics (and no
+/// `results`), so each base falls back to the Titan counter only where the
+/// metrics did not report it — in the RAW categories, so the fallback survives
+/// cumulative merging.
+pub fn extract_bedrock_invocation_metrics(json: &Value) -> Option<AiTokenUsage> {
+    let metrics = json.get("amazon-bedrock-invocationMetrics")?;
+    let mut categories =
+        UsageCategories::bedrock_invocation_metrics(Some(metrics)).with_carrier(Some(metrics));
+    if categories.prompt_base == Counter::Absent
+        && let Some(prompt) = titan_prompt(json)
+    {
+        categories.prompt_base = Counter::Value(prompt);
     }
+    if categories.completion_base == Counter::Absent
+        && let Some(completion) = titan_completion(json)
+    {
+        categories.completion_base = Counter::Value(completion);
+    }
+    let mut invoke = AiTokenUsage {
+        provider: Some(AiProvider::Bedrock),
+        ..Default::default()
+    };
+    invoke.apply_categories(categories);
+    Some(invoke)
 }
 
 /// Hugging Face TGI native usage.
@@ -621,6 +716,360 @@ fn extract_tgi_usage(json: &Value) -> AiTokenUsage {
         total_tokens: sum_pair(prompt, completion),
         model: None,
         provider: Some(AiProvider::Tgi),
+        ..Default::default()
+    }
+}
+
+/// The Anthropic `message_start` usage carrier with its `output_tokens`
+/// removed. That count is an initial placeholder (commonly 1); the cumulative
+/// output arrives on `message_delta`. Treating it as the completion count
+/// would make a stream interrupted before the terminal delta look complete.
+pub fn anthropic_message_start_usage(message: &Value) -> Value {
+    let mut usage = message.get("usage").cloned().unwrap_or(Value::Null);
+    if let Some(object) = usage.as_object_mut() {
+        object.remove("output_tokens");
+    }
+    serde_json::json!({ "usage": usage })
+}
+
+/// One raw provider counter. `Invalid` (present but not a non-negative
+/// integer) is kept distinct from `Absent` so a malformed field can never be
+/// read as "omitted, therefore zero".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Counter {
+    #[default]
+    Absent,
+    Value(u64),
+    Invalid,
+}
+
+impl Counter {
+    /// `null` is absence: Anthropic types its cache counters as nullable.
+    fn read(usage: Option<&Value>, field: &str) -> Self {
+        match usage.and_then(|value| value.get(field)) {
+            None | Some(Value::Null) => Self::Absent,
+            Some(value) => value.as_u64().map_or(Self::Invalid, Self::Value),
+        }
+    }
+
+    fn merge(&mut self, newer: Self) {
+        if newer != Self::Absent {
+            *self = newer;
+        }
+    }
+
+    fn is_reported(self) -> bool {
+        self != Self::Absent
+    }
+}
+
+/// Which provider's category layout a [`UsageCategories`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CategoryFamily {
+    /// `input_tokens` + `cache_creation_input_tokens` +
+    /// `cache_read_input_tokens`; `output_tokens`.
+    Anthropic,
+    /// `promptTokenCount` plus `toolUsePromptTokenCount`;
+    /// `candidatesTokenCount` plus `thoughtsTokenCount`; `totalTokenCount`.
+    /// proto3 JSON omits zero counters, so an omitted base is zero when a
+    /// sibling on its side is reported.
+    Gemini,
+    /// `inputTokens` + `cacheReadInputTokens` + `cacheWriteInputTokens`;
+    /// `outputTokens`; `totalTokens`.
+    BedrockConverse,
+}
+
+/// Raw token categories behind a folded prompt/completion pair.
+///
+/// The billed input of an Anthropic Messages or Bedrock Converse request is
+/// the uncached input PLUS prompt-cache writes and reads, which those
+/// providers report beside the base counter rather than inside it (Anthropic:
+/// total input is `cache_read_input_tokens` plus `cache_creation_input_tokens`
+/// plus `input_tokens`; AWS: `inputTokens` plus `cacheReadInputTokens` plus
+/// `cacheWriteInputTokens`). Gemini bills `toolUsePromptTokenCount` as input
+/// and `thoughtsTokenCount` as output outside `candidatesTokenCount`, and
+/// documents `totalTokenCount` as prompt plus tool-use prompt plus thoughts
+/// plus candidates. Folding here is the single rule every metering surface
+/// uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageCategories {
+    family: Option<CategoryFamily>,
+    prompt_base: Counter,
+    prompt_extras: [Counter; 2],
+    completion_base: Counter,
+    completion_extra: Counter,
+    reported_total: Counter,
+}
+
+impl UsageCategories {
+    fn anthropic(usage: Option<&Value>) -> Self {
+        Self {
+            family: Some(CategoryFamily::Anthropic),
+            prompt_base: Counter::read(usage, "input_tokens"),
+            prompt_extras: [
+                Counter::read(usage, "cache_creation_input_tokens"),
+                Counter::read(usage, "cache_read_input_tokens"),
+            ],
+            completion_base: Counter::read(usage, "output_tokens"),
+            completion_extra: Counter::Absent,
+            reported_total: Counter::Absent,
+        }
+    }
+
+    fn gemini(usage: Option<&Value>) -> Self {
+        // Both spellings are validated: a malformed alternate invalidates the
+        // completion even beside a valid canonical count (the stream router
+        // rejects the same response).
+        let candidates = match (
+            Counter::read(usage, "candidatesTokenCount"),
+            Counter::read(usage, "completionTokenCount"),
+        ) {
+            (Counter::Invalid, _) | (_, Counter::Invalid) => Counter::Invalid,
+            (Counter::Absent, alternate) => alternate,
+            (canonical, _) => canonical,
+        };
+        Self {
+            family: Some(CategoryFamily::Gemini),
+            prompt_base: Counter::read(usage, "promptTokenCount"),
+            prompt_extras: [
+                Counter::read(usage, "toolUsePromptTokenCount"),
+                Counter::Absent,
+            ],
+            completion_base: candidates,
+            completion_extra: Counter::read(usage, "thoughtsTokenCount"),
+            reported_total: Counter::read(usage, "totalTokenCount"),
+        }
+    }
+
+    /// `None` when the document carries no Converse `usage` counters at all.
+    fn bedrock_converse(usage: Option<&Value>) -> Option<Self> {
+        let categories = Self {
+            family: Some(CategoryFamily::BedrockConverse),
+            prompt_base: Counter::read(usage, "inputTokens"),
+            prompt_extras: [
+                Counter::read(usage, "cacheReadInputTokens"),
+                Counter::read(usage, "cacheWriteInputTokens"),
+            ],
+            completion_base: Counter::read(usage, "outputTokens"),
+            completion_extra: Counter::Absent,
+            reported_total: Counter::read(usage, "totalTokens"),
+        };
+        let malformed_carrier = usage.is_some_and(|usage| !usage.is_null() && !usage.is_object());
+        if malformed_carrier {
+            return Some(categories.with_carrier(usage));
+        }
+        let reported = categories.prompt_base.is_reported()
+            || categories.prompt_extras.iter().any(|c| c.is_reported())
+            || categories.completion_base.is_reported()
+            || categories.reported_total.is_reported();
+        reported.then_some(categories)
+    }
+
+    /// Bare Bedrock input/output counts (Titan), in the invocation-metrics
+    /// layout so they merge with later metrics chunks.
+    fn bedrock_bases(prompt: Option<u64>, completion: Option<u64>) -> Self {
+        Self {
+            family: Some(CategoryFamily::Anthropic),
+            prompt_base: prompt.map_or(Counter::Absent, Counter::Value),
+            completion_base: completion.map_or(Counter::Absent, Counter::Value),
+            ..Self::default()
+        }
+    }
+
+    /// `amazon-bedrock-invocationMetrics`, in the Anthropic layout (uncached
+    /// input + cache write + cache read; output), so terminal metrics merge
+    /// with the Anthropic events of the same InvokeModel stream instead of
+    /// replacing their cache categories.
+    fn bedrock_invocation_metrics(metrics: Option<&Value>) -> Self {
+        Self {
+            family: Some(CategoryFamily::Anthropic),
+            prompt_base: Counter::read(metrics, "inputTokenCount"),
+            prompt_extras: [
+                Counter::read(metrics, "cacheWriteInputTokenCount"),
+                Counter::read(metrics, "cacheReadInputTokenCount"),
+            ],
+            completion_base: Counter::read(metrics, "outputTokenCount"),
+            completion_extra: Counter::Absent,
+            reported_total: Counter::Absent,
+        }
+    }
+
+    /// A present usage carrier that is not an object (or `null`) is malformed:
+    /// mark the whole snapshot invalid so it unmeters instead of being read as
+    /// "nothing reported" while a stale count stays complete.
+    fn with_carrier(mut self, carrier: Option<&Value>) -> Self {
+        if carrier.is_some_and(|carrier| !carrier.is_null() && !carrier.is_object()) {
+            self.reported_total = Counter::Invalid;
+        }
+        self
+    }
+
+    /// The provider whose layout these categories carry, if any.
+    pub(crate) fn family_provider(&self) -> Option<AiProvider> {
+        match self.family? {
+            CategoryFamily::Anthropic => Some(AiProvider::Anthropic),
+            CategoryFamily::Gemini => Some(AiProvider::Google),
+            CategoryFamily::BedrockConverse => Some(AiProvider::Bedrock),
+        }
+    }
+
+    fn zero_omitted_base(&self) -> bool {
+        self.family == Some(CategoryFamily::Gemini)
+    }
+
+    fn merge(&mut self, newer: &Self) {
+        if self.family != newer.family {
+            *self = newer.clone();
+            return;
+        }
+        self.prompt_base.merge(newer.prompt_base);
+        for (current, newer) in self.prompt_extras.iter_mut().zip(newer.prompt_extras) {
+            current.merge(newer);
+        }
+        self.completion_base.merge(newer.completion_base);
+        self.completion_extra.merge(newer.completion_extra);
+        self.reported_total.merge(newer.reported_total);
+    }
+
+    /// Fold one side. `Absent` when the side was not reported (or only a
+    /// category was reported for a provider that always sends the base);
+    /// `Invalid` when any of its counters is malformed or their sum overflows
+    /// — never publish a partial or wrapped count as complete.
+    fn side(&self, base: Counter, extras: &[Counter]) -> Counter {
+        if base == Counter::Invalid || extras.contains(&Counter::Invalid) {
+            return Counter::Invalid;
+        }
+        let base = match base {
+            Counter::Value(base) => base,
+            // proto3 zero-omission: a reported sibling means the base was 0.
+            Counter::Absent
+                if self.zero_omitted_base() && extras.iter().any(|c| c.is_reported()) =>
+            {
+                0
+            }
+            // A category without the base its provider always sends is not a
+            // count of that side: unmeter it rather than undercount it.
+            Counter::Absent if extras.iter().any(|c| c.is_reported()) => {
+                return Counter::Invalid;
+            }
+            _ => return Counter::Absent,
+        };
+        let mut sum = base;
+        for counter in extras {
+            if let Counter::Value(value) = counter {
+                match sum.checked_add(*value) {
+                    Some(next) => sum = next,
+                    None => return Counter::Invalid,
+                }
+            }
+        }
+        Counter::Value(sum)
+    }
+
+    /// `(prompt invalid, completion invalid)` for the merged state.
+    ///
+    /// A malformed provider TOTAL invalidates both: the components can then no
+    /// longer be trusted to rebuild a complete total, so the usage is
+    /// unmetered as a whole rather than resynthesized from them.
+    pub(crate) fn invalid_sides(&self) -> (bool, bool) {
+        // Any malformed or overflowing counter unmeters the whole usage, so
+        // the consumer's unmetered-response policy decides, rather than a
+        // surviving side being read as a partial lower bound.
+        let any_invalid = self.reported_total == Counter::Invalid
+            || self.reported_floor().is_none()
+            || self.side(self.prompt_base, &self.prompt_extras) == Counter::Invalid
+            || self.side(self.completion_base, &[self.completion_extra]) == Counter::Invalid;
+        (any_invalid, any_invalid)
+    }
+
+    /// Checked sum of every counter this usage reported, base or category,
+    /// whether or not its side folds to a complete value. `None` (overflow)
+    /// means no complete total can be stated and a previously recorded one is
+    /// stale, so the whole usage is unmetered.
+    fn reported_floor(&self) -> Option<u64> {
+        let counters = [
+            self.prompt_base,
+            self.prompt_extras[0],
+            self.prompt_extras[1],
+            self.completion_base,
+            self.completion_extra,
+        ];
+        counters
+            .iter()
+            .try_fold(0u64, |sum, counter| match counter {
+                Counter::Value(value) => sum.checked_add(*value),
+                _ => Some(sum),
+            })
+    }
+
+    fn fold(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let prompt = self.side(self.prompt_base, &self.prompt_extras);
+        let completion = self.side(self.completion_base, &[self.completion_extra]);
+        let value = |side: Counter| match side {
+            Counter::Value(value) => Some(value),
+            _ => None,
+        };
+        // A malformed or overflowing side also invalidates the total: the
+        // whole usage is then unmetered rather than partially counted.
+        if self.reported_total == Counter::Invalid || self.reported_floor().is_none() {
+            return (None, None, None);
+        }
+        if prompt == Counter::Invalid || completion == Counter::Invalid {
+            return (None, None, None);
+        }
+        let (prompt, completion) = (value(prompt), value(completion));
+        let total = match self.reported_total {
+            // The provider total stays authoritative (it may cover a category
+            // this parser does not model) but never below the components the
+            // same usage reports, even when only one side is present.
+            // The floor counts EVERY reported counter, so a category reported
+            // without its base (cache reads beside an omitted input count)
+            // still keeps a low total from standing; an overflowing floor
+            // leaves the total unstated.
+            // A total below the reported counters is inconsistent; it can only
+            // be raised to them when every side is known, otherwise the result
+            // is a lower bound, not a complete total.
+            Counter::Value(reported) => self.reported_floor().and_then(|floor| {
+                if reported >= floor || (prompt.is_some() && completion.is_some()) {
+                    Some(reported.max(floor))
+                } else {
+                    None
+                }
+            }),
+            // Without a provider total, only both sides make a complete one.
+            _ => match (prompt, completion) {
+                (Some(p), Some(c)) => p.checked_add(c),
+                _ => None,
+            },
+        };
+        (prompt, completion, total)
+    }
+
+    /// Merge `newer`'s categories into this running state and return `newer`
+    /// with its counters replaced by the fold of the MERGED categories, so a
+    /// cumulative consumer sees the whole billed count even when this update
+    /// restated only some categories. A usage without categories passes
+    /// through unchanged.
+    pub(crate) fn absorb(&mut self, mut newer: AiTokenUsage) -> AiTokenUsage {
+        if newer.categories.family.is_none() {
+            return newer;
+        }
+        self.merge(&newer.categories);
+        let (prompt, completion, total) = self.fold();
+        newer.prompt_tokens = prompt;
+        newer.completion_tokens = completion;
+        newer.total_tokens = total;
+        newer
+    }
+}
+
+impl AiTokenUsage {
+    fn apply_categories(&mut self, categories: UsageCategories) {
+        let (prompt, completion, total) = categories.fold();
+        self.prompt_tokens = prompt;
+        self.completion_tokens = completion;
+        self.total_tokens = total;
+        self.categories = categories;
     }
 }
 

@@ -12412,6 +12412,34 @@ async fn route_tool_call_arguments(
     ctx
 }
 
+/// `log_raw_arguments` copies at most 4096 bytes into request metadata and
+/// flags a cut value, so one call cannot put an unbounded string into every
+/// transaction log line.
+#[tokio::test]
+async fn raw_argument_logging_is_bounded() {
+    let long = "\u{00e9}".repeat(5000);
+    let ctx = route_tool_call_arguments(false, false, true, json!({ "body": long })).await;
+    let logged = ctx
+        .metadata
+        .get("mcp.arguments")
+        .expect("raw arguments are logged");
+    assert!(logged.len() <= 4096, "logged {} bytes", logged.len());
+    assert!(logged.starts_with(r#"{"body":""#), "{logged}");
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.arguments_truncated")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    let ctx = route_tool_call_arguments(false, false, true, json!({ "repo": 42 })).await;
+    assert_eq!(
+        ctx.metadata.get("mcp.arguments").map(String::as_str),
+        Some(r#"{"repo":42}"#)
+    );
+    assert!(!ctx.metadata.contains_key("mcp.arguments_truncated"));
+}
+
 /// Issue #5357: argument observation is its own setting. Turning schema
 /// validation off must not silently turn the requested observation off with it.
 #[tokio::test]

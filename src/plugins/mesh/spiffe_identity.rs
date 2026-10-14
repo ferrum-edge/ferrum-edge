@@ -275,11 +275,24 @@ impl SpiffeIdentity {
             Value::Object(_) => {
                 Err("spiffe_identity: no configuration fields are supported".to_string())
             }
+            // Name only the JSON type: echoing the rejected value would copy an
+            // arbitrarily large admin payload into the error and the logs.
             other => Err(format!(
-                "spiffe_identity: `config` must be an object, got: {other:?}",
-                other = other.to_string()
+                "spiffe_identity: `config` must be an object, got a JSON {}",
+                json_type_name(other)
             )),
         }
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

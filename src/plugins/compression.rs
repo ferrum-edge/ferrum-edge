@@ -619,7 +619,7 @@ impl CompressionPlugin {
                 "br" if self.config.brotli_enabled => {}
                 "gzip" => return Err("unsupported content-encoding 'gzip'".to_string()),
                 "br" => return Err("unsupported content-encoding 'br'".to_string()),
-                other => return Err(format!("unsupported content-encoding '{other}'")),
+                _ => return Err("unsupported content-encoding token".to_string()),
             }
         }
         // A single coding records its canonical member (`parse_content_codings`
@@ -733,9 +733,9 @@ impl CompressionPlugin {
         let plan = match self.classify_request_content_encoding(&ce) {
             Ok(plan) => plan,
             Err(e) => {
-                warn_sampled!(
-                    "compression: rejecting request with invalid Content-Encoding '{ce}': {e}"
-                );
+                // The client-supplied header value is not echoed: it is
+                // attacker-chosen text up to the header size limit.
+                warn_sampled!("compression: rejecting request with invalid Content-Encoding: {e}");
                 return PluginResult::Reject {
                     status_code: 400,
                     body: r#"{"error":"Malformed or unsupported Content-Encoding"}"#.to_string(),
