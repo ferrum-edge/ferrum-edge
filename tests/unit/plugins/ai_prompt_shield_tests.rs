@@ -4930,3 +4930,39 @@ async fn escaped_placeholder_growth_is_charged() {
         Some("redaction_budget_exceeded")
     );
 }
+
+/// Numeric scalars replaced by a placeholder string are charged their
+/// serialized growth too (escaped placeholder plus quotes).
+#[tokio::test]
+async fn numeric_scalar_redaction_charges_escaped_growth() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "scan_fields": "all",
+        "patterns": [],
+        "custom_patterns": [{"name": "digit", "regex": "7"}],
+        "redaction_placeholder": "\u{0}".repeat(512)
+    }))
+    .unwrap();
+
+    // 10 numeric 7s: ~30.7 KB of serialized growth fits the 64 KiB floor.
+    let small = json!({"values": vec![7; 10]});
+    let mut ctx = make_post_ctx(&small);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // 30 numeric 7s: 15 KB decoded, ~92 KB serialized.
+    let large = json!({"values": vec![7; 30]});
+    let mut ctx = make_post_ctx(&large);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
+    assert_eq!(
+        ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+        Some("redaction_budget_exceeded")
+    );
+
+    // Mixed numeric and string values share the allowance.
+    let mixed = json!({"values": vec![7; 15], "prompt": "7".repeat(15)});
+    let mut ctx = make_post_ctx(&mixed);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
+}

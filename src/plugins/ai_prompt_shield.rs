@@ -3908,8 +3908,11 @@ fn redact_json_strings(
             let rendered = n.to_string();
             if let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(&rendered)) {
                 // Replacing a scalar can grow the document just like rewriting
-                // a string, so charge the same aggregate allowance.
-                let growth = pattern.placeholder.len().saturating_sub(rendered.len());
+                // a string, so charge the same aggregate allowance, measured
+                // as serialized: the escaped placeholder plus its quotes.
+                let growth = super::ai_response_guard::json_escaped_len(&pattern.placeholder)
+                    .saturating_add(2)
+                    .saturating_sub(rendered.len());
                 if growth > 0 && !budget.charge_growth(growth) {
                     return;
                 }
