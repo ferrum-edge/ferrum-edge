@@ -2335,3 +2335,20 @@ async fn test_transaction_debugger_redacts_credential_class_headers_in_both_dire
     assert!(logs.contains("safe-request-value"), "{logs}");
     assert!(logs.contains("safe-response-value"), "{logs}");
 }
+
+/// Issue #6619: text bodies drop `name=value` / `name: value` lines whose
+/// field name is credential-shaped, keeping ordinary prose lines.
+#[test]
+fn test_text_body_drops_credential_class_field_lines() {
+    let plugin = capture_plugin();
+    let body = b"hsm_pin=735102\ntotp_seed=482913\ncsrf: opaque-value\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body, BodyKind::Text, 512);
+    for secret in ["735102", "482913", "opaque-value"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}

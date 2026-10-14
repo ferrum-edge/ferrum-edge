@@ -253,6 +253,7 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "MfA_RECOVERY_CODE",
         "PiN1",
         "mFaRecoveryCode",
+        "ACCESS_TOKENS",
         "SIGNINGKEYUTF8",
         "signingkey1base64url",
         "PRIVATE_EC_P256_PKCS8_PEM_KEY",

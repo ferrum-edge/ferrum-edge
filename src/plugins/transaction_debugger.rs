@@ -767,6 +767,11 @@ impl TransactionDebugger {
             // classifier is for key names and would drop prose such as
             // `auth_method=jwt_auth` (issue #6619).
             || is_sensitive_name_by_listed_rules(&lowered)
+            // A `name=value` / `name: value` line whose field name is
+            // credential-shaped (`hsm_pin=…`, `csrf: …`) is dropped too.
+            || line
+                .split_once(['=', ':'])
+                .is_some_and(|(name, _)| is_sensitive_header_name(name.trim()))
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
             || lowered.contains("eyj")
