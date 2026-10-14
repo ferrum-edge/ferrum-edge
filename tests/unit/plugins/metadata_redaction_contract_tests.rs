@@ -636,6 +636,19 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "signingKeyBase64Url",
     "signingkeybase64url",
     "signingkey1",
+    // Owner-qualified `…pass` joined, then `phrase` / `code` split off.
+    "gpgpass_phrase",
+    "GPGPASS_PHRASE",
+    "x-gpgpass-phrase",
+    "vaultPass_code",
+    // Key material with the qualifier after `key`.
+    "key_private",
+    "keyPrivate",
+    "x-key-private",
+    "key_signing",
+    "keys_private",
+    "mesh.key_private",
+    "keyprivate",
     "x-signingKey1Base64Url",
     "x-dbPin1Value",
     "x-signingKeyEncoded",
@@ -774,6 +787,10 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "assess_score",
     "clientKeyboard",
     "cacheKey",
+    "bypass_code",
+    "compass_word",
+    "key_count",
+    "keyspace_name",
 ];
 
 #[test]
@@ -874,4 +891,13 @@ fn header_names_never_take_the_metadata_outcome_exemption() {
     assert!(is_sensitive_header_name(exempt));
     assert!(is_sensitive_header_name("x-session-id"));
     assert!(!is_sensitive_header_name("x-request-id"));
+    // Debugger header capture and header-tag admission share this decision.
+    for header in [
+        "x-key-private",
+        "x-keyprivate",
+        "x-gpgpass-phrase",
+        "x-key-signing",
+    ] {
+        assert!(is_sensitive_header_name(header), "{header}");
+    }
 }

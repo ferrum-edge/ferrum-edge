@@ -337,35 +337,62 @@ pub struct TransactionDebugger {
 /// several assignments per line (`auth_method=jwt_auth hsm_pin=3`).
 fn assignment_field_names(line: &str) -> impl Iterator<Item = &str> {
     line.match_indices(['=', ':'])
-        .filter_map(move |(offset, _)| {
-            let before = line[..offset].trim_end();
-            // A quoted field name is taken whole, spaces and punctuation included
-            // (`"totp seed": …`, `"hsm_pin[]": …`, `'a \'b\'' = …`).
-            if let Some(quote) = before.chars().last().filter(|ch| matches!(ch, '"' | '\'')) {
-                let inner = &before[..before.len() - quote.len_utf8()];
-                let mut open = None;
-                for (index, ch) in inner.char_indices().rev() {
-                    if ch == quote && !inner[..index].ends_with('\\') {
-                        open = Some(index + ch.len_utf8());
-                        break;
-                    }
-                }
-                let name = &inner[open.unwrap_or(0)..];
-                return (!name.is_empty()).then_some(name);
-            }
-            // Walk back over identifier characters by `char_indices`, so a
-            // multi-byte character in front of the name never yields an index
-            // inside it.
-            let start = before
+        .filter_map(move |(offset, _)| assignment_field_name(line, offset))
+        .flat_map(|name| {
+            // Judge the whole token, and also its trailing identifier run, so
+            // exact-name policies (`redacted_body_fields`, listed headers)
+            // still match after a prefix such as `/callback?code`.
+            let tail_start = name
                 .char_indices()
                 .rev()
                 .find(|(_, ch)| {
                     !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '[' | ']'))
                 })
                 .map_or(0, |(index, ch)| index + ch.len_utf8());
-            let name = &before[start..];
-            (!name.is_empty()).then_some(name)
+            let tail = &name[tail_start..];
+            [
+                Some(name),
+                (tail_start > 0 && !tail.is_empty()).then_some(tail),
+            ]
+            .into_iter()
+            .flatten()
         })
+}
+
+/// The field name assigned at `offset` (an `=` / `:` in `line`).
+fn assignment_field_name(line: &str, offset: usize) -> Option<&str> {
+    let before = line[..offset].trim_end();
+    // A quoted field name is taken whole, spaces and punctuation included
+    // (`"totp seed": …`, `"hsm_pin[]": …`, `'a \'b\'' = …`).
+    if let Some(quote) = before.chars().last().filter(|ch| matches!(ch, '"' | '\'')) {
+        let inner = &before[..before.len() - quote.len_utf8()];
+        let mut open = None;
+        for (index, ch) in inner.char_indices().rev() {
+            if ch == quote && !inner[..index].ends_with('\\') {
+                open = Some(index + ch.len_utf8());
+                break;
+            }
+        }
+        let name = &inner[open.unwrap_or(0)..];
+        return (!name.is_empty()).then_some(name);
+    }
+    // An unquoted name is the whole token back to the previous
+    // assignment / prose separator, Unicode and punctuation included
+    // (`hsm_piné`, `hsm_pin/opaque`); the shared segmenter judges it.
+    // `char_indices` keeps the start on a character boundary.
+    let start = before
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '&' | ';' | ',' | '=' | ':' | '{' | '}' | '(' | ')' | '"' | '\''
+                )
+        })
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    let name = &before[start..];
+    (!name.is_empty()).then_some(name)
 }
 
 impl TransactionDebugger {

@@ -2386,6 +2386,24 @@ fn test_text_body_assignment_parsing_handles_utf8_and_quotes() {
     );
 }
 
+/// Unquoted field names are kept whole up to a separator, so a Unicode or
+/// punctuation suffix cannot cut the credential segment off the name.
+#[test]
+fn test_text_body_unquoted_field_names_keep_unicode_and_punctuation() {
+    let plugin = capture_plugin();
+    let body = "hsm_pin\u{e9}=735107\nhsm_pin/opaque=735108\nnote x-key-private=735109\n/cb?code=735110\ncaf\u{e9}=visible-cafe\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in ["735107", "735108", "735109", "735110"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(text.rendered.contains("visible-cafe"), "{}", text.rendered);
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}
+
 /// Quoted field names are classified whole (spaces, brackets, escapes).
 #[test]
 fn test_text_body_quoted_field_names_are_classified_whole() {

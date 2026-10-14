@@ -383,7 +383,58 @@ fn has_inline_key_material(lower: &str) -> bool {
         lower
             .find(qualifier)
             .is_some_and(|offset| names_key_material(&lower[offset + qualifier.len()..]))
+    }) || has_reverse_inline_key_material(lower)
+}
+
+/// Reverse order inside one segment: `key` / `keys` (optionally with
+/// digits) directly followed by a key-material qualifier (`keyprivate`,
+/// `keyssigning`, `key2rsa`). `key` closing an ordinary word (`monkey`,
+/// `turkey`) does not count.
+fn has_reverse_inline_key_material(lower: &str) -> bool {
+    lower.match_indices("key").any(|(offset, _)| {
+        let end = offset + "key".len();
+        if BENIGN_KEY_WORDS
+            .iter()
+            .any(|word| lower[..end].ends_with(word))
+        {
+            return false;
+        }
+        let rest = &lower[end..];
+        let rest = rest.strip_prefix('s').unwrap_or(rest);
+        let rest = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
+        CREDENTIAL_KEY_QUALIFIERS
+            .iter()
+            .any(|qualifier| rest.starts_with(qualifier))
     })
+}
+
+/// Whether a whole segment is a bare key word (`key`, `keys`, `key1`) that a
+/// directly following qualifier segment turns into key material
+/// (`key_private`, `x-key-signing`, `keyPrivate`).
+fn is_bare_key_segment(lower: &str) -> bool {
+    let rest = lower
+        .strip_prefix("key")
+        .map(|rest| rest.strip_prefix('s').unwrap_or(rest));
+    rest.is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Ordinary words that end in `pass` and do not start a passphrase /
+/// passcode / password compound across segments.
+const BENIGN_PASS_ENDINGS: &[&str] = &[
+    "bypass",
+    "compass",
+    "surpass",
+    "overpass",
+    "underpass",
+    "trespass",
+    "encompass",
+];
+
+/// Whether a segment ends in `pass` so that a following `phrase` / `code` /
+/// `word` segment completes a credential (`pass_phrase`, `gpgpass_phrase`,
+/// `x-vaultpass-code`).
+fn ends_credential_pass(lower: &str) -> bool {
+    lower.ends_with("pass") && !BENIGN_PASS_ENDINGS.contains(&lower)
 }
 
 /// What may follow `key` / `keys` and still name key material
@@ -757,6 +808,10 @@ fn lowered_segment_is_credential(lower: &str, in_key_context: bool) -> bool {
 ///   encoding words (`rsa`, `pem`, `ed25519`, …), within one segment
 ///   (`privatekey`, `awsaccesskeyid`) or across segments (`private_key`,
 ///   `private_rsa_key`, `privateRsaKey`).
+///   The reverse order is key material too (`key_private`, `keyPrivate`,
+///   `keysigning`);
+/// * an owner-qualified segment ending in `pass` followed by `phrase` /
+///   `code` / `word` (`gpgpass_phrase`); `bypass_code` stays visible.
 ///
 /// Lowercased compounds are recognized as well as camelCase ones, so a name
 /// normalized before classification (an HTTP header name) cannot slip past.
@@ -800,6 +855,7 @@ fn classify_credential_class_segments(key: &str) -> bool {
     let mut sensitive = false;
     let mut in_key_context = false;
     let mut previous_is_pass = false;
+    let mut previous_is_bare_key = false;
     let mut in_mfa_context = false;
     let mut in_token_credential_context = false;
     for_each_metadata_key_segment(key, |segment| {
@@ -834,9 +890,13 @@ fn classify_credential_class_segments(key: &str) -> bool {
             || lower
                 .find("mfa")
                 .is_some_and(|offset| names_mfa_material(&lower[offset + "mfa".len()..]));
-        sensitive = sensitive || is_credential_token_plural(lower, in_token_credential_context);
+        sensitive = sensitive
+            || is_credential_token_plural(lower, in_token_credential_context)
+            // Reverse order across segments: `key_private`, `x-key-signing`.
+            || (previous_is_bare_key && opens_key_context(lower));
         in_token_credential_context |= opens_token_credential_context(lower);
-        previous_is_pass = lower == "pass";
+        previous_is_pass = ends_credential_pass(lower);
+        previous_is_bare_key = is_bare_key_segment(lower);
         in_mfa_context |= lower.contains("mfa");
         // Once a qualifier appears, the context stays open for the rest of
         // the key: a later `key` segment is key material.
