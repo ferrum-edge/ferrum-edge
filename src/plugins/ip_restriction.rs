@@ -2,7 +2,12 @@
 //!
 //! Standalone IP-based access control plugin, independent of consumer
 //! authentication. Supports exact IPs, CIDR notation, and IPv6.
-//! Operates in either allow-first or deny-first mode.
+//!
+//! The decision is fixed: a deny match always rejects, and a non-empty allow
+//! list rejects every address outside it. The deprecated `mode` key
+//! (`allow_first` / `deny_first`) never changes whether a request is admitted
+//! (issue #6610). It only picks which rejection body and log reason an address
+//! that is both outside the allow list and on the deny list receives.
 //!
 //! Rules are compiled on the cold path into sorted, merged numeric intervals.
 //! Request matching is allocation-free, lock-free, and O(log n) in the number
@@ -170,6 +175,9 @@ impl IpRestriction {
             };
         };
 
+        // Both arms reject exactly the same addresses (deny wins, then the
+        // allow list must match); `mode` only orders the two checks, which
+        // decides the reported reason for an address that fails both.
         match self.mode {
             Mode::AllowFirst => {
                 if !self.allow.is_empty() && !self.allow.contains(client_ip) {

@@ -3916,13 +3916,17 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
+| `allowed_consumers` | String[] | (omitted) | Consumer usernames explicitly allowed. Omit it for no username allow check; an explicitly empty array is rejected. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. An external principal above the 512-byte authenticated-principal limit is rejected during authentication, so entries longer than that can never match. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
+| `allowed_groups` | String[] | (omitted) | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Omit it for no group allow check; an explicitly empty array is rejected. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy.
+An allow-list that is present must name at least one entry: `allowed_consumers: []` or
+`allowed_groups: []` is rejected at config validation. An empty allow-list has nothing to
+match, so it can mean neither "allow nobody" nor "no restriction" safely; omit the key
+when no allow restriction is intended. Empty deny-lists remain accepted and deny nothing.
 Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
 semantics; accepted rule values are still stored and matched byte-for-byte.
 
@@ -4178,7 +4182,7 @@ Restricts access based on client IP address or CIDR range. Runs on every protoco
 |---|---|---|---|
 | `allow` | String[] | `[]` | Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty disables allow-list enforcement. |
 | `deny` | String[] | `[]` | Denied IP addresses or CIDR ranges (IPv4 or IPv6). Empty disables deny-list enforcement. |
-| `mode` | String | `allow_first` | `allow_first` or `deny_first` — controls list evaluation order for non-overlapping rules. Deny always wins on overlap. |
+| `mode` | String | `allow_first` | Deprecated and decision-neutral. `allow_first` or `deny_first` only selects the rejection reason for an address that is both outside `allow` and on `deny`; it never changes whether a request is admitted. |
 
 At least one of `allow` or `deny` must be configured. Empty config or both lists empty rejects plugin creation.
 
@@ -4186,7 +4190,7 @@ The config must be an object containing only `allow`, `deny`, and `mode`. Unknow
 
 Rules are validated and compiled at config load time into sorted, merged numeric intervals; duplicates, overlaps, and adjacent ranges collapse without changing inclusive CIDR boundaries. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. IPv4 rule octets must use canonical unsigned decimal notation, so ambiguous forms such as `010.1.2.3` and `+10.1.2.3` are rejected. Request-time lookup is allocation-free, lock-free, and O(log n) in the number of non-overlapping intervals rather than a scan of configured rules. The authoritative client IP is parsed and canonicalized once per request, TCP connection, or UDP/DTLS session and the typed value is reused by every attached `ip_restriction` instance. IPv4-mapped IPv6 identities normalize to IPv4 before policy; mapped CIDR rules therefore accept only `/96`–`/128`, which map to IPv4 `/0`–`/32`, while shorter mapped prefixes are rejected as ambiguous. Native IPv6 CIDRs accept `/0`–`/128`; IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching. A malformed authoritative client IP always fails closed. Debug-level construction logs expose only the selected mode and effective IPv4/IPv6 interval counts, never configured addresses.
 
-When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
+When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`, and a non-empty `allow` list always rejects addresses outside it. `mode` does not change that decision in either setting: an allow entry can never carve an exception out of a broader deny rule. Its only effect is which rejection an address that fails both checks receives (`allow_first`: `IP address not allowed`; `deny_first`: `IP address denied`). `mode` is deprecated and kept only so existing configurations still load; to admit a host inside a denied range, narrow the `deny` rules instead.
 
 ### `geo_restriction`
 

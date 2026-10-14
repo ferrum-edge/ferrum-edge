@@ -28619,8 +28619,10 @@ components:
         (consumer username → group) then allow (consumer username → group).
         Deny always overrides allow. At least one of `allowed_consumers`,
         `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or
-        `allow_authenticated_identity=true` must be configured. Unknown config
-        keys are rejected. `allow_authenticated_identity=true` cannot be combined
+        `allow_authenticated_identity=true` must be configured, and an allow-list
+        (`allowed_consumers`/`allowed_groups`) that is present must be non-empty:
+        omit it for no allow restriction. Unknown config keys are rejected.
+        `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
         ip_restriction for IP/CIDR rules. Rule entries match principal values
@@ -28667,16 +28669,17 @@ components:
       properties:
         allowed_consumers:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             maxLength: 255
             pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
-          default: []
           description: >-
-            Consumer usernames that are explicitly allowed. Empty list disables
-            the username allow check (other allow rules still apply). Each
-            entry is at most 255 Unicode characters.
+            Consumer usernames that are explicitly allowed. Omit the key for no
+            username allow check (other allow rules still apply). An explicitly
+            empty array is rejected rather than read as allow-all or deny-all.
+            Each entry is at most 255 Unicode characters.
         disallowed_consumers:
           type: array
           items:
@@ -28694,16 +28697,17 @@ components:
             external identities fail closed at runtime.
         allowed_groups:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             maxLength: 255
             pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
-          default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
-            any of the consumer's `acl_groups` appears in this list. Each
-            entry is at most 255 Unicode characters.
+            any of the consumer's `acl_groups` appears in this list. Omit the
+            key for no group allow check; an explicitly empty array is
+            rejected. Each entry is at most 255 Unicode characters.
         disallowed_groups:
           type: array
           items:
@@ -28928,12 +28932,15 @@ components:
           type: string
           enum: [allow_first, deny_first]
           default: allow_first
+          deprecated: true
           description: >-
-            Order of list evaluation for non-overlapping rules. `allow_first`
-            (default) reject when an allow list is configured but the IP is not
-            in it, otherwise check deny. `deny_first` rejects on any deny match
-            first, then enforces the allow list. When the same IP matches both
-            lists, deny always wins regardless of mode.
+            Deprecated and decision-neutral: `mode` never changes whether a
+            request is admitted. A deny match always rejects, and a non-empty
+            allow list always rejects addresses outside it, in either mode. The
+            only effect is which rejection an address that is both outside the
+            allow list and on the deny list receives: `allow_first` (default)
+            reports "IP address not allowed", `deny_first` reports "IP address
+            denied". An allow entry never overrides a deny entry.
 
     BotDetectionConfig:
       type: object
