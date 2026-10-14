@@ -187,6 +187,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Equal-priority plugins now run in a deterministic order** (issue #6614).
+  Ties used to follow config iteration order, which a database (unordered
+  `proxy_plugins` association rows), a reordered config file, or an
+  incremental reload could change. Chains now order by priority, then plugin
+  name, then scope (global, proxy, proxy group), then plugin-config id.
+  Candidate admission and every rebuild path use the same order. No two
+  built-in plugins share a default priority, so chains of distinct plugin
+  types are unchanged. Several instances of one plugin at the same priority
+  now run in plugin-config id order instead of config/association order, and
+  two `cors` instances sharing a priority can no longer be split by an
+  equal-priority interloper.
+- **Documented the custom-plugin trust boundary and constructor contract**
+  (issue #6616). `CUSTOM_PLUGINS.md` now states that `custom_plugins/` code is
+  trusted, in-process gateway code whose declared failure policy is taken as
+  given. It also says constructors double as validators and must be free of
+  side effects, because admin, CP, and `ferrum-edge validate` construct and
+  drop them.
 - **Plugin instances with a `priority_override` or trigger keep every
   capability declaration** (issue #6606). The cache wrapper did not forward
   `admits_authenticated_stream_principal`, `cors_uses_strict_origin_policy`

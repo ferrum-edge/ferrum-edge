@@ -14399,18 +14399,28 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
 
 #[test]
 fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interlopers() {
-    // Equal priorities follow config order for proxy instances, not association
-    // order. Put the interloper last in associations to expose that difference.
-    for middle_name in ["ip_restriction", "udp_rate_limiting"] {
+    // Equal priorities break ties by plugin name (issue #6614), so an
+    // equal-priority HTTP interloper sorts after both `cors` instances and can
+    // no longer split them, whatever the config or association order. A
+    // distinct middle priority still splits them, and only an HTTP interloper
+    // makes that an error. Admission and runtime must agree in every scope and
+    // under both input orders.
+    for (middle_name, middle_priority, expect_ok) in [
+        ("ip_restriction", 100, true),
+        ("udp_rate_limiting", 100, true),
+        ("ip_restriction", 150, false),
+        ("udp_rate_limiting", 150, true),
+    ] {
+        let last_priority = if middle_priority == 100 { 100 } else { 200 };
         let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);
-        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(100), None);
+        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(last_priority), None);
         let mut middle = make_plugin_config_with_priority(
             "middle",
             middle_name,
             PluginScope::Proxy,
             Some("p1"),
             true,
-            Some(100),
+            Some(middle_priority),
             None,
         );
         for scope in [
@@ -14422,28 +14432,24 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
                 pc.scope = scope.clone();
                 pc.proxy_id = (scope == PluginScope::Proxy).then(|| "p1".to_string());
             }
-            let associations = if scope == PluginScope::ProxyGroup {
-                vec!["a", "middle", "b"]
-            } else {
-                vec!["a", "b", "middle"]
-            };
-            let config = make_config(
-                vec![make_proxy("p1", "/api", associations)],
-                vec![first.clone(), middle.clone(), last.clone()],
-            );
-            let admission =
-                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None);
-            let runtime = PluginCache::new(&config);
-            assert_eq!(
-                admission.is_ok(),
-                middle_name == "udp_rate_limiting",
-                "{middle_name}/{scope:?}: {admission:?}"
-            );
-            assert_eq!(
-                runtime.is_ok(),
-                admission.is_ok(),
-                "{middle_name}/{scope:?}"
-            );
+            for reversed in [false, true] {
+                let mut associations = vec!["a", "middle", "b"];
+                let mut plugin_configs = vec![first.clone(), middle.clone(), last.clone()];
+                if reversed {
+                    associations.reverse();
+                    plugin_configs.reverse();
+                }
+                let config =
+                    make_config(vec![make_proxy("p1", "/api", associations)], plugin_configs);
+                let label =
+                    format!("{middle_name}@{middle_priority}/{scope:?}/reversed={reversed}");
+                let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                    &config, None,
+                );
+                let runtime = PluginCache::new(&config);
+                assert_eq!(admission.is_ok(), expect_ok, "{label}: {admission:?}");
+                assert_eq!(runtime.is_ok(), admission.is_ok(), "{label}");
+            }
         }
     }
 }
@@ -14488,6 +14494,154 @@ fn candidate_topology_does_not_open_node_local_geo_database() {
             "{error}"
         );
     }
+}
+
+// ── Deterministic equal-priority ordering (issue #6614) ─────────────────────
+
+fn update_header_transformer(
+    id: &str,
+    value: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "request_transformer",
+        json!({"rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "x-order",
+            "value": value
+        }]}),
+        scope,
+        proxy_id,
+    )
+}
+
+fn chain_names(cache: &PluginCache, proxy_id: &str) -> Vec<String> {
+    cache
+        .get_plugins("ferrum", proxy_id)
+        .iter()
+        .map(|plugin| plugin.name().to_string())
+        .collect()
+}
+
+async fn final_order_header(cache: &PluginCache, proxy_id: &str) -> Option<String> {
+    let plugins = cache.get_plugins_for_protocol("ferrum", proxy_id, ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    for plugin in plugins.iter() {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    headers.get("x-order").cloned()
+}
+
+#[test]
+fn equal_priority_plugins_order_by_name_regardless_of_config_order() {
+    let mut size_limit = make_plugin_config(
+        "a-size",
+        "response_size_limiting",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    size_limit.priority_override = Some(500);
+    let mut ip_filter = make_plugin_config(
+        "z-ip",
+        "ip_restriction",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    ip_filter.priority_override = Some(500);
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["a-size", "z-ip"])],
+        vec![size_limit.clone(), ip_filter.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["z-ip", "a-size"])],
+        vec![ip_filter, size_limit],
+    );
+
+    let forward_names = chain_names(&PluginCache::new(&forward).unwrap(), "p1");
+    let reversed_names = chain_names(&PluginCache::new(&reversed).unwrap(), "p1");
+    assert_eq!(
+        forward_names,
+        vec!["ip_restriction", "response_size_limiting"]
+    );
+    assert_eq!(
+        forward_names, reversed_names,
+        "config row order must not reorder equal-priority plugins"
+    );
+}
+
+#[tokio::test]
+async fn same_plugin_instances_order_by_config_id_regardless_of_row_order() {
+    let a = update_header_transformer("rt-a", "a", PluginScope::Proxy, Some("p1"));
+    let b = update_header_transformer("rt-b", "b", PluginScope::Proxy, Some("p1"));
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt-a", "rt-b"])],
+        vec![a.clone(), b.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt-b", "rt-a"])],
+        vec![b, a],
+    );
+
+    // `update` is last-writer-wins, so the surviving value names the instance
+    // that ran last: ascending id order puts `rt-b` after `rt-a`.
+    let forward_cache = PluginCache::new(&forward).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+    let reversed_cache = PluginCache::new(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&reversed_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+
+    // A reload that only reorders rows keeps the same chain order.
+    forward_cache.rebuild(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+}
+
+#[tokio::test]
+async fn proxy_group_instances_order_by_config_id_regardless_of_association_order() {
+    let a = update_header_transformer("pg-a", "a", PluginScope::ProxyGroup, None);
+    let b = update_header_transformer("pg-b", "b", PluginScope::ProxyGroup, None);
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["pg-a", "pg-b"])],
+        vec![a.clone(), b.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["pg-b", "pg-a"])],
+        vec![b, a],
+    );
+
+    let forward_cache = PluginCache::new(&forward).unwrap();
+    let reversed_cache = PluginCache::new(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        final_order_header(&reversed_cache, "p1").await.as_deref(),
+        Some("b")
+    );
 }
 
 // ---- PluginInstanceWrapper forwards every capability predicate (#6606) ----
