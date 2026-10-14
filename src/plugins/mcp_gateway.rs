@@ -175,6 +175,11 @@ const MCP_VALIDATION_KEYS: &[&str] = &[
     "validate_tool_arguments",
     "validate_tool_results",
 ];
+/// Largest `mcp.arguments` value `observability.log_raw_arguments` copies into
+/// request metadata. Longer serialized arguments are cut at a UTF-8 boundary
+/// and flagged with `mcp.arguments_truncated`, so one call cannot put an
+/// arbitrarily large value into every transaction log line.
+const MAX_LOGGED_RAW_ARGUMENTS_BYTES: usize = 4096;
 const MCP_OBSERVABILITY_KEYS: &[&str] =
     &["emit_metadata", "log_argument_hash", "log_raw_arguments"];
 const MCP_SERVER_KEYS: &[&str] = &[
@@ -5007,8 +5012,19 @@ impl McpGateway {
                     .insert("mcp.arguments_hash".to_string(), hash_value(arguments));
             }
             if self.observability.log_raw_arguments {
-                ctx.metadata
-                    .insert("mcp.arguments".to_string(), arguments.to_string());
+                let mut raw = arguments.to_string();
+                if raw.len() > MAX_LOGGED_RAW_ARGUMENTS_BYTES {
+                    let mut end = MAX_LOGGED_RAW_ARGUMENTS_BYTES;
+                    while !raw.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    // A fresh bounded copy: `truncate` would keep the full
+                    // serialized allocation alive in request metadata.
+                    raw = raw[..end].to_owned();
+                    ctx.metadata
+                        .insert("mcp.arguments_truncated".to_string(), "true".to_string());
+                }
+                ctx.metadata.insert("mcp.arguments".to_string(), raw);
             }
             if self.validation.validate_tool_arguments {
                 match validate_json_schema(&entry.input_validator, arguments) {
@@ -6179,6 +6195,7 @@ impl McpGateway {
         ctx.metadata.remove("mcp.resource_uri");
         ctx.metadata.remove("mcp.upstream_resource_uri");
         ctx.metadata.remove("mcp.arguments");
+        ctx.metadata.remove("mcp.arguments_truncated");
         ctx.metadata.remove("mcp.arguments_hash");
         ctx.metadata.remove("mcp.input_schema_hash");
         ctx.metadata.remove("mcp.schema_validation");

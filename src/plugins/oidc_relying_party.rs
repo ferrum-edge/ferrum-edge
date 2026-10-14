@@ -1353,6 +1353,15 @@ impl OidcRelyingParty {
             );
         }
         if let Some(error) = ctx.query_params.get("error") {
+            // Relay the provider's error code only when it is a short
+            // token-like code (letters, digits, `_`, `-`, `.`), which covers
+            // every registered RFC 6749 / OIDC error code. Anything else is
+            // replaced so the callback never reflects arbitrary query text.
+            let error = if oauth_error_code_is_relayable(error) {
+                error.as_str()
+            } else {
+                "authorization_failed"
+            };
             return self.callback_reject(400, json!({"error": error}).to_string(), Some(&state));
         };
         let Some(code) = ctx.query_params.get("code").cloned() else {
@@ -4746,8 +4755,38 @@ pub(crate) mod refresh_flight_test_seams {
     }
 }
 
+/// Upper bound on a relayed provider `error` code. Registered codes are well
+/// under this length.
+const MAX_RELAYED_OAUTH_ERROR_CODE_BYTES: usize = 64;
+
+/// `true` when a callback `error` value is a plausible RFC 6749 error code.
+fn oauth_error_code_is_relayable(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_RELAYED_OAUTH_ERROR_CODE_BYTES
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callback_error_relay_admits_only_short_token_codes() {
+        use super::oauth_error_code_is_relayable;
+        for code in [
+            "access_denied",
+            "invalid_request",
+            "login_required",
+            "consent_required",
+            "temporarily_unavailable",
+        ] {
+            assert!(oauth_error_code_is_relayable(code), "{code}");
+        }
+        assert!(!oauth_error_code_is_relayable(""));
+        assert!(!oauth_error_code_is_relayable("access denied"));
+        assert!(!oauth_error_code_is_relayable("<script>alert(1)</script>"));
+        assert!(!oauth_error_code_is_relayable(&"a".repeat(65)));
+    }
 
     /// A per-process session secret for these tests. Published literals are
     /// refused by `reject_published_session_secret`, so tests never use one.

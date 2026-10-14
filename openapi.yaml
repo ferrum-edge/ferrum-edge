@@ -32318,9 +32318,10 @@ components:
                 description: >-
                   HTTP method token to match (omit or null to match all methods).
                   When supplied it must be a non-empty HTTP method token (runtime
-                  validates via http::Method). The configured method is
-                  normalized to uppercase and compared exactly with the request
-                  method.
+                  validates via http::Method). Registered standard methods are
+                  matched case-insensitively (get matches GET); extension
+                  methods are case-sensitive per RFC 9110 section 9.1 and match
+                  the configured spelling exactly.
               path:
                 type: string
                 minLength: 1
@@ -34152,8 +34153,8 @@ components:
               description: "Replace matches with [REDACTED:<type>:<hmac-prefix>] so identical values stay correlatable without storing the raw value. The digest is a keyed HMAC-SHA256 (see hash_secret), never a plain hash — most PII value spaces are small enough to brute-force offline from an unsalted digest."
             hash_secret:
               type: [string, "null"]
-              minLength: 16
-              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. The minimum length is counted in CHARACTERS (Unicode code points), matching this minLength — not in UTF-8 bytes, so an 8-character multi-byte secret is refused even though it carries 16 bytes. When set (min 16 characters), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted or null, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
+              minLength: 32
+              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. The minimum length is counted in CHARACTERS (Unicode code points), matching this minLength — not in UTF-8 bytes, so a 16-character multi-byte secret is refused even though it carries 32 bytes. When set (min 32 characters), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted or null, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
         limits:
           type: [object, "null"]
           additionalProperties: false
@@ -37631,7 +37632,7 @@ components:
             log_raw_arguments:
               type: [boolean, "null"]
               default: false
-              description: Copies raw MCP tool arguments into request metadata. Arguments can contain secrets or PII; prefer log_argument_hash unless the logging path is explicitly protected. Evaluated independently of validation.validate_tool_arguments.
+              description: Copies raw MCP tool arguments into request metadata (mcp.arguments), capped at 4096 bytes on a UTF-8 boundary; a longer value is cut and mcp.arguments_truncated is set to "true". Arguments can contain secrets or PII; prefer log_argument_hash unless the logging path is explicitly protected. Evaluated independently of validation.validate_tool_arguments.
             log_argument_hash:
               type: [boolean, "null"]
               default: true
