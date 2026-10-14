@@ -57,7 +57,7 @@ fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
 }
 
-fn live(client: &PluginHttpClient) -> &reqwest::Client {
+fn live(client: &PluginHttpClient) -> reqwest::Client {
     client.get().expect("test plugin HTTP client")
 }
 
@@ -935,7 +935,7 @@ fn plugin_http_client_production_builder_has_no_panic_or_expect() {
         "terminal construction failure must be represented as Option, not an assumed-live client"
     );
     assert!(
-        uncommented.contains("Result<&reqwest::Client, PluginHttpClientUnavailable>"),
+        uncommented.contains("Result<reqwest::Client, PluginHttpClientUnavailable>"),
         "get()/get_http2() must expose terminal construction failure without panicking"
     );
 }
@@ -1840,7 +1840,7 @@ mod plugin_egress_crls {
         // Baseline: the CA-signed certificate is trusted without a CRL.
         let no_crl = plugin_client(&ca_path, Vec::new());
         assert_eq!(
-            fetch(no_crl.get().expect("shared client"), port)
+            fetch(&no_crl.get().expect("shared client"), port)
                 .await
                 .expect("baseline fetch"),
             200
@@ -1854,7 +1854,7 @@ mod plugin_egress_crls {
             other_crl.get_http1().expect("HTTP/1.1 companion"),
         ] {
             assert_eq!(
-                fetch(client, port)
+                fetch(&client, port)
                     .await
                     .expect("fetch with an unrelated revocation"),
                 200
@@ -1870,7 +1870,7 @@ mod plugin_egress_crls {
             ("http1", revoked.get_http1().expect("HTTP/1.1 companion")),
         ] {
             assert!(
-                fetch(client, port).await.is_err(),
+                fetch(&client, port).await.is_err(),
                 "{shape} plugin client must refuse a certificate revoked by the gateway CRL"
             );
         }
@@ -1890,19 +1890,163 @@ mod plugin_egress_crls {
         let startup = vec![crl_revoking(&ca, OTHER_SERIAL)];
         let live = ferrum_edge::tls::shared_crl_list(Arc::new(startup.clone()));
         let client = plugin_client(&ca_path, startup).with_live_crls(Arc::clone(&live));
-        let shared = client.get().expect("shared client");
-        assert_eq!(fetch(shared, port).await.expect("startup generation"), 200);
+        let shared = || client.get().expect("shared client");
+        assert_eq!(
+            fetch(&shared(), port).await.expect("startup generation"),
+            200
+        );
 
         live.store(Arc::new(vec![crl_revoking(&ca, REVOKED_SERIAL)]));
         assert!(
-            fetch(shared, port).await.is_err(),
+            fetch(&shared(), port).await.is_err(),
             "a revocation published after startup must reach new plugin connections"
         );
 
         live.store(Arc::new(vec![crl_revoking(&ca, OTHER_SERIAL)]));
         assert_eq!(
-            fetch(shared, port).await.expect("revocation withdrawn"),
+            fetch(&shared(), port).await.expect("revocation withdrawn"),
             200
+        );
+    }
+
+    /// HTTPS origin that keeps connections alive and counts TLS handshakes.
+    async fn spawn_keepalive_https_origin(
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("leaf cert");
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("leaf key");
+        let provider = Arc::new(ferrum_edge::fips::base_crypto_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("server protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTPS origin");
+        let port = listener.local_addr().expect("origin address").port();
+        let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&handshakes);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    let mut request = Vec::new();
+                    loop {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buf[..read]),
+                        }
+                        while let Some(end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            request.drain(..end + 4);
+                            if tls
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                      content-length: 11\r\n\r\n{\"keys\":[]}",
+                                )
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (port, handshakes)
+    }
+
+    /// A CRL refresh retires the shared clients' pooled connections (issue
+    /// #6651): the next request handshakes again under the new generation, so
+    /// a revocation also stops a keep-alive connection opened before it.
+    #[tokio::test]
+    async fn crl_refresh_retires_pooled_plugin_connections() {
+        let ca = test_ca();
+        let ca_file = write_ca(&ca);
+        let ca_path = ca_file.path().to_str().expect("CA path").to_string();
+        let (cert_pem, key_pem) = leaf(&ca, REVOKED_SERIAL);
+        let (port, handshakes) = spawn_keepalive_https_origin(&cert_pem, &key_pem).await;
+
+        let startup = vec![crl_revoking(&ca, OTHER_SERIAL)];
+        let live = ferrum_edge::tls::shared_crl_list(Arc::new(startup.clone()));
+        let client = plugin_client(&ca_path, startup).with_live_crls(Arc::clone(&live));
+        let shared = || client.get().expect("shared client");
+
+        assert_eq!(fetch(&shared(), port).await.expect("first fetch"), 200);
+        assert_eq!(fetch(&shared(), port).await.expect("pooled fetch"), 200);
+        assert_eq!(
+            handshakes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unchanged CRL generation keeps reusing the pooled connection"
+        );
+
+        live.store(Arc::new(vec![crl_revoking(&ca, REVOKED_SERIAL)]));
+        assert!(
+            fetch(&shared(), port).await.is_err(),
+            "a pooled connection opened before the revocation must not carry new requests"
+        );
+    }
+
+    /// A dedicated plugin client (spec_expose) applies the gateway CRLs.
+    #[tokio::test]
+    async fn spec_expose_applies_the_gateway_crl() {
+        use ferrum_edge::plugins::Plugin;
+
+        let ca = test_ca();
+        let ca_file = write_ca(&ca);
+        let ca_path = ca_file.path().to_str().expect("CA path").to_string();
+        let (cert_pem, key_pem) = leaf(&ca, REVOKED_SERIAL);
+        let port = spawn_https_origin(&cert_pem, &key_pem).await;
+        let spec_url = format!("https://{HOST}:{port}/openapi.json");
+
+        let fetch_status = |crls: Vec<CertificateRevocationListDer<'static>>| {
+            let spec_url = spec_url.clone();
+            let ca_path = ca_path.clone();
+            async move {
+                let plugin = ferrum_edge::plugins::spec_expose::SpecExpose::new(
+                    &serde_json::json!({ "spec_url": spec_url, "cache_ttl_seconds": 0 }),
+                    plugin_client(&ca_path, crls),
+                )
+                .expect("spec_expose constructs");
+                let mut ctx = ferrum_edge::plugins::RequestContext::new(
+                    "127.0.0.1".to_string(),
+                    "GET".to_string(),
+                    "/specz".to_string(),
+                );
+                let mut proxy = super::super::plugin_utils::create_test_proxy();
+                proxy.listen_path = Some("/".to_string());
+                ctx.matched_proxy = Some(Arc::new(proxy));
+                match plugin.on_request_received(&mut ctx).await {
+                    ferrum_edge::plugins::PluginResult::Reject { status_code, .. } => status_code,
+                    other => panic!("spec_expose must answer /specz itself, got {other:?}"),
+                }
+            }
+        };
+
+        assert_eq!(
+            fetch_status(vec![crl_revoking(&ca, OTHER_SERIAL)]).await,
+            200,
+            "an unrelated revocation keeps the spec fetch working"
+        );
+        assert_eq!(
+            fetch_status(vec![crl_revoking(&ca, REVOKED_SERIAL)]).await,
+            502,
+            "a revoked spec origin must not be trusted"
         );
     }
 }

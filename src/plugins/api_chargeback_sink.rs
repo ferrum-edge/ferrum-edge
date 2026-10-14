@@ -65,6 +65,7 @@ use super::utils::{
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
 use crate::observability_delivery::DeliveryWorkerControl;
+use crate::plugins::utils::http_client::{DedicatedClientAlpn, DedicatedPluginClient};
 use crate::plugins::utils::log_schema::view::status_class;
 use crate::plugins::utils::log_schema::{
     DerivedKind, EmittedKeys, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable,
@@ -2927,7 +2928,7 @@ struct ClickHouseFlushConfig {
 #[derive(Clone)]
 enum ClickHouseHttpClient {
     Shared(Box<PluginHttpClient>),
-    Dedicated(reqwest::Client),
+    Dedicated(DedicatedPluginClient),
 }
 
 impl ClickHouseHttpClient {
@@ -4944,7 +4945,7 @@ async fn post_json_each_row_bytes(
                 };
             }
         },
-        ClickHouseHttpClient::Dedicated(client) => client.post(&cfg.insert_url),
+        ClickHouseHttpClient::Dedicated(client) => client.current().post(&cfg.insert_url),
     }
     .timeout(cfg.timeout)
     .header(CONTENT_TYPE, "application/json")
@@ -5735,78 +5736,144 @@ fn build_clickhouse_http_client(
         return Ok(ClickHouseHttpClient::Shared(Box::new(shared.clone())));
     }
 
-    // Ignore ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
-    // process state (matches the shared PluginHttpClient builders). reqwest
-    // enables system-proxy discovery by default. With a proxy selected, the
-    // connector dials and screens the *proxy* while the proxy resolves and
-    // connects to the configured ClickHouse host, so the ultimate destination
-    // address never passes the `DnsCacheResolver` egress screen installed
-    // below. Inherited proxy environment must not be able to override the
-    // gateway's documented outbound address boundary.
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_millis(cfg.timeout_ms))
-        .timeout(Duration::from_millis(cfg.timeout_ms))
-        // Do not follow redirects: a 3xx from an allowed ClickHouse host could
-        // otherwise bounce an export to an egress-policy-denied IP (matches the
-        // shared PluginHttpClient redirect policy).
-        .redirect(reqwest::redirect::Policy::none());
-    if let Some(dns_cache) = shared.dns_cache().cloned() {
-        builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
-    }
     if cfg.tls.insecure_skip_verify {
         warn!(
             plugin = PLUGIN_NAME,
             "ClickHouse TLS certificate verification is disabled; use only for testing"
         );
-        builder = builder.danger_accept_invalid_certs(true);
     }
     if !cfg.tls.verify_hostname {
         warn!(
             plugin = PLUGIN_NAME,
             "ClickHouse TLS hostname verification is disabled; use only for testing"
         );
-        builder = builder.tls_danger_accept_invalid_hostnames(true);
     }
-    if let Some(ca_file) = cfg.tls.ca_file.as_ref() {
-        let pem = fs::read(ca_file)
-            .map_err(|_| format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.ca_file`"))?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
+    let ca_pem = match cfg.tls.ca_file.as_ref() {
+        Some(ca_file) => Some(
+            fs::read(ca_file)
+                .map_err(|_| format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.ca_file`"))?,
+        ),
+        None => None,
+    };
+    let ca_certs = match ca_pem.as_ref() {
+        Some(pem) => Some(reqwest::Certificate::from_pem_bundle(pem).map_err(|_| {
             format!("{PLUGIN_NAME}: failed to parse `clickhouse.tls.ca_file`: invalid PEM bundle")
-        })?;
-        builder = builder.tls_certs_only(certs);
-    }
-    match (&cfg.tls.client_cert_file, &cfg.tls.client_key_file) {
+        })?),
+        None => None,
+    };
+    let identity_pem = match (&cfg.tls.client_cert_file, &cfg.tls.client_key_file) {
         (Some(cert), Some(key)) => {
-            let mut pem = fs::read(cert).map_err(|_| {
+            let cert_pem = fs::read(cert).map_err(|_| {
                 format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.client_cert_file`")
             })?;
-            let mut key_pem = fs::read(key).map_err(|_| {
+            let key_pem = fs::read(key).map_err(|_| {
                 format!("{PLUGIN_NAME}: failed to read `clickhouse.tls.client_key_file`")
             })?;
-            pem.push(b'\n');
-            pem.append(&mut key_pem);
-            let identity = reqwest::Identity::from_pem(&pem).map_err(|_| {
-                format!(
-                    "{PLUGIN_NAME}: failed to parse ClickHouse client identity: invalid PEM in \
-                     `clickhouse.tls.client_cert_file` or `clickhouse.tls.client_key_file`"
-                )
-            })?;
-            builder = builder.identity(identity);
+            Some((cert_pem, key_pem))
         }
-        (None, None) => {}
+        (None, None) => None,
         _ => {
             return Err(format!(
                 "{PLUGIN_NAME}: `clickhouse.tls.client_cert_file` and `clickhouse.tls.client_key_file` must be set together"
             ));
         }
-    }
-    builder
-        .build()
+    };
+    let identity_error = || {
+        format!(
+            "{PLUGIN_NAME}: failed to parse ClickHouse client identity: invalid PEM in \
+             `clickhouse.tls.client_cert_file` or `clickhouse.tls.client_key_file`"
+        )
+    };
+    let reqwest_identity = match identity_pem.as_ref() {
+        Some((cert_pem, key_pem)) => {
+            let mut pem = cert_pem.clone();
+            pem.push(b'\n');
+            pem.extend_from_slice(key_pem);
+            Some(reqwest::Identity::from_pem(&pem).map_err(|_| identity_error())?)
+        }
+        None => None,
+    };
+    // Gateway CRLs apply only while this client verifies the server fully
+    // (issue #6651); with verification or hostname checks disabled the
+    // operator has opted out of server authentication for this sink.
+    let verify = !cfg.tls.insecure_skip_verify && cfg.tls.verify_hostname;
+    use rustls::pki_types::pem::PemObject;
+    let crl_client_auth = match identity_pem.as_ref() {
+        Some((cert_pem, key_pem)) if verify && shared.enforces_gateway_crls() => {
+            let certs = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| identity_error())?;
+            if certs.is_empty() {
+                return Err(identity_error());
+            }
+            let key = crate::tls::parse_pem_private_key(
+                key_pem,
+                "ClickHouse client key",
+                "clickhouse.tls.client_key_file",
+            )
+            .map_err(|_| identity_error())?;
+            Some((certs, key))
+        }
+        _ => None,
+    };
+
+    let dns_cache = shared.dns_cache().cloned();
+    let timeout = Duration::from_millis(cfg.timeout_ms);
+    let insecure_skip_verify = cfg.tls.insecure_skip_verify;
+    let verify_hostname = cfg.tls.verify_hostname;
+    shared
+        .dedicated_client(
+            verify,
+            ca_pem.as_deref(),
+            crl_client_auth,
+            DedicatedClientAlpn::Negotiated,
+            move |crl_tls| {
+                // Ignore ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
+                // `NO_PROXY` process state (matches the shared PluginHttpClient
+                // builders). With a proxy selected, the connector dials and
+                // screens the *proxy* while the proxy resolves and connects to
+                // the configured ClickHouse host, so the ultimate destination
+                // address never passes the `DnsCacheResolver` egress screen
+                // installed below.
+                let mut builder = reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(timeout)
+                    .timeout(timeout)
+                    // Do not follow redirects: a 3xx from an allowed ClickHouse
+                    // host could otherwise bounce an export to an
+                    // egress-policy-denied IP (matches the shared
+                    // PluginHttpClient redirect policy).
+                    .redirect(reqwest::redirect::Policy::none());
+                if let Some(dns_cache) = dns_cache.clone() {
+                    builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
+                }
+                match crl_tls {
+                    // CA, client identity and the live CRL verifier are all in
+                    // the preconfigured rustls config.
+                    Some(tls) => builder = builder.use_preconfigured_tls(tls),
+                    None => {
+                        if insecure_skip_verify {
+                            builder = builder.danger_accept_invalid_certs(true);
+                        }
+                        if !verify_hostname {
+                            builder = builder.tls_danger_accept_invalid_hostnames(true);
+                        }
+                        if let Some(certs) = ca_certs.clone() {
+                            builder = builder.tls_certs_only(certs);
+                        }
+                        if let Some(identity) = reqwest_identity.clone() {
+                            builder = builder.identity(identity);
+                        }
+                    }
+                }
+                builder.build().map_err(|_| {
+                    format!(
+                        "{PLUGIN_NAME}: failed to build ClickHouse HTTP client for `clickhouse.tls`"
+                    )
+                })
+            },
+        )
         .map(ClickHouseHttpClient::Dedicated)
-        .map_err(|_| {
-            format!("{PLUGIN_NAME}: failed to build ClickHouse HTTP client for `clickhouse.tls`")
-        })
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -13078,7 +13145,7 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<(), String> {
     let flush_config = ClickHouseFlushConfig {
-        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: insert_url.to_string(),
         redacted_insert_url: redacted_endpoint_url_str(insert_url),
         username: None,
@@ -13116,7 +13183,7 @@ pub fn probe_charge_body_materialization_with_projection_for_tests(
 ) -> Result<(usize, usize, usize), String> {
     let metrics = Arc::new(SinkMetrics::default());
     let cfg = ClickHouseFlushConfig {
-        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: "http://127.0.0.1/".to_string(),
         redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
         username: None,
@@ -13175,7 +13242,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
     };
     let metrics = Arc::new(SinkMetrics::default());
     let cfg = ClickHouseFlushConfig {
-        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: "http://127.0.0.1/".to_string(),
         redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
         username: None,
