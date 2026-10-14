@@ -5052,6 +5052,20 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
         "candidatesTokenCount",
         "Gemini",
     )?;
+    // `completionTokenCount` is the alternate spelling the shared extractor
+    // and the stream router also accept when the canonical field is absent.
+    let completion_tokens = match completion_tokens {
+        Some(completion) => Some(completion),
+        None => {
+            native_usage_pair(
+                resp.get("usageMetadata"),
+                "promptTokenCount",
+                "completionTokenCount",
+                "Gemini",
+            )?
+            .1
+        }
+    };
     // Same folding as the `ai_stream_router` Gemini normalizer: tool-use
     // prompting is input-side, and thinking tokens are billed output that is
     // not part of `candidatesTokenCount`.
@@ -5071,16 +5085,9 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
     )?;
     // The provider total stays authoritative but never below the components
     // it reports, even when only one side is present.
-    let floor = native_usage_floor(
-        resp.get("usageMetadata"),
-        &[
-            "promptTokenCount",
-            "candidatesTokenCount",
-            "toolUsePromptTokenCount",
-            "thoughtsTokenCount",
-        ],
-        "Gemini",
-    )?;
+    // Gemini folds zero-omitted bases, so every reported counter is already
+    // inside the folded sides and their sum is the floor.
+    let floor = 0;
     let total = clamped_reported_total(
         resp["usageMetadata"]["totalTokenCount"].as_u64(),
         prompt_tokens,

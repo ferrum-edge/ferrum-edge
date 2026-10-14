@@ -612,21 +612,24 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     // metrics (and no `results`), so each component falls back to the Titan
     // counter only where the metrics did not report it.
     if let Some(metrics) = json.get("amazon-bedrock-invocationMetrics") {
+        let mut categories = UsageCategories::bedrock_invocation_metrics(Some(metrics));
+        // Fill the RAW bases, so the fallback survives cumulative merging
+        // (which re-folds categories) rather than living only in the fold.
+        if categories.prompt_base == Counter::Absent
+            && let Some(prompt) = titan_prompt
+        {
+            categories.prompt_base = Counter::Value(prompt);
+        }
+        if categories.completion_base == Counter::Absent
+            && let Some(completion) = titan_completion
+        {
+            categories.completion_base = Counter::Value(completion);
+        }
         let mut invoke = AiTokenUsage {
             provider: Some(AiProvider::Bedrock),
             ..Default::default()
         };
-        invoke.apply_categories(UsageCategories::bedrock_invocation_metrics(Some(metrics)));
-        let (prompt_invalid, completion_invalid) = invoke.categories.invalid_sides();
-        if invoke.prompt_tokens.is_none() && !prompt_invalid {
-            invoke.prompt_tokens = titan_prompt;
-        }
-        if invoke.completion_tokens.is_none() && !completion_invalid {
-            invoke.completion_tokens = titan_completion;
-        }
-        if invoke.total_tokens.is_none() && !prompt_invalid && !completion_invalid {
-            invoke.total_tokens = sum_pair(invoke.prompt_tokens, invoke.completion_tokens);
-        }
+        invoke.apply_categories(categories);
         return invoke;
     }
     let prompt = titan_prompt;

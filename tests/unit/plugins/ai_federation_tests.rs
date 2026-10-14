@@ -9754,3 +9754,27 @@ fn test_normalized_gemini_nullable_counters_are_absence() {
     .expect("null counters are unset, not malformed");
     assert_eq!((prompt, completion, total), (10, 40, 50));
 }
+
+#[test]
+fn test_normalized_gemini_accepts_the_completion_alternate() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "completionTokenCount": 5,
+            "thoughtsTokenCount": 40
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    let (_, prompt, completion, total) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&gemini).unwrap(),
+        "gemini-2.0-flash",
+    )
+    .unwrap();
+    assert_eq!((prompt, completion, total), (10, 45, 55));
+}

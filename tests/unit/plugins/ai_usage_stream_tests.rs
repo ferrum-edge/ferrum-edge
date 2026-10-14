@@ -1399,3 +1399,42 @@ fn nullable_gemini_counters_are_absence() {
         (Some(10), Some(40), Some(50))
     );
 }
+
+#[test]
+fn titan_fallback_survives_accumulation_and_merging() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let chunk = json!({
+        "inputTextTokenCount": 21,
+        "amazon-bedrock-invocationMetrics": {"outputTokenCount": 60}
+    });
+    let stream = bedrock_invoke_chunk(chunk.clone());
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "prompt_tokens"
+        ),
+        Some(21)
+    );
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(81)
+    );
+
+    let mut merged =
+        extract_response_usage(&json!({"inputTextTokenCount": 21}), AiProvider::Bedrock);
+    merged.merge_cumulative(extract_response_usage(&chunk, AiProvider::Bedrock));
+    assert_eq!(
+        (
+            merged.prompt_tokens,
+            merged.completion_tokens,
+            merged.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+}

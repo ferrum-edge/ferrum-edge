@@ -270,9 +270,21 @@ impl AiTokenMetrics {
                     .map(String::from);
             }
 
-            let event_provider = fixed_provider
-                .or_else(|| detect_sse_provider(payload))
-                .or(detected_provider);
+            // An Anthropic Messages event is authoritative by its own shape
+            // (as in the shared streaming accumulator), even under a
+            // configured provider such as `bedrock` that wraps it; otherwise
+            // its usage, cache categories included, would be parsed as the
+            // wrapper's and lost.
+            let anthropic_event = event_type.is_some_and(|kind| {
+                kind.starts_with("message_") || kind.starts_with("content_block_")
+            });
+            let event_provider = if anthropic_event {
+                Some(AiProvider::Anthropic)
+            } else {
+                fixed_provider
+                    .or_else(|| detect_sse_provider(payload))
+                    .or(detected_provider)
+            };
             let Some(provider) = event_provider else {
                 continue;
             };

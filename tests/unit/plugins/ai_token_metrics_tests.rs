@@ -1813,3 +1813,34 @@ async fn bedrock_terminal_metrics_cache_counters_reach_sse_metrics() {
         Some("1015")
     );
 }
+
+/// Under an explicit `bedrock` provider, the wrapped Anthropic events are still
+/// read by their own shape, so terminal metrics that omit the cache counters
+/// cannot drop the cache reads the start reported.
+#[tokio::test]
+async fn explicit_bedrock_keeps_wrapped_anthropic_cache_categories() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "provider": "bedrock",
+        "buffer_streaming_responses": true
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5}}\n\n",
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("1010")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("1015")
+    );
+}
