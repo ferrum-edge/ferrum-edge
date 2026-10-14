@@ -180,23 +180,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — `response_caching` caps `max_entries` at 10,000,000**
-  (issue #6612). The value sized an up-front capacity reservation, so one
-  huge integer in config could abort the process during a reload instead
-  of failing validation. Admission now rejects anything above the ceiling,
-  `openapi.yaml` publishes the same `maximum`, and the predictor's initial
-  reservation is capped at 1024 slots whatever `max_entries` is.
-- **BREAKING — `openapi_validator` caps `max_body_bytes` at 64 MiB**
-  (issue #6612 sibling audit). The value is also the per-layer decoded
-  ceiling while undoing `Content-Encoding` (amplification checks off), so an
-  arbitrary 64-bit value let a small compressed body inflate without a
-  meaningful bound. Values above 67108864 are now rejected at admission.
-- **BREAKING — `body_validator` caps `grpc_max_decompressed_size_bytes` at
-  64 MiB** (issue #6612 sibling audit). Compressed gRPC frames inflate into
-  a buffer bounded only by this value, so an explicit value above 67108864
-  is now rejected at admission. An environment-inherited
-  `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` above the ceiling is clamped to it.
-
 - **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
   `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
   clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging

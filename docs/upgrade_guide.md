@@ -50,16 +50,6 @@ side of each collision, either through the Admin API of a still-running
 
 Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
 
-### Hard ceilings on cache and decode size knobs (#6612, PR #6638)
-
-These plugin fields are now refused at admission above a hard ceiling:
-- `response_caching` `max_entries` is capped at 10000000.
-- `openapi_validator` `max_body_bytes` is capped at 67108864 (64 MiB).
-- `body_validator` `grpc_max_decompressed_size_bytes` is capped at 67108864.
-
-An omitted `body_validator` value inherited from a larger `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` is clamped to the ceiling instead of refused. Lower any configured value above its ceiling before upgrading; otherwise the plugin config is rejected (`400` on the Admin API, startup failure in file mode).
-
-
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
