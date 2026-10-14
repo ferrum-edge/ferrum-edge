@@ -1481,7 +1481,7 @@ consumers:
     username: "alice"
     credentials:
       keyauth:
-        - key: "alice-api-key"
+        - key: "alice-api-key-0123456789"
         - key: "alice-rotated-key"
 
 plugin_configs:

@@ -825,9 +825,10 @@ fn test_consumer_colon_username_without_basicauth_is_admitted() {
     // The restriction is Basic-specific: other credential types represent a
     // colon-bearing identity perfectly well.
     let mut consumer = make_consumer("test", "alice:admin");
-    consumer
-        .credentials
-        .insert("keyauth".into(), serde_json::json!([{"key": "the-key"}]));
+    consumer.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "the-key-0123456789"}]),
+    );
     assert!(
         consumer.validate_fields().is_ok(),
         "{:?}",
@@ -974,7 +975,7 @@ fn test_consumer_keyauth_accepts_valid_rotation_array() {
     let mut consumer = make_consumer("test", "alice");
     consumer.credentials.insert(
         "keyauth".into(),
-        serde_json::json!([{"key": "current-key"}, {"key": "next-key"}]),
+        serde_json::json!([{"key": "current-key-0123456789"}, {"key": "next-key-0123456789"}]),
     );
 
     assert!(consumer.validate_fields().is_ok());

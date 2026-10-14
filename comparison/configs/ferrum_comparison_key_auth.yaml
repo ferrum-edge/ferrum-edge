@@ -42,7 +42,7 @@ consumers:
     custom_id: "benchmark"
     credentials:
       keyauth:
-        - key: "test-api-key"
+        - key: "comparison-key-auth-0001"
 
 plugin_configs:
   - id: "plugin-keyauth-bench"
