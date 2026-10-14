@@ -840,6 +840,15 @@ impl UsageCategories {
         self
     }
 
+    /// The provider whose layout these categories carry, if any.
+    pub(crate) fn family_provider(&self) -> Option<AiProvider> {
+        match self.family? {
+            CategoryFamily::Anthropic => Some(AiProvider::Anthropic),
+            CategoryFamily::Gemini => Some(AiProvider::Google),
+            CategoryFamily::BedrockConverse => Some(AiProvider::Bedrock),
+        }
+    }
+
     fn zero_omitted_base(&self) -> bool {
         self.family == Some(CategoryFamily::Gemini)
     }

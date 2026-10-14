@@ -1457,3 +1457,29 @@ fn malformed_usage_container_unmeters_instead_of_keeping_stale_counts() {
     assert!(!merged.is_complete_for_mode("total_tokens"));
     assert_eq!(merged.total_for_mode("total_tokens"), None);
 }
+
+#[test]
+fn malformed_converse_usage_container_unmeters_on_both_framings() {
+    let valid = json!({"usage": {"inputTokens": 5, "outputTokens": 6, "totalTokens": 11}});
+    let malformed = json!({"usage": []});
+
+    // SSE framing under a configured provider.
+    let body = sse(&[&valid.to_string(), &malformed.to_string()]);
+    let mut extractor =
+        UsageStreamExtractor::new(UsageStreamFormat::Sse, Some(AiProvider::Bedrock));
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+
+    // AWS event-stream framing, provider identified from the earlier report.
+    let mut stream =
+        event_stream_message(b"\x00\x00\x00\x00", &serde_json::to_vec(&valid).unwrap());
+    stream.extend_from_slice(&event_stream_message(
+        b"\x00\x00\x00\x00",
+        &serde_json::to_vec(&malformed).unwrap(),
+    ));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+}

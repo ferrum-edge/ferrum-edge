@@ -284,6 +284,19 @@ impl UsageAccumulator {
                 .unwrap_or(AiProvider::OpenAi);
             self.record(&extract_response_usage(json, provider));
         }
+        // A present, non-null `usage` that is not an object is a malformed
+        // report, not an omission: route it to invalidation under the
+        // detected, configured, or previously identified provider so a stale
+        // complete count cannot survive it.
+        else if json
+            .get("usage")
+            .is_some_and(|usage| !usage.is_null() && !usage.is_object())
+            && let Some(provider) = detect_sse_provider(json)
+                .or(configured)
+                .or_else(|| self.categories.family_provider())
+        {
+            self.record(&extract_response_usage(json, provider));
+        }
 
         match json.get("type").and_then(Value::as_str) {
             // Anthropic streams its input (with prompt-cache writes and reads

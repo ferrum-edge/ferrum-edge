@@ -7866,7 +7866,7 @@ Extracts token usage from LLM HTTP JSON response bodies and writes it to request
 - Anthropic `cache_creation_input_tokens` and `cache_read_input_tokens` are added to `input_tokens`, since Anthropic reports them beside it rather than inside it.
 - Bedrock Converse `cacheReadInputTokens` and `cacheWriteInputTokens` are added to `inputTokens`.
 - Gemini/Vertex `toolUsePromptTokenCount` is added to the prompt, and `thoughtsTokenCount` (billed output that is not part of `candidatesTokenCount`) to the completion.
-- A provider total stays authoritative but is never published below the sum of the components it reports.
+- For Gemini and Bedrock (Converse and invocation metrics), a provider total stays authoritative but is never published below the sum of the counters it reports. OpenAI-compatible totals are passed through as reported.
 - On the native Anthropic stream, the `message_start` `output_tokens` placeholder is not taken as the completion count; the cumulative output on `message_delta` is.
 
 OpenAI already includes cached and reasoning tokens in `prompt_tokens` / `completion_tokens`. The cost rates are flat per category, so for a prompt-cached request the estimate is approximate. Cache reads, which providers bill below the base input rate, are overestimated. Cache writes, which Anthropic bills at 1.25× or 2× the base input rate, are underestimated. Prompt-token budgets charge the whole billed input.

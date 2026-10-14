@@ -184,7 +184,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streamed extraction (`ai_rate_limiter`, `ai_token_metrics`) and to the
   `ai_stream_router` and `ai_federation` normalizers, so token budgets no
   longer undercharge cached or thinking requests and every surface agrees.
-  A provider total is never published below its own components.
+  A Gemini or Bedrock provider total is never published below its own
+  reported counters.
   Categories merge field by field across streamed events, and a malformed
   counter leaves its side unmetered instead of partially counted.
 - **Plugin instances with a `priority_override` or trigger keep every
