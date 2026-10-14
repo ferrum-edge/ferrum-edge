@@ -28,20 +28,6 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `claim_headers` follows the `output_claim_headers` bounds (#6620)
-
-On `jwks_auth`, `oauth2_introspection` and `oidc_relying_party`, a
-`claim_headers` object now admits at most 16 mappings, claim paths of at most
-256 bytes with no whitespace or control characters, header names of at most
-128 bytes, no two mappings naming the same header (`X_Tenant_Id` counts as
-`X-Tenant-Id`), and none of the framing, provenance, credential-bearing or
-gateway-reserved destinations `output_claim_headers` already refused
-(`cookie`, `content-length`, `forwarded`, `via`, `x-real-ip`, `x-forwarded-*`,
-`x-ferrum-*` and similar). A stored config outside these bounds fails to load:
-map the claim to a non-reserved header such as `x-authenticated-user`, and
-split or merge mappings as needed. At request time a claim value that is not a
-valid header value or exceeds 8192 bytes now leaves the destination absent.
-
 ### Shared consumer credentials are refused (#6572)
 
 Consumers whose `id`, `username` or `custom_id` collide are still quarantined

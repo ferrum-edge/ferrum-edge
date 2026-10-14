@@ -180,22 +180,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING — `claim_headers` follows the `output_claim_headers` bounds**
-  (issue #6620). On `jwks_auth`, `oauth2_introspection` and
-  `oidc_relying_party`, a resolved claim value that is not a valid header value
-  (CR, LF or other control bytes) or exceeds 8192 bytes, including a joined
-  array claim, now leaves the destination absent. Before, an oversized valid
-  value was forwarded to the backend, and a malformed one was either dropped
-  at the outbound header conversion or failed the backend request on the
-  reqwest path, depending on the adapter. The object form also takes the list
-  form's admission rules: at most 16 mappings, bounded claim paths and header
-  names, no duplicate destination, and the strict reserved-destination list
-  (`cookie`, `content-length`, `x-forwarded-*`, `x-ferrum-*` and the other
-  framing and provenance names). `claim_headers` compares destinations the
-  way a CGI-style backend does, so `X_Real_IP` is reserved like `X-Real-IP`
-  and `X_Tenant_Id` duplicates `X-Tenant-Id`, including against `jwks_auth`'s
-  `output_claim_headers`; instances owning such spellings sanitize one shared
-  destination.
+- **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
+  `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
+  clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging
+  sinks) verify servers through a rustls verifier that applies the shared CRL
+  policy, so a revoked certificate is refused there as on every other TLS
+  surface. They trust `FERRUM_TLS_CA_BUNDLE_PATH` exclusively or, without it,
+  the bundled webpki roots instead of the OS trust store, disable session
+  resumption, and follow the backend CRL generation that backend TLS live
+  reload publishes. A trust store or verifier that cannot be built fails
+  closed. `FERRUM_TLS_NO_VERIFY` still disables verification, and now logs a
+  warning when a CA bundle or CRL source is configured alongside it.
 - **`ldap_auth` re-checks `required_groups` on cached credentials** (issue
   #6609). With the opt-in credential cache, a hit used to skip the group
   search for the whole `cache_ttl_seconds` (up to 24 hours). A hit whose last
@@ -226,11 +221,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`oauth2_introspection` reads a JSON `null` `exp`, `active_until` or
-  `expires_in` as omitted** (issue #6611), matching its `nbf` handling.
-  Authorization servers that serialize unset members as `null` used to fail
-  every authentication with a 503. A null member never hides a present sibling
-  bound, and other non-integer values are still a 503.
+- **`ws_logging` charges one back-off per failed attempt and none after the
+  last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
+  failure, including after the final attempt, and `send_batch` added
+  `retry_delay_ms` on top, so at the defaults a batch aimed at an
+  unreachable collector held the single delivery worker for about 44 s.
+  The retry ladder now owns the back-off. That is `reconnect_delay_ms` after
+  a failed connection and `retry_delay_ms` after a failed send, never both
+  and never after the final attempt, and per-attempt warnings are sampled.
+  The same change removes the unreachable empty-`endpoint_url` flush branch
+  and refuses a partially staged activation before consuming its config.
+  `ws_rate_limiting` single-flights its over-cap idle sweep behind the same
+  cooldown CAS gate `udp_rate_limiting` uses, as defense in depth.
 - **Equal-priority plugins now run in a deterministic order** (issue #6614).
   Ties used to follow config iteration order, which a database (unordered
   `proxy_plugins` association rows), a reordered config file, or an
