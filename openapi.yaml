@@ -31476,7 +31476,7 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 67108864
           description: >-
             Maximum decompressed gRPC protobuf payload size in bytes for both
             request and response validation. Positive integer matching runtime
@@ -31484,8 +31484,10 @@ components:
             bounded. When omitted,
             inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses
             as an unsigned integer; otherwise falls back to 10 MiB (10485760).
-            No static OpenAPI default is advertised because the effective value
-            can be environment-derived.
+            Hard ceiling 67108864 (64 MiB): a larger configured value is
+            rejected, and an environment-inherited value above it is clamped to
+            it. No static OpenAPI default is advertised because the effective
+            value can be environment-derived.
 
     OpenapiValidatorConfig:
       type: object
@@ -31604,9 +31606,9 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 67108864
           default: 1048576
-          description: Maximum raw or decompressed body size to validate; also bounded by the target's usize range.
+          description: Maximum raw or decompressed body size to validate, 1 to 67108864 (64 MiB). It is also the per-layer decoded ceiling while undoing Content-Encoding, so a larger value is rejected at admission.
         schema_draft:
           type: string
           enum: [auto, draft7, draft2020-12]
@@ -33292,9 +33294,9 @@ components:
           type: [integer, "null"]
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 10000000
           default: 10000
-          description: Maximum number of cached entries. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — no full-map clone or sort is performed while the accounting mutex is held. Must be greater than zero.
+          description: Maximum number of cached entries, 1 to 10000000. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — no full-map clone or sort is performed while the accounting mutex is held. A value above the ceiling is rejected at admission.
         max_entry_size_bytes:
           type: [integer, "null"]
           format: uint64
