@@ -9,15 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `ai_semantic_cache` and `ai_semantic_firewall` refuse a
-  cleartext embedding endpoint off loopback** (issue #6617). Both send an API
-  key with every embedding call. An `http://` endpoint is now admitted without
-  an opt-in only for a `127.0.0.0/8` or `::1` literal. Any other host, the name
-  `localhost` included, needs
-  `semantic_embedding_allow_plaintext: true` (cache) or
-  `provider.allow_plaintext: true` (firewall), matching the `allow_plaintext`
-  opt-in `ai_federation` and `ai_stream_router` already require. `ai_semantic_firewall`
-  also refuses whitespace or control characters in `provider.endpoint`.
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
@@ -188,13 +179,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slow-call or egress-denial warnings.
 
 ### Changed
-
-- **Plugin hot-path allocations** (issues #6617, #6628). `prometheus_metrics`
-  counter maps and the global JWKS cache are now sharded through
-  `pool_shard_amount`, like other hot-path `DashMap`s. `mcp_gateway` reads
-  the one session field it needs instead of deep-cloning the whole downstream
-  session. Route header `add` rules no longer allocate a key when appending
-  to an existing header.
 
 - **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
   `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP

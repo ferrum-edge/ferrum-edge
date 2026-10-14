@@ -28,23 +28,6 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### Cleartext AI embedding endpoints need an opt-in (issue #6617)
-
-`ai_semantic_cache` and `ai_semantic_firewall` send an API key with every
-embedding call. An `http://` embedding endpoint is now refused at load time
-unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`.
-The name `localhost` does not count, because DNS overrides decide where it
-connects. Before upgrading, either:
-
-- switch the endpoint to `https://`,
-- point a local sidecar at `127.0.0.1` instead of `localhost`, or
-- set `semantic_embedding_allow_plaintext: true` (cache) or
-  `provider.allow_plaintext: true` (firewall) when cleartext to that host is
-  intended.
-
-`ai_semantic_firewall` also refuses a `provider.endpoint` that contains
-whitespace or control characters instead of trimming them.
-
 ### Shared consumer credentials are refused (#6572)
 
 Consumers whose `id`, `username` or `custom_id` collide are still quarantined
