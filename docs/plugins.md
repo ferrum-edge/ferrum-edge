@@ -2967,7 +2967,7 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
 | `expected_issuer` | String | *(none)* | Required `iss` value, compared as an exact case-sensitive string; mutually exclusive with `expected_issuers` |
 | `expected_issuers` | String[] | `[]` | Accepted `iss` values. A token still claims exactly one issuer; several accepted values do not admit an array-valued `iss` |
-| `audiences` | String[] | `[]` | Accepted `aud` values; audience validation is disabled when empty |
+| `audiences` | String[] | `[]` | Accepted `aud` values; OR-matched. When non-empty, the token must carry `aud` and at least one value must match. When empty, tokens without `aud` are accepted and a token that carries `aud` is rejected (RFC 7519 §4.1.3) |
 | `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
 | `require_nbf` | Boolean | `false` | Require an `nbf` claim; when present, `nbf` is always validated |
 | `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |

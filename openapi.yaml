@@ -24555,8 +24555,9 @@ components:
             minLength: 1
             pattern: "\\S"
           description: >-
-            Accepted aud claims; audience validation is disabled when empty and
-            no entry may be blank
+            Accepted aud claims (OR-matched); no entry may be blank. When
+            non-empty, the token must carry a matching aud. When empty, a token
+            without aud is accepted and a token that carries aud is rejected.
         require_exp:
           type: boolean
           default: true
