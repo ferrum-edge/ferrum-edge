@@ -9778,3 +9778,28 @@ fn test_normalized_gemini_accepts_the_completion_alternate() {
     .unwrap();
     assert_eq!((prompt, completion, total), (10, 45, 55));
 }
+
+#[test]
+fn test_normalized_gemini_rejects_a_malformed_completion_alternate() {
+    let gemini = json!({
+        "candidates": [{
+            "content": {"parts": [{"text": "x"}], "role": "model"},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "completionTokenCount": "bad"
+        },
+        "modelVersion": "gemini-2.0-flash"
+    });
+    assert!(
+        test_helpers::normalize_response_test(
+            "google_gemini",
+            200,
+            &serde_json::to_vec(&gemini).unwrap(),
+            "gemini-2.0-flash",
+        )
+        .is_err()
+    );
+}

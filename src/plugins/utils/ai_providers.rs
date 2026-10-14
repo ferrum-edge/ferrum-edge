@@ -581,6 +581,23 @@ fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
 
 fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     let usage = json.get("usage");
+    // InvokeModel with a Claude model returns the native Anthropic Messages
+    // body (snake_case `input_tokens` / cache counters / `output_tokens`), so
+    // it folds with the Anthropic rule while keeping the Bedrock identity.
+    if usage.is_some_and(|usage| {
+        [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .any(|field| usage.get(field).is_some())
+    }) {
+        let mut anthropic = extract_anthropic_usage(json);
+        anthropic.provider = Some(AiProvider::Bedrock);
+        return anthropic;
+    }
     // Converse reports uncached input separately from prompt-cache reads and
     // writes; the billed input is their sum (AWS: `total input tokens =
     // inputTokens + cacheReadInputTokens + cacheWriteInputTokens`).
@@ -771,9 +788,16 @@ impl UsageCategories {
     }
 
     fn gemini(usage: Option<&Value>) -> Self {
-        let candidates = match Counter::read(usage, "candidatesTokenCount") {
-            Counter::Absent => Counter::read(usage, "completionTokenCount"),
-            reported => reported,
+        // Both spellings are validated: a malformed alternate invalidates the
+        // completion even beside a valid canonical count (the stream router
+        // rejects the same response).
+        let candidates = match (
+            Counter::read(usage, "candidatesTokenCount"),
+            Counter::read(usage, "completionTokenCount"),
+        ) {
+            (Counter::Invalid, _) | (_, Counter::Invalid) => Counter::Invalid,
+            (Counter::Absent, alternate) => alternate,
+            (canonical, _) => canonical,
         };
         Self {
             family: Some(CategoryFamily::Gemini),

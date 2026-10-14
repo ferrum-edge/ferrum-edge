@@ -1843,6 +1843,11 @@ async fn explicit_bedrock_keeps_wrapped_anthropic_cache_categories() {
         ctx.metadata.get("ai_total_tokens").map(String::as_str),
         Some("1015")
     );
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("bedrock"),
+        "an explicit provider keeps the exported identity"
+    );
 }
 
 /// Native usage and Bedrock invocation metrics in the same event are merged

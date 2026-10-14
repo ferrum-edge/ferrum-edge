@@ -1483,3 +1483,33 @@ fn malformed_converse_usage_container_unmeters_on_both_framings() {
     extractor.finish();
     assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
 }
+
+#[test]
+fn buffered_claude_on_bedrock_body_folds_cache_categories() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({"usage": {"input_tokens": 10, "cache_read_input_tokens": 1000, "output_tokens": 5}}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(
+        (usage.prompt_tokens, usage.total_tokens, usage.provider),
+        (Some(1010), Some(1015), Some(AiProvider::Bedrock))
+    );
+}
+
+#[test]
+fn malformed_gemini_completion_alternate_invalidates_completion() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "completionTokenCount": "bad"
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(usage.completion_tokens, None);
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+}

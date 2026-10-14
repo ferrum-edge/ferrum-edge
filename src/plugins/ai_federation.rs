@@ -5054,18 +5054,15 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
     )?;
     // `completionTokenCount` is the alternate spelling the shared extractor
     // and the stream router also accept when the canonical field is absent.
-    let completion_tokens = match completion_tokens {
-        Some(completion) => Some(completion),
-        None => {
-            native_usage_pair(
-                resp.get("usageMetadata"),
-                "promptTokenCount",
-                "completionTokenCount",
-                "Gemini",
-            )?
-            .1
-        }
-    };
+    // Validated even when the canonical field is present, like the router.
+    let alternate_completion = native_usage_pair(
+        resp.get("usageMetadata"),
+        "promptTokenCount",
+        "completionTokenCount",
+        "Gemini",
+    )?
+    .1;
+    let completion_tokens = completion_tokens.or(alternate_completion);
     // Same folding as the `ai_stream_router` Gemini normalizer: tool-use
     // prompting is input-side, and thinking tokens are billed output that is
     // not part of `candidatesTokenCount`.

@@ -315,6 +315,14 @@ impl AiTokenMetrics {
                 metrics.provider = Some(provider);
                 snapshots.push(metrics);
             }
+            // The wire parser follows the event's shape, but the exported
+            // identity follows an explicit configuration: wrapped events under
+            // `provider: bedrock` stay labelled Bedrock.
+            if fixed_provider == Some(AiProvider::Bedrock) {
+                for snapshot in &mut snapshots {
+                    snapshot.provider = Some(AiProvider::Bedrock);
+                }
+            }
             for mut extracted in snapshots {
                 // A category-bearing snapshot is merged even when it folds to no
                 // counter: a malformed (or cache-only) update must still reach
