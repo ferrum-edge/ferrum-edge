@@ -2263,7 +2263,10 @@ fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
 }
 
 #[test]
-fn adaptive_concurrency_route_association_order_resets_winning_destination() {
+/// Equal-priority route plugins order by plugin-config id, not association
+/// order (issue #6614), so reordering associations changes neither the winning
+/// destination nor the route definition, and live admission state is kept.
+fn adaptive_concurrency_route_association_order_keeps_winning_destination_and_state() {
     let mut config = cache_config(
         "proxy",
         json!({
@@ -2321,19 +2324,12 @@ fn adaptive_concurrency_route_association_order_resets_winning_destination() {
         )
         .expect("route association reorder should publish");
 
-    let mut first_effective_proxy = reloaded.proxies[0].clone();
-    first_effective_proxy.backend_host = "first.local".to_string();
-    let replacement = expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
-        &first_effective_proxy,
-        None,
-    ));
+    // The held permit still counts: a reset would have admitted this.
     assert_rejected(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
-        &first_effective_proxy,
+        &second_effective_proxy,
         None,
     ));
-    drop(replacement);
     drop(held);
 }
 
