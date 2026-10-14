@@ -1,6 +1,7 @@
 //! External unit + memory-contract coverage for `BackendRecvBatch`
 //! (issue #6672): lazy slot buffers, whole-datagram batch receive on a
-//! connected socket, and `WouldBlock` on an empty queue.
+//! connected socket, adaptive offer ramp, and `WouldBlock` on an empty
+//! queue.
 //!
 //! Linux-only because the non-Linux target exposes only an empty stub.
 
@@ -54,7 +55,7 @@ fn empty_connected_socket_returns_would_block_and_allocates_one_slot() {
 }
 
 #[test]
-fn receives_whole_datagrams_in_order_in_one_call() {
+fn receives_whole_datagrams_in_order_with_adaptive_offer_ramp() {
     let (backend, peer) = connected_pair();
     let peer_addr = backend.local_addr().expect("backend addr");
     peer.send_to(b"one", peer_addr).expect("send one");
@@ -64,12 +65,22 @@ fn receives_whole_datagrams_in_order_in_one_call() {
 
     let mut batch = BackendRecvBatch::new(8);
     // Loopback delivery is not instantaneous; poll briefly for the burst.
-    let mut received = 0;
+    // The adaptive offer starts at one slot and doubles when filled, so a
+    // three-datagram burst arrives as 1 + 2 across two calls, in order.
+    let mut got: Vec<Vec<u8>> = Vec::new();
     for _ in 0..200 {
+        if got.len() == 3 {
+            break;
+        }
         match batch.recv(backend.as_raw_fd(), 8) {
             Ok(n) => {
-                received = n;
-                break;
+                assert!(
+                    n >= 1,
+                    "a successful recv always returns at least one datagram"
+                );
+                for i in 0..n {
+                    got.push(batch.datagram(i).to_vec());
+                }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -77,19 +88,15 @@ fn receives_whole_datagrams_in_order_in_one_call() {
             Err(e) => panic!("recv failed: {e}"),
         }
     }
-    assert_eq!(received, 3, "one recvmmsg must return the whole burst");
-    assert_eq!(batch.count(), 3);
-    assert_eq!(batch.datagram(0), b"one");
-    assert_eq!(batch.datagram(1), b"twotwo");
-    assert_eq!(batch.datagram(2), vec![0x5au8; 4096].as_slice());
-    // Reservation is proportional to the burst bound offered to the
-    // syscall (8 here), never to untouched capacity beyond it, and a
-    // batch that only ever offers one slot reserves exactly one.
-    let allocated = batch.datagram_buffer_capacity_bytes();
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0], b"one");
+    assert_eq!(got[1], b"twotwo");
+    assert_eq!(got[2], vec![0x5au8; 4096]);
+    // Only slots the ramp actually offered (1, then 2) were reserved.
     assert_eq!(
-        allocated,
-        8 * 65535,
-        "slots are reserved lazily up to the offered burst bound"
+        batch.datagram_buffer_capacity_bytes(),
+        2 * 65535,
+        "reservation follows offered slots, not the caller's burst bound"
     );
     let mut single = BackendRecvBatch::new(8);
     let _ = single.recv(backend.as_raw_fd(), 1);
@@ -101,7 +108,7 @@ fn receives_whole_datagrams_in_order_in_one_call() {
 }
 
 #[test]
-fn max_count_bounds_the_burst_and_the_remainder_stays_queued() {
+fn max_count_bounds_each_call_and_the_remainder_stays_queued() {
     let (backend, peer) = connected_pair();
     let peer_addr = backend.local_addr().expect("backend addr");
     for i in 0..5u8 {
@@ -110,17 +117,18 @@ fn max_count_bounds_the_burst_and_the_remainder_stays_queued() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let mut batch = BackendRecvBatch::new(8);
-    let first = batch
-        .recv(backend.as_raw_fd(), 2)
-        .expect("first bounded recv");
-    assert_eq!(first, 2);
-    assert_eq!(batch.datagram(0), &[0u8; 16]);
-    assert_eq!(batch.datagram(1), &[1u8; 16]);
-
-    let second = batch.recv(backend.as_raw_fd(), 8).expect("remainder recv");
-    assert_eq!(second, 3);
-    assert_eq!(batch.datagram(0), &[2u8; 16]);
-    assert_eq!(batch.datagram(2), &[4u8; 16]);
+    // max_count caps every call regardless of the adaptive offer.
+    let mut got: Vec<u8> = Vec::new();
+    while got.len() < 5 {
+        let n = batch
+            .recv(backend.as_raw_fd(), 2)
+            .expect("bounded recv must succeed while datagrams are queued");
+        assert!(n <= 2, "call exceeded its max_count bound");
+        for i in 0..n {
+            got.push(batch.datagram(i)[0]);
+        }
+    }
+    assert_eq!(got, vec![0, 1, 2, 3, 4], "order preserved, nothing lost");
 }
 
 #[test]

@@ -411,6 +411,18 @@ pub struct BackendRecvBatch {
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
     count: usize,
+    /// Slots whose buffer + `iovec`/`mmsghdr` have been built. Slot buffers
+    /// never reallocate after their first reservation, so built headers
+    /// stay valid and are not rebuilt per call — rebuilding up to
+    /// `capacity` headers to receive one datagram measured as a net
+    /// regression (issue #6672).
+    built_slots: usize,
+    /// Slots to offer the next call, adapted to observed burst size:
+    /// doubles when a call fills everything offered, settles to the last
+    /// received count otherwise. Echo-depth traffic converges to offering
+    /// a single slot, making the call a plain `recvmsg` equivalent;
+    /// genuine bursts ramp 1→2→4→… across consecutive bursts.
+    next_offer: usize,
 }
 
 /// Per-session reply `recvmmsg` capacity. Matches the frontend batch size
@@ -446,6 +458,8 @@ impl BackendRecvBatch {
             msgs: vec![unsafe { std::mem::zeroed() }; capacity],
             capacity,
             count: 0,
+            built_slots: 0,
+            next_offer: 1,
         }
     }
 
@@ -508,12 +522,20 @@ impl BackendRecvBatch {
     /// Same contract as [`RecvMmsgBatch::recv`]: pointer arrays are rebuilt
     /// before the syscall and the batch outlives it.
     pub fn recv(&mut self, fd: std::os::fd::RawFd, max_count: usize) -> std::io::Result<usize> {
-        let n = max_count.min(self.capacity);
+        // Offer only what observed bursts justify (see `next_offer`),
+        // bounded by the caller's burst limit and the batch capacity.
+        let n = max_count.min(self.capacity).min(self.next_offer.max(1));
         if n == 0 {
             self.count = 0;
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
         }
-        for i in 0..n {
+        // Build headers only for slots not yet built. A slot's buffer is
+        // reserved once and never reallocates, and this batch's Vec
+        // headers are never resized after `new`, so cached iovec/mmsghdr
+        // pointers stay valid; the kernel treats `msg_hdr` as inputs plus
+        // the `msg_len` output it overwrites per received slot.
+        while self.built_slots < n {
+            let i = self.built_slots;
             self.ensure_slot_buf(i);
             self.iovecs[i] = libc::iovec {
                 iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
@@ -522,6 +544,7 @@ impl BackendRecvBatch {
             self.msgs[i] = unsafe { std::mem::zeroed() };
             self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
             self.msgs[i].msg_hdr.msg_iovlen = 1;
+            self.built_slots += 1;
         }
         let ret = unsafe {
             libc::recvmmsg(
@@ -547,6 +570,14 @@ impl BackendRecvBatch {
         for i in 0..received {
             self.lens[i] = self.msgs[i].msg_len;
         }
+        // Adapt the next offer (see `next_offer`): a full batch means more
+        // may be queued, so grow; a partial batch is the whole burst, so
+        // settle to its size and keep echo-depth calls single-slot cheap.
+        self.next_offer = if received == n {
+            (n * 2).min(self.capacity)
+        } else {
+            received.max(1)
+        };
         #[cfg(feature = "bench-udp-profile")]
         {
             crate::udp_profile::recvmmsg(crate::udp_profile::Direction::Reply, n, &Ok(received));

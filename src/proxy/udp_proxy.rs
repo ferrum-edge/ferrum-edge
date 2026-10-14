@@ -7312,19 +7312,30 @@ async fn recv_backend_reply_batch(
     want: usize,
 ) -> std::io::Result<usize> {
     use std::os::fd::AsRawFd;
-    loop {
-        sock.readable().await?;
-        match udp_drain!(
-            true,
-            sock.try_io(tokio::io::Interest::READABLE, || {
-                batch.recv(sock.as_raw_fd(), want)
-            })
-        ) {
-            Ok(n) => return Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
+    // `poll_fn` over `poll_recv_ready` + `try_io` mirrors tokio's own
+    // `recv` future structure (one readiness registration, syscall in the
+    // same poll) instead of a separate `readable()` future round-trip,
+    // which measured slower than the `recv` it replaced (issue #6672).
+    std::future::poll_fn(|cx| {
+        loop {
+            match sock.poll_recv_ready(cx) {
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+            match udp_drain!(
+                true,
+                sock.try_io(tokio::io::Interest::READABLE, || {
+                    batch.recv(sock.as_raw_fd(), want)
+                })
+            ) {
+                Ok(n) => return std::task::Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
         }
-    }
+    })
+    .await
 }
 
 /// Whether an admitted DTLS session may still be handed to the relay tasks.
