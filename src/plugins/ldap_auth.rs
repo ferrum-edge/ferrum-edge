@@ -19,7 +19,13 @@
 //!
 //! Successful authentications can be cached in-memory (keyed by a random-key
 //! HMAC over username + password) to avoid hitting the LDAP server on every
-//! request.
+//! request. A cache hit skips the bind, so a password change or account
+//! disablement in the directory takes effect only when the entry expires
+//! (`cache_ttl_seconds`). Group membership is bounded separately: with
+//! `required_groups` set, a hit whose last group check is older than
+//! `group_cache_ttl_seconds` re-runs the group search before it is admitted,
+//! and a user removed from every required group is refused and evicted
+//! (issue #6609).
 //!
 //! ## TLS integration
 //!
@@ -61,7 +67,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -80,6 +86,13 @@ use super::{RequestContext, strip_auth_scheme};
 
 pub const LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
 pub const LDAP_AUTH_MAX_CACHE_TTL_SECONDS: u64 = 86_400;
+/// Default bound on how long a cached authentication may be served without
+/// re-checking `required_groups`.
+pub const LDAP_AUTH_DEFAULT_GROUP_CACHE_TTL_SECONDS: u64 = 60;
+/// A cached credential keeps authenticating for its whole TTL after the
+/// password changes or the account is disabled. Above this TTL, construction
+/// logs that revocation lag so it is an explicit operator choice.
+pub const LDAP_AUTH_CACHE_TTL_WARN_SECONDS: u64 = 900;
 pub const LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES: usize = 10_000;
 /// Upper bound on `max_cache_entries`. The cache holds one canonical identity
 /// per admitted credential, so an unbounded configured maximum is a memory
@@ -98,6 +111,10 @@ const LDAP_AUTH_DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
 const LDAP_AUTH_MAX_CONCURRENT_REQUESTS: usize = 1_024;
 const LDAP_AUTH_USER_SEARCH_SIZE_LIMIT: i32 = 2;
 const LDAP_AUTH_GROUP_SEARCH_SIZE_LIMIT: i32 = 1_000;
+/// RDN prefix for [`LdapAuth::equalize_unknown_user_bind`]. Each bind appends
+/// 128 random bits, so no real entry can be targeted repeatedly (and locked
+/// out) by unknown-username traffic.
+const LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN_PREFIX: &str = "cn=ferrum-edge-unknown-";
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct CacheKey([u8; 32]);
@@ -105,6 +122,35 @@ struct CacheKey([u8; 32]);
 struct CacheEntry {
     expires_at: Instant,
     canonical_identity: String,
+    /// DN of the authenticated entry, kept so a cache hit can re-run the
+    /// group search without repeating the bind.
+    user_dn: String,
+    /// `required_groups` membership is re-checked on a hit at or after this
+    /// instant.
+    groups_verified_until: Instant,
+    /// Distinguishes this admission from a later one under the same key, so a
+    /// group re-check that raced a replacement or expiry never refreshes,
+    /// admits through, or evicts an entry it did not observe.
+    generation: u64,
+}
+
+/// A live cache hit.
+struct CachedAuthentication {
+    canonical_identity: String,
+    user_dn: String,
+    /// `required_groups` is configured and the last group check is older than
+    /// `group_cache_ttl`.
+    groups_due: bool,
+    expires_at: Instant,
+    generation: u64,
+}
+
+/// Result of re-checking `required_groups` for a cache hit.
+enum CachedGroupRevalidation {
+    Decided(VerifyOutcome),
+    /// The observed entry expired or was replaced while the check ran; the
+    /// caller must authenticate uncached instead of trusting it.
+    Stale,
 }
 
 struct AuthenticatedUser {
@@ -188,9 +234,14 @@ pub struct LdapAuth {
     ldap_concurrency: Arc<Semaphore>,
     /// Cache TTL for successful auth results (0 = disabled)
     cache_ttl: Duration,
+    /// Longest a cache hit is admitted without re-checking `required_groups`
+    /// (0 = re-check on every hit).
+    group_cache_ttl: Duration,
     /// In-memory cache keyed by a process-random HMAC over username + password.
     cache: Arc<DashMap<CacheKey, CacheEntry>>,
     cache_entries: AtomicUsize,
+    /// Source of [`CacheEntry::generation`].
+    cache_generation: AtomicU64,
     /// Zeroized on drop. A full-memory compromise can still recover this key.
     cache_hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// Maximum entries in the auth result cache. Prevents unbounded growth
@@ -465,6 +516,26 @@ impl LdapAuth {
             ));
         }
 
+        let group_cache_ttl_secs = parse_u64(
+            config_obj,
+            "group_cache_ttl_seconds",
+            LDAP_AUTH_DEFAULT_GROUP_CACHE_TTL_SECONDS,
+        )?;
+        if group_cache_ttl_secs > LDAP_AUTH_MAX_CACHE_TTL_SECONDS {
+            return Err(format!(
+                "ldap_auth: `group_cache_ttl_seconds` must not exceed {LDAP_AUTH_MAX_CACHE_TTL_SECONDS}"
+            ));
+        }
+        if cache_ttl_secs > LDAP_AUTH_CACHE_TTL_WARN_SECONDS {
+            warn!(
+                cache_ttl_seconds = cache_ttl_secs,
+                "ldap_auth: a cached credential keeps authenticating for up to \
+                 'cache_ttl_seconds' after its password changes or its account is disabled in \
+                 the directory; group membership is re-checked every \
+                 'group_cache_ttl_seconds'. Lower 'cache_ttl_seconds' to shorten that lag."
+            );
+        }
+
         let max_cache_entries = parse_usize(
             config_obj,
             "max_cache_entries",
@@ -565,8 +636,10 @@ impl LdapAuth {
             request_timeout: Duration::from_secs(request_timeout_secs),
             ldap_concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
             cache_ttl: Duration::from_secs(cache_ttl_secs),
+            group_cache_ttl: Duration::from_secs(group_cache_ttl_secs),
             cache: Arc::new(DashMap::with_shard_amount(cache_shard_amount)),
             cache_entries: AtomicUsize::new(0),
+            cache_generation: AtomicU64::new(0),
             cache_hmac_key,
             max_cache_entries,
             hide_credentials,
@@ -600,39 +673,68 @@ impl LdapAuth {
     }
 
     /// Check if a successful auth result is cached and still valid.
-    fn check_cache(&self, username: &str, password: &str) -> Option<String> {
+    fn check_cache(&self, username: &str, password: &str) -> Option<CachedAuthentication> {
         if self.cache_ttl.is_zero() {
             return None;
         }
         let key = self.cache_key(username, password)?;
         if let Some(entry) = self.cache.get(&key) {
-            if Instant::now() < entry.expires_at {
-                return Some(entry.canonical_identity.clone());
+            let now = Instant::now();
+            if now < entry.expires_at {
+                return Some(CachedAuthentication {
+                    canonical_identity: entry.canonical_identity.clone(),
+                    user_dn: entry.user_dn.clone(),
+                    groups_due: !self.required_groups.is_empty()
+                        && now >= entry.groups_verified_until,
+                    expires_at: entry.expires_at,
+                    generation: entry.generation,
+                });
             }
-            // Expired — remove the entry
+            // Expired — remove exactly the entry observed, never a replacement
+            // admitted since.
+            let generation = entry.generation;
             drop(entry);
-            if self.cache.remove(&key).is_some() {
-                self.release_cache_slot();
-            }
+            self.remove_cache_generation(&key, generation);
         }
         None
     }
 
+    fn remove_cache_generation(&self, key: &CacheKey, generation: u64) -> bool {
+        if self
+            .cache
+            .remove_if(key, |_, entry| entry.generation == generation)
+            .is_some()
+        {
+            self.release_cache_slot();
+            return true;
+        }
+        false
+    }
+
     /// Cache a successful authentication result.
-    fn set_cache(&self, username: &str, password: &str, canonical_identity: &str) {
+    fn set_cache(&self, username: &str, password: &str, user: &AuthenticatedUser) {
         if self.cache_ttl.is_zero() {
             return;
         }
         let Some(key) = self.cache_key(username, password) else {
             return;
         };
-        let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+        let now = Instant::now();
+        let Some(expires_at) = now.checked_add(self.cache_ttl) else {
             warn!("ldap_auth: cache expiry could not be represented; skipping cache admission");
             return;
         };
+        // Never later than the entry's own expiry.
+        let groups_verified_until = now
+            .checked_add(self.group_cache_ttl)
+            .map_or(expires_at, |until| until.min(expires_at));
+        let generation = self.cache_generation.fetch_add(1, Ordering::Relaxed);
         let new_entry = || CacheEntry {
             expires_at,
-            canonical_identity: canonical_identity.to_string(),
+            canonical_identity: user.canonical_identity.clone(),
+            user_dn: user.dn.clone(),
+            groups_verified_until,
+            generation,
         };
 
         if let Some(mut existing) = self.cache.get_mut(&key) {
@@ -656,6 +758,33 @@ impl LdapAuth {
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 vacant.insert(new_entry());
             }
+        }
+    }
+
+    /// Record a successful group re-check on the exact entry it was run for.
+    /// Returns `false` when that entry expired or was replaced meanwhile, in
+    /// which case the re-check must not admit the request.
+    fn mark_cached_groups_verified(&self, username: &str, password: &str, generation: u64) -> bool {
+        let Some(key) = self.cache_key(username, password) else {
+            return false;
+        };
+        let Some(mut entry) = self.cache.get_mut(&key) else {
+            return false;
+        };
+        let now = Instant::now();
+        if entry.generation != generation || now >= entry.expires_at {
+            return false;
+        }
+        entry.groups_verified_until = now
+            .checked_add(self.group_cache_ttl)
+            .map_or(entry.expires_at, |until| until.min(entry.expires_at));
+        true
+    }
+
+    /// Drop the exact cached authentication a group re-check refused.
+    fn evict_cached_authentication(&self, username: &str, password: &str, generation: u64) {
+        if let Some(key) = self.cache_key(username, password) {
+            self.remove_cache_generation(&key, generation);
         }
     }
 
@@ -908,6 +1037,8 @@ impl LdapAuth {
 
             let result_entry = match rs.len() {
                 0 => {
+                    let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+                    self.equalize_unknown_user_bind(search_base).await?;
                     return Err(AuthError::Credential(
                         "ldap_auth: user not found".to_string(),
                     ));
@@ -955,6 +1086,52 @@ impl LdapAuth {
         };
 
         Ok(authenticated_user)
+    }
+
+    /// Spend the gateway-side work a known user's failed bind costs (a fresh
+    /// connection and one simple bind round trip) when search-then-bind finds
+    /// no entry, so the extra round trips no longer reveal which usernames
+    /// exist (issue #6609). Directory-side cost can still differ: a directory
+    /// may verify an expensive password hash only for an existing entry.
+    ///
+    /// The bind targets a fresh random RDN under `search_base_dn` with a random
+    /// throwaway password: the client's password never leaves for a DN it did
+    /// not authenticate against, and no real entry is targeted repeatedly.
+    ///
+    /// Infrastructure failures are classified exactly like the real user bind
+    /// (`AuthError::Backend`, 500), so an unreachable or unavailable directory
+    /// answers an unknown and a known username the same way. Only a credential
+    /// rejection (or an unexpected success) of the throwaway bind becomes the
+    /// ordinary "user not found" 401.
+    async fn equalize_unknown_user_bind(&self, search_base: &str) -> Result<(), AuthError> {
+        let mut random = [0u8; 40];
+        crate::fips::backend::rand::SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| {
+                AuthError::Backend("ldap_auth: failed to generate equalizer bind".to_string())
+            })?;
+        let (rdn_suffix, password_bytes) = random.split_at(16);
+        let rdn_suffix: String = rdn_suffix
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let throwaway_password = base64::engine::general_purpose::STANDARD.encode(password_bytes);
+        let equalizer_dn = if search_base.is_empty() {
+            format!("{LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN_PREFIX}{rdn_suffix}")
+        } else {
+            format!("{LDAP_AUTH_UNKNOWN_USER_EQUALIZER_RDN_PREFIX}{rdn_suffix},{search_base}")
+        };
+        let mut ldap = self.connect().await?;
+        let bind_result = ldap
+            .with_timeout(self.connect_timeout)
+            .simple_bind(&equalizer_dn, &throwaway_password)
+            .await
+            .map_err(|e| AuthError::Backend(format!("ldap_auth: user bind failed: {e}")));
+        let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+        match classify_user_bind_result(bind_result?, "user bind") {
+            Ok(()) | Err(AuthError::Credential(_)) => Ok(()),
+            Err(backend) => Err(backend),
+        }
     }
 
     /// Read the configured canonical identity attribute off an already
@@ -1343,6 +1520,7 @@ fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String>
         "request_timeout_seconds",
         "max_concurrent_requests",
         "cache_ttl_seconds",
+        "group_cache_ttl_seconds",
         "max_cache_entries",
         "hide_credentials",
     ];
@@ -1961,11 +2139,25 @@ impl AuthMechanism for LdapAuth {
             return VerifyOutcome::NotApplicable;
         };
         let password = Zeroizing::new(password);
+        // One wall-clock budget for the whole authentication: a group re-check
+        // and any uncached fallback after it share it.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
 
         // Check cache first
-        if let Some(canonical_identity) = self.check_cache(&username, &password) {
+        if let Some(cached) = self.check_cache(&username, &password) {
             debug!("ldap_auth: cache hit for user '{}'", username);
-            return self.identity_outcome(&canonical_identity, consumer_index);
+            if !cached.groups_due {
+                return self.identity_outcome(&cached.canonical_identity, consumer_index);
+            }
+            match self
+                .revalidate_cached_groups(&username, &password, cached, consumer_index, deadline)
+                .await
+            {
+                CachedGroupRevalidation::Decided(outcome) => return outcome,
+                // The entry lapsed or was replaced during the check: fall
+                // through to a full uncached authentication.
+                CachedGroupRevalidation::Stale => {}
+            }
         }
 
         let _permit = match self.ldap_concurrency.try_acquire() {
@@ -1978,8 +2170,8 @@ impl AuthMechanism for LdapAuth {
             }
         };
 
-        match tokio::time::timeout(
-            self.request_timeout,
+        match tokio::time::timeout_at(
+            deadline,
             self.verify_uncached(&username, &password, consumer_index),
         )
         .await
@@ -2040,6 +2232,80 @@ auth_flow::impl_auth_plugin!(
 );
 
 impl LdapAuth {
+    /// Re-run the `required_groups` search for a cache hit whose last group
+    /// check is older than `group_cache_ttl`, under the same concurrency and
+    /// wall-clock bounds as an uncached authentication (the request's single
+    /// `deadline`), further capped by the observed entry's remaining lifetime.
+    ///
+    /// A user no longer in any required group is refused (403) and the
+    /// observed entry is evicted. A directory failure or deadline fails closed
+    /// (500) and keeps the entry, so the next hit retries the check. Success
+    /// admits only while the very entry that was checked is still live;
+    /// otherwise the caller falls back to an uncached authentication, so a
+    /// slow check can never stretch a credential past `cache_ttl_seconds`.
+    async fn revalidate_cached_groups(
+        &self,
+        username: &str,
+        password: &str,
+        cached: CachedAuthentication,
+        consumer_index: &ConsumerIndex,
+        deadline: tokio::time::Instant,
+    ) -> CachedGroupRevalidation {
+        let remaining = cached.expires_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return CachedGroupRevalidation::Stale;
+        }
+        let budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(remaining);
+        let _permit = match self.ldap_concurrency.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!("ldap_auth: maximum concurrent authentication work reached");
+                return CachedGroupRevalidation::Decided(VerifyOutcome::Internal(
+                    r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
+                ));
+            }
+        };
+        let membership = tokio::time::timeout(
+            budget,
+            self.check_group_membership(&cached.user_dn, &cached.canonical_identity),
+        )
+        .await;
+        let outcome = match membership {
+            Ok(Ok(true)) => {
+                if !self.mark_cached_groups_verified(username, password, cached.generation) {
+                    return CachedGroupRevalidation::Stale;
+                }
+                self.identity_outcome(&cached.canonical_identity, consumer_index)
+            }
+            Ok(Ok(false)) => {
+                self.evict_cached_authentication(username, password, cached.generation);
+                warn!(
+                    "ldap_auth: cached user '{}' is no longer a member of any required group",
+                    cached.canonical_identity
+                );
+                VerifyOutcome::Forbidden(
+                    r#"{"error":"User is not a member of any required group"}"#.into(),
+                )
+            }
+            Ok(Err(e)) => {
+                warn!("{}", e.log_message());
+                VerifyOutcome::Internal(r#"{"error":"LDAP group membership check failed"}"#.into())
+            }
+            Err(_) if Instant::now() >= cached.expires_at => {
+                return CachedGroupRevalidation::Stale;
+            }
+            Err(_) => {
+                warn!("ldap_auth: group re-check exceeded the configured wall-clock deadline");
+                VerifyOutcome::Internal(
+                    r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
+                )
+            }
+        };
+        CachedGroupRevalidation::Decided(outcome)
+    }
+
     async fn verify_uncached(
         &self,
         presented_username: &str,
@@ -2091,11 +2357,7 @@ impl LdapAuth {
             }
         }
 
-        self.set_cache(
-            presented_username,
-            password,
-            &authenticated_user.canonical_identity,
-        );
+        self.set_cache(presented_username, password, &authenticated_user);
 
         debug!(
             "ldap_auth: authenticated canonical identity '{}'",
@@ -2150,6 +2412,110 @@ mod tests {
             Some(value) => value,
             None => panic!("{context}"),
         }
+    }
+
+    fn test_user(name: &str) -> AuthenticatedUser {
+        AuthenticatedUser {
+            dn: format!("uid={name},dc=example,dc=com"),
+            canonical_identity: name.to_string(),
+        }
+    }
+
+    fn cached_group_test_plugin(group_cache_ttl_seconds: u64) -> LdapAuth {
+        must(
+            LdapAuth::new(
+                &serde_json::json!({
+                    "ldap_url": "ldap://127.0.0.1:389",
+                    "bind_dn_template": "uid={username},dc=example,dc=com",
+                    "canonical_identity_attribute": "uid",
+                    "group_base_dn": "ou=groups,dc=example,dc=com",
+                    "required_groups": ["admins"],
+                    "cache_ttl_seconds": 60,
+                    "group_cache_ttl_seconds": group_cache_ttl_seconds
+                }),
+                PluginHttpClient::default(),
+            ),
+            "build cached LDAP group plugin",
+        )
+    }
+
+    #[test]
+    fn cache_hit_reports_group_recheck_due_only_after_group_ttl() {
+        let fresh = cached_group_test_plugin(60);
+        fresh.set_cache("alice", "password", &test_user("alice"));
+        let hit = must_some(fresh.check_cache("alice", "password"), "fresh cache hit");
+        assert!(
+            !hit.groups_due,
+            "a just-verified entry needs no group re-check"
+        );
+        assert_eq!(hit.user_dn, "uid=alice,dc=example,dc=com");
+
+        let every_hit = cached_group_test_plugin(0);
+        every_hit.set_cache("alice", "password", &test_user("alice"));
+        let hit = must_some(every_hit.check_cache("alice", "password"), "cache hit");
+        assert!(
+            hit.groups_due,
+            "group_cache_ttl_seconds = 0 re-checks every hit"
+        );
+
+        // Recording a successful re-check is bounded by the entry's own expiry
+        // and the group TTL.
+        let mut refreshed = cached_group_test_plugin(0);
+        refreshed.set_cache("alice", "password", &test_user("alice"));
+        refreshed.group_cache_ttl = Duration::from_secs(30);
+        let observed = must_some(refreshed.check_cache("alice", "password"), "cache hit");
+        assert!(refreshed.mark_cached_groups_verified("alice", "password", observed.generation));
+        let hit = must_some(refreshed.check_cache("alice", "password"), "cache hit");
+        assert!(!hit.groups_due);
+
+        refreshed.evict_cached_authentication("alice", "password", observed.generation);
+        assert!(refreshed.check_cache("alice", "password").is_none());
+        assert_eq!(refreshed.cache_entries.load(Ordering::Acquire), 0);
+    }
+
+    /// A re-check that raced a replacement under the same key neither
+    /// refreshes nor evicts the replacement, and does not admit.
+    #[test]
+    fn group_recheck_is_bound_to_the_entry_it_observed() {
+        let plugin = cached_group_test_plugin(0);
+        plugin.set_cache("alice", "password", &test_user("alice"));
+        let observed = must_some(plugin.check_cache("alice", "password"), "cache hit");
+        // A concurrent uncached authentication replaces the entry.
+        plugin.set_cache("alice", "password", &test_user("alice"));
+        let replacement = must_some(plugin.check_cache("alice", "password"), "cache hit");
+        assert_ne!(observed.generation, replacement.generation);
+
+        assert!(
+            !plugin.mark_cached_groups_verified("alice", "password", observed.generation),
+            "a stale re-check must not admit through the replacement"
+        );
+        plugin.evict_cached_authentication("alice", "password", observed.generation);
+        let survivor = must_some(plugin.check_cache("alice", "password"), "replacement kept");
+        assert_eq!(survivor.generation, replacement.generation);
+        assert_eq!(plugin.cache_entries.load(Ordering::Acquire), 1);
+    }
+
+    /// An entry that expired while its re-check ran is not admitted.
+    #[test]
+    fn group_recheck_does_not_admit_an_expired_entry() {
+        let plugin = cached_group_test_plugin(0);
+        plugin.set_cache("alice", "password", &test_user("alice"));
+        let observed = must_some(plugin.check_cache("alice", "password"), "cache hit");
+        let key = must_some(plugin.cache_key("alice", "password"), "cache key");
+        if let Some(mut entry) = plugin.cache.get_mut(&key) {
+            entry.expires_at = Instant::now();
+        }
+        assert!(!plugin.mark_cached_groups_verified("alice", "password", observed.generation));
+        assert!(plugin.check_cache("alice", "password").is_none());
+        assert_eq!(plugin.cache_entries.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cache_hit_without_required_groups_never_rechecks_groups() {
+        let plugin = cached_test_plugin(4);
+        plugin.set_cache("alice", "password", &test_user("alice"));
+        let hit = must_some(plugin.check_cache("alice", "password"), "cache hit");
+        assert!(!hit.groups_due);
     }
 
     fn cached_test_plugin(max_cache_entries: usize) -> LdapAuth {
@@ -2232,7 +2598,7 @@ mod tests {
         let plugin = cached_test_plugin(4);
         for index in 0..100 {
             let username = format!("user-{index}");
-            plugin.set_cache(&username, "password", &username);
+            plugin.set_cache(&username, "password", &test_user(&username));
             assert!(plugin.cache.len() <= 4);
             assert!(plugin.cache_entries.load(Ordering::Acquire) <= 4);
         }
@@ -2240,7 +2606,10 @@ mod tests {
         assert_eq!(plugin.cache.len(), 4);
         assert_eq!(plugin.cache_entries.load(Ordering::Acquire), 4);
         assert_eq!(
-            plugin.check_cache("user-99", "password").as_deref(),
+            plugin
+                .check_cache("user-99", "password")
+                .map(|cached| cached.canonical_identity)
+                .as_deref(),
             Some("user-99")
         );
     }
@@ -2254,7 +2623,7 @@ mod tests {
                 scope.spawn(move || {
                     for item in 0..32 {
                         let username = format!("worker-{worker}-item-{item}");
-                        plugin.set_cache(&username, "password", &username);
+                        plugin.set_cache(&username, "password", &test_user(&username));
                     }
                 });
             }
@@ -2271,7 +2640,7 @@ mod tests {
     fn unrepresentable_cache_expiry_is_skipped_without_panicking() {
         let mut plugin = cached_test_plugin(4);
         plugin.cache_ttl = Duration::MAX;
-        plugin.set_cache("alice", "password", "alice");
+        plugin.set_cache("alice", "password", &test_user("alice"));
         assert!(plugin.cache.is_empty());
         assert_eq!(plugin.cache_entries.load(Ordering::Acquire), 0);
     }

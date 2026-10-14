@@ -32,6 +32,10 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 With `allow_credentials: true`, a `"*.suffix"` origin is refused when the suffix is a single label, a public suffix, or has a Public Suffix List rule beneath it (`*.com`, `*.co.uk`, `*.github.io`, `*.amazonaws.com`). A credentialed `regex` origin must prove that it pins the host. Use exact origins, a registrable-domain wildcard such as `"*.example.com"`, an anchored regex ending in a fixed domain, or the host-bounded prefix `scheme://host:`. Without credentials these matchers are unchanged.
 
+### `openapi_validator` bypass headers need a secret (PR #6634)
+
+Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
