@@ -126,17 +126,6 @@ are removed. For a security decision on the query, use
 `plugins::utils::query::canonical_query_for_policy`, as described in
 [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md#request-context).
 
-### `VAULT_ADDR` must use `https` for a remote Vault (#6582)
-
-`_VAULT` and `vault://` resolution now refuses a plaintext `http` `VAULT_ADDR`
-unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Startup and
-`ferrum-edge validate` exit with a diagnostic naming `VAULT_ADDR`. Switch the
-address to `https`. If you must keep plaintext to a remote Vault, set
-`FERRUM_VAULT_ALLOW_PLAINTEXT=true` in the environment and expect a warning at
-startup. A Vault redirect to a plaintext address is refused under the same
-rule, and a loopback `http` Vault (for example a local agent) is no longer
-reached through `HTTP_PROXY`/`ALL_PROXY`.
-
 ## Upgrading to 0.9.17
 
 0.9.17 was published on 2026-10-10 UTC from commit

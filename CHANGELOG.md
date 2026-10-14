@@ -9,19 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `VAULT_ADDR` must use `https` unless the Vault host is
-  loopback** (issue #6582). `_VAULT` and `vault://` resolution accepted
-  `http` for any host, so a remote plaintext address sent `VAULT_TOKEN` and
-  every fetched secret unencrypted. Plaintext `http` is now refused for a
-  non-loopback host with a diagnostic naming `VAULT_ADDR` (the address and
-  token are not echoed). `localhost`, `127.0.0.0/8`, `::1`, and IPv4-mapped
-  loopback stay accepted for a local Vault agent or dev server. Set
-  `FERRUM_VAULT_ALLOW_PLAINTEXT=true` in the environment to accept remote
-  plaintext explicitly; Ferrum then logs a warning once, deferred until logging
-  starts when the address is first used during startup. The rule also covers
-  redirects, since `X-Vault-Token` survives them: a redirect to plaintext
-  `http` is refused unless the opt-in is set or both ends are loopback. A
-  loopback `http` Vault is contacted directly, never through `HTTP_PROXY`.
+- **An unencoded `;` in the query is now an ambiguity that fail-closed query
+  consumers reject** (issue #6579; query counterpart of GHSA-fcqw-793q-wg5x /
+  GHSA-5mrg-vq2h-6j3w). The canonical query view split pairs only on `&`, so
+  `?tenant=admin&x=;tenant=victim` was one unambiguous `tenant=admin` to OPA,
+  `mesh_route_dispatch` query predicates, and `serverless_function` query
+  forwarding, while a backend that also splits on `;` (Rack before 3.0, Go
+  before 1.17, Python before 3.9.2) executed `tenant=victim`. A new
+  `semicolon_separator` classification records any unencoded `;` in a name
+  or value: OPA (`query_ambiguity_policy: reject`) denies before the policy
+  call, `mesh_route_dispatch` answers `400`, and `serverless_function` fails
+  with `ambiguous_query_encoding`. Under OPA `delegate` the token appears in
+  `input.query_ambiguity`. `%3B` stays an unambiguous literal semicolon.
+  Credential stripping (`hide_credentials` query locations, and the
+  `request_transformer` pre-mutation strip) now also drops an `&` segment
+  that carries the credential behind a `;` (`carrier=;api_key=secret`), and
+  WAF `FE-HPP-001` compares duplicates under the `&`+`;` convention too, with
+  exclusions and `fp_filters` judged on each convention's own pairs. OPA
+  `delegate` input withholds a pair whose `;` sub-pair names a redacted
+  credential (split on the encoded bytes, so `%3B` stays content).
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
@@ -234,6 +240,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ws_logging` charges one back-off per failed attempt and none after the
+  last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
+  failure, including after the final attempt, and `send_batch` added
+  `retry_delay_ms` on top, so at the defaults a batch aimed at an
+  unreachable collector held the single delivery worker for about 44 s.
+  The retry ladder now owns the back-off. That is `reconnect_delay_ms` after
+  a failed connection and `retry_delay_ms` after a failed send, never both
+  and never after the final attempt, and per-attempt warnings are sampled.
+  The same change removes the unreachable empty-`endpoint_url` flush branch
+  and refuses a partially staged activation before consuming its config.
+  `ws_rate_limiting` single-flights its over-cap idle sweep behind the same
+  cooldown CAS gate `udp_rate_limiting` uses, as defense in depth.
 - **Equal-priority plugins now run in a deterministic order** (issue #6614).
   Ties used to follow config iteration order, which a database (unordered
   `proxy_plugins` association rows), a reordered config file, or an

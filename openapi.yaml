@@ -26051,8 +26051,9 @@ components:
                       be decoded to one value is rejected with 400 before any
                       rule is evaluated: a repeated or percent-encoded duplicate
                       name, a literal '+' (RFC 3986 plus vs form-urlencoded
-                      space), malformed percent-encoding, or a non-UTF-8
-                      decoding.
+                      space), an unencoded ';' (a pair separator for backends
+                      that also split on ';'; '%3B' is unambiguous), malformed
+                      percent-encoding, or a non-UTF-8 decoding.
                   uri:
                     description: |
                       Optional URI predicate (Istio `StringMatch` shape).
@@ -28558,8 +28559,10 @@ components:
             guaranteed to read identically: a duplicate decoded parameter name
             (including a percent-encoded alias such as a=1&%61=2 or a bare/valued
             pair such as flag&flag=1), a literal '+' (RFC 3986 plus vs
-            form-urlencoded space), malformed percent-encoding, or a non-UTF-8
-            decoding. 'reject' denies the request with the configured deny_status
+            form-urlencoded space), an unencoded ';' (a pair separator for
+            backends that also split on ';'; reported as semicolon_separator,
+            while '%3B' is unambiguous), malformed percent-encoding, or a
+            non-UTF-8 decoding. 'reject' denies the request with the configured deny_status
             and deny_body before calling OPA. 'delegate' calls OPA anyway and
             lets the policy decide from the ordered, occurrence-complete
             input.query_pairs array and the input.query_ambiguity
@@ -33157,7 +33160,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include decoded query parameters from the shared canonical backend-bound query view in the function payload, after omitting credentials that an earlier auth plugin marked for backend stripping. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3 and includes any earlier ordered query transform. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal '+', malformed percent-encoding, non-UTF-8 decodings, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
+          description: "Include decoded query parameters from the shared canonical backend-bound query view in the function payload, after omitting credentials that an earlier auth plugin marked for backend stripping. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3 and includes any earlier ordered query transform. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal '+', an unencoded ';' ('%3B' is unambiguous), malformed percent-encoding, non-UTF-8 decodings, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
