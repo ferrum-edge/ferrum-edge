@@ -29,6 +29,7 @@
 use super::super::RequestContext;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::Hash;
 
 /// Returns `true` when the request's `Accept` header indicates Server-Sent
 /// Events (i.e., contains `text/event-stream`). Matches the WHATWG EventSource
@@ -670,6 +671,53 @@ pub const MAX_ANTHROPIC_CONTENT_BLOCKS: usize = 64;
 /// responses cap `candidateCount` in the single digits.
 pub const MAX_GEMINI_CANDIDATES: usize = 64;
 
+/// Ceiling on the distinct live accumulators in EACH OpenAI-style family the
+/// reassembler keys by provider-supplied indexes: legacy Completions text and
+/// chat `delta.content` per choice, chat tool calls per `(choice, tool)`,
+/// Responses-API output text per `(output, content)`, and Responses-API
+/// function-call arguments per output.
+///
+/// Every index arrives on the wire, so an unbounded keying map would let a
+/// stream of one-byte deltas at ever-new indexes grow per-accumulator overhead
+/// without growing the text the callers' byte budgets account for. The bound is
+/// on the number of live keys, not on the index value, so a two-dimensional
+/// key cannot multiply it. A key that would exceed it is folded into one shared
+/// overflow accumulator per family. Its content is still reassembled and
+/// inspected, never dropped, and the stream is marked uninspectable (see
+/// [`provider_stream_uninspectable`](SseReassembler::provider_stream_uninspectable)),
+/// because interleaving deltas of different choices or calls in one
+/// accumulator could split a phrase that a single choice carried intact.
+/// OpenAI documents `n` up to 128, so legitimate streams stay below it.
+pub const MAX_OPENAI_STREAM_ACCUMULATORS: usize = 128;
+
+/// Find or create the accumulator for `key`, folding a key beyond
+/// [`MAX_OPENAI_STREAM_ACCUMULATORS`] live entries into `overflow` and marking
+/// the stream uninspectable.
+fn bounded_slot<'a, K: Copy + Eq + Hash, V: Default>(
+    entries: &'a mut Vec<(K, V)>,
+    positions: &mut HashMap<K, usize>,
+    key: K,
+    overflow: K,
+    uninspectable: &mut bool,
+) -> &'a mut V {
+    let key = if positions.contains_key(&key) || entries.len() < MAX_OPENAI_STREAM_ACCUMULATORS {
+        key
+    } else {
+        *uninspectable = true;
+        overflow
+    };
+    let pos = match positions.get(&key).copied() {
+        Some(pos) => pos,
+        None => {
+            let pos = entries.len();
+            entries.push((key, V::default()));
+            positions.insert(key, pos);
+            pos
+        }
+    };
+    &mut entries[pos].1
+}
+
 /// A coherent text fragment reassembled from many streaming-SSE delta frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseText {
@@ -867,6 +915,14 @@ impl SseReassembler {
     /// prose, tool names/arguments, and Responses API text/arguments), without
     /// allocating a snapshot. Windowed policy inspectors use this for their
     /// aggregate retained-state budget.
+    ///
+    /// This is a text measure: the per-accumulator bookkeeping (keyed `Vec`
+    /// entry plus lookup-table entry) is not included. It cannot grow with the
+    /// stream, because every keyed family is capped
+    /// ([`MAX_OPENAI_STREAM_ACCUMULATORS`] per OpenAI-style family,
+    /// [`MAX_ANTHROPIC_CONTENT_BLOCKS`] + 1 and [`MAX_GEMINI_CANDIDATES`] + 1),
+    /// so it is bounded by [`accumulator_count`](Self::accumulator_count) times
+    /// a fixed per-entry size, independent of input.
     pub fn retained_text_len(&self) -> usize {
         let completion_text = self
             .completion_text
@@ -926,6 +982,18 @@ impl SseReassembler {
             .saturating_add(self.anthropic_error_text.len())
     }
 
+    /// Number of live keyed accumulators across every family.
+    pub fn accumulator_count(&self) -> usize {
+        self.completion_text
+            .len()
+            .saturating_add(self.content.len())
+            .saturating_add(self.tool_calls.len())
+            .saturating_add(self.responses_text.len())
+            .saturating_add(self.responses_args.len())
+            .saturating_add(self.anthropic_blocks.len())
+            .saturating_add(self.gemini_candidates.len())
+    }
+
     /// `true` when a stream identified as a provider protocol this reassembler
     /// models carried something it could not fold into its reassembled
     /// document.
@@ -952,6 +1020,10 @@ impl SseReassembler {
     /// `token.text` deltas reconstruct, so folding them into that prose would
     /// corrupt it.
     ///
+    /// OpenAI-style chat / Completions / Responses streams: more than
+    /// [`MAX_OPENAI_STREAM_ACCUMULATORS`] live choices, tool calls, output
+    /// texts, or output arguments in one family (the excess is folded).
+    ///
     /// Such a frame may carry client-visible text on a path nothing here reads,
     /// so a caller that promised inspection must treat the whole stream as
     /// uninspectable and fail closed rather than deliver a clean verdict over
@@ -974,8 +1046,105 @@ impl SseReassembler {
     /// the streamed `inspect` path inspects the current window repeatedly as the
     /// stream grows, so it cannot move the strings out the way
     /// [`into_texts`](Self::into_texts) does for the one-shot buffered path.
+    ///
+    /// Only the non-empty fragment strings are copied; the keyed accumulators,
+    /// their lookup tables and empty entries are not cloned per call.
     pub fn texts(&self) -> Vec<SseText> {
-        self.clone().into_texts()
+        let mut out = Vec::new();
+        let mut push = |kind: SseTextKind, json_path: String, text: &str| {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind,
+                    json_path,
+                    text: text.to_string(),
+                });
+            }
+        };
+        for (choice, text) in &self.completion_text {
+            push(
+                SseTextKind::CompletionText,
+                format!("$.choices[{choice}].text"),
+                text,
+            );
+        }
+        for (choice, text) in &self.content {
+            push(
+                SseTextKind::ChatContent,
+                format!("$.choices[{choice}].delta.content"),
+                text,
+            );
+        }
+        for ((choice, tool), accum) in &self.tool_calls {
+            push(
+                SseTextKind::ChatToolName,
+                format!("$.choices[{choice}].delta.tool_calls[{tool}].function.name"),
+                &accum.name,
+            );
+            push(
+                SseTextKind::ChatToolArguments,
+                format!("$.choices[{choice}].delta.tool_calls[{tool}].function.arguments"),
+                &accum.arguments,
+            );
+        }
+        for ((output, content), text) in &self.responses_text {
+            push(
+                SseTextKind::ResponsesText,
+                format!("$.output[{output}].content[{content}].text"),
+                text,
+            );
+        }
+        for (output, text) in &self.responses_args {
+            push(
+                SseTextKind::ResponsesArguments,
+                format!("$.output[{output}].arguments"),
+                text,
+            );
+        }
+        for (index, block) in &self.anthropic_blocks {
+            push(
+                SseTextKind::AnthropicText,
+                format!("$.content[{index}].text"),
+                &block.text,
+            );
+            push(
+                SseTextKind::AnthropicToolName,
+                format!("$.content[{index}].name"),
+                &block.name,
+            );
+            push(
+                SseTextKind::AnthropicToolInput,
+                format!("$.content[{index}].input"),
+                &block.input_json,
+            );
+        }
+        for (index, candidate) in &self.gemini_candidates {
+            push(
+                SseTextKind::GeminiText,
+                format!("$.candidates[{index}].content.parts[*].text"),
+                &candidate.text,
+            );
+            push(
+                SseTextKind::GeminiFunctionCallName,
+                format!("$.candidates[{index}].content.parts[*].functionCall.name"),
+                &candidate.name,
+            );
+            push(
+                SseTextKind::GeminiFunctionCallArgs,
+                format!("$.candidates[{index}].content.parts[*].functionCall.args"),
+                &candidate.args_json,
+            );
+        }
+        push(
+            SseTextKind::TgiGeneratedText,
+            "$[0].generated_text".to_string(),
+            &self.tgi_text,
+        );
+        push(
+            SseTextKind::AnthropicText,
+            "$.error.message".to_string(),
+            &self.anthropic_error_text,
+        );
+        out
     }
 
     /// Trim streamed tool-call names/arguments and Responses-API function-call
@@ -1920,70 +2089,53 @@ impl SseReassembler {
     }
 
     fn completion_text_mut(&mut self, choice: usize) -> &mut String {
-        let pos = match self.completion_text_positions.get(&choice).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.completion_text.len();
-                self.completion_text.push((choice, String::new()));
-                self.completion_text_positions.insert(choice, pos);
-                pos
-            }
-        };
-        &mut self.completion_text[pos].1
+        bounded_slot(
+            &mut self.completion_text,
+            &mut self.completion_text_positions,
+            choice,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn content_mut(&mut self, choice: usize) -> &mut String {
-        let pos = match self.content_positions.get(&choice).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.content.len();
-                self.content.push((choice, String::new()));
-                self.content_positions.insert(choice, pos);
-                pos
-            }
-        };
-        &mut self.content[pos].1
+        bounded_slot(
+            &mut self.content,
+            &mut self.content_positions,
+            choice,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn tool_call_mut(&mut self, choice: usize, tool: usize) -> &mut ToolCallAccumulator {
-        let key = (choice, tool);
-        let pos = match self.tool_call_positions.get(&key).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.tool_calls.len();
-                self.tool_calls.push((key, ToolCallAccumulator::default()));
-                self.tool_call_positions.insert(key, pos);
-                pos
-            }
-        };
-        &mut self.tool_calls[pos].1
+        bounded_slot(
+            &mut self.tool_calls,
+            &mut self.tool_call_positions,
+            (choice, tool),
+            (usize::MAX, usize::MAX),
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn responses_text_mut(&mut self, output: usize, content: usize) -> &mut String {
-        let key = (output, content);
-        let pos = match self.responses_text_positions.get(&key).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.responses_text.len();
-                self.responses_text.push((key, String::new()));
-                self.responses_text_positions.insert(key, pos);
-                pos
-            }
-        };
-        &mut self.responses_text[pos].1
+        bounded_slot(
+            &mut self.responses_text,
+            &mut self.responses_text_positions,
+            (output, content),
+            (usize::MAX, usize::MAX),
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn responses_args_mut(&mut self, output: usize) -> &mut String {
-        let pos = match self.responses_args_positions.get(&output).copied() {
-            Some(pos) => pos,
-            None => {
-                let pos = self.responses_args.len();
-                self.responses_args.push((output, String::new()));
-                self.responses_args_positions.insert(output, pos);
-                pos
-            }
-        };
-        &mut self.responses_args[pos].1
+        bounded_slot(
+            &mut self.responses_args,
+            &mut self.responses_args_positions,
+            output,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 }
 
@@ -2601,10 +2753,21 @@ data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"baz\"}}]}\n\n";
             }));
         }
 
+        // Issue #6624: distinct choice keys are capped; the excess folds into
+        // one overflow accumulator whose bytes are kept, and the stream is
+        // flagged so enforcing callers fail closed.
+        assert!(reassembler.provider_stream_uninspectable());
         let texts = reassembler.into_texts();
-        assert_eq!(texts.len(), 4096);
+        assert_eq!(texts.len(), MAX_OPENAI_STREAM_ACCUMULATORS + 1);
         assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
-        assert_eq!(texts[4095].json_path, "$.choices[4095].delta.content");
+        let overflow = texts.last().expect("overflow accumulator");
+        assert_eq!(
+            overflow.json_path,
+            format!("$.choices[{}].delta.content", usize::MAX)
+        );
+        assert_eq!(overflow.text.len(), 4096 - MAX_OPENAI_STREAM_ACCUMULATORS);
+        let retained: usize = texts.iter().map(|text| text.text.len()).sum();
+        assert_eq!(retained, 4096);
     }
 
     #[test]

@@ -17,11 +17,11 @@ use ferrum_edge::plugins::utils::query::{
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
 use ferrum_edge::plugins::utils::sse::{
-    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseEventName,
-    SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
-    classify_forwarded_sse_prefix, parse_sse_data_frames_checked, split_sse_line_terminator,
-    sse_event_end, sse_event_end_after, sse_line_end, sse_lines, sse_lines_inclusive,
-    strip_sse_boms,
+    AnthropicEvent, MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES,
+    MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseForwardedPrefix, SseReassembler, SseText,
+    SseTextKind, UTF8_BOM, classify_forwarded_sse_prefix, parse_sse_data_frames_checked,
+    split_sse_line_terminator, sse_event_end, sse_event_end_after, sse_line_end, sse_lines,
+    sse_lines_inclusive, strip_sse_boms,
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
@@ -2494,4 +2494,100 @@ fn cached_header_sanitizer_ratelimit_match_is_bounded_and_keeps_existing_familie
     ] {
         assert!(!is_sensitive_header(name), "{name} should be kept");
     }
+}
+
+/// Issue #6624: the OpenAI-style families key by provider-supplied indexes
+/// too, so they fold past a live-accumulator ceiling exactly like the
+/// Anthropic/Gemini paths, keep every byte for inspection, and fail closed.
+#[test]
+fn openai_and_responses_stream_indexes_fold_and_flag() {
+    let overflow = 500;
+    let total = MAX_OPENAI_STREAM_ACCUMULATORS + overflow;
+    let frames: Vec<serde_json::Value> = vec![
+        // chat delta.content per choice
+        serde_json::json!({"choices": (0..total)
+            .map(|i| serde_json::json!({"index": i, "delta": {"content": "c"}}))
+            .collect::<Vec<_>>()}),
+        // legacy Completions text per choice
+        serde_json::json!({"choices": (0..total)
+            .map(|i| serde_json::json!({"index": i, "text": "t"}))
+            .collect::<Vec<_>>()}),
+    ];
+    let mut reassembler = SseReassembler::new();
+    for frame in &frames {
+        reassembler.push_frame(frame);
+    }
+    // Two-dimensional tool-call keys: the cap is on live keys, so choice x
+    // tool cannot multiply it.
+    for choice in 0..30 {
+        let calls: Vec<_> = (0..30)
+            .map(|tool| {
+                serde_json::json!({"index": tool, "function": {"name": "n", "arguments": "a"}})
+            })
+            .collect();
+        reassembler.push_frame(&serde_json::json!({
+            "choices": [{"index": choice, "delta": {"tool_calls": calls}}]
+        }));
+    }
+    for index in 0..total {
+        reassembler.push_frame(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": index,
+            "content_index": index,
+            "delta": "r"
+        }));
+        reassembler.push_frame(&serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": index,
+            "delta": "f"
+        }));
+    }
+
+    assert!(
+        reassembler.provider_stream_uninspectable(),
+        "an index family past the ceiling fails closed"
+    );
+    assert_eq!(
+        reassembler.accumulator_count(),
+        5 * (MAX_OPENAI_STREAM_ACCUMULATORS + 1),
+        "each family holds at most the ceiling plus one shared overflow accumulator"
+    );
+    let texts = reassembler.texts();
+    assert_eq!(texts, reassembler.clone().into_texts());
+    let bytes_of = |kind: SseTextKind| -> usize {
+        texts
+            .iter()
+            .filter(|text| text.kind == kind)
+            .map(|text| text.text.len())
+            .sum()
+    };
+    // Every delta byte is still present for inspection, none dropped.
+    assert_eq!(bytes_of(SseTextKind::ChatContent), total);
+    assert_eq!(bytes_of(SseTextKind::CompletionText), total);
+    assert_eq!(bytes_of(SseTextKind::ChatToolName), 900);
+    assert_eq!(bytes_of(SseTextKind::ChatToolArguments), 900);
+    assert_eq!(bytes_of(SseTextKind::ResponsesText), total);
+    assert_eq!(bytes_of(SseTextKind::ResponsesArguments), total);
+}
+
+#[test]
+fn openai_stream_within_the_index_ceiling_stays_inspectable() {
+    let mut reassembler = SseReassembler::new();
+    reassembler.push_frame(
+        &serde_json::json!({"choices": (0..MAX_OPENAI_STREAM_ACCUMULATORS)
+        .map(|i| serde_json::json!({"index": i, "delta": {"content": "c"}}))
+        .collect::<Vec<_>>()}),
+    );
+    assert!(!reassembler.provider_stream_uninspectable());
+    assert_eq!(
+        reassembler.accumulator_count(),
+        MAX_OPENAI_STREAM_ACCUMULATORS
+    );
+    // Draining releases slots, so a later stream segment can reuse them.
+    reassembler.drain_assistant_prefix(usize::MAX);
+    assert_eq!(reassembler.accumulator_count(), 0);
+    reassembler.push_frame(&serde_json::json!({
+        "choices": [{"index": 999, "delta": {"content": "late"}}]
+    }));
+    assert!(!reassembler.provider_stream_uninspectable());
 }
