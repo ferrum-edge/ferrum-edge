@@ -122,7 +122,7 @@ docker run --rm \
     chmod +x /usr/local/bin/protoc
     rm /tmp/protoc.zip
     export PROTOC=/usr/local/bin/protoc
-    cargo build --features "$LINUX_GNU_FEATURES" --profile "$LINUX_GNU_PROFILE" --target "$LINUX_GNU_TARGET" --target-dir /src/target/linux-gnu-sysroot
+    cargo build --locked --features "$LINUX_GNU_FEATURES" --profile "$LINUX_GNU_PROFILE" --target "$LINUX_GNU_TARGET" --target-dir /src/target/linux-gnu-sysroot
     chown -R "${HOST_UID}:${HOST_GID}" \
       /src/target/linux-gnu-sysroot \
       /opt/cargo \
