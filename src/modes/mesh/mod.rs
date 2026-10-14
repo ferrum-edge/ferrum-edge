@@ -1661,6 +1661,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
+    scope_request_auth_refusal_to_inbound_routes(&mut config, runtime);
     // VirtualService-derived CORS attaches to the just-materialized outbound
     // routes (issue #1973) — after materialization so the proxy ids exist,
     // before DR application like every other route-policy overlay.
@@ -14174,6 +14175,12 @@ fn inject_mesh_request_auth_plugin(
     // refusal is forced over any operator `request_termination` global, which
     // would otherwise suppress a non-forced mesh-managed instance.
     if applicable.iter().any(|ra| ra.refused) {
+        // The refusal supersedes JWT validation for this workload: drop the
+        // managed `jwks_auth` so a sibling rule set that cannot construct
+        // (for example an oversized provider union) cannot veto the reload
+        // that installs the refusal and leave the previous configuration in
+        // force.
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
         warn!(
             "mesh RequestAuthentication: a RequestAuthentication selecting this workload was \
              rejected by translation; refusing every HTTP request to this workload (fail \
@@ -14190,13 +14197,13 @@ fn inject_mesh_request_auth_plugin(
             }),
             &runtime.namespace,
         );
-    } else {
-        remove_mesh_managed_plugin(
-            config,
-            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
-            &runtime.namespace,
-        );
+        return;
     }
+    remove_mesh_managed_plugin(
+        config,
+        MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+        &runtime.namespace,
+    );
 
     if applicable.is_empty() {
         // No applicable RequestAuthentication — remove any previously injected
@@ -14259,6 +14266,49 @@ fn inject_mesh_request_auth_plugin(
         jwks_config,
         &runtime.namespace,
     );
+}
+
+/// Restrict the RequestAuthentication refusal (issue #6656) to requests
+/// entering this workload. RequestAuthentication governs requests to the
+/// selected workload, so its outbound requests to healthy peers must keep
+/// flowing. Runs after inbound and outbound routes are materialized: the
+/// refusal is gated by a trigger on exactly the mesh inbound route ids, and
+/// with no inbound route it matches nothing.
+fn scope_request_auth_refusal_to_inbound_routes(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) {
+    let mut inbound: Vec<String> = config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.namespace == runtime.namespace && is_mesh_inbound_route_id(&proxy.id))
+        .map(|proxy| proxy.id.clone())
+        .collect();
+    inbound.sort();
+    inbound.dedup();
+    let Some(refusal) = config.plugin_configs.iter_mut().find(|plugin| {
+        plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+    }) else {
+        return;
+    };
+    if inbound.is_empty() {
+        // No mesh inbound route identifies this workload's ingress, so the
+        // refusal stays on every route (fail closed).
+        return;
+    }
+    let trigger = serde_json::json!({ "when": { "match": { "proxy_id": inbound } } });
+    match serde_json::from_value(trigger) {
+        Ok(trigger) => refusal.trigger = Some(trigger),
+        Err(error) => {
+            // Fail closed: an unrepresentable trigger leaves the refusal on
+            // every route rather than dropping it.
+            warn!(
+                error = %sanitize_startup_cause(error.to_string(), &[]),
+                "mesh RequestAuthentication refusal could not be scoped to inbound routes; \
+                 refusing on every route"
+            );
+        }
+    }
 }
 
 /// Build a single `jwks_auth` provider configuration from a [`MeshJwtRule`].
@@ -35917,6 +35967,17 @@ mod tests {
         );
         refused.jwt_rules.clear();
         refused.refused = true;
+        // A valid sibling RA for the same workload: its jwks_auth must not be
+        // installed beside the refusal (it could veto the reload).
+        let sibling = test_request_authentication(
+            "valid-jwt",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
+        );
         // An operator-managed global of the same type must not suppress it.
         let now = chrono::Utc::now();
         let operator_termination = crate::config::types::PluginConfig {
@@ -35939,7 +36000,7 @@ mod tests {
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                request_authentications: vec![refused],
+                request_authentications: vec![refused, sibling],
                 ..MeshConfig::default()
             })),
             plugin_configs: vec![operator_termination],
@@ -35958,6 +36019,13 @@ mod tests {
         assert_eq!(refusal.config["status_code"], 503);
         crate::plugins::validate_plugin_config("request_termination", &refusal.config)
             .expect("refusal config must construct");
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID),
+            "the refusal supersedes the managed jwks_auth"
+        );
 
         // A workload the refused resource does not select is unaffected.
         let other_runtime = MeshRuntimeConfig {
@@ -35992,6 +36060,60 @@ mod tests {
                 .iter()
                 .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
         );
+    }
+
+    /// The refusal applies only to requests entering the workload: it is
+    /// gated to the mesh inbound route ids, so the workload's own outbound
+    /// requests keep flowing; the managed `jwks_auth` is removed.
+    #[test]
+    fn request_auth_refusal_is_scoped_to_inbound_routes() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig::default();
+        for id in ["__mesh-inbound-api-8080", "__mesh-outbound-reviews-9080"] {
+            config.proxies.push(node_waypoint_udp_listener_proxy(
+                id,
+                &runtime.namespace,
+                "upstream",
+                18080,
+                false,
+                "udp",
+                now,
+            ));
+        }
+        force_ensure_global_plugin(
+            &mut config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+        let refusal = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+            .expect("refusal plugin");
+        let trigger = serde_json::to_value(refusal.trigger.as_ref().expect("scoped trigger"))
+            .expect("trigger serializes");
+        assert_eq!(
+            trigger["when"]["match"]["proxy_id"],
+            serde_json::json!(["__mesh-inbound-api-8080"])
+        );
+        assert!(refusal.enabled);
+
+        // With no inbound route the refusal stays on every route.
+        let mut bare = GatewayConfig::default();
+        force_ensure_global_plugin(
+            &mut bare,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut bare, &runtime);
+        assert!(bare.plugin_configs[0].trigger.is_none());
+        assert!(bare.plugin_configs[0].enabled);
     }
 
     #[tokio::test]

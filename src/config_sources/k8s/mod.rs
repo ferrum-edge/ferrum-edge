@@ -2466,7 +2466,14 @@ fn carry_refused_request_authentications(
     translation
         .config
         .mesh
-        .get_or_insert_with(|| Box::new(MeshConfig::default()))
+        .get_or_insert_with(|| {
+            // Every mesh-producing object was skipped: keep the configured
+            // Istio root namespace so a mesh-wide marker stays owned by it.
+            Box::new(MeshConfig {
+                istio_root_namespace: options.istio_root_namespace.clone(),
+                ..MeshConfig::default()
+            })
+        })
         .request_authentications
         .extend(refused);
 }

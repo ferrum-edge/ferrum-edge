@@ -665,3 +665,30 @@ fn underscore_equivalent_output_claim_destinations_are_rejected() {
     .expect_err("native mesh admission must agree with translation");
     assert!(native.contains("more than once"), "{native}");
 }
+
+/// A marker-only translation (every mesh object refused) keeps the configured
+/// Istio root namespace, so a mesh-wide refusal stays owned by it.
+#[test]
+fn refused_marker_only_translation_keeps_the_custom_root_namespace() {
+    let options = K8sTranslationOptions::new(
+        "mesh-root".to_string(),
+        TrustDomain::new("cluster.local").expect("test trust domain"),
+    )
+    .with_istio_root_namespace("mesh-root".to_string());
+    let refused = request_authentication(
+        "mesh-root",
+        json!({
+            "jwtRules": [{"jwksUri": "https://issuer.example.com/jwks"}]
+        }),
+    );
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(&[refused], options)
+        .expect("translation completes with the resource skipped");
+    assert_eq!(skipped.len(), 1);
+    let mesh = translation.config.mesh.expect("refused marker published");
+    assert_eq!(mesh.istio_root_namespace, "mesh-root");
+    assert!(mesh.request_authentications[0].refused);
+    assert!(matches!(
+        mesh.request_authentications[0].scope,
+        PolicyScope::MeshWide
+    ));
+}
