@@ -20,6 +20,14 @@ mod registry;
 #[cfg(feature = "secrets-vault")]
 mod vault;
 
+/// Emit warnings that external secret resolution recorded before the logging
+/// subscriber existed. Startup resolution runs before logging is initialized,
+/// so callers invoke this right after `init_logging` succeeds.
+pub fn emit_deferred_startup_warnings() {
+    #[cfg(feature = "secrets-vault")]
+    vault::emit_deferred_plaintext_warning();
+}
+
 #[cfg(any(feature = "secrets-aws", feature = "secrets-vault"))]
 pub(crate) fn split_reference_field(reference: &str) -> (&str, Option<&str>) {
     match reference.split_once('#') {
@@ -1283,6 +1291,9 @@ impl RedactionPlan {
 // data-plane fetch path can be exercised against a local fake Key Vault with a
 // pre-acquired bearer token (no Entra ID round trip). `AzureCredentials`
 // carries `from_static_token()` for that injection.
+#[cfg(feature = "secrets-azure")]
+#[doc(hidden)]
+pub use azure::hold_ca_bundle_reader_permit_for_test as azure_hold_ca_bundle_reader_permit_for_test;
 #[cfg(feature = "secrets-azure")]
 pub use azure::{
     AzureCredentials, AzureSecret, apply_tls_version_option as azure_apply_tls_version_option,

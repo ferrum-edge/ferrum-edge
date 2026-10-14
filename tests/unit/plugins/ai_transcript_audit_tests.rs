@@ -552,7 +552,7 @@ async fn rejects_privacy_capture_sampling_redaction_limits_and_fail_posture_typo
             Some("always_capture_on_guardrail"),
         ),
         (
-            json!({ "redaction": { "hash_secre": "fleet-stable-hmac-key" } }),
+            json!({ "redaction": { "hash_secre": "fleet-stable-hmac-key-0123456789ab" } }),
             "config.redaction.hash_secre",
             Some("hash_secret"),
         ),
@@ -3284,8 +3284,8 @@ async fn hash_secret_keys_the_redacted_value_digest() {
         PiiRedactor::from_config(&builtins, &[], "[REDACTED:{type}]", true, secret, "test")
             .expect("valid redactor")
     };
-    let keyed_a = make(Some("fleet-stable-hmac-key"));
-    let keyed_b = make(Some("fleet-stable-hmac-key"));
+    let keyed_a = make(Some("fleet-stable-hmac-key-0123456789ab"));
+    let keyed_b = make(Some("fleet-stable-hmac-key-0123456789ab"));
     let keyed_other = make(Some("a-different-hmac-key"));
     let random_a = make(None);
     let random_b = make(None);
@@ -4784,7 +4784,7 @@ async fn body_hashes_are_keyed_hmac_not_plain_sha256() {
     // be HMAC-SHA256 under that key — reusing the redaction-placeholder key —
     // and never the plain SHA-256 an offline attacker could brute-force through
     // a predictable JSON wrapper.
-    let secret = "fleet-stable-hmac-key";
+    let secret = "fleet-stable-hmac-key-0123456789ab";
     let resp_body: &[u8] = br#"{"choices":[{"message":{"content":"hi"}}]}"#;
     let records =
         capture_roundtrip(json!({ "redaction": { "hash_secret": secret } }), resp_body).await;
@@ -4876,7 +4876,7 @@ async fn pii_redactor_fallback_key_is_shared_across_constructions() {
 
 #[tokio::test]
 async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
-    let secret = "fleet-stable-hmac-key";
+    let secret = "fleet-stable-hmac-key-0123456789ab";
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -8175,7 +8175,7 @@ async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
         "tools": [{"type":"function","function":{"name": huge_tool.clone()}}]
     });
     let body_bytes = serde_json::to_vec(&body).unwrap();
-    let secret = "fleet-stable-hmac-key";
+    let secret = "fleet-stable-hmac-key-0123456789ab";
 
     for mode in [
         json!({ "mode": "redacted_body" }),
@@ -10201,7 +10201,7 @@ async fn unemittable_candidate_pays_no_capture_work() {
 async fn unchanged_request_body_is_hmaced_once_across_every_hook() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
-    let secret = "fleet-stable-hmac-key-once";
+    let secret = "fleet-stable-hmac-key-0123456789ab-once";
     let overrides = json!({ "redaction": { "hash_secret": secret } });
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(&endpoint, overrides),

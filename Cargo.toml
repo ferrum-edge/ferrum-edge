@@ -222,6 +222,7 @@ httpdate = "1"
 
 # Other utilities
 regex = "1"
+regex-syntax = "0.8"
 semver = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
@@ -335,9 +336,13 @@ google-cloud-wkt = { version = "=1.9.0", default-features = false, optional = tr
 opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
 # GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser.
 aws-smithy-json = { version = "=0.62.7", optional = true }
-azure_security_keyvault_secrets = { version = "0.14", optional = true }
-azure_identity = { version = "0.35", optional = true }
-azure_core = { version = "0.35", optional = true }
+# Azure SDK 1.x trio: upgrade all three together (`azure_identity` and the
+# Key Vault client implement/consume `azure_core`'s `TokenCredential`, so a
+# mixed major line does not compile). 1.x refuses bearer auth over non-TLS
+# URLs, so Key Vault references must be `https://` (see src/secrets/azure.rs).
+azure_security_keyvault_secrets = { version = "1.0.1", optional = true }
+azure_identity = { version = "1.0", optional = true }
+azure_core = { version = "1.1", optional = true }
 
 # GeoIP (geo_restriction plugin)
 maxminddb = "0.32"
@@ -553,7 +558,7 @@ wiremock = "0.6"
 # via testcontainers; env-mutating tests serialize via serial_test. Only the
 # `secrets_functional` test target uses testcontainers.
 # See tests/secrets_functional/.
-testcontainers = "0.27"
+testcontainers = "0.28"
 # `serial_test` is also the reader/writer gate in
 # `tests/unit/plugins/serverless_function_tests.rs`: a test that publishes a
 # provider credential fixture is `#[serial(serverless_env)]` and every test that

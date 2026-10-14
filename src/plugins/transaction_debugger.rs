@@ -650,9 +650,13 @@ impl TransactionDebugger {
                 .iter()
                 .any(|h| header_name.eq_ignore_ascii_case(h))
             || ctx.request_header_requires_redaction(header_name)
-            // The shared metadata decision (issue #6619): credential-class
-            // names such as `x-session-id`, `x-csrf` or `x-private-key` are
-            // redacted in request and response trace records too.
+            // Class-based fallback (issue #6619): a header whose NAME looks
+            // like a credential under the shared metadata decision (listed
+            // substrings, token / API-key spellings, operator
+            // `FERRUM_LOG_REDACT_METADATA_KEYS` extras, and credential-class
+            // names such as `x-session-id`, `x-csrf` or `x-private-key`) is
+            // redacted even when it is not on the fixed list. Headers never take
+            // the metadata-only outcome exemption.
             || is_sensitive_header_name(header_name)
     }
 

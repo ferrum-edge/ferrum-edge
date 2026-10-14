@@ -2203,14 +2203,15 @@ impl AiTranscriptAudit {
         // Counted in CHARACTERS, not UTF-8 bytes, so the admitted contract is
         // the one the documentation, the diagnostic, and the JSON Schema
         // `minLength` all state (JSON Schema counts code points, and a
-        // byte-counted minimum would silently admit an 8-character secret that
-        // the published component refuses). 16 characters is never fewer than
-        // 16 bytes, so this is the stricter of the two readings.
+        // byte-counted minimum would silently admit a 16-character secret that
+        // the published component refuses). 32 characters is never fewer than
+        // 32 bytes, so this is the stricter of the two readings. 32 is the same
+        // floor the OIDC session encryption secret uses.
         if let Some(secret) = hash_secret
-            && secret.chars().count() < 16
+            && secret.chars().count() < 32
         {
             return Err(
-                "ai_transcript_audit: `redaction.hash_secret` must be at least 16 characters"
+                "ai_transcript_audit: `redaction.hash_secret` must be at least 32 characters"
                     .to_string(),
             );
         }

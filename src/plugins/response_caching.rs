@@ -146,6 +146,16 @@ static CACHE_STATUS_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
 /// Maximum cache entries before triggering eviction of expired entries.
 const DEFAULT_MAX_ENTRIES: usize = 10_000;
 
+/// Hard admission ceiling for `max_entries`. The value sizes the eviction
+/// bookkeeping (and, at one tenth, the uncacheable predictor), so an arbitrary
+/// 64-bit integer must fail validation instead of reaching an allocator on a
+/// reload.
+const MAX_MAX_ENTRIES: usize = 10_000_000;
+
+/// Upper bound on what the predictor preallocates up front. Capacity beyond
+/// this grows on demand, so a large `max_entries` costs memory only when used.
+const PREDICTOR_INITIAL_CAPACITY_MAX: usize = 1024;
+
 /// Default TTL when no Cache-Control header is present (5 minutes).
 const DEFAULT_TTL_SECONDS: u64 = 300;
 
@@ -1012,8 +1022,7 @@ impl ResponseCachingConfig {
 
         Ok(Self {
             ttl_seconds: optional_u64(config, "ttl_seconds")?.unwrap_or(DEFAULT_TTL_SECONDS),
-            max_entries: optional_positive_usize(config, "max_entries")?
-                .unwrap_or(DEFAULT_MAX_ENTRIES),
+            max_entries: bounded_max_entries(config)?,
             max_entry_size_bytes: optional_positive_usize(config, "max_entry_size_bytes")?
                 .unwrap_or(DEFAULT_MAX_ENTRY_SIZE_BYTES),
             max_total_size_bytes: optional_positive_usize(config, "max_total_size_bytes")?
@@ -1066,6 +1075,17 @@ fn optional_u64(config: &Value, field: &'static str) -> Result<Option<u64>, Stri
             "response_caching: `{field}` must be an unsigned integer"
         )),
     }
+}
+
+fn bounded_max_entries(config: &Value) -> Result<usize, String> {
+    let max_entries =
+        optional_positive_usize(config, "max_entries")?.unwrap_or(DEFAULT_MAX_ENTRIES);
+    if max_entries > MAX_MAX_ENTRIES {
+        return Err(format!(
+            "response_caching: `max_entries` must be at most {MAX_MAX_ENTRIES}"
+        ));
+    }
+    Ok(max_entries)
 }
 
 fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
@@ -1219,8 +1239,13 @@ struct UncacheablePredictor {
 impl UncacheablePredictor {
     fn new(max_entries: usize, shard_amount: usize) -> Self {
         Self {
-            keys: DashMap::with_capacity_and_shard_amount(max_entries / 4, shard_amount),
-            order: Mutex::new(VecDeque::with_capacity(max_entries.min(1024))),
+            keys: DashMap::with_capacity_and_shard_amount(
+                (max_entries / 4).min(PREDICTOR_INITIAL_CAPACITY_MAX),
+                shard_amount,
+            ),
+            order: Mutex::new(VecDeque::with_capacity(
+                max_entries.min(PREDICTOR_INITIAL_CAPACITY_MAX),
+            )),
             next_seq: AtomicU64::new(1),
             max_entries,
         }

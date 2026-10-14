@@ -274,7 +274,11 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         ],
     ),
     ("ai_prompt_shield", NONE),
-    ("waf", NONE),
+    (
+        "waf",
+        // `header_present` values are shared secrets that suppress every rule.
+        &[secret(&["global_exemptions", "header_present", "*"])],
+    ),
     ("fault_injection", NONE),
     ("body_validator", NONE),
     ("openapi_validator", NONE),

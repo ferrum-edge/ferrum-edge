@@ -102,20 +102,20 @@
 //! separate design rather than a widening of this module:
 //!
 //! * **Streaming responses.** A response that never buffers never reaches a body
-//!   transform, so no body policy applies to it. `response_transformer` declines
-//!   to buffer when the *client* sent `Accept: text/event-stream`, which means a
-//!   client can currently keep a configured body policy from running by asking
-//!   for SSE on a route that answers with ordinary JSON. Closing that requires
-//!   deciding on the response media type instead of the request's, plus a
-//!   streaming-side enforcement point — tracked separately.
+//!   transform, so no body policy applies to it. A client `Accept:
+//!   text/event-stream` no longer releases anything on its own:
+//!   `response_transformer` keeps its pre-header buffering vote and refines it
+//!   against the backend's declared response media type. It releases a
+//!   response whose declared type is not JSON (a genuine `text/event-stream`,
+//!   `application/octet-stream`, and similar) or is a framed gRPC type, none
+//!   of which a JSON body policy can act on; a declared or untyped JSON
+//!   response stays buffered. Enforcing a body policy over a true event stream
+//!   would need a streaming-side enforcement point — a separate design.
 //!
-//!   The gap is exactly that narrow: it is about a response that never buffers.
-//!   Once anything else *does* buffer such a request's response, the claim
-//!   predicate covers it like any other, because the transform runs over it like
-//!   any other. `response_transformer` therefore does NOT decline SSE in
-//!   `enforces_response_body_policy` — only in `should_buffer_response_body`,
-//!   which is its buffering vote rather than its policy claim. A response that
-//!   genuinely is `text/event-stream` still falls out on media type.
+//!   `response_transformer` does NOT decline client SSE intent in
+//!   `enforces_response_body_policy`: once a response buffers, the claim
+//!   predicate covers it like any other, because the transform runs over it
+//!   like any other.
 //! * **Framed gRPC.** `application/grpc+json` and the gRPC-Web `+json` variants
 //!   end in `+json`, but carry length-prefixed frames rather than a bare
 //!   document, so no JSON field rule can act on them. `response_transformer`

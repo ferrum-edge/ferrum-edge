@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **An unencoded `;` in the query is now an ambiguity that fail-closed query
+  consumers reject** (issue #6579; query counterpart of GHSA-fcqw-793q-wg5x /
+  GHSA-5mrg-vq2h-6j3w). The canonical query view split pairs only on `&`, so
+  `?tenant=admin&x=;tenant=victim` was one unambiguous `tenant=admin` to OPA,
+  `mesh_route_dispatch` query predicates, and `serverless_function` query
+  forwarding, while a backend that also splits on `;` (Rack before 3.0, Go
+  before 1.17, Python before 3.9.2) executed `tenant=victim`. A new
+  `semicolon_separator` classification records any unencoded `;` in a name
+  or value: OPA (`query_ambiguity_policy: reject`) denies before the policy
+  call, `mesh_route_dispatch` answers `400`, and `serverless_function` fails
+  with `ambiguous_query_encoding`. Under OPA `delegate` the token appears in
+  `input.query_ambiguity`. `%3B` stays an unambiguous literal semicolon.
+  Credential stripping (`hide_credentials` query locations, and the
+  `request_transformer` pre-mutation strip) now also drops an `&` segment
+  that carries the credential behind a `;` (`carrier=;api_key=secret`), and
+  WAF `FE-HPP-001` compares duplicates under the `&`+`;` convention too, with
+  exclusions and `fp_filters` judged on each convention's own pairs. OPA
+  `delegate` input withholds a pair whose `;` sub-pair names a redacted
+  credential (split on the encoded bytes, so `%3B` stays content).
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose

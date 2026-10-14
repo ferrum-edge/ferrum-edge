@@ -226,6 +226,15 @@ const ALLOWED_CUSTOM_PATTERN_KEYS: &[&str] = &["name", "regex"];
 /// separately and precisely by [`MAX_REDACTION_PLACEHOLDER_BYTES`].
 const MAX_CUSTOM_PATTERN_NAME_CHARS: usize = 128;
 
+/// Hard ceiling on `custom_patterns` entries. Each entry compiles into its own
+/// `Regex` and into the shared detection `RegexSet`, so the count is a
+/// construction-cost bound. Same bound as `ai_response_guard`.
+const MAX_CUSTOM_PATTERNS: usize = 256;
+
+/// Hard ceiling on `max_scan_bytes`: the request body this plugin regex-scans
+/// and may rewrite synchronously. Same bound as `ai_response_guard`.
+const MAX_SCAN_BYTES_CEILING: usize = 64 * 1024 * 1024;
+
 /// Upper bound on the RENDERED per-pattern redaction placeholder — the
 /// configured template with `{type}` already substituted. Bounding the rendered
 /// form rather than the template is what actually caps amplification: a
@@ -388,18 +397,6 @@ impl RedactionBudget {
     }
 }
 
-/// Append `value` to `output` only while the result stays within `ceiling`,
-/// so an expanding rewrite is refused BEFORE it allocates rather than after.
-fn push_within_ceiling(output: &mut String, value: &str, ceiling: usize) -> bool {
-    match output.len().checked_add(value.len()) {
-        Some(next) if next <= ceiling => {
-            output.push_str(value);
-            true
-        }
-        _ => false,
-    }
-}
-
 /// Replace every configured pattern's matches in `text` with that pattern's
 /// pre-rendered placeholder, under `budget`.
 ///
@@ -417,42 +414,25 @@ fn redact_text_bounded(text: &str, patterns: &[PiiPattern], budget: &RedactionBu
     if budget.is_exhausted() {
         return text.to_string();
     }
-    // Every intermediate pass over this one string is bounded by what the
-    // aggregate allowance can still pay for.
-    let ceiling = text.len().saturating_add(budget.remaining());
-    let mut result = text.to_string();
-    for pattern in patterns {
-        let mut matches = pattern.regex.find_iter(&result);
-        let Some(first_match) = matches.next() else {
-            continue;
-        };
-        let mut replaced = String::with_capacity(result.len());
-        let mut cursor = 0usize;
-        for matched in std::iter::once(first_match).chain(matches) {
-            // A zero-width match inserts the placeholder at every position and
-            // amplifies a bounded body without bound. Config admission already
-            // refuses patterns that match the empty string; a contextual
-            // assertion can still produce an empty span beside non-empty input,
-            // so refuse those here too.
-            if matched.start() == matched.end() {
-                budget.fail();
-                return text.to_string();
-            }
-            if !push_within_ceiling(&mut replaced, &result[cursor..matched.start()], ceiling)
-                || !push_within_ceiling(&mut replaced, &pattern.placeholder, ceiling)
-            {
-                budget.fail();
-                return text.to_string();
-            }
-            cursor = matched.end();
-        }
-        if !push_within_ceiling(&mut replaced, &result[cursor..], ceiling) {
-            budget.fail();
-            return text.to_string();
-        }
-        result = replaced;
-    }
-    let growth = result.len().saturating_sub(text.len());
+    // Live allocations (the still-resident intermediate plus the buffer being
+    // written) are bounded by what the aggregate allowance can still pay for,
+    // and the retained result is compacted to its length.
+    let limit = text.len().saturating_add(budget.remaining());
+    let Some(result) = super::ai_response_guard::replace_sequentially_bounded(
+        text,
+        patterns
+            .iter()
+            .map(|pattern| (&pattern.regex, pattern.placeholder.as_str())),
+        limit,
+    ) else {
+        budget.fail();
+        return text.to_string();
+    };
+    // Charged on the JSON-escaped form: the rewritten prompt is serialized
+    // back into a JSON document, where a control-character placeholder grows
+    // six-fold.
+    let growth = super::ai_response_guard::json_escaped_len(&result)
+        .saturating_sub(super::ai_response_guard::json_escaped_len(text));
     if growth > 0 && !budget.charge_growth(growth) {
         return text.to_string();
     }
@@ -588,6 +568,11 @@ impl AiPromptShield {
 
         let max_scan_bytes =
             optional_positive_usize(config, "max_scan_bytes")?.unwrap_or(1_048_576);
+        if max_scan_bytes > MAX_SCAN_BYTES_CEILING {
+            return Err(format!(
+                "ai_prompt_shield: `max_scan_bytes` must be at most {MAX_SCAN_BYTES_CEILING}"
+            ));
+        }
 
         // Build pattern list from config
         let pattern_names: Vec<String> =
@@ -599,6 +584,14 @@ impl AiPromptShield {
                     "aws_key".to_string(),
                 ]
             });
+
+        // Refuse duplicates before anything is compiled: with unknown names
+        // already fatal, this bounds the list by the built-in catalog.
+        super::ai_response_guard::reject_duplicate_names(
+            &pattern_names,
+            "ai_prompt_shield",
+            "patterns",
+        )?;
 
         let mut patterns: Vec<PiiPattern> = Vec::new();
 
@@ -632,6 +625,11 @@ impl AiPromptShield {
 
         // Add custom patterns
         if let Some(custom) = optional_array(config, "custom_patterns")? {
+            if custom.len() > MAX_CUSTOM_PATTERNS {
+                return Err(format!(
+                    "ai_prompt_shield: `custom_patterns` must have at most {MAX_CUSTOM_PATTERNS} entries"
+                ));
+            }
             for (index, entry) in custom.iter().enumerate() {
                 // Closed member set, exactly like the top-level gate: an
                 // unsupported nested option must be diagnosed at admission
@@ -3910,8 +3908,11 @@ fn redact_json_strings(
             let rendered = n.to_string();
             if let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(&rendered)) {
                 // Replacing a scalar can grow the document just like rewriting
-                // a string, so charge the same aggregate allowance.
-                let growth = pattern.placeholder.len().saturating_sub(rendered.len());
+                // a string, so charge the same aggregate allowance, measured
+                // as serialized: the escaped placeholder plus its quotes.
+                let growth = super::ai_response_guard::json_escaped_len(&pattern.placeholder)
+                    .saturating_add(2)
+                    .saturating_sub(rendered.len());
                 if growth > 0 && !budget.charge_growth(growth) {
                     return;
                 }

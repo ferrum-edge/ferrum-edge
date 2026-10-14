@@ -191,6 +191,24 @@ impl Waf {
                     Cow::Borrowed(raw_k)
                 };
                 self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, subject);
+                // A backend that also splits on `;` reads each `;` sub-pair as
+                // a parameter of its own (issue #6579), so `?html=ok;q=<x>`
+                // must not hide `q` behind an excluded `html`. Split on the
+                // encoded bytes so `%3B` stays content.
+                if pair.contains(';') {
+                    // Every sub-pair, the first included: an anchored or
+                    // `equals` rule, or a suffix filter, can decide `role=admin`
+                    // differently from `role=admin;note=ok`.
+                    for sub_pair in pair.split(';').filter(|sub| !sub.is_empty()) {
+                        let (sub_k, sub_v) = sub_pair.split_once('=').unwrap_or((sub_pair, ""));
+                        let sub_name = if self.compiled.query_exclusions_active {
+                            normalize::query_component_name(sub_k)
+                        } else {
+                            Cow::Borrowed(sub_k)
+                        };
+                        self.scan_query_pair(&mut outcome, sub_k, sub_v, &sub_name, subject);
+                    }
+                }
             }
         } else {
             // Materialized keys are already decoded: they are the names as
@@ -883,15 +901,49 @@ impl Waf {
     ) {
         if let Some(rule_index) = self.specials.hpp {
             // An excluded parameter may legitimately repeat (`ids=1&ids=2`),
-            // so its pairs are dropped before duplicates are compared.
-            let judged = match &self.compiled.rules[rule_index].exclusions {
-                Some(exclusions) if !exclusions.query_params.is_empty() => {
-                    Cow::Owned(query_without_excluded_params(raw_query, exclusions))
-                }
-                _ => Cow::Borrowed(raw_query),
+            // so its pairs are dropped before duplicates are compared. Each
+            // separator convention is judged on its own retained pairs, and
+            // false-positive filters see that same text: `&` only, then `&`
+            // plus `;` for backends that also split on `;` (issue #6579). A
+            // conflict that survives suppression under either convention is
+            // enforced.
+            let exclusions = self.compiled.rules[rule_index]
+                .exclusions
+                .as_ref()
+                .filter(|exclusions| !exclusions.query_params.is_empty());
+            let kept = |pair: &&str| {
+                exclusions.is_none_or(|exclusions| {
+                    let raw_key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+                    !exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
+                })
             };
-            if decode::has_conflicting_duplicate_query_key(&judged) {
-                self.push_special(outcome, rule_index, &judged, subject);
+            if decode::has_conflicting_duplicate_among(raw_query.split('&').filter(kept)) {
+                // Filters see exactly the pairs conflict detection judged.
+                let judged = match exclusions {
+                    Some(_) => Cow::Owned(
+                        raw_query
+                            .split('&')
+                            .filter(|pair| !pair.is_empty())
+                            .filter(kept)
+                            .collect::<Vec<_>>()
+                            .join("&"),
+                    ),
+                    None => Cow::Borrowed(raw_query),
+                };
+                if self.special_hit_allowed(rule_index, &judged, subject) {
+                    self.push_special(outcome, rule_index, &judged, subject);
+                    return;
+                }
+            }
+            if raw_query.contains(';') {
+                let retained: Vec<&str> = raw_query
+                    .split(['&', ';'])
+                    .filter(|pair| !pair.is_empty())
+                    .filter(kept)
+                    .collect();
+                if decode::has_conflicting_duplicate_among(retained.iter().copied()) {
+                    self.push_special(outcome, rule_index, &retained.join("&"), subject);
+                }
             }
         }
     }
@@ -932,6 +984,20 @@ impl Waf {
         }
     }
 
+    /// Whether a special rule's hit on `value` survives scoping, exemptions,
+    /// and the rule's false-positive filters.
+    fn special_hit_allowed(
+        &self,
+        rule_index: usize,
+        value: &str,
+        subject: ScanSubject<'_>,
+    ) -> bool {
+        let rule = &self.compiled.rules[rule_index];
+        self.rule_applies(subject, rule_index)
+            && !self.exemptions.suppresses_value(value)
+            && !rule.suppresses_text(value)
+    }
+
     fn push_special(
         &self,
         outcome: &mut ScanOutcome,
@@ -940,10 +1006,7 @@ impl Waf {
         subject: ScanSubject<'_>,
     ) {
         let rule = &self.compiled.rules[rule_index];
-        if self.rule_applies(subject, rule_index)
-            && !self.exemptions.suppresses_value(value)
-            && !rule.suppresses_text(value)
-        {
+        if self.special_hit_allowed(rule_index, value, subject) {
             outcome.push(RuleHit {
                 rule_index,
                 target_name: rule.target.log_target(),
@@ -985,19 +1048,38 @@ fn cookie_name(crumb: &str) -> &str {
 
 /// `raw_query` without the pairs whose decoded name is excluded.
 fn query_without_excluded_params(raw_query: &str, exclusions: &FieldExclusions) -> String {
+    let excluded = |pair: &str| {
+        let raw_key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        exclusions.excludes_query_param(&normalize::query_component_name(raw_key))
+    };
     let mut kept = String::with_capacity(raw_query.len());
     for pair in raw_query.split('&') {
         if pair.is_empty() {
             continue;
         }
-        let raw_key = pair.split_once('=').map_or(pair, |(key, _)| key);
-        if exclusions.excludes_query_param(&normalize::query_component_name(raw_key)) {
+        // An excluded `&` pair may still carry non-excluded `;` sub-pairs that
+        // a `;`-splitting backend reads as parameters of their own (issue
+        // #6579); keep those so whole-URL rules still see them.
+        // A non-excluded pair is kept whole: under the `&` reading its value
+        // runs to the next `&`, `;` sub-pairs included.
+        let retained: Cow<'_, str> = if !excluded(pair) {
+            Cow::Borrowed(pair)
+        } else if pair.contains(';') {
+            let subs: Vec<&str> = pair
+                .split(';')
+                .filter(|sub| !sub.is_empty() && !excluded(sub))
+                .collect();
+            if subs.is_empty() {
+                continue;
+            }
+            Cow::Owned(subs.join(";"))
+        } else {
             continue;
-        }
+        };
         if !kept.is_empty() {
             kept.push('&');
         }
-        kept.push_str(pair);
+        kept.push_str(&retained);
     }
     kept
 }

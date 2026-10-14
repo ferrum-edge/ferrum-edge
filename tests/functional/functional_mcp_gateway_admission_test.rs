@@ -795,7 +795,7 @@ fn bridge_config(backend_port: u16) -> GatewayConfig {
 }
 
 /// API key of the one agent Consumer in [`governed_bridge_config`].
-const AGENT_KEY: &str = "agent-alice-key";
+const AGENT_KEY: &str = "agent-alice-key-0123456789";
 
 /// [`bridge_config`]'s OpenAPI bridge behind the AI governance stack:
 /// `key_auth`, `ai_transcript_audit` exporting to the collector on

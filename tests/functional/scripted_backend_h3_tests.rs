@@ -6159,6 +6159,10 @@ fn h3_body_waf_plugin_config(target: &str) -> Value {
     if target == "response_body" {
         config["response_inspection"] = json!(true);
         config["response_body_inspection"] = json!(true);
+        // The fixture serves `application/octet-stream`; this test pins the
+        // oversize relay, not the unlisted-type disposition, so keep that body
+        // on the streaming path.
+        config["on_unlisted_response_content_type"] = json!("allow");
     }
     json!({
         "id": "h3-oversize-waf",

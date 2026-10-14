@@ -25,7 +25,7 @@ Each gateway is tested as a reverse proxy with four scenarios:
 | **HTTP (plaintext)** | Client → Gateway (port 8000) → Backend. Measures raw proxy overhead. |
 | **HTTPS (TLS termination)** | Client → Gateway (port 8443, TLS) → Backend (plaintext). Measures TLS handshake and encryption overhead at the gateway. |
 | **E2E TLS (full encryption)** | Client → Gateway (port 8443, TLS) → Backend (TLS, port 3443). Measures full end-to-end encryption where the gateway re-encrypts traffic to the backend. |
-| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP, `/api/echo-auth`) → Backend `/api/echo`. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
+| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP, `/api/echo-auth`) → Backend `/api/echo`. Each request includes an API key header (`apikey: comparison-key-auth-0001`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
 
 Every scenario sends the same workload: a ~10 KB JSON `POST` to `/api/echo`, which the backend echoes back, so each run measures request and response body proxying (wrk scripts in `comparison/lua/`).
 
