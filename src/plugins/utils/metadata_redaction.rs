@@ -388,13 +388,23 @@ const KEY_MATERIAL_TRAILERS: &[&str] = &[
 /// by a counter word (`tokenspersecond`, `tokensused`). A singular credential
 /// representation that merely starts with `s` (`tokensigned`) is not one.
 fn is_token_count_shape(rest: &str) -> bool {
-    const COUNTER_WORDS: &[&str] = &[
+    // Complete counter expressions only, never prefixes (`tokensingleuse`
+    // must not pass as `tokens` + `in…`).
+    const COUNTER_SUFFIXES: &[&str] = &[
+        "",
         "per",
+        "persecond",
+        "perminute",
+        "perhour",
+        "perday",
+        "perrequest",
         "used",
         "total",
         "count",
         "in",
         "out",
+        "input",
+        "output",
         "remaining",
         "limit",
         "max",
@@ -405,9 +415,8 @@ fn is_token_count_shape(rest: &str) -> bool {
         "estimated",
         "budget",
     ];
-    rest.strip_prefix('s').is_some_and(|after| {
-        after.is_empty() || COUNTER_WORDS.iter().any(|word| after.starts_with(word))
-    })
+    rest.strip_prefix('s')
+        .is_some_and(|after| COUNTER_SUFFIXES.contains(&after))
 }
 
 /// A singular `token` followed by digits or a representation trailer inside
@@ -708,6 +717,7 @@ fn is_credential_class_name(key: &str) -> bool {
     let mut sensitive = false;
     let mut in_key_context = false;
     let mut previous_is_pass = false;
+    let mut previous_is_mfa = false;
     for_each_metadata_key_segment(key, |segment| {
         if sensitive {
             return;
@@ -734,8 +744,14 @@ fn is_credential_class_name(key: &str) -> bool {
             || (previous_is_pass
                 && ["phrase", "code", "word", "wd", "key"]
                     .iter()
+                    .any(|word| lower.starts_with(word)))
+            // `mfa` + `code` / `seed` / … split across segments (`mfa_seed`).
+            || (previous_is_mfa
+                && ["code", "seed", "secret", "key", "token", "pin"]
+                    .iter()
                     .any(|word| lower.starts_with(word)));
         previous_is_pass = lower == "pass";
+        previous_is_mfa = lower == "mfa";
         // Once a qualifier appears, the context stays open for the rest of
         // the key: a later `key` segment is key material.
         in_key_context |= opens_key_context(lower);
