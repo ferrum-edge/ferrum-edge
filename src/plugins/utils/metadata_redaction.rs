@@ -1947,10 +1947,7 @@ mod tests {
         let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["trace_id"], "abc-123");
-        assert_eq!(
-            parsed["request_deduplication.replayed"],
-            "visible-control"
-        );
+        assert_eq!(parsed["request_deduplication.replayed"], "visible-control");
         for key in [
             "_dedup_key",
             "_dedup_fingerprint",
