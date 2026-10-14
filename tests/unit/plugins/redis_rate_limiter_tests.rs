@@ -5807,7 +5807,10 @@ fn watched_writes_queue_multi_alone_and_require_queued_before_exec() {
     let multi = helper
         .find("redis::cmd(\"MULTI\").query_async(conn).await")
         .unwrap();
-    let multi_error = helper.find("ifletErr(e)=multi{").unwrap();
+    // MULTI must be acknowledged with exactly `OK` before the write is sent.
+    let multi_error = helper
+        .find("self.require_ok_acknowledgement(&reply,\"MULTI\")?")
+        .unwrap();
     let queued = helper.find("write.query_async(conn).await").unwrap();
     let queued_ok = helper.find("Ok(reply)ifreply==\"QUEUED\"=>{}").unwrap();
     let exec = helper
@@ -5834,7 +5837,11 @@ fn watched_writes_queue_multi_alone_and_require_queued_before_exec() {
     assert!(publish.contains(".exec_watched_write(&mutconn,&set,\"compare-and-set\")"));
     assert!(publish.contains("letmutset=redis::cmd(\"SET\");"));
     for body in [ownership, publish] {
-        assert!(!body.contains(".atomic()") && !body.contains("redis::pipe()"));
+        assert!(!body.contains(".atomic()"));
+        // The only pipeline is the bounded compare read, sent before MULTI.
+        let compare = body.find("redis::pipe()").unwrap();
+        assert!(compare < body.find(".exec_watched_write(").unwrap());
+        assert_eq!(body.matches("redis::pipe()").count(), 1);
     }
 }
 

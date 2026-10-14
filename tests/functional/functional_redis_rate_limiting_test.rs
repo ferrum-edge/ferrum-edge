@@ -3688,6 +3688,10 @@ async fn test_request_deduplication_redis_finalized_empty_synthetic_successes_re
         .arg("+multi")
         .arg("+exec")
         .arg("+del")
+        // Bounded record reads and ownership compares (issue #6622).
+        .arg("+exists")
+        .arg("+strlen")
+        .arg("+getrange")
         .query_async(&mut admin)
         .await
         .unwrap();
@@ -3706,7 +3710,10 @@ async fn test_request_deduplication_redis_finalized_empty_synthetic_successes_re
         }
         let result: Result<redis::Value, redis::RedisError> =
             probe.query_async(&mut restricted).await;
-        assert_eq!(result.unwrap_err().code(), Some("NOPERM"));
+        assert!(
+            result.is_ok(),
+            "{command} must be granted for deduplication"
+        );
     }
 
     let config = format!(
