@@ -38,7 +38,8 @@ use crate::plugins::otel_tracing::{
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::{
-    is_credential_class_metadata_key, is_operator_sensitive_metadata_key, is_sensitive_metadata_key,
+    is_credential_class_metadata_key, is_operator_sensitive_metadata_key, is_sensitive_header_name,
+    is_sensitive_metadata_key,
 };
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -1981,7 +1982,7 @@ fn validate_custom_tags(
             http::header::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                 format!("workload_metrics: custom tag {name:?} has invalid header name {header:?}")
             })?;
-        if is_sensitive_metadata_key(header_name.as_str()) {
+        if is_sensitive_header_name(header_name.as_str()) {
             return Err(format!(
                 "workload_metrics: custom tag {name:?} cannot copy sensitive header {header:?}"
             ));

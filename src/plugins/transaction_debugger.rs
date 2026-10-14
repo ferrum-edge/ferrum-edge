@@ -95,7 +95,8 @@ use crate::plugins::utils::log_schema::{
     SummarySchema, TimestampFormat, resolve_schema,
 };
 use crate::plugins::utils::metadata_redaction::{
-    REDACTED_PLACEHOLDER, is_sensitive_metadata_key, is_sensitive_name_by_listed_rules,
+    REDACTED_PLACEHOLDER, is_sensitive_header_name, is_sensitive_metadata_key,
+    is_sensitive_name_by_listed_rules,
 };
 use crate::proxy::tcp_proxy::StreamIoSide;
 
@@ -564,7 +565,7 @@ impl TransactionDebugger {
             // The shared metadata decision (issue #6619): credential-class
             // names such as `x-session-id`, `x-csrf` or `x-private-key` are
             // redacted in request and response trace records too.
-            || is_sensitive_metadata_key(header_name)
+            || is_sensitive_header_name(header_name)
     }
 
     /// Create a redacted copy of headers for safe logging.

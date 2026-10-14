@@ -630,6 +630,9 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "mesh.private_ec_p256_key",
     "privateecp256key",
     "x-sigBase64Url",
+    "x-dbPinUtf8",
+    "x-pin1",
+    "ssh_keys",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",
     "mesh.private_ec_p256_pkcs8_pem_key",
@@ -661,6 +664,9 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "design_version",
     "outside_count",
     "sacred_flag",
+    "residency",
+    "data_residency",
+    "client_keyboard_layout",
 ];
 
 #[test]

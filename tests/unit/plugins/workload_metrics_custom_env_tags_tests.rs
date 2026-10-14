@@ -213,6 +213,7 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "PRIVATE_EC_P256_KEY",
         "SIGBASE64URL",
         "DBPINVALUEHEX",
+        "DBPINUTF8",
         "PRIVATE_EC_P256_PKCS8_PEM_KEY",
     ];
 
@@ -269,6 +270,8 @@ fn custom_env_tags_do_not_reject_incidental_benign_fragments() {
         "CLUSTER_ID",
         "CLIENT_NAME",
         "CLIENTIDENTITY_MODE",
+        "DATA_RESIDENCY",
+        "CLIENT_KEYBOARD_LAYOUT",
         "REDIS_HOST",
         "DATABASE_NAME",
     ] {
@@ -353,6 +356,10 @@ fn custom_header_tags_reject_credential_class_header_names() {
         "x-private-ec-p256-key",
         "x-sigBase64Url",
         "x-dbPinValueHex",
+        "x-dbPinUtf8",
+        "x-pin1",
+        // The metadata-only outcome-key exemption never covers a header.
+        "mesh_authz.ignored_baggage.assertion_out_of_scope",
         "x-private-ec-p256-pkcs8-pem-key",
     ] {
         let error = workload_metrics_new_with_env_lookup_for_test(
@@ -381,4 +388,17 @@ fn credential_class_tag_destinations_are_rejected_separately_from_sources() {
     .err()
     .expect("a credential-class tag name must be refused");
     assert!(error.contains("reserved or sensitive"), "{error}");
+}
+
+#[test]
+fn ordinary_dimension_tag_names_remain_admitted() {
+    for tag in ["residency", "client_keyboard_layout"] {
+        workload_metrics_new_with_env_lookup_for_test(
+            &json!({
+                "custom_env_tags": {tag: "ISTIO_META_ZONE"}
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .unwrap_or_else(|error| panic!("tag name {tag} must be admitted, got {error}"));
+    }
 }

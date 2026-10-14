@@ -370,7 +370,25 @@ fn has_inline_key_material(lower: &str) -> bool {
     CREDENTIAL_KEY_QUALIFIERS.iter().any(|qualifier| {
         lower
             .find(qualifier)
-            .is_some_and(|offset| lower[offset + qualifier.len()..].contains("key"))
+            .is_some_and(|offset| names_key_material(&lower[offset + qualifier.len()..]))
+    })
+}
+
+/// What may follow `key` / `keys` and still name key material
+/// (`keyid`, `keypem`, `keydata`); ordinary words such as `keyboard` and
+/// `keyword` do not qualify.
+const KEY_MATERIAL_TRAILERS: &[&str] = &[
+    "id", "ids", "pem", "der", "data", "value", "values", "file", "path", "bytes", "b64", "base64",
+    "hex", "json", "material", "pair", "raw", "blob", "bin", "string", "secret",
+];
+
+/// Whether `text` contains `key` / `keys` that ends it or is followed only by a
+/// key-material trailer (`key`, `rsakey`, `keypem`, `p256keyid`).
+fn names_key_material(text: &str) -> bool {
+    text.match_indices("key").any(|(offset, _)| {
+        let rest = &text[offset + "key".len()..];
+        let rest = rest.strip_prefix('s').unwrap_or(rest);
+        rest.is_empty() || KEY_MATERIAL_TRAILERS.contains(&rest)
     })
 }
 
@@ -407,7 +425,7 @@ const BENIGN_SHORT_CLASS_SEGMENTS: &[&str] = &[
 const SHORT_CLASS_TRAILERS: &[&str] = &[
     "s", "value", "values", "code", "codes", "id", "ids", "number", "num", "hash", "data",
     "string", "secret", "seed", "key", "token", "block", "base64", "b64", "b64url", "hex", "pem",
-    "der", "raw", "bytes", "bin", "blob", "json", "enc", "encoded",
+    "der", "raw", "bytes", "bin", "blob", "json", "encoded", "utf8", "utf16", "ascii", "latin1",
 ];
 
 /// Short credential classes that only count inside a qualified compound,
@@ -438,6 +456,10 @@ fn has_qualified_short_class(lower: &str) -> bool {
             {
                 return true;
             }
+            // Numbered variants (`pin1`, `sid2`, `dbpin2`).
+            if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) {
+                return true;
+            }
             !prefix.is_empty() && prefix.len() >= *min_prefix && (rest.is_empty() || rest == "s")
         })
     })
@@ -452,7 +474,7 @@ fn lowered_segment_is_credential(lower: &str, in_key_context: bool) -> bool {
             .iter()
             .any(|stem| lower.contains(stem))
         || has_qualified_short_class(lower)
-        || (in_key_context && lower.contains("key"))
+        || (in_key_context && names_key_material(lower))
         || has_inline_key_material(lower)
 }
 
@@ -488,6 +510,19 @@ pub fn is_credential_class_metadata_key(key: &str) -> bool {
     {
         return false;
     }
+    is_credential_class_name(key)
+}
+
+/// Whether a request/response HEADER name is sensitive: the shared metadata
+/// decision plus the credential-class classifier WITHOUT the metadata-only
+/// outcome-key exemption. A header named like a gateway outcome signal is
+/// still caller-supplied, so the name proves nothing about its value.
+pub fn is_sensitive_header_name(name: &str) -> bool {
+    is_sensitive_metadata_key(name) || is_credential_class_name(name)
+}
+
+/// The credential-class classifier without any exemption.
+fn is_credential_class_name(key: &str) -> bool {
     let mut sensitive = false;
     let mut in_key_context = false;
     for_each_metadata_key_segment(key, |segment| {
