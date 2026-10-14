@@ -25,6 +25,10 @@ ARG IPROUTE2_VERSION=6.15.0-1
 ARG BPF_LINKER_VERSION=0.11.0
 ARG BPF_LINKER_AMD64_SHA256=10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450
 ARG BPF_LINKER_ARM64_SHA256=d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d838ee61b73eb9
+# Dated nightly for the eBPF ELF build (#6574), the same one the fuzz lane
+# pins in fuzz/rust-toolchain.toml. A floating `nightly` would make the
+# published eBPF images depend on whichever nightly was current at build time.
+ARG EBPF_NIGHTLY_TOOLCHAIN=nightly-2026-09-30
 
 # --- eBPF build stage (nightly, Linux only) ---
 # Compiles the no_std `ferrum-ebpf` crate to a BPF ELF using nightly +
@@ -32,20 +36,19 @@ ARG BPF_LINKER_ARM64_SHA256=d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d8
 # COPY'd into the runtime image and loaded by node_agent / node-waypoint mesh
 # mode at startup via aya. Linking requires `bpf-linker` (installed below).
 #
-# The ebpf/ workspace pins a nightly via ebpf/rust-toolchain.toml, but the
-# `cargo +nightly` invocations below explicitly select the latest installed
-# nightly — the `+nightly` override takes precedence over the toolchain file,
-# so the pin is NOT what is used here. Both resolve to a nightly toolchain so
-# the build works today; if the eBPF crate ever requires a *specific* pinned
-# nightly, drop `+nightly` from the build below so the rust-toolchain.toml pin
-# is honored (and install rust-src on that pinned toolchain). core-only
-# build-std matches the crate's `#![no_std]` + `panic = "abort"`.
+# The ebpf/ workspace's rust-toolchain.toml names the floating `nightly`
+# channel. The image build does not use it: it installs the dated
+# EBPF_NIGHTLY_TOOLCHAIN declared above and selects it explicitly with
+# `cargo +<toolchain>`, which takes precedence over the toolchain file.
+# `--locked` builds exactly ebpf/Cargo.lock and fails instead of re-resolving.
+# core-only build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 # Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
 FROM rust:latest@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
 ARG BPF_LINKER_AMD64_SHA256
 ARG BPF_LINKER_ARM64_SHA256
+ARG EBPF_NIGHTLY_TOOLCHAIN
 # Use the upstream static release instead of compiling bpf-linker against the
 # mutable LLVM installation in rust:latest. Both architecture-specific assets
 # and their SHA-256 digests are pinned above.
@@ -68,11 +71,12 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/bpf-linker; \
     rm -f "${archive}"; \
     bpf-linker --version
-RUN rustup toolchain install nightly --component rust-src \
-    && rustup run nightly rustc --version
+RUN rustup toolchain install "${EBPF_NIGHTLY_TOOLCHAIN}" --profile minimal --component rust-src \
+    && rustup run "${EBPF_NIGHTLY_TOOLCHAIN}" rustc --version
 COPY ebpf/ /build/ebpf/
 WORKDIR /build/ebpf
-RUN cargo +nightly build \
+RUN cargo "+${EBPF_NIGHTLY_TOOLCHAIN}" build \
+        --locked \
         --release \
         -p ferrum-ebpf \
         --target bpfel-unknown-none \
@@ -140,18 +144,20 @@ ARG CARGO_PROFILE=release
 # or the dependency cache layer is invalidated by the fingerprint change.
 ENV FERRUM_ARM64_RELEASE_PROFILE_ENV="CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
 
+# Both builds pass `--locked`: they compile exactly the committed Cargo.lock
+# and fail rather than silently re-resolving a dependency (#6574).
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
     if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
-    cargo build --features "${FEATURES}" --profile "${CARGO_PROFILE}" 2>/dev/null || true && \
+    cargo build --locked --features "${FEATURES}" --profile "${CARGO_PROFILE}" 2>/dev/null || true && \
     rm -rf src
 
 # ── Build the real binary ───────────────────────────────────────────────
 COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
-    touch src/main.rs && cargo build --features "${FEATURES}" --profile "${CARGO_PROFILE}" && \
+    touch src/main.rs && cargo build --locked --features "${FEATURES}" --profile "${CARGO_PROFILE}" && \
     install -m 0755 "target/${CARGO_PROFILE}/ferrum-edge" "target/${CARGO_PROFILE}/ferrum-cni" /build/
 
 # Distroless has no shell; stage the empty SQLite volume directory here.
