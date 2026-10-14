@@ -1347,6 +1347,12 @@ fn validated_introspection_not_before_at(
 /// Resolve an introspection credential's authoritative validity once, at the
 /// provider-response boundary. Relative `expires_in` is converted immediately
 /// so cache hits and single-flight followers cannot slide the deadline.
+///
+/// A JSON `null` in `exp`, `active_until` or `expires_in` is read as an omitted
+/// member, exactly as [`validated_introspection_not_before`] reads a null
+/// `nbf` (issue #6611). Authorization servers that serialize unset optional
+/// members as `null` would otherwise fail every authentication with a 503.
+/// Every other present non-integer shape is still a broken dependency response.
 fn validated_introspection_expiry(claims: &Value) -> Result<Option<i64>, IntrospectionDecision> {
     validated_introspection_expiry_at(claims, chrono::Utc::now().timestamp())
 }
@@ -1357,7 +1363,7 @@ fn validated_introspection_expiry_at(
 ) -> Result<Option<i64>, IntrospectionDecision> {
     let mut deadline: Option<i64> = None;
     for field in ["exp", "active_until"] {
-        let Some(value) = claims.get(field) else {
+        let Some(value) = claims.get(field).filter(|value| !value.is_null()) else {
             continue;
         };
         let expiry = value
@@ -1366,7 +1372,7 @@ fn validated_introspection_expiry_at(
             .ok_or(IntrospectionDecision::Unavailable)?;
         deadline = Some(deadline.map_or(expiry, |current| current.min(expiry)));
     }
-    if let Some(value) = claims.get("expires_in") {
+    if let Some(value) = claims.get("expires_in").filter(|value| !value.is_null()) {
         let seconds = value
             .as_i64()
             .or_else(|| value.as_u64()?.try_into().ok())
@@ -2537,6 +2543,33 @@ mod tests {
             Ok(expiry) => assert_eq!(expiry, Some(1_050)),
             Err(_) => panic!("valid authoritative expiry claims must be accepted"),
         }
+    }
+
+    #[test]
+    fn introspection_expiry_reads_null_members_as_omitted() {
+        for claims in [
+            json!({"exp": null}),
+            json!({"active_until": null}),
+            json!({"expires_in": null}),
+            json!({"exp": null, "active_until": null, "expires_in": null}),
+        ] {
+            assert!(
+                matches!(validated_introspection_expiry_at(&claims, 1_000), Ok(None)),
+                "null expiry members must read as omitted: {claims}"
+            );
+        }
+        // A null member never hides a sibling bound.
+        assert!(matches!(
+            validated_introspection_expiry_at(
+                &json!({"exp": null, "active_until": 1_200, "expires_in": null}),
+                1_000
+            ),
+            Ok(Some(1_200))
+        ));
+        assert!(matches!(
+            validated_introspection_expiry_at(&json!({"exp": 900, "active_until": null}), 1_000),
+            Err(IntrospectionDecision::Inactive)
+        ));
     }
 
     #[test]

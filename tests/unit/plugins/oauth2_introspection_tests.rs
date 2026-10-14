@@ -2315,6 +2315,95 @@ async fn absent_null_past_and_current_nbf_still_authenticate() {
     }
 }
 
+/// Issue #6611: an authorization server that serializes unset `exp`,
+/// `active_until` or `expires_in` as JSON `null` must authenticate exactly like
+/// one that omits them, matching the long-standing `nbf: null` handling. These
+/// responses used to fail every authentication with a 503.
+#[tokio::test]
+async fn null_expiry_members_authenticate_like_omitted_ones() {
+    let server = MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+    let responses = Arc::new([
+        json!({"active": true, "username": "null-exp", "exp": null}),
+        json!({"active": true, "username": "null-active-until", "active_until": null}),
+        json!({"active": true, "username": "null-expires-in", "expires_in": null}),
+        json!({
+            "active": true,
+            "username": "all-null",
+            "exp": null,
+            "nbf": null,
+            "active_until": null,
+            "expires_in": null
+        }),
+        json!({"active": true, "username": "null-beside-bound", "exp": null, "active_until": now + 600}),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with({
+            let responses = Arc::clone(&responses);
+            let calls = Arc::clone(&calls);
+            move |_: &wiremock::Request| {
+                let index = calls
+                    .fetch_add(1, Ordering::SeqCst)
+                    .min(responses.len() - 1);
+                ResponseTemplate::new(200).set_body_json(responses[index].clone())
+            }
+        })
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &config(&format!("{}/introspect", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for (token, expected) in [
+        ("null-exp", "null-exp"),
+        ("null-active-until", "null-active-until"),
+        ("null-expires-in", "null-expires-in"),
+        ("all-null", "all-null"),
+        ("null-beside-bound", "null-beside-bound"),
+    ] {
+        let mut ctx = make_ctx(token);
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some(expected));
+    }
+}
+
+/// A null expiry member never hides an expired sibling bound.
+#[tokio::test]
+async fn null_expiry_member_does_not_mask_an_expired_sibling() {
+    let server = MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "expired-sibling",
+            "exp": null,
+            "active_until": now - 1
+        })))
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &config(&format!("{}/introspect", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("expired-sibling-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_bearer_reject(result, 401, "invalid_token");
+    assert!(ctx.authenticated_identity.is_none());
+}
+
 /// A present but malformed `nbf` is a broken dependency response, classified
 /// like malformed expiry data: a fixed plain `503`, never a bearer challenge
 /// and never cached in either direction.

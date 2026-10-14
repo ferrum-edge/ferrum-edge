@@ -39,6 +39,10 @@ pub struct ClaimHeaderDestinations {
     /// metadata key is precomputed so the request path can look a destination's
     /// staged value up directly, with no per-request formatting.
     entries: Vec<(String, String)>,
+    /// Per entry, the destination as a CGI-style backend reads it (`_` folded
+    /// to `-`). The once-per-request sanitization marker is keyed on this, so
+    /// instances owning `x-tenant-id` and `x_tenant_id` claim one destination.
+    sanitization_keys: Vec<String>,
 }
 
 impl ClaimHeaderDestinations {
@@ -62,7 +66,14 @@ impl ClaimHeaderDestinations {
             .collect();
         entries.sort_unstable();
         entries.dedup();
-        Self { entries }
+        let sanitization_keys = entries
+            .iter()
+            .map(|(_, destination)| backend_equivalence_key(destination))
+            .collect();
+        Self {
+            entries,
+            sanitization_keys,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -91,27 +102,43 @@ pub fn parse_claim_headers(
     let Some(value) = config.get(field) else {
         return Ok(Vec::new());
     };
+    // Name only the JSON type: a mis-shaped value may carry operator secrets
+    // and this message reaches admin responses and logs.
     let object = value.as_object().ok_or_else(|| {
-        format!(
-            "{plugin}: `{field}` must be an object, got: {value:?}",
-            value = value.to_string()
-        )
+        format!("{plugin}: `{field}` must be an object of claim path to header name")
     })?;
-    let mut mappings = Vec::with_capacity(object.len());
+    // The object form shares the list form's bounded surface (issue #6620):
+    // one validated token may fan a claim out to every destination.
+    if object.len() > MAX_OUTPUT_CLAIM_HEADERS {
+        return Err(format!(
+            "{plugin}: `{field}` supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
+        ));
+    }
+    let mut mappings: Vec<ClaimHeaderMapping> = Vec::with_capacity(object.len());
     for (index, (claim_path, header_value)) in object.iter().enumerate() {
         let parsed_claim_path = parse_claim_path_value(
             &format!("{field}[{index}].claim"),
             &Value::String(claim_path.clone()),
             plugin,
         )?;
+        validate_claim_path_bounds(&parsed_claim_path, field, index, plugin)?;
         let raw_header = header_value.as_str().ok_or_else(|| {
-            format!(
-                "{plugin}: `{field}[{index}].header` must be a header name string, got: {header_value:?}",
-                header_value = header_value.to_string()
-            )
+            format!("{plugin}: `{field}[{index}].header` must be a header name string")
         })?;
-        let header_name =
-            normalize_allowed_header(raw_header, plugin, &format!("{field}[{index}].header"))?;
+        let header_name = normalize_bounded_destination(
+            raw_header,
+            field,
+            index,
+            plugin,
+            DestinationMatching::BackendEquivalent,
+        )?;
+        reject_duplicate_destination(
+            &mappings,
+            &header_name,
+            field,
+            plugin,
+            DestinationMatching::BackendEquivalent,
+        )?;
         let metadata_key = format!("{metadata_prefix}{header_name}");
         mappings.push(ClaimHeaderMapping {
             claim_path: parsed_claim_path,
@@ -120,6 +147,99 @@ pub fn parse_claim_headers(
         });
     }
     Ok(mappings)
+}
+
+fn validate_claim_path_bounds(
+    claim_path: &str,
+    field: &str,
+    index: usize,
+    plugin: &str,
+) -> Result<(), String> {
+    if claim_path.len() > MAX_OUTPUT_CLAIM_PATH_LEN
+        || claim_path
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(format!(
+            "{plugin}: `{field}[{index}].claim` must be at most \
+             {MAX_OUTPUT_CLAIM_PATH_LEN} bytes and contain no whitespace or control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// How strictly a mapping form compares destination names at admission.
+#[derive(Clone, Copy)]
+enum DestinationMatching {
+    /// Exact lowercase names. `output_claim_headers` keeps this: it is also the
+    /// shape mesh translation admits for Istio `outputClaimToHeaders`, and a
+    /// RequestAuthentication refused there is dropped from the published
+    /// configuration rather than failing closed, so its admission must not
+    /// tighten here alone.
+    Exact,
+    /// Also as a CGI-style backend reads the name (`_` folded to `-`), so
+    /// `X_Real_IP` is reserved like `X-Real-IP` and `X_Tenant_Id` duplicates
+    /// `X-Tenant-Id`. Used by `claim_headers` (issue #6620).
+    BackendEquivalent,
+}
+
+/// Normalize a destination header and apply the shared length and strict
+/// reserved-target gates both mapping forms enforce.
+fn normalize_bounded_destination(
+    raw_header: &str,
+    field: &str,
+    index: usize,
+    plugin: &str,
+    matching: DestinationMatching,
+) -> Result<String, String> {
+    let header_name =
+        normalize_allowed_header(raw_header, plugin, &format!("{field}[{index}].header"))?;
+    if header_name.len() > MAX_OUTPUT_CLAIM_HEADER_NAME_LEN {
+        return Err(format!(
+            "{plugin}: `{field}[{index}].header` must be at most \
+             {MAX_OUTPUT_CLAIM_HEADER_NAME_LEN} bytes"
+        ));
+    }
+    let reserved = match matching {
+        DestinationMatching::Exact => is_output_claim_reserved_header(&header_name),
+        DestinationMatching::BackendEquivalent => {
+            is_output_claim_reserved_header(&backend_equivalence_key(&header_name))
+        }
+    };
+    if reserved {
+        return Err(format!(
+            "{plugin}: `{field}` cannot target framing, provenance, credential-bearing, \
+             or gateway-reserved header {header_name:?}"
+        ));
+    }
+    Ok(header_name)
+}
+
+/// Two mappings naming the same destination would derive the same metadata
+/// key, so whichever claim resolved last would decide the gateway-asserted
+/// value. Refuse that at load instead of resolving it by declaration order.
+fn reject_duplicate_destination(
+    mappings: &[ClaimHeaderMapping],
+    header_name: &str,
+    field: &str,
+    plugin: &str,
+    matching: DestinationMatching,
+) -> Result<(), String> {
+    if mappings.iter().any(|mapping| match matching {
+        DestinationMatching::Exact => mapping.destination_header == header_name,
+        DestinationMatching::BackendEquivalent => {
+            crate::proxy::headers::field_names_equivalent_for_backends(
+                &mapping.destination_header,
+                header_name,
+            )
+        }
+    }) {
+        return Err(format!(
+            "{plugin}: `{field}` declares header {header_name:?} more than once; \
+             a destination may be asserted from exactly one claim"
+        ));
+    }
+    Ok(())
 }
 
 /// Parse the ARRAY form of a claim → header mapping list.
@@ -172,43 +292,25 @@ pub fn parse_claim_header_list(
             .ok_or_else(|| format!("{plugin}: `{field}[{index}].claim` is required"))?;
         let claim_path =
             parse_claim_path_value(&format!("{field}[{index}].claim"), claim_value, plugin)?;
-        if claim_path.len() > MAX_OUTPUT_CLAIM_PATH_LEN
-            || claim_path
-                .chars()
-                .any(|character| character.is_control() || character.is_whitespace())
-        {
-            return Err(format!(
-                "{plugin}: `{field}[{index}].claim` must be at most \
-                 {MAX_OUTPUT_CLAIM_PATH_LEN} bytes and contain no whitespace or control characters"
-            ));
-        }
+        validate_claim_path_bounds(&claim_path, field, index, plugin)?;
         let raw_header = object
             .get("header")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("{plugin}: `{field}[{index}].header` must be a string"))?;
-        let header_name =
-            normalize_allowed_header(raw_header, plugin, &format!("{field}[{index}].header"))?;
-        if header_name.len() > MAX_OUTPUT_CLAIM_HEADER_NAME_LEN {
-            return Err(format!(
-                "{plugin}: `{field}[{index}].header` must be at most \
-                 {MAX_OUTPUT_CLAIM_HEADER_NAME_LEN} bytes"
-            ));
-        }
-        if is_output_claim_reserved_header(&header_name) {
-            return Err(format!(
-                "{plugin}: `{field}` cannot target framing, provenance, credential-bearing, \
-                 or gateway-reserved header {header_name:?}"
-            ));
-        }
-        if mappings
-            .iter()
-            .any(|mapping| mapping.destination_header == header_name)
-        {
-            return Err(format!(
-                "{plugin}: `{field}` declares header {header_name:?} more than once; \
-                 a destination may be asserted from exactly one claim"
-            ));
-        }
+        let header_name = normalize_bounded_destination(
+            raw_header,
+            field,
+            index,
+            plugin,
+            DestinationMatching::Exact,
+        )?;
+        reject_duplicate_destination(
+            &mappings,
+            &header_name,
+            field,
+            plugin,
+            DestinationMatching::Exact,
+        )?;
         mappings.push(ClaimHeaderMapping {
             metadata_key: format!("{metadata_prefix}{header_name}"),
             claim_path,
@@ -366,23 +468,27 @@ fn sanitize_owned_claim_header_destinations(
     }
     let sanitized = ctx.plugin_state_mut();
     headers.retain(|name, _| {
-        !destinations.names().any(|destination| {
-            !sanitized
-                .sanitized_claim_header_destinations
-                .contains(destination)
-                && crate::proxy::headers::field_names_equivalent_for_backends(name, destination)
-        })
+        !destinations
+            .names()
+            .zip(destinations.sanitization_keys.iter())
+            .any(|(destination, key)| {
+                !sanitized.sanitized_claim_header_destinations.contains(key)
+                    && crate::proxy::headers::field_names_equivalent_for_backends(name, destination)
+            })
     });
-    for destination in destinations.names() {
-        if !sanitized
-            .sanitized_claim_header_destinations
-            .contains(destination)
-        {
+    for key in &destinations.sanitization_keys {
+        if !sanitized.sanitized_claim_header_destinations.contains(key) {
             sanitized
                 .sanitized_claim_header_destinations
-                .insert(destination.to_string());
+                .insert(key.clone());
         }
     }
+}
+
+/// A destination name as a CGI-style backend reads it: ASCII-lowercased with
+/// `_` folded to `-` (see `field_names_equivalent_for_backends`).
+fn backend_equivalence_key(name: &str) -> String {
+    name.to_ascii_lowercase().replace('_', "-")
 }
 
 pub fn parse_separator(
@@ -412,23 +518,55 @@ pub fn parse_separator(
 /// Returning `None` is what makes the destination absent after sanitization, so
 /// an empty or blank claim must never yield `Some("")` — a backend that trusts
 /// the destination would otherwise see a gateway-asserted empty identity.
+///
+/// The value passes the same gate as the output path (issue #6620): at most
+/// [`MAX_OUTPUT_CLAIM_VALUE_LEN`] bytes, with an array join bounded while it is
+/// built, and a complete `HeaderValue` check so a claim carrying CR/LF or other
+/// control bytes leaves the destination absent instead of reaching the
+/// outbound header conversion. Never logs or returns the claim on refusal.
 fn claim_value_for_header(claims: &Value, claim_path: &str, separator: &str) -> Option<String> {
     let value = match resolve_claim_path(claims, claim_path)? {
-        Value::String(value) => value.clone(),
-        Value::Array(values) => {
-            let parts: Vec<&str> = values
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|part| !part.trim().is_empty())
-                .collect();
-            if parts.is_empty() {
+        Value::String(value) => {
+            if value.len() > MAX_OUTPUT_CLAIM_VALUE_LEN {
                 return None;
             }
-            parts.join(separator)
+            value.clone()
         }
+        Value::Array(values) => bounded_claim_join(values, separator)?,
         _ => return None,
     };
-    (!value.trim().is_empty()).then_some(value)
+    if value.trim().is_empty() {
+        return None;
+    }
+    HeaderValue::from_str(&value).ok()?;
+    Some(value)
+}
+
+/// Join the nonblank string members of an array claim, refusing (rather than
+/// truncating) once the joined value would exceed
+/// [`MAX_OUTPUT_CLAIM_VALUE_LEN`]. The bound is checked before each append, so
+/// an oversized claim never allocates past the cap.
+fn bounded_claim_join(values: &[Value], separator: &str) -> Option<String> {
+    let mut joined = String::new();
+    for part in values
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|part| !part.trim().is_empty())
+    {
+        let separator_len = if joined.is_empty() {
+            0
+        } else {
+            separator.len()
+        };
+        if joined.len() + separator_len + part.len() > MAX_OUTPUT_CLAIM_VALUE_LEN {
+            return None;
+        }
+        if separator_len > 0 {
+            joined.push_str(separator);
+        }
+        joined.push_str(part);
+    }
+    (!joined.is_empty()).then_some(joined)
 }
 
 fn normalize_allowed_header(raw_header: &str, plugin: &str, field: &str) -> Result<String, String> {
@@ -478,10 +616,11 @@ pub fn is_reserved_header(name: &str) -> bool {
 
 /// Headers that a validated JWT claim must never be allowed to synthesize.
 ///
-/// This is intentionally stricter than the legacy `claim_headers` predicate:
-/// `outputClaimToHeaders` is a new Istio-facing surface, so direct plugin
-/// configuration and mesh translation can share one fail-closed contract
-/// without changing established `claim_headers` configurations.
+/// Both `claim_headers` (object form) and `output_claim_headers` (list form)
+/// enforce this list (issue #6620). It is stricter than [`is_reserved_header`],
+/// which still decides which names the legacy error message calls "reserved".
+/// `claim_headers` also checks the `_`-folded spelling; see
+/// `DestinationMatching`.
 pub fn is_output_claim_reserved_header(name: &str) -> bool {
     let lowercase = name.to_ascii_lowercase();
     is_reserved_header(&lowercase)
@@ -518,6 +657,146 @@ mod tests {
         )
         .expect_err("reserved header should reject");
         assert!(err.contains("reserved"));
+    }
+
+    fn parse_object(config: serde_json::Value) -> Result<Vec<ClaimHeaderMapping>, String> {
+        parse_claim_headers(
+            config.as_object().expect("object"),
+            "claim_headers",
+            "test",
+            "test.",
+        )
+    }
+
+    #[test]
+    fn legacy_claim_value_refuses_header_illegal_and_oversized_values() {
+        let cap = MAX_OUTPUT_CLAIM_VALUE_LEN;
+        let claims = json!({
+            "crlf": "alice\r\nx-injected: 1",
+            "lf": "alice\nx-injected: 1",
+            "nul": "alice\u{0}",
+            "array_crlf": ["admin", "editor\r\nx-injected: 1"],
+            "at_cap": "a".repeat(cap),
+            "over_cap": "a".repeat(cap + 1),
+            "array_at_cap": ["a".repeat(cap - 2), "b"],
+            "array_over_cap": ["a".repeat(cap - 1), "b"],
+            "huge_array": vec!["role"; 100_000],
+            "ok": "alice@example.com",
+        });
+        for refused in [
+            "crlf",
+            "lf",
+            "nul",
+            "array_crlf",
+            "over_cap",
+            "array_over_cap",
+            "huge_array",
+        ] {
+            assert_eq!(
+                claim_value_for_header(&claims, refused, ","),
+                None,
+                "{refused} must leave the destination absent"
+            );
+        }
+        assert_eq!(
+            claim_value_for_header(&claims, "at_cap", ",").map(|value| value.len()),
+            Some(cap)
+        );
+        assert_eq!(
+            claim_value_for_header(&claims, "array_at_cap", ",").map(|value| value.len()),
+            Some(cap)
+        );
+        assert_eq!(
+            claim_value_for_header(&claims, "ok", ",").as_deref(),
+            Some("alice@example.com")
+        );
+        // The cacheable introspection view goes through the same gate.
+        let mappings = vec![ClaimHeaderMapping {
+            claim_path: "crlf".to_string(),
+            metadata_key: "p.x-user".to_string(),
+            destination_header: "x-user".to_string(),
+        }];
+        assert!(normalized_claim_header_values(&claims, &mappings, ",").is_empty());
+    }
+
+    #[test]
+    fn object_form_shares_the_list_form_bounds() {
+        let too_many: serde_json::Map<String, serde_json::Value> = (0..=MAX_OUTPUT_CLAIM_HEADERS)
+            .map(|index| (format!("claim{index}"), json!(format!("x-claim-{index}"))))
+            .collect();
+        let error = parse_object(json!({"claim_headers": too_many})).expect_err("17 entries");
+        assert!(error.contains("at most 16 entries"), "{error}");
+
+        let at_cap: serde_json::Map<String, serde_json::Value> = (0..MAX_OUTPUT_CLAIM_HEADERS)
+            .map(|index| (format!("claim{index}"), json!(format!("x-claim-{index}"))))
+            .collect();
+        assert_eq!(
+            parse_object(json!({"claim_headers": at_cap}))
+                .expect("16 entries")
+                .len(),
+            MAX_OUTPUT_CLAIM_HEADERS
+        );
+
+        let error = parse_object(json!({"claim_headers": {"sub": "X-User", "email": "x-user"}}))
+            .expect_err("duplicate destination");
+        assert!(error.contains("more than once"), "{error}");
+        // Backend-equivalent spellings are the same destination.
+        let error = parse_object(
+            json!({"claim_headers": {"tenant": "X-Tenant-Id", "role": "X_Tenant_Id"}}),
+        )
+        .expect_err("underscore-equivalent duplicate destination");
+        assert!(error.contains("more than once"), "{error}");
+
+        for reserved in [
+            "cookie",
+            "Content-Length",
+            "x-forwarded-user",
+            "X-Ferrum-Anything",
+            "forwarded",
+            "via",
+            "x-real-ip",
+            "X_Real_IP",
+            "X_Forwarded_For",
+            "X_Ferrum_Anything",
+            "Content_Length",
+        ] {
+            let error = parse_object(json!({"claim_headers": {"sub": reserved}}))
+                .expect_err("strict reserved destination");
+            assert!(error.contains("reserved"), "{reserved}: {error}");
+        }
+
+        let long_path = "a".repeat(MAX_OUTPUT_CLAIM_PATH_LEN + 1);
+        let error = parse_object(json!({"claim_headers": {long_path: "x-user"}}))
+            .expect_err("long claim path");
+        assert!(error.contains("claim"), "{error}");
+
+        let long_header = format!("x-{}", "a".repeat(MAX_OUTPUT_CLAIM_HEADER_NAME_LEN));
+        let error = parse_object(json!({"claim_headers": {"sub": long_header}}))
+            .expect_err("long header name");
+        assert!(error.contains("at most"), "{error}");
+
+        let error = parse_object(json!({"claim_headers": ["secret-value"]}))
+            .expect_err("non-object claim_headers");
+        assert!(!error.contains("secret-value"), "{error}");
+    }
+
+    #[test]
+    fn list_form_keeps_exact_destination_matching() {
+        // `output_claim_headers` mirrors mesh `outputClaimToHeaders` admission,
+        // which compares exact names; see `DestinationMatching::Exact`.
+        let mappings = parse_claim_header_list(
+            json!({"output_claim_headers": [
+                {"header": "X-Tenant-Id", "claim": "tenant"},
+                {"header": "X_Tenant_Id", "claim": "role"}
+            ]})
+            .as_object()
+            .expect("object"),
+            "output_claim_headers",
+            "test",
+            "test.",
+        )
+        .expect("exact matching admits distinct spellings");
+        assert_eq!(mappings.len(), 2);
     }
 
     #[test]
