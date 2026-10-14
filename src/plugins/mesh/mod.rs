@@ -98,6 +98,10 @@ mod tests {
             ("mesh.source.workload".to_string(), "frontend".to_string()),
             ("mesh.session_id".to_string(), "session-secret".to_string()),
             ("mesh.private_key".to_string(), "key-secret".to_string()),
+            (
+                "mesh.private_rsa2048_key".to_string(),
+                "sized-key-secret".to_string(),
+            ),
             ("tenant".to_string(), "acme".to_string()),
             (
                 "x-session-id".to_string(),

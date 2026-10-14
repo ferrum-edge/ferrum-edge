@@ -386,6 +386,12 @@ fn fill_key_material_tables(lower: &str, reaches_key: &mut [bool], consumed: &mu
         let rest = &lower[index..];
         let mut reaches = rest.starts_with("key");
         let mut all_words = false;
+        // Key sizes and other digits (`rsa2048`, `aes256`, a `2048` segment)
+        // never end the key-material context.
+        if rest.as_bytes()[0].is_ascii_digit() {
+            reaches |= reaches_key[index + 1];
+            all_words |= consumed[index + 1];
+        }
         for word in KEY_MATERIAL_INTERVENING_WORDS {
             if rest.starts_with(word) {
                 let next = index + word.len();
@@ -432,14 +438,17 @@ const SHORT_CLASS_TRAILERS: &[&str] = &[
 ];
 
 /// Short credential classes that only count inside a qualified compound,
-/// with the minimum qualifier length in front of them.
-const QUALIFIED_SHORT_CLASSES: &[(&str, usize)] = &[("pin", 3), ("sid", 3), ("otp", 2)];
+/// with the minimum qualifier length in front of them when nothing follows.
+const QUALIFIED_SHORT_CLASSES: &[(&str, usize)] =
+    &[("pin", 3), ("sid", 3), ("otp", 2), ("sig", 3), ("cred", 3)];
 
 /// Qualified short-class compounds that survive lowercasing: a short class
-/// preceded by a qualifier of the minimum length and/or followed by a listed
-/// trailer (`vendorpin`, `vendorpinvalue`, `pinnumber`, `usersid`, `smsotp`,
-/// `otpcode`). Ordinary words fail one of the bounds (`spin`, `inside`,
-/// `president`, `footprint`) or are listed (`hairpin`).
+/// followed by a listed trailer word (`pinvalue`, `dbpinvalue`, `sigvalue`,
+/// `credvalue`, `otpcode`), or ending the segment after a qualifier of the
+/// minimum length (`vendorpin`, `usersid`, `smsotp`, `vendorsig`,
+/// `vendorcred`). Ordinary words fail one of the bounds (`spin`, `inside`,
+/// `president`, `footprint`, `design`, `credit`, `sacred`) or are listed
+/// (`hairpin`).
 fn has_qualified_short_class(lower: &str) -> bool {
     if BENIGN_SHORT_CLASS_SEGMENTS.contains(&lower) {
         return false;
@@ -448,14 +457,12 @@ fn has_qualified_short_class(lower: &str) -> bool {
         lower.match_indices(class).any(|(offset, _)| {
             let prefix = &lower[..offset];
             let rest = &lower[offset + class.len()..];
-            let trailer = SHORT_CLASS_TRAILERS.contains(&rest);
-            if prefix.is_empty() {
-                // The bare class is a class segment already; a leading class
-                // needs a trailer (`pinvalue`, not `pinned`).
-                trailer
-            } else {
-                prefix.len() >= *min_prefix && (rest.is_empty() || trailer)
+            // A real trailer word makes it a compound whatever precedes it;
+            // the bare plural `s` only counts after a full qualifier.
+            if rest.len() >= 2 && SHORT_CLASS_TRAILERS.contains(&rest) {
+                return true;
             }
+            !prefix.is_empty() && prefix.len() >= *min_prefix && (rest.is_empty() || rest == "s")
         })
     })
 }

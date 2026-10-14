@@ -612,6 +612,16 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "idJwe",
     "pinvalue",
     "smsOtpCode",
+    "x-sigValue",
+    "x-vendorCred",
+    "x-dbPinValue",
+    "SIGVALUE",
+    "CREDVALUE",
+    "private_rsa2048_key",
+    "private_rsa_2048_key",
+    "privateRSA2048Key",
+    "encryption_aes256_key",
+    "mesh.private_rsa2048_key",
     // The outcome-signal exemption covers only its complete key.
     "session_id.assertion_out_of_scope",
     "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
@@ -632,6 +642,10 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "mesh_authz.ignored_baggage",
     "mesh_authz.ignored_baggage.assertion_out_of_scope",
     "ai_stream_router_pass_through",
+    "signal_strength",
+    "credit_card_brand",
+    "sidecar_version",
+    "cache_2048_key",
 ];
 
 #[test]
