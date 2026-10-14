@@ -8,6 +8,6 @@ fuzz_target!(|data: &[u8]| {
     };
     assert!(
         ferrum_edge::fuzz_support::fuzz_jwt_svid_invariant(data),
-        "a JWT-SVID without the fixed authority's signature validated"
+        "a JWT-SVID invariant broke: an unsigned token validated or a JWKS failed its round trip"
     );
 });
