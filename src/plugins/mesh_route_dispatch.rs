@@ -2204,10 +2204,9 @@ impl Plugin for MeshRouteDispatch {
     }
 
     /// Query predicates are evaluated against the canonical decoding of the
-    /// forwarded query, not `ctx.query_params`, so routing is already
-    /// H1/H2/H3-identical. This stays keyed on query predicates so the shared
-    /// map other plugins on the proxy see is decoded whenever this plugin
-    /// routes on the query.
+    /// forwarded query, not `ctx.query_params`, so routing is H1/H2/H3-identical.
+    /// Keyed on query predicates so early route-total planning builds the
+    /// canonical view only when this instance routes on the query.
     fn requires_decoded_query_params(&self) -> bool {
         self.has_query_predicates
     }
@@ -3550,7 +3549,7 @@ mod tests {
         .unwrap();
         assert!(
             !method_only.requires_decoded_query_params(),
-            "method/header-only routing must not change HTTP/3 query-param materialization"
+            "method/header-only routing declares no query predicate"
         );
 
         let query_rule = MeshRouteDispatch::new(&json!({
