@@ -42,6 +42,10 @@ map the claim to a non-reserved header such as `x-authenticated-user`, and
 split or merge mappings as needed. At request time a claim value that is not a
 valid header value or exceeds 8192 bytes now leaves the destination absent.
 
+### `openapi_validator` bypass headers need a secret (PR #6634)
+
+Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
