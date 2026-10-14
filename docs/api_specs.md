@@ -164,7 +164,7 @@ x-ferrum-validate:
     methods: [OPTIONS]
     consumers: [emergency-bypass]
     header_present:
-      x-bypass-validator: null
+      x-bypass-validator: replace-with-a-long-random-secret
 ```
 
 `x-ferrum-validate` accepts:
